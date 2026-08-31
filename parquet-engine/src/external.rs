@@ -86,7 +86,7 @@ impl BoundTable for ExternalParquetTable {
     fn table_revision(&self) -> TableRevision {
         TableRevision {
             identity: self.location.clone(),
-            version: 0,
+            version: "0".to_string(),
         }
     }
 

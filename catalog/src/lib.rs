@@ -290,13 +290,18 @@ impl PivotTransaction {
 
 #[async_trait]
 impl CatalogTransaction for PivotTransaction {
-    fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool {
-        self.find_or_create_sub_transaction(datastore)
-            .is_some_and(|sub_transaction| sub_transaction.does_schema_exist(schema))
+    fn does_schema_exist(&self, datastore: &str, schema: &str) -> CatalogResult<bool> {
+        let Some(sub_transaction) = self.find_or_create_sub_transaction(datastore) else {
+            return Ok(false);
+        };
+        sub_transaction.does_schema_exist(schema)
     }
 
-    fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
-        let sub_transaction = self.find_or_create_sub_transaction(&reference.datastore)?;
+    fn bind_table(&self, reference: &TableReference) -> CatalogResult<Option<Box<dyn BoundTable>>> {
+        let Some(sub_transaction) = self.find_or_create_sub_transaction(&reference.datastore)
+        else {
+            return Ok(None);
+        };
         sub_transaction.bind_table(&reference.datastore, &reference.schema_qualified_name())
     }
 
@@ -311,8 +316,11 @@ impl CatalogTransaction for PivotTransaction {
         )
     }
 
-    fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
-        let sub_transaction = self.find_or_create_sub_transaction(&reference.datastore)?;
+    fn table_revision(&self, reference: &TableReference) -> CatalogResult<Option<TableRevision>> {
+        let Some(sub_transaction) = self.find_or_create_sub_transaction(&reference.datastore)
+        else {
+            return Ok(None);
+        };
         sub_transaction.table_revision(&reference.schema_qualified_name())
     }
 
@@ -481,24 +489,27 @@ mod tests {
 
     #[async_trait]
     impl DatastoreTransaction for EmptyTransaction {
-        fn does_schema_exist(&self, schema: &str) -> bool {
-            schema == planner::DEFAULT_SCHEMA_NAME
+        fn does_schema_exist(&self, schema: &str) -> CatalogResult<bool> {
+            Ok(schema == planner::DEFAULT_SCHEMA_NAME)
         }
 
         fn bind_table(
             &self,
             _datastore: &str,
             _name: &SchemaQualifiedTableName,
-        ) -> Option<Box<dyn BoundTable>> {
-            None
+        ) -> CatalogResult<Option<Box<dyn BoundTable>>> {
+            Ok(None)
         }
 
-        fn table_revision(&self, _name: &SchemaQualifiedTableName) -> Option<TableRevision> {
-            None
+        fn table_revision(
+            &self,
+            _name: &SchemaQualifiedTableName,
+        ) -> CatalogResult<Option<TableRevision>> {
+            Ok(None)
         }
 
-        fn tables(&self) -> Vec<DatastoreTableMetadata> {
-            Vec::new()
+        fn tables(&self) -> CatalogResult<Vec<DatastoreTableMetadata>> {
+            Ok(Vec::new())
         }
     }
 

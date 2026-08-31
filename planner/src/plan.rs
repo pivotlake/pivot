@@ -89,20 +89,24 @@ impl PlanNode {
     pub(crate) fn has_matching_table_revisions(
         &self,
         transaction: &dyn CatalogTransaction,
-    ) -> bool {
+    ) -> Result<bool, crate::Error> {
         let operator_matches = match &self.operator {
             Operator::Input(input) => {
                 let table_reference = input.table.table_reference();
                 let table_revision = input.table.table_revision();
-                transaction.table_revision(&table_reference).as_ref() == Some(&table_revision)
+                transaction.table_revision(&table_reference)?.as_ref() == Some(&table_revision)
             }
             _ => true,
         };
-        operator_matches
-            && self
-                .inputs
-                .iter()
-                .all(|input| input.has_matching_table_revisions(transaction))
+        if !operator_matches {
+            return Ok(false);
+        }
+        for input in &self.inputs {
+            if !input.has_matching_table_revisions(transaction)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn fmt_indented(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
@@ -347,7 +351,10 @@ impl Plan {
         !self.requires_rebind && self.root.is_cacheable()
     }
 
-    pub fn has_matching_table_revisions(&self, transaction: &dyn CatalogTransaction) -> bool {
+    pub fn has_matching_table_revisions(
+        &self,
+        transaction: &dyn CatalogTransaction,
+    ) -> Result<bool, crate::Error> {
         self.root.has_matching_table_revisions(transaction)
     }
 

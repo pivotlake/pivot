@@ -270,14 +270,17 @@ fn same_table_name_in_two_schemas_resolves_separately() {
     let transaction = datastore.clone().begin_transaction();
     let default = transaction
         .table_revision(&SchemaQualifiedTableName::new("main", "events"))
+        .expect("table lookup succeeds")
         .expect("table in the default schema");
     let analytics = transaction
         .table_revision(&SchemaQualifiedTableName::new("analytics", "events"))
+        .expect("table lookup succeeds")
         .expect("table in the analytics schema");
     assert_ne!(default.identity, analytics.identity);
     assert!(
         transaction
             .table_revision(&SchemaQualifiedTableName::new("reporting", "events"))
+            .expect("table lookup succeeds")
             .is_none()
     );
 }
@@ -303,6 +306,7 @@ fn a_table_is_stored_at_its_identity() {
     for schema in ["main", "analytics"] {
         let id = transaction
             .table_revision(&SchemaQualifiedTableName::new(schema, "events"))
+            .expect("table lookup succeeds")
             .expect("table created")
             .identity;
         assert!(
@@ -434,7 +438,7 @@ fn compiling_a_create_schema_does_not_stage_it() {
         .unwrap();
 
     // Bound and compiled, but never executed.
-    assert!(!transaction.does_schema_exist("analytics"));
+    assert!(!transaction.does_schema_exist("analytics").unwrap());
     commit_datastore_transaction(transaction).unwrap();
     assert!(!datastore.contains_schema("analytics"));
 

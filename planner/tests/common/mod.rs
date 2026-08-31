@@ -122,7 +122,7 @@ impl BoundTable for TestTable {
     fn table_revision(&self) -> TableRevision {
         TableRevision {
             identity: format!("{}:{}", self.reference.datastore, self.reference.table),
-            version: 0,
+            version: "0".to_string(),
         }
     }
 
@@ -235,24 +235,32 @@ struct TestTransaction {
 impl CatalogTransaction for TestTransaction {
     // Every test table lives in the default schema, so that is the only schema
     // this catalog defines.
-    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-        schema == DEFAULT_SCHEMA_NAME
+    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> planner::catalog::Result<bool> {
+        Ok(schema == DEFAULT_SCHEMA_NAME)
     }
 
-    fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
-        self.tables
+    fn bind_table(
+        &self,
+        reference: &TableReference,
+    ) -> planner::catalog::Result<Option<Box<dyn BoundTable>>> {
+        Ok(self
+            .tables
             .get(&reference.table)
             .cloned()
-            .map(|t| Box::new(t) as _)
+            .map(|t| Box::new(t) as _))
     }
 
-    fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
-        self.tables
+    fn table_revision(
+        &self,
+        reference: &TableReference,
+    ) -> planner::catalog::Result<Option<TableRevision>> {
+        Ok(self
+            .tables
             .contains_key(&reference.table)
             .then(|| TableRevision {
                 identity: format!("{}:{}", reference.datastore, reference.table),
-                version: 0,
-            })
+                version: "0".to_string(),
+            }))
     }
 }
 

@@ -48,7 +48,7 @@
 //!         TableReference { datastore: "default".into(), schema: "main".into(), table: "hits".into() }
 //!     }
 //!     fn table_revision(&self) -> TableRevision {
-//!         TableRevision { identity: "hits".into(), version: 0 }
+//!         TableRevision { identity: "hits".into(), version: "0".into() }
 //!     }
 //!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>, _emit_row_group_metadata: bool) -> planner::catalog::Result<RecordBatchOperatorSpec> {
 //!         Ok(table_input(dispatcher, &self.parquet, projection, false))
@@ -79,20 +79,20 @@
 //! // catalog: it ignores the datastore qualifier and holds every table in the
 //! // default schema.
 //! impl CatalogTransaction for MyTransaction {
-//!     fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-//!         schema == planner::DEFAULT_SCHEMA_NAME
+//!     fn does_schema_exist(&self, _datastore: &str, schema: &str) -> planner::catalog::Result<bool> {
+//!         Ok(schema == planner::DEFAULT_SCHEMA_NAME)
 //!     }
-//!     fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
-//!         self.tables
+//!     fn bind_table(&self, reference: &TableReference) -> planner::catalog::Result<Option<Box<dyn BoundTable>>> {
+//!         Ok(self.tables
 //!             .get(&reference.table)
 //!             .cloned()
-//!             .map(|t| Box::new(MyTable { parquet: t.parquet, columns: t.columns }) as Box<dyn BoundTable>)
+//!             .map(|t| Box::new(MyTable { parquet: t.parquet, columns: t.columns }) as Box<dyn BoundTable>))
 //!     }
-//!     fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
-//!         self.tables.contains_key(&reference.table).then(|| TableRevision {
+//!     fn table_revision(&self, reference: &TableReference) -> planner::catalog::Result<Option<TableRevision>> {
+//!         Ok(self.tables.contains_key(&reference.table).then(|| TableRevision {
 //!             identity: format!("{}:{}", reference.datastore, reference.table),
-//!             version: 0,
-//!         })
+//!             version: "0".into(),
+//!         }))
 //!     }
 //! }
 //!
@@ -161,13 +161,15 @@ pub use duckdb_planner::{
     DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
 };
 
-/// Errors surfaced by [`Planner::plan`].
+/// Errors surfaced by planning and validating a [`Plan`].
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
     Planning(#[from] duckdb_planner::Error),
     #[error("Error converting plan: {0}")]
     PlanConversion(#[from] plan::Error),
+    #[error(transparent)]
+    Catalog(#[from] catalog::Error),
     #[error("Invalid table-function registry: {0}")]
     TableFunctionRegistry(String),
 }

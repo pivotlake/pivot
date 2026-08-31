@@ -47,24 +47,27 @@ impl Datastore for EmptyDatastore {
 struct EmptyTransaction;
 
 impl DatastoreTransaction for EmptyTransaction {
-    fn does_schema_exist(&self, schema: &str) -> bool {
-        schema == planner::DEFAULT_SCHEMA_NAME
+    fn does_schema_exist(&self, schema: &str) -> planner::catalog::Result<bool> {
+        Ok(schema == planner::DEFAULT_SCHEMA_NAME)
     }
 
     fn bind_table(
         &self,
         _datastore: &str,
         _name: &SchemaQualifiedTableName,
-    ) -> Option<Box<dyn BoundTable>> {
-        None
+    ) -> planner::catalog::Result<Option<Box<dyn BoundTable>>> {
+        Ok(None)
     }
 
-    fn table_revision(&self, _name: &SchemaQualifiedTableName) -> Option<TableRevision> {
-        None
+    fn table_revision(
+        &self,
+        _name: &SchemaQualifiedTableName,
+    ) -> planner::catalog::Result<Option<TableRevision>> {
+        Ok(None)
     }
 
-    fn tables(&self) -> Vec<DatastoreTableMetadata> {
-        Vec::new()
+    fn tables(&self) -> planner::catalog::Result<Vec<DatastoreTableMetadata>> {
+        Ok(Vec::new())
     }
 }
 

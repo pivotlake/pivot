@@ -32,8 +32,12 @@ impl DuckDBTable for TTable {
 struct TestTransaction;
 
 impl DuckDBTransaction for TestTransaction {
-    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-        schema == "main"
+    fn does_schema_exist(
+        &self,
+        _datastore: &str,
+        schema: &str,
+    ) -> duckdb_planner::catalog_provider::Result<bool> {
+        Ok(schema == "main")
     }
 
     fn bind_table(
@@ -41,11 +45,11 @@ impl DuckDBTransaction for TestTransaction {
         _datastore: &str,
         _schema: &str,
         table_name: &str,
-    ) -> Option<Box<dyn DuckDBTable>> {
-        match table_name {
+    ) -> duckdb_planner::catalog_provider::Result<Option<Box<dyn DuckDBTable>>> {
+        Ok(match table_name {
             "t" => Some(Box::new(TTable)),
             _ => None,
-        }
+        })
     }
 }
 
@@ -62,8 +66,12 @@ impl DuckDBTransaction for ScalarTransaction {
         })
     }
 
-    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-        schema == "main"
+    fn does_schema_exist(
+        &self,
+        _datastore: &str,
+        schema: &str,
+    ) -> duckdb_planner::catalog_provider::Result<bool> {
+        Ok(schema == "main")
     }
 
     fn bind_table(
@@ -71,8 +79,8 @@ impl DuckDBTransaction for ScalarTransaction {
         _datastore: &str,
         _schema: &str,
         _table_name: &str,
-    ) -> Option<Box<dyn DuckDBTable>> {
-        None
+    ) -> duckdb_planner::catalog_provider::Result<Option<Box<dyn DuckDBTable>>> {
+        Ok(None)
     }
 }
 

@@ -98,7 +98,7 @@ pub trait DuckDBTransaction: Send + Sync {
     /// asks this when the binder looks a schema up, before any table inside it is
     /// resolved, so a reference into a schema that does not exist fails as an
     /// unknown schema rather than as an unknown table.
-    fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool;
+    fn does_schema_exist(&self, datastore: &str, schema: &str) -> Result<bool>;
 
     /// Given a table name in schema `schema` of datastore `datastore` (the
     /// DuckDB database qualifier), return a table/object that implements
@@ -106,8 +106,12 @@ pub trait DuckDBTransaction: Send + Sync {
     /// datastore's snapshot. Returns `None` if the table doesn't exist.
     /// Single-datastore transactions ignore `datastore`; a composite over
     /// several datastores routes by it.
-    fn bind_table(&self, datastore: &str, schema: &str, name: &str)
-    -> Option<Box<dyn DuckDBTable>>;
+    fn bind_table(
+        &self,
+        datastore: &str,
+        schema: &str,
+        name: &str,
+    ) -> Result<Option<Box<dyn DuckDBTable>>>;
 
     /// Bind a globally registered table-function invocation through the
     /// current query transaction.
@@ -188,7 +192,7 @@ pub(crate) fn catalog_does_schema_exist(
     transaction: &TransactionContext,
     datastore: &str,
     schema: &str,
-) -> bool {
+) -> Result<bool> {
     transaction.transaction.does_schema_exist(datastore, schema)
 }
 
@@ -197,22 +201,27 @@ pub(crate) fn catalog_get_table(
     datastore: &str,
     schema: &str,
     name: &str,
-) -> CatalogGetTableResult {
-    match transaction.transaction.bind_table(datastore, schema, name) {
-        Some(table) => {
-            let columns = table.duckdb_typed_columns();
-            CatalogGetTableResult {
-                found: true,
-                columns,
-                table: Box::new(OptionalTableWrapper { table: Some(table) }),
+) -> Result<CatalogGetTableResult> {
+    Ok(
+        match transaction
+            .transaction
+            .bind_table(datastore, schema, name)?
+        {
+            Some(table) => {
+                let columns = table.duckdb_typed_columns();
+                CatalogGetTableResult {
+                    found: true,
+                    columns,
+                    table: Box::new(OptionalTableWrapper { table: Some(table) }),
+                }
             }
-        }
-        None => CatalogGetTableResult {
-            found: false,
-            columns: Vec::new(),
-            table: Box::new(OptionalTableWrapper { table: None }),
+            None => CatalogGetTableResult {
+                found: false,
+                columns: Vec::new(),
+                table: Box::new(OptionalTableWrapper { table: None }),
+            },
         },
-    }
+    )
 }
 
 pub(crate) fn catalog_bind_table_function(
