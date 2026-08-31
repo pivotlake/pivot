@@ -8,6 +8,7 @@
 //! the byte-level layout of an individual column chunk needed by the
 //! decompressor to locate pages on disk.
 
+use crate::thrift::general::CompressionCodec;
 use crate::types::table::ParquetTable;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
@@ -37,6 +38,11 @@ pub struct ColumnStatistics {
 /// on disk without re-parsing Parquet footer metadata at read time.
 #[derive(Clone)]
 pub struct ColumnChunkMeta {
+    /// Compression codec of every page in this chunk, from the footer. Whether
+    /// the engine can decompress it is checked when a page is actually read,
+    /// so a chunk in an unsupported codec is fine as long as row-group pruning
+    /// or the projection keeps its pages from being decoded.
+    pub codec: CompressionCodec,
     /// Offset of the dictionary page, if the column uses dictionary encoding.
     pub dictionary_page_offset: Option<i64>,
     /// Offset of the first data page.

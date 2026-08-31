@@ -211,6 +211,7 @@ pub(crate) fn row_groups_from_metadata(
                     let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
                         && data_pages_all_dictionary(meta.encoding_stats.as_deref());
                     ColumnChunkMeta {
+                        codec: meta.codec,
                         dictionary_page_offset: meta.dictionary_page_offset,
                         data_page_offset: meta.data_page_offset,
                         total_compressed_size: meta.total_compressed_size,

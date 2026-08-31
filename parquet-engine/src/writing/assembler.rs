@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::thrift::footer::{
     ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement,
 };
-use crate::thrift::general::Encoding;
+use crate::thrift::general::{CompressionCodec, Encoding};
 use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use arrow_schema::{DataType, FieldRef, SchemaRef};
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
@@ -36,8 +36,6 @@ const REPETITION_REQUIRED: i32 = 0;
 /// Parquet repetition type for an optional (nullable) field — a field whose rows
 /// carry definition levels.
 const REPETITION_OPTIONAL: i32 = 1;
-/// Parquet `CompressionCodec::SNAPPY`.
-const SNAPPY_CODEC: i32 = 1;
 /// Parquet format version written into the footer.
 const PARQUET_VERSION: i32 = 1;
 
@@ -375,7 +373,7 @@ fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<Colum
             physical_type: leaf.physical_type,
             encodings,
             path_in_schema: leaf.path,
-            codec: SNAPPY_CODEC,
+            codec: CompressionCodec::SNAPPY,
             num_values,
             total_uncompressed_size: uncompressed,
             total_compressed_size: compressed,

@@ -1,3 +1,4 @@
+use crate::thrift::general::CompressionCodec;
 use crate::thrift::headers::PageHeader;
 use crate::thrift::parquet_thrift::ThriftReadInputProtocol;
 use crate::types::leaves::projected_leaves;
@@ -54,7 +55,10 @@ fn parse_page_header(bytes: &[Bytes]) -> PageHeader {
 pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
     open_file: OpenFile,
-    locations: Vec<FileRange>,
+    /// Each projected leaf's file range, paired with the page codec its footer
+    /// entry recorded so the buffer built from the response can tag every
+    /// column's parts with it.
+    locations: Vec<(CompressionCodec, FileRange)>,
 }
 
 impl RowGroupRequest {
@@ -72,10 +76,11 @@ impl RowGroupRequest {
             .iter()
             .map(|&leaf| {
                 let meta: &ColumnChunkMeta = &columns[leaf];
-                FileRange::new(
+                let range = FileRange::new(
                     meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize,
                     meta.total_compressed_size as usize,
-                )
+                );
+                (meta.codec, range)
             })
             .collect();
 
@@ -90,22 +95,24 @@ impl RowGroupRequest {
         &self.open_file
     }
 
-    pub fn locations(&self) -> &[FileRange] {
-        &self.locations
+    pub fn file_ranges(&self) -> impl Iterator<Item = FileRange> + '_ {
+        self.locations.iter().map(|&(_, range)| range)
     }
 
     /// Pair this row group's domain metadata with dispatch's resolved response.
     /// Runs on the claiming worker (the fetcher emits from the worker that
     /// admitted the request), so the buffer records it as the decode owner.
     pub fn into_row_group_buffer(self, response: ReadResponse) -> RowGroupBuffer {
-        let locations = response.into_locations();
-        assert_eq!(locations.len(), self.locations.len());
+        let resolved = response.into_locations();
+        assert_eq!(resolved.len(), self.locations.len());
         RowGroupBuffer {
             metadata: self.metadata,
-            columns: locations
+            columns: resolved
                 .into_iter()
-                .map(|parts| {
-                    parts
+                .zip(self.locations)
+                .map(|(parts, (codec, _))| ColumnBuffer {
+                    codec,
+                    parts: parts
                         .into_iter()
                         .map(|part| match part {
                             ReadData::Compressed { offset, bytes } => {
@@ -123,7 +130,7 @@ impl RowGroupRequest {
                                 data,
                             },
                         })
-                        .collect()
+                        .collect(),
                 })
                 .collect(),
             worker_id: dispatch::worker::WORKER_IDX.get(),
@@ -133,12 +140,20 @@ impl RowGroupRequest {
 
 pub struct RowGroupBuffer {
     pub metadata: QueryRowGroupMetadata,
-    /// Each projected column's resolved parts, in file order.
-    pub columns: Vec<Vec<ColumnPart>>,
+    /// Each projected column's resolved bytes, in file order.
+    pub columns: Vec<ColumnBuffer>,
     /// The worker every page of this row group returns to for decode. It must
     /// be the worker that claimed the row group: that worker holds the row
     /// group's decoder state and accounts for the claim (see
     /// `RowGroupFetcher`). The middle stages may run on stealing siblings, so
     /// the id is stamped at claim time, not by whoever runs a stage.
     pub worker_id: usize,
+}
+
+/// One projected column's resolved parts, tagged with the codec its compressed
+/// pages were written with (from the column chunk's footer metadata).
+pub struct ColumnBuffer {
+    pub codec: CompressionCodec,
+    /// The column's resolved parts, in file order.
+    pub parts: Vec<ColumnPart>,
 }
