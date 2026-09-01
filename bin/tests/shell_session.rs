@@ -1,6 +1,7 @@
 use arrow_array::{Array, Int64Array, StringViewArray};
 use bin::execution::{Command, ExecuteOptions, StatementOutput};
 use bin::shell::{ShellInstance, ShellLimits};
+use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
 use dispatch::BUFFER_SIZE;
 
 #[test]
@@ -103,7 +104,9 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
     let path = parent.path().join("data");
     let location = path.to_str().unwrap();
     let instance = runtime
-        .block_on(async { ShellInstance::open_with_resources(location, 1, 32) })
+        .block_on(async {
+            ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
+        })
         .unwrap();
     let executor = instance.executor();
 
@@ -156,7 +159,8 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
     assert_eq!((ids.value(0), names.value(0)), (1, "alice"));
     assert_eq!((ids.value(1), names.value(1)), (2, "bob"));
 
-    let error = match ShellInstance::open_with_resources(location, 1, 32) {
+    let error = match ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
+    {
         Ok(_) => panic!("a second instance opened the locked datastore"),
         Err(error) => error,
     };
@@ -169,7 +173,9 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
     assert!(path.join(".pivot.lock").is_file());
 
     let reopened = runtime
-        .block_on(async { ShellInstance::open_with_resources(location, 1, 32) })
+        .block_on(async {
+            ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
+        })
         .unwrap();
     let select = runtime.block_on(reopened.executor().execute(
         "SELECT id, name FROM people ORDER BY id".to_string(),

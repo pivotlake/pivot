@@ -4,6 +4,7 @@
 
 use bin::execution::{ExecuteOptions, StatementOutput};
 use bin::shell::ShellInstance;
+use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
 
 #[test]
 fn set_and_reset_hand_back_the_variable_name_and_value() {
@@ -14,7 +15,12 @@ fn set_and_reset_hand_back_the_variable_name_and_value() {
         .unwrap();
     let instance = runtime
         .block_on(async {
-            ShellInstance::open_with_resources(directory.path().to_str().unwrap(), 1, 32)
+            ShellInstance::open_with_resources(
+                directory.path().to_str().unwrap(),
+                1,
+                32,
+                DEFAULT_REFRESH_INTERVAL,
+            )
         })
         .unwrap();
 

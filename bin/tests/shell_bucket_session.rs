@@ -6,6 +6,7 @@
 use arrow_array::{Array, Int64Array};
 use bin::execution::{ExecuteOptions, StatementOutput};
 use bin::shell::ShellInstance;
+use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
 use datastore_pivot::test_support;
 
 #[test]
@@ -40,7 +41,9 @@ fn write_then_reopen(location: &str) -> Vec<i64> {
         .unwrap();
 
     let instance = runtime
-        .block_on(async { ShellInstance::open_with_resources(location, 1, 32) })
+        .block_on(async {
+            ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
+        })
         .unwrap();
     assert_eq!(instance.location(), location);
     runtime.block_on(async {
@@ -58,7 +61,9 @@ fn write_then_reopen(location: &str) -> Vec<i64> {
     drop(instance);
 
     let reopened = runtime
-        .block_on(async { ShellInstance::open_with_resources(location, 1, 32) })
+        .block_on(async {
+            ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
+        })
         .unwrap();
     let output = runtime
         .block_on(reopened.executor().execute(

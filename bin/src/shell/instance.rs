@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use datastore_pivot::PivotDatastore;
+use datastore_pivot::{DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, PivotDatastore};
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
-use object_storage::AmbientExternalStoreFactory;
+use object_storage::{AmbientExternalStoreFactory, ObjectStore, open_store};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 const MIB: u64 = 1024 * 1024;
@@ -168,18 +169,33 @@ impl ShellInstance {
 
         let buffers = usize::try_from(memory_bytes / BUFFER_SIZE as u64)
             .map_err(|_| ResourceLimitError::MemoryTooLarge)?;
-        Self::open_with_resources(location, workers, buffers)
+        Self::open_with_resources(location, workers, buffers, DEFAULT_REFRESH_INTERVAL)
     }
 
-    /// Open with an explicit dispatch shape. This is useful for embedding and
-    /// for small black-box test instances.
+    /// Open with an explicit dispatch shape and refresh cadence. This is useful
+    /// for embedding and for small black-box test instances.
+    ///
+    /// The instance reloads its tables from the store every `refresh_interval`,
+    /// the same background sweep the server runs, so data another process
+    /// commits to a shared store becomes visible to later queries. Compaction
+    /// and vacuum stay off: those belong to one owning process per datastore,
+    /// and an interactive shell over a shared store is not it. The sweep spawns
+    /// onto the ambient tokio runtime, so call this from within one.
     pub fn open_with_resources(
         location: &str,
         workers: usize,
         buffers: usize,
+        refresh_interval: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
-        let datastore = PivotDatastore::open(location, dispatch.dispatcher())?;
+        let store: Arc<dyn ObjectStore> = open_store(location)?.into();
+        let maintenance = MaintenanceConfig {
+            refresh_interval,
+            compaction: None,
+            vacuum: None,
+        };
+        let datastore =
+            PivotDatastore::from_store(store, dispatch.dispatcher(), Some(maintenance))?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
         let catalog = Arc::new(
             PivotCatalog::new(
@@ -195,6 +211,7 @@ impl ShellInstance {
                 Arc::new(AmbientExternalStoreFactory),
             ),
         );
+        catalog.start();
         let executor =
             crate::execution::Executor::new(catalog.clone(), dispatch.dispatcher().clone());
         Ok(Self {
