@@ -45,8 +45,8 @@ mod vacuum;
 pub use binding::TableBinding;
 pub use compact::{
     CompacterHandle, CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM,
-    DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_REFRESH_INTERVAL, MaintenanceConfig,
-    compact_table_files, default_merge_target_bytes,
+    DEFAULT_COMPACT_POLL, DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE,
+    DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, compact_table_files, default_merge_target_bytes,
 };
 pub use manifest::{
     ColumnStatFilter, DeltaFileEntry, PartitionEqFilter, PartitionValues, pivot_scalar,
@@ -390,30 +390,37 @@ impl PivotDatastore {
             .maintenance
             .as_ref()
             .and_then(|maintenance| maintenance.compaction.as_ref());
-        let (target_bytes, merge_target_bytes, min_files, max_concurrent_merges, poll_interval) =
-            match configured {
-                Some(config) => (
-                    config.target_bytes,
-                    config.merge_target_bytes,
-                    config.min_files,
-                    config.max_concurrent_merges,
-                    Some(config.poll_interval),
-                ),
-                None => (
-                    crate::compact::DEFAULT_COMPACT_BYTES,
-                    crate::compact::default_merge_target_bytes(
-                        crate::compact::DEFAULT_COMPACT_BYTES,
-                    ),
-                    crate::compact::DEFAULT_MIN_FILES_TO_MERGE,
-                    crate::compact::DEFAULT_COMPACT_PARALLELISM,
-                    None,
-                ),
-            };
+        let (
+            target_bytes,
+            merge_target_bytes,
+            min_files,
+            max_concurrent_merges,
+            layout_clique_size,
+            poll_interval,
+        ) = match configured {
+            Some(config) => (
+                config.target_bytes,
+                config.merge_target_bytes,
+                config.min_files,
+                config.max_concurrent_merges,
+                config.layout_clique_size,
+                Some(config.poll_interval),
+            ),
+            None => (
+                crate::compact::DEFAULT_COMPACT_BYTES,
+                crate::compact::default_merge_target_bytes(crate::compact::DEFAULT_COMPACT_BYTES),
+                crate::compact::DEFAULT_MIN_FILES_TO_MERGE,
+                crate::compact::DEFAULT_COMPACT_PARALLELISM,
+                crate::compact::DEFAULT_LAYOUT_CLIQUE_SIZE,
+                None,
+            ),
+        };
         let (handle, actor) = crate::compact::CompacterHandle::new(
             target_bytes,
             merge_target_bytes,
             min_files,
             max_concurrent_merges,
+            layout_clique_size,
             poll_interval,
             Arc::clone(self),
         );
