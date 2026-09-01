@@ -160,6 +160,10 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         }
         DuckOperator::Filter(f) => Operator::Filter(Filter::from_handle(f)?),
         DuckOperator::Aggregate(a) => Operator::Aggregate(Aggregate::from_handle(a)?),
+        DuckOperator::Distinct(d) => {
+            let child = inputs.first().expect("a DISTINCT dedups a child's rows");
+            Operator::Distinct(Distinct::from_handle(d, child.output_types()?.len())?)
+        }
         DuckOperator::OrderBy(o) => Operator::OrderBy(OrderBy::from_handle(o)?),
         DuckOperator::TopN(t) => Operator::TopN(TopN::from_handle(t, ctx)?),
         DuckOperator::Limit(l) => Operator::Limit(Limit::from_handle(l)?),

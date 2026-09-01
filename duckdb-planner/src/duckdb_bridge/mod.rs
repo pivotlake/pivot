@@ -268,6 +268,13 @@ pub mod ffi {
         fn lo_aggregate_expr_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_aggregate_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
 
+        // ---- Distinct ----
+        /// Whether the node is `DISTINCT ON (...)` rather than a plain
+        /// `DISTINCT` over the whole row.
+        fn lo_distinct_is_distinct_on(op: &LogicalOperator) -> Result<bool>;
+        fn lo_distinct_target_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_distinct_target(op: &LogicalOperator, index: usize) -> Result<&Expression>;
+
         // ---- TopN ----
         fn lo_topn_order_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_topn_order_direction(op: &LogicalOperator, index: usize) -> Result<u8>;

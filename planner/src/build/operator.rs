@@ -15,11 +15,11 @@ use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
     Aggregate as AggregateView, BridgeError, ChunkGet as ChunkGetView, Compact as CompactView,
     CopyFromStdin as CopyFromStdinView, CreateSchema as CreateSchemaView,
-    CreateTable as CreateTableView, CreateUser as CreateUserView, Drop as DropView,
-    Filter as FilterView, Insert as InsertView, Limit as LimitView, OrderBy as OrderByView,
-    OrderKey, Projection as ProjectionView, Reset as ResetView, Set as SetView,
-    TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
-    Values as ValuesView,
+    CreateTable as CreateTableView, CreateUser as CreateUserView, Distinct as DistinctView,
+    Drop as DropView, Filter as FilterView, Insert as InsertView, Limit as LimitView,
+    OrderBy as OrderByView, OrderKey, Projection as ProjectionView, Reset as ResetView,
+    Set as SetView, TableFunctionScan as TableFunctionScanView, TableScan as TableScanView,
+    TopN as TopNView, Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
@@ -29,7 +29,7 @@ use crate::catalog::{
 };
 use crate::expression::{Error as ExpressionError, Expression, Ref};
 use crate::operator::{
-    Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser,
+    Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Distinct,
     DropTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode,
     Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
@@ -193,6 +193,45 @@ impl Aggregate {
                 .map(Expression::from_handle)
                 .collect::<Result<Vec<_>, _>>()?,
         })
+    }
+}
+
+impl Distinct {
+    /// Build a [`Distinct`] from a `SELECT DISTINCT` node. The node's declared
+    /// output is the child's columns unchanged, while the dedup operator emits
+    /// its key columns in key order; the two agree only when the targets are
+    /// exactly the child's columns, so anything else (a `DISTINCT ON`, whose
+    /// non-target columns take an arbitrary row's values) is rejected. A key
+    /// tuple dedups the same in any order, so sorting the keys into column
+    /// order makes the output the child's layout.
+    pub(crate) fn from_handle(
+        view: DistinctView<'_>,
+        child_width: usize,
+    ) -> Result<Distinct, OperatorError> {
+        if view.is_distinct_on()? {
+            return Err(OperatorError::Unsupported(
+                "DISTINCT ON is not supported".to_string(),
+            ));
+        }
+        let mut keys = view
+            .targets()?
+            .into_iter()
+            .map(|target| match Expression::from_handle(target)? {
+                Expression::Ref(r) => Ok((r.column_idx, r.return_type)),
+                other => Err(OperatorError::Unsupported(format!(
+                    "DISTINCT over a computed expression is not supported: {other}"
+                ))),
+            })
+            .collect::<Result<Vec<_>, OperatorError>>()?;
+        keys.sort_unstable_by_key(|(column, _)| *column);
+        let covers_child = keys.len() == child_width
+            && keys.iter().enumerate().all(|(i, (column, _))| i == *column);
+        if !covers_child {
+            return Err(OperatorError::Unsupported(
+                "DISTINCT over a subset of the output columns is not supported".to_string(),
+            ));
+        }
+        Ok(Distinct { keys })
     }
 }
 

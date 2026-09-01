@@ -126,6 +126,11 @@ const Expression &lo_aggregate_group(const LogicalOperator &op, size_t index);
 size_t lo_aggregate_expr_count(const LogicalOperator &op);
 const Expression &lo_aggregate_expr(const LogicalOperator &op, size_t index);
 
+// ---- Distinct ----
+bool lo_distinct_is_distinct_on(const LogicalOperator &op);
+size_t lo_distinct_target_count(const LogicalOperator &op);
+const Expression &lo_distinct_target(const LogicalOperator &op, size_t index);
+
 // ---- TopN ----
 size_t lo_topn_order_count(const LogicalOperator &op);
 uint8_t lo_topn_order_direction(const LogicalOperator &op, size_t index);

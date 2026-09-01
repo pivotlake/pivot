@@ -209,6 +209,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_INSERT => Operator::Insert(Insert { raw: self.raw }),
             L::LOGICAL_FILTER => Operator::Filter(Filter { raw: self.raw }),
             L::LOGICAL_AGGREGATE_AND_GROUP_BY => Operator::Aggregate(Aggregate { raw: self.raw }),
+            L::LOGICAL_DISTINCT => Operator::Distinct(Distinct { raw: self.raw }),
             L::LOGICAL_ORDER_BY => Operator::OrderBy(OrderBy { raw: self.raw }),
             L::LOGICAL_TOP_N => Operator::TopN(TopN { raw: self.raw }),
             L::LOGICAL_LIMIT => Operator::Limit(Limit { raw: self.raw }),
@@ -254,6 +255,8 @@ pub enum Operator<'plan> {
     Insert(Insert<'plan>),
     Filter(Filter<'plan>),
     Aggregate(Aggregate<'plan>),
+    /// A `DISTINCT` over the child's rows.
+    Distinct(Distinct<'plan>),
     OrderBy(OrderBy<'plan>),
     TopN(TopN<'plan>),
     Limit(Limit<'plan>),
@@ -331,6 +334,8 @@ define_handles! { ffi::LogicalOperator;
     Filter,
     /// A `LogicalAggregate`: GROUP BY keys plus aggregate expressions.
     Aggregate,
+    /// A `LogicalDistinct`: dedup of the child's rows on the distinct targets.
+    Distinct,
     /// A `LogicalOrder`: a list of sort keys.
     OrderBy,
     /// A `LogicalTopN`: ORDER BY + LIMIT, optionally a dynamic-filter producer.
@@ -506,6 +511,26 @@ impl<'plan> Aggregate<'plan> {
             .map(|i| {
                 Ok(Expr {
                     raw: ffi::lo_aggregate_expr(self.raw, i)?,
+                })
+            })
+            .collect()
+    }
+}
+
+impl<'plan> Distinct<'plan> {
+    /// Whether this is a `DISTINCT ON (...)` rather than a plain `DISTINCT`
+    /// over the whole row.
+    pub fn is_distinct_on(self) -> Result<bool> {
+        Ok(ffi::lo_distinct_is_distinct_on(self.raw)?)
+    }
+
+    /// The expressions the node deduplicates on. The binding resolver has run,
+    /// so each is a reference into the child's output columns.
+    pub fn targets(self) -> Result<Vec<Expr<'plan>>> {
+        (0..ffi::lo_distinct_target_count(self.raw)?)
+            .map(|i| {
+                Ok(Expr {
+                    raw: ffi::lo_distinct_target(self.raw, i)?,
                 })
             })
             .collect()
