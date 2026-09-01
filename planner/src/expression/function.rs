@@ -2,9 +2,9 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic, Length,
-    Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Substring,
-    Suffix, TemporalConvert, VariantGet,
+    Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic,
+    Length, Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
+    Substring, Suffix, TemporalConvert, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -73,6 +73,8 @@ pub enum Function {
     /// `regexp_jit_replace` — like `RegexpReplace` but always PCRE2 JIT-compiled.
     RegexpJitReplace(RegexpJitReplace),
     Divide(Divide),
+    /// `left || right` string concatenation.
+    Concat(Concat),
     /// `substring(string, start[, length])` with constant positions.
     Substring(Substring),
     DateTrunc(DateTrunc),
@@ -130,6 +132,10 @@ impl Function {
                 visit(&d.left);
                 visit(&d.right);
             }
+            Function::Concat(c) => {
+                visit(&c.left);
+                visit(&c.right);
+            }
             Function::Substring(s) => visit(&s.input),
             Function::DateTrunc(d) => visit(&d.source),
             Function::DatePart(d) => visit(&d.source),
@@ -172,6 +178,10 @@ impl Function {
                 visit(&mut d.left);
                 visit(&mut d.right);
             }
+            Function::Concat(c) => {
+                visit(&mut c.left);
+                visit(&mut c.right);
+            }
             Function::Substring(s) => visit(&mut s.input),
             Function::DateTrunc(d) => visit(&mut d.source),
             Function::DatePart(d) => visit(&mut d.source),
@@ -198,6 +208,7 @@ impl Display for Function {
             Function::RegexpFullMatch(r) => write!(f, "{r}"),
             Function::RegexpJitReplace(r) => write!(f, "{r}"),
             Function::Divide(d) => write!(f, "{d}"),
+            Function::Concat(c) => write!(f, "{c}"),
             Function::Substring(s) => write!(f, "{s}"),
             Function::DateTrunc(dt) => write!(f, "{dt}"),
             Function::DatePart(d) => write!(f, "{d}"),
@@ -224,11 +235,12 @@ impl Function {
             Function::Arithmetic(a) => a.return_type.clone(),
             Function::Length(l) => l.return_type.clone(),
             Function::DatePart(d) => d.return_type.clone(),
-            // The regex replacers and substring rewrite strings, and a
-            // formatted byte count is one.
+            // The regex replacers, substring and concatenation rewrite
+            // strings, and a formatted byte count is one.
             Function::RegexpReplace(_)
             | Function::RegexpJitReplace(_)
             | Function::Substring(_)
+            | Function::Concat(_)
             | Function::FormatBytes(_) => Type::Utf8,
             // `/` computes a float quotient, single- or double-precision.
             Function::Divide(d) => d.return_type.clone(),
@@ -262,6 +274,7 @@ impl Function {
             Function::RegexpFullMatch(r) => r.compile(),
             Function::RegexpJitReplace(r) => r.compile(),
             Function::Divide(d) => d.compile(),
+            Function::Concat(c) => c.compile(),
             Function::Substring(s) => s.compile(),
             Function::DateTrunc(dt) => dt.compile(),
             Function::DatePart(d) => d.compile(),

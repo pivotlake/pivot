@@ -21,9 +21,9 @@ use duckdb_planner::handle::{
 use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 
 use crate::expression::{
-    AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
-    ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length, Like,
+    AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Concat,
+    Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide,
+    Error, Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length, Like,
     MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch,
     RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, VariantGet,
 };
@@ -358,6 +358,7 @@ impl Function {
                 None => Ok(Function::Arithmetic(Arithmetic::from_handle(func)?)),
             },
             "*" => Ok(Function::Arithmetic(Arithmetic::from_handle(func)?)),
+            "||" => Ok(Function::Concat(Concat::from_handle(func)?)),
             "length" | "strlen" | "len" => Ok(Function::Length(Length::from_handle(func)?)),
             "format_bytes" => Ok(Function::FormatBytes(FormatBytes::from_handle(func)?)),
             // The `substring(x FROM a FOR b)` syntax binds to the same call.
@@ -527,6 +528,24 @@ impl Arithmetic {
             left: Box::new(Expression::from_handle(params[0])?),
             right: Box::new(Expression::from_handle(params[1])?),
             return_type: type_from_logical(func.return_type()?)?,
+        })
+    }
+}
+
+impl Concat {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<Concat, Error> {
+        // `||` also concatenates blobs and lists; only the string form (whose
+        // operands DuckDB's binder casts to VARCHAR) is supported.
+        let return_type = type_from_logical(func.return_type()?)?;
+        if return_type != Type::Utf8 {
+            return Err(Error::UnsupportedScalarFunction(format!(
+                "|| over {return_type} (only strings can be concatenated)"
+            )));
+        }
+        let params = function_args(func, 2)?;
+        Ok(Concat {
+            left: Box::new(Expression::from_handle(params[0])?),
+            right: Box::new(Expression::from_handle(params[1])?),
         })
     }
 }
