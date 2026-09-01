@@ -285,8 +285,8 @@ fn display_output(output: StatementOutput<TextBatch>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MetaCommand, ParsedBuffer, is_quit_statement, parse_buffer, parse_meta_command,
-        parse_stats_toggle,
+        MetaCommand, ParsedBuffer, execute_statement, is_quit_statement, parse_buffer,
+        parse_meta_command, parse_stats_toggle,
     };
 
     #[test]
@@ -323,6 +323,41 @@ mod tests {
                 trailing_meta_command: Some(("\\timing".to_string(), MetaCommand::Timing(None),)),
             }
         );
+    }
+
+    #[test]
+    fn set_statements_turn_stats_on_and_off_across_a_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let instance = runtime
+            .block_on(async {
+                crate::shell::ShellInstance::open_with_resources(
+                    directory.path().to_str().unwrap(),
+                    1,
+                    32,
+                )
+            })
+            .unwrap();
+        let mut stats = false;
+
+        let on_after_set = runtime.block_on(async {
+            let executor = instance.executor();
+            assert!(
+                execute_statement(executor, "SET pivot_stats = 1".into(), false, &mut stats).await
+            );
+            let on = stats;
+            assert!(
+                execute_statement(executor, "SET pivot_stats = 0".into(), false, &mut stats).await
+            );
+            on
+        });
+
+        assert!(on_after_set);
+        assert!(!stats);
+        drop(instance);
     }
 
     #[test]
