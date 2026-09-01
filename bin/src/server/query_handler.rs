@@ -3,7 +3,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::execution::{Command, ExecuteOptions, Execution, StatementOutput};
+use crate::execution::{Command, ExecuteOptions, Execution, StatementOutput, is_truthy};
 use crate::server::arrow_to_pgwire::{PGRowBatch, build_field_info};
 use crate::server::auth::Authenticator;
 use crate::server::copy_session;
@@ -32,7 +32,7 @@ use pgwire::messages::response::NoticeResponse;
 use tracing::{info, warn};
 
 /// Per-connection flag toggled with `SET pivot_stats = true`.
-const STATS_FLAG: &str = "pivot_stats";
+const STATS_FLAG: &str = crate::execution::STATS_VARIABLE;
 
 /// Per-connection flag toggled with `SET perf = 1`.
 #[cfg(feature = "perf")]
@@ -211,13 +211,6 @@ fn is_utc_zone(zone: &str) -> bool {
     matches!(
         zone.to_ascii_lowercase().trim_matches('\''),
         "utc" | "etc/utc" | "gmt" | "etc/gmt" | "+00" | "+00:00" | "00:00"
-    )
-}
-
-fn is_truthy(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "true" | "t" | "1" | "on" | "yes"
     )
 }
 
