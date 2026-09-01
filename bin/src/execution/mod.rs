@@ -28,7 +28,7 @@ use planning::{PlanCache, plan_query};
 pub use copy::CopyIngest;
 pub use types::{
     Command, Error, ExecuteOptions, Execution, ExecutionStats, Result, ResultColumn,
-    StatementOutput,
+    STATS_VARIABLE, StatementOutput, is_truthy,
 };
 
 /// Shared SQL execution state for every frontend of one Pivot instance.

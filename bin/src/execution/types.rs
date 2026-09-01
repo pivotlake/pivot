@@ -10,6 +10,20 @@ use tokio::task::JoinError;
 
 use super::CopyIngest;
 
+/// The session variable every frontend reads to toggle per-statement
+/// execution stats: `SET pivot_stats = true` turns them on for the session,
+/// `RESET pivot_stats` (or a falsy value) turns them off. The executor only
+/// parses the statement; each frontend applies the toggle to its own session.
+pub const STATS_VARIABLE: &str = "pivot_stats";
+
+/// Whether a `SET` value spells a true boolean, the way PostgreSQL reads one.
+pub fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "t" | "1" | "on" | "yes"
+    )
+}
+
 /// Options that affect execution but not the statement's result.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecuteOptions {

@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::Instant;
 
-use crate::execution::{ExecuteOptions, StatementOutput};
+use crate::execution::{ExecuteOptions, STATS_VARIABLE, StatementOutput, is_truthy};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -16,6 +16,10 @@ Shell commands:
   \\timing            toggle statement timing
   \\timing on|off     set statement timing
   \\h, \\help         show this help
+
+Session settings:
+  SET pivot_stats = on;    print each statement's execution stats
+  RESET pivot_stats;       stop printing them
 ";
 
 pub(crate) async fn run_shell(
@@ -41,6 +45,7 @@ async fn run_repl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = String::new();
     let mut timing = false;
+    let mut stats = false;
     loop {
         let prompt = if buffer.is_empty() {
             "pivot=> "
@@ -84,7 +89,7 @@ async fn run_repl(
             if is_quit_statement(&statement) {
                 return Ok(());
             }
-            if !execute_statement(executor, statement, timing).await {
+            if !execute_statement(executor, statement, timing, &mut stats).await {
                 failed = true;
                 break;
             }
@@ -188,6 +193,14 @@ fn is_off(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "off" | "false" | "0")
 }
 
+/// Interpret a parsed `SET`/`RESET` against the shell's stats toggle: the new
+/// state when the statement names `pivot_stats`, `None` for any other
+/// variable. `RESET` arrives with no value and reads as off.
+fn parse_stats_toggle(name: &str, value: Option<&str>) -> Option<bool> {
+    name.eq_ignore_ascii_case(STATS_VARIABLE)
+        .then(|| value.is_some_and(is_truthy))
+}
+
 fn is_quit_statement(statement: &str) -> bool {
     statement
         .strip_suffix(';')
@@ -198,11 +211,28 @@ async fn execute_statement(
     executor: &crate::execution::Executor,
     sql: String,
     timing: bool,
+    stats: &mut bool,
 ) -> bool {
+    // Like the server, read the flag before the statement runs: the SET that
+    // turns stats on reports no stats itself, the one that turns them off
+    // still reports its own.
+    let collect_stats = *stats;
+    let options = ExecuteOptions {
+        collect_stats,
+        profile: false,
+    };
     let started = Instant::now();
     let succeeded = tokio::select! {
-        result = executor.execute_with_output::<TextBatch>(sql, ExecuteOptions::default()) => match result {
+        result = executor.execute_with_output::<TextBatch>(sql, options) => match result {
             Ok(execution) => {
+                if let StatementOutput::Set { name, value } = &execution.output
+                    && let Some(enabled) = parse_stats_toggle(name, value.as_deref())
+                {
+                    *stats = enabled;
+                }
+                if collect_stats {
+                    println!("{}", execution.stats.summary());
+                }
                 if let Err(error) = display_output(execution.output) {
                     eprintln!("pivot: writing output: {error}");
                     false
@@ -254,7 +284,10 @@ fn display_output(output: StatementOutput<TextBatch>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MetaCommand, ParsedBuffer, is_quit_statement, parse_buffer, parse_meta_command};
+    use super::{
+        MetaCommand, ParsedBuffer, is_quit_statement, parse_buffer, parse_meta_command,
+        parse_stats_toggle,
+    };
 
     #[test]
     fn parses_supported_meta_commands() {
@@ -290,6 +323,15 @@ mod tests {
                 trailing_meta_command: Some(("\\timing".to_string(), MetaCommand::Timing(None),)),
             }
         );
+    }
+
+    #[test]
+    fn toggles_stats_only_for_the_pivot_stats_variable() {
+        assert_eq!(parse_stats_toggle("pivot_stats", Some("1")), Some(true));
+        assert_eq!(parse_stats_toggle("PIVOT_STATS", Some("on")), Some(true));
+        assert_eq!(parse_stats_toggle("pivot_stats", Some("off")), Some(false));
+        assert_eq!(parse_stats_toggle("pivot_stats", None), Some(false));
+        assert_eq!(parse_stats_toggle("search_path", Some("1")), None);
     }
 
     #[test]
