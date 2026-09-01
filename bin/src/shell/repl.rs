@@ -338,6 +338,7 @@ mod tests {
                     directory.path().to_str().unwrap(),
                     1,
                     32,
+                    datastore_pivot::DEFAULT_REFRESH_INTERVAL,
                 )
             })
             .unwrap();

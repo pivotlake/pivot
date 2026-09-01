@@ -16,10 +16,11 @@
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
 //! per-file row groups at one log version. The in-memory set is kept current by
 //! **push, not pull**: a periodic [`refresh_from_store`](PivotDatastore::refresh_from_store)
-//! sweep (the server runs one on an interval) reloads every table to its latest
-//! committed version and fetches any new files' footers, and an in-process
-//! writer (INSERT, compaction) [`publish_table`](PivotDatastore::publish_table)s
-//! its committed copy immediately. Queries never touch the store: a query opens
+//! sweep (the server and the shell each run one on an interval) reloads every
+//! table to its latest committed version and fetches any new files' footers,
+//! and an in-process writer (INSERT, compaction)
+//! [`publish_table`](PivotDatastore::publish_table)s its committed copy
+//! immediately. Queries never touch the store: a query opens
 //! a transaction ([`Datastore::begin_transaction`]) whose [`PivotSnapshot`]
 //! freezes the table set as of that moment, and every binding, scan, and late
 //! materialize of that query reads the frozen snapshot with zero I/O.
