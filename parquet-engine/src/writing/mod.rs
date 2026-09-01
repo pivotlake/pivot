@@ -61,6 +61,29 @@ mod stats;
 pub use stats::aggregate_file_stats;
 mod types;
 
+/// Plan the consecutive row-group ranges used to split one compaction rewrite.
+///
+/// `row_group_body_sizes` are the encoded, compressed body sizes: Parquet
+/// headers and footers are deliberately outside the target. The result uses
+/// the same minimum-file-count, byte-balanced plan as the production writer,
+/// including one singleton output for an individually oversized row group.
+/// Exposing the plan separately lets compaction distribution tests exercise
+/// the production split policy without manufacturing physical Parquet files.
+pub fn compaction_file_ranges(
+    row_group_body_sizes: &[usize],
+    target_size: usize,
+) -> Vec<std::ops::Range<usize>> {
+    assert!(
+        !row_group_body_sizes.is_empty(),
+        "a compaction split needs at least one row group"
+    );
+    assert!(
+        target_size > 0,
+        "a compaction split target must be positive"
+    );
+    assembler::compaction_file_ranges(row_group_body_sizes, target_size)
+}
+
 pub use types::AssembledFile;
 
 use std::sync::Arc;

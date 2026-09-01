@@ -136,6 +136,9 @@ use planner::catalog::SchemaQualifiedTableName;
 
 mod overlap;
 
+#[cfg(test)]
+mod distribution_tests;
+
 /// Rows per row group in a merged file.
 const ROW_GROUP_ROWS: usize = 128 * 1024;
 

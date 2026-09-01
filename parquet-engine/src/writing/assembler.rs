@@ -181,7 +181,7 @@ fn build_files(
                 .iter()
                 .map(|group| group.bytes.len())
                 .collect::<Vec<_>>();
-            balanced_row_group_ranges(&weights, target_size)
+            compaction_file_ranges(&weights, target_size)
         }
         _ => std::iter::once(0..groups.len()).collect(),
     };
@@ -195,7 +195,7 @@ fn build_files(
 /// Balance compressed row-group bodies across the minimum number of files.
 /// Capping planning weights at the target makes every oversized group fill a
 /// partition by itself without letting its excess distort the other ranges.
-fn balanced_row_group_ranges(weights: &[usize], target_size: usize) -> Vec<Range<usize>> {
+pub(super) fn compaction_file_ranges(weights: &[usize], target_size: usize) -> Vec<Range<usize>> {
     debug_assert!(!weights.is_empty());
     let weights = weights
         .iter()
@@ -510,13 +510,13 @@ mod tests {
         let weights = [8, 1, 1, 8];
 
         assert_eq!(minimum_file_count_for_target(&weights, 10), 2);
-        assert_eq!(balanced_row_group_ranges(&weights, 10), [0..2, 2..4]);
+        assert_eq!(compaction_file_ranges(&weights, 10), [0..2, 2..4]);
     }
 
     #[test]
     fn oversized_groups_are_singleton_files() {
         assert_eq!(
-            balanced_row_group_ranges(&[4, 11, 4, 4], 10),
+            compaction_file_ranges(&[4, 11, 4, 4], 10),
             [0..1, 1..2, 2..4]
         );
     }
