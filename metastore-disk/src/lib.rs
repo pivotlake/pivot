@@ -118,8 +118,8 @@ use catalog::metastore::{
 };
 use datastore_pivot::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
-    DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, MaintenanceConfig, PivotDatastore,
-    VacuumConfig, default_merge_target_bytes,
+    DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, MaintenanceConfig,
+    PivotDatastore, VacuumConfig, default_merge_target_bytes,
 };
 use dispatch::DataFlowDispatcher;
 use object_storage::{
@@ -651,6 +651,7 @@ impl DatastoreConfig {
             max_concurrent_merges: self
                 .compact_parallelism
                 .unwrap_or(DEFAULT_COMPACT_PARALLELISM),
+            layout_clique_size: DEFAULT_LAYOUT_CLIQUE_SIZE,
             poll_interval: DEFAULT_COMPACT_POLL,
         })
     }

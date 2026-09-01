@@ -1,13 +1,86 @@
-//! Background compaction and layout optimization of a table's Parquet files.
+//! Background compaction of a table's Parquet files.
 //!
-//! Frequent writes litter a table with small files, and scans pay per file. The
-//! [`CompacterHandle`] merges them: files below half the configured target are
-//! accumulated to a comfortably full output, with a file-count fallback for
-//! pathological piles, while half-full files whose sort-key ranges overlap
-//! heavily are rewritten into target-sized, range-ordered outputs. A row group
-//! that exceeds the target remains one oversized file because row groups are
-//! the smallest independently encoded unit. Each rewrite swaps its inputs into
-//! the table in a single log commit.
+//! Frequent writes litter a table with small files, and scans pay per file.
+//! The [`CompacterHandle`] runs two strategies, split by file size: files
+//! below half the configured target are merged as *small files*, files at
+//! least half full are candidates for *layout optimization*. Both rewrite
+//! their inputs into target-sized outputs and swap them into the table in a
+//! single log commit. A row group larger than the target stays one
+//! oversized file, since row groups are the smallest independently encoded
+//! unit. Each pass tries small files first, then layout.
+//!
+//! # Small files
+//!
+//! A partition's small files are merged once their total reaches the merge
+//! target, the file target with headroom for compression gains. A pile that
+//! reaches the file-count threshold before the byte target is merged once
+//! it is balanced: the batch must total at least five times its largest
+//! file, each file weighed with a fixed cost so that many tiny files
+//! qualify, and the largest file is dropped and the test repeated until the
+//! rest passes or nothing useful remains. `COMPACT ... FINAL` drops both
+//! guards and merges any two or more small files.
+//!
+//! # Layout optimization
+//!
+//! Layout optimization reduces the work left after min/max pruning. A scan
+//! can discard a file when its sort-key range misses the predicate, then
+//! discard row groups within a retained file by the same test. If many files
+//! cover the same key range, file pruning retains all of them and each can
+//! contribute row groups whose bounds meet the predicate. Rewriting their
+//! rows in sort order cuts the shared range into files with narrower,
+//! non-overlapping ranges, so a query usually retains fewer files and fewer
+//! row groups.
+//!
+//! Candidates are files at least half the target size in one partition of a
+//! table with a sort key. A pair is measured on the first sort column on
+//! which the files are not both fixed at the same value. Their ranges must
+//! share more than a single boundary value, and a routine pair qualifies
+//! only when more than
+//! [`overlap::CONTESTED_ROW_GROUP_PERCENT_BAR`] percent of each file's row
+//! groups lie inside the other file's range. Missing row-group bounds count
+//! as contested because they cannot prove that the group is outside it.
+//!
+//! A routine round starts with the file having the most qualifying partners
+//! and merges a full clique, meaning that every pair in the group qualifies.
+//! The default clique has [`DEFAULT_LAYOUT_CLIQUE_SIZE`] files, six at the
+//! default 20 percent bar. Smaller cliques wait for more files instead of
+//! causing repeated partial rewrites. The default size also makes each
+//! output's range narrow enough that it normally falls below the bar against
+//! an unmerged broad file, keeping successive layout scales apart. Files in
+//! different partitions are never paired. Neither are files with unusable
+//! manifest bounds or no rows, pairs whose ranges are disjoint or merely
+//! touch, or pairs fixed at one identical value across the entire sort key.
+//! These exclusions apply even to a final sweep.
+//!
+//! For example, the pinned distribution scenario begins with 1,000 identical
+//! target-full files, each spanning 1,000 keys in ten equal row groups. With
+//! six-file routine cliques it performs 472 merges and converges to:
+//!
+//! ```text
+//! key-range span (keys)   files
+//!                     5     352
+//!                     6     512
+//!                    28      36
+//!                    29      72
+//!                   167      16
+//!                   168       8
+//!                 1,000       4
+//! ```
+//!
+//! Thus 864 files cover only five or six adjacent keys, with progressively
+//! fewer files at the wider leftover scales. A narrow query can prune almost
+//! all of those files before using row-group bounds inside the few it keeps,
+//! instead of visiting all 1,000 original full-range files.
+//!
+//! `COMPACT ... FINAL` still requires a measurable pair that shares a real
+//! key interval, but drops the contested-row-group bar and the full-clique
+//! requirement. It takes a seed and its strongest directly overlapping
+//! partners, up to the same group-size cap, and keeps merging until no such
+//! group remains. This lets a broad file be rewritten with narrower files
+//! nested inside its range even when those narrow files do not all overlap
+//! one another.
+//!
+//! # Merging and committing
 //!
 //! The compacter is **location-agnostic**: candidates come from the table's
 //! manifest (paths, sizes, partition values, and stats; no directory scanning), and the merge (read,
@@ -92,6 +165,18 @@ pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 /// in flight also holds its inputs' decoded rows in memory.
 pub const DEFAULT_COMPACT_PARALLELISM: usize = 3;
 
+/// Default size of the clique a routine round merges, and the cap on a
+/// final sweep's connected group: one more than the bar's reciprocal, the
+/// narrowest merge that keeps the layout's scales apart. A clique merge's outputs each span about `1 / clique_size` of the
+/// inputs' range, so a leftover input holds at most `total / width` of its
+/// row groups inside any output, below the bar's `total * percent / 100 + 1`;
+/// the extra one is a full row group of slack against cut drift. Narrower
+/// merges let leftovers and outputs merge across scales (files of four row
+/// groups need only one contested group and break at width four). Wider
+/// merges settle rows in fewer rewrites but hold every input's decoded rows
+/// in memory.
+pub const DEFAULT_LAYOUT_CLIQUE_SIZE: usize = 100 / overlap::CONTESTED_ROW_GROUP_PERCENT_BAR + 1;
+
 /// Default cadence for reloading the tables from the store. This bounds how
 /// stale a query's view of externally committed data in a shared remote store
 /// is, so it trades freshness against the store's listing traffic.
@@ -135,6 +220,9 @@ pub struct CompactionConfig {
     /// How many merges a round may have in flight at once. Selection stays
     /// serial whatever this is; only the rewrites overlap.
     pub max_concurrent_merges: usize,
+    /// Files one layout merge rewrites together, at least two; see
+    /// [`DEFAULT_LAYOUT_CLIQUE_SIZE`].
+    pub layout_clique_size: usize,
     /// How often to re-check the tables' logs for newly-accumulated files.
     pub poll_interval: Duration,
 }
@@ -148,10 +236,18 @@ pub struct CompacterHandle {
     commands: mpsc::UnboundedSender<CompactionCommand>,
 }
 
+/// Which pass a round runs: the routine one, which keeps every guard, or
+/// the final sweep, which drops them and settles the table.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CompactionPass {
+    Routine,
+    Final,
+}
+
 struct CompactionCommand {
     name: SchemaQualifiedTableName,
     table: CatalogTable,
-    final_sweep: bool,
+    pass: CompactionPass,
     result: oneshot::Sender<crate::Result<u64>>,
 }
 
@@ -162,15 +258,18 @@ pub(crate) struct CompacterActor {
     min_files: usize,
     /// How many merges a round may have in flight at once.
     max_concurrent_merges: usize,
+    /// Files one layout merge rewrites together, at least two; see
+    /// [`DEFAULT_LAYOUT_CLIQUE_SIZE`].
+    layout_clique_size: usize,
     /// How often to re-check the tables' logs, or `None` when only explicit
     /// commands drive this actor.
     poll_interval: Option<Duration>,
     datastore: Arc<PivotDatastore>,
     commands: mpsc::UnboundedReceiver<CompactionCommand>,
-    /// Each table's layout pair scores, remembered from round to round so a
+    /// Each table's pair overlaps, remembered from round to round so a
     /// pass only measures the files it has not seen before (see
-    /// [`overlap::LayoutScoreCache`]).
-    layout_score_caches: HashMap<uuid::Uuid, overlap::LayoutScoreCache>,
+    /// [`overlap::OverlapCache`]).
+    overlap_caches: HashMap<uuid::Uuid, overlap::OverlapCache>,
 }
 
 impl CompacterHandle {
@@ -179,6 +278,7 @@ impl CompacterHandle {
         merge_target_bytes: u64,
         min_files: usize,
         max_concurrent_merges: usize,
+        layout_clique_size: usize,
         poll_interval: Option<Duration>,
         datastore: Arc<PivotDatastore>,
     ) -> (Self, CompacterActor) {
@@ -190,18 +290,20 @@ impl CompacterHandle {
                 merge_target_bytes,
                 min_files: min_files.max(2),
                 max_concurrent_merges: max_concurrent_merges.max(1),
+                layout_clique_size: layout_clique_size.max(2),
                 poll_interval,
                 datastore,
                 commands: receiver,
-                layout_score_caches: HashMap::new(),
+                overlap_caches: HashMap::new(),
             },
         )
     }
 
     /// Enqueue one table from the caller's transaction snapshot; the round
     /// refreshes it to the latest version as it begins and keeps merging until
-    /// nothing qualifies. `FINAL` drops the normal merge-size, file-count,
-    /// balance, or 30% overlap guards.
+    /// nothing qualifies. `FINAL` drops the small-file guards and the
+    /// contested bar and compacts each partition to one contiguous flow, see
+    /// the module docs.
     pub(crate) async fn compact(
         &self,
         name: SchemaQualifiedTableName,
@@ -209,11 +311,16 @@ impl CompacterHandle {
         final_sweep: bool,
     ) -> crate::Result<u64> {
         let (result, answer) = oneshot::channel();
+        let pass = if final_sweep {
+            CompactionPass::Final
+        } else {
+            CompactionPass::Routine
+        };
         self.commands
             .send(CompactionCommand {
                 name,
                 table,
-                final_sweep,
+                pass,
                 result,
             })
             .map_err(|_| crate::Error::CompacterStopped)?;
@@ -240,7 +347,7 @@ impl CompacterActor {
                 command = self.commands.recv() => match command {
                     Some(command) => {
                         let res = self
-                            .compact_table(&command.name, command.table, command.final_sweep)
+                            .compact_table(&command.name, command.table, command.pass)
                             .await;
                         let _ = command.result.send(res.map(|(_, count)| count));
                     },
@@ -264,9 +371,12 @@ impl CompacterActor {
     async fn compact_all(&mut self) {
         let tables = self.datastore.tables();
         let live: HashSet<uuid::Uuid> = tables.iter().map(|(_, table)| table.id()).collect();
-        self.layout_score_caches.retain(|id, _| live.contains(id));
+        self.overlap_caches.retain(|id, _| live.contains(id));
         for (name, table) in tables {
-            if let Err(error) = self.compact_table(&name, table, false).await {
+            if let Err(error) = self
+                .compact_table(&name, table, CompactionPass::Routine)
+                .await
+            {
                 error!(table = %name, error = %error, "compaction round failed");
             }
         }
@@ -275,7 +385,7 @@ impl CompacterActor {
     /// Compact `table` until it has no candidate left: the round refreshes the
     /// table to the latest committed version once as it begins, then each pass
     /// starts a small-file group if one qualifies, else the best overlapping
-    /// large-file pair. Up to `max_concurrent_merges` of those rewrites run at
+    /// large-file group. Up to `max_concurrent_merges` of those rewrites run at
     /// once, each holding its inputs reserved until it commits, so selection
     /// works around the merges already in flight. A pass with nothing to start
     /// and nothing in flight ends the round. Returns the table as it stands and
@@ -291,10 +401,9 @@ impl CompacterActor {
         &mut self,
         name: &SchemaQualifiedTableName,
         mut table: CatalogTable,
-        final_sweep: bool,
+        pass: CompactionPass,
     ) -> crate::Result<(CatalogTable, u64)> {
         let mut passes = 0;
-        let apply_guards = !final_sweep;
         let mut in_flight = JoinSet::new();
         let mut reserved = HashSet::new();
         table.refresh()?;
@@ -303,8 +412,7 @@ impl CompacterActor {
             let id = table.id();
 
             while in_flight.len() < self.max_concurrent_merges {
-                let Some((inputs, kind)) = self.next_batch(name, &table, apply_guards, &reserved)
-                else {
+                let Some((inputs, kind)) = self.next_batch(&table, pass, &reserved) else {
                     break;
                 };
                 reserved.extend(inputs.iter().map(|file| file.path.clone()));
@@ -354,20 +462,19 @@ impl CompacterActor {
     }
 
     /// The next merge a pass can start: a small-file group if one qualifies,
-    /// else the best overlapping large-file pair. `reserved` holds the files
-    /// the merges already in flight are rewriting, which no second merge may
-    /// claim.
+    /// else the best overlapping large-file group grown from the most
+    /// contested pair. `reserved` holds the files the merges already in
+    /// flight are rewriting, which no second merge may claim.
     fn next_batch(
         &mut self,
-        name: &SchemaQualifiedTableName,
         table: &CatalogTable,
-        apply_guards: bool,
+        pass: CompactionPass,
         reserved: &HashSet<ObjectPath>,
     ) -> Option<(Vec<FileRef>, MergeKind)> {
-        if let Some(inputs) = self.next_small_batch(table, apply_guards, reserved) {
+        if let Some(inputs) = self.next_small_batch(table, pass, reserved) {
             return Some((inputs, MergeKind::SmallFiles));
         }
-        let inputs = self.next_layout_optimization(name, table, reserved)?;
+        let inputs = self.next_layout_optimization(table, reserved, pass)?;
         Some((inputs, MergeKind::LayoutOptimization))
     }
 
@@ -379,7 +486,7 @@ impl CompacterActor {
     fn next_small_batch(
         &self,
         table: &CatalogTable,
-        apply_guards: bool,
+        pass: CompactionPass,
         reserved: &HashSet<ObjectPath>,
     ) -> Option<Vec<FileRef>> {
         let mut by_partition: Vec<(Option<crate::PartitionValues>, Vec<&DeltaFileEntry>)> =
@@ -399,37 +506,29 @@ impl CompacterActor {
             }
         }
 
-        by_partition.into_iter().find_map(|(_, files)| {
-            if apply_guards {
+        by_partition.into_iter().find_map(|(_, files)| match pass {
+            CompactionPass::Routine => {
                 small_file_batch(files, self.merge_target_bytes, self.min_files)
-            } else {
-                (files.len() >= 2)
-                    .then(|| files.into_iter().map(|entry| entry.file.clone()).collect())
             }
+            CompactionPass::Final => (files.len() >= 2)
+                .then(|| files.into_iter().map(|entry| entry.file.clone()).collect()),
         })
     }
 
-    /// Find the most contested pair of already-half-full files: the one where
-    /// the largest share of each file's row groups lies within the other
-    /// file's range. Pairs never cross partitions. Sort columns are considered
-    /// in table order; a column only defers to the next one when both files
-    /// are the same singleton on it. Selection itself skips pairs whose ranges
-    /// merely touch at one value, pairs of one identical key value throughout
-    /// that exceed the output ceiling, and pairs without more than a fifth of
-    /// each file's row groups contested. That last one is the whole bar:
-    /// layout optimization merges every pair that clears it, whether or not
-    /// the round applies the small-file guards.
+    /// The next group of at-least-half-full files one merge should rewrite
+    /// together, chosen within one partition by the table's
+    /// [`overlap::OverlapCache`]: a full clique in a routine round, any
+    /// connected group in a final sweep. Reserved files stay in view so
+    /// their remembered overlaps survive a failed merge; selection passes
+    /// their pairs over.
     fn next_layout_optimization(
         &mut self,
-        name: &SchemaQualifiedTableName,
         table: &CatalogTable,
         reserved: &HashSet<ObjectPath>,
+        pass: CompactionPass,
     ) -> Option<Vec<FileRef>> {
         table.sort_by().first()?;
 
-        // Reserved files stay in the selection's view: a merge holding them
-        // can fail, so their remembered scores must survive, and it is the
-        // selection that passes their pairs over.
         let mut by_partition: Vec<(
             Option<crate::PartitionValues>,
             Vec<overlap::LayoutCandidate<'_>>,
@@ -452,15 +551,20 @@ impl CompacterActor {
             .iter()
             .map(|(_, files)| files.as_slice())
             .collect();
-        let cache = self.layout_score_caches.entry(table.id()).or_default();
-        let selected = cache.select_pair(&partitions, table.sort_by(), self.target_bytes, reserved);
-        info!(
-            table = %name,
-            eligible_pairs = cache.eligible_pair_count(),
-            "layout pairs eligible for merging"
-        );
-        let (_, left, right) = selected?;
-        Some(vec![left.file.clone(), right.file.clone()])
+        let cache = self.overlap_caches.entry(table.id()).or_default();
+        cache.observe(&partitions, table.sort_by());
+        let group = cache.select_group(reserved, pass, self.layout_clique_size)?;
+        let files_by_path: HashMap<&str, &FileRef> = by_partition
+            .iter()
+            .flat_map(|(_, candidates)| candidates.iter())
+            .map(|candidate| (candidate.entry.file.path.as_str(), &candidate.entry.file))
+            .collect();
+        Some(
+            group
+                .iter()
+                .map(|path| files_by_path[path.as_str()].clone())
+                .collect(),
+        )
     }
 }
 
@@ -987,14 +1091,26 @@ mod tests {
 
     /// Drive one full compaction sweep to completion on a temporary runtime.
     fn run_one_sweep(target_bytes: u64, datastore: Arc<PivotDatastore>) {
-        run_one_sweep_with_parallelism(target_bytes, DEFAULT_COMPACT_PARALLELISM, datastore)
+        run_one_sweep_with(
+            target_bytes,
+            DEFAULT_COMPACT_PARALLELISM,
+            DEFAULT_LAYOUT_CLIQUE_SIZE,
+            datastore,
+        )
     }
 
-    /// [`run_one_sweep`] with the number of merges the round may have in
-    /// flight spelled out.
-    fn run_one_sweep_with_parallelism(
+    /// [`run_one_sweep`] with layout cliques kept to pairs, for scenarios
+    /// where two files are the full clique.
+    fn run_one_sweep_with_pair_layout(target_bytes: u64, datastore: Arc<PivotDatastore>) {
+        run_one_sweep_with(target_bytes, DEFAULT_COMPACT_PARALLELISM, 2, datastore)
+    }
+
+    /// [`run_one_sweep`] with the merges in flight and the layout merge width
+    /// spelled out.
+    fn run_one_sweep_with(
         target_bytes: u64,
         max_concurrent_merges: usize,
+        layout_clique_size: usize,
         datastore: Arc<PivotDatastore>,
     ) {
         tokio::runtime::Builder::new_multi_thread()
@@ -1008,6 +1124,7 @@ mod tests {
                     default_merge_target_bytes(target_bytes),
                     DEFAULT_MIN_FILES_TO_MERGE,
                     max_concurrent_merges,
+                    layout_clique_size,
                     None,
                     datastore,
                 );
@@ -1019,14 +1136,42 @@ mod tests {
             });
     }
 
-    fn run_command(
+    /// The size knobs one compaction command runs under.
+    struct CompacterSizes {
         target_bytes: u64,
         merge_target_bytes: u64,
         min_files: usize,
+        layout_clique_size: usize,
+    }
+
+    impl CompacterSizes {
+        /// The defaults for `target_bytes`.
+        fn defaults(target_bytes: u64) -> Self {
+            Self {
+                target_bytes,
+                merge_target_bytes: default_merge_target_bytes(target_bytes),
+                min_files: DEFAULT_MIN_FILES_TO_MERGE,
+                layout_clique_size: DEFAULT_LAYOUT_CLIQUE_SIZE,
+            }
+        }
+
+        /// The defaults with the small-file strategy switched off, so a
+        /// scenario exercises layout optimization alone.
+        fn without_small_files(target_bytes: u64) -> Self {
+            Self {
+                merge_target_bytes: u64::MAX,
+                min_files: usize::MAX,
+                ..Self::defaults(target_bytes)
+            }
+        }
+    }
+
+    fn run_command(
+        sizes: CompacterSizes,
         datastore: Arc<PivotDatastore>,
         name: SchemaQualifiedTableName,
         table: CatalogTable,
-        final_sweep: bool,
+        pass: CompactionPass,
     ) -> u64 {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1034,15 +1179,19 @@ mod tests {
             .unwrap()
             .block_on(async move {
                 let (compacter, actor) = CompacterHandle::new(
-                    target_bytes,
-                    merge_target_bytes,
-                    min_files,
+                    sizes.target_bytes,
+                    sizes.merge_target_bytes,
+                    sizes.min_files,
                     DEFAULT_COMPACT_PARALLELISM,
+                    sizes.layout_clique_size,
                     None,
                     datastore,
                 );
                 let actor = tokio::spawn(actor.run());
-                let sweeps = compacter.compact(name, table, final_sweep).await.unwrap();
+                let sweeps = compacter
+                    .compact(name, table, pass == CompactionPass::Final)
+                    .await
+                    .unwrap();
                 actor.abort();
                 sweeps
             })
@@ -1085,13 +1234,11 @@ mod tests {
         datastore.refresh_from_store().unwrap();
 
         let sweeps = run_command(
-            target,
-            default_merge_target_bytes(target),
-            DEFAULT_MIN_FILES_TO_MERGE,
+            CompacterSizes::defaults(target),
             datastore.clone(),
             name.clone(),
             captured,
-            false,
+            CompactionPass::Routine,
         );
 
         assert_eq!(sweeps, 2, "one merging pass and one that finds nothing");
@@ -1124,7 +1271,7 @@ mod tests {
         let files = datastore.table_files(&name).unwrap();
         let target = files.iter().map(|file| file.size).min().unwrap();
 
-        run_one_sweep(target, datastore.clone());
+        run_one_sweep_with_pair_layout(target, datastore.clone());
 
         let files = datastore.table_files(&name).unwrap();
         assert!(
@@ -1169,7 +1316,7 @@ mod tests {
         let files = datastore.table_files(&name).unwrap();
         let target = files.iter().map(|file| file.size).min().unwrap();
 
-        run_one_sweep_with_parallelism(target, 3, datastore.clone());
+        run_one_sweep_with(target, 3, 2, datastore.clone());
 
         let files = datastore.table_files(&name).unwrap();
         assert!(
@@ -1219,28 +1366,24 @@ mod tests {
             .saturating_mul(2)
             .saturating_add(1);
 
-        let guarded_sweeps = run_command(
-            target,
-            u64::MAX,
-            usize::MAX,
+        let routine_sweeps = run_command(
+            CompacterSizes::without_small_files(target),
             datastore.clone(),
             name.clone(),
             table.clone(),
-            false,
+            CompactionPass::Routine,
         );
-        let guarded_files = datastore.table_handle(&name).unwrap().file_refs().len();
+        let routine_files = datastore.table_handle(&name).unwrap().file_refs().len();
         let final_sweeps = run_command(
-            target,
-            u64::MAX,
-            usize::MAX,
+            CompacterSizes::without_small_files(target),
             datastore.clone(),
             name.clone(),
             table,
-            true,
+            CompactionPass::Final,
         );
 
-        assert_eq!(guarded_sweeps, 1);
-        assert_eq!(guarded_files, 4);
+        assert_eq!(routine_sweeps, 1);
+        assert_eq!(routine_files, 4);
         assert_eq!(final_sweeps, 3);
         assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 2);
         dispatch.exit();
@@ -1283,36 +1426,38 @@ mod tests {
             .saturating_mul(2);
 
         run_command(
-            target,
-            u64::MAX,
-            usize::MAX,
+            CompacterSizes {
+                layout_clique_size: 2,
+                ..CompacterSizes::without_small_files(target)
+            },
             datastore.clone(),
             name.clone(),
             table,
-            false,
+            CompactionPass::Routine,
         );
-        let after_guarded = datastore.table_handle(&name).unwrap();
-        let guarded_files: Vec<String> = after_guarded
+        let after_routine = datastore.table_handle(&name).unwrap();
+        let routine_files: Vec<String> = after_routine
             .file_refs()
             .iter()
             .map(|file| file.path.name().to_string())
             .collect();
         let final_sweeps = run_command(
-            target,
-            u64::MAX,
-            usize::MAX,
+            CompacterSizes {
+                layout_clique_size: 2,
+                ..CompacterSizes::without_small_files(target)
+            },
             datastore.clone(),
             name.clone(),
-            after_guarded,
-            true,
+            after_routine,
+            CompactionPass::Final,
         );
 
-        assert_eq!(guarded_files.len(), 3);
-        assert!(guarded_files.contains(&"c.parquet".to_string()));
-        assert!(guarded_files.contains(&"d.parquet".to_string()));
+        assert_eq!(routine_files.len(), 3);
+        assert!(routine_files.contains(&"c.parquet".to_string()));
+        assert!(routine_files.contains(&"d.parquet".to_string()));
         assert_eq!(
             final_sweeps, 1,
-            "the final command finds nothing the guarded round left behind"
+            "the final command finds nothing the routine round left behind"
         );
         assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 3);
         dispatch.exit();
@@ -1452,7 +1597,7 @@ mod tests {
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let files = datastore.table_files(&name).unwrap();
         let target = files.iter().map(|file| file.size).min().unwrap();
-        run_one_sweep(target, datastore.clone());
+        run_one_sweep_with_pair_layout(target, datastore.clone());
 
         let files = datastore.table_files(&name).unwrap();
         assert_eq!(files.len(), 2);
@@ -1517,7 +1662,7 @@ mod tests {
         assert!(unbounded_size <= target * 2);
 
         let before_version = table.version();
-        run_one_sweep(target, datastore.clone());
+        run_one_sweep_with_pair_layout(target, datastore.clone());
 
         let compacted = datastore.table_handle(&name).unwrap();
         assert_eq!(compacted.version(), before_version + 1);
@@ -1591,7 +1736,7 @@ mod tests {
         let stable_version = compacted.version();
         let stable_paths: std::collections::HashSet<_> =
             outputs.iter().map(|file| file.path.clone()).collect();
-        run_one_sweep(target, datastore.clone());
+        run_one_sweep_with_pair_layout(target, datastore.clone());
         let after_normal = datastore.table_handle(&name).unwrap();
         assert_eq!(after_normal.version(), stable_version);
         assert_eq!(
@@ -1603,13 +1748,14 @@ mod tests {
             stable_paths
         );
         let final_sweeps = run_command(
-            target,
-            default_merge_target_bytes(target),
-            DEFAULT_MIN_FILES_TO_MERGE,
+            CompacterSizes {
+                layout_clique_size: 2,
+                ..CompacterSizes::defaults(target)
+            },
             datastore.clone(),
             name,
             after_normal,
-            true,
+            CompactionPass::Final,
         );
         assert_eq!(final_sweeps, 1);
         assert_eq!(
@@ -1617,6 +1763,250 @@ mod tests {
             stable_version
         );
 
+        dispatch.exit();
+    }
+
+    /// Three mutually overlapping 80%-full files are exactly the configured
+    /// clique, so a single merge and one commit rewrite all of them together
+    /// into sorted, range-disjoint files that no later pass selects again.
+    #[test]
+    fn layout_optimization_merges_a_group_of_three_in_one_pass() {
+        const ROWS_PER_INPUT: usize = 256_000;
+        let dispatch = Dispatch::spin_up(2, 8 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_wide_parquet_file(&adopted, "first.parquet", ROWS_PER_INPUT, 11);
+        write_wide_parquet_file(&adopted, "second.parquet", ROWS_PER_INPUT, 29);
+        write_wide_parquet_file(&adopted, "third.parquet", ROWS_PER_INPUT, 47);
+        let datastore =
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let table = datastore.table_handle(&name).unwrap();
+        let inputs = table.file_refs();
+        assert_eq!(inputs.len(), 3);
+        let target = inputs
+            .iter()
+            .map(|file| file.size)
+            .max()
+            .unwrap()
+            .saturating_mul(5)
+            .div_ceil(4);
+        assert!(inputs.iter().all(|file| !is_small_file(file.size, target)));
+        let before_version = table.version();
+
+        run_one_sweep_with(target, DEFAULT_COMPACT_PARALLELISM, 3, datastore.clone());
+
+        let compacted = datastore.table_handle(&name).unwrap();
+        assert_eq!(
+            compacted.version(),
+            before_version + 1,
+            "one merge rewrites all three inputs"
+        );
+        let outputs = compacted.file_refs();
+        assert_eq!(outputs.len(), 2, "target={target}, outputs={outputs:?}");
+        assert!(outputs.iter().all(|file| file.size <= target));
+        assert!(outputs.iter().all(|file| !is_small_file(file.size, target)));
+        let mut ranges: Vec<(i64, i64)> = compacted
+            .file_entries()
+            .map(|entry| {
+                let stats = entry.stats.as_ref().unwrap();
+                let scalar = |values: &std::collections::HashMap<String, ArrayRef>| {
+                    values["Timestamp"]
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0)
+                };
+                (scalar(&stats.min_values), scalar(&stats.max_values))
+            })
+            .collect();
+        ranges.sort_unstable();
+        assert_eq!(ranges.first().unwrap().0, 1);
+        assert_eq!(ranges.last().unwrap().1, ROWS_PER_INPUT as i64);
+        for window in ranges.windows(2) {
+            assert!(window[0].1 < window[1].0, "ranges are disjoint: {ranges:?}");
+        }
+        let row_count: i64 = compacted
+            .build_scan_view(&[], &[])
+            .unwrap()
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows)
+            .sum();
+        assert_eq!(row_count, (3 * ROWS_PER_INPUT) as i64);
+        let log = db
+            .path()
+            .join(compacted.location())
+            .join("_delta_log")
+            .join(format!("{:020}.json", compacted.version()));
+        let actions: Vec<serde_json::Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.get("remove").is_some())
+                .count(),
+            3
+        );
+
+        run_one_sweep_with(target, DEFAULT_COMPACT_PARALLELISM, 3, datastore.clone());
+        assert_eq!(
+            datastore.table_handle(&name).unwrap().version(),
+            compacted.version()
+        );
+
+        dispatch.exit();
+    }
+
+    /// Two overlapping large files are less than the clique of three, so a
+    /// routine round stands them deliberately; the final sweep settles them.
+    #[test]
+    fn routine_round_stands_a_partial_clique_and_the_final_sweep_settles_it() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted_dir = db.path().join("events");
+        std::fs::create_dir_all(&adopted_dir).unwrap();
+        write_parquet_file(&adopted_dir, "a.parquet", vec![0, 100]);
+        write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
+        let datastore =
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(Path::new("events")),
+            true,
+        );
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let table = datastore.table_handle(&name).unwrap();
+        let target = table
+            .file_refs()
+            .iter()
+            .map(|file| file.size)
+            .min()
+            .unwrap();
+        let before_version = table.version();
+
+        run_one_sweep_with(target, DEFAULT_COMPACT_PARALLELISM, 3, datastore.clone());
+        let after_routine = datastore.table_handle(&name).unwrap();
+        let final_sweeps = run_command(
+            CompacterSizes {
+                layout_clique_size: 3,
+                ..CompacterSizes::defaults(target)
+            },
+            datastore.clone(),
+            name.clone(),
+            after_routine.clone(),
+            CompactionPass::Final,
+        );
+
+        assert_eq!(after_routine.version(), before_version);
+        assert!(final_sweeps <= 3);
+        let settled = datastore.table_handle(&name).unwrap();
+        assert_eq!(settled.version(), before_version + 1);
+        assert!(
+            settled
+                .file_refs()
+                .iter()
+                .all(|file| file.path.name().starts_with("pivot-"))
+        );
+        let rows: i64 = fresh_parquet(&datastore, "events")
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows)
+            .sum();
+        assert_eq!(rows, 4);
+        dispatch.exit();
+    }
+
+    /// A wide file covers several mutually disjoint narrow files, none of
+    /// which contests more than a fifth of its row groups: no pair clears
+    /// the bar, so routine rounds stand still, and the final sweep's relaxed
+    /// connected group settles the whole neighborhood into files that share
+    /// no stretch of the key.
+    #[test]
+    fn final_sweep_settles_a_hub_no_routine_round_can_see() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_parquet_file_with_row_group_size(&adopted, "hub.parquet", (0..20).collect(), 1);
+        write_parquet_file(&adopted, "s1.parquet", vec![2, 3]);
+        write_parquet_file(&adopted, "s2.parquet", vec![8, 9]);
+        write_parquet_file(&adopted, "s3.parquet", vec![14, 15]);
+        let datastore =
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(&adopted),
+            true,
+        );
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let table = datastore.table_handle(&name).unwrap();
+        // Keep every input, satellites included, out of the small-file path.
+        let target = table
+            .file_refs()
+            .iter()
+            .map(|file| file.size)
+            .min()
+            .unwrap()
+            .saturating_mul(2);
+        let before_version = table.version();
+
+        run_one_sweep(target, datastore.clone());
+        let after_routine = datastore.table_handle(&name).unwrap();
+        let final_sweeps = run_command(
+            CompacterSizes::without_small_files(target),
+            datastore.clone(),
+            name.clone(),
+            after_routine.clone(),
+            CompactionPass::Final,
+        );
+
+        assert_eq!(after_routine.version(), before_version);
+        assert!(final_sweeps <= 4, "relaxed merging converges quickly");
+        let settled = datastore.table_handle(&name).unwrap();
+        assert!(settled.version() > before_version);
+        assert!(
+            settled
+                .file_refs()
+                .iter()
+                .all(|file| file.path.name().starts_with("pivot-"))
+        );
+        let mut ranges: Vec<(i64, i64)> = settled
+            .file_entries()
+            .map(|entry| {
+                let stats = entry.stats.as_ref().unwrap();
+                let scalar = |values: &std::collections::HashMap<String, ArrayRef>| {
+                    values["Timestamp"]
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0)
+                };
+                (scalar(&stats.min_values), scalar(&stats.max_values))
+            })
+            .collect();
+        ranges.sort_unstable();
+        for window in ranges.windows(2) {
+            assert!(
+                window[0].1 <= window[1].0,
+                "no two files share a stretch of the key: {ranges:?}"
+            );
+        }
+        let rows: i64 = fresh_parquet(&datastore, "events")
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows)
+            .sum();
+        assert_eq!(rows, 26);
         dispatch.exit();
     }
 
@@ -1708,26 +2098,28 @@ mod tests {
             .saturating_mul(2)
             .saturating_add(1);
         run_command(
-            target,
-            0,
-            DEFAULT_MIN_FILES_TO_MERGE,
+            CompacterSizes {
+                merge_target_bytes: 0,
+                ..CompacterSizes::defaults(target)
+            },
             datastore.clone(),
             name.clone(),
             table,
-            false,
+            CompactionPass::Routine,
         );
 
         // One round merges each partition's small files in turn; a second round
         // then finds nothing left to do.
         assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 2);
         run_command(
-            target,
-            0,
-            DEFAULT_MIN_FILES_TO_MERGE,
+            CompacterSizes {
+                merge_target_bytes: 0,
+                ..CompacterSizes::defaults(target)
+            },
             datastore.clone(),
             name.clone(),
             datastore.table_handle(&name).unwrap(),
-            false,
+            CompactionPass::Routine,
         );
 
         // Reload from Delta rather than trusting the in-memory swap. Exactly one
@@ -1849,13 +2241,11 @@ mod tests {
             .saturating_add(1);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         run_command(
-            target,
-            default_merge_target_bytes(target),
-            DEFAULT_MIN_FILES_TO_MERGE,
+            CompacterSizes::defaults(target),
             datastore.clone(),
             name.clone(),
             datastore.table_handle(&name).unwrap(),
-            true,
+            CompactionPass::Final,
         );
 
         // One merged object replaced the two inputs, in the store and in the
