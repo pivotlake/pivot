@@ -243,6 +243,15 @@ pub(super) fn build_group_by_operator(
     output_limit: Option<GroupLimit>,
     nullability: &[bool],
 ) -> Result<RecordBatchOperatorSpec, Error> {
+    // A GROUP BY with no aggregate expressions is a keys-only dedup: the
+    // optimizer leaves this shape when nothing reads the aggregate values (e.g.
+    // a COUNT(*) over a grouped subquery prunes the subquery's aggregates). Any
+    // pushed-down group limit is dropped, not applied early; the LIMIT operator
+    // above still trims the output.
+    if exprs.is_empty() {
+        return build_dedup_operator(input, keys, nullability);
+    }
+
     // Coalesce aggregates that fold to the same value so each is scattered/merged
     // once and the hash entry stays narrow: a COUNT(col) over a NULL-free column
     // is COUNT(*), a SUM/MIN/MAX of the same column is identical. `to_unique[i]`

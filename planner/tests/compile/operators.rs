@@ -2342,3 +2342,92 @@ fn cte_read_by_body_and_by_scalar_subquery(mut testing_planner: TestingPlanner) 
             .clone()
     );
 }
+
+#[rstest]
+fn select_distinct_dedups_duplicate_values(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT DISTINCT name FROM example_table",
+    );
+
+    let mut names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["alice", "bob", "charlie", "dave"]);
+}
+
+#[rstest]
+fn select_distinct_over_multiple_columns(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "visits",
+        &[
+            (
+                "id",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![1i64, 1, 2, 2, 2])) as ArrayRef,
+            ),
+            (
+                "page",
+                Type::Utf8,
+                str_col(vec!["home", "home", "home", "cart", "cart"]),
+            ),
+        ],
+    );
+
+    let mut rows = run(&mut testing_planner, "SELECT DISTINCT id, page FROM visits");
+
+    rows.sort_by_key(|r| {
+        (
+            r["id"].as_i64().unwrap(),
+            r["page"].as_str().unwrap().to_string(),
+        )
+    });
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"id": 1, "page": "home"},
+            {"id": 2, "page": "cart"},
+            {"id": 2, "page": "home"},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn group_by_without_aggregates_dedups_keys(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT name FROM example_table GROUP BY name",
+    );
+
+    let mut names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["alice", "bob", "charlie", "dave"]);
+}
+
+// The projection reads nothing from the dedup, only its row count: one output
+// row per group must still come through.
+#[rstest]
+fn constant_projection_over_group_by_without_aggregates(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT 1 FROM example_table GROUP BY name",
+    );
+
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|r| r["1"] == 1));
+}
+
+// The outer COUNT(*) reads none of the subquery's aggregate values, so the
+// optimizer prunes them and leaves the inner GROUP BY with no aggregate
+// expressions at all; counting its groups must still work.
+#[rstest]
+fn count_over_grouped_subquery_with_pruned_aggregates(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT COUNT(*) FROM (SELECT name, max(a) FROM example_table GROUP BY name)",
+    );
+
+    assert_eq!(rows[0]["count_star()"], 4);
+}

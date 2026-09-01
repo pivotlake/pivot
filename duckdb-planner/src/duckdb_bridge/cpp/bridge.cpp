@@ -15,6 +15,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
@@ -468,6 +469,20 @@ size_t lo_aggregate_expr_count(const LogicalOperator &op) {
 
 const Expression &lo_aggregate_expr(const LogicalOperator &op, size_t index) {
 	return *as<duckdb::LogicalAggregate>(op).expressions[index];
+}
+
+// ---- Distinct ----
+
+bool lo_distinct_is_distinct_on(const LogicalOperator &op) {
+	return as<duckdb::LogicalDistinct>(op).distinct_type == duckdb::DistinctType::DISTINCT_ON;
+}
+
+size_t lo_distinct_target_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalDistinct>(op).distinct_targets.size();
+}
+
+const Expression &lo_distinct_target(const LogicalOperator &op, size_t index) {
+	return *as<duckdb::LogicalDistinct>(op).distinct_targets[index];
 }
 
 // ---- TopN ----
