@@ -80,6 +80,8 @@ Pivot’s compaction strategy prioritizes files with overlapping ranges. By comp
 
 The same query for user_id = 1200 can now prune three of the four files and only read file C.
 
+Background compaction does this in bulk. Files whose sort-key ranges overlap are rewritten together, six at a time, once six such files have accumulated: sorting six files at once and cutting the result back into full-size files narrows each file's range about sixfold per rewrite, so a row reaches its final place in a few rewrites however the data arrived. Files whose ranges do not overlap are never rewritten, so a table whose sort key arrives in order, such as a timestamp, costs no compaction work beyond merging small files. `COMPACT table FINAL` finishes the job on demand, rewriting until no two files' ranges overlap.
+
 Together, soft sorting and overlap-aware compaction keep similar values clustered as the table evolves, improving pruning at both the file and row-group level.
 
 This is conceptually similar to ClickHouse’s sparse primary-key index / table order by definition, but applied to Parquet files and open table formats.
