@@ -758,7 +758,17 @@ impl PivotDatastore {
             .collect();
         let mut reclaimed = 0;
         for entry in expired {
+            tracing::info!(
+                table_id = %entry.id,
+                location = %entry.location,
+                "vacuum: deleting dropped table's storage"
+            );
             self.delete_table_storage(&entry.location)?;
+            tracing::info!(
+                table_id = %entry.id,
+                location = %entry.location,
+                "vacuum: deleted dropped table's storage"
+            );
             // Forget the tombstone only now, so a failure above leaves it for
             // the next sweep. Under the index write lock like every other
             // read-modify-write of the shared manifest.

@@ -36,13 +36,13 @@ use crate::{CatalogTable, PivotDatastore};
 use object_storage::ObjectPath;
 
 /// Default cadence for re-scanning the tables for newly-expired files and
-/// superseded commits. Both expire on the retention timescale (days, by Delta's
+/// superseded commits. Both expire on the retention timescale (hours, by the
 /// default `deletedFileRetentionDuration`), so hourly polling is ample.
 pub const DEFAULT_VACUUM_POLL: Duration = Duration::from_secs(60 * 60);
 
 /// Tuning for a datastore's self-managed vacuum loop. The deletion window is not
-/// configured here: each table's own `delta.deletedFileRetentionDuration` (7 days
-/// by Delta's default) governs how long an unreferenced file is kept.
+/// configured here: each table's own `delta.deletedFileRetentionDuration` (4
+/// hours by default) governs how long an unreferenced file is kept.
 #[derive(Clone)]
 pub struct VacuumConfig {
     /// How often to re-scan the tables.

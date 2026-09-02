@@ -645,8 +645,9 @@ impl CatalogTable {
     }
 
     /// How long a file this table no longer references is kept before vacuum may
-    /// delete it: the table's `delta.deletedFileRetentionDuration`, or Delta's
-    /// default when unset. Vacuum ages unreferenced files against this window.
+    /// delete it: the table's `delta.deletedFileRetentionDuration`, or the
+    /// datastore's 4-hour default when unset. Vacuum ages unreferenced files
+    /// against this window.
     pub fn deleted_file_retention(&self) -> std::time::Duration {
         crate::log::deleted_file_retention(&self.snapshot)
     }
