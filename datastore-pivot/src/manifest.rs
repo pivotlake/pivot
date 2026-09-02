@@ -183,9 +183,10 @@ impl CatalogManifestSchemaEntry {
 /// A dropped table's tombstone: the identity and storage location the table
 /// held, kept so vacuum can delete the storage once the retention window has
 /// passed (a query that bound the table before the drop may still be reading
-/// its files). `retention_ms` is the table's own `deletedFileRetentionDuration`,
-/// captured at drop time because the Delta log it lived in is itself part of
-/// the storage awaiting deletion.
+/// its files). `retention_ms` records the table's own
+/// `deletedFileRetentionDuration` at drop time (the Delta log it lived in is
+/// itself part of the storage awaiting deletion); reclamation does not read it,
+/// every dropped table waits the same fixed window from `dropped_at_ms`.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct DroppedTableEntry {
     pub(crate) id: TableId,

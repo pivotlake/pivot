@@ -1,6 +1,6 @@
 //! `DROP TABLE` at the datastore level: the drop removes only the catalog
 //! entries (durably, and only at commit), the table's storage survives for
-//! vacuum to reclaim after the retention window, and a refresh removes a table
+//! vacuum to reclaim after a fixed four-hour window, and a refresh removes a table
 //! another process dropped from the shared manifest.
 
 mod common;
@@ -24,7 +24,8 @@ use planner::catalog::{
     Column, CreateTableRequest, DropTableRequest, Result as CatalogResult, SchemaQualifiedTableName,
 };
 
-const EIGHT_DAYS_MS: u64 = 8 * 24 * 60 * 60 * 1000;
+const THREE_HOURS_MS: u64 = 3 * 60 * 60 * 1000;
+const FIVE_HOURS_MS: u64 = 5 * 60 * 60 * 1000;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -236,16 +237,16 @@ fn vacuum_reclaims_a_dropped_tables_storage_only_after_retention() {
     drop_table(&datastore, &dispatch, drop_request("t", false)).unwrap();
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
 
-    vacuumer.vacuum_all(now_ms());
+    vacuumer.vacuum_all(now_ms() + THREE_HOURS_MS);
     assert!(
         table_dir.exists(),
-        "within the retention window the dropped table's storage is kept"
+        "within the fixed four-hour window the dropped table's storage is kept"
     );
 
-    vacuumer.vacuum_all(now_ms() + EIGHT_DAYS_MS);
+    vacuumer.vacuum_all(now_ms() + FIVE_HOURS_MS);
     assert!(
         !table_dir.exists(),
-        "past the retention window the dropped table's storage is deleted"
+        "past the fixed four-hour window the dropped table's storage is deleted"
     );
     assert!(
         adopted_dir.join("live.parquet").exists(),

@@ -59,6 +59,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -84,6 +85,13 @@ use thiserror::Error as ThisError;
 const PRE_EXISTING_PARQUETS_OPTION: &str = "with_pre_existing_parquets";
 /// `WITH (partition_by = 'a, b')` — ordered, comma-separated partition columns.
 const PARTITION_BY_OPTION: &str = "partition_by";
+
+/// How long a dropped table's storage is kept before vacuum deletes it,
+/// counted from the drop. A fixed window for every table: a query that bound
+/// the table before the drop only needs its files for as long as it runs, so
+/// the table's `deletedFileRetentionDuration` (sized for readers on an old
+/// snapshot of a live table) is not what governs here and is ignored.
+const DROPPED_TABLE_RETENTION: Duration = Duration::from_secs(4 * 60 * 60);
 /// `WITH (sort_by = 'a, b')` — ordered, comma-separated sort columns.
 const SORT_BY_OPTION: &str = "sort_by";
 
@@ -744,16 +752,18 @@ impl PivotDatastore {
         Ok(())
     }
 
-    /// Delete the storage of every dropped table whose retention window has
-    /// passed (evaluated against `now_ms`), forgetting each tombstone once its
-    /// storage is gone. Returns how many tables were reclaimed. Driven by the
-    /// vacuum sweep; a tombstone whose deletion fails midway stays, and the
-    /// next sweep retries (deletes are idempotent).
+    /// Delete the storage of every dropped table whose
+    /// [`DROPPED_TABLE_RETENTION`] has passed since the drop (evaluated
+    /// against `now_ms`), forgetting each tombstone once its storage is gone.
+    /// Returns how many tables were reclaimed. Driven by the vacuum sweep; a
+    /// tombstone whose deletion fails midway stays, and the next sweep retries
+    /// (deletes are idempotent).
     pub fn reclaim_dropped_tables(&self, now_ms: u64) -> Result<u64> {
+        let retention_ms = DROPPED_TABLE_RETENTION.as_millis() as u64;
         let expired: Vec<manifest::DroppedTableEntry> = CatalogManifest::load(self.store.as_ref())?
             .dropped_tables()
             .iter()
-            .filter(|entry| entry.dropped_at_ms.saturating_add(entry.retention_ms) <= now_ms)
+            .filter(|entry| entry.dropped_at_ms.saturating_add(retention_ms) <= now_ms)
             .cloned()
             .collect();
         let mut reclaimed = 0;
