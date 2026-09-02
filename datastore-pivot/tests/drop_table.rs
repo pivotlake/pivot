@@ -24,7 +24,8 @@ use planner::catalog::{
     Column, CreateTableRequest, DropTableRequest, Result as CatalogResult, SchemaQualifiedTableName,
 };
 
-const EIGHT_DAYS_MS: u64 = 8 * 24 * 60 * 60 * 1000;
+/// Past the default 4-hour `deletedFileRetentionDuration`.
+const FIVE_HOURS_MS: u64 = 5 * 60 * 60 * 1000;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -242,7 +243,7 @@ fn vacuum_reclaims_a_dropped_tables_storage_only_after_retention() {
         "within the retention window the dropped table's storage is kept"
     );
 
-    vacuumer.vacuum_all(now_ms() + EIGHT_DAYS_MS);
+    vacuumer.vacuum_all(now_ms() + FIVE_HOURS_MS);
     assert!(
         !table_dir.exists(),
         "past the retention window the dropped table's storage is deleted"

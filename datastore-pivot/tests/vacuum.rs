@@ -22,7 +22,8 @@ use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir};
 use datastore_pivot::{DEFAULT_VACUUM_POLL, PivotDatastore, Vacuumer};
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 
-const EIGHT_DAYS_MS: u64 = 8 * 24 * 60 * 60 * 1000;
+/// Past the default 4-hour `deletedFileRetentionDuration`.
+const FIVE_HOURS_MS: u64 = 5 * 60 * 60 * 1000;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -102,7 +103,7 @@ fn unreferenced_file_past_retention_is_deleted_and_the_live_file_is_kept() {
     write_parquet(&table_dir.join("orphan.parquet"));
 
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
-    vacuumer.vacuum_all(now_ms() + EIGHT_DAYS_MS);
+    vacuumer.vacuum_all(now_ms() + FIVE_HOURS_MS);
 
     assert!(
         !table_dir.join("orphan.parquet").exists(),
@@ -148,7 +149,7 @@ fn a_file_in_the_adopted_directory_is_never_deleted() {
     write_parquet(&adopted_dir.join("theirs.parquet"));
 
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
-    vacuumer.vacuum_all(now_ms() + EIGHT_DAYS_MS);
+    vacuumer.vacuum_all(now_ms() + FIVE_HOURS_MS);
 
     assert!(adopted_dir.join("theirs.parquet").exists());
 }
@@ -175,7 +176,7 @@ fn compaction_merges_adopted_files_without_deleting_them() {
     let id = datastore.table_handle(&name).unwrap().id();
     datastore_pivot::compact_table_files(&datastore, id, &inputs, 128 * 1024, 128 * 1024).unwrap();
     Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()))
-        .vacuum_all(now_ms() + EIGHT_DAYS_MS);
+        .vacuum_all(now_ms() + FIVE_HOURS_MS);
 
     // One merged file in the table's own directory, holding every row.
     let merged = datastore.table_files(&name).unwrap();

@@ -108,11 +108,13 @@ const DEFAULT_LOG_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long a data file no longer referenced by the current table version is
 /// kept before the vacuum sweep deletes it. Read per table from the standard
-/// `delta.deletedFileRetentionDuration` property and falls back to Delta's own
-/// default. It is the window a reader on a superseded snapshot is guaranteed its
-/// files survive, so it must exceed the longest a reader can lag behind the
-/// current version.
-const DEFAULT_DELETED_FILE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// `delta.deletedFileRetentionDuration` property and falls back to this default
+/// (4 hours, well under Delta's 7-day default: compaction churns files far
+/// faster than a lagging reader does). The same window keeps a dropped table's
+/// storage. It is the window a reader on a superseded snapshot is guaranteed
+/// its files survive, so it must exceed the longest a reader can lag behind
+/// the current version.
+const DEFAULT_DELETED_FILE_RETENTION: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// The Delta state needed to rebuild one in-memory catalog table, together with
 /// the snapshot it was read from. The holder keeps that snapshot so its next
@@ -399,7 +401,7 @@ fn remove_files_metadata(
 }
 
 /// The window an unreferenced data file is kept before the vacuum sweep may
-/// delete it: the table's `delta.deletedFileRetentionDuration`, or Delta's
+/// delete it: the table's `delta.deletedFileRetentionDuration`, or our own
 /// default ([`DEFAULT_DELETED_FILE_RETENTION`]) when the table does not set it.
 /// This is the same window a checkpoint keeps a `Remove` tombstone, so a reader
 /// on a superseded snapshot is guaranteed its files survive for at least this
