@@ -768,7 +768,18 @@ impl PivotDatastore {
             .collect();
         let mut reclaimed = 0;
         for entry in expired {
-            self.delete_table_storage(&entry.location)?;
+            tracing::info!(
+                table_id = %entry.id,
+                location = %entry.location,
+                "vacuum: deleting a dropped table's storage"
+            );
+            let deleted = self.delete_table_storage(&entry.location)?;
+            tracing::info!(
+                table_id = %entry.id,
+                location = %entry.location,
+                objects = deleted,
+                "vacuum: deleted a dropped table's storage"
+            );
             // Forget the tombstone only now, so a failure above leaves it for
             // the next sweep. Under the index write lock like every other
             // read-modify-write of the shared manifest.
@@ -786,17 +797,20 @@ impl PivotDatastore {
     /// data files and its `_delta_log`. Only objects *listed under that
     /// directory* are deleted, so a file the table adopted from elsewhere
     /// (`with_pre_existing_parquets`) is never touched: it lives outside the
-    /// location and no listing here returns it.
-    fn delete_table_storage(&self, location: &ObjectPath) -> Result<()> {
+    /// location and no listing here returns it. Returns how many objects were
+    /// deleted.
+    fn delete_table_storage(&self, location: &ObjectPath) -> Result<u64> {
         assert!(
             !location.is_empty(),
             "a table's location is its own directory, never the database root"
         );
         let log_dir = location.join("_delta_log");
+        let mut deleted = 0;
         for directory in [location, &log_dir] {
             for object in self.store.list(directory)?.objects {
                 self.store
                     .delete(&directory.join(object.file.path.as_str()))?;
+                deleted += 1;
             }
         }
         // A local filesystem keeps directories as real entries even once every
@@ -814,7 +828,7 @@ impl PivotDatastore {
                 }
             }
         }
-        Ok(())
+        Ok(deleted)
     }
 
     /// Whether this datastore defines a schema named `schema`.
