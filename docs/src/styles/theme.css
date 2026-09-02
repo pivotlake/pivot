@@ -189,6 +189,11 @@
   fill: var(--sl-color-gray-4);
 }
 
+/* The bar a comparison figure is arguing for; the baseline bar stays gray-4. */
+.arch-bar-strong {
+  fill: var(--sl-color-gray-2);
+}
+
 /* Headings and chrome carry the display face; prose stays monospace. */
 .sl-markdown-content h1,
 .sl-markdown-content h2,
