@@ -780,9 +780,8 @@ impl CatalogTable {
     }
 
     /// Where the table's data lives, relative to the database root (an absolute
-    /// path escapes to the store root). Combine with the store's own root
-    /// (see [`PivotDatastore::store_description`](crate::PivotDatastore::store_description))
-    /// to know the physical location.
+    /// path escapes to the store root). Combine with the store's own root to
+    /// know the physical location.
     pub fn location(&self) -> &str {
         self.location.as_str()
     }

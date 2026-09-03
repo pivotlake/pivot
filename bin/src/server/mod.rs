@@ -64,7 +64,6 @@ mod arrow_to_pgwire;
 mod auth;
 pub mod config;
 mod copy_session;
-mod http;
 mod limits;
 mod listener;
 #[cfg(feature = "perf")]

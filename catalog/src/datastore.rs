@@ -8,7 +8,6 @@
 //! [`planner::catalog::CatalogTransaction`] routes each resolution to the right
 //! datastore's transaction by name.
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -236,10 +235,4 @@ pub trait Datastore: Debug + Send + Sync {
     /// maintenance sweep cannot race the pool's teardown. Default: nothing to
     /// stop.
     fn abort(&self) {}
-
-    /// Downcast hook (owned): recover the concrete backend as an owned `Arc`, for
-    /// a server feature specific to one datastore format (the web dashboard's
-    /// Parquet-level introspection). Implemented as
-    /// `fn into_any_arc(self: Arc<Self>) { self }`.
-    fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }

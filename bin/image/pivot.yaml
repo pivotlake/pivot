@@ -9,9 +9,8 @@
 # alongside them. With PIVOT_DISK_CACHE_SIZE set, the entrypoint writes a
 # disk_cache section into the server section below.
 server:
-  # Beyond loopback, so published container ports reach the server and the
-  # dashboard. Loopback inside a container is reachable from nowhere.
+  # Beyond loopback, so published container ports reach the server. Loopback
+  # inside a container is reachable from nowhere.
   bind: 0.0.0.0:5432
-  http_bind: 0.0.0.0:8081
 
 metastore: {}

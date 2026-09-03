@@ -18,10 +18,6 @@ server:
   # view of data committed by other processes can be. Defaults to 30s.
   refresh_interval: 30s
 
-  # Also serve the bundled web dashboard on this address. Omitted means no
-  # dashboard.
-  # http_bind: 127.0.0.1:8081
-
   # Cache remote (S3 / GCS) reads on local disk. The whole section is optional; `dir`
   # is required once it is present, and the contents survive a restart.
   # disk_cache:

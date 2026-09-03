@@ -274,8 +274,8 @@ pub trait ObjectStore: Debug + Send + Sync {
 
     /// A human-readable description of where this store is rooted - e.g.
     /// `file:///var/lib/pivot`, `s3://bucket/prefix`, or `gs://bucket/prefix`.
-    /// Purely for diagnostics and introspection (a dashboard showing whether a
-    /// table lives on local disk or object storage); never an addressable key.
+    /// Purely for diagnostics (saying whether a table lives on local disk or
+    /// object storage); never an addressable key.
     /// The default falls back to the backend's `Debug` form.
     fn describe(&self) -> String {
         format!("{self:?}")

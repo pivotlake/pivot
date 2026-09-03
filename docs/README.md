@@ -43,8 +43,7 @@ npm --prefix docs run build    # writes docs/dist/
 npm --prefix docs run preview  # serve the built bundle
 ```
 
-`dist/` is a plain static directory. It can be uploaded to any static host, or
-served by `pivot server` the same way `web/frontend/dist/` is embedded today.
+`dist/` is a plain static directory that can be uploaded to any static host.
 
 ## After changing `astro.config.mjs`
 

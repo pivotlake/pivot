@@ -19,7 +19,6 @@ Every server setting is optional.
 | Key | Default | Description |
 | --- | --- | --- |
 | `server.bind` | `127.0.0.1:5432` | Address for the Postgres wire endpoint. |
-| `server.http_bind` | Disabled | Address for the bundled web dashboard and HTTP API. |
 | `server.memory` | 80% of total memory | Buffer-pool budget. Overrides `PIVOT_MEMORY_PCT`. |
 | `server.workers` | Machine core count | Dispatch worker threads. |
 | `server.refresh_interval` | `30s` | How often in-memory catalogs refresh commits made by other processes. |
