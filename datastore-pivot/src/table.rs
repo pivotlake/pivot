@@ -669,21 +669,25 @@ impl CatalogTable {
 
     /// The Parquet data objects physically present under the table location,
     /// each with its storage modification time (Unix ms) — what vacuum's orphan
-    /// sweep lists to find files that no log action references. Data files are
-    /// flat under the location (partition values live in the log, not the path),
-    /// so a one-level listing is complete; non-`.parquet` objects (the
-    /// `_delta_log`) are excluded. Paths are relative to the location, matching
+    /// sweep lists to find files that no log action references. Streamed as
+    /// the store lists them, so the sweep deletes while later pages are still
+    /// being fetched; an error ends the stream. Data files are flat under the
+    /// location (partition values live in the log, not the path), so a
+    /// one-level listing is complete; non-`.parquet` objects (the `_delta_log`)
+    /// are excluded. Paths are relative to the location, matching
     /// [`file_refs`](Self::file_refs) and what [`delete_data_file`](Self::delete_data_file)
     /// expects.
-    pub fn list_data_files(&self) -> crate::Result<Vec<(ObjectPath, u64)>> {
-        Ok(self
-            .store
-            .list(&self.location)?
-            .objects
-            .into_iter()
-            .filter(|object| object.file.path.as_str().ends_with(".parquet"))
-            .map(|object| (object.file.path, object.modified_unix_ms))
-            .collect())
+    pub fn list_data_files(&self) -> impl Iterator<Item = crate::Result<(ObjectPath, u64)>> + '_ {
+        self.store
+            .list(&self.location)
+            .objects()
+            .filter_map(|object| match object {
+                Ok(object) if object.file.path.as_str().ends_with(".parquet") => {
+                    Some(Ok((object.file.path, object.modified_unix_ms)))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error.into())),
+            })
     }
 
     /// The Delta version this copy is at, read off the snapshot it holds.

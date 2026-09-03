@@ -129,7 +129,7 @@ impl Vacuumer {
     /// mtime is older than the deletion window (the table's
     /// `deletedFileRetentionDuration`).
     /// Finally delete the superseded commit JSONs past the log-retention window.
-    /// Errors are logged and end the round; the next poll retries.
+    /// Errors are logged and end the step they hit; the next poll retries.
     fn vacuum_table(&self, name: &SchemaQualifiedTableName, mut table: CatalogTable, now_ms: u64) {
         if let Err(e) = table.refresh() {
             warn!(table = %name, error = %e, "vacuum: table refresh failed");
@@ -143,15 +143,15 @@ impl Vacuumer {
         // ever adopted -- and therefore a deletion candidate.
         let live: HashSet<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
 
-        let files = match table.list_data_files() {
-            Ok(files) => files,
-            Err(e) => {
-                warn!(table = %name, error = %e, "vacuum: listing data files failed");
-                return;
-            }
-        };
         let mut deleted = 0u64;
-        for (path, modified_ms) in files {
+        for listed in table.list_data_files() {
+            let (path, modified_ms) = match listed {
+                Ok(listed) => listed,
+                Err(e) => {
+                    warn!(table = %name, error = %e, "vacuum: listing data files failed");
+                    break;
+                }
+            };
             // Keep a live file. Keep any unreferenced file still within the
             // window: it may be an upload a writer has not committed yet, or a
             // just-superseded file a reader on the prior snapshot still needs.

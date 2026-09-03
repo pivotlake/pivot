@@ -26,7 +26,7 @@
 //! the same object name.
 
 use super::{
-    DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
+    DataFileLocation, FileRef, ListEntry, ListPage, ListedObject, Listing, ObjectPath, ObjectStore,
     ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, object_key,
     parse_iso8601_millis, percent_encode,
 };
@@ -394,11 +394,7 @@ impl ObjectStore for GcsStore {
     /// Objects directly under `prefix`, one level deep. The narrowing
     /// `name_prefix` goes into the request's `prefix` parameter, so the
     /// service never returns (or pages through) children outside it.
-    fn list_with_name_prefix(
-        &self,
-        prefix: &ObjectPath,
-        name_prefix: &str,
-    ) -> Result<DirectoryListing> {
+    fn list_with_name_prefix<'a>(&'a self, prefix: &ObjectPath, name_prefix: &str) -> Listing<'a> {
         let object_prefix = object_key(&self.prefix, prefix);
         let encoded_prefix = if object_prefix.is_empty() {
             percent_encode(name_prefix)
@@ -413,64 +409,9 @@ impl ObjectStore for GcsStore {
             "{}/storage/v1/b/{}/o?prefix={encoded_prefix}&delimiter=%2F",
             self.endpoint, self.bucket
         );
-        let mut page_token: Option<String> = None;
-        let mut objects = Vec::new();
-        let mut prefixes = Vec::new();
-        loop {
-            let url = match &page_token {
-                Some(token) => format!("{base_url}&pageToken={}", percent_encode(token)),
-                None => base_url.clone(),
-            };
-            let header = self.auth.header()?;
-            let response = self
-                .auth
-                .agent
-                .get(&url)
-                .set("Authorization", &header)
-                .call()
-                .map_err(|error| StoreError::Http(format!("GCS LIST {object_prefix}: {error}")))?;
-            let body: ListResponse = response
-                .into_json()
-                .map_err(|error| StoreError::Http(format!("GCS LIST parse: {error}")))?;
-
-            prefixes.extend(body.prefixes.into_iter().filter_map(|prefix| {
-                let relative = super::relative_key(&object_prefix, &prefix);
-                let relative = relative.trim_end_matches('/');
-                (!relative.is_empty()).then(|| ObjectPath::new(relative))
-            }));
-            objects.extend(
-                body.items
-                    .into_iter()
-                    .map(|item| {
-                        let size = item.size.parse().map_err(|_| {
-                            StoreError::Http(format!(
-                                "GCS LIST: bad size `{}` for {}",
-                                item.size, item.name
-                            ))
-                        })?;
-                        let modified_unix_ms =
-                            parse_iso8601_millis(&item.updated).ok_or_else(|| {
-                                StoreError::Http(format!(
-                                    "GCS LIST object `{}` has an unparseable updated `{}`",
-                                    item.name, item.updated
-                                ))
-                            })?;
-                        Ok(ListedObject {
-                            file: FileRef {
-                                path: ObjectPath::new(super::key_name(&item.name)),
-                                size,
-                            },
-                            modified_unix_ms,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            );
-            page_token = body.next_page_token;
-            if page_token.is_none() {
-                break;
-            }
-        }
-        Ok(DirectoryListing { objects, prefixes })
+        super::paged_listing(move |page_token| {
+            self.fetch_list_page(&object_prefix, &base_url, page_token)
+        })
     }
 
     fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
@@ -492,6 +433,66 @@ impl ObjectStore for GcsStore {
 }
 
 impl GcsStore {
+    /// One page of the one-level listing under `object_prefix`, requested
+    /// through `base_url` (which already carries the prefix and delimiter),
+    /// continuing from `page_token` when there was a previous page.
+    fn fetch_list_page(
+        &self,
+        object_prefix: &str,
+        base_url: &str,
+        page_token: Option<&str>,
+    ) -> Result<ListPage> {
+        let url = match page_token {
+            Some(token) => format!("{base_url}&pageToken={}", percent_encode(token)),
+            None => base_url.to_string(),
+        };
+        let header = self.auth.header()?;
+        let response = self
+            .auth
+            .agent
+            .get(&url)
+            .set("Authorization", &header)
+            .call()
+            .map_err(|error| StoreError::Http(format!("GCS LIST {object_prefix}: {error}")))?;
+        let body: ListResponse = response
+            .into_json()
+            .map_err(|error| StoreError::Http(format!("GCS LIST parse: {error}")))?;
+
+        let mut entries = Vec::with_capacity(body.items.len() + body.prefixes.len());
+        for item in body.items {
+            let size = item.size.parse().map_err(|_| {
+                StoreError::Http(format!(
+                    "GCS LIST: bad size `{}` for {}",
+                    item.size, item.name
+                ))
+            })?;
+            let modified_unix_ms = parse_iso8601_millis(&item.updated).ok_or_else(|| {
+                StoreError::Http(format!(
+                    "GCS LIST object `{}` has an unparseable updated `{}`",
+                    item.name, item.updated
+                ))
+            })?;
+            entries.push(ListEntry::Object(ListedObject {
+                file: FileRef {
+                    path: ObjectPath::new(super::key_name(&item.name)),
+                    size,
+                },
+                modified_unix_ms,
+            }));
+        }
+        for prefix in body.prefixes {
+            let relative = super::relative_key(object_prefix, &prefix);
+            let relative = relative.trim_end_matches('/');
+            if !relative.is_empty() {
+                entries.push(ListEntry::Prefix(ObjectPath::new(relative)));
+            }
+        }
+        Ok(ListPage {
+            entries,
+            next_token: body.next_page_token,
+        })
+    }
+
     /// GET an object's media, returning its bytes and the `x-goog-generation`
     /// header when the service sent one; `None` if the object does not exist.
     fn fetch(&self, key: &ObjectPath) -> Result<Option<(Vec<u8>, Option<String>)>> {

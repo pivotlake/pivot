@@ -309,9 +309,10 @@ impl ParquetLocationPattern {
             let mut matched = Vec::new();
             for directory in directories {
                 for prefix in store
-                    .list_with_name_prefix(&directory, literal_prefix(segment))?
-                    .prefixes
+                    .list_with_name_prefix(&directory, literal_prefix(segment))
+                    .prefixes()
                 {
+                    let prefix = prefix?;
                     if wildcard_segment_matches(segment, prefix.as_str()) {
                         matched.push(directory.join(prefix.as_str()));
                     }
@@ -323,9 +324,10 @@ impl ParquetLocationPattern {
         let mut files = Vec::new();
         for directory in directories {
             for object in store
-                .list_with_name_prefix(&directory, literal_prefix(filename_pattern))?
-                .objects
+                .list_with_name_prefix(&directory, literal_prefix(filename_pattern))
+                .objects()
             {
+                let object = object?;
                 if !wildcard_segment_matches(filename_pattern, object.file.path.as_str()) {
                     continue;
                 }
