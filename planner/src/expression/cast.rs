@@ -12,10 +12,12 @@
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use crate::types::{Type, physical_arrow_type};
+use crate::types::{Type, UTC_TIMEZONE, physical_arrow_type};
 use arrow_array::builder::StringViewBuilder;
+use arrow_array::cast::AsArray;
+use arrow_array::types::TimestampMicrosecondType;
 use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, StructArray};
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::{ArrowError, DataType, TimeUnit};
 use parquet_variant_compute::{
     GetOptions, VariantArray, json_to_variant, unshred_variant, variant_get,
 };
@@ -57,6 +59,14 @@ impl Cast {
         if matches!(self.source.result_type(), Ok(Type::Variant)) {
             return self.compile_variant_to_json();
         }
+        // Between TIMESTAMP and TIMESTAMPTZ no real cast is needed: the session
+        // zone is UTC, so a TIMESTAMP's wall-clock value already is the UTC
+        // instant a TIMESTAMPTZ holds, and only the zone tag changes. This
+        // shortcut exists to skip arrow's cast kernel, which would still run its
+        // per-row zone conversion for UTC.
+        if self.is_timestamp_retag() {
+            return self.compile_timestamp_retag();
+        }
 
         let target = self.target_arrow.clone();
         // Cast strictly: a value the target type cannot represent must fail
@@ -83,6 +93,50 @@ impl Cast {
                     ExprResult::Scalar(Scalar::new(out))
                 } else {
                     ExprResult::Array(out)
+                }
+            }) as ExprEvalFn
+        }))
+    }
+
+    /// Whether this cast is between TIMESTAMP and TIMESTAMPTZ in either
+    /// direction.
+    fn is_timestamp_retag(&self) -> bool {
+        matches!(
+            (self.source.result_type(), &self.target),
+            (Ok(Type::Timestamp), Type::TimestampTz) | (Ok(Type::TimestampTz), Type::Timestamp)
+        )
+    }
+
+    fn compile_timestamp_retag(&self) -> Result<ExprFn, compile::Error> {
+        let zone = match &self.target_arrow {
+            DataType::Timestamp(TimeUnit::Microsecond, zone) => zone.clone(),
+            other => unreachable!("a timestamp retag targets a timestamp, not {other}"),
+        };
+        // The retag is only sound while every zone in play is UTC; any other
+        // zone would need the real conversion.
+        if let Some(zone) = &zone {
+            assert_eq!(
+                zone.as_ref(),
+                UTC_TIMEZONE,
+                "a zone cast is a retag only under UTC"
+            );
+        }
+        let source_builder = self.source.compile()?;
+        Ok(Box::new(move || {
+            let mut source_expr = source_builder();
+            let zone = zone.clone();
+            Box::new(move |batch: &RecordBatch| {
+                let src = source_expr(batch);
+                let (arr, is_scalar) = src.as_datum().get();
+                let retagged: ArrayRef = Arc::new(
+                    arr.as_primitive::<TimestampMicrosecondType>()
+                        .clone()
+                        .with_timezone_opt(zone.clone()),
+                );
+                if is_scalar {
+                    ExprResult::Scalar(Scalar::new(retagged))
+                } else {
+                    ExprResult::Array(retagged)
                 }
             }) as ExprEvalFn
         }))
@@ -238,7 +292,10 @@ pub fn json_to_canonical_variant(text: &ArrayRef) -> Result<ArrayRef, ArrowError
 mod tests {
     use crate::test_support::*;
     use crate::types::Type;
-    use arrow_array::{ArrayRef, StringArray};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::TimestampMicrosecondType;
+    use arrow_array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
+    use arrow_schema::{DataType, TimeUnit};
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -294,5 +351,39 @@ mod tests {
             err.to_string().contains("TRY_CAST is not supported"),
             "got: {err}"
         );
+    }
+
+    /// A cast between TIMESTAMP and TIMESTAMPTZ only changes the zone tag:
+    /// every microsecond value, including nulls, comes through unchanged.
+    #[rstest]
+    #[case(Type::Timestamp, "TIMESTAMPTZ", Some("UTC"))]
+    #[case(Type::TimestampTz, "TIMESTAMP", None)]
+    fn timestamp_zone_cast_only_changes_the_zone_tag(
+        mut testing_planner: TestingPlanner,
+        #[case] source: Type,
+        #[case] target: &str,
+        #[case] zone: Option<&str>,
+    ) {
+        let micros =
+            TimestampMicrosecondArray::from(vec![Some(1_700_000_000_000_000), None, Some(0)]);
+        let source_zone = matches!(source, Type::TimestampTz).then_some("UTC");
+        let column: ArrayRef = Arc::new(micros.clone().with_timezone_opt(source_zone));
+        testing_planner.add_table("events", &[("ts", source, column)]);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            &format!("SELECT CAST(ts AS {target}) FROM events"),
+        );
+
+        let out = batches[0].column(0);
+        assert_eq!(
+            out.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, zone.map(Into::into))
+        );
+        assert_eq!(
+            out.as_primitive::<TimestampMicrosecondType>().values(),
+            micros.values()
+        );
+        assert_eq!(out.null_count(), 1);
     }
 }
