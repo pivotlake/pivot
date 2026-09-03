@@ -783,30 +783,40 @@ impl PivotDatastore {
     }
 
     /// Delete every object under a dropped table's own storage directory: its
-    /// data files and its `_delta_log`. Only objects *listed under that
-    /// directory* are deleted, so a file the table adopted from elsewhere
-    /// (`with_pre_existing_parquets`) is never touched: it lives outside the
-    /// location and no listing here returns it.
+    /// data files, its `_delta_log`, and anything nested deeper. Only objects
+    /// *listed under that directory* are deleted, so a file the table adopted
+    /// from elsewhere (`with_pre_existing_parquets`) is never touched: it lives
+    /// outside the location and no listing here returns it.
     fn delete_table_storage(&self, location: &ObjectPath) -> Result<()> {
         assert!(
             !location.is_empty(),
             "a table's location is its own directory, never the database root"
         );
-        let log_dir = location.join("_delta_log");
-        for directory in [location, &log_dir] {
-            for object in self.store.list(directory)?.objects {
+        // A listing is one level deep, so walk the subtree: delete each
+        // directory's objects and queue its child prefixes. An object store
+        // has no directories, so anything the walk skipped would be leaked
+        // silently while the caller drops the tombstone; visiting every
+        // prefix is what makes the reported success true.
+        let mut visited = vec![location.clone()];
+        let mut pending = vec![location.clone()];
+        while let Some(directory) = pending.pop() {
+            let listing = self.store.list(&directory)?;
+            for object in listing.objects {
                 self.store
                     .delete(&directory.join(object.file.path.as_str()))?;
             }
+            for prefix in listing.prefixes {
+                let child = directory.join(prefix.as_str());
+                visited.push(child.clone());
+                pending.push(child);
+            }
         }
         // A local filesystem keeps directories as real entries even once every
-        // object in them is deleted, so remove the emptied ones; object stores
-        // have no directories to remove. A directory that turns out non-empty
-        // (unexpected nested content the one-level listings above never
-        // returned) fails here, keeping the tombstone for investigation rather
-        // than silently leaving unreclaimed storage behind.
+        // object in them is deleted, so remove the emptied ones, each after
+        // everything under it: a directory is visited before its children, so
+        // the reverse visit order is deepest first.
         if let Some(root) = self.store.local_root() {
-            for directory in [&log_dir, location] {
+            for directory in visited.iter().rev() {
                 match std::fs::remove_dir(root.join(directory.as_str())) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

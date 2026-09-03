@@ -9,8 +9,9 @@
 //!
 //! Covered: store contract (round-trip through `source` and `sink`, one-level
 //! `list`, lost-update-free `update`), and the table lifecycle end to end — `CREATE TABLE`,
-//! reopen, **appending a file** (out-of-band registration), and **compaction**
-//! (replacing files) — all over object storage.
+//! reopen, **appending a file** (out-of-band registration), **compaction**
+//! (replacing files), and **reclaiming a dropped table** — all over object
+//! storage.
 
 mod common;
 
@@ -33,7 +34,7 @@ use dispatch::Projection;
 use harness::Backend;
 use object_storage::ObjectPath;
 use parquet_engine::table_input;
-use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
+use planner::catalog::{Column, CreateTableRequest, DropTableRequest, SchemaQualifiedTableName};
 use planner::types::Type;
 
 // --- helpers (not tests) ---------------------------------------------------
@@ -113,6 +114,36 @@ fn scan(d: &DispatchGuard, datastore: &PivotDatastore, name: &str) -> Vec<i64> {
 
 fn row_groups(datastore: &PivotDatastore, name: &str) -> usize {
     current_parquet(datastore, name).row_groups().len()
+}
+
+/// The table's own storage directory, relative to the store root.
+fn table_location(datastore: &PivotDatastore, name: &str) -> ObjectPath {
+    ObjectPath::new(
+        datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
+            .expect("table exists")
+            .location(),
+    )
+}
+
+/// `DROP TABLE <name>`, the way the server runs it: execute the staging
+/// dataflow, then commit the transaction that unregisters the table.
+fn drop_table(d: &DispatchGuard, datastore: &Arc<PivotDatastore>, name: &str) {
+    let transaction = datastore.clone().begin_transaction();
+    transaction
+        .bind_drop_table(DropTableRequest {
+            datastore_name: None,
+            schema_name: None,
+            name: name.to_string(),
+            if_exists: false,
+        })
+        .unwrap()
+        .compile(d)
+        .unwrap()
+        .execute()
+        .collect()
+        .unwrap();
+    commit_datastore_transaction(transaction).unwrap();
 }
 
 // --- behaviours (run on every backend) -------------------------------------
@@ -339,6 +370,36 @@ mod bodies {
         assert_eq!(names, vec!["part-1.bin".to_string()]);
         assert_eq!(prefixes, vec!["part-sub".to_string()]);
     }
+
+    /// Reclaiming a dropped table deletes everything under its location, an
+    /// object nested below the one-level listings included, and forgets the
+    /// tombstone only then.
+    pub fn reclaim_deletes_a_dropped_tables_nested_objects(b: &Backend) {
+        let d = dispatch_with_buffers(2, 32);
+        let datastore = create_events(&d, b, &[("a.parquet", &[1])]);
+        let location = table_location(&datastore, "events");
+        drop_table(&d, &datastore, "events");
+        b.store
+            .put(
+                &location.join("_delta_log/stray/00000000000000000001.json"),
+                b"{}",
+            )
+            .unwrap();
+
+        let reclaimed = datastore.reclaim_dropped_tables(u64::MAX).unwrap();
+
+        assert_eq!(reclaimed, 1);
+        let listing = b.store.list(&location).unwrap();
+        assert!(
+            listing.objects.is_empty() && listing.prefixes.is_empty(),
+            "nothing is left under the table's location: {listing:?}"
+        );
+        assert_eq!(
+            datastore.reclaim_dropped_tables(u64::MAX).unwrap(),
+            0,
+            "the tombstone is forgotten once the storage is gone"
+        );
+    }
 }
 
 // --- backend matrix --------------------------------------------------------
@@ -380,3 +441,4 @@ backend_tests!(sink_writes_object_back);
 backend_tests!(update_never_loses_a_write);
 backend_tests!(list_returns_objects_and_child_prefixes);
 backend_tests!(list_narrows_to_a_name_prefix);
+backend_tests!(reclaim_deletes_a_dropped_tables_nested_objects);
