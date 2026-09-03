@@ -2,7 +2,7 @@
 //! directory.
 
 use super::{
-    DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore, Result,
+    DataFileLocation, FileRef, ListEntry, ListedObject, Listing, ObjectPath, ObjectStore, Result,
     StoreConnection, StoreError,
 };
 use std::path::{Path, PathBuf};
@@ -147,70 +147,24 @@ impl ObjectStore for LocalStore {
         }
     }
 
-    fn list_with_name_prefix(
-        &self,
-        prefix: &ObjectPath,
-        name_prefix: &str,
-    ) -> Result<DirectoryListing> {
-        let dir = self.path_for(prefix);
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
+    fn list_with_name_prefix<'a>(&'a self, prefix: &ObjectPath, name_prefix: &str) -> Listing<'a> {
+        let entries = match std::fs::read_dir(self.path_for(prefix)) {
+            Ok(entries) => entries,
             // A not-yet-created directory lists as empty, not an error.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(DirectoryListing::default());
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Listing::empty(),
             Err(source) => {
-                return Err(StoreError::Io {
+                return Listing::failed(StoreError::Io {
                     key: prefix.to_string(),
                     source,
                 });
             }
         };
-        let mut objects = Vec::new();
-        let mut prefixes = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| StoreError::Io {
-                key: prefix.to_string(),
-                source,
-            })?;
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if !name.starts_with(name_prefix) {
-                continue;
-            }
-            let file_type = entry.file_type().map_err(|source| StoreError::Io {
-                key: prefix.join(&name).to_string(),
-                source,
-            })?;
-            if file_type.is_dir() {
-                prefixes.push(ObjectPath::new(name));
-                continue;
-            }
-            let meta = entry.metadata().map_err(|source| StoreError::Io {
-                key: prefix.to_string(),
-                source,
-            })?;
-            if !meta.is_file() {
-                continue;
-            }
-            let modified = meta.modified().map_err(|source| StoreError::Io {
-                key: prefix.to_string(),
-                source,
-            })?;
-            let modified_unix_ms = modified
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            objects.push(ListedObject {
-                file: FileRef {
-                    path: ObjectPath::new(name),
-                    size: meta.len(),
-                },
-                modified_unix_ms,
-            });
-        }
-        Ok(DirectoryListing { objects, prefixes })
+        let prefix = prefix.clone();
+        let name_prefix = name_prefix.to_string();
+        Listing::new(
+            entries
+                .filter_map(move |entry| read_list_entry(&prefix, &name_prefix, entry).transpose()),
+        )
     }
 
     fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
@@ -230,6 +184,52 @@ impl ObjectStore for LocalStore {
     fn sink(&self, key: &ObjectPath) -> Result<DataFileLocation> {
         Ok(DataFileLocation::Local(self.path_for(key)))
     }
+}
+
+fn read_list_entry(
+    prefix: &ObjectPath,
+    name_prefix: &str,
+    entry: std::io::Result<std::fs::DirEntry>,
+) -> Result<Option<ListEntry>> {
+    let entry = entry.map_err(|source| StoreError::Io {
+        key: prefix.to_string(),
+        source,
+    })?;
+    let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+        return Ok(None);
+    };
+    if !name.starts_with(name_prefix) {
+        return Ok(None);
+    }
+    let file_type = entry.file_type().map_err(|source| StoreError::Io {
+        key: prefix.join(&name).to_string(),
+        source,
+    })?;
+    if file_type.is_dir() {
+        return Ok(Some(ListEntry::Prefix(ObjectPath::new(name))));
+    }
+    let metadata = entry.metadata().map_err(|source| StoreError::Io {
+        key: prefix.to_string(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let modified = metadata.modified().map_err(|source| StoreError::Io {
+        key: prefix.to_string(),
+        source,
+    })?;
+    let modified_unix_ms = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(Some(ListEntry::Object(ListedObject {
+        file: FileRef {
+            path: ObjectPath::new(name),
+            size: metadata.len(),
+        },
+        modified_unix_ms,
+    })))
 }
 
 #[cfg(test)]
@@ -296,9 +296,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::new(dir.path()).unwrap();
         assert!(store.get(&p("nope")).unwrap().is_none());
-        assert_eq!(
-            store.list(&p("_missing")).unwrap(),
-            DirectoryListing::default()
-        );
+
+        assert_eq!(store.list(&p("_missing")).count(), 0);
+    }
+
+    #[test]
+    fn list_continues_while_returned_objects_are_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path()).unwrap();
+        for i in 0..64 {
+            store.put(&p(&format!("d/{i}.bin")), b"v").unwrap();
+        }
+
+        let mut deleted = 0;
+        for object in store.list(&p("d")).objects() {
+            store
+                .delete(&p("d").join(object.unwrap().file.path.as_str()))
+                .unwrap();
+            deleted += 1;
+        }
+
+        assert_eq!(deleted, 64);
+        assert_eq!(store.list(&p("d")).count(), 0);
     }
 }

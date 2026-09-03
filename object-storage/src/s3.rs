@@ -14,7 +14,7 @@
 //! without resolving credentials again.
 
 use super::{
-    DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
+    DataFileLocation, FileRef, ListEntry, ListPage, ListedObject, Listing, ObjectPath, ObjectStore,
     ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, object_key,
     parse_iso8601_millis, percent_encode,
 };
@@ -249,11 +249,7 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn list_with_name_prefix(
-        &self,
-        prefix: &ObjectPath,
-        name_prefix: &str,
-    ) -> Result<DirectoryListing> {
+    fn list_with_name_prefix<'a>(&'a self, prefix: &ObjectPath, name_prefix: &str) -> Listing<'a> {
         let object_prefix = object_key(&self.prefix, prefix);
         let encoded_prefix = if object_prefix.is_empty() {
             percent_encode(name_prefix)
@@ -264,64 +260,9 @@ impl ObjectStore for S3Store {
                 percent_encode(name_prefix)
             )
         };
-        let mut continuation: Option<String> = None;
-        let mut objects = Vec::new();
-        let mut prefixes = Vec::new();
-        loop {
-            let mut query = format!("list-type=2&prefix={encoded_prefix}&delimiter=%2F");
-            if let Some(token) = &continuation {
-                query.push_str("&continuation-token=");
-                query.push_str(&percent_encode(token));
-            }
-            let url = format!("{}/?{}", self.base, query);
-            let signed = self.sign("GET", &url, &[], &[])?;
-            let req = Self::apply(self.agent.get(&url), &signed);
-            let body = match req.call() {
-                Ok(response) => response
-                    .into_string()
-                    .map_err(|error| StoreError::Http(format!("LIST body: {error}")))?,
-                Err(error) => {
-                    return Err(StoreError::Http(format!("LIST {object_prefix}: {error}")));
-                }
-            };
-            let parsed: ListBucketResult = quick_xml::de::from_str(&body)
-                .map_err(|error| StoreError::Http(format!("LIST parse: {error}")))?;
-
-            objects.extend(
-                parsed
-                    .contents
-                    .into_iter()
-                    .map(|contents| {
-                        let modified_unix_ms = parse_iso8601_millis(&contents.last_modified)
-                            .ok_or_else(|| {
-                                StoreError::Http(format!(
-                                    "LIST object `{}` has an unparseable LastModified `{}`",
-                                    contents.key, contents.last_modified
-                                ))
-                            })?;
-                        Ok(ListedObject {
-                            file: FileRef {
-                                path: ObjectPath::new(super::key_name(&contents.key)),
-                                size: contents.size,
-                            },
-                            modified_unix_ms,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            );
-            prefixes.extend(parsed.common_prefixes.into_iter().filter_map(|common| {
-                let relative = super::relative_key(&object_prefix, &common.prefix);
-                let relative = relative.trim_end_matches('/');
-                (!relative.is_empty()).then(|| ObjectPath::new(relative))
-            }));
-            if !parsed.is_truncated {
-                break;
-            }
-            continuation = Some(parsed.next_continuation_token.ok_or_else(|| {
-                StoreError::Http("LIST response is truncated without a continuation token".into())
-            })?);
-        }
-        Ok(DirectoryListing { objects, prefixes })
+        super::paged_listing(move |continuation| {
+            self.fetch_list_page(&object_prefix, &encoded_prefix, continuation)
+        })
     }
 
     fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
@@ -345,6 +286,68 @@ impl ObjectStore for S3Store {
 }
 
 impl S3Store {
+    fn fetch_list_page(
+        &self,
+        object_prefix: &str,
+        encoded_prefix: &str,
+        continuation: Option<&str>,
+    ) -> Result<ListPage> {
+        let mut query = format!("list-type=2&prefix={encoded_prefix}&delimiter=%2F");
+        if let Some(token) = continuation {
+            query.push_str("&continuation-token=");
+            query.push_str(&percent_encode(token));
+        }
+        let url = format!("{}/?{}", self.base, query);
+        let signed = self.sign("GET", &url, &[], &[])?;
+        let request = Self::apply(self.agent.get(&url), &signed);
+        let body = match request.call() {
+            Ok(response) => response
+                .into_string()
+                .map_err(|error| StoreError::Http(format!("LIST body: {error}")))?,
+            Err(error) => {
+                return Err(StoreError::Http(format!("LIST {object_prefix}: {error}")));
+            }
+        };
+        let parsed: ListBucketResult = quick_xml::de::from_str(&body)
+            .map_err(|error| StoreError::Http(format!("LIST parse: {error}")))?;
+
+        let mut entries = Vec::with_capacity(parsed.contents.len() + parsed.common_prefixes.len());
+        for contents in parsed.contents {
+            let modified_unix_ms =
+                parse_iso8601_millis(&contents.last_modified).ok_or_else(|| {
+                    StoreError::Http(format!(
+                        "LIST object `{}` has an unparseable LastModified `{}`",
+                        contents.key, contents.last_modified
+                    ))
+                })?;
+            entries.push(ListEntry::Object(ListedObject {
+                file: FileRef {
+                    path: ObjectPath::new(super::key_name(&contents.key)),
+                    size: contents.size,
+                },
+                modified_unix_ms,
+            }));
+        }
+        for common_prefix in parsed.common_prefixes {
+            let relative = super::relative_key(object_prefix, &common_prefix.prefix);
+            let relative = relative.trim_end_matches('/');
+            if !relative.is_empty() {
+                entries.push(ListEntry::Prefix(ObjectPath::new(relative)));
+            }
+        }
+        let next_token = if parsed.is_truncated {
+            Some(parsed.next_continuation_token.ok_or_else(|| {
+                StoreError::Http("LIST response is truncated without a continuation token".into())
+            })?)
+        } else {
+            None
+        };
+        Ok(ListPage {
+            entries,
+            next_token,
+        })
+    }
+
     /// GET an object, returning its bytes and the `ETag` header when the
     /// service sent one; `None` if the object does not exist.
     fn fetch(&self, key: &ObjectPath) -> Result<Option<(Vec<u8>, Option<String>)>> {

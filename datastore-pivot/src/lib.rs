@@ -794,7 +794,8 @@ impl PivotDatastore {
         );
         let log_dir = location.join("_delta_log");
         for directory in [location, &log_dir] {
-            for object in self.store.list(directory)?.objects {
+            for object in self.store.list(directory).objects() {
+                let object = object?;
                 self.store
                     .delete(&directory.join(object.file.path.as_str()))?;
             }
@@ -1154,15 +1155,19 @@ impl PivotTransaction {
     /// each named relative to it. A missing directory yields no files. Used where
     /// the *listing* is the source of truth: `CREATE TABLE`.
     fn list_file_refs(&self, directory: &ObjectPath) -> Result<Vec<FileRef>> {
-        Ok(self
-            .datastore
+        self.datastore
             .store
-            .list(directory)?
-            .objects
-            .into_iter()
-            .map(|object| object.file)
-            .filter(|file| file.path.as_str().ends_with(".parquet"))
-            .collect())
+            .list(directory)
+            .objects()
+            .filter_map(|object| match object {
+                Ok(object) if object.file.path.as_str().ends_with(".parquet") => {
+                    Some(Ok(object.file))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<object_storage::Result<Vec<_>>>()
+            .map_err(Error::from)
     }
 }
 

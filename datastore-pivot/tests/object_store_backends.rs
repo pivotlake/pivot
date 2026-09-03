@@ -31,7 +31,7 @@ use common::{
 use datastore_pivot::PivotDatastore;
 use dispatch::Projection;
 use harness::Backend;
-use object_storage::ObjectPath;
+use object_storage::{ListEntry, Listing, ObjectPath};
 use parquet_engine::table_input;
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 use planner::types::Type;
@@ -113,6 +113,18 @@ fn scan(d: &DispatchGuard, datastore: &PivotDatastore, name: &str) -> Vec<i64> {
 
 fn row_groups(datastore: &PivotDatastore, name: &str) -> usize {
     current_parquet(datastore, name).row_groups().len()
+}
+
+fn names_and_prefixes(listing: Listing<'_>) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut prefixes = Vec::new();
+    for entry in listing {
+        match entry.unwrap() {
+            ListEntry::Object(object) => names.push(object.file.path.to_string()),
+            ListEntry::Prefix(prefix) => prefixes.push(prefix.to_string()),
+        }
+    }
+    (names, prefixes)
 }
 
 // --- behaviours (run on every backend) -------------------------------------
@@ -293,20 +305,31 @@ mod bodies {
             .put(&ObjectPath::new("d/sub/deep/z.bin"), b"pq")
             .unwrap();
 
-        let listing = b.store.list(&ObjectPath::new("d")).unwrap();
-        let names: Vec<String> = listing
-            .objects
-            .into_iter()
-            .map(|o| o.file.path.as_str().to_string())
-            .collect();
-        let prefixes: Vec<String> = listing
-            .prefixes
-            .into_iter()
-            .map(|prefix| prefix.to_string())
-            .collect();
+        let (names, prefixes) = names_and_prefixes(b.store.list(&ObjectPath::new("d")));
 
         assert_eq!(names, vec!["x.bin".to_string()]);
         assert_eq!(prefixes, vec!["sub".to_string()]);
+    }
+
+    /// A listing remains usable while its caller deletes each yielded object.
+    pub fn list_survives_deleting_as_it_goes(b: &Backend) {
+        let directory = ObjectPath::new("delete-as-listed");
+        for i in 0..64 {
+            b.store
+                .put(&directory.join(&format!("{i}.bin")), b"value")
+                .unwrap();
+        }
+
+        let mut deleted = 0;
+        for object in b.store.list(&directory).objects() {
+            b.store
+                .delete(&directory.join(object.unwrap().file.path.as_str()))
+                .unwrap();
+            deleted += 1;
+        }
+
+        assert_eq!(deleted, 64);
+        assert_eq!(b.store.list(&directory).count(), 0);
     }
 
     /// A name prefix narrows a listing to children whose own name starts with
@@ -321,21 +344,11 @@ mod bodies {
             .put(&ObjectPath::new("n/misc-sub/y.bin"), b"d")
             .unwrap();
 
-        let listing = b
-            .store
-            .list_with_name_prefix(&ObjectPath::new("n"), "part-")
-            .unwrap();
+        let (names, prefixes) = names_and_prefixes(
+            b.store
+                .list_with_name_prefix(&ObjectPath::new("n"), "part-"),
+        );
 
-        let names: Vec<String> = listing
-            .objects
-            .into_iter()
-            .map(|o| o.file.path.as_str().to_string())
-            .collect();
-        let prefixes: Vec<String> = listing
-            .prefixes
-            .into_iter()
-            .map(|prefix| prefix.to_string())
-            .collect();
         assert_eq!(names, vec!["part-1.bin".to_string()]);
         assert_eq!(prefixes, vec!["part-sub".to_string()]);
     }
@@ -379,4 +392,5 @@ backend_tests!(source_reads_object_back);
 backend_tests!(sink_writes_object_back);
 backend_tests!(update_never_loses_a_write);
 backend_tests!(list_returns_objects_and_child_prefixes);
+backend_tests!(list_survives_deleting_as_it_goes);
 backend_tests!(list_narrows_to_a_name_prefix);

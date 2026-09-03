@@ -143,15 +143,15 @@ impl Vacuumer {
         // ever adopted -- and therefore a deletion candidate.
         let live: HashSet<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
 
-        let files = match table.list_data_files() {
-            Ok(files) => files,
-            Err(e) => {
-                warn!(table = %name, error = %e, "vacuum: listing data files failed");
-                return;
-            }
-        };
         let mut deleted = 0u64;
-        for (path, modified_ms) in files {
+        for file in table.list_data_files() {
+            let (path, modified_ms) = match file {
+                Ok(file) => file,
+                Err(error) => {
+                    warn!(table = %name, error = %error, "vacuum: listing data files failed");
+                    return;
+                }
+            };
             // Keep a live file. Keep any unreferenced file still within the
             // window: it may be an upload a writer has not committed yet, or a
             // just-superseded file a reader on the prior snapshot still needs.

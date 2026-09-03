@@ -76,13 +76,131 @@ pub struct ListedObject {
     pub modified_unix_ms: u64,
 }
 
-/// One level of an object-store namespace. `objects` are the files directly
-/// under the requested prefix; `prefixes` are its immediate child prefixes,
-/// each named relative to that same requested prefix.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DirectoryListing {
-    pub objects: Vec<ListedObject>,
-    pub prefixes: Vec<ObjectPath>,
+/// One entry in a one-level object-store listing. Objects and immediate child
+/// prefixes are both named relative to the prefix being listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListEntry {
+    Object(ListedObject),
+    Prefix(ObjectPath),
+}
+
+/// A lazy one-level object-store listing. Remote stores fetch each page only
+/// after every entry from the preceding page has been consumed. Errors are
+/// yielded in place because a later page can fail after earlier entries have
+/// already been processed.
+pub struct Listing<'a> {
+    entries: Box<dyn Iterator<Item = Result<ListEntry>> + Send + 'a>,
+    ended: bool,
+}
+
+impl<'a> Listing<'a> {
+    pub fn new(entries: impl Iterator<Item = Result<ListEntry>> + Send + 'a) -> Self {
+        Self {
+            entries: Box::new(entries),
+            ended: false,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(std::iter::empty())
+    }
+
+    pub fn failed(error: StoreError) -> Self {
+        Self::new(std::iter::once(Err(error)))
+    }
+
+    /// Yield only objects, ignoring child prefixes.
+    pub fn objects(self) -> impl Iterator<Item = Result<ListedObject>> + Send + 'a {
+        self.filter_map(|entry| match entry {
+            Ok(ListEntry::Object(object)) => Some(Ok(object)),
+            Ok(ListEntry::Prefix(_)) => None,
+            Err(error) => Some(Err(error)),
+        })
+    }
+
+    /// Yield only child prefixes, ignoring objects.
+    pub fn prefixes(self) -> impl Iterator<Item = Result<ObjectPath>> + Send + 'a {
+        self.filter_map(|entry| match entry {
+            Ok(ListEntry::Prefix(prefix)) => Some(Ok(prefix)),
+            Ok(ListEntry::Object(_)) => None,
+            Err(error) => Some(Err(error)),
+        })
+    }
+}
+
+impl Iterator for Listing<'_> {
+    type Item = Result<ListEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ended {
+            return None;
+        }
+        let entry = self.entries.next();
+        if !matches!(entry, Some(Ok(_))) {
+            self.ended = true;
+        }
+        entry
+    }
+}
+
+/// One page returned by a remote listing request.
+pub(crate) struct ListPage {
+    pub(crate) entries: Vec<ListEntry>,
+    pub(crate) next_token: Option<String>,
+}
+
+enum PageCursor {
+    Start,
+    Continue(String),
+    End,
+}
+
+/// Turn a page-fetching function into a lazy listing. The next page is fetched
+/// only when the current page has no entries left to yield.
+pub(crate) fn paged_listing<'a>(
+    fetch_page: impl FnMut(Option<&str>) -> Result<ListPage> + Send + 'a,
+) -> Listing<'a> {
+    Listing::new(PagedEntries {
+        fetch_page,
+        entries: Vec::new().into_iter(),
+        cursor: PageCursor::Start,
+    })
+}
+
+struct PagedEntries<F> {
+    fetch_page: F,
+    entries: std::vec::IntoIter<ListEntry>,
+    cursor: PageCursor,
+}
+
+impl<F: FnMut(Option<&str>) -> Result<ListPage>> Iterator for PagedEntries<F> {
+    type Item = Result<ListEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(entry) = self.entries.next() {
+                return Some(Ok(entry));
+            }
+            let token = match &self.cursor {
+                PageCursor::Start => None,
+                PageCursor::Continue(token) => Some(token.as_str()),
+                PageCursor::End => return None,
+            };
+            match (self.fetch_page)(token) {
+                Ok(page) => {
+                    self.entries = page.entries.into_iter();
+                    self.cursor = match page.next_token {
+                        Some(token) => PageCursor::Continue(token),
+                        None => PageCursor::End,
+                    };
+                }
+                Err(error) => {
+                    self.cursor = PageCursor::End;
+                    return Some(Err(error));
+                }
+            }
+        }
+    }
 }
 
 impl FileRef {
@@ -230,19 +348,16 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn delete(&self, key: &ObjectPath) -> Result<()>;
 
     /// List one level under `prefix`: direct objects and immediate child
-    /// prefixes, all named relative to `prefix`.
-    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing> {
+    /// prefixes, all named relative to `prefix`. Entries are yielded lazily as
+    /// the backend produces them. A missing prefix yields an empty listing.
+    fn list<'a>(&'a self, prefix: &ObjectPath) -> Listing<'a> {
         self.list_with_name_prefix(prefix, "")
     }
 
     /// [`list`](Self::list), narrowed to children whose own name starts with
     /// `name_prefix`. A remote backend pushes the narrowing into the request,
     /// so a narrow listing does not page through the whole directory.
-    fn list_with_name_prefix(
-        &self,
-        prefix: &ObjectPath,
-        name_prefix: &str,
-    ) -> Result<DirectoryListing>;
+    fn list_with_name_prefix<'a>(&'a self, prefix: &ObjectPath, name_prefix: &str) -> Listing<'a>;
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
     /// a filesystem path, a remote one a GET URL — either presigned or paired
@@ -605,6 +720,61 @@ mod tests {
 
         // The increment re-applied over the winner's "7", not over the stale "1".
         assert_eq!(stored.borrow().0, b"8");
+    }
+
+    #[test]
+    fn paged_listing_fetches_the_next_page_after_consuming_the_current_page() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pages_fetched = AtomicUsize::new(0);
+        let object = |name: &str| {
+            ListEntry::Object(ListedObject {
+                file: FileRef {
+                    path: ObjectPath::new(name),
+                    size: 1,
+                },
+                modified_unix_ms: 0,
+            })
+        };
+        let mut listing = paged_listing(|token| {
+            pages_fetched.fetch_add(1, Ordering::Relaxed);
+            Ok(match token {
+                None => ListPage {
+                    entries: vec![object("a"), object("b")],
+                    next_token: Some("page-2".to_string()),
+                },
+                Some("page-2") => ListPage {
+                    entries: vec![object("c")],
+                    next_token: None,
+                },
+                Some(other) => panic!("unexpected page token {other}"),
+            })
+        });
+
+        let first = listing.next().unwrap().unwrap();
+        let second = listing.next().unwrap().unwrap();
+        let pages_after_first_page = pages_fetched.load(Ordering::Relaxed);
+        let third = listing.next().unwrap().unwrap();
+        let end = listing.next();
+
+        assert_eq!(
+            [first, second, third],
+            [object("a"), object("b"), object("c")]
+        );
+        assert_eq!(pages_after_first_page, 1);
+        assert_eq!(pages_fetched.load(Ordering::Relaxed), 2);
+        assert!(end.is_none());
+    }
+
+    #[test]
+    fn a_page_error_ends_the_listing() {
+        let mut listing = paged_listing(|_| Err(StoreError::Http("boom".to_string())));
+
+        let error = listing.next();
+        let after_error = listing.next();
+
+        assert!(matches!(error, Some(Err(StoreError::Http(message))) if message == "boom"));
+        assert!(after_error.is_none());
     }
 
     #[test]
