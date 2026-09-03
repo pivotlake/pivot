@@ -506,12 +506,23 @@ impl OverlapCache {
             .clone()
     }
 
-    /// Keep only `live` files and the pairs between two of them.
+    /// Forget the files not in `live` and every pair containing one, at the
+    /// cost of the gone files' pairs rather than of every remembered pair.
     fn retain_live_files(&mut self, live: &HashSet<&str>) {
-        self.known_paths.retain(|path| live.contains(path.as_str()));
-        self.partners.retain(|path, _| live.contains(path.as_str()));
-        for partners in self.partners.values_mut() {
-            partners.retain(|path, _| live.contains(path.as_str()));
+        let gone: Vec<Arc<ObjectPath>> = self
+            .known_paths
+            .iter()
+            .filter(|path| !live.contains(path.as_str()))
+            .cloned()
+            .collect();
+        for path in gone {
+            self.known_paths.remove(&path);
+            let partners = self.partners.remove(&path).unwrap_or_default();
+            for partner in partners.keys() {
+                if let Some(partner_pairs) = self.partners.get_mut(partner) {
+                    partner_pairs.remove(&path);
+                }
+            }
         }
     }
 }
