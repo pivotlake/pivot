@@ -290,10 +290,13 @@ impl OverlapCache {
     ///
     /// Each partition is swept in order of minimum on the whole sort key,
     /// keeping the files whose maximum has not yet been passed; only those
-    /// can share a stretch of the key with the current file. A file seen
-    /// before is measured only against the new files still in reach, so a
-    /// pass measures only pairs with a new file, and the first observation
-    /// of a table measures its overlapping pairs rather than all pairs.
+    /// can share a stretch of the key with the current file. A new file is
+    /// measured against every file in reach, a file seen before only
+    /// against the new ones, so a pass measures only pairs with a new file,
+    /// and the first observation of a table measures its overlapping pairs
+    /// rather than all pairs. Reach is trimmed only when a new file comes
+    /// up: a file dropped there ends before every later file too, and a
+    /// known file measures so few pairs that a stale one costs nothing.
     pub(super) fn observe(&mut self, partitions: &[&[LayoutCandidate<'_>]], sort_by: &[String]) {
         let Some(leading_column) = sort_by.first() else {
             return;
@@ -318,15 +321,16 @@ impl OverlapCache {
                 .filter(|candidate| is_measurable(candidate, leading_column))
                 .collect();
             ordered.sort_unstable_by(|left, right| compare_minimums(left, right, sort_by));
-            // Files whose range the sweep has not passed.
-            let mut in_reach: Vec<&LayoutCandidate<'_>> = Vec::new();
+            // Files whose range the sweep has not passed, each flagged new.
+            let mut in_reach: Vec<(&LayoutCandidate<'_>, bool)> = Vec::new();
             for candidate in ordered {
                 let candidate_is_new = new_paths.contains(candidate.entry.file.path.as_str());
                 let candidate_path = self.interned(&candidate.entry.file.path);
-                in_reach.retain(|partner| !partner.ends_before(candidate, sort_by));
-                for partner in &in_reach {
-                    // A known file is measured only against new files.
-                    if !candidate_is_new && !new_paths.contains(partner.entry.file.path.as_str()) {
+                if candidate_is_new {
+                    in_reach.retain(|(partner, _)| !partner.ends_before(candidate, sort_by));
+                }
+                for (partner, partner_is_new) in &in_reach {
+                    if !candidate_is_new && !partner_is_new {
                         continue;
                     }
                     let Some(overlap) = measure_pair(partner, candidate, sort_by) else {
@@ -342,7 +346,7 @@ impl OverlapCache {
                         .or_default()
                         .insert(partner_path, overlap);
                 }
-                in_reach.push(candidate);
+                in_reach.push((candidate, candidate_is_new));
             }
         }
     }
