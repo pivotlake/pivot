@@ -103,9 +103,6 @@ impl Config {
 pub struct ServerConfig {
     /// TCP socket the PostgreSQL endpoint binds to.
     pub bind: SocketAddr,
-    /// Also serve the bundled web dashboard (data-flow graph, live compaction
-    /// stats, system metrics, SQL console) on this address. Omit to disable.
-    pub http_bind: Option<SocketAddr>,
     /// Memory budget for the buffer pool, such as `32g`. Defaults to a
     /// percentage of the machine's total memory.
     pub memory: Option<ByteSize>,
@@ -129,7 +126,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: DEFAULT_BIND,
-            http_bind: None,
             memory: None,
             workers: None,
             refresh_interval: Interval::from_duration(DEFAULT_REFRESH_INTERVAL),

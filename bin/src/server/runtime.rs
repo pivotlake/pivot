@@ -206,9 +206,6 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
         )?;
         let catalog = build_catalog(&options.config, &metastore, dispatch.dispatcher())?;
         let mut server = Server::new(server_config.bind, dispatch, catalog, metastore);
-        if let Some(address) = server_config.http_bind {
-            server = server.with_http_bind(address);
-        }
         if let Some(acceptor) = tls {
             server = server.with_tls(acceptor);
         }

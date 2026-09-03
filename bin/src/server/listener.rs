@@ -97,17 +97,13 @@ pub struct Server {
     bind: SocketAddr,
     worker_watchers: JoinSet<std::thread::Result<()>>,
     shutdown: Shutdown,
-    /// Transport-neutral statement executor shared by PostgreSQL and HTTP.
+    /// Statement executor every connection runs its queries through.
     query_executor: Arc<crate::execution::Executor>,
-    /// Every datastore, presented as one composite catalog. Query binding and
-    /// dashboard access start here. [`serve`](Self::serve) starts each datastore's
+    /// Every datastore, presented as one composite catalog. Query binding
+    /// starts here. [`serve`](Self::serve) starts each datastore's
     /// background maintenance when it begins serving and aborts it on shutdown,
     /// before the worker pool is torn down.
     catalog: Arc<PivotCatalog>,
-    /// Address for the optional bundled web dashboard (the `http` module).
-    /// `None` (the default) leaves it off; set it with
-    /// [`with_http_bind`](Self::with_http_bind).
-    http_bind: Option<SocketAddr>,
     /// The metastore consulted for every connection's current user and
     /// authentication method.
     metastore: Arc<dyn Metastore>,
@@ -132,8 +128,7 @@ impl Server {
         metastore: Arc<dyn Metastore>,
     ) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the query
-        // handler needs it to compile every plan, and the web console runs
-        // queries on the worker pool.
+        // handler needs it to compile every plan.
         let dispatcher = dispatch.dispatcher().clone();
         let (handles, shutdown) = dispatch.into_parts();
         let mut watchers = JoinSet::new();
@@ -150,17 +145,9 @@ impl Server {
             worker_watchers: watchers,
             query_executor,
             catalog,
-            http_bind: None,
             metastore,
             tls: None,
         }
-    }
-
-    /// Also serve the bundled web dashboard (served by the `http` module) on `addr`
-    /// while the server runs. Off by default.
-    pub fn with_http_bind(mut self, addr: SocketAddr) -> Self {
-        self.http_bind = Some(addr);
-        self
     }
 
     /// Offer `acceptor`'s certificate to connections that ask to encrypt
@@ -196,28 +183,6 @@ impl Server {
         // Start each datastore's background maintenance.
         self.catalog.start();
 
-        // Optionally serve the bundled web dashboard. It reads the executor's live
-        // state directly - the catalog and the dispatcher (for the in-process
-        // query console). Read-only except `/api/query`, so on shutdown we just
-        // abort the task.
-        let http_task = self.http_bind.map(|bind| {
-            // The dashboard has no authentication of its own, and `/api/query`
-            // runs arbitrary SQL. PostgreSQL users do not govern this endpoint.
-            warn!(
-                %bind,
-                "web dashboard is unauthenticated and runs SQL; users govern only the PostgreSQL endpoint"
-            );
-            let state = crate::server::http::IntrospectState::new(
-                self.catalog.clone(),
-                self.query_executor.clone(),
-            );
-            tokio::spawn(async move {
-                if let Err(e) = crate::server::http::serve(bind, state, std::future::pending()).await {
-                    error!(?e, "web dashboard server error");
-                }
-            })
-        });
-
         loop {
             tokio::select! {
                 // Prefer a clean shutdown over a worker exit if both fire on
@@ -225,9 +190,6 @@ impl Server {
                 biased;
                 _ = &mut shutdown => {
                     info!("shutdown signalled, stopping workers");
-                    if let Some(task) = &http_task {
-                        task.abort();
-                    }
                     // Stop each datastore's maintenance *before* tearing down the
                     // pool, so no refresh/compaction sweep races the workers'
                     // exit.
@@ -241,9 +203,6 @@ impl Server {
                     return Ok(());
                 }
                 Some(joined) = self.worker_watchers.join_next() => {
-                    if let Some(task) = &http_task {
-                        task.abort();
-                    }
                     self.catalog.abort();
                     self.shutdown.shutdown();
                     return Err(match joined {

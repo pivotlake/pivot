@@ -55,7 +55,6 @@ pub use manifest::{
 pub use object_storage::FileRef;
 pub use vacuum::{DEFAULT_VACUUM_POLL, VacuumConfig, Vacuumer};
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -911,13 +910,6 @@ impl PivotDatastore {
             .cloned()
     }
 
-    /// A human-readable description of where this database is rooted (local
-    /// directory or object-store bucket/prefix) - for introspection. BoundTable
-    /// locations are relative to this root.
-    pub fn store_description(&self) -> String {
-        self.store.describe()
-    }
-
     /// BoundTable `name`'s current committed files — refreshing to the latest version
     /// first, so a commit by INSERT/compaction (in this process or another) is
     /// reflected. `None` if no such table exists.
@@ -926,45 +918,6 @@ impl PivotDatastore {
         let _ = table.refresh();
         Some(table.file_refs())
     }
-
-    /// BoundTable `name`'s physical files as transport-neutral `(path, size)` pairs in
-    /// stable metadata (manifest) order, for introspection. `None` if no such
-    /// table exists. Refreshes to the latest committed version first. Sizes come
-    /// from the files' `FileRef`s, correlated by path (the two orderings differ,
-    /// so a map lookup rather than a zip).
-    pub fn table_data_files(
-        &self,
-        name: &SchemaQualifiedTableName,
-    ) -> Result<Option<Vec<DataFileInfo>>> {
-        let Some(mut table) = self.table_handle(name) else {
-            return Ok(None);
-        };
-        table.refresh()?;
-        let sizes: HashMap<String, u64> = table
-            .file_refs()
-            .into_iter()
-            .map(|file| (file.path.as_str().to_string(), file.size))
-            .collect();
-        let files = table
-            .file_partitions()
-            .into_iter()
-            .map(|(path, _)| {
-                let path = path.as_str().to_string();
-                let size = sizes.get(&path).copied().unwrap_or(0);
-                DataFileInfo { path, size }
-            })
-            .collect();
-        Ok(Some(files))
-    }
-}
-
-/// One physical data file exposed by datastore introspection: its stable path
-/// and byte size, transport-neutral so the HTTP layer needs no knowledge of the
-/// backing store.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DataFileInfo {
-    pub path: String,
-    pub size: u64,
 }
 
 impl PivotTransaction {
@@ -1342,10 +1295,6 @@ impl Datastore for PivotDatastore {
         for handle in self.maintenance_tasks.lock().unwrap().drain(..) {
             handle.abort();
         }
-    }
-
-    fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
     }
 }
 

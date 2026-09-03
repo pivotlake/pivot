@@ -147,12 +147,6 @@ impl PivotCatalog {
         &self.default_name
     }
 
-    /// Every datastore, name and handle: for reaching one by name and for
-    /// introspection.
-    pub fn iter_datastores(&self) -> impl Iterator<Item = (&String, &Arc<dyn Datastore>)> {
-        self.datastores.iter()
-    }
-
     pub fn datastore_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.datastores.keys().cloned().collect();
         names.push(system::DATASTORE_NAME.to_string());
@@ -471,7 +465,6 @@ impl UserCreation for PivotUserCreation {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
 
     use super::*;
     use crate::datastore::DatastoreTableMetadata;
@@ -521,10 +514,6 @@ mod tests {
 
         fn data_path(&self) -> String {
             "memory://".to_string()
-        }
-
-        fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-            self
         }
     }
 

@@ -104,7 +104,6 @@ server:
   memory: 32g               # default: 80% of total RAM (see PIVOT_MEMORY_PCT)
   workers: 16               # default: number of cores
   refresh_interval: 30s     # default 30s
-  http_bind: 127.0.0.1:8081 # serve the web dashboard; omitted means no dashboard
   disk_cache:               # cache S3 reads on local disk; omitted means no cache
     dir: /var/cache/pivot   # required once the section is present
     size: 64g               # default 64g

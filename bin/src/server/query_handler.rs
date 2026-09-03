@@ -38,28 +38,6 @@ const STATS_FLAG: &str = crate::execution::STATS_VARIABLE;
 #[cfg(feature = "perf")]
 const PERF_FLAG: &str = "perf";
 
-/// Run SQL through the same executor as the PostgreSQL endpoint and return
-/// heap-backed Arrow batches for the HTTP dashboard.
-pub(crate) async fn execute_sql(
-    executor: Arc<crate::execution::Executor>,
-    sql: String,
-) -> Result<Vec<arrow_array::RecordBatch>, String> {
-    let execution = executor
-        .execute(sql, ExecuteOptions::default())
-        .await
-        .map_err(|error| error.to_string())?;
-    match execution.output {
-        StatementOutput::Rows { batches, .. } => Ok(batches),
-        StatementOutput::Command(_) | StatementOutput::Set { .. } => Ok(Vec::new()),
-        StatementOutput::CopyFromStdin(ingest) => {
-            // Dropping the running ingest aborts it: the dataflow cancels and
-            // the statement's transaction rolls back.
-            drop(ingest);
-            Err("COPY FROM STDIN is only supported over the PostgreSQL protocol".to_string())
-        }
-    }
-}
-
 fn into_pgwire_error(error: crate::execution::Error) -> PgWireError {
     user_error(error.to_string())
 }

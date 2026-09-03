@@ -1,6 +1,5 @@
 mod common;
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::{Arc, OnceLock};
@@ -41,10 +40,6 @@ impl Datastore for EmptyDatastore {
 
     fn data_path(&self) -> String {
         String::new()
-    }
-
-    fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
     }
 }
 

@@ -67,7 +67,7 @@ COPY --chmod=644 pivot.yaml /etc/pivot/pivot.yaml
 RUN mkdir -p /var/lib/pivot/datastores/default
 
 ENV RUST_LOG=info
-# 5432 is the pgwire endpoint, 8081 the web dashboard.
-EXPOSE 5432 8081
+# The pgwire endpoint.
+EXPOSE 5432
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["pivot", "server", "--config", "/etc/pivot/pivot.yaml", "--metastore-file", "/var/lib/pivot/metastore.yaml"]

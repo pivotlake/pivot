@@ -3,7 +3,7 @@ name = "bin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The `pivot` executable: the statement executor, the PostgreSQL-wire and HTTP server (`pivot server`), and the interactive shell (`pivot open`)."
+description = "The `pivot` executable: the statement executor, the PostgreSQL-wire server (`pivot server`), and the interactive shell (`pivot open`)."
 
 [[bin]]
 name = "pivot"
@@ -26,11 +26,8 @@ lru = { workspace = true }
 # COPY frames arrive as refcounted protocol bytes and decode without copying.
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros", "sync", "signal", "time"] }
-axum = "0.8"
 serde = { workspace = true }
-serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
-include_dir = "0.7"
 pgwire = { workspace = true }
 # Generates per-process secrets for mock authentication of unknown users.
 rand = { workspace = true }
@@ -64,6 +61,7 @@ perf = ["dep:libc", "dispatch/perf"]
 
 [dev-dependencies]
 tokio-postgres = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 parquet = { workspace = true }
 # The variant end-to-end test builds the documents it loads.
