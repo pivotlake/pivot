@@ -50,30 +50,32 @@ fn init_tracing() {
 
 /// Wait for an interactive interrupt or the termination signal sent by a
 /// service manager.
-async fn wait_for_shutdown_signal() {
+fn wait_for_shutdown_signal() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
     {
-        let mut terminate =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(terminate) => terminate,
-                Err(error) => {
-                    error!(%error, "failed to listen for the termination signal");
+        use tokio::signal::unix::{SignalKind, signal};
+        let terminate = signal(SignalKind::terminate());
+        let interrupt = signal(SignalKind::interrupt());
+        async move {
+            let (mut terminate, mut interrupt) = match (terminate, interrupt) {
+                (Ok(terminate), Ok(interrupt)) => (terminate, interrupt),
+                (Err(error), _) | (_, Err(error)) => {
+                    error!(%error, "failed to listen for shutdown signals");
                     return;
                 }
             };
-        tokio::select! {
-            interrupt = tokio::signal::ctrl_c() => {
-                if let Err(error) = interrupt {
-                    error!(%error, "failed to listen for Ctrl-C");
-                }
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
             }
-            _ = terminate.recv() => {}
         }
     }
 
     #[cfg(not(unix))]
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        error!(%error, "failed to listen for Ctrl-C");
+    async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            error!(%error, "failed to listen for Ctrl-C");
+        }
     }
 }
 
