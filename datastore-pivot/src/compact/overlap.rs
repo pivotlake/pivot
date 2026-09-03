@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef};
 use arrow_cast::cast;
-use arrow_ord::cmp;
+use arrow_ord::ord::make_comparator;
+use arrow_schema::SortOptions;
 
 use super::CompactionPass;
 use crate::TableFile;
@@ -134,15 +135,12 @@ fn compare(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
     compare_same_type(left, right)
 }
 
+/// Order two single-value arrays of one type through one typed comparator,
+/// built once per call: selection compares bounds by the million, and a
+/// comparator costs a fraction of the comparison kernels' result arrays.
 fn compare_same_type(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
-    if cmp::eq(left, right).ok()?.value(0) {
-        return Some(Ordering::Equal);
-    }
-    Some(if cmp::lt(left, right).ok()?.value(0) {
-        Ordering::Less
-    } else {
-        Ordering::Greater
-    })
+    let comparator = make_comparator(left.as_ref(), right.as_ref(), SortOptions::default()).ok()?;
+    Some(comparator(0, 0))
 }
 
 /// A file without statistics, rows, or ordered leading bounds cannot
