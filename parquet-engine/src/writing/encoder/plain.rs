@@ -8,9 +8,9 @@
 
 use crate::thrift::general::{CompressionCodec, Encoding};
 use arrow_array::{
-    Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BinaryViewArray, BooleanArray, Date32Array, Decimal64Array, Decimal128Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 
@@ -110,6 +110,19 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
         }};
     }
     match array.data_type() {
+        // Parquet PLAIN booleans are packed from the least-significant bit of
+        // each byte. A page starts on a fresh byte, and unused high bits in its
+        // last byte stay zero.
+        DataType::Boolean => {
+            let a = downcast::<BooleanArray>(array)?;
+            for start in (0..len).step_by(8) {
+                let mut byte = 0_u8;
+                for bit in 0..(len - start).min(8) {
+                    byte |= u8::from(a.value(start + bit)) << bit;
+                }
+                out.push(byte);
+            }
+        }
         // The two narrow signed widths widen to the INT32 that is Parquet's
         // narrowest integer.
         DataType::Int8 => widened!(Int8Array, i32),
@@ -179,6 +192,18 @@ fn downcast<A: 'static>(array: &dyn Array) -> WriteResult<&A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encodes_booleans_least_significant_bit_first() {
+        let array = BooleanArray::from(vec![
+            true, false, true, true, false, false, true, false, true,
+        ]);
+
+        let mut out = Vec::new();
+        encode_into(&array, &mut out).unwrap();
+
+        assert_eq!(out, vec![0b0100_1101, 0b0000_0001]);
+    }
 
     /// A string-view value longer than 12 bytes lives in an external buffer, not
     /// inline in the view; the encoder must follow the view to it and write the

@@ -16,10 +16,14 @@
 //!
 //! Concrete leaf decoders are type aliases over `TypedLeafDecoder`:
 //! - [`primitive::PrimitiveLeafDecoder`] for fixed-width numeric types.
+//! - [`BooleanLeafDecoder`] for bit-packed boolean values.
 //! - [`bytes_view::BytesViewDecoder`] for variable-length string / binary types.
 
 pub(crate) mod bytes_view;
 pub use bytes_view::BytesViewDecoder;
+
+mod boolean;
+pub(crate) use boolean::BooleanLeafDecoder;
 
 mod decimal;
 pub use decimal::{DecimalStorage, decimal_decoder};

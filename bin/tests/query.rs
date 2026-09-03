@@ -736,6 +736,36 @@ async fn insert_stores_a_null_constant_as_a_null(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn insert_stores_boolean_values_and_nulls(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE boolean_insert (position BIGINT, flag BOOLEAN)")
+        .await
+        .unwrap();
+
+    conn.simple_query(
+        "INSERT INTO boolean_insert VALUES (1, true), (2, false), (3, NULL), (4, true)",
+    )
+    .await
+    .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT position, flag FROM boolean_insert ORDER BY position",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("t".into())],
+            vec![Some("2".into()), Some("f".into())],
+            vec![Some("3".into()), None],
+            vec![Some("4".into()), Some("t".into())],
+        ]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn insert_with_a_column_list_fills_only_the_named_columns(#[future] conn: Conn) {
     conn.simple_query("CREATE TABLE listed_insert (id BIGINT, name VARCHAR, note VARCHAR)")
         .await

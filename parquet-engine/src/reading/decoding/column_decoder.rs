@@ -11,8 +11,8 @@
 
 use crate::reading::decoding::leaf_decoders;
 use crate::reading::decoding::leaf_decoders::{
-    BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder, TimestampMicrosecondLeafDecoder,
-    decimal_decoder,
+    BooleanLeafDecoder, BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder,
+    TimestampMicrosecondLeafDecoder, decimal_decoder,
 };
 use crate::types::leaves::{OutputRead, reconstruct_column_from_leaves};
 use crate::types::metadata::ColumnChunkMeta;
@@ -287,6 +287,7 @@ pub fn create_leaf_decoder(
         };
     }
     match data_type {
+        DataType::Boolean => Ok(Box::new(BooleanLeafDecoder::new(max_def_level))),
         DataType::UInt8 => Ok(primitive!(UInt8Type)),
         DataType::UInt16 => Ok(primitive!(UInt16Type)),
         DataType::UInt32 => Ok(primitive!(UInt32Type)),

@@ -117,6 +117,10 @@ enum PlainSizes<'a> {
 impl<'a> PlainSizes<'a> {
     fn new(values: &'a ArrayRef) -> WriteResult<Self> {
         Ok(match values.data_type() {
+            // Booleans are bit-packed on disk. Counting one byte per value is
+            // a conservative page-size estimate; row groups are smaller than
+            // the resulting page limit in practice.
+            DataType::Boolean => Self::Fixed(1),
             // A date is a day count, stored as the INT32 it is annotated as, and
             // a value narrower than its physical type takes that type's width
             // (the narrow integers widened to INT32).

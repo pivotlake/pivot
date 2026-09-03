@@ -19,8 +19,8 @@ use arrow_array::types::{
     Int32Type, Int64Type, TimestampMicrosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{
-    Array, ArrayRef, ArrowPrimitiveType, BinaryViewArray, Date32Array, PrimitiveArray, RecordBatch,
-    StringArray, StringViewArray, TimestampMicrosecondArray,
+    Array, ArrayRef, ArrowPrimitiveType, BinaryViewArray, BooleanArray, Date32Array,
+    PrimitiveArray, RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use dispatch::{Dispatch, Projection, values_input};
@@ -55,6 +55,7 @@ enum Shape {
 
 /// How to build one type's column, and the encoding its distinct values take.
 struct TypeSpec {
+    repeated_encoding: &'static str,
     distinct_encoding: &'static str,
     build: Box<dyn Fn(Shape) -> ArrayRef>,
 }
@@ -73,7 +74,7 @@ impl TypeSpec {
             name: format!("{type_name}_{shape_name}"),
             values: (self.build)(shape),
             encoding: match shape {
-                Shape::Repeated => DICTIONARY,
+                Shape::Repeated => self.repeated_encoding,
                 Shape::Distinct | Shape::Nullable => self.distinct_encoding,
             },
         }
@@ -105,6 +106,7 @@ fn primitive<T: ArrowPrimitiveType>(
     stamp: impl Fn(PrimitiveArray<T>) -> ArrayRef + 'static,
 ) -> TypeSpec {
     TypeSpec {
+        repeated_encoding: DICTIONARY,
         distinct_encoding,
         build: Box::new(move |shape| {
             let array: PrimitiveArray<T> = (0..ROWS)
@@ -124,6 +126,7 @@ fn primitive<T: ArrowPrimitiveType>(
 fn bytes(build: impl Fn(Vec<Option<String>>) -> ArrayRef + 'static) -> TypeSpec {
     let value = |row: usize| format!("{row}-{}", "value".repeat(row % 17));
     TypeSpec {
+        repeated_encoding: DICTIONARY,
         distinct_encoding: PACKED_LENGTHS,
         build: Box::new(move |shape| {
             let rows = (0..ROWS)
@@ -134,6 +137,22 @@ fn bytes(build: impl Fn(Vec<Option<String>>) -> ArrayRef + 'static) -> TypeSpec 
                 })
                 .collect();
             build(rows)
+        }),
+    }
+}
+
+/// A boolean type. Parquet's PLAIN representation is already one bit per
+/// value, and the format forbids dictionary encoding for BOOLEAN.
+fn boolean() -> TypeSpec {
+    TypeSpec {
+        repeated_encoding: PLAIN,
+        distinct_encoding: PLAIN,
+        build: Box::new(|shape| {
+            Arc::new(BooleanArray::from_iter((0..ROWS).map(|row| match shape {
+                Shape::Repeated => Some(repeated_index(row).is_multiple_of(2)),
+                Shape::Distinct => Some(row.is_multiple_of(2)),
+                Shape::Nullable => (!is_null(row)).then_some(row.is_multiple_of(2)),
+            }))) as ArrayRef
         }),
     }
 }
@@ -393,6 +412,7 @@ macro_rules! type_tests {
 }
 
 type_tests! {
+    boolean => boolean();
     // The narrow signed widths store their bits in an INT32, and read back as
     // themselves only if the file kept the column's width. Their deltas fit
     // that width, so distinct values pack like any other whole number.

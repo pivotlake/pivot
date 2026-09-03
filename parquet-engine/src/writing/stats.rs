@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use arrow_arith::aggregate::{max, min};
 use arrow_array::{
-    Array, ArrayRef, BinaryViewArray, Date32Array, Datum, Decimal64Array, Decimal128Array,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringArray,
-    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryViewArray, BooleanArray, Date32Array, Datum, Decimal64Array,
+    Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    Scalar, StringArray, StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 
@@ -43,6 +44,15 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         }};
     }
     match array.data_type() {
+        DataType::Boolean => {
+            let a = array.as_any().downcast_ref::<BooleanArray>()?;
+            if a.len() == a.null_count() {
+                return None;
+            }
+            let lo: ArrayRef = Arc::new(BooleanArray::from(vec![a.false_count() == 0]));
+            let hi: ArrayRef = Arc::new(BooleanArray::from(vec![a.true_count() != 0]));
+            Some((lo, hi))
+        }
         DataType::Int8 => numeric!(Int8Array),
         DataType::Int16 => numeric!(Int16Array),
         DataType::Int32 => numeric!(Int32Array),
@@ -139,6 +149,9 @@ pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
         };
     }
     Some(match value.data_type() {
+        DataType::Boolean => vec![u8::from(
+            value.as_any().downcast_ref::<BooleanArray>()?.value(0),
+        )],
         DataType::Int8 => widened_le_bytes!(Int8Array, i32),
         DataType::Int16 => widened_le_bytes!(Int16Array, i32),
         DataType::Int32 => le_bytes!(Int32Array),
