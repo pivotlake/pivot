@@ -40,21 +40,63 @@ pub struct PushedPredicate {
 
 impl PushedPredicate {
     /// Recognize the predicate shapes whose Parquet statistics can safely
-    /// eliminate row groups. Unsupported shapes are left entirely upstream.
-    pub fn from_filter(filter: TableFilter) -> Option<Self> {
+    /// eliminate row groups. Unsupported shapes are left entirely upstream and
+    /// yield no predicates.
+    pub fn from_filter(filter: TableFilter) -> Vec<Self> {
         let TableFilter::Expression(expr) = filter else {
-            return None;
+            return Vec::new();
         };
-        let Expression::Compare(compare) = expr.as_ref() else {
-            return None;
-        };
-        let (column_expr, constant) = match (compare.left.as_ref(), compare.right.as_ref()) {
-            (column, Expression::Constant(value)) => (column, value),
-            // DuckDB normally canonicalizes the column to the left. Keep
-            // constant-left comparisons upstream instead of risking an
-            // incorrect direction during metadata pruning.
-            _ => return None,
-        };
+        match expr.as_ref() {
+            Expression::Compare(compare) => {
+                // DuckDB normally canonicalizes the column to the left. Keep
+                // constant-left comparisons upstream instead of risking an
+                // incorrect direction during metadata pruning.
+                let Expression::Constant(constant) = compare.right.as_ref() else {
+                    return Vec::new();
+                };
+                Self::from_bound(&compare.left, compare.compare_type, constant)
+                    .into_iter()
+                    .collect()
+            }
+            // DuckDB's filter combiner folds a lower and an upper bound on one
+            // column into a single BETWEEN before offering it for pushdown, so
+            // a two-sided range always arrives as one expression. Each bound
+            // prunes on its own.
+            Expression::Between(between) => {
+                let (Expression::Constant(lower), Expression::Constant(upper)) =
+                    (between.lower.as_ref(), between.upper.as_ref())
+                else {
+                    return Vec::new();
+                };
+                let lower_compare = if between.lower_inclusive {
+                    CompareType::GreaterEqual
+                } else {
+                    CompareType::Greater
+                };
+                let upper_compare = if between.upper_inclusive {
+                    CompareType::LessEqual
+                } else {
+                    CompareType::Less
+                };
+                [
+                    Self::from_bound(&between.input, lower_compare, lower),
+                    Self::from_bound(&between.input, upper_compare, upper),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A single `column <compare_type> constant` bound, when the column side
+    /// is one whose statistics can prune.
+    fn from_bound(
+        column_expr: &Expression,
+        compare_type: CompareType,
+        constant: &Scalar<ArrayRef>,
+    ) -> Option<Self> {
         // DuckDB casts a TIMESTAMP column to TIMESTAMPTZ for a mixed-type
         // comparison. In UTC the cast preserves the microsecond value, so
         // retag the constant as TIMESTAMP for statistics pruning.
@@ -77,7 +119,7 @@ impl PushedPredicate {
             column_idx: column.column_idx,
             path: column.path,
             as_type: column.as_type,
-            compare_type: compare.compare_type,
+            compare_type,
             value,
         })
     }
