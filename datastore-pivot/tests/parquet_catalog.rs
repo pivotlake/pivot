@@ -607,6 +607,108 @@ fn timestamp_cast_pushdown_prunes_native_timestamp_row_groups() {
     assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
 }
 
+/// A table of one zone-less TIMESTAMP column with the values 0s, 60s and
+/// 120s, each in its own row group, so a range prune is observable.
+fn minute_events_table() -> (TempDir, Arc<PivotDatastore>) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "occurred",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(TimestampMicrosecondArray::from(vec![
+            0_i64,
+            60_000_000,
+            120_000_000,
+        ])) as ArrayRef],
+    )
+    .unwrap();
+    let dir = write_one_row_per_group(&[batch]);
+    let (database, datastore) = empty_datastore();
+    create_table(
+        &datastore,
+        create_request(
+            "events",
+            dir.path(),
+            vec![Column {
+                name: "occurred".to_string(),
+                col_type: Type::Timestamp,
+            }],
+        ),
+    )
+    .unwrap();
+    (database, datastore)
+}
+
+/// Rows the query's table scan produces on its own, before the plan's runtime
+/// Filter: what statistics pruning left of the table.
+fn scanned_row_count(datastore: &Arc<PivotDatastore>, sql: &str) -> usize {
+    let catalog = single_catalog(datastore);
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    )
+    .unwrap();
+    let plan = planner.plan(sql, catalog.begin_transaction()).unwrap();
+    let input = first_input(&plan.root).expect("query has a table scan");
+    input
+        .table
+        .compile_scan(&dispatcher(), Projection::all(0), Vec::new(), false)
+        .unwrap()
+        .collect()
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum()
+}
+
+/// DuckDB offers a two-sided range on one column as a single BETWEEN, so both
+/// bounds must prune, not just a lone comparison.
+#[test]
+fn between_pushdown_prunes_row_groups_outside_both_bounds() {
+    let (_database, datastore) = minute_events_table();
+
+    let scanned = scanned_row_count(
+        &datastore,
+        "SELECT occurred FROM events \
+         WHERE occurred BETWEEN '1970-01-01 00:00:30' AND '1970-01-01 00:01:30'",
+    );
+
+    assert_eq!(scanned, 1);
+}
+
+/// A lower and an upper comparison on the same column are folded into a
+/// BETWEEN before pushdown, so they prune exactly like the BETWEEN spelling.
+#[test]
+fn paired_comparisons_pushdown_prune_like_between() {
+    let (_database, datastore) = minute_events_table();
+
+    let scanned = scanned_row_count(
+        &datastore,
+        "SELECT occurred FROM events \
+         WHERE occurred >= '1970-01-01 00:00:30' AND occurred <= '1970-01-01 00:01:30'",
+    );
+
+    assert_eq!(scanned, 1);
+}
+
+/// A BETWEEN against TIMESTAMPTZ bounds wraps the column in the UTC identity
+/// cast; both bounds still prune the native timestamp statistics.
+#[test]
+fn timestamp_cast_between_pushdown_prunes_native_timestamp_row_groups() {
+    let (_database, datastore) = minute_events_table();
+
+    let scanned = scanned_row_count(
+        &datastore,
+        "SELECT occurred FROM events \
+         WHERE occurred BETWEEN TIMESTAMPTZ '1970-01-01 00:00:30+00' \
+         AND TIMESTAMPTZ '1970-01-01 00:01:30+00'",
+    );
+
+    assert_eq!(scanned, 1);
+}
+
 /// Each bind hands out a fresh clone, so pushdown applied to one binding
 /// must not leak into a subsequent one.
 #[test]

@@ -156,9 +156,7 @@ impl BoundTable for ExternalParquetTable {
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
-        if let Some(predicate) = PushedPredicate::from_filter(filter) {
-            self.predicates.push(predicate);
-        }
+        self.predicates.extend(PushedPredicate::from_filter(filter));
         // Statistics and dictionaries may skip work, but the SQL filter stays
         // above the scan and remains responsible for query correctness.
         Ok(false)

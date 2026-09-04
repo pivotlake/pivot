@@ -248,9 +248,7 @@ impl BoundTable for TableBinding {
         // equality/dictionary pruning) happens in `compile`, once the row-group
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
-        if let Some(predicate) = PushedPredicate::from_filter(filter) {
-            self.predicates.push(predicate);
-        }
+        self.predicates.extend(PushedPredicate::from_filter(filter));
 
         Ok(false)
     }
