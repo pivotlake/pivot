@@ -1,0 +1,255 @@
+name: Release Branches
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Cut the current release line and advance main, or bump an existing release line's patch version"
+        type: choice
+        options:
+          - cut-minor
+          - cut-major
+          - patch
+        default: cut-minor
+      release_branch:
+        description: "Existing release/X.Y branch to bump (required only for patch)"
+        type: string
+        required: false
+        default: ""
+
+# A cut turns this:
+#
+#     main (X.Y.0)
+#
+# into this, in one atomic push:
+#
+#     release/X.Y -> X.Y.0
+#                       \
+#                        main -> X.(Y+1).0  (cut-minor)
+#                        main -> (X+1).0.0  (cut-major)
+#
+# Patch bumps never touch main; they advance an existing release/X.Y branch.
+concurrency:
+  group: release-branches
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    name: ${{ inputs.operation == 'patch' && 'Bump release patch' || 'Cut release branch' }}
+    runs-on: ubuntu-latest
+    env:
+      OPERATION: ${{ inputs.operation }}
+      REQUESTED_RELEASE_BRANCH: ${{ inputs.release_branch }}
+    steps:
+      # Always run the trusted workflow definition from main. Patch mode checks
+      # out its target branch separately below.
+      - name: Require dispatch from main
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Run this workflow from main, not ${GITHUB_REF#refs/heads/}."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.operation == 'patch' && inputs.release_branch || 'main' }}
+          fetch-depth: 0
+
+      # Cargo must read the patched Arrow manifests before it can refresh the
+      # lockfile. The DuckDB source submodule is not a Cargo package and is not
+      # needed for a version-only change.
+      - name: Initialize Cargo manifest dependencies
+        run: git submodule update --init --depth 1 arrow-rs
+
+      - name: Plan version change
+        id: version
+        run: |
+          set -euo pipefail
+
+          current_version=$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          if ! [[ "$current_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Cargo.toml must contain one plain SemVer workspace version; found '$current_version'."
+            exit 1
+          fi
+
+          major=${BASH_REMATCH[1]}
+          minor=${BASH_REMATCH[2]}
+          patch=${BASH_REMATCH[3]}
+          base_sha=$(git rev-parse HEAD)
+
+          case "$OPERATION" in
+            cut-minor)
+              if [ "$patch" -ne 0 ]; then
+                echo "::error::main is $current_version. Its patch component must be zero; patch versions belong on release branches."
+                exit 1
+              fi
+              if [ -n "$REQUESTED_RELEASE_BRANCH" ]; then
+                echo "::error::release_branch is only valid with the patch operation."
+                exit 1
+              fi
+              release_branch="release/$major.$minor"
+              new_version="$major.$((minor + 1)).0"
+              target_branch=main
+              ;;
+            cut-major)
+              if [ "$patch" -ne 0 ]; then
+                echo "::error::main is $current_version. Its patch component must be zero; patch versions belong on release branches."
+                exit 1
+              fi
+              if [ -n "$REQUESTED_RELEASE_BRANCH" ]; then
+                echo "::error::release_branch is only valid with the patch operation."
+                exit 1
+              fi
+              release_branch="release/$major.$minor"
+              new_version="$((major + 1)).0.0"
+              target_branch=main
+              ;;
+            patch)
+              if ! [[ "$REQUESTED_RELEASE_BRANCH" =~ ^release/(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                echo "::error::Patch bumps require a branch named release/X.Y; got '$REQUESTED_RELEASE_BRANCH'."
+                exit 1
+              fi
+              branch_major=${BASH_REMATCH[1]}
+              branch_minor=${BASH_REMATCH[2]}
+              if [ "$major" -ne "$branch_major" ] || [ "$minor" -ne "$branch_minor" ]; then
+                echo "::error::$REQUESTED_RELEASE_BRANCH contains version $current_version; expected $branch_major.$branch_minor.Z."
+                exit 1
+              fi
+              release_branch=$REQUESTED_RELEASE_BRANCH
+              new_version="$major.$minor.$((patch + 1))"
+              target_branch=$release_branch
+              ;;
+            *)
+              echo "::error::Unknown operation '$OPERATION'."
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "current=$current_version"
+            echo "new=$new_version"
+            echo "release_branch=$release_branch"
+            echo "target_branch=$target_branch"
+            echo "base_sha=$base_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure release branch does not already exist
+        if: ${{ inputs.operation != 'patch' }}
+        env:
+          RELEASE_BRANCH: ${{ steps.version.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          existing=$(git ls-remote --heads origin "refs/heads/$RELEASE_BRANCH")
+          if [ -n "$existing" ]; then
+            echo "::error::$RELEASE_BRANCH already exists. Use the patch operation to advance it."
+            exit 1
+          fi
+
+      - name: Update workspace version
+        env:
+          CURRENT_VERSION: ${{ steps.version.outputs.current }}
+          NEW_VERSION: ${{ steps.version.outputs.new }}
+        run: |
+          set -euo pipefail
+
+          sed -i "/^\[workspace\.package\]$/,/^\[/s/^version = \"$CURRENT_VERSION\"$/version = \"$NEW_VERSION\"/" Cargo.toml
+
+          # Refresh the local workspace package entries in Cargo.lock without
+          # compiling anything.
+          cargo metadata --format-version 1 >/dev/null
+          cargo metadata --locked --format-version 1 >/dev/null
+
+          if ! grep -q "^version = \"$NEW_VERSION\"$" Cargo.toml; then
+            echo "::error::Failed to update Cargo.toml to $NEW_VERSION."
+            exit 1
+          fi
+
+          expected_old="-version = \"$CURRENT_VERSION\""
+          expected_new="+version = \"$NEW_VERSION\""
+          lock_diff=$(git diff --unified=0 -- Cargo.lock)
+          old_count=$(grep -Fxc -- "$expected_old" <<< "$lock_diff" || true)
+          new_count=$(grep -Fxc -- "$expected_new" <<< "$lock_diff" || true)
+          if [ "$old_count" -eq 0 ] || [ "$old_count" -ne "$new_count" ]; then
+            echo "::error::Cargo.lock did not receive a balanced workspace version update."
+            exit 1
+          fi
+          unexpected_lock_changes=$(
+            while IFS= read -r line; do
+              case "$line" in
+                '--- '*|'+++ '*) ;;
+                -*|+*)
+                  if [ "$line" != "$expected_old" ] && [ "$line" != "$expected_new" ]; then
+                    printf '%s\n' "$line"
+                  fi
+                  ;;
+              esac
+            done <<< "$lock_diff"
+          )
+          if [ -n "$unexpected_lock_changes" ]; then
+            printf "::error::Cargo changed more than workspace versions in Cargo.lock:\n%s\n" "$unexpected_lock_changes"
+            exit 1
+          fi
+
+          unexpected=$(git diff --name-only | grep -Ev '^(Cargo\.toml|Cargo\.lock)$' || true)
+          if [ -n "$unexpected" ]; then
+            printf "::error::The version update unexpectedly changed:\n%s\n" "$unexpected"
+            exit 1
+          fi
+          git diff --check
+
+      - name: Commit version change
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.new }}
+          TARGET_BRANCH: ${{ steps.version.outputs.target_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "release: bump $TARGET_BRANCH to $NEW_VERSION"
+
+      - name: Create release branch and advance main
+        if: ${{ inputs.operation != 'patch' }}
+        env:
+          BASE_SHA: ${{ steps.version.outputs.base_sha }}
+          RELEASE_BRANCH: ${{ steps.version.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse HEAD^)" != "$BASE_SHA" ]; then
+            echo "::error::The version bump is not immediately after the release branch point."
+            exit 1
+          fi
+
+          # GitHub supports atomic pushes. Either both refs move, or neither
+          # does, so a protected or concurrently updated main cannot leave a
+          # half-created release line behind.
+          git push --atomic origin \
+            "$BASE_SHA:refs/heads/$RELEASE_BRANCH" \
+            "HEAD:refs/heads/main"
+
+      - name: Advance release branch
+        if: ${{ inputs.operation == 'patch' }}
+        env:
+          RELEASE_BRANCH: ${{ steps.version.outputs.release_branch }}
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+
+      - name: Summarize
+        env:
+          CURRENT_VERSION: ${{ steps.version.outputs.current }}
+          NEW_VERSION: ${{ steps.version.outputs.new }}
+          RELEASE_BRANCH: ${{ steps.version.outputs.release_branch }}
+        run: |
+          if [ "$OPERATION" = patch ]; then
+            printf '### Patch version advanced\n\n- Branch: `%s`\n- Version: `%s` → `%s`\n' \
+              "$RELEASE_BRANCH" "$CURRENT_VERSION" "$NEW_VERSION" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '### Release branch created\n\n- Branch: `%s` at `%s`\n- `main`: `%s` → `%s`\n' \
+              "$RELEASE_BRANCH" "${{ steps.version.outputs.base_sha }}" \
+              "$CURRENT_VERSION" "$NEW_VERSION" >> "$GITHUB_STEP_SUMMARY"
+          fi
