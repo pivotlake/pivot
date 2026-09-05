@@ -5,6 +5,20 @@ sidebar:
   order: 1
 ---
 
+Pivot is split into multiple components that operate and communicate with each other -- together forming the complete architecture of the system.
+
+The first and most core component of the engine is the Dispatch execution pool:
+
+
+## Dispatch execution pool
+<architecture>
+
+THe dispatch execution engine is responsible to receive a physical execution plan of a query and execute it reliably on a set of "dispatch workers": a collective of workers (one worker per core) that perform the computational and netwokring operations required to complete the execution of a query.
+
+After "dispatching" a query to the dispatch pool, each CPU worker is in charge of executing the physical plan, and scheling different operations in the plan so the query operates in the most efficiant way. For example, if worker A has just outputted a recordbatch that is hot in ran, the worker will prefer to execute the next operator in line B vs sanother operator "c" that works on data that is not hot in cache. To the contrary, if there are multiple queries running in the same time, the worker might split the available CPU resources the two queries in a "smart" way, trying to strike a balance between CPU cache efficiency while not letting one query "starve" the other.
+
+In addition to running the CPU work, the dispatch worker also handles IO requests and attemps to prioritize IO etween them (a IO request from a "Materialize" operator that can free up memory quickly might be prioritized over an IO request to fetch new data that will cause memory conumtion to only go up).
+
 Pivot separates the metadata required to operate a server from the data and table metadata required to execute queries. This allows a local CLI session to access the same data and tables as a cluster serving clients, while maintaining separate authentication and server configurations.
 
 <figure class="arch-figure">

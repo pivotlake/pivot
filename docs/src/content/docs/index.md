@@ -147,9 +147,6 @@ evaluation, experiments and local analysis today.
   supported today is listed under [Reference](/docs/reference/); assume
   anything not listed there is missing.
 
-See the [Roadmap](/docs/roadmap/) for planned capabilities and work currently
-in progress.
-
 ### Where to start
 
 - [Quickstart](/docs/quickstart/) runs a server and issues a first query.
