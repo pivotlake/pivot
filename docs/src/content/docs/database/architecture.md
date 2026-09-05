@@ -11,15 +11,80 @@ The first and most core component of the engine is the Dispatch execution pool:
 
 
 ## Dispatch execution pool
-<architecture>
 
-THe dispatch execution engine is responsible to receive a physical execution plan of a query and execute it reliably on a set of "dispatch workers": a collective of workers (one worker per core) that perform the computational and netwokring operations required to complete the execution of a query.
+The dispatch execution engine is responsible for receiving a query’s physical execution plan and reliably executing it across a set of dispatch workers: a collection of workers, one per CPU core, that perform the computation, networking, and I/O required to execute a query.
 
-After "dispatching" a query to the dispatch pool, each CPU worker is in charge of executing the physical plan, and scheling different operations in the plan so the query operates in the most efficiant way. For example, if worker A has just outputted a recordbatch that is hot in ran, the worker will prefer to execute the next operator in line B vs sanother operator "c" that works on data that is not hot in cache. To the contrary, if there are multiple queries running in the same time, the worker might split the available CPU resources the two queries in a "smart" way, trying to strike a balance between CPU cache efficiency while not letting one query "starve" the other.
+<figure class="arch-figure">
+<svg viewBox="0 0 920 352" role="img" aria-labelledby="dispatch-pool-title dispatch-pool-desc">
+<title id="dispatch-pool-title">A physical execution plan runs across the dispatch worker pool</title>
+<desc id="dispatch-pool-desc">The query's physical execution plan is dispatched to a pool with one worker per CPU core. Workers 1, 2, and N each perform computation, networking, and other I/O.</desc>
+<defs>
+<marker id="dispatch-pool-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
+</marker>
+</defs>
+<rect x="320" y="16" width="280" height="64" rx="3" class="arch-panel" />
+<text x="460" y="43" text-anchor="middle" class="arch-title">Physical execution plan</text>
+<text x="460" y="65" text-anchor="middle" class="arch-muted">operators + data flow</text>
+<rect x="40" y="116" width="840" height="220" rx="3" class="arch-panel" />
+<text x="64" y="147" class="arch-title">Dispatch pool</text>
+<text x="856" y="147" text-anchor="end" class="arch-muted">one worker per CPU core</text>
+<path d="M460,80 V177 M187,177 H733" class="arch-line" />
+<path d="M187,177 V199" class="arch-line" marker-end="url(#dispatch-pool-arrow)" />
+<path d="M460,177 V199" class="arch-line" marker-end="url(#dispatch-pool-arrow)" />
+<path d="M733,177 V199" class="arch-line" marker-end="url(#dispatch-pool-arrow)" />
+<rect x="64" y="202" width="246" height="110" rx="2" class="arch-inner" />
+<text x="80" y="227" class="arch-title">Worker 1</text>
+<text x="294" y="227" text-anchor="end" class="arch-muted">CPU core 1</text>
+<line x1="64" y1="240" x2="310" y2="240" class="arch-rule" />
+<text x="80" y="266" class="arch-label">Computation</text>
+<text x="80" y="291" class="arch-label">Networking + other I/O</text>
+<rect x="337" y="202" width="246" height="110" rx="2" class="arch-inner" />
+<text x="353" y="227" class="arch-title">Worker 2</text>
+<text x="567" y="227" text-anchor="end" class="arch-muted">CPU core 2</text>
+<line x1="337" y1="240" x2="583" y2="240" class="arch-rule" />
+<text x="353" y="266" class="arch-label">Computation</text>
+<text x="353" y="291" class="arch-label">Networking + other I/O</text>
+<text x="596.5" y="264" text-anchor="middle" class="arch-label">…</text>
+<rect x="610" y="202" width="246" height="110" rx="2" class="arch-inner" />
+<text x="626" y="227" class="arch-title">Worker N</text>
+<text x="840" y="227" text-anchor="end" class="arch-muted">CPU core N</text>
+<line x1="610" y1="240" x2="856" y2="240" class="arch-rule" />
+<text x="626" y="266" class="arch-label">Computation</text>
+<text x="626" y="291" class="arch-label">Networking + other I/O</text>
+</svg>
+</figure>
 
-In addition to running the CPU work, the dispatch worker also handles IO requests and attemps to prioritize IO etween them (a IO request from a "Materialize" operator that can free up memory quickly might be prioritized over an IO request to fetch new data that will cause memory conumtion to only go up).
+Once a query has been "dispatched" to the pool, each CPU worker is in charge of executing the physical plan and scheduling the operations within it so that the query runs as efficiently as possible. For example, if worker A has just emitted an output that is hot in the CPU's cache, the worker will prefer to run the next operator in line, B, over another operator, C, that works on data which is not cache-resident. Conversely, when multiple queries are running at the same time, the worker may split the available CPU resources between them in a "smart" way, striking a balance between cache efficiency and making sure that one query doesn't starve the other.
 
-Pivot separates the metadata required to operate a server from the data and table metadata required to execute queries. This allows a local CLI session to access the same data and tables as a cluster serving clients, while maintaining separate authentication and server configurations.
+Beyond CPU work, the dispatch worker also handles IO requests and prioritizes between them. A "Materialize" operator that enriches existing data with additional columns, for example, takes precedence over the input operator feeding it, so the channel between the two doesn't fill up and hold onto memory:
+
+<figure class="arch-figure" style="max-width: 620px;">
+<svg viewBox="0 0 620 104" role="img" aria-labelledby="materialize-priority-title materialize-priority-desc">
+<title id="materialize-priority-title">Prioritizing materialization drains buffered input</title>
+<desc id="materialize-priority-desc">Input reads produce record batches that wait in a channel for materialization to fetch additional columns. Prioritizing materialization drains the channel and releases memory held by waiting batches.</desc>
+<defs>
+<marker id="materialize-priority-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
+</marker>
+</defs>
+<rect x="16" y="16" width="132" height="72" rx="3" class="arch-panel" />
+<text x="82" y="44" text-anchor="middle" class="arch-title">Input</text>
+<text x="82" y="69" text-anchor="middle" class="arch-muted">reads new data</text>
+<path d="M151,52 H211" class="arch-line" marker-end="url(#materialize-priority-arrow)" />
+<rect x="216" y="16" width="160" height="72" rx="3" class="arch-inner" />
+<text x="296" y="41" text-anchor="middle" class="arch-label">Waiting batches</text>
+<rect x="258" y="55" width="20" height="16" rx="1" class="arch-cell" />
+<rect x="286" y="55" width="20" height="16" rx="1" class="arch-cell" />
+<rect x="314" y="55" width="20" height="16" rx="1" class="arch-cell" />
+<path d="M379,52 H439" class="arch-line" marker-end="url(#materialize-priority-arrow)" />
+<rect x="444" y="16" width="160" height="72" rx="3" class="arch-panel" />
+<text x="524" y="44" text-anchor="middle" class="arch-title">Materialize</text>
+<text x="524" y="69" text-anchor="middle" class="arch-muted">fetch columns</text>
+</svg>
+</figure>
+
+## System architecture
 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 492" role="img" aria-labelledby="map-title map-desc">
