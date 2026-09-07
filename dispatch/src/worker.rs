@@ -540,6 +540,12 @@ impl Worker {
             self.try_finishing_dataflows();
 
             if !self.did_work_last_iteration {
+                // Don't clear buffers or sleep on IO while there is work to steal.
+                self.try_steal_work();
+                if self.did_work_last_iteration {
+                    continue;
+                }
+
                 // One ring serves both disk and HTTP, so a single wait wakes on
                 // either kind of completion — no dual-ring coordination needed.
                 // The wait doubles as a select over worker notifications: the
@@ -568,11 +574,7 @@ impl Worker {
                     continue;
                 }
 
-                self.try_steal_work();
-
-                if !self.did_work_last_iteration {
-                    self.clear_dirty_buffer_or_park();
-                }
+                self.clear_dirty_buffer_or_park();
             }
         }
     }
