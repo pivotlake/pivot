@@ -13,9 +13,9 @@ export default defineConfig({
       description: "Documentation for pivotdb, a columnar analytics engine.",
       favicon: "/pivot-favicon.png",
       customCss: ["./src/styles/theme.css"],
-      tableOfContents: { minHeadingLevel: 3, maxHeadingLevel: 4 },
-      // Puts the pre-release banner on every page. Starlight has no site-wide
-      // banner setting; the middleware fills in the per-page frontmatter one.
+      tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 4 },
+      // Adds the shared pre-release banner and nests the table of contents
+      // beneath the page title.
       routeMiddleware: "./src/routeData.ts",
       expressiveCode: {
         themes: [codeThemeDark, codeThemeLight],

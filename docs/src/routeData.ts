@@ -5,9 +5,20 @@ import { defineRouteMiddleware } from "@astrojs/starlight/route-data";
 // result rather than from the introduction still sees it. A page that sets its
 // own banner keeps it.
 export const onRequest = defineRouteMiddleware((context) => {
-  const { entry } = context.locals.starlightRoute;
+  const { entry, toc } = context.locals.starlightRoute;
   entry.data.banner ??= {
     content:
       'Pivot is in early development and is <strong>not production ready</strong>. See <a href="/docs/#project-status">Project status</a>.',
   };
+
+  if (toc) {
+    // Gather the sections, including any nested under Starlight's Overview,
+    // then put them all beneath a single page-title entry.
+    const sections = toc.items.flatMap((item) =>
+      item.slug === "_top" ? item.children : [item],
+    );
+    toc.items = [
+      { depth: 1, slug: "_top", text: entry.data.title, children: sections },
+    ];
+  }
 });

@@ -86,6 +86,15 @@ Together, soft sorting and overlap-aware compaction keep similar values clustere
 
 This is conceptually similar to ClickHouse’s sparse primary-key index / table order by definition, but applied to Parquet files and open table formats.
 
+
+#### Aggressive format based pruning
+After laying the data out for efficient pruning and filtering, Pivot leans on a number of Parquet-specific strategies so that a query touches as little data as possible. These include:
+
+- **Dictionary-based pruning** — when a column chunk is dictionary-encoded, Pivot can look for the filter value in the column's dictionary before touching the column data itself. If the value isn't there, every data page pointing at that dictionary can be skipped outright — no decompression, decoding, or searching required.
+- **Page-level pruning** — even when a row group does contain matching rows, some of its pages may hold none of the rows selected by the filters or by late materialization. Pivot uses the selected row positions to identify those pages and skip their decompression and decoding entirely.
+- **Selective decoding** — during late materialization, Pivot passes the surviving row positions down into the Parquet reader. Within each page it does have to read, only surviving rows are written to the output batches, and where the encoding allows, unwanted values are skipped without being decoded at all. This cuts both CPU work and the memory needed to build intermediate results.
+- **Bloom-filter pruning** (coming soon) — Pivot will soon also utilize Bloom filters to rule out row groups that cannot contain a requested value, avoiding unnecessary reads for equality filters.
+
 #### Late materialization
 
 Queries often return many columns even though only a small subset is needed to determine which rows belong in the final result. Reading and decoding all selected columns upfront can therefore waste significant I/O and CPU on rows that will eventually be discarded.
@@ -164,4 +173,4 @@ Rather than forcing Pivot users to move to an unfamiliar or less mature operatin
 Unlike engines that are primarily optimized around their own internal storage formats, Pivot is built to perform at its best directly on Parquet files. As part of this, it takes advantage of several properties of the Parquet format to reduce the amount of data that needs to be read and processed:
 
 - "decodeless" filtering - in many scenarios, you can determin if a parquet  
-- Dictionary based pruning - if a dictionary of a value 
+- Dictionary based pruning - if a dictionary of a value
