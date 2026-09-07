@@ -7,7 +7,7 @@ sidebar:
 
 ## System architecture
 
-Pivot's components work together to plan and execute queries, manage metadata, and access table data.
+Pivot separates query execution, data access, and server metadata into distinct layers. This allows the same execution engine to operate with different data sources (such as Iceberg and Delta Lake) and deployment models (such as a local shell or a server cluster).
 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 492" role="img" aria-labelledby="map-title map-desc">
@@ -21,7 +21,6 @@ Pivot's components work together to plan and execute queries, manage metadata, a
 <g transform="translate(0 -156)">
 <rect x="40" y="180" width="840" height="200" rx="3" class="arch-panel" />
 <text x="64" y="210" class="arch-title">Pivot</text>
-<text x="856" y="210" text-anchor="end" class="arch-muted">one process · one worker pool</text>
 <rect x="64" y="224" width="240" height="104" rx="2" class="arch-inner" />
 <rect x="65" y="225" width="238" height="23" class="arch-strip" />
 <line x1="65" y1="248" x2="303" y2="248" class="arch-rule" />
@@ -29,7 +28,6 @@ Pivot's components work together to plan and execute queries, manage metadata, a
 <text x="292" y="241" text-anchor="end" class="arch-tiny">in memory</text>
 <text x="76" y="270" class="arch-tiny">datastores by name</text>
 <text x="76" y="288" class="arch-tiny">snapshot per query</text>
-<line x1="306" y1="276" x2="337" y2="276" class="arch-line" marker-end="url(#map-head)" />
 <rect x="340" y="224" width="240" height="104" rx="2" class="arch-inner" />
 <rect x="341" y="225" width="238" height="23" class="arch-strip" />
 <line x1="341" y1="248" x2="579" y2="248" class="arch-rule" />
@@ -37,7 +35,6 @@ Pivot's components work together to plan and execute queries, manage metadata, a
 <text x="568" y="241" text-anchor="end" class="arch-tiny">per query</text>
 <text x="352" y="270" class="arch-tiny">bind tables from snapshot</text>
 <text x="352" y="288" class="arch-tiny">prune + push down</text>
-<line x1="582" y1="276" x2="613" y2="276" class="arch-line" marker-end="url(#map-head)" />
 <rect x="616" y="224" width="240" height="104" rx="2" class="arch-inner" />
 <rect x="617" y="225" width="238" height="23" class="arch-strip" />
 <line x1="617" y1="248" x2="855" y2="248" class="arch-rule" />
@@ -98,11 +95,12 @@ Pivot's components work together to plan and execute queries, manage metadata, a
 </svg>
 </figure>
 
-- [Dispatch execution pool](#dispatch-execution-pool) - executes physical plans across workers that handle computation and I/O.
-- [Planner](#planner) - turns SQL into an optimized execution plan.
-- [Catalog](#catalog) - connects the planner to named datastores and holds their snapshots for each query.
-- [Metastore](#metastore) - holds server configuration, users, and datastore connections.
-- [Datastore](#datastore) - manages schemas, tables, versions, and data files.
+These responsibilities are divided across five core components:
+- [Dispatch execution pool](#dispatch-execution-pool) - Executes physical plans across a pool of workers responsible for computation and I/O.
+- [Planner](#planner) - Translates SQL queries into optimized physical execution plans.
+- [Catalog](#catalog) - Connects the planner to named datastores and maintains the datastore snapshots used by each query.
+- [Datastore](#datastore) - Manages schemas, tables, table versions, and the underlying data files.
+- [Metastore](#metastore) - Manages server-level configuration, including users, authentication, and datastore connections.
 
 ### Dispatch execution pool
 
@@ -260,23 +258,110 @@ datastore, not as one atomic snapshot across all datastores.
 
 The catalog also exposes a read-only "virtual" [system tables datastore](/docs/reference/system-tables/), so users can query metadata about the current running pivot instance.
 
+### Datastore
+
+A datastore is a collection of schemas and tables exposed to Pivot through a common interface. Each configured datastore implementation handles table discovery, metadata, snapshots, and supported read and write operations for its underlying storage or table format.
+
+Pivot currently supports/exposes the following datastores:
+* Pivot — A collection of Delta Lake tables.
+* Iceberg — Tables stored using the Apache Iceberg table format.
+* System — Internal tables exposing information about the running Pivot instance.
+
+A server can expose multiple datastores, with tables addressed as `datastore.schema.table`.
+
+For example, a query can join orders in a Pivot datastore named `analytics` with customer
+details in an Iceberg datastore named `lake`:
+
+```sql
+SELECT
+    orders.order_id,
+    customers.customer_name,
+    orders.total_amount
+FROM analytics.sales.orders AS orders
+JOIN lake.crm.customers AS customers
+    ON orders.customer_id = customers.customer_id;
+```
+
+Here, `analytics` and `lake` are datastore names, while `sales` and `crm` are
+schemas within those datastores. Pivot reads each table through its
+datastore and executes the join in the same query engine.
+
 ### Metastore
 
-The metastore is the server's configuration and identity layer. It tells Pivot:
+The metastore is a collective of configurations and secrets that declare the metadata a pivot instance needs for it to run.
 
-- Which named datastores to open and which one is the default
-- Where each datastore lives and which credentials can access it
-- Which users may connect and how they authenticate
+These include:
+- Datastores — their names, implementations, locations, and settings, including which datastore is the default for unqualified table names.
+- Secrets — credentials for accessing object storage, scoped to the locations they apply to. Multiple datastores can use the same secret.
+- Users — which users are authored to access pivot, and how do they authenticate.
 
-The metastore does **not** sit in the scan path and does not hold every table or
-Parquet file. Once the server has opened its datastores, queries resolve table
-metadata through the datastore snapshots held by the in-memory catalog.
+Thanks to the separation of datastores and metastore, different instances / deployments of pivot might access different datastores in different permission models and with different configurations:
 
-The standard deployment uses the YAML-backed disk metastore. It works well for
-one server: datastore definitions and users live in the server configuration
-and optional metastore file.
+<figure class="arch-figure">
+<svg viewBox="0 0 920 514" role="img" aria-labelledby="deployments-title deployments-desc">
+<title id="deployments-title">Two Pivot instances with different metastores share one datastore</title>
+<desc id="deployments-desc">Object storage holds two datastores: analytics, a Pivot datastore, and lake, an Iceberg datastore. A Pivot shell started with pivot open on the analytics location uses an ephemeral metastore and reads and writes only analytics. A Pivot server started with pivot server and a metastore from pivot.yaml reads and writes analytics, reads lake, and serves SQL clients over the Postgres wire, where the analyst user logs in with a password.</desc>
+<defs>
+<marker id="deployments-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
+</marker>
+</defs>
+<rect x="40" y="16" width="840" height="156" rx="3" class="arch-panel" />
+<text x="64" y="46" class="arch-title">Object storage</text>
+<text x="856" y="46" text-anchor="end" class="arch-muted">S3 · GCS</text>
+<text x="64" y="66" class="arch-muted">datastores</text>
+<rect x="64" y="80" width="392" height="76" rx="3" class="arch-inner" />
+<rect x="65" y="81" width="390" height="24" class="arch-strip" />
+<line x1="65" y1="105" x2="455" y2="105" class="arch-rule" />
+<text x="76" y="98" class="arch-label">analytics</text>
+<text x="444" y="98" text-anchor="end" class="arch-tiny">Pivot · Delta Lake format</text>
+<text x="76" y="124" class="arch-tiny">s3://company-data/pivot/</text>
+<text x="76" y="142" class="arch-tiny">pivot manifest + delta log + parquet</text>
+<rect x="480" y="80" width="376" height="76" rx="3" class="arch-inner" />
+<rect x="481" y="81" width="374" height="24" class="arch-strip" />
+<line x1="481" y1="105" x2="855" y2="105" class="arch-rule" />
+<text x="492" y="98" class="arch-label">lake</text>
+<text x="844" y="98" text-anchor="end" class="arch-tiny">Iceberg</text>
+<text x="492" y="124" class="arch-tiny">s3://lakehouse/warehouse/</text>
+<text x="492" y="142" class="arch-tiny">metadata + manifests + parquet</text>
+<line x1="182" y1="258" x2="182" y2="158" class="arch-line" marker-end="url(#deployments-arrow)" />
+<text x="196" y="210" class="arch-muted">read + write</text>
+<path d="M524,258 V222 M380,222 H668" class="arch-line" />
+<path d="M380,222 V160" class="arch-line" marker-end="url(#deployments-arrow)" />
+<text x="394" y="210" class="arch-muted">read + write</text>
+<path d="M668,222 V160" class="arch-line" marker-end="url(#deployments-arrow)" />
+<text x="682" y="210" class="arch-muted">read</text>
+<rect x="40" y="260" width="310" height="92" rx="3" class="arch-panel" />
+<text x="64" y="290" class="arch-title">Pivot shell</text>
+<rect x="226" y="271" width="100" height="26" rx="2" class="arch-inner" />
+<rect x="235" y="277" width="14" height="14" rx="1" class="arch-cell" />
+<text x="255" y="289" class="arch-tiny">metastore</text>
+<rect x="64" y="306" width="266" height="26" rx="2" class="arch-inner" />
+<text x="76" y="323" class="arch-prompt">$</text>
+<text x="88" y="323" class="arch-cmd">pivot open s3://company-data/pivot/</text>
+<rect x="380" y="260" width="500" height="92" rx="3" class="arch-panel" />
+<text x="404" y="290" class="arch-title">Pivot server</text>
+<rect x="756" y="271" width="100" height="26" rx="2" class="arch-inner" />
+<rect x="765" y="277" width="14" height="14" rx="1" class="arch-cell" />
+<text x="785" y="289" class="arch-tiny">metastore</text>
+<rect x="404" y="306" width="452" height="26" rx="2" class="arch-inner" />
+<text x="416" y="323" class="arch-prompt">$</text>
+<text x="428" y="323" class="arch-cmd">pivot server --config pivot.yaml</text>
+<line x1="524" y1="408" x2="524" y2="354" class="arch-line" marker-end="url(#deployments-arrow)" />
+<text x="538" y="384" class="arch-muted">Postgres wire</text>
+<rect x="380" y="408" width="500" height="90" rx="3" class="arch-panel" />
+<text x="404" y="432" class="arch-title">SQL clients</text>
+<text x="856" y="432" text-anchor="end" class="arch-muted">backend · psql · BI tools</text>
+<rect x="404" y="442" width="452" height="44" rx="2" class="arch-inner" />
+<text x="416" y="459" class="arch-prompt">$</text>
+<text x="428" y="459" class="arch-cmd">psql -h pivot.internal -U analyst</text>
+<text x="416" y="477" class="arch-cmd">Password for user analyst: ********</text>
+</svg>
+</figure>
 
-#### Sharing a metastore across a cluster
+In this example, both instances open the same Pivot datastore. The server loads its metastore from a YAML file: two datastores, an analyst user who logs in with a password, and an S3 secret scoped to the datastore location. The shell, started with `pivot open`, builds an ephemeral metastore from its command line: a single datastore, credentials read from the environment, and no user login. Only the server also reads the Iceberg datastore.
+
+##### Sharing a metastore across a cluster of instances
 
 > **Upcoming:** PostgreSQL-backed metastores are under development and are not
 > available in the current release. The configuration may change before the
@@ -284,7 +369,7 @@ and optional metastore file.
 
 A PostgreSQL metastore lets several Pivot servers use the same datastore
 registry and user directory. The analytical data still lives in the configured
-datastore—typically S3—not in PostgreSQL. Each Pivot server executes queries on
+datastore, typically S3, not in PostgreSQL. Each Pivot server executes queries on
 its own worker pool, so this creates a load-balanced cluster rather than one
 distributed query spanning several servers.
 
@@ -327,29 +412,5 @@ requires restarting the nodes. User records are checked on each login, allowing
 new users and credential rotations to apply across the cluster without a Pivot
 restart. The metastore URL and stored credentials should be accessible only to
 the Pivot servers and their operators.
-
-### Datastore
-
-A datastore is one named, transactional data source. It owns schemas, tables,
-table versions, and the files that make up those tables. A server can expose
-several datastores, and SQL can address them as
-`datastore.schema.table`. Unqualified names use the configured default
-datastore.
-
-The Pivot datastore keeps durable state alongside the data:
-
-- A Pivot manifest records the schemas and tables in the datastore.
-- Each table's Delta log records its schema, partitioning, versions, and active
-  Parquet files.
-- Parquet footers provide row-group metadata and statistics used during scans.
-
-Each query opens a consistent snapshot of every datastore it touches. A query
-that uses only one datastore does not snapshot the others. Transactions across
-different datastores are not atomic as a single unit.
-
-A local datastore is owned by one Pivot process at a time. A remote datastore
-on shared object storage can be opened by multiple servers; periodic refreshes
-make commits from one server visible to the others. Background compaction and
-vacuum should run on only one server for a shared datastore.
 
 ## Deployment Architecture
