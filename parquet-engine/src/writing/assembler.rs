@@ -16,7 +16,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::thrift::footer::{
-    ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement,
+    ColumnChunk, ColumnMetaData, ColumnOrder, FileMetaData, LogicalType, RowGroup, SchemaElement,
 };
 use crate::thrift::general::Encoding;
 use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
@@ -319,12 +319,20 @@ fn build_file(
         });
     }
 
+    // Readers following the spec only honour a chunk's `min_value`/`max_value`
+    // when the footer names an order for every leaf column.
+    let schema_elements = build_schema_elements(schema)?;
+    let leaf_count = schema_elements
+        .iter()
+        .filter(|element| element.num_children.is_none())
+        .count();
     let file_meta = FileMetaData {
         version: PARQUET_VERSION,
-        schema: build_schema_elements(schema)?,
+        schema: schema_elements,
         num_rows,
         row_groups,
         created_by: Some("pivotdb".to_string()),
+        column_orders: Some(vec![ColumnOrder::TYPE_ORDER; leaf_count]),
     };
     write_footer(&mut out, &file_meta)?;
     Ok((out, file_meta))

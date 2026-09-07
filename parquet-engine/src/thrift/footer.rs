@@ -1,6 +1,6 @@
 use super::general::{CompressionCodec, Encoding, PageType, TimeUnit};
 use super::parquet_thrift::*;
-use crate::{general_err, thrift_struct};
+use crate::{general_err, thrift_struct, thrift_union_all_empty};
 use std::io::Write;
 
 // LogicalType is a thrift union where most variants are empty structs. We model
@@ -282,6 +282,16 @@ thrift_struct!(
     }
 );
 
+thrift_union_all_empty!(
+/// How a leaf column's `min_value`/`max_value` statistics are ordered. A
+/// reader following the spec ignores those statistics unless the footer names
+/// an order for every leaf, and `TYPE_ORDER` (the ordering the column's type
+/// defines) is the only one the format has.
+union ColumnOrder {
+  1: TypeDefinedOrder TYPE_ORDER
+}
+);
+
 thrift_struct!(
     pub struct FileMetaData {
         1: required i32 version;
@@ -289,6 +299,9 @@ thrift_struct!(
         3: required i64 num_rows;
         4: required list<RowGroup> row_groups;
         6: optional string created_by;
+        /// One entry per leaf column, in schema order. Optional in the format
+        /// (older writers omit it), so files without it still parse.
+        7: optional list<ColumnOrder> column_orders;
     }
 );
 

@@ -18,6 +18,8 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::ColumnOrder;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet_variant_compute::{
     ShreddedSchemaBuilder, VariantArray, json_to_variant, shred_variant, unshred_variant,
 };
@@ -448,6 +450,32 @@ fn every_leaf_carries_footer_statistics() {
         .unwrap();
     assert_eq!(typed.1, Some(0), "every row shredded into the typed leaf");
     assert!(typed.2, "a typed leaf carries a min/max to prune on");
+}
+
+/// A reader following the spec ignores every chunk's `min_value`/`max_value`
+/// unless the footer names an order for each leaf column, so the writer has to
+/// stamp one per leaf.
+#[test]
+fn the_footer_names_a_type_defined_order_for_every_leaf() {
+    let files = write(
+        vec![JsonItem(rows(&[r#"{"id": 1, "name": "a"}"#]))],
+        128 * 1024,
+    );
+
+    let reader = SerializedFileReader::new(bytes::Bytes::copy_from_slice(&files[0])).unwrap();
+    let file_metadata = reader.metadata().file_metadata();
+    let column_orders = file_metadata.column_orders().unwrap();
+
+    assert_eq!(
+        column_orders.len(),
+        file_metadata.schema_descr().num_columns()
+    );
+    assert!(
+        column_orders
+            .iter()
+            .all(|order| matches!(order, ColumnOrder::TYPE_DEFINED_ORDER(_))),
+        "{column_orders:?}"
+    );
 }
 
 /// A shredded path may only be pruned by its typed leaf when the `value`
