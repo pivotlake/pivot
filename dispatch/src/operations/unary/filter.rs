@@ -12,6 +12,13 @@
 //! large batches instead of a runt batch per input. Whether to coalesce at all
 //! is the consumer's call, carried as a [`RowDelivery`]: an operator that acts
 //! on early rows needs them as soon as they are selected.
+//!
+//! The accumulator copies the survivors' values rather than referencing the
+//! input batches' buffers. A selective filter may see thousands of input
+//! batches before it holds a full batch to emit, and a survivor that kept its
+//! source buffer alive would keep the whole decompressed page (and so the ring
+//! slot) it came from pinned for that entire stretch. Over a large scan that
+//! pins more than the ring holds, and eviction finds nothing to take.
 
 use crate::RECORD_BATCH_SIZE;
 use crate::arrays::accumulator::BatchAccumulator;
@@ -164,7 +171,7 @@ where
             self.accumulator = None;
         }
         let accumulator = self.accumulator.get_or_insert_with(|| {
-            BatchAccumulator::retaining_source_buffers(batch.schema(), &mut self.allocator)
+            BatchAccumulator::copying_coalesced(batch.schema(), &mut self.allocator)
         });
         accumulator.append_batch_by_indices_flushing::<unary::Error>(
             &batch,
@@ -423,6 +430,48 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(i32_col(&out[0]), vec![1, 4]);
+    }
+
+    #[test]
+    fn coalesced_survivors_do_not_keep_the_source_buffers_alive() {
+        use arrow_array::StringViewArray;
+        init_test_free_pool(4);
+        let long_values = vec!["a string too long to be inlined in its view"; 3];
+        let input: ArrayRef = Arc::new(StringViewArray::from(long_values));
+        let source_buffers: Vec<*const u8> = input
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .data_buffers()
+            .iter()
+            .map(|buffer| buffer.as_ptr())
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![input]).unwrap();
+        let filter = filter_operator(keep_first_row);
+
+        let out = run_unary_to_completion(filter, vec![batch]);
+
+        let survivors = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(
+            survivors.value(0),
+            "a string too long to be inlined in its view"
+        );
+        assert!(
+            survivors
+                .data_buffers()
+                .iter()
+                .all(|buffer| !source_buffers.contains(&buffer.as_ptr())),
+            "the survivor still points into the input batch's buffer"
+        );
     }
 
     #[test]

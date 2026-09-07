@@ -104,6 +104,22 @@ impl BatchAccumulator {
         )
     }
 
+    /// A coalescing accumulator that copies values: [`COALESCING_CAPACITY`] rows
+    /// (or as many as a slab holds for the widest column, see
+    /// [`capacity`](Self::capacity)) whose view columns own their bytes
+    /// ([`ValueStorage::CopyValues`]). For an operator that may hold rows a long
+    /// time before it has a full batch to emit, such as a selective filter over
+    /// a large scan, so the rows it holds keep only their own bytes alive and
+    /// not every source batch they were drawn from.
+    pub fn copying_coalesced(schema: SchemaRef, allocator: &mut SlabAllocator) -> Self {
+        Self::new(
+            schema,
+            COALESCING_CAPACITY,
+            ValueStorage::CopyValues,
+            allocator,
+        )
+    }
+
     /// An accumulator for rows that outlive the batches they came from, such as
     /// a Parquet row group held until its file finishes encoding. Its values are
     /// copied ([`ValueStorage::CopyValues`]), so the batch it hands out holds no
