@@ -145,6 +145,21 @@ pub trait Unary<I, O> {
         true
     }
 
+    /// Whether `consume` only turns its input into IO requests, doing no CPU
+    /// work and sending nothing downstream until the IO lands (a fetcher).
+    ///
+    /// The worker runs one CPU step per pass, taken from the most downstream
+    /// operator that has work, so an operator's input is normally consumed only
+    /// once everything downstream of it is idle. For a fetcher that would mean
+    /// its read-ahead is refilled only after the worker has decoded everything
+    /// it already fetched, serializing fetch and decode. A unary that returns
+    /// `true` is instead offered its input on every pass, bounded by its own
+    /// [`ready_for_more_work`](Self::ready_for_more_work), so fetching overlaps
+    /// with the CPU work downstream.
+    fn dispatches_io(&self) -> bool {
+        false
+    }
+
     /// Handle a completed logical read. Dispatch has already resolved cache
     /// hits and committed any physical reads.
     fn process_read_response(
@@ -273,6 +288,13 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
         Ok(WorkStatus::Ran)
     }
 
+    fn run_io_dispatch(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
+        if !self.unary.dispatches_io() {
+            return Ok(WorkStatus::Pending);
+        }
+        self.run_cpu_work(io)
+    }
+
     fn process_read_response(
         &mut self,
         io: &mut OperatorIO,
@@ -369,5 +391,72 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
 
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         self.unary.upstream_cancel_flag()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::unary::test_utils::CollectSender;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    struct QueueReceiver<T>(RefCell<VecDeque<T>>);
+    impl<T> Receiver<T> for QueueReceiver<T> {
+        fn is_empty(&self) -> bool {
+            self.0.borrow().is_empty()
+        }
+        fn try_recv(&self) -> Option<T> {
+            self.0.borrow_mut().pop_front()
+        }
+        fn steal(&self) -> Option<T> {
+            None
+        }
+    }
+
+    /// Forwards its input, declaring itself an IO dispatcher when told to.
+    struct Forwarder {
+        dispatches_io: bool,
+    }
+    impl Unary<u32, u32> for Forwarder {
+        fn consume(
+            &mut self,
+            item: u32,
+            sender: &mut dyn Sender<u32>,
+            _io: &mut OperatorIO,
+        ) -> Result<()> {
+            sender.send(item)?;
+            Ok(())
+        }
+        fn dispatches_io(&self) -> bool {
+            self.dispatches_io
+        }
+    }
+
+    fn operator_with_one_item(
+        dispatches_io: bool,
+    ) -> UnaryOperator<u32, u32, Forwarder, QueueReceiver<u32>> {
+        UnaryOperator::new(
+            Forwarder { dispatches_io },
+            QueueReceiver(RefCell::new(VecDeque::from([7]))),
+            Box::new(CollectSender::new()),
+            Arc::new(AtomicUsize::new(1)),
+        )
+    }
+
+    #[test]
+    fn io_dispatch_consumes_only_for_a_dispatching_unary() {
+        let mut plain = operator_with_one_item(false);
+        let mut fetcher = operator_with_one_item(true);
+        let mut test_io = crate::io::TestOperatorIO::default();
+        let mut io = test_io.io();
+
+        let plain_status = plain.run_io_dispatch(&mut io).unwrap();
+        let fetcher_status = fetcher.run_io_dispatch(&mut io).unwrap();
+
+        assert!(matches!(plain_status, WorkStatus::Pending));
+        assert!(!plain.receiver.is_empty());
+        assert!(matches!(fetcher_status, WorkStatus::Ran));
+        assert!(fetcher.receiver.is_empty());
     }
 }

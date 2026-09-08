@@ -562,10 +562,25 @@ impl DataFlow {
 
     /// Run one unit of CPU work, traversing leaf-to-root (downstream first for cache locality).
     /// Returns [`WorkStatus::Ran`] if any operator did work.
+    ///
+    /// Before the walk, every operator gets its
+    /// [`run_io_dispatch`](Operator::run_io_dispatch) step: the walk stops at
+    /// the first operator with work, so a fetcher at the root would otherwise
+    /// refill its read-ahead only once the worker had drained everything
+    /// downstream of it.
     pub fn run_ready_cpu_work(&mut self, requester: &mut IORequester) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_read_id);
-            d.graph
+            let mut dispatched = WorkStatus::Pending;
+            let _: ControlFlow<()> = d.graph.traverse_forwards(|node_id, operator| {
+                io.set_operator_idx(node_id);
+                if let WorkStatus::Ran = operator.run_io_dispatch(&mut io)? {
+                    dispatched = WorkStatus::Ran;
+                }
+                Ok(ControlFlow::<()>::Continue(()))
+            })?;
+            let cpu = d
+                .graph
                 .traverse_backwards(|node_id, operator| {
                     io.set_operator_idx(node_id);
                     let status = operator.run_cpu_work(&mut io)?;
@@ -577,7 +592,12 @@ impl DataFlow {
                 .map(|c| match c {
                     ControlFlow::Continue(_) => WorkStatus::Pending,
                     ControlFlow::Break(_) => WorkStatus::Ran,
-                })
+                })?;
+            Ok(if dispatched == WorkStatus::Ran {
+                WorkStatus::Ran
+            } else {
+                cpu
+            })
         })
     }
 
@@ -844,5 +864,65 @@ mod tests {
         assert!(is_abandoned(&graph, 0));
         assert!(is_abandoned(&graph, 1));
         assert!(!is_abandoned(&graph, 2));
+    }
+
+    /// A root whose consumption is IO dispatch: it counts dispatch steps and
+    /// never has CPU work of its own.
+    struct DispatchingOperator(Arc<AtomicUsize>);
+    impl Operator for DispatchingOperator {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
+            Ok(WorkStatus::Pending)
+        }
+        fn run_io_dispatch(
+            &mut self,
+            _io: &mut OperatorIO,
+        ) -> crate::operations::Result<WorkStatus> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(WorkStatus::Ran)
+        }
+        fn process_fs_write_response(
+            &mut self,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
+            Ok(FinishStatus::Pending)
+        }
+    }
+
+    #[test]
+    fn io_dispatch_runs_on_a_pass_whose_cpu_step_goes_downstream() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let operators: Vec<Box<dyn Operator>> = vec![
+            Box::new(DispatchingOperator(dispatches.clone())),
+            Box::new(CountingOperator(runs.clone())),
+        ];
+        let (err_tx, _err_rx) = mpsc::channel();
+        let (stats_tx, _stats_rx) = mpsc::channel();
+        let mut flow = DataFlow::new(
+            0,
+            Arc::new(AtomicBool::new(false)),
+            err_tx,
+            operators,
+            vec![(0, 1)],
+            HashMap::default(),
+            stats_tx,
+            false,
+        );
+        let mut requester = IORequester::default();
+
+        let status = flow.run_ready_cpu_work(&mut requester);
+
+        assert!(matches!(status, WorkStatus::Ran));
+        assert_eq!(dispatches.load(Ordering::Relaxed), 1);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 }

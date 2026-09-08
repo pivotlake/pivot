@@ -136,6 +136,16 @@ pub trait Operator {
         Ok(WorkStatus::Pending)
     }
 
+    /// Turn one input item into IO requests, if this operator is one whose
+    /// consumption is IO dispatch rather than CPU work (see
+    /// [`Unary::dispatches_io`](super::Unary::dispatches_io)). The dataflow
+    /// offers this step on every pass, before the downstream-first CPU walk,
+    /// so a fetcher keeps its read-ahead full while the worker is busy
+    /// decoding what it fetched earlier. Default: nothing to dispatch.
+    fn run_io_dispatch(&mut self, _io: &mut OperatorIO) -> Result<WorkStatus> {
+        Ok(WorkStatus::Pending)
+    }
+
     /// A flag this operator raises to ask the `DataFlow` to abandon everything
     /// *upstream* of it, used by `LIMIT` to stop the scan once it has buffered
     /// enough rows, without disturbing operators downstream of it (e.g. a

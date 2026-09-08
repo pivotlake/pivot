@@ -86,6 +86,10 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
         self.request_region(request, range, io)
     }
 
+    fn dispatches_io(&self) -> bool {
+        true
+    }
+
     fn ready_for_more_work(&mut self) -> bool {
         let disk_in_flight = self
             .in_flight
