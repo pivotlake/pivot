@@ -210,9 +210,10 @@ claim the same scope, so which secret that is never depends on the order they
 were written in. A secret with no `scope` covers every location of its type;
 there can be only one such secret per type.
 
-An `s3://` datastore needs a secret covering it: without one there is nothing to
-sign its requests with, and startup stops. A `gs://` datastore without one falls
-back to the ambient Application Default Credentials chain instead:
+An `s3://` datastore without a covering secret uses anonymous, unsigned
+requests. This supports public S3 locations; define a secret when the location
+requires authentication. A `gs://` datastore without one falls back to the
+ambient Application Default Credentials chain instead:
 `GOOGLE_APPLICATION_CREDENTIALS`, the file
 `gcloud auth application-default login` writes, or the workload identity of the
 Google compute instance.

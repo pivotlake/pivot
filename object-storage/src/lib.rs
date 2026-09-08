@@ -11,7 +11,8 @@
 //! opened the store: a metastore hands them in per datastore, and [`open_store`]
 //! falls back to the environment. [`StoreConnection`] exposes those resolved
 //! settings to format-specific adapters without making this crate depend on
-//! them. This runs off the io_uring ring on purpose: a
+//! them. S3 falls back to unsigned anonymous requests when no credentials are
+//! available. This runs off the io_uring ring on purpose: a
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
@@ -114,9 +115,10 @@ pub struct DataFile {
 
 /// Where a data file's bytes live, for reading or writing: a local filesystem
 /// path (via the io_uring file path) or a remote URL (HTTP on the same ring). A
-/// remote URL either carries its own auth (an S3 presigned URL, `auth: None`) or
-/// pairs a stable URL with an [`AuthHeader`] that mints a fresh bearer token per
-/// request. Which variant a store yields is its business, not the caller's.
+/// remote URL either carries its own auth (an S3 presigned URL), needs no auth
+/// (anonymous S3), or pairs a stable URL with an [`AuthHeader`] that mints a
+/// fresh bearer token per request. Which variant a store yields is its business,
+/// not the caller's.
 ///
 /// The same key maps to a different URL per direction — [`source`](ObjectStore::source)
 /// builds the read URL, [`sink`](ObjectStore::sink) the write URL (e.g. S3 presigns
@@ -303,7 +305,9 @@ pub enum StoreConnection {
     Local,
     S3 {
         uri: String,
-        credentials: S3Credentials,
+        region: String,
+        credentials: Option<S3Credentials>,
+        endpoint: Option<String>,
     },
     Gcs {
         uri: String,
@@ -442,8 +446,9 @@ pub(crate) fn update_by_version_swap(
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
 /// `gs://bucket/prefix`, or a local path (optionally `file://`). Credentials are
-/// whatever the process itself can resolve; a caller holding its own opens the
-/// backend directly (`S3Store::with_credentials`, `GcsStore::with_credentials_file`).
+/// whatever the process itself can resolve. S3 uses anonymous access when both
+/// key variables are absent; a caller holding its own opens the backend directly
+/// (`S3Store::with_credentials`, `GcsStore::with_credentials_file`).
 pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     match StoreScheme::of(uri)? {
         StoreScheme::S3 => Ok(Box::new(S3Store::with_env_credentials(uri)?)),

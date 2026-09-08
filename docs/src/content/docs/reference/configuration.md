@@ -54,7 +54,7 @@ specific secret covering a datastore location is selected.
 
 | Secret type | Keys |
 | --- | --- |
-| `s3` | `type: s3`, optional `scope`, required `region`, `access_key_id`, and `secret_access_key`, plus optional `endpoint` for S3-compatible storage. |
+| `s3` | `type: s3`, optional `scope` and `region`, required `access_key_id` and `secret_access_key`, plus optional `endpoint` for S3-compatible storage. Without a matching secret, S3 uses anonymous, unsigned requests. A missing region is discovered with an unsigned `HeadBucket` request; specify it for compatible endpoints that do not return `x-amz-bucket-region`. |
 | `gcs` | `type: gcs`, optional `scope`, and required `credentials_file`. Without a matching secret, GCS uses ambient Application Default Credentials. |
 
 Two secrets cannot claim the same scope.

@@ -1,14 +1,21 @@
-//! S3 (and S3-compatible) backend: blocking HTTP via [`ureq`], requests signed
-//! with SigV4 via `aws_sigv4::http_request::sign` (a pure function — no runtime).
+//! S3 (and S3-compatible) backend: blocking HTTP via [`ureq`], with
+//! authenticated requests signed through `aws_sigv4::http_request::sign` (a
+//! pure function — no runtime). When no credentials are configured, requests
+//! are sent anonymously instead, which supports public buckets and S3-compatible
+//! endpoints that do not require authentication.
 //!
 //! Credentials come from one of two places. [`S3Store::with_env_credentials`]
 //! reads them from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`;
-//! region from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
+//! optional region from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
 //! `AWS_ENDPOINT_URL` selects a path-style S3-compatible endpoint like MinIO).
 //! [`S3Store::with_credentials`] takes them explicitly, so a metastore can supply
 //! a datastore's own key/secret/region/endpoint rather than relying on whatever
 //! the process was started with.
 //!
+//! If neither key is present in the environment, the store uses anonymous
+//! access; setting only one key is rejected as an incomplete configuration.
+//! When no region is supplied, the store sends an unsigned `HeadBucket` request
+//! and takes the region from S3's `x-amz-bucket-region` response header.
 //! Either way the resolved parameters are kept on the store and exposed through
 //! [`ObjectStore::connection`] so another client can address the same bucket
 //! without resolving credentials again.
@@ -34,8 +41,10 @@ pub struct S3Store {
     /// In-bucket prefix under which this datastore's keys live.
     prefix: String,
     region: String,
-    access_key: String,
-    secret_key: String,
+    /// Both keys are present for signed access and both are absent for
+    /// anonymous access. Constructors preserve that invariant.
+    access_key: Option<String>,
+    secret_key: Option<String>,
     /// The path-style endpoint override this store was opened with, if any.
     endpoint: Option<String>,
     /// Base origin, e.g. `https://bucket.s3.us-east-1.amazonaws.com` (virtual
@@ -50,7 +59,9 @@ pub struct S3Store {
 /// [`S3Store::with_credentials`], as a metastore holds them per datastore.
 #[derive(Clone)]
 pub struct S3Credentials {
-    pub region: String,
+    /// Optional signing region. When not set, it is discovered with an
+    /// unsigned `HeadBucket` request before the store is opened.
+    pub region: Option<String>,
     pub access_key: String,
     pub secret_key: String,
     /// A path-style S3-compatible endpoint (e.g. MinIO). `None` uses AWS
@@ -60,20 +71,55 @@ pub struct S3Credentials {
 
 impl S3Store {
     /// Open `s3://bucket/prefix` with the credentials, region, and endpoint the
-    /// environment carries. The two keys are required: without something to sign
-    /// a request with there is nothing this store could do.
+    /// environment carries. If neither key is set, use anonymous access. A
+    /// partial key pair is rejected rather than silently changing auth modes.
     pub fn with_env_credentials(uri: &str) -> Result<Self> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
 
-        let region = env_any(&["AWS_REGION", "AWS_DEFAULT_REGION"])
-            .unwrap_or_else(|| "us-east-1".to_string());
-        let credentials = S3Credentials {
+        let region = env_any(&["AWS_REGION", "AWS_DEFAULT_REGION"]);
+        let (access_key, secret_key) = env_credentials()?;
+        Self::build(
+            uri,
+            bucket,
+            prefix,
             region,
-            access_key: env_req("AWS_ACCESS_KEY_ID")?,
-            secret_key: env_req("AWS_SECRET_ACCESS_KEY")?,
-            endpoint: std::env::var("AWS_ENDPOINT_URL").ok(),
-        };
-        Ok(Self::build(uri, bucket, prefix, credentials))
+            access_key,
+            secret_key,
+            std::env::var("AWS_ENDPOINT_URL").ok(),
+        )
+    }
+
+    /// Open `s3://bucket/prefix` anonymously against AWS's standard endpoint.
+    /// This deliberately does not consult the environment, so a metastore can
+    /// preserve its scoped-secret policy while allowing an uncovered public
+    /// location to be read.
+    pub fn anonymous(uri: &str) -> Result<Self> {
+        let (bucket, prefix) = parse_s3_uri(uri)?;
+        Self::build(uri, bucket, prefix, None, None, None, None)
+    }
+
+    /// Open anonymously with explicit connection parameters. Useful for an
+    /// S3-compatible service whose endpoint is not AWS's standard endpoint.
+    pub fn anonymous_with_options(
+        uri: &str,
+        region: impl Into<String>,
+        endpoint: Option<String>,
+    ) -> Result<Self> {
+        let (bucket, prefix) = parse_s3_uri(uri)?;
+        Self::build(
+            uri,
+            bucket,
+            prefix,
+            Some(region.into()),
+            None,
+            None,
+            endpoint,
+        )
+    }
+
+    /// Whether this store sends S3 requests without SigV4 authentication.
+    pub fn is_anonymous(&self) -> bool {
+        self.access_key.is_none()
     }
 
     /// Parse `s3://bucket/prefix` but take credentials/region/endpoint from
@@ -81,13 +127,35 @@ impl S3Store {
     /// open a datastore with its own configured keys.
     pub fn with_credentials(uri: &str, credentials: S3Credentials) -> Result<Self> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
-        Ok(Self::build(uri, bucket, prefix, credentials))
+        Self::build(
+            uri,
+            bucket,
+            prefix,
+            credentials.region,
+            Some(credentials.access_key),
+            Some(credentials.secret_key),
+            credentials.endpoint,
+        )
     }
 
-    /// Assemble the store from a parsed bucket/prefix and resolved credentials,
-    /// computing the signing origin and `Host` from the (optional) endpoint.
-    fn build(uri: &str, bucket: &str, prefix: &str, credentials: S3Credentials) -> Self {
-        let (base, host) = match credentials.endpoint.as_deref() {
+    /// Assemble the store from a parsed bucket/prefix and resolved connection
+    /// parameters, computing the signing origin and `Host` from the optional
+    /// endpoint.
+    fn build(
+        uri: &str,
+        bucket: &str,
+        prefix: &str,
+        region: Option<String>,
+        access_key: Option<String>,
+        secret_key: Option<String>,
+        endpoint: Option<String>,
+    ) -> Result<Self> {
+        let agent = ureq::AgentBuilder::new().build();
+        let region = match region.filter(|region| !region.trim().is_empty()) {
+            Some(region) => region,
+            None => discover_bucket_region(&agent, bucket, endpoint.as_deref())?,
+        };
+        let (base, host) = match endpoint.as_deref() {
             // Path-style against a custom endpoint (MinIO etc.).
             Some(ep) => {
                 let ep = ep.trim_end_matches('/');
@@ -103,22 +171,22 @@ impl S3Store {
             }
             // Virtual-hosted style on AWS.
             None => {
-                let host = format!("{bucket}.s3.{}.amazonaws.com", credentials.region);
+                let host = format!("{bucket}.s3.{region}.amazonaws.com");
                 (format!("https://{host}"), host)
             }
         };
 
-        Self {
+        Ok(Self {
             uri: uri.to_string(),
             prefix: prefix.to_string(),
-            region: credentials.region,
-            access_key: credentials.access_key,
-            secret_key: credentials.secret_key,
-            endpoint: credentials.endpoint,
+            region,
+            access_key,
+            secret_key,
+            endpoint,
             base,
             host,
-            agent: ureq::AgentBuilder::new().build(),
-        }
+            agent,
+        })
     }
 
     /// Full request URL for an in-bucket object name (already prefixed).
@@ -136,10 +204,15 @@ impl S3Store {
         extra_headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Vec<(String, String)>> {
+        let (access_key, secret_key) = match (&self.access_key, &self.secret_key) {
+            (Some(access_key), Some(secret_key)) => (access_key, secret_key),
+            (None, None) => return Ok(Vec::new()),
+            _ => unreachable!("S3 credentials are either both present or both absent"),
+        };
         // Long-lived keys only, so neither a session token nor an expiry.
         // `Static` is the SDK's own name for keys handed over directly rather
         // than resolved by a credentials provider.
-        let creds = Credentials::new(&self.access_key, &self.secret_key, None, None, "Static");
+        let creds = Credentials::new(access_key, secret_key, None, None, "Static");
         let identity = creds.into();
 
         let mut settings = SigningSettings::default();
@@ -185,7 +258,12 @@ impl S3Store {
 
 impl ObjectStore for S3Store {
     fn describe(&self) -> String {
-        format!("{} (prefix `{}`)", self.base, self.prefix)
+        let auth = if self.is_anonymous() {
+            ", anonymous"
+        } else {
+            ""
+        };
+        format!("{} (prefix `{}`{auth})", self.base, self.prefix)
     }
 
     /// A no-op: S3 has no directories. A key is a flat string, and an object at
@@ -201,12 +279,17 @@ impl ObjectStore for S3Store {
     fn connection(&self) -> StoreConnection {
         StoreConnection::S3 {
             uri: self.uri.clone(),
-            credentials: S3Credentials {
-                region: self.region.clone(),
-                access_key: self.access_key.clone(),
-                secret_key: self.secret_key.clone(),
+            region: self.region.clone(),
+            credentials: self.access_key.as_ref().map(|access_key| S3Credentials {
+                region: Some(self.region.clone()),
+                access_key: access_key.clone(),
+                secret_key: self
+                    .secret_key
+                    .clone()
+                    .expect("an access key always has a matching secret key"),
                 endpoint: self.endpoint.clone(),
-            },
+            }),
+            endpoint: self.endpoint.clone(),
         }
     }
 
@@ -329,7 +412,9 @@ impl ObjectStore for S3Store {
     }
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {
-        // S3 presigns the URL: auth rides in the query string, no per-request header.
+        // Authenticated S3 presigns the URL, while anonymous S3 returns the
+        // same object URL without query parameters. Neither needs a per-request
+        // header from the range reader.
         Ok(DataFileLocation::Remote {
             url: self.presign_get(key)?,
             auth: None,
@@ -410,8 +495,9 @@ impl S3Store {
         }
     }
 
-    /// A time-limited GET URL for `key`, signed in the query string so the
-    /// io_uring HTTP reader can range-read it with no auth headers.
+    /// A GET URL for `key`: time-limited and signed in the query string when
+    /// credentials exist, bare when this store is anonymous. Either form lets
+    /// the io_uring HTTP reader range-read it with no auth headers.
     fn presign_get(&self, key: &ObjectPath) -> Result<url::Url> {
         self.presign("GET", key)
     }
@@ -419,11 +505,19 @@ impl S3Store {
     fn presign(&self, method: &str, key: &ObjectPath) -> Result<url::Url> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
+        let (access_key, secret_key) = match (&self.access_key, &self.secret_key) {
+            (Some(access_key), Some(secret_key)) => (access_key, secret_key),
+            (None, None) => {
+                return url::Url::parse(&url)
+                    .map_err(|e| StoreError::Http(format!("parsing anonymous S3 url: {e}")));
+            }
+            _ => unreachable!("S3 credentials are either both present or both absent"),
+        };
 
         // Long-lived keys only, so neither a session token nor an expiry.
         // `Static` is the SDK's own name for keys handed over directly rather
         // than resolved by a credentials provider.
-        let creds = Credentials::new(&self.access_key, &self.secret_key, None, None, "Static");
+        let creds = Credentials::new(access_key, secret_key, None, None, "Static");
         let identity = creds.into();
 
         let mut settings = SigningSettings::default();
@@ -504,18 +598,200 @@ fn parse_s3_uri(uri: &str) -> Result<(&str, &str)> {
     Ok(rest.split_once('/').unwrap_or((rest, "")))
 }
 
+/// Ask the bucket which region owns it. AWS returns `x-amz-bucket-region` from
+/// `HeadBucket` even when the unsigned request is denied, so a private bucket
+/// can be located before credentials are signed for its region. A custom
+/// endpoint gets the same path-style probe; compatible services that do not
+/// implement the header need an explicit region instead.
+fn discover_bucket_region(
+    agent: &ureq::Agent,
+    bucket: &str,
+    endpoint: Option<&str>,
+) -> Result<String> {
+    let url = match endpoint {
+        Some(endpoint) => format!("{}/{bucket}", endpoint.trim_end_matches('/')),
+        None => format!("https://{bucket}.s3.amazonaws.com"),
+    };
+    let response = match agent.head(&url).call() {
+        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+        Err(error) => {
+            return Err(StoreError::Http(format!(
+                "discovering region for S3 bucket `{bucket}` with HEAD {url}: {error}"
+            )));
+        }
+    };
+    let status = response.status();
+    response
+        .header("x-amz-bucket-region")
+        .filter(|region| !region.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            StoreError::Config(format!(
+                "HEAD {url} returned {status} without x-amz-bucket-region; set the S3 region explicitly"
+            ))
+        })
+}
+
 fn env_any(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| std::env::var(k).ok())
 }
 
-fn env_req(key: &str) -> Result<String> {
-    std::env::var(key)
-        .map_err(|_| StoreError::Config(format!("environment variable {key} not set")))
+fn env_credentials() -> Result<(Option<String>, Option<String>)> {
+    match (
+        std::env::var("AWS_ACCESS_KEY_ID").ok(),
+        std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
+    ) {
+        (Some(access_key), Some(secret_key)) => Ok((Some(access_key), Some(secret_key))),
+        (None, None) => Ok((None, None)),
+        _ => Err(StoreError::Config(
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
+    /// Serve one response to the region-discovery HEAD request.
+    fn region_server(region: Option<&str>) -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let region = region.map(str::to_string);
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            let region_header = region
+                .map(|region| format!("x-amz-bucket-region: {region}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\n{region_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+        (endpoint, handle)
+    }
+
+    #[test]
+    fn anonymous_requests_have_no_signature() {
+        let store = S3Store::anonymous_with_options(
+            "s3://public-bucket/root",
+            "us-east-1",
+            Some("http://objects.example".to_string()),
+        )
+        .unwrap();
+
+        assert!(
+            store
+                .sign("GET", "http://objects.example", &[], &[])
+                .unwrap()
+                .is_empty()
+        );
+        let DataFileLocation::Remote { url, auth } =
+            store.source(&ObjectPath::new("part.parquet")).unwrap()
+        else {
+            panic!("S3 source must be remote");
+        };
+        assert_eq!(
+            url.as_str(),
+            "http://objects.example/public-bucket/root/part.parquet"
+        );
+        assert!(url.query().is_none());
+        assert!(auth.is_none());
+        assert!(matches!(
+            store.connection(),
+            StoreConnection::S3 {
+                credentials: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_missing_region_is_discovered_from_a_denied_head_bucket_request() {
+        let (endpoint, request) = region_server(Some("eu-west-2"));
+
+        let store = S3Store::with_credentials(
+            "s3://private-bucket/root",
+            S3Credentials {
+                region: None,
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                endpoint: Some(endpoint),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.connection(),
+            StoreConnection::S3 { region, .. } if region == "eu-west-2"
+        ));
+        let request = request.join().unwrap();
+        assert!(request.starts_with("HEAD /private-bucket "));
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[test]
+    fn missing_region_header_asks_for_an_explicit_region() {
+        let (endpoint, request) = region_server(None);
+
+        let error = discover_bucket_region(
+            &ureq::AgentBuilder::new().build(),
+            "compatible-bucket",
+            Some(&endpoint),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("set the S3 region explicitly"));
+        request.join().unwrap();
+    }
+
+    #[test]
+    fn configured_credentials_still_sign_requests() {
+        let store = S3Store::with_credentials(
+            "s3://private-bucket/root",
+            S3Credentials {
+                region: Some("us-east-1".to_string()),
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                endpoint: Some("http://objects.example".to_string()),
+            },
+        )
+        .unwrap();
+
+        let headers = store
+            .sign(
+                "GET",
+                "http://objects.example/private-bucket/root/part.parquet",
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        );
+        let DataFileLocation::Remote { url, .. } =
+            store.source(&ObjectPath::new("part.parquet")).unwrap()
+        else {
+            panic!("S3 source must be remote");
+        };
+        assert!(url.query().is_some());
+        assert!(matches!(
+            store.connection(),
+            StoreConnection::S3 {
+                credentials: Some(_),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn list_response_parses_keys_and_sizes() {
