@@ -38,6 +38,11 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// each accepted operation to the kernel.
 pub const RING_SIZE: u32 = 64;
 
+/// How many times one `completions` pass re-reaps the ring while HTTP sockets
+/// keep completing (see `IORequester::reap_sockets_then_disk`).
+#[cfg(target_os = "linux")]
+const SOCKET_REAP_ROUNDS: usize = 4;
+
 /// One in-flight operator-owned local-file operation.
 struct InFlightFsOp {
     request: DataFlowRequest<FsRequest>,
@@ -529,18 +534,7 @@ impl IORequester {
     /// the [`CachedHttpEngine`]'s cache-file reads / write-backs, and its HTTP
     /// sockets. We drain it once and route each completion to its owner.
     pub fn completions(&mut self) -> Result<Vec<std::result::Result<Completion, FailedIO>>> {
-        let raw = self.backend.completions()?;
-
-        // HTTP socket CQEs drive the engine first: they may submit follow-up SQEs
-        // and populate its completed/failed lists. On non-Linux the ring is
-        // disk-only (the engine runs synchronously), so there are none here.
-        #[cfg(target_os = "linux")]
-        for &(result, ud) in &raw {
-            if (ud as u64) & HTTP_TAG != 0 {
-                self.http
-                    .on_socket_completion(&mut self.backend, ud as u64, result)?;
-            }
-        }
+        let raw = self.reap_sockets_then_disk()?;
 
         let mut out = Vec::new();
 
@@ -548,9 +542,6 @@ impl IORequester {
         // reads / write-backs. Disjoint id spaces, so the id's owning map sorts
         // them out. A negative result is a failure surfaced to just that dataflow.
         for &(result, ud) in &raw {
-            if !disk_completion(ud) {
-                continue; // HTTP socket op, already routed above
-            }
             if let Some(InFlightFsOp {
                 request,
                 bytes_done: done,
@@ -724,6 +715,45 @@ impl IORequester {
         Ok(out)
     }
 
+    /// Drain the ring, driving every HTTP socket CQE through the engine and
+    /// returning the disk CQEs for the caller to route.
+    ///
+    /// A socket CQE re-pumps its connection with the next recv, and when the
+    /// kernel already holds more of that socket's bytes the recv completes
+    /// inline at submit, so the queue is reaped again while sockets keep
+    /// completing: every extra round moves each backlogged connection one more
+    /// buffer along before this pass hands the worker back to CPU work. The
+    /// round bound keeps a pass finite under a sustained inbound stream.
+    #[cfg(target_os = "linux")]
+    fn reap_sockets_then_disk(&mut self) -> Result<Vec<(i32, Identifier)>> {
+        let mut disk = Vec::new();
+        let mut raw = self.backend.completions()?;
+        for round in 1.. {
+            let mut socket_progress = false;
+            for &(result, ud) in &raw {
+                if (ud as u64) & HTTP_TAG != 0 {
+                    self.http
+                        .on_socket_completion(&mut self.backend, ud as u64, result)?;
+                    socket_progress = true;
+                } else {
+                    disk.push((result, ud));
+                }
+            }
+            if !socket_progress || round == SOCKET_REAP_ROUNDS {
+                break;
+            }
+            raw = self.backend.completions()?;
+        }
+        Ok(disk)
+    }
+
+    /// Non-Linux rings carry disk ops only (the HTTP engine runs synchronously),
+    /// so every CQE is a disk CQE.
+    #[cfg(not(target_os = "linux"))]
+    fn reap_sockets_then_disk(&mut self) -> Result<Vec<(i32, Identifier)>> {
+        self.backend.completions()
+    }
+
     /// Blocks until at least one pending read (disk or HTTP) makes progress. On
     /// Linux both ride one ring, so a single `submit_and_wait` wakes on either.
     #[cfg(target_os = "linux")]
@@ -769,18 +799,6 @@ fn http_cache_extent(request: &DataFlowRequest<HttpRequest>) -> Option<(OpenFile
         HttpRequest::Get(read) => Some((OpenFile::Remote(read.remote.clone()), read.block.clone())),
         HttpRequest::Upload(_) => None,
     }
-}
-
-/// Whether a CQE's `user_data` is a disk read rather than an HTTP socket op. The
-/// HTTP engine sets the `HTTP_TAG` high bit on its SQEs (Linux only); disk ids
-/// are small counters that never reach it.
-#[cfg(target_os = "linux")]
-fn disk_completion(ud: Identifier) -> bool {
-    (ud as u64) & HTTP_TAG == 0
-}
-#[cfg(not(target_os = "linux"))]
-fn disk_completion(_ud: Identifier) -> bool {
-    true
 }
 
 #[cfg(test)]
