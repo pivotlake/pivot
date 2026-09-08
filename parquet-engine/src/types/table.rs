@@ -206,32 +206,35 @@ pub(crate) fn row_groups_from_metadata(
                 leaves.len()
             )));
         }
-        row_groups.push((
-            rg.num_rows,
-            rg.columns
-                .into_iter()
-                .enumerate()
-                .map(|(j, cc)| {
-                    let meta = cc.meta_data.expect("missing column metadata");
-                    let physical_type = meta.physical_type;
-                    leaf_physical_types[j] = physical_type;
-                    leaf_stats[j].push(meta.statistics);
-                    let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
-                        && data_pages_all_dictionary(meta.encoding_stats.as_deref());
-                    ColumnChunkMeta {
-                        codec: meta.codec,
-                        dictionary_page_offset: meta.dictionary_page_offset,
-                        data_page_offset: meta.data_page_offset,
-                        total_compressed_size: meta.total_compressed_size,
-                        total_uncompressed_size: meta.total_uncompressed_size,
-                        max_def_level: leaf_infos[j].def_level,
-                        physical_type,
-                        fixed_len_byte_width: leaf_infos[j].type_length,
-                        data_pages_all_dictionary,
-                    }
-                })
-                .collect(),
-        ));
+        let mut columns: Vec<ColumnChunkMeta> = rg
+            .columns
+            .into_iter()
+            .enumerate()
+            .map(|(j, cc)| {
+                let meta = cc.meta_data.expect("missing column metadata");
+                let physical_type = meta.physical_type;
+                leaf_physical_types[j] = physical_type;
+                leaf_stats[j].push(meta.statistics);
+                let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
+                    && data_pages_all_dictionary(meta.encoding_stats.as_deref());
+                ColumnChunkMeta {
+                    codec: meta.codec,
+                    dictionary_page_offset: meta.dictionary_page_offset,
+                    data_page_offset: meta.data_page_offset,
+                    total_compressed_size: meta.total_compressed_size,
+                    total_uncompressed_size: meta.total_uncompressed_size,
+                    max_def_level: leaf_infos[j].def_level,
+                    physical_type,
+                    fixed_len_byte_width: leaf_infos[j].type_length,
+                    data_pages_all_dictionary,
+                }
+            })
+            .collect();
+        // The collect runs in place over the buffer the footer parse allocated
+        // for the chunks, which is several times wider per element than what is
+        // kept. The surplus lives as long as the table does, so release it here.
+        columns.shrink_to_fit();
+        row_groups.push((rg.num_rows, columns));
     }
 
     let statistics = Arc::new(
@@ -840,6 +843,20 @@ mod tests {
                 .value(0),
             &[2]
         );
+    }
+
+    #[test]
+    fn row_group_column_metadata_keeps_no_surplus_capacity() {
+        // Setup
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let batch = RecordBatch::try_from_iter([("value", values)]).unwrap();
+
+        // Execute
+        let (_dir, table) = write_parquet(&batch, EnabledStatistics::Chunk);
+
+        // Assert
+        let columns = &table.row_groups[0].columns;
+        assert_eq!(columns.capacity(), columns.len());
     }
 
     fn enc_stat(page_type: PageType, encoding: Encoding, count: i32) -> PageEncodingStats {
