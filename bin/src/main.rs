@@ -22,10 +22,11 @@ enum PivotCommand {
     /// also spelled s3a://), gs://bucket/prefix, or file:///path.
     ///
     /// Object-store credentials are read from the environment. S3 takes
-    /// AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, its region from AWS_REGION
-    /// or AWS_DEFAULT_REGION (us-east-1 when neither is set), and an optional
-    /// AWS_ENDPOINT_URL naming a path-style S3-compatible endpoint such as
-    /// MinIO. GCS follows Application Default Credentials:
+    /// AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY when both are set, or uses
+    /// anonymous access when both are absent. Its region comes from AWS_REGION
+    /// or AWS_DEFAULT_REGION when set, and is discovered with HeadBucket
+    /// otherwise. An optional AWS_ENDPOINT_URL names a path-style S3-compatible
+    /// endpoint such as MinIO. GCS follows Application Default Credentials:
     /// GOOGLE_APPLICATION_CREDENTIALS, then the gcloud login file, then the
     /// instance metadata server.
     Open {

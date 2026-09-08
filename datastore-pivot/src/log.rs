@@ -823,13 +823,21 @@ impl DeltaEngine {
 fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObjectStore>, Error> {
     let store: Arc<DynObjectStore> = match connection {
         StoreConnection::Local => Arc::new(LocalFileSystem::new()),
-        StoreConnection::S3 { uri, credentials } => {
-            let mut builder = AmazonS3Builder::new()
-                .with_url(uri)
-                .with_region(credentials.region)
-                .with_access_key_id(credentials.access_key)
-                .with_secret_access_key(credentials.secret_key);
-            if let Some(endpoint) = credentials.endpoint {
+        StoreConnection::S3 {
+            uri,
+            region,
+            credentials,
+            endpoint,
+        } => {
+            let mut builder = AmazonS3Builder::new().with_url(uri).with_region(region);
+            if let Some(credentials) = credentials {
+                builder = builder
+                    .with_access_key_id(credentials.access_key)
+                    .with_secret_access_key(credentials.secret_key);
+            } else {
+                builder = builder.with_skip_signature(true);
+            }
+            if let Some(endpoint) = endpoint {
                 builder = builder
                     .with_endpoint(endpoint)
                     .with_allow_http(true)

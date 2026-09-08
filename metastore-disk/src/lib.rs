@@ -65,9 +65,10 @@
 //!       credentials_file: /etc/pivot/gcs-key.json
 //! ```
 //!
-//! An `s3://` datastore needs a secret covering it: without one there is
-//! nothing to sign its requests with, and startup stops. A `gs://` datastore
-//! without one falls back to the ambient Application Default Credentials chain
+//! An `s3://` datastore without a covering secret uses anonymous, unsigned
+//! requests. This supports public S3 locations; define a secret when the
+//! location requires authentication. A `gs://` datastore without one falls
+//! back to the ambient Application Default Credentials chain
 //! (`GOOGLE_APPLICATION_CREDENTIALS`, the file
 //! `gcloud auth application-default login` writes, or the workload identity of
 //! the Google compute instance).
@@ -123,8 +124,7 @@ use datastore_pivot::{
 };
 use dispatch::DataFlowDispatcher;
 use object_storage::{
-    ExternalStoreFactory, GcsStore, LocalStore, ObjectStore, S3Store, StoreError, StoreScheme,
-    local_path,
+    ExternalStoreFactory, GcsStore, LocalStore, ObjectStore, S3Store, StoreScheme, local_path,
 };
 use pgwire::api::auth::sasl::scram::gen_salted_password;
 use serde::{Deserialize, Serialize};
@@ -171,14 +171,10 @@ struct SecretExternalStoreFactory {
 impl ExternalStoreFactory for SecretExternalStoreFactory {
     fn open(&self, root_uri: &str) -> object_storage::Result<Arc<dyn ObjectStore>> {
         match StoreScheme::of(root_uri)? {
-            StoreScheme::S3 => {
-                let credentials = self.secrets.resolve_s3(root_uri).ok_or_else(|| {
-                    StoreError::Config(format!(
-                        "no S3 secret covers external store root `{root_uri}`"
-                    ))
-                })?;
-                Ok(Arc::new(S3Store::with_credentials(root_uri, credentials)?))
-            }
+            StoreScheme::S3 => Ok(Arc::new(match self.secrets.resolve_s3(root_uri) {
+                Some(credentials) => S3Store::with_credentials(root_uri, credentials)?,
+                None => S3Store::anonymous(root_uri)?,
+            })),
             StoreScheme::Gcs => Ok(Arc::new(match self.secrets.resolve_gcs(root_uri) {
                 Some(credentials_file) => {
                     GcsStore::with_credentials_file(root_uri, credentials_file)?
@@ -451,8 +447,6 @@ pub enum Error {
         scope: String,
         expected: &'static str,
     },
-    #[error("datastore `{name}`: no secret is scoped to `{location}`; define one under `secrets`")]
-    NoSecret { name: String, location: String },
     #[error("user `{name}` already exists")]
     UserExists { name: String },
     #[error("creating a user requires a metastore file; start the server with --metastore-file")]
@@ -687,25 +681,16 @@ impl DatastoreConfig {
     /// serving an empty datastore out of a directory named after the URI.
     ///
     /// A remote store is opened with the secret scoped to its location. An S3
-    /// location needs one: without it there is nothing to sign a request with.
-    /// A GCS location without one falls back to the ambient Application
-    /// Default Credentials chain, which on Google compute is the whole
-    /// configuration a store needs.
-    fn open_store(&self, name: &str, secrets: &Secrets) -> Result<Arc<dyn ObjectStore>> {
+    /// location without one uses anonymous, unsigned requests, supporting
+    /// public buckets and no-auth S3 endpoints. A GCS location without one
+    /// falls back to the ambient Application Default Credentials chain, which
+    /// on Google compute is the whole configuration a store needs.
+    fn open_store(&self, _name: &str, secrets: &Secrets) -> Result<Arc<dyn ObjectStore>> {
         match StoreScheme::of(&self.location)? {
-            StoreScheme::S3 => {
-                let credentials =
-                    secrets
-                        .resolve_s3(&self.location)
-                        .ok_or_else(|| Error::NoSecret {
-                            name: name.to_string(),
-                            location: self.location.clone(),
-                        })?;
-                Ok(Arc::new(S3Store::with_credentials(
-                    &self.location,
-                    credentials,
-                )?))
-            }
+            StoreScheme::S3 => Ok(Arc::new(match secrets.resolve_s3(&self.location) {
+                Some(credentials) => S3Store::with_credentials(&self.location, credentials)?,
+                None => S3Store::anonymous(&self.location)?,
+            })),
             StoreScheme::Gcs => Ok(Arc::new(match secrets.resolve_gcs(&self.location) {
                 Some(credentials_file) => {
                     GcsStore::with_credentials_file(&self.location, credentials_file)?
@@ -976,7 +961,7 @@ datastores:
     }
 
     #[test]
-    fn an_s3_datastore_no_secret_covers_is_rejected() {
+    fn an_s3_datastore_no_secret_covers_selects_anonymous_access() {
         let yaml = format!(
             "{WARM_SECTION}{}",
             r#"
@@ -991,9 +976,19 @@ secrets:
         );
 
         let store = from_yaml(&yaml).unwrap();
-        let error = open_store(&store, "warm").unwrap_err();
+        assert!(
+            store
+                .secrets
+                .resolve_s3(&datastore(&store, "warm").location)
+                .is_none()
+        );
+    }
 
-        assert!(matches!(&error, Error::NoSecret { .. }), "{error}");
+    #[test]
+    fn an_external_s3_location_without_a_covering_secret_selects_anonymous_access() {
+        let store = from_yaml(HOT_SECTION).unwrap();
+
+        assert!(store.secrets.resolve_s3("s3://public/events").is_none());
     }
 
     #[test]
@@ -1101,6 +1096,28 @@ secrets:
     }
 
     #[test]
+    fn an_s3_secret_may_omit_its_region_for_discovery() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  aws:
+    type: s3
+    access_key_id: AKIA
+    secret_access_key: secret
+"#
+        );
+
+        let store = from_yaml(&yaml).unwrap();
+        let credentials = store
+            .secrets
+            .resolve_s3("s3://analytics/warm/data")
+            .unwrap();
+
+        assert!(credentials.region.is_none());
+    }
+
+    #[test]
     fn a_scope_covers_a_deeper_path_but_not_a_longer_bucket_name() {
         // One scope, two datastores: `covered` sits under the bucket it names,
         // `adjacent` in a bucket whose name merely starts with it.
@@ -1133,8 +1150,12 @@ secrets:
                 .describe()
                 .contains("eu-west-1")
         );
-        let error = open_store(&store, "adjacent").unwrap_err();
-        assert!(matches!(&error, Error::NoSecret { .. }), "{error}");
+        assert!(
+            store
+                .secrets
+                .resolve_s3(&datastore(&store, "adjacent").location)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1155,9 +1176,12 @@ secrets:
         );
 
         let store = from_yaml(&yaml).unwrap();
-        let error = open_store(&store, "warm").unwrap_err();
-
-        assert!(matches!(&error, Error::NoSecret { .. }), "{error}");
+        assert!(
+            store
+                .secrets
+                .resolve_s3(&datastore(&store, "warm").location)
+                .is_none()
+        );
     }
 
     #[test]

@@ -48,7 +48,10 @@ pub(crate) enum SecretConfig {
         /// every S3 location.
         #[serde(skip_serializing_if = "Option::is_none")]
         scope: Option<String>,
-        region: String,
+        /// Optional signing region. For AWS S3, an unspecified region is
+        /// discovered from the bucket before the store is opened.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        region: Option<String>,
         access_key_id: String,
         secret_access_key: String,
         /// A path-style S3-compatible endpoint (e.g. MinIO). Omitted, requests
@@ -156,7 +159,7 @@ fn split_segments(uri: &str) -> Vec<String> {
 /// An S3 secret as resolved: what signing a request needs.
 #[derive(Clone)]
 struct S3Secret {
-    region: String,
+    region: Option<String>,
     access_key_id: String,
     secret_access_key: String,
     endpoint: Option<String>,

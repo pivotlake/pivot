@@ -154,29 +154,6 @@ fn external_parquet_query(root: &str) -> String {
 }
 
 #[test]
-fn an_external_s3_location_without_a_covering_secret_is_rejected() {
-    let database = TempDir::new().unwrap();
-    let config = datastores_section(&database.path().to_string_lossy());
-
-    let message = block_on(async {
-        let client = connect_client(start_server_from_config(&config)).await;
-        client
-            .simple_query(
-                "SELECT value FROM read_parquet(\
-                 's3://uncovered/events/part-*.parquet')",
-            )
-            .await
-            .unwrap_err()
-            .as_db_error()
-            .unwrap()
-            .message()
-            .to_string()
-    });
-
-    assert!(message.contains("no S3 secret covers"), "{message}");
-}
-
-#[test]
 fn an_s3_datastore_is_served_with_the_secret_scoped_to_it() {
     let Some(backend) = test_support::s3("secrets-s3") else {
         return;

@@ -68,10 +68,11 @@ metastore:
   # a location authenticates it, and two secrets may not claim the same scope.
   # Omit `scope` to cover every location of the type.
   #
-  # An `s3://` datastore needs a secret covering it. A `gs://` one without a
-  # secret falls back to the ambient Application Default Credentials
-  # (GOOGLE_APPLICATION_CREDENTIALS, `gcloud auth application-default login`, or
-  # the workload identity of the Google compute instance).
+  # An `s3://` datastore without a covering secret uses anonymous requests, for
+  # public buckets. A `gs://` one without a secret falls back to the ambient
+  # Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS, `gcloud
+  # auth application-default login`, or the workload identity of the Google
+  # compute instance).
   secrets:
     example-bucket:
       type: s3
