@@ -160,15 +160,30 @@ report_how_to_run() {
         pivot_command=pivot
     else
         pivot_command=$(abbreviate_home "$binary_directory/pivot" '~')
-        printf '\n%s is not on your PATH. To put it there, append this line to your shell profile:\n' \
-            "$(abbreviate_home "$binary_directory" '~')"
-        printf '    export PATH="%s:$PATH"\n' "$(abbreviate_home "$binary_directory" '$HOME')"
     fi
 
     printf '\nGet started:\n'
     printf '    %s open ~/pivot-data           open a local datastore in the SQL shell\n' "$pivot_command"
     printf '    %s open s3://bucket/prefix     or one that lives in object storage\n' "$pivot_command"
     printf '\nDocumentation: https://pivotlake.io/docs\n\n'
+
+    if [ "$on_path" = 0 ]; then
+        bold=
+        reset=
+        if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then
+            bold=$(printf '\033[1m')
+            reset=$(printf '\033[0m')
+        fi
+        case "${SHELL:-}" in
+            */zsh) shell_profile='${ZDOTDIR:-$HOME}/.zshrc' ;;
+            */bash) shell_profile='$HOME/.bashrc' ;;
+            *) shell_profile='$HOME/.profile' ;;
+        esac
+        printf '%s%s is not on your PATH. To add it permanently and activate it now, run:\n' \
+            "$bold" "$(abbreviate_home "$binary_directory" '~')"
+        printf '    echo '\''export PATH="%s:$PATH"'\'' >> "%s" && . "%s"%s\n' \
+            "$(abbreviate_home "$binary_directory" '$HOME')" "$shell_profile" "$shell_profile" "$reset"
+    fi
 }
 
 main() {
