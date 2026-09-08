@@ -4,13 +4,13 @@ description: What is available in Pivot today and what the project is working to
 sidebar:
   order: 3
 ---
-Pivot is still an early-stage product. As with any product at this stage, we had to be deliberate about which features and capabilities made it into the initial releases, focusing on the set we felt was most important for getting Pivot into users’ hands.
+Pivot is still an early-stage product. As with any product at this stage, the initial releases required a deliberate focus on the features and capabilities considered most important for getting Pivot into users’ hands.
 
-This section is intended to provide visibility into where Pivot is heading and the features and capabilities we expect to add over the short to medium term.
+This section is intended to provide visibility into where Pivot is heading and the features and capabilities that are expected to be added over the short to medium term.
 
 Pivot was created to improve the ecosystem around open data formats and make it possible to build and operate an open data architecture without compromising on performance. The direction outlined here reflects that goal, but it is not set in stone.
 
-If you are using Pivot, considering using it, or simply have thoughts about where the project should go, we would love to hear them. If you disagree with any of the priorities outlined here or think something important is missing, please open a GitHub issue at  or start a discussion in the community Slack.
+If you are using Pivot, considering using it, or simply have thoughts about where the project should go, we would love to hear them. If you disagree with any of the priorities outlined here or think something important is missing, please open a GitHub issue at |fillme| or start a discussion in the community Slack.
 
 ## Planned enhancements:
 ### Format support
