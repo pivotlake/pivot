@@ -168,22 +168,11 @@ Because of this, some databases have explored building specialized operating sys
 Rather than forcing Pivot users to move to an unfamiliar or less mature operating system, Pivot tries to get the best of both worlds: taking as much control as possible over scheduling, I/O, and memory management from the OS, while still benefiting from the stability, ecosystem, and extensive set of libraries that Linux has to offer.
 
 #### Memory: custom memory management
-Instead of relying on an existing general-purpose allocator, Pivot uses an internal block-based allocator for most of its memory needs. Rather than dealing with fragmentation, heap size classes, and many of the other concerns general-purpose allocators are designed around, Pivot manages memory as a collection of fixed-size 2 MB buffers.
+Instead of relying on a general-purpose allocator, Pivot uses its own block-based allocator for most of its memory needs. Every operation in Pivot (decompression, decoding, and so on) works over a collection of fixed-size, non-contiguous 2 MB blocks rather than a single contiguous buffer.
 
-This works well because Pivot’s memory usage mostly falls into two categories:
+This predictable and simple memory model provides several advantages over a traditional general-purpose allocator:
 
-* Large, long-lived allocations — Parquet row groups, decoded data, decompression buffers, and similar objects. These allocations tend to live longer because they may remain in cache and be reused across queries.
-* Small, short-lived allocations — temporary objects and intermediate data created while executing a query. These allocations are typically no longer needed once an operator, or the query itself, finishes.
-
-Fixed-size 2 MB buffers fit both patterns particularly well.
-
-For large allocations, Pivot simply combines multiple 2 MB buffers into a single logical allocation. Because Pivot controls the layers operating on this memory—decryption, decompression, decoding, and so on—those operations are designed to work directly over non-contiguous blocks. A 20 MB Parquet row group, for example, can be backed by ten separate 2 MB buffers while appearing to the rest of the engine as one logically contiguous region. There is no need to find or maintain a physically contiguous 20 MB allocation.
-
-For small allocations, Pivot uses bump allocation on top of the same 2 MB buffers. Each query or operator can allocate temporary objects by simply advancing an offset within its current buffer. Once that buffer fills up, it grabs another 2 MB buffer and continues from offset zero. When the operator finishes, all of the buffers it used can be released at once—without individually tracking or freeing every small allocation.
-
-Thanks to its fixed 2 MB buffer design, Pivot gets several performance benefits almost for free:
-
-**Fewer page faults** - Pivot’s 2 MB buffers are allocated and faulted in once at startup, then kept for the lifetime of the process rather than being returned to the operating system. Acquiring a buffer is simply a pop from a per-worker free list, and releasing one is a push. There are no size classes to select, no fragmentation to manage, and no mmap or munmap calls on the allocation path (like jemalloc has):
+**Fewer page faults** - Since all of Pivot's buffers are in a constant size -- they can be `mmap`ed and faulted in once at startup, then kept for the lifetime of the process. Acquiring a buffer is simply a pop from a per-worker free list, and releasing one is a push. There are no size classes to select, no fragmentation to manage, and no mmap or munmap calls on the allocation path like other allocators have:
 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 216" role="img" aria-labelledby="alloc-title alloc-desc">
@@ -215,12 +204,12 @@ Thanks to its fixed 2 MB buffer design, Pivot gets several performance benefits 
 <figcaption>100 rounds of acquiring 1000 × 2 MB buffers, touching every page, and releasing them. AWS c8g.4xlarge.</figcaption>
 </figure>
 
-**Huge pages can be utilized.** Because every buffer is exactly 2 MB, Pivot asks Linux to back the buffer ring with transparent 2 MB huge pages instead of ordinary 4 KB pages. When a query's working set spans more pages than the TLB can hold, each miss costs a multi-level walk through the page tables. With huge pages, one TLB entry covers 512 times as much memory, so operators that jump around large structures, such as the hash tables behind joins and aggregations, hit in the dTLB far more often and walk the page tables far less:
+**Huge pages can be utilized.** Because every buffer is exactly 2 MB, Pivot asks Linux to back the buffer ring with transparent 2 MB huge pages instead of ordinary 4 KB pages. When a query's working set spans more pages than the [TLB](https://en.wikipedia.org/wiki/Translation_lookaside_buffer) can hold, each miss costs a multi-level walk through the page tables. With huge pages, one TLB entry covers 512 times as much memory, so operators that jump around large structures, such as the hash tables behind joins and aggregations, hit in the dTLB far more often and walk the page tables far less:
 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 216" role="img" aria-labelledby="tlb-title tlb-desc">
 <title id="tlb-title">TPC-H q21 with and without huge pages</title>
-<desc id="tlb-desc">Two bar charts for TPC-H SF100 query 21 run hot with the buffer ring on huge pages and on ordinary pages. Query time is 2.47 seconds with huge pages and 3.13 seconds without, 21 percent faster. Data TLB page walks over a 20 second window are 1.2 billion with huge pages and 5.8 billion without, 4.8 times fewer.</desc>
+<desc id="tlb-desc">Two bar charts for TPC-H SF100 query 21 run hot with the buffer ring on huge pages and on ordinary pages. Query time is 2.47 seconds with huge pages and 3.13 seconds without, 21 percent faster. Data TLB page walks are 1.2 billion with huge pages and 5.8 billion without, 4.8 times fewer.</desc>
 <rect x="40" y="24" width="404" height="172" rx="3" class="arch-panel" />
 <text x="64" y="54" class="arch-title">Query time</text>
 <text x="420" y="54" text-anchor="end" class="arch-muted">hot run</text>
@@ -234,7 +223,6 @@ Thanks to its fixed 2 MB buffer design, Pivot gets several performance benefits 
 <text x="335" y="169" class="arch-label">3.13 s</text>
 <rect x="476" y="24" width="404" height="172" rx="3" class="arch-panel" />
 <text x="500" y="54" class="arch-title">Data TLB page walks</text>
-<text x="856" y="54" text-anchor="end" class="arch-muted">20 s window</text>
 <text x="500" y="90" class="arch-label">Huge pages on</text>
 <text x="856" y="90" text-anchor="end" class="arch-tiny">4.8× fewer</text>
 <line x1="500.5" y1="96" x2="500.5" y2="176" class="arch-rule" />
@@ -247,8 +235,98 @@ Thanks to its fixed 2 MB buffer design, Pivot gets several performance benefits 
 <figcaption>TPC-H SF100 q21, hot, with transparent huge pages enabled and disabled in the kernel. AWS c8g.4xlarge.</figcaption>
 </figure>
 
-#### Schelding: a thread per core architecture with custom internal schedling:
+#### Scheduling: a thread per core architecture with custom internal scheduling:
+In the world of database performance, context switches are one of the worst enemies of efficient execution. When multiple tasks or threads compete for the same CPU core, constantly switching between them adds overhead and, more importantly, disrupts the CPU caches that each task relies on. The result is more time spent switching between work and less time actually doing it.
+
+To minimize this overhead, Pivot uses a thread-per-core architecture, designed so that context switches almost never occur during query execution. Each CPU core runs a dedicated Pivot “worker” responsible for scheduling, executing, and orchestrating the work assigned to that core.
+
+To make the most of the CPU caches, each worker also prefers to schedule operations whose data is already “hot” in cache over operations that would require bringing new data in. For example, after decoding a batch of data, a worker will prefer to immediately run a filter over that batch rather than start decoding a new one.
+
+When a worker runs out of work, it can also steal work from a neighboring worker. This allows idle cores to help busy ones, keeping CPU utilization high while still preserving the cache locality of the thread-per-core model:
+
+<figure class="arch-figure">
+<svg viewBox="0 0 920 216" role="img" aria-labelledby="steal-title steal-desc">
+<title id="steal-title">The same query on two cores, without and with work stealing</title>
+<desc id="steal-desc">Two timelines. Without stealing, worker 1 has nine batches and worker 2 has three, so worker 2 finishes early and sits idle while worker 1 works through the rest, and the query finishes when worker 1 does. With stealing, once worker 2 runs out of its own batches it steals the three batches at the oldest end of worker 1 queue. Worker 1 keeps running its newest batches, both workers finish after six batches, and the query completes a third sooner.</desc>
+<defs>
+<marker id="steal-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
+</marker>
+</defs>
+<rect x="40" y="24" width="404" height="172" rx="3" class="arch-panel" />
+<text x="64" y="54" class="arch-title">Without stealing</text>
+<text x="420" y="54" text-anchor="end" class="arch-muted">time</text>
+<line x1="64.5" y1="70" x2="64.5" y2="176" class="arch-rule" />
+<text x="64" y="90" class="arch-label">Worker 1</text>
+<rect x="65" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="101" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="137" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="173" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="209" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="245" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="281" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="317" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="353" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<text x="64" y="146" class="arch-label">Worker 2</text>
+<rect x="65" y="156" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="101" y="156" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="137" y="156" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="173" y="156" width="216" height="16" rx="1" class="arch-inner" />
+<text x="281" y="168" text-anchor="middle" class="arch-tiny">idle</text>
+<path d="M389.5,96 V176" class="arch-line" stroke-dasharray="3 3" />
+<text x="389" y="192" text-anchor="middle" class="arch-tiny">query done</text>
+<rect x="476" y="24" width="404" height="172" rx="3" class="arch-panel" />
+<text x="500" y="54" class="arch-title">With stealing</text>
+<text x="856" y="54" text-anchor="end" class="arch-muted">time</text>
+<line x1="500.5" y1="70" x2="500.5" y2="176" class="arch-rule" />
+<text x="500" y="90" class="arch-label">Worker 1</text>
+<text x="825" y="90" text-anchor="end" class="arch-tiny">oldest end of its queue</text>
+<rect x="501" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="537" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="573" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="609" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="645" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="681" y="100" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="717" y="100" width="34" height="16" rx="1" class="arch-inner" />
+<rect x="753" y="100" width="34" height="16" rx="1" class="arch-inner" />
+<rect x="789" y="100" width="34" height="16" rx="1" class="arch-inner" />
+<text x="500" y="146" class="arch-label">Worker 2</text>
+<rect x="501" y="156" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="537" y="156" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="573" y="156" width="34" height="16" rx="1" class="arch-bar" />
+<rect x="609" y="156" width="34" height="16" rx="1" class="arch-bar-strong" />
+<rect x="645" y="156" width="34" height="16" rx="1" class="arch-bar-strong" />
+<rect x="681" y="156" width="34" height="16" rx="1" class="arch-bar-strong" />
+<path d="M770,118 C770,140 662,132 662,153" class="arch-line" marker-end="url(#steal-arrow)" />
+<path d="M717.5,96 V176" class="arch-line" stroke-dasharray="3 3" />
+<text x="717" y="192" text-anchor="middle" class="arch-tiny">query done</text>
+</svg>
+<figcaption>Twelve equal batches on two cores. Without stealing, Worker 2 finishes its share and idles while Worker 1 works through the rest. With stealing, Worker 2 takes batches from the oldest end of Worker 1's queue, the ones Worker 1 would have reached last and that have long left its cache, so Worker 1 keeps running its newest, still-hot batches and both cores stay busy until the query is done. Stealing stays within a NUMA node, since a batch's memory lives on the node that produced it.</figcaption>
+</figure>
+
+When multiple queries run in parallel, Pivot workers schedule work across them in a way that balances CPU cache locality with fairness. Workers try to balance between executing operations whose data is already hot in cache, and ensuring that no single query consumes all available CPU time and causes others to starve.
 
 #### IO: direct IO with IO uring:
+As a complement to its thread-per-core architecture, Pivot uses io_uring for I/O. This allows each worker to efficiently dispatch and manage many concurrent I/O operations while reducing the syscall overhead associated with reads and writes.
+
+Pivot also avoids relying on the operating system’s page cache for caching disk data, as some other databases such as ClickHouse do by default. Instead, it uses direct I/O together with its own dedicated caching system.
+
+Managing the cache directly gives Pivot more control over what memory is used for. Rather than having disk pages cached independently by the operating system, Pivot can make eviction decisions across different types of cached data—for example, choosing between compressed data read from disk and decompressed or otherwise processed data that is more expensive to reconstruct.
+
+Because these decisions are made by the database itself, Pivot can prioritize cached objects based on their actual value to query execution, rather than relying on the more general-purpose caching policies of the operating system.
 
 ### It utilizes the hardware well.
+
+#### Utilizing the CPU cache
+Pivot’s execution strategy is inspired by [Morsel driven parallelism](https://db.in.tum.de/~leis/papers/morsels.pdf). It prioritizes cache locality by processing data in small batches (i.e. morsels) sized to fit within the CPU’s L1 cache, and tries to perform as much work as possible on each morsel while its data remains hot in the cache.
+
+A single morsel of data is typically processed through the entire pipeline of operations that make up a query before the next morsel begins processing:
+
+<figure>
+
+Thanks to this execution model, along with many cache-conscious optimizations in operators such as GROUP BY and JOIN, queries running on Pivot need to access “cold” memory significantly less often than on other engines:
+
+<figure of memory access of us vs others>
+
+#### Utilizing modern NVMEs
+...

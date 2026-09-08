@@ -133,7 +133,7 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 - **Fast** - Written in Rust and built on state-of-the-art columnar execution techniques, including morsel-driven parallelism, SIMD, NUMA-aware execution, and cache-conscious aggregation and joins, in addition to a few novel additions (#Why-is-pivot-fast?).
 - **Scalable** - With object storage as its backing store, Pivot can be scaled up, down, or to zero almost instantly.
 - **Portable** -     Pivot can run both as a server serving backends and clients, or as a local engine where users and agents query the source of truth directly—allowing local ad-hoc and agentic analytics to share the same engine and architecture as traditional dashboards and in-app analytics
-- **Open** - Pivot is open source and built on open data formats (Delta Lake, with [Iceberg support in progress](/docs/roadmap/#iceberg-tables)). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
+- **Open** - Pivot is open source and built on open data formats (Delta Lake, with [Iceberg support in progress](/docs/database/roadmap/#iceberg-tables)). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
 
 ### Project status
 
@@ -152,6 +152,6 @@ evaluation, experiments and local analysis today.
 - [Quickstart](/docs/quickstart/) runs a server and issues a first query.
 - [Architecture](/docs/database/architecture/) explains how a query becomes
   work across the dispatch pool.
-- [Roadmap](/docs/roadmap/) shows what is available, in progress, and planned.
+- [Roadmap](/docs/database/roadmap/) shows what is available, in progress, and planned.
 - [Reference](/docs/reference/) lists supported SQL, functions, data types,
   system tables, and configuration.

@@ -90,11 +90,6 @@ export default defineConfig({
           label: "Database",
           items: [{ autogenerate: { directory: "database" } }],
         },
-        { label: "Roadmap", slug: "roadmap" },
-        {
-          label: "Use cases",
-          items: [{ autogenerate: { directory: "use-cases" } }],
-        },
         {
           label: "Reference",
           items: [{ autogenerate: { directory: "reference" } }],

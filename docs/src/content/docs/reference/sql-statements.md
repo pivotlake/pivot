@@ -28,4 +28,4 @@ See [Table options](/docs/reference/table-options/) for the three supported
 `CREATE TABLE ... WITH (...)` settings.
 
 `DELETE` is not supported yet. Follow its status on the
-[Roadmap](/docs/roadmap/#delete-support).
+[Roadmap](/docs/database/roadmap/#delete-support).
