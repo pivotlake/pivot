@@ -262,10 +262,9 @@
   font-size: 0.8125rem;
 }
 
-/* Only group headings are set as small caps. Top-level page links also carry
-   Starlight's `.large` class, and uppercasing those makes an ordinary link
-   read as a section heading. */
-#starlight__sidebar summary .large {
+/* Only top-level section headings use small caps. Nested groups read like
+   page links, with their chevron indicating that they expand. */
+#starlight__sidebar .top-level > li > details > summary .large {
   font-family: var(--docs-font-display);
   font-size: 0.75rem;
   text-transform: uppercase;
@@ -273,11 +272,28 @@
   color: var(--sl-color-gray-3);
 }
 
-#starlight__sidebar a {
+#starlight__sidebar a,
+#starlight__sidebar .top-level ul summary {
   border-radius: 0;
   border-left: 1px solid transparent;
   padding-left: 0.75rem;
   color: var(--sl-color-gray-2);
+}
+
+/* Match the typography and row spacing of neighboring page links. */
+#starlight__sidebar .top-level ul summary {
+  padding-block: 0.3em;
+}
+
+#starlight__sidebar .top-level ul summary .large {
+  font: inherit;
+  color: inherit;
+}
+
+@media (min-width: 50rem) {
+  #starlight__sidebar .top-level ul summary {
+    font-size: var(--sl-text-sm);
+  }
 }
 
 /* Top-level page links carry Starlight's `.large` class, which sets 1rem at
@@ -291,7 +307,9 @@
   color: var(--sl-color-gray-1);
 }
 
-#starlight__sidebar a:hover {
+#starlight__sidebar a:hover,
+#starlight__sidebar .top-level ul summary:hover,
+#starlight__sidebar .top-level ul summary:focus-visible {
   color: var(--sl-color-white);
   background-color: transparent;
 }

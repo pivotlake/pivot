@@ -1,96 +1,110 @@
 ---
-title: Configuration
-description: YAML configuration for the pivotdb server and its datastores.
-sidebar:
-  order: 6
+title: "Server configuration"
+description: Configure server resources, caching, TLS, and startup settings.
 ---
 
-The server reads one YAML file, the one `--config` names. Unknown fields are
-rejected, including unknown fields nested inside a section.
+Pivot reads a YAML configuration file. The `server` section controls the
+instance; `metastore` declares the data and users it serves.
 
-The file has a `server` section for the instance, top-level `datastores`,
-`secrets` and `users` maps for what it serves, and a `metastore` section naming
-the file the server writes to. The three maps are the operator's and the server
-never rewrites them; `CREATE USER` lands in the metastore file.
+## Example
 
-Sizes accept whole bytes or base-1024 `k`, `m`, `g`, and `t` suffixes, such as
-`512m` or `32g`. Durations require a `ms`, `s`, `m`, or `h` suffix, such as
-`500ms` or `30s`.
+Save this as `pivot.yaml` to serve a local datastore:
 
-### `server`
+```yaml
+server:
+  bind: 127.0.0.1:5432
+  memory: 4g
+  workers: 4
+  refresh_interval: 30s
 
-Every server setting is optional.
+metastore:
+  datastores:
+    local:
+      kind: pivot
+      location: ./pivot-data
+      default: true
+```
+
+Start the server with:
+
+```sh
+pivot server --config pivot.yaml
+```
+
+## Server
+
+Every `server` setting is optional. Unknown fields are rejected, including
+unknown fields nested inside a section.
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `server.bind` | `127.0.0.1:5432` | Address for the Postgres wire endpoint. |
-| `server.memory` | 80% of total memory minus 4 GiB | Buffer-pool budget. Overrides `PIVOT_MEMORY_PCT`. The 4 GiB is held back for allocations outside the pool. |
+| `server.memory` | 80% of total memory | Buffer-pool budget. Overrides `PIVOT_MEMORY_PCT`. |
 | `server.workers` | Machine core count | Dispatch worker threads. |
 | `server.refresh_interval` | `30s` | How often in-memory catalogs refresh commits made by other processes. |
+
+## Size and duration values
+
+Sizes accept whole bytes or base-1024 `k`, `m`, `g`, and `t` suffixes, such as
+`512m` or `32g`. Durations require `ms`, `s`, `m`, or `h`, such as `500ms` or
+`30s`.
+
+## Disk cache
+
+The optional disk cache stores remote reads on local disk. Add it under
+`server`:
+
+```yaml
+server:
+  disk_cache:
+    dir: /var/cache/pivot
+    size: 64g
+    max_objects: 65536
+```
+
+| Key | Default | Description |
+| --- | --- | --- |
 | `server.disk_cache.dir` | Required when enabled | Persistent local directory for cached remote reads. |
 | `server.disk_cache.size` | `64g` | Cached-byte budget. |
 | `server.disk_cache.max_objects` | `65536` | Maximum cached objects and open cache file descriptors. |
+
+## TLS
+
+Configure both files to offer TLS to clients:
+
+```yaml
+server:
+  tls:
+    cert: /etc/pivot/server.crt
+    key: /etc/pivot/server.key
+```
+
+| Key | Default | Description |
+| --- | --- | --- |
 | `server.tls.cert` | Required when enabled | PEM certificate followed by any intermediate certificates. |
 | `server.tls.key` | Required when enabled | PEM private key in PKCS#8, PKCS#1, or SEC1 form. |
 
-Adding `server.tls` makes TLS available but does not require clients to use it.
-Both `cert` and `key` are required.
+Both files are required when `server.tls` is present. Enabling TLS makes it
+available but does not require clients to use it.
 
-### `datastores`
+## Metastore
 
-Exactly one datastore, in the config or the metastore file, must set
-`default: true`.
+### `metastore.datastores`
 
-| Key | Default | Description |
-| --- | --- | --- |
-| `kind` | Required | Datastore implementation. `pivot` is the only supported value. |
-| `location` | Required | Local path, `s3://` URI, or `gs://` URI. |
-| `default` | `false` | Makes this the target of unqualified SQL names. Exactly one must be true. |
-| `compact` | `true` | Runs background compaction. Enable it in only one process per shared datastore. |
-| `compact_bytes` | `64m` | Compaction output target; files strictly below half this size are small-file candidates, and an individual row group may exceed it. |
-| `compact_merge_bytes` | 1.3 times `compact_bytes` | Accumulated small-file bytes that immediately trigger a merge. |
-| `compact_min_files` | `100` | File count at which the small-file balance fallback may merge. |
-| `compact_parallelism` | `1` | Maximum number of disjoint compaction merges rewritten concurrently. Values below one run one merge at a time. Each merge in flight holds its decoded input rows in memory. |
-| `vacuum` | `true` | Deletes expired unreferenced files and old log entries. Enable it in only one process per shared datastore. |
+Declare local or object-storage datastores and their maintenance settings in
+[Datastores and storage credentials](/docs/reference/server/datastores/#datastores).
 
-### `secrets`
+### `metastore.secrets`
 
-Secret names are user-defined. `scope` is an optional URI prefix; the most
-specific secret covering a datastore location is selected.
+Configure scoped S3 or GCS credentials in
+[Storage credentials](/docs/reference/server/datastores/#storage-credentials).
 
-| Secret type | Keys |
-| --- | --- |
-| `s3` | `type: s3`, optional `scope` and `region`, required `access_key_id` and `secret_access_key`, plus optional `endpoint` for S3-compatible storage. Without a matching secret, S3 uses anonymous, unsigned requests. A missing region is discovered with an unsigned `HeadBucket` request; specify it for compatible endpoints that do not return `x-amz-bucket-region`. |
-| `gcs` | `type: gcs`, optional `scope`, and required `credentials_file`. Without a matching secret, GCS uses ambient Application Default Credentials. |
+### `metastore.users`
 
-Two secrets cannot claim the same scope.
+Configure trust or SCRAM authentication in
+[Users and authentication](/docs/reference/server/authentication/).
 
-### `users`
-
-| Authentication method | Configuration |
-| --- | --- |
-| Trust | `auth: { method: trust }`. No password is checked. |
-| Password | `auth: { method: password, password: Password1337 }`. The server derives a SCRAM-SHA-256 verifier from the password when it reads the file; the password itself is never sent or stored. |
-| SCRAM-SHA-256 | `auth: { method: scram-sha-256, verifier: "pivot-scram-sha-256$..." }`. The precomputed verifier, as `CREATE USER` writes it. |
-
-The built-in `pivot` user uses trust authentication unless it is configured
-explicitly.
-
-### `metastore`
-
-The file the server writes to. Optional: without it the server serves the
-config's own entries and refuses `CREATE USER`.
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `metastore.kind` | Required | `file` is the only supported value. |
-| `metastore.path` | Required | A YAML file of the same `datastores`, `secrets` and `users` maps as the config, without a `server` or `metastore` section. It must exist, and only the server should be able to read it. |
-
-The config's entries and the file's are served together. A name defined in
-both is a startup error, and `CREATE USER` refuses a name the config defines,
-because the server never rewrites the config.
-
-### Docker image bootstrap
+## Docker image bootstrap
 
 On the first server start, the `pivotlake/pivot` image creates
 `/var/lib/pivot/metastore.yaml` from environment variables when that file does
@@ -110,12 +124,15 @@ These variables are bootstrap settings, not live overrides. If
 To change an initialized volume, edit its metastore file or start with a fresh
 volume.
 
-### Environment variables
+## Environment variables
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `PIVOT_MEMORY_PCT` | `80` | Percentage of total memory the buffer pool takes, minus 4 GiB, when `server.memory` or `pivot open --memory` is omitted. |
+| `PIVOT_MEMORY_PCT` | `80` | Percentage of total memory used when `server.memory` is omitted. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Unset | GCS credentials file used by the ambient credentials chain when no matching GCS secret exists. |
 
-See `server/config.example.yaml` in the repository for a complete annotated
-configuration.
+## Related
+
+- [Annotated configuration example](https://github.com/Epsio-Labs/pivotdb/blob/main/bin/config.example.yaml)
+- [Quickstart](/docs/quickstart/)
+- [Session settings](/docs/reference/statements/set-reset/)

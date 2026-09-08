@@ -7,6 +7,9 @@ export default defineConfig({
   // Used for canonical URLs and the sitemap.
   site: "https://pivotlake.io",
   base: "/docs",
+  redirects: {
+    "/reference/table-options/": "/docs/reference/statements/create-table/#table-options",
+  },
   integrations: [
     starlight({
       title: "pivotdb",
@@ -81,8 +84,8 @@ export default defineConfig({
             "window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};plausible.init()",
         },
       ],
-      // Every entry is a directory under src/content/docs/. Pages order
-      // themselves by the `sidebar.order` field in their frontmatter.
+      // Reference groups are explicit so SQL and server topics stay separate.
+      // Commands and function categories order themselves with sidebar.order.
       sidebar: [
         { label: "Introduction", slug: "index" },
         { label: "Quickstart", slug: "quickstart" },
@@ -91,8 +94,29 @@ export default defineConfig({
           items: [{ autogenerate: { directory: "database" } }],
         },
         {
-          label: "Reference",
-          items: [{ autogenerate: { directory: "reference" } }],
+          label: "SQL reference",
+          items: [
+            {
+              label: "Statements",
+              collapsed: true,
+              items: [{ autogenerate: { directory: "reference/statements" } }],
+            },
+            {
+              label: "Functions & operators",
+              collapsed: true,
+              items: [{ autogenerate: { directory: "reference/functions" } }],
+            },
+            { slug: "reference/data-types" },
+          ],
+        },
+        {
+          label: "Server reference",
+          items: [
+            { slug: "reference/configuration" },
+            { slug: "reference/server/datastores" },
+            { slug: "reference/server/authentication" },
+            { slug: "reference/system-tables" },
+          ],
         },
       ],
       pagination: true,

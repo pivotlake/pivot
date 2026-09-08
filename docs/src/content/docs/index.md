@@ -133,7 +133,7 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 - **Fast** - Written in Rust and built on state-of-the-art columnar execution techniques, including morsel-driven parallelism, SIMD, NUMA-aware execution, and cache-conscious aggregation and joins, in addition to a few novel additions (#Why-is-pivot-fast?).
 - **Scalable** - With object storage as its backing store, Pivot can be scaled up, down, or to zero almost instantly.
 - **Portable** -     Pivot can run both as a server serving backends and clients, or as a local engine where users and agents query the source of truth directly—allowing local ad-hoc and agentic analytics to share the same engine and architecture as traditional dashboards and in-app analytics
-- **Open** - Pivot is open source and built on open data formats (Delta Lake, with [Iceberg support in progress](/docs/database/roadmap/#iceberg-tables)). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
+- **Open** - Pivot is open source and built on open data formats (Delta Lake, with [Iceberg support in progress](/docs/database/roadmap/#format-support)). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
 
 ### Project status
 
@@ -144,7 +144,7 @@ evaluation, experiments and local analysis today.
   the on-disk layout change between releases, with no migration path and no
   deprecation period. Expect to recreate a deployment rather than upgrade it.
 - **Gaps in coverage.** Whole areas of SQL are unimplemented. What is
-  supported today is listed under [Reference](/docs/reference/); assume
+  supported today is listed under [SQL reference](/docs/reference/); assume
   anything not listed there is missing.
 
 ### Where to start
@@ -153,5 +153,7 @@ evaluation, experiments and local analysis today.
 - [Architecture](/docs/database/architecture/) explains how a query becomes
   work across the dispatch pool.
 - [Roadmap](/docs/database/roadmap/) shows what is available, in progress, and planned.
-- [Reference](/docs/reference/) lists supported SQL, functions, data types,
-  system tables, and configuration.
+- [SQL reference](/docs/reference/) documents commands, functions, operators,
+  and data types with examples.
+- [Server reference](/docs/reference/configuration/) covers configuration,
+  datastores, authentication, and system tables.
