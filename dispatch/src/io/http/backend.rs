@@ -520,6 +520,17 @@ mod uring_engine {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::Arc;
 
+    /// Bytes one recv may pull off a socket into the connection's scratch
+    /// buffer. A recv's completion is reaped on the worker's next pass through
+    /// its ring, and a pass also runs one CPU step, so a connection advances by
+    /// at most one recv per step: with a 16 KB buffer (one TLS record) a
+    /// decoding worker moved 16 KB per connection per step and a 2 MB region
+    /// took 128 steps. A recv this size drains what the kernel buffered while
+    /// the step ran in one go; rustls consumes the whole buffer record by
+    /// record (`consume_received`). The buffer lives only for the duration of
+    /// an exchange, so idle pooled connections hold none.
+    const RECV_BUFFER_SIZE: usize = 256 * 1024;
+
     /// How many times a single range read is re-issued on a fresh connection
     /// before it's reported as failed. Covers the common case — a pooled
     /// keep-alive connection the server closed on its idle timeout — plus a few
@@ -572,10 +583,11 @@ mod uring_engine {
 
         // Reusable send buffer for plaintext request heads and TLS ciphertext.
         out_buf: Vec<u8>,
-        // Reusable recv scratch (TLS ciphertext, or plaintext headers). Allocated
-        // once at `IO_CHUNK_SIZE` and never re-zeroed — recv overwrites `[..n]`
-        // and we only read that. Plaintext bodies skip it entirely (recv'd into
-        // `dest`).
+        // Recv scratch (TLS ciphertext, or plaintext headers), sized
+        // `RECV_BUFFER_SIZE` for the life of an exchange and released when the
+        // connection returns to the pool. Never re-zeroed: recv overwrites
+        // `[..n]` and we only read that. Plaintext bodies skip it entirely
+        // (recv'd into `dest`).
         in_buf: Vec<u8>,
     }
 
@@ -657,6 +669,7 @@ mod uring_engine {
         /// request/response field, including an upload's `Arc<[u8]>`, is dropped.
         fn into_connection(mut self) -> (Identifier, Conn) {
             self.conn.out_buf.clear();
+            self.conn.in_buf = Vec::new();
             (self.id, self.conn)
         }
 
@@ -1162,8 +1175,8 @@ mod uring_engine {
                 sockaddr,
                 sockaddr_len,
                 out_buf: Vec::new(),
-                // Allocated once; reused (never re-zeroed) for every recv.
-                in_buf: vec![0u8; IO_CHUNK_SIZE],
+                // Sized by `pump` when the first recv needs it.
+                in_buf: Vec::new(),
             })
         }
 
@@ -1244,8 +1257,11 @@ mod uring_engine {
                         (false, a, remaining, fd)
                     } else {
                         exchange.recv_in_dest = false;
+                        if exchange.conn.in_buf.len() < RECV_BUFFER_SIZE {
+                            exchange.conn.in_buf.resize(RECV_BUFFER_SIZE, 0);
+                        }
                         let a = exchange.conn.in_buf.as_mut_ptr() as usize;
-                        (false, a, IO_CHUNK_SIZE, fd)
+                        (false, a, RECV_BUFFER_SIZE, fd)
                     }
                 }
             };
