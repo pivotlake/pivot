@@ -104,6 +104,19 @@
   font-family: var(--sl-font);
 }
 
+/* What a figure measured and how. Quieter than the prose so it reads as a
+   caption, but with the same width and left edge as the drawing above it. */
+.arch-figure figcaption {
+  margin-top: 0.5rem;
+  /* The panels sit 40 units in from either side of the 920-unit drawing, so
+     the caption is inset by the same fraction and lines up with their edges. */
+  padding-inline: calc(40 / 920 * 100%);
+  text-align: center;
+  color: var(--sl-color-gray-3);
+  font-size: 0.65em;
+  line-height: 1.5;
+}
+
 .arch-panel {
   fill: var(--sl-color-bg-sidebar);
   stroke: var(--sl-color-hairline);

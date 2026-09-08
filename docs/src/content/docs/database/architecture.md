@@ -295,12 +295,12 @@ These include:
 - Secrets — credentials for accessing object storage, scoped to the locations they apply to. Multiple datastores can use the same secret.
 - Users — which users are authored to access pivot, and how do they authenticate.
 
-Thanks to the separation of datastores and metastore, different instances / deployments of pivot might access different datastores in different permission models and with different configurations:
+Thanks to the separation of datastores and metastore, different instances / deployments of pivot might access different /overlapping datastores with different permission models and with different configurations:
 
 <figure class="arch-figure">
-<svg viewBox="0 0 920 514" role="img" aria-labelledby="deployments-title deployments-desc">
+<svg viewBox="0 0 920 496" role="img" aria-labelledby="deployments-title deployments-desc">
 <title id="deployments-title">Two Pivot instances with different metastores share one datastore</title>
-<desc id="deployments-desc">Object storage holds two datastores: analytics, a Pivot datastore, and lake, an Iceberg datastore. A Pivot shell started with pivot open on the analytics location uses an ephemeral metastore and reads and writes only analytics. A Pivot server started with pivot server and a metastore from pivot.yaml reads and writes analytics, reads lake, and serves SQL clients over the Postgres wire, where the analyst user logs in with a password.</desc>
+<desc id="deployments-desc">Object storage holds two datastores: analytics, a Pivot datastore, and lake, an Iceberg datastore. A Pivot shell started with pivot open on the analytics location uses an ephemeral metastore and reads and writes only analytics. A Pivot server started with pivot server and a metastore from pivot.yaml reads and writes analytics, reads lake, and serves SQL clients such as the analyst user over the Postgres wire.</desc>
 <defs>
 <marker id="deployments-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
@@ -349,68 +349,80 @@ Thanks to the separation of datastores and metastore, different instances / depl
 <text x="428" y="323" class="arch-cmd">pivot server --config pivot.yaml</text>
 <line x1="524" y1="408" x2="524" y2="354" class="arch-line" marker-end="url(#deployments-arrow)" />
 <text x="538" y="384" class="arch-muted">Postgres wire</text>
-<rect x="380" y="408" width="500" height="90" rx="3" class="arch-panel" />
+<rect x="380" y="408" width="500" height="72" rx="3" class="arch-panel" />
 <text x="404" y="432" class="arch-title">SQL clients</text>
 <text x="856" y="432" text-anchor="end" class="arch-muted">backend · psql · BI tools</text>
-<rect x="404" y="442" width="452" height="44" rx="2" class="arch-inner" />
+<rect x="404" y="442" width="452" height="26" rx="2" class="arch-inner" />
 <text x="416" y="459" class="arch-prompt">$</text>
 <text x="428" y="459" class="arch-cmd">psql -h pivot.internal -U analyst</text>
-<text x="416" y="477" class="arch-cmd">Password for user analyst: ********</text>
 </svg>
 </figure>
 
-In this example, both instances open the same Pivot datastore. The server loads its metastore from a YAML file: two datastores, an analyst user who logs in with a password, and an S3 secret scoped to the datastore location. The shell, started with `pivot open`, builds an ephemeral metastore from its command line: a single datastore, credentials read from the environment, and no user login. Only the server also reads the Iceberg datastore.
-
-##### Sharing a metastore across a cluster of instances
+#### Sharing a metastore across a cluster of instances
 
 > **Upcoming:** PostgreSQL-backed metastores are under development and are not
 > available in the current release. The configuration may change before the
 > feature is merged.
 
-A PostgreSQL metastore lets several Pivot servers use the same datastore
-registry and user directory. The analytical data still lives in the configured
-datastore, typically S3, not in PostgreSQL. Each Pivot server executes queries on
-its own worker pool, so this creates a load-balanced cluster rather than one
-distributed query spanning several servers.
+A PostgreSQL-backed metastore allows running multiple Pivot instances that share a single source of truth for datastore definitions, users, and other configuration.
 
-Every server in the cluster points at the same metastore database:
+Keeping this metadata in a simple to setup PostgreSQL endpoint makes a Pivot cluster easy to deploy, manage, and coordinate compared to requiring a dedicated coordination service such as ZooKeeper.
 
-```yaml title="node-a.yaml"
-server:
-  bind: 0.0.0.0:5432
+<figure class="arch-figure">
+<svg viewBox="0 0 920 552" role="img" aria-labelledby="cluster-title cluster-desc">
+<title id="cluster-title">A Pivot cluster behind a load balancer, sharing one metastore and one datastore</title>
+<desc id="cluster-desc">The datastore in object storage sits above the cluster and is what every instance reads and writes. A PostgreSQL metastore sits beside the cluster and supplies configuration and identity to every instance. The cluster holds N Pivot server instances. A load balancer routes each connection to one instance, and SQL clients connect to the load balancer over the Postgres wire.</desc>
+<defs>
+<marker id="cluster-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
+</marker>
+</defs>
+<rect x="392" y="16" width="488" height="64" rx="3" class="arch-panel" />
+<text x="416" y="43" class="arch-title">Datastore</text>
+<text x="416" y="65" class="arch-muted">s3://company-data/pivot/</text>
+<text x="856" y="54" text-anchor="end" class="arch-muted">data plane</text>
+<line x1="636" y1="80" x2="636" y2="148" class="arch-line" marker-start="url(#cluster-arrow)" marker-end="url(#cluster-arrow)" />
+<text x="650" y="118" class="arch-muted">read / write</text>
+<rect x="40" y="148" width="256" height="172" rx="3" class="arch-panel" />
+<text x="64" y="178" class="arch-title">Metastore</text>
+<text x="64" y="198" class="arch-muted">PostgreSQL · control plane</text>
+<rect x="64" y="210" width="208" height="26" rx="2" class="arch-inner" />
+<text x="76" y="227" class="arch-tiny">datastores</text>
+<text x="260" y="227" text-anchor="end" class="arch-tiny">locations</text>
+<rect x="64" y="242" width="208" height="26" rx="2" class="arch-inner" />
+<text x="76" y="259" class="arch-tiny">users</text>
+<text x="260" y="259" text-anchor="end" class="arch-tiny">scram-sha-256</text>
+<rect x="64" y="274" width="208" height="26" rx="2" class="arch-inner" />
+<text x="76" y="291" class="arch-tiny">credentials</text>
+<text x="260" y="291" text-anchor="end" class="arch-tiny">storage keys</text>
+<line x1="298" y1="224" x2="390" y2="224" stroke-dasharray="4 5" class="arch-line" marker-start="url(#cluster-arrow)" marker-end="url(#cluster-arrow)" />
+<text x="343" y="194" text-anchor="middle" class="arch-muted">config +</text>
+<text x="343" y="210" text-anchor="middle" class="arch-muted">identity</text>
+<rect x="392" y="148" width="488" height="172" rx="3" class="arch-panel" />
+<text x="416" y="178" class="arch-title">Pivot cluster</text>
+<rect x="416" y="196" width="196" height="56" rx="2" class="arch-inner" />
+<text x="432" y="230" class="arch-title">Instance 1</text>
+<text x="596" y="230" text-anchor="end" class="arch-muted">server</text>
+<text x="636" y="232" text-anchor="middle" class="arch-label">…</text>
+<rect x="660" y="196" width="196" height="56" rx="2" class="arch-inner" />
+<text x="676" y="230" class="arch-title">Instance N</text>
+<text x="840" y="230" text-anchor="end" class="arch-muted">server</text>
+<path d="M636,356 V288 M514,288 H758" class="arch-line" />
+<path d="M514,288 V255" class="arch-line" marker-end="url(#cluster-arrow)" />
+<path d="M758,288 V255" class="arch-line" marker-end="url(#cluster-arrow)" />
+<text x="650" y="342" class="arch-muted">any instance</text>
+<rect x="392" y="356" width="488" height="64" rx="3" class="arch-panel" />
+<text x="416" y="383" class="arch-title">Load balancer</text>
+<text x="416" y="405" class="arch-muted">one address for the whole cluster</text>
+<text x="856" y="394" text-anchor="end" class="arch-muted">pivot.internal:5432</text>
+<path d="M636,472 V422" class="arch-line" marker-end="url(#cluster-arrow)" />
+<text x="650" y="452" class="arch-muted">Postgres wire</text>
+<rect x="496" y="472" width="280" height="64" rx="3" class="arch-panel" />
+<text x="636" y="499" text-anchor="middle" class="arch-title">SQL clients</text>
+<text x="636" y="521" text-anchor="middle" class="arch-muted">backend · psql · BI tools</text>
+</svg>
+</figure>
 
-metastore:
-  kind: postgres
-  url: postgres://pivot:secret@pg.internal:5432/pivot_metastore
-  compact: true
-```
-
-The other nodes use the same `metastore.url`, choose their own `server.bind`,
-and leave `compact` disabled. At most one server should enable compaction for a
-shared datastore.
-
-On first connection, Pivot creates the `pivot_metastore` schema and its tables.
-The cluster will begin serving after the metastore contains exactly one default
-datastore. For example:
-
-```sql
-INSERT INTO pivot_metastore.datastores
-  (name, kind, location, is_default, compact,
-   region, access_key_id, secret_access_key)
-VALUES
-  ('analytics', 'delta', 's3://company-data/pivot/', true, true,
-   'us-east-1', 'PIVOT_ACCESS_KEY', 'PIVOT_SECRET_KEY');
-
-INSERT INTO pivot_metastore.users
-  (name, auth_method, scram_verifier)
-VALUES
-  ('analyst', 'scram-sha-256', 'pivot-scram-sha-256$4096:...$...');
-```
-
-Datastore definitions are loaded when a Pivot server starts, so changing one
-requires restarting the nodes. User records are checked on each login, allowing
-new users and credential rotations to apply across the cluster without a Pivot
-restart. The metastore URL and stored credentials should be accessible only to
-the Pivot servers and their operators.
+Any user or datastore created on one instance is immediately visible to all other instances. Scaling rules and other cluster-wide configuration can be coordinated from a single central location.
 
 ## Deployment Architecture
