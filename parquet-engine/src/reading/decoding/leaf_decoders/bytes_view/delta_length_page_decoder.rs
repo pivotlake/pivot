@@ -130,7 +130,20 @@ impl<V: ByteViewType> DeltaLengthPageDecoder<V> {
             return 0;
         }
 
-        let block = builder.append_block(self.buffers[self.position.buffer_index].clone());
+        // The block is registered only when a value in the run is too long
+        // to inline, so a run of short values names no page and keeps none
+        // alive. A view over an inlined value ignores the block it is given.
+        let mut previous = start;
+        let needs_block = candidates[..fitting].iter().any(|&end| {
+            let long = end - previous > MAX_INLINE_STRING_VIEW as u32;
+            previous = end;
+            long
+        });
+        let block = if needs_block {
+            builder.append_block(self.buffers[self.position.buffer_index].clone())
+        } else {
+            0
+        };
         let bytes: &[u8] = buffer.as_ref();
         let base = self.position.offset as u32;
         // Walk the run's ends into views over the block registered above.
@@ -172,5 +185,66 @@ impl<V: ByteViewType> DeltaLengthPageDecoder<V> {
             // SAFETY: a value this short is stored inside the view itself.
             unsafe { builder.append_raw_view_unchecked(&make_view(bytes.as_ref(), 0, 0)) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeDelta};
+    use crate::writing::encoder::delta::encode_length_byte_array;
+    use arrow_array::types::StringViewType;
+    use arrow_array::{Array, StringViewArray};
+    use dispatch::memory::{SlabAllocator, init_test_free_pool};
+
+    fn encode_page(values: &[&str]) -> Vec<Bytes> {
+        let mut page = Vec::new();
+        encode_length_byte_array(&StringViewArray::from(values.to_vec()), &mut page).unwrap();
+        vec![Bytes::from(page)]
+    }
+
+    fn decode_in_runs(values: &[&str], run: usize) -> StringViewArray {
+        let mut allocator = SlabAllocator::new(true);
+        let mut decoder = DeltaLengthPageDecoder::<StringViewType>::new(
+            encode_page(values),
+            ReaderPosition::default(),
+        )
+        .unwrap();
+        let mut builder = ViewsBuilder::with_capacity(&mut allocator, values.len());
+        for _ in 0..values.len().div_ceil(run) {
+            decoder.read(&mut builder, run);
+        }
+        builder
+            .into_array(None)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .clone()
+    }
+
+    /// A page consumed as many runs (how nulls and pushed-down filter masks
+    /// drive the decoder) registers its buffer once, not once per run.
+    #[test]
+    fn reading_a_page_in_runs_registers_its_buffer_once() {
+        init_test_free_pool(4);
+        let values = ["a value longer than twelve bytes"; 6];
+
+        let array = decode_in_runs(&values, 1);
+
+        assert_eq!(array.data_buffers().len(), 1);
+        assert_eq!(array.iter().flatten().collect::<Vec<_>>(), values);
+    }
+
+    /// Values that inline into their views need no data block, so a page of
+    /// short values leaves the array with no buffers to keep alive.
+    #[test]
+    fn short_values_register_no_buffer() {
+        init_test_free_pool(4);
+        let values = ["short", "values", "only"];
+
+        let array = decode_in_runs(&values, 3);
+
+        assert_eq!(array.data_buffers().len(), 0);
+        assert_eq!(array.iter().flatten().collect::<Vec<_>>(), values);
     }
 }

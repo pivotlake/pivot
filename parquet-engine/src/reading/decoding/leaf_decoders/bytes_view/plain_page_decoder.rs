@@ -72,13 +72,17 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
     ///
     /// Returns `Err(Error::Len)` if the length prefix is split across buffers,
     /// or `Err(Error::ReadStr(len))` if the string body is split.
+    ///
+    /// The buffer is registered as a data block only once a value too long to
+    /// inline needs it. A run of short values registers nothing, so an array
+    /// whose values all inline names no page at all and keeps none alive.
     fn read_from_current_buffer(
         &mut self,
         output: &mut ViewsBuilder<V>,
         size: usize,
     ) -> Result<(), Error> {
         let bytes = &self.data[self.position.buffer_index];
-        let block_id = output.append_block(self.buffers[self.position.buffer_index].clone());
+        let mut block_id: Option<u32> = None;
 
         let buf: &[u8] = bytes.as_ref();
         let mut read = 0;
@@ -102,8 +106,16 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
                 return Err(Error::ReadStr(len));
             }
 
-            unsafe {
-                output.append_view_unchecked(block_id, start_offset as u32, len);
+            if len as usize > MAX_INLINE_STRING_VIEW {
+                let block = *block_id.get_or_insert_with(|| {
+                    output.append_block(self.buffers[self.position.buffer_index].clone())
+                });
+                unsafe {
+                    output.append_view_unchecked(block, start_offset as u32, len);
+                }
+            } else {
+                let value = unsafe { buf.get_unchecked(start_offset..end_offset) };
+                unsafe { output.append_raw_view_unchecked(&make_view(value, 0, 0)) };
             }
             self.position.offset = end_offset;
 
@@ -393,5 +405,48 @@ mod tests {
         dec.read(&mut out, 3);
 
         assert_eq!(extract(out), vec!["x", "y", "hello"]);
+    }
+
+    fn data_buffer_count(builder: ViewsBuilder<StringViewType>) -> usize {
+        builder
+            .into_array(None)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .data_buffers()
+            .len()
+    }
+
+    /// A page consumed as many runs (how nulls and pushed-down filter masks
+    /// drive the decoder) registers its buffer once, not once per run.
+    #[test]
+    fn reading_a_page_in_runs_registers_its_buffer_once() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let long = "a value longer than twelve bytes";
+        let data = make_data(vec![encode_plain(&[long; 6])]);
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut out = ViewsBuilder::with_capacity(&mut allocator, 6);
+
+        for _ in 0..6 {
+            dec.read(&mut out, 1);
+        }
+
+        assert_eq!(data_buffer_count(out), 1);
+    }
+
+    /// Values that inline into their views need no data block, so a page of
+    /// short values leaves the array with no buffers to keep alive.
+    #[test]
+    fn short_values_register_no_buffer() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let data = make_data(vec![encode_plain(&["short", "values", "only"])]);
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut out = ViewsBuilder::with_capacity(&mut allocator, 3);
+
+        dec.read(&mut out, 3);
+
+        assert_eq!(data_buffer_count(out), 0);
     }
 }
