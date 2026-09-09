@@ -16,8 +16,9 @@ use crate::types::{Type, UTC_TIMEZONE, physical_arrow_type};
 use arrow_array::builder::StringViewBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::types::TimestampMicrosecondType;
-use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, StructArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, StringViewArray, StructArray};
 use arrow_schema::{ArrowError, DataType, TimeUnit};
+use parquet_variant::Variant;
 use parquet_variant_compute::{
     GetOptions, VariantArray, json_to_variant, unshred_variant, variant_get,
 };
@@ -233,7 +234,61 @@ fn render_variant_text(
     unquote_strings: bool,
 ) -> Result<ArrayRef, ArrowError> {
     let variant = VariantArray::try_new(input)?;
-    let variant = unshred_variant(&variant)?;
+    let json = match variant.typed_value_field() {
+        // The field is shredded as strings, so the typed leaf already holds
+        // the text of every row that was a string. Read it as is and render
+        // only the rows that fell back to variant bytes, instead of folding
+        // the whole column back into bytes and parsing each row again.
+        Some(typed) if unquote_strings && typed.data_type() == &DataType::Utf8View => {
+            render_shredded_strings(&variant, typed.as_string_view())?
+        }
+        _ => render_variant_rows(&unshred_variant(&variant)?, unquote_strings)?,
+    };
+    let json: ArrayRef = Arc::new(json);
+    if target == &DataType::Utf8View {
+        return Ok(json);
+    }
+    arrow::compute::cast_with_options(
+        &json,
+        target,
+        &arrow::compute::CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )
+}
+
+/// Renders a field shredded as strings: the typed leaf supplies each string
+/// row, and a row whose value is in the residual bytes (a JSON null, a number,
+/// an object) is rendered as JSON like any other variant.
+fn render_shredded_strings(
+    variant: &VariantArray,
+    strings: &StringViewArray,
+) -> Result<StringViewArray, ArrowError> {
+    let metadata = variant.metadata_field();
+    let residual = variant.value_field();
+    let mut json = StringViewBuilder::with_capacity(variant.len());
+    let mut text = Vec::new();
+    for row in 0..variant.len() {
+        if variant.is_null(row) {
+            json.append_null();
+        } else if strings.is_valid(row) {
+            json.append_value(strings.value(row));
+        } else if let Some(residual) = residual.filter(|residual| residual.is_valid(row)) {
+            let value = Variant::try_new(metadata.value(row), residual.value(row))?;
+            append_json_text(&mut json, &mut text, value)?;
+        } else {
+            json.append_null();
+        }
+    }
+    Ok(json.finish())
+}
+
+/// Renders an unshredded variant row by row.
+fn render_variant_rows(
+    variant: &VariantArray,
+    unquote_strings: bool,
+) -> Result<StringViewArray, ArrowError> {
     let mut json = StringViewBuilder::with_capacity(variant.len());
     let mut text = Vec::new();
     for row in 0..variant.len() {
@@ -246,27 +301,25 @@ fn render_variant_text(
             json.append_value(value);
             continue;
         }
-        text.clear();
-        value.to_json(&mut text).map_err(|e| {
-            ArrowError::ComputeError(format!("variant value failed to render as JSON: {e}"))
-        })?;
-        json.append_value(
-            std::str::from_utf8(&text)
-                .map_err(|e| ArrowError::ComputeError(format!("variant JSON is not UTF-8: {e}")))?,
-        );
+        append_json_text(&mut json, &mut text, value)?;
     }
-    let json: ArrayRef = Arc::new(json.finish());
-    if target == &DataType::Utf8View {
-        return Ok(json);
-    }
-    arrow::compute::cast_with_options(
-        &json,
-        target,
-        &arrow::compute::CastOptions {
-            safe: false,
-            ..Default::default()
-        },
-    )
+    Ok(json.finish())
+}
+
+fn append_json_text(
+    json: &mut StringViewBuilder,
+    text: &mut Vec<u8>,
+    value: Variant<'_, '_>,
+) -> Result<(), ArrowError> {
+    text.clear();
+    value.to_json(text).map_err(|e| {
+        ArrowError::ComputeError(format!("variant value failed to render as JSON: {e}"))
+    })?;
+    json.append_value(
+        std::str::from_utf8(text)
+            .map_err(|e| ArrowError::ComputeError(format!("variant JSON is not UTF-8: {e}")))?,
+    );
+    Ok(())
 }
 
 /// Parse an array of JSON-document strings into a variant of the canonical
