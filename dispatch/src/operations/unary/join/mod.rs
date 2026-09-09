@@ -317,9 +317,9 @@ mod tests {
 
     type Int64Key = SingleColumnKey<arrow_array::types::Int64Type>;
 
-    fn extract_consumer<K: JoinKey, const BUILD_OUTER: bool>(
-        breaker: PipelineBreaker<RecordBatch, (), JoinBuildConsumer<K, BUILD_OUTER>>,
-    ) -> JoinBuildConsumer<K, BUILD_OUTER> {
+    fn extract_consumer<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool>(
+        breaker: PipelineBreaker<RecordBatch, (), JoinBuildConsumer<K, TRACK_MATCHED_BUILD_ROWS>>,
+    ) -> JoinBuildConsumer<K, TRACK_MATCHED_BUILD_ROWS> {
         match breaker {
             PipelineBreaker::Consuming(c) => c,
             _ => unreachable!(),
