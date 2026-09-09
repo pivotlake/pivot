@@ -87,8 +87,7 @@ impl BatchAccumulator {
         self.len
     }
 
-    /// Rows this accumulator can hold before it must be taken. Not always what
-    /// the caller asked for, see [`with_capacity`](Self::with_capacity).
+    /// Rows this accumulator can hold before it must be taken.
     pub fn capacity(&self) -> usize {
         COALESCING_CAPACITY
     }
@@ -615,5 +614,193 @@ mod tests {
         let emitted = accumulator.take_batch(&mut allocator).unwrap();
 
         assert_eq!(emitted, batch);
+    }
+
+    /// A one-column batch of `rows` copies of `value`, which must be long
+    /// enough to live in a data buffer rather than inline in its view.
+    fn long_rows(value: &str, rows: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "name",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(StringViewArray::from(vec![value; rows]))],
+        )
+        .unwrap()
+    }
+
+    fn shares_no_buffer_with(emitted: &RecordBatch, source: &RecordBatch) -> bool {
+        let source = data_buffer_pointers(source, 0);
+        data_buffer_pointers(emitted, 0)
+            .iter()
+            .all(|buffer| !source.contains(buffer))
+    }
+
+    #[test]
+    fn an_append_at_the_share_threshold_retains() {
+        init_test_free_pool(8);
+        let batch = long_rows("a value longer than twelve bytes", 100);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&batch, &(0..15).collect::<Vec<_>>(), &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        assert_eq!(
+            data_buffer_pointers(&emitted, 0),
+            data_buffer_pointers(&batch, 0)
+        );
+    }
+
+    #[test]
+    fn an_append_just_below_the_share_threshold_copies() {
+        init_test_free_pool(8);
+        let batch = long_rows("a value longer than twelve bytes", 100);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&batch, &(0..14).collect::<Vec<_>>(), &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        assert!(shares_no_buffer_with(&emitted, &batch));
+    }
+
+    #[test]
+    fn nulls_survive_a_selective_append() {
+        init_test_free_pool(8);
+        let mut values = vec![Some("a value longer than twelve bytes"); 20];
+        values[3] = None;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "name",
+                DataType::Utf8View,
+                true,
+            )])),
+            vec![Arc::new(StringViewArray::from(values))],
+        )
+        .unwrap();
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&batch, &[3, 4], &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        assert_eq!(emitted, batch.slice(3, 2));
+        assert!(shares_no_buffer_with(&emitted, &batch));
+    }
+
+    /// Copied values past one block's worth open a second block, and the views
+    /// written after the rollover name it.
+    #[test]
+    fn copied_values_open_a_second_block() {
+        init_test_free_pool(8);
+        let value = "v".repeat(10 * 1024);
+        let batch = long_rows(&value, 200);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&batch, &(0..28).collect::<Vec<_>>(), &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        assert_eq!(emitted, batch.slice(0, 28));
+        assert_eq!(data_buffer_pointers(&emitted, 0).len(), 2);
+    }
+
+    #[test]
+    fn a_held_source_is_forgotten_after_take_batch() {
+        init_test_free_pool(8);
+        let batch = long_rows("a value longer than twelve bytes", 20);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+        accumulator.append_batch_by_indices(&batch, &(0..10).collect::<Vec<_>>(), &mut allocator);
+        accumulator.take_batch(&mut allocator).unwrap();
+
+        accumulator.append_batch_by_indices(&batch, &[0], &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        assert!(shares_no_buffer_with(&emitted, &batch));
+    }
+
+    #[test]
+    fn a_selective_range_append_copies() {
+        init_test_free_pool(8);
+        let batch = long_rows("a value longer than twelve bytes", 20);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_range(&batch, 3, 1, &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        assert_eq!(emitted, batch.slice(3, 1));
+        assert!(shares_no_buffer_with(&emitted, &batch));
+    }
+
+    /// Retained buffers and copied blocks share one list, so a copy between
+    /// two retains must leave every view naming the right entry.
+    #[test]
+    fn values_stay_right_across_retained_and_copied_appends() {
+        init_test_free_pool(8);
+        let first = long_rows("the first source's long value", 20);
+        let second = long_rows("the second source's long value", 20);
+        let third = long_rows("the third source's long value", 20);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(first.schema(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&first, &(0..10).collect::<Vec<_>>(), &mut allocator);
+        accumulator.append_batch_by_indices(&second, &[0], &mut allocator);
+        accumulator.append_batch_by_indices(&third, &(0..10).collect::<Vec<_>>(), &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        let expected = concat_batches(
+            &first.schema(),
+            &[first.slice(0, 10), second.slice(0, 1), third.slice(0, 10)],
+        )
+        .unwrap();
+        assert_eq!(emitted, expected);
+    }
+
+    #[test]
+    fn a_struct_child_copies_on_a_selective_append() {
+        init_test_free_pool(8);
+        let fields = Fields::from(vec![Field::new("value", DataType::BinaryView, false)]);
+        let child = BinaryViewArray::from(vec![
+            b"a document body well past twelve bytes".as_slice();
+            20
+        ]);
+        let column = StructArray::new(fields.clone(), vec![Arc::new(child)], None);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "doc",
+                DataType::Struct(fields),
+                false,
+            )])),
+            vec![Arc::new(column)],
+        )
+        .unwrap();
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&batch, &[0], &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        assert_eq!(emitted, batch.slice(0, 1));
+        let child_buffers = |batch: &RecordBatch| -> Vec<*const u8> {
+            batch
+                .column(0)
+                .as_struct()
+                .column(0)
+                .as_binary_view()
+                .data_buffers()
+                .iter()
+                .map(|buffer| buffer.as_ptr())
+                .collect()
+        };
+        let source = child_buffers(&batch);
+        assert!(
+            child_buffers(&emitted)
+                .iter()
+                .all(|buffer| !source.contains(buffer))
+        );
     }
 }
