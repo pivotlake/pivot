@@ -1,11 +1,12 @@
-//! The join's stored build rows, and the one `u32` id that addresses a row.
+//! The join's stored build rows, and the one `u64` id that addresses a row.
 //!
 //! The build side keeps its rows as the batches they arrived in, without
 //! copying: a batch of at most [`ROWS_PER_BATCH`] rows is stored as it is, a
 //! larger one as zero-copy slices. A stored row's id packs which batch and
-//! which row within it into one `u32`; a batch shorter than
-//! [`ROWS_PER_BATCH`] leaves a gap in the id space, which costs nothing
-//! because ids are only gather addresses and are never required to be dense.
+//! which row within it into one `u64`, so the build side is bounded by memory
+//! rather than by the id width; a batch shorter than [`ROWS_PER_BATCH`]
+//! leaves a gap in the id space, which costs nothing because ids are only
+//! gather addresses and are never required to be dense.
 //!
 //! This module is the only place that knows how an id splits. Everything else
 //! goes through the helpers below.
@@ -19,8 +20,6 @@ use arrow_schema::ArrowError;
 const ROWS_PER_BATCH: usize = crate::RECORD_BATCH_SIZE;
 /// A row id is `build_row_batch_idx << BATCH_SHIFT | row_in_batch`.
 const BATCH_SHIFT: u32 = ROWS_PER_BATCH.trailing_zeros();
-/// How many batches the `u32` id encoding addresses.
-const MAX_BATCHES: usize = (u32::MAX as usize + 1) >> BATCH_SHIFT;
 const _: () = assert!(ROWS_PER_BATCH.is_power_of_two());
 
 /// The build-side rows after all workers have merged them, prepared once for
@@ -42,21 +41,17 @@ impl BuildRows {
     /// Merge every worker's stored rows, in the given order, into the
     /// published whole, and prepare them for probing. No bytes move in the
     /// merge. Alongside the rows, returns each worker's row id base: the
-    /// single `u32` added to that worker's local ids at scatter time.
+    /// single `u64` added to that worker's local ids at scatter time.
     pub(crate) fn new<const TRACK_MATCHES: bool>(
         workers: impl IntoIterator<Item = Vec<RecordBatch>>,
         output_indices: &[usize],
-    ) -> Result<(Self, Vec<u32>), ArrowError> {
+    ) -> Result<(Self, Vec<u64>), ArrowError> {
         let mut batches = Vec::new();
         let mut row_id_bases = Vec::new();
         for worker in workers {
-            row_id_bases.push((batches.len() << BATCH_SHIFT) as u32);
+            row_id_bases.push((batches.len() << BATCH_SHIFT) as u64);
             batches.extend(worker);
         }
-        assert!(
-            batches.len() <= MAX_BATCHES,
-            "join build side exceeds the row id space"
-        );
         let output_batches: Vec<RecordBatch> = batches
             .iter()
             .map(|batch| batch.project(output_indices))
@@ -104,7 +99,7 @@ impl BuildRows {
 
 /// Split a row id into its batch index and the row within that batch.
 #[inline(always)]
-pub(crate) fn split_row_id(row_id: u32) -> (usize, usize) {
+pub(crate) fn split_row_id(row_id: u64) -> (usize, usize) {
     (
         (row_id >> BATCH_SHIFT) as usize,
         (row_id as usize) & (ROWS_PER_BATCH - 1),
@@ -127,7 +122,7 @@ pub(crate) fn row_id_shift() -> u32 {
 /// its first row's id, for the caller to generate tuples from. Ids are local
 /// to `batches`; a worker's ids are globalized with the base merge assigns
 /// it.
-pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(u32, RecordBatch)> {
+pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(u64, RecordBatch)> {
     let total = batch.num_rows();
     if total == 0 {
         return Vec::new();
@@ -141,11 +136,7 @@ pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(
         } else {
             batch.slice(offset, rows)
         };
-        assert!(
-            batches.len() < MAX_BATCHES,
-            "join build side exceeds the row id space"
-        );
-        adopted.push(((batches.len() << BATCH_SHIFT) as u32, stored.clone()));
+        adopted.push(((batches.len() << BATCH_SHIFT) as u64, stored.clone()));
         batches.push(stored);
         offset += rows;
     }
@@ -155,4 +146,20 @@ pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(
 /// The id space the stored rows occupy, gaps included.
 fn row_id_space(batches: &[RecordBatch]) -> usize {
     batches.len() << BATCH_SHIFT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_ids_split_past_the_u32_range() {
+        let batch_idx = 1usize << 40;
+        let row = 5usize;
+
+        let row_id = (batch_idx << BATCH_SHIFT | row) as u64;
+
+        assert_eq!(split_row_id(row_id), (batch_idx, row));
+        assert_eq!(first_row_id(batch_idx), row_id as usize - row);
+    }
 }

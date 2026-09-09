@@ -69,12 +69,12 @@ impl ValidityMask {
     /// landing at accumulated position `at` onward in id order.
     pub(super) fn append_by_ids<'n>(
         &mut self,
-        ids: &[u32],
+        ids: &[u64],
         shift: u32,
         at: usize,
         batch_nulls: impl Fn(usize) -> Option<&'n NullBuffer>,
     ) {
-        let mask = (1u32 << shift) - 1;
+        let mask = (1u64 << shift) - 1;
         for (offset, &id) in ids.iter().enumerate() {
             let Some(nulls) = batch_nulls((id >> shift) as usize) else {
                 continue;

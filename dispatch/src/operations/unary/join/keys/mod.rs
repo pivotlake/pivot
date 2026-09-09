@@ -81,7 +81,7 @@ pub trait JoinKey: 'static {
         reader: &Self::Reader<'_>,
         verifier: &Self::Verifier<'_>,
         probe_idx: usize,
-        build_row_id: u32,
+        build_row_id: u64,
     ) -> bool;
 }
 

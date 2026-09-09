@@ -187,7 +187,7 @@ pub fn create_for_workers<
     let table = JoinTable {
         directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
         keys: Arc::new(JoinCell::new(MultiSlabBuffer::<K::Stored>::new(vec![]))),
-        rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
+        rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u64>::new(vec![]))),
         build_rows: Arc::new(JoinCell::new(BuildRows::empty())),
         build_saw_null_key: Arc::new(JoinCell::new(false)),
     };

@@ -27,7 +27,7 @@ const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
 pub(crate) struct BuildTuple<K> {
     hash: u64,
     key: K,
-    row: u32,
+    row: u64,
 }
 
 pub(crate) type PartitionBuffers<K> = Vec<SlabVec<BuildTuple<K>>>;
@@ -147,7 +147,7 @@ where
                     BuildTuple {
                         hash,
                         key,
-                        row: first_row_id + i as u32,
+                        row: first_row_id + i as u64,
                     },
                 );
             }
@@ -184,7 +184,7 @@ unsafe impl<K: Copy + Send, const BUILD_OUTER: bool> Send for JoinBuilder<K, BUI
 pub struct JoinBuildJob<K: Copy + Send> {
     /// This partition's tuples, one entry per build worker, paired with that
     /// worker's row id base (added to each tuple's local row id).
-    tuples: Vec<(u32, SlabVec<BuildTuple<K>>)>,
+    tuples: Vec<(u64, SlabVec<BuildTuple<K>>)>,
     table: JoinTable<K>,
     arena_offset: usize,
 
@@ -332,7 +332,7 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
         let keys = unsafe { &mut *self.table.keys.get() };
         *keys = arena_alloc.create_multi_slab_buffer::<K>(total.max(1), false);
         let rows = unsafe { &mut *self.table.rows.get() };
-        *rows = arena_alloc.create_multi_slab_buffer::<u32>(total.max(1), false);
+        *rows = arena_alloc.create_multi_slab_buffer::<u64>(total.max(1), false);
 
         // Prefix sums give each partition its arena offset.
         let mut offsets = vec![0usize; NUM_PARTITIONS];
@@ -342,7 +342,7 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
 
         let slots_per_partition = dir_capacity / NUM_PARTITIONS;
         for (i, &arena_offset) in offsets.iter().enumerate() {
-            let tuples: Vec<(u32, SlabVec<BuildTuple<K>>)> = worker_outputs
+            let tuples: Vec<(u64, SlabVec<BuildTuple<K>>)> = worker_outputs
                 .iter_mut()
                 .zip(&row_bases)
                 .map(|(output, &row_base)| (row_base, std::mem::take(&mut output.tuples[i])))

@@ -79,7 +79,7 @@ pub(super) trait ColumnAccumulator {
     fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u32],
+        ids: &[u64],
         shift: u32,
         destination_start: usize,
         allocator: &mut SlabAllocator,

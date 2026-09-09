@@ -74,12 +74,12 @@ impl ColumnAccumulator for ConcatenatedColumn {
     fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u32],
+        ids: &[u64],
         shift: u32,
         _destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
-        let mask = (1u32 << shift) - 1;
+        let mask = (1u64 << shift) - 1;
         // Consecutive same-batch rows become one slice, as above.
         let mut push = |batch: usize, start: usize, len: usize| {
             self.arrays

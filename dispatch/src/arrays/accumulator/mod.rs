@@ -200,7 +200,7 @@ impl BatchAccumulator {
         &mut self,
         columns: &[ChunkedColumn],
         shift: u32,
-        ids: &[u32],
+        ids: &[u64],
         allocator: &mut SlabAllocator,
     ) {
         assert!(self.len + ids.len() <= self.capacity);

@@ -43,8 +43,11 @@ pub(super) struct ProbeMatchOutputter {
     /// Matched `(probe row, build row id)` pairs waiting to be drained. A semi
     /// join fills only the probe indices.
     pub(super) probe_indices: Vec<u32>,
-    pub(super) build_indices: Vec<u32>,
+    pub(super) build_indices: Vec<u64>,
     pub(super) matched: usize,
+    /// The rows of one stored build batch an unmatched-row scan keeps, as
+    /// positions within that batch.
+    kept_build_rows: Vec<u32>,
     /// The join's residual predicate, applied to the collected pairs at drain
     /// time, before any pair is flagged or emitted.
     pub(super) residual_filters: Option<ResidualFilter>,
@@ -115,6 +118,7 @@ impl ProbeMatchOutputter {
             probe_indices: vec![0; RECORD_BATCH_SIZE],
             build_indices: vec![0; RECORD_BATCH_SIZE],
             matched: 0,
+            kept_build_rows: vec![0; RECORD_BATCH_SIZE],
             has_residual: residual_filters.is_some(),
             residual_filters,
             missed_probe_rows: Vec::new(),
@@ -467,13 +471,13 @@ impl ProbeMatchOutputter {
             // only if its flag holds the kept value. A stored batch holds at
             // most one output batch's worth of rows, so a pass never overfills
             // the accumulator.
-            self.build_indices[found] = row as u32;
+            self.kept_build_rows[found] = row as u32;
             found += (build_rows.matched[first_row_id + row] == self.scan_kept_flag) as usize;
         }
         if found > 0 {
             self.build.append_batch_by_indices(
                 batch,
-                &self.build_indices[..found],
+                &self.kept_build_rows[..found],
                 &mut self.allocator,
             );
         }
