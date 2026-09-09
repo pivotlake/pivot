@@ -6,6 +6,7 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use crate::shell::parser::split_complete;
+use crate::shell::progress::show_opening_progress;
 use crate::shell::render::{TextBatch, render_table};
 use crate::shell::{ShellInstance, ShellLimits};
 
@@ -30,7 +31,8 @@ pub(crate) async fn run_shell(
         return Err("an interactive terminal is required".into());
     }
 
-    let instance = ShellInstance::open_with_limits(&datastore_location, limits)?;
+    let instance =
+        show_opening_progress(|| ShellInstance::open_with_limits(&datastore_location, limits))?;
     let editor = DefaultEditor::new()?;
 
     println!("pivot shell ({})", env!("CARGO_PKG_VERSION"));
