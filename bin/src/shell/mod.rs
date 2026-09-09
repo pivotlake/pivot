@@ -2,6 +2,7 @@
 
 mod instance;
 mod parser;
+mod progress;
 mod render;
 mod repl;
 
