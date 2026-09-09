@@ -1,5 +1,5 @@
-//! Physical cleanup of a table's unreferenced Parquet files and superseded log
-//! commits.
+//! Physical cleanup of a table's unreferenced Parquet files and the log files a
+//! checkpoint has superseded.
 //!
 //! Compaction (and, in time, DELETE) retires a file by writing a Delta `Remove`
 //! action for it, but leaves the object in place: a query that loaded the prior
@@ -8,13 +8,14 @@
 //! table's storage grows without bound, and the [`Vacuumer`] is the back half:
 //! it deletes every object the current table version no longer references, once
 //! that object's storage mtime is older than the table's
-//! `deletedFileRetentionDuration`. In the same sweep it also deletes the commit
-//! JSONs a checkpoint has folded in that are past the log-retention window (the
-//! checkpoints are written inline on the commit path, in [`crate::log`], not
-//! here), so the `_delta_log` does not grow unbounded either. A dropped table
-//! follows the same shape one level up: `DROP TABLE` removes only the catalog
-//! entries and leaves a manifest tombstone, and the sweep deletes the whole
-//! table's storage once the tombstone is older than the table's retention.
+//! `deletedFileRetentionDuration`. In the same sweep it also deletes every log
+//! file past the log-retention window that sits below the oldest checkpoint the
+//! log still needs (writing a checkpoint stays on the commit path, in
+//! [`crate::log`], not here), so the `_delta_log` does not grow unbounded
+//! either. A dropped table follows the
+//! same shape one level up: `DROP TABLE` removes only the catalog entries and
+//! leaves a manifest tombstone, and the sweep deletes the whole table's storage
+//! once the tombstone is older than the table's retention.
 //!
 //! Like the compacter it is **location-agnostic** and **deployment-agnostic**:
 //! it holds nothing but a datastore handle, reads each table's directory, and
@@ -168,13 +169,13 @@ impl Vacuumer {
             info!(table = %name, files = deleted, "vacuumed files");
         }
 
-        // Reclaim log storage in the same sweep: delete commit JSONs a checkpoint
-        // has folded in that are past the table's log-retention window. The
-        // checkpoints themselves are written inline on the commit path; this is
-        // only the deletion of what they supersede.
+        // Reclaim log storage in the same sweep: delete the commits, checkpoints
+        // and checksums a later checkpoint has made redundant, once they are
+        // past the table's log-retention window. Writing a checkpoint stays on
+        // the commit path; this is only the deletion of what one supersedes.
         match table.cleanup_log(now_ms) {
             Ok(cleaned) if cleaned > 0 => {
-                info!(table = %name, log_files = cleaned, "cleaned up superseded commits");
+                info!(table = %name, log_files = cleaned, "cleaned up superseded log files");
             }
             Ok(_) => {}
             Err(e) => warn!(table = %name, error = %e, "vacuum: log cleanup failed"),
