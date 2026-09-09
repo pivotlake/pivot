@@ -12,10 +12,12 @@
 //! emits full-size batches, so a selective filter's downstream sees a few
 //! large batches instead of a runt batch per input. Whether to coalesce at all
 //! is the consumer's call, carried as a [`RowDelivery`]: an operator that acts
-//! on early rows needs them as soon as they are selected.
+//! on early rows needs them as soon as they are selected, and for it each
+//! input batch's survivors are gathered out of that batch and sent at once.
 
 use crate::RECORD_BATCH_SIZE;
 use crate::arrays::accumulator::BatchAccumulator;
+use crate::arrays::take;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
@@ -129,8 +131,9 @@ where
     F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send,
 {
     /// Apply the selection sitting in `self.selection` to `batch`: send whole
-    /// surviving batches directly, coalesce partial ones through the
-    /// accumulator.
+    /// surviving batches directly, gather partial ones out of the batch when
+    /// delivery is immediate, and coalesce them through the accumulator
+    /// otherwise.
     fn deliver_selected_rows(
         &mut self,
         batch: RecordBatch,
@@ -147,6 +150,27 @@ where
         if batch.num_columns() == 0 {
             let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(kept));
             let selected = RecordBatch::try_new_with_options(batch.schema(), vec![], &options)
+                .map_err(unary::Error::from)?;
+            output.send(selected)?;
+            return Ok(());
+        }
+        // An immediately delivered batch is consumed as soon as it is sent, so
+        // its survivors are gathered straight out of the input: the gather is
+        // sized to the selection and a view column keeps sharing the input's
+        // data buffers, which are released moments later regardless. The
+        // accumulator would decide per batch whether to copy the values, a
+        // cost that only pays off for an accumulation that outlives its
+        // inputs, and would hand out full-capacity slabs for a batch of a few
+        // rows.
+        if self.delivery == RowDelivery::Immediate {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| take(&mut self.allocator, column, &self.selection))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(unary::Error::from)?;
+            let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(kept));
+            let selected = RecordBatch::try_new_with_options(batch.schema(), columns, &options)
                 .map_err(unary::Error::from)?;
             output.send(selected)?;
             return Ok(());
@@ -173,9 +197,6 @@ where
             &mut self.allocator,
             &mut |full| output.send(full).map_err(Into::into),
         )?;
-        if self.delivery == RowDelivery::Immediate && !accumulator.is_empty() {
-            output.send(accumulator.take_batch(&mut self.allocator)?)?;
-        }
         Ok(())
     }
 }
@@ -411,6 +432,51 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(i32_col(&out[0]), vec![1]);
         assert_eq!(i32_col(&out[1]), vec![4]);
+    }
+
+    /// An immediately delivered batch is consumed at once, so its strings keep
+    /// pointing at the input's data buffers instead of being copied.
+    #[test]
+    fn immediate_delivery_shares_the_input_buffers() {
+        use arrow_array::StringViewArray;
+        use arrow_array::cast::AsArray;
+        init_test_free_pool(4);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
+        let col: ArrayRef = Arc::new(StringViewArray::from(vec![
+            "a value longer than twelve bytes";
+            20
+        ]));
+        let input = RecordBatch::try_new(schema, vec![col]).unwrap();
+        let source_buffer = input.column(0).as_string_view().data_buffers()[0].as_ptr();
+        let filter = FilterFactory(keep_first_row, RowDelivery::Immediate).build_unary();
+
+        let out = run_unary_to_completion(filter, vec![input]);
+
+        let emitted = out[0].column(0).as_string_view();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted.data_buffers()[0].as_ptr(), source_buffer);
+    }
+
+    /// Immediate delivery never coalesces, so batches of unlike schema come
+    /// out one by one without any flush between them.
+    #[test]
+    fn immediate_delivery_emits_unlike_schemas_separately() {
+        init_test_free_pool(4);
+        let one = struct_batch(vec![Field::new("a", DataType::Int32, true)]);
+        let two = struct_batch(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let filter = FilterFactory(keep_first_row, RowDelivery::Immediate).build_unary();
+
+        let out = run_unary_to_completion(filter, vec![one, two]);
+
+        assert_eq!(out.len(), 2);
+        assert_ne!(out[0].schema(), out[1].schema());
     }
 
     /// The same filter under a group-by or a join hands over one coalesced
