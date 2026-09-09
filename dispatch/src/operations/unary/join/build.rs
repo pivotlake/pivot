@@ -246,7 +246,8 @@ impl<K: Copy + Send> JoinBuildJob<K> {
                 let arena_idx = (entry >> 16) as usize;
                 unsafe {
                     keys.ptr_at_index(arena_idx).write(tuple.key);
-                    rows.ptr_at_index(arena_idx).write(row_base + tuple.row);
+                    rows.ptr_at_index(arena_idx)
+                        .write((row_base + tuple.row) as u32);
                 }
             });
         }
@@ -332,7 +333,7 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
         let keys = unsafe { &mut *self.table.keys.get() };
         *keys = arena_alloc.create_multi_slab_buffer::<K>(total.max(1), false);
         let rows = unsafe { &mut *self.table.rows.get() };
-        *rows = arena_alloc.create_multi_slab_buffer::<u64>(total.max(1), false);
+        *rows = arena_alloc.create_multi_slab_buffer::<u32>(total.max(1), false);
 
         // Prefix sums give each partition its arena offset.
         let mut offsets = vec![0usize; NUM_PARTITIONS];

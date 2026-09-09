@@ -430,7 +430,7 @@ struct ProbeWindow<
     const MARK: bool,
 > {
     keys: &'a MultiSlabBuffer<K::Stored>,
-    rows: &'a MultiSlabBuffer<u64>,
+    rows: &'a MultiSlabBuffer<u32>,
     reader: K::Reader<'b>,
     verifier: K::Verifier<'a>,
     /// The full probed batch, which the residual predicate's probe columns
@@ -497,7 +497,7 @@ impl<
                     &self.reader,
                     &self.verifier,
                     probe_row,
-                    self.rows[key_index],
+                    self.rows[key_index] as u64,
                 );
             // Const-gated so the other kinds' candidate loop compiles exactly
             // as it did before this tracking existed.
@@ -531,7 +531,8 @@ impl<
                 // was a match* which removes the need for branching here.
                 unsafe {
                     *self.output.probe_indices.get_unchecked_mut(output_idx) = probe_row as u32;
-                    *self.output.build_indices.get_unchecked_mut(output_idx) = self.rows[key_index];
+                    *self.output.build_indices.get_unchecked_mut(output_idx) =
+                        self.rows[key_index] as u64;
                 }
                 self.output.matched = output_idx + key_matches as usize;
                 if self.output.matched == RECORD_BATCH_SIZE {

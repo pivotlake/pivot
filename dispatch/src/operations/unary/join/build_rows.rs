@@ -52,6 +52,11 @@ impl BuildRows {
             row_id_bases.push((batches.len() << BATCH_SHIFT) as u64);
             batches.extend(worker);
         }
+        // The table's row arena narrows every id to u32 at scatter time.
+        assert!(
+            row_id_space(&batches) <= u32::MAX as usize + 1,
+            "join build side exceeds the row arena's id space"
+        );
         let output_batches: Vec<RecordBatch> = batches
             .iter()
             .map(|batch| batch.project(output_indices))
