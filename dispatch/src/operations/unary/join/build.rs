@@ -66,8 +66,8 @@ impl<K: Copy + Send + 'static> NormalizationBatches for BuildWorkerOutput<K> {
 
 pub struct JoinBuildConsumer<
     K: JoinKey,
-    const BUILD_OUTER: bool,
-    O = JoinBuilder<<K as JoinKey>::Stored, BUILD_OUTER>,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
+    O = JoinBuilder<<K as JoinKey>::Stored, TRACK_MATCHED_BUILD_ROWS>,
 > {
     key_columns: Vec<usize>,
     /// The build columns whose extremes this worker computes at seal time,
@@ -86,12 +86,14 @@ pub struct JoinBuildConsumer<
     saw_null_key: bool,
 }
 
-unsafe impl<K: JoinKey, const BUILD_OUTER: bool, O: Send> Send
-    for JoinBuildConsumer<K, BUILD_OUTER, O>
+unsafe impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O: Send> Send
+    for JoinBuildConsumer<K, TRACK_MATCHED_BUILD_ROWS, O>
 {
 }
 
-impl<K: JoinKey, const BUILD_OUTER: bool, O> JoinBuildConsumer<K, BUILD_OUTER, O> {
+impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O>
+    JoinBuildConsumer<K, TRACK_MATCHED_BUILD_ROWS, O>
+{
     pub(crate) fn new(
         key_columns: Vec<usize>,
         filter_columns: Vec<usize>,
@@ -185,8 +187,8 @@ pub(crate) fn split_null_keys(
     (kept, (dropped.num_rows() > 0).then_some(dropped))
 }
 
-impl<K: JoinKey, const BUILD_OUTER: bool, O, Out> Consumer<RecordBatch, Out>
-    for JoinBuildConsumer<K, BUILD_OUTER, O>
+impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O, Out> Consumer<RecordBatch, Out>
+    for JoinBuildConsumer<K, TRACK_MATCHED_BUILD_ROWS, O>
 where
     O: BatchesOutputter<BuildWorkerOutput<K::Stored>, Out>,
 {
@@ -242,7 +244,7 @@ where
     }
 }
 
-pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
+pub struct JoinBuilder<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> {
     table: JoinTable<K>,
     injector: Arc<Injector<JoinBuildJob<K>>>,
     jobs_injected: Arc<AtomicBool>,
@@ -257,7 +259,10 @@ pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
     build_filters: Vec<JoinBuildFilter>,
 }
 
-unsafe impl<K: Copy + Send, const BUILD_OUTER: bool> Send for JoinBuilder<K, BUILD_OUTER> {}
+unsafe impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Send
+    for JoinBuilder<K, TRACK_MATCHED_BUILD_ROWS>
+{
+}
 
 /// One unit of the parallel table-build phase, stolen and run by any build
 /// worker between the gather barrier and the `build_ready` gate.
@@ -337,7 +342,9 @@ impl<K: Copy + Send> JoinBuildJob<K> {
     }
 }
 
-impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOIN_BUILD_SIDE> {
+impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
+    JoinBuilder<K, TRACK_MATCHED_BUILD_ROWS>
+{
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         table: JoinTable<K>,
@@ -433,7 +440,7 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
         // whose side is outer, anti, or semi this also allocates one matched
         // flag per row id (gaps included); null-keyed rows have no tuple and
         // remain unmatched.
-        let (build_rows, row_bases) = BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(
+        let (build_rows, row_bases) = BuildRows::new::<TRACK_MATCHED_BUILD_ROWS>(
             worker_outputs
                 .iter_mut()
                 .map(|output| std::mem::take(&mut output.build_row_batches)),
@@ -488,8 +495,8 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
     }
 }
 
-impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> BatchesOutputter<BuildWorkerOutput<K>, ()>
-    for JoinBuilder<K, OUTER_JOIN_BUILD_SIDE>
+impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
+    BatchesOutputter<BuildWorkerOutput<K>, ()> for JoinBuilder<K, TRACK_MATCHED_BUILD_ROWS>
 {
     fn accept(&mut self, group: BuildWorkerOutput<K>) -> unary::Result<()> {
         let gather = self.gather.clone();
@@ -500,16 +507,16 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> BatchesOutputter<BuildWo
     }
 }
 
-impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool>
-    InitializableOutputter<BuildWorkerOutput<K>, ()> for JoinBuilder<K, OUTER_JOIN_BUILD_SIDE>
+impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
+    InitializableOutputter<BuildWorkerOutput<K>, ()> for JoinBuilder<K, TRACK_MATCHED_BUILD_ROWS>
 {
     fn initialize(&mut self, groups: Vec<BuildWorkerOutput<K>>) -> unary::Result<()> {
         self.initialize_groups(groups)
     }
 }
 
-impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> Outputter<()>
-    for JoinBuilder<K, OUTER_JOIN_BUILD_SIDE>
+impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Outputter<()>
+    for JoinBuilder<K, TRACK_MATCHED_BUILD_ROWS>
 {
     fn output(&mut self, _sender: &mut dyn Sender<()>) -> unary::Result<bool> {
         match self.injector.steal() {
