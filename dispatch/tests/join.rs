@@ -1169,6 +1169,36 @@ fn a_build_filter_publishes_the_key_bounds() {
     assert_eq!(survivors, vec![1, 2, 3]);
 }
 
+#[test]
+fn a_normalized_build_seals_the_key_bitset() {
+    // Through the normalizer the build groups land on one collector worker,
+    // yet every worker still sets its own share of the bitset, so it seals.
+    let probe = int64_batch("key", &[1, 2, 3]);
+    let build = int64_batch("key", &[42, 7, 19]);
+    let key_bitset_slot = Arc::new(KeyBitsetSlot::new());
+    let mut spec = inner_join(vec![0], vec![0]);
+    spec.build_filters = vec![JoinBuildFilter {
+        build_column: 0,
+        min_slot: Arc::new(BoundarySlot::new()),
+        max_slot: Arc::new(BoundarySlot::new()),
+        key_bitset_slot: key_bitset_slot.clone(),
+    }];
+
+    let d = dispatch(2);
+    let probe_input = values_input(&d, vec![probe]).record_batches();
+    let build_input = values_input(&d, vec![build]).record_batches();
+    probe_input
+        .join_normalizing_build(build_input, &[DataType::Int64], spec)
+        .collect()
+        .unwrap();
+
+    let bitset = key_bitset_slot.get().expect("sparse keys seal a bitset");
+    let mut survivors = Vec::new();
+    let probe_keys: ArrayRef = Arc::new(Int64Array::from(vec![6, 7, 19, 42, 43]));
+    bitset.select(&probe_keys, &mut survivors);
+    assert_eq!(survivors, vec![1, 2, 3]);
+}
+
 fn boundary_i64(slot: &BoundarySlot) -> i64 {
     use arrow_array::Datum;
     let boundary = slot.boundary().expect("the sealed build published a bound");
