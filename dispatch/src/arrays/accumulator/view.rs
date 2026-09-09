@@ -21,7 +21,7 @@
 //! own view, and both paths copy that view across as it lies.
 
 use super::BUFFER_SIZE;
-use super::column::{ChunkedColumn, ColumnAccumulator};
+use super::column::{ChunkedColumn, ColumnAccumulator, EncodedRowIds, split_encoded_id};
 use super::fixed_width::gather_fixed_width;
 use super::validity::ValidityMask;
 use crate::memory::{SlabAllocator, SlabBuffer};
@@ -190,10 +190,10 @@ impl ViewColumn {
     /// chunks are retained whatever share of each the append takes: a caller
     /// holding rows as chunks keeps them alive for as long as it gathers from
     /// them, so referencing them pins nothing the caller does not pin already.
-    fn append_batches(
+    fn append_batches<I: Copy + Into<u64>>(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u32],
+        ids: &[I],
         shift: u32,
         destination_start: usize,
     ) {
@@ -213,17 +213,13 @@ impl ViewColumn {
             generation,
             ..
         } = self;
-        let mask = (1u32 << shift) - 1;
         // SAFETY: the views slab has capacity for `destination_start` plus the
         // appended rows (checked by the caller).
         unsafe {
             let mut dst = views.ptr_at_index(destination_start);
             for &id in ids {
-                let batch_idx = (id >> shift) as usize;
-                let mut view = Self::view_at(
-                    *column.values.get_unchecked(batch_idx),
-                    (id & mask) as usize,
-                );
+                let (batch_idx, row) = split_encoded_id(id, shift);
+                let mut view = Self::view_at(*column.values.get_unchecked(batch_idx), row);
                 // A view longer than the inline limit points into its batch's
                 // data buffers (buffers 1 onward); register those once per
                 // emitted batch and rebase the buffer index onto the list.
@@ -391,12 +387,17 @@ impl ColumnAccumulator for ViewColumn {
     fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u32],
+        ids: EncodedRowIds<'_>,
         shift: u32,
         destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
-        self.append_batches(column, ids, shift, destination_start)
+        match ids {
+            EncodedRowIds::Narrow(ids) => {
+                self.append_batches(column, ids, shift, destination_start)
+            }
+            EncodedRowIds::Wide(ids) => self.append_batches(column, ids, shift, destination_start),
+        }
     }
 
     fn take_array(

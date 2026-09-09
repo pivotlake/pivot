@@ -74,7 +74,7 @@ macro_rules! impl_packed_join_key {
                 _reader: &Self::Reader<'_>,
                 _verifier: &(),
                 _probe_idx: usize,
-                _build_row_id: u32,
+                _build_row_id: u64,
             ) -> bool {
                 true
             }
