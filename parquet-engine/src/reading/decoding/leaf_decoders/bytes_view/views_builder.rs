@@ -53,7 +53,21 @@ pub struct ViewsBuilder<V: ByteViewType> {
 impl<V: ByteViewType> ViewsBuilder<V> {
     /// Registers a data block and returns its block ID (used in non-inline
     /// views to reference string data).
+    ///
+    /// A page decoder registers the buffer it is reading from once per run it
+    /// decodes, and a page is consumed as many runs when nulls or a pushed-down
+    /// filter mask break it up. The same buffer offered again right after
+    /// itself gets its existing id back, so the array names each page once
+    /// however many runs were cut from it. Only the last entry is compared:
+    /// runs from one page are consecutive, and a buffer that comes back after
+    /// another was registered in between is rare enough to take a fresh entry.
     pub fn append_block(&mut self, block: Buffer) -> u32 {
+        if let Some(last) = self.buffers.last()
+            && last.as_ptr() == block.as_ptr()
+            && last.len() == block.len()
+        {
+            return self.buffers.len() as u32 - 1;
+        }
         let block_id = self.buffers.len() as u32;
         self.buffers.push(block);
         block_id
@@ -138,5 +152,39 @@ impl<V: ByteViewType> ArrayBuilder for ViewsBuilder<V> {
                 nulls,
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::types::StringViewType;
+    use dispatch::memory::init_test_free_pool;
+
+    #[test]
+    fn registering_the_same_buffer_again_returns_its_existing_id() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut builder = ViewsBuilder::<StringViewType>::with_capacity(&mut allocator, 4);
+        let page = Buffer::from(vec![0u8; 64]);
+
+        let first = builder.append_block(page.clone());
+        let again = builder.append_block(page.clone());
+
+        assert_eq!(first, again);
+        assert_eq!(builder.buffers.len(), 1);
+    }
+
+    #[test]
+    fn a_different_buffer_gets_a_new_id() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut builder = ViewsBuilder::<StringViewType>::with_capacity(&mut allocator, 4);
+
+        let first = builder.append_block(Buffer::from(vec![0u8; 64]));
+        let second = builder.append_block(Buffer::from(vec![1u8; 64]));
+
+        assert_ne!(first, second);
+        assert_eq!(builder.buffers.len(), 2);
     }
 }
