@@ -16,5 +16,5 @@ __pycache__/
 *.pending-snap
 
 # binaries the deploy workflow drops next to the runtime image Dockerfile
-server/image/amd64/
-server/image/arm64/
+bin/image/amd64/
+bin/image/arm64/
