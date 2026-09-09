@@ -18,7 +18,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::TimestampMicrosecondType;
 use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, StringViewArray, StructArray};
 use arrow_schema::{ArrowError, DataType, TimeUnit};
-use parquet_variant::Variant;
+use parquet_variant::{Variant, VariantPath};
 use parquet_variant_compute::{
     GetOptions, VariantArray, json_to_variant, unshred_variant, variant_get,
 };
@@ -184,17 +184,33 @@ impl Cast {
 /// strings lose their JSON quotes, while other values use their JSON
 /// representation.
 pub fn cast_variant_array(input: &ArrayRef, target: &DataType) -> Result<ArrayRef, ArrowError> {
-    // Text renders JSON null as the string `null` and keeps only an absent
-    // value as SQL NULL, so it cannot use the typed read below, which maps
-    // both to SQL NULL.
+    extract_variant_path(input, VariantPath::new(Vec::new()), Some(target))
+}
+
+/// Reads `path` out of a variant column, cast to `target` when one is given.
+///
+/// A typed target is read in one pass: the path walk and the conversion happen
+/// row by row inside `variant_get`, with no intermediate variant array. Text
+/// renders JSON null as the string `null` and keeps only an absent value as
+/// SQL NULL, so it cannot use that read, which maps both to SQL NULL; it
+/// extracts the path first and renders the result.
+pub fn extract_variant_path(
+    input: &ArrayRef,
+    path: VariantPath<'_>,
+    target: Option<&DataType>,
+) -> Result<ArrayRef, ArrowError> {
+    let Some(target) = target else {
+        return variant_get(input, GetOptions::new_with_path(path));
+    };
     if target.is_string() {
-        return variant_to_text_array(input, target);
+        let extracted = variant_get(input, GetOptions::new_with_path(path))?;
+        return variant_to_text_array(&extracted, target);
     }
 
     let target_field = Arc::new(arrow_schema::Field::new("item", target.clone(), true));
     variant_get(
         input,
-        GetOptions::new()
+        GetOptions::new_with_path(path)
             .with_as_type(Some(target_field))
             .with_cast_options(arrow::compute::CastOptions {
                 safe: false,

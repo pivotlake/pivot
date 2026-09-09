@@ -25,7 +25,7 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, TimeUnit};
 use dispatch::VariantExtract;
 use parquet_variant::{VariantPath, VariantPathElement};
-use parquet_variant_compute::{GetOptions, cast_to_variant, variant_get};
+use parquet_variant_compute::cast_to_variant;
 use planner::expression::cast_variant_array;
 use std::sync::Arc;
 use thiserror::Error;
@@ -112,11 +112,7 @@ fn extract_variant_path(
         .iter()
         .map(|segment| VariantPathElement::field(segment.as_str()))
         .collect();
-    let extracted = variant_get(column, GetOptions::new_with_path(variant_path))?;
-    match as_type {
-        Some(as_type) => cast_variant_array(&extracted, as_type),
-        None => Ok(extracted),
-    }
+    planner::expression::extract_variant_path(column, variant_path, as_type.as_ref())
 }
 
 /// Decodes one output column of a row group's batches.

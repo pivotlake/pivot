@@ -46,6 +46,7 @@ pub use between::Between;
 pub use case::{Case, CaseCheck};
 pub use cast::Cast;
 pub use cast::cast_variant_array;
+pub use cast::extract_variant_path;
 pub use cast::json_to_canonical_variant;
 pub use compare::{Compare, CompareType};
 pub use concat::Concat;
