@@ -27,7 +27,8 @@ pub use packed::PackedKey;
 pub use single_column::SingleColumnKey;
 
 use ahash::RandomState;
-use arrow_array::{Array, RecordBatch};
+use arrow::compute::filter_record_batch;
+use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_buffer::NullBuffer;
 
 /// One key shape of a hash equi-join. Implementations are zero-sized markers;
@@ -104,4 +105,17 @@ pub(crate) fn combined_key_validity(
         });
     }
     combined
+}
+
+/// Drop rows any of whose join key columns is null: an equi-join can never
+/// match them, and the probe's hot loops read key values without validity
+/// checks. Only the probe side filters; the build side keeps its batches
+/// whole (they become the stored build row batches) and skips null-keyed rows when
+/// generating tuples.
+pub(crate) fn filter_null_keys(batch: RecordBatch, key_columns: &[usize]) -> RecordBatch {
+    let Some(combined_validity) = combined_key_validity(&batch, key_columns) else {
+        return batch;
+    };
+    let mask = BooleanArray::new(combined_validity.inner().clone(), None);
+    filter_record_batch(&batch, &mask).expect("null-key filter mask matches batch length")
 }

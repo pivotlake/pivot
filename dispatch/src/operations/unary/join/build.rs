@@ -6,13 +6,13 @@ use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::key_bitset::{KeyBitset, integer_scalar};
-use crate::operations::unary::join::keys::{JoinKey, combined_key_validity};
+use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::{BatchesOutputter, InitializableOutputter, NormalizationBatches};
 use crate::operations::{Consumer, Outputter, unary};
 use crate::waker::worker_waker;
 use ahash::RandomState;
-use arrow::compute::{concat, filter_record_batch, sort_to_indices, take};
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use arrow::compute::{concat, sort_to_indices, take};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::SortOptions;
 use crossbeam_deque::{Injector, Steal};
 use std::sync::Arc;
@@ -153,38 +153,6 @@ fn combine_extremes(candidates: Vec<ArrayRef>, largest: bool) -> Option<ArrayRef
     let indices = sort_to_indices(&combined, Some(options), Some(1))
         .expect("join key columns support ordering");
     Some(take(&combined, &indices, None).expect("a sort index is in bounds"))
-}
-
-/// Drop rows any of whose join key columns is null: an equi-join can never
-/// match them, and the probe's hot loops read key values without validity
-/// checks. Only the probe side filters; the build side keeps its batches
-/// whole (they become the stored build row batches) and skips null-keyed rows when
-/// generating tuples.
-pub(crate) fn filter_null_keys(batch: RecordBatch, key_columns: &[usize]) -> RecordBatch {
-    let Some(combined_validity) = combined_key_validity(&batch, key_columns) else {
-        return batch;
-    };
-    let mask = BooleanArray::new(combined_validity.inner().clone(), None);
-    filter_record_batch(&batch, &mask).expect("null-key filter mask matches batch length")
-}
-
-/// Split a probe batch into its rows with fully non-null keys and, when any
-/// exist, the null-keyed rest. A probe-side outer join keeps the rest: those
-/// rows can never match, but they still reach the output null-padded.
-pub(crate) fn split_null_keys(
-    batch: RecordBatch,
-    key_columns: &[usize],
-) -> (RecordBatch, Option<RecordBatch>) {
-    let Some(combined_validity) = combined_key_validity(&batch, key_columns) else {
-        return (batch, None);
-    };
-    let keep = BooleanArray::new(combined_validity.inner().clone(), None);
-    let drop = arrow::compute::not(&keep).expect("a validity mask negates");
-    let kept =
-        filter_record_batch(&batch, &keep).expect("null-key filter mask matches batch length");
-    let dropped =
-        filter_record_batch(&batch, &drop).expect("null-key filter mask matches batch length");
-    (kept, (dropped.num_rows() > 0).then_some(dropped))
 }
 
 impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O, Out> Consumer<RecordBatch, Out>
