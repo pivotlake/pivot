@@ -7,7 +7,7 @@
 //! level is an identity operation and copies no rows.
 //!
 //! Merge tasks compare only key rows to construct a gather order, then apply
-//! that order to every column through [`crate::arrays::take::take_chunked`].
+//! that order to every column through [`crate::arrays::take_chunked`].
 //! Tasks run only on their selected NUMA node.
 
 mod batch_sort;
@@ -23,7 +23,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use crossbeam_deque::{Injector, Steal};
 
 use crate::Topology;
-use crate::arrays::take::take;
+use crate::arrays::take;
 use crate::gather_barrier::GatherBarrier;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::{NodeIdOutput, Sender};

@@ -12,7 +12,6 @@ use arrow_schema::{ArrowError, DataType};
 
 use super::column::{ChunkedColumn, ColumnAccumulator};
 use super::validity::ValidityMask;
-use crate::arrays::slab_into_buffer;
 use crate::memory::{SlabAllocator, SlabBuffer};
 
 pub(super) struct FixedWidthColumn {
@@ -129,7 +128,7 @@ impl ColumnAccumulator for FixedWidthColumn {
     ) -> Result<ArrayRef, ArrowError> {
         let fresh = allocate_values_slab(self.capacity, self.width, allocator);
         let slab = std::mem::replace(&mut self.slab, fresh);
-        let buffer = slab_into_buffer(slab, len * self.width);
+        let buffer = slab.into_buffer(len * self.width);
         let out = ArrayData::builder(self.data_type.clone())
             .len(len)
             .add_buffer(buffer)

@@ -1,5 +1,5 @@
 //! [`PlainPageDecoder`] — reads length-prefixed byte arrays from plain-encoded
-//! Parquet pages into a [`ViewsBuilder`].
+//! Parquet pages into a [`ViewBuilder`].
 //!
 //! Each value on disk is a 4-byte little-endian length followed by that many
 //! bytes of payload. The decoder has a fast path that stays within a single
@@ -9,11 +9,11 @@
 use super::super::ArrayBuilder;
 use crate::reading::decoding::leaf_decoders::DecodePlain;
 use crate::reading::decoding::leaf_decoders::bytes_view::delta_length_page_decoder::DeltaLengthPageDecoder;
-use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
 use arrow_array::builder::make_view;
 use arrow_array::types::ByteViewType;
 use arrow_buffer::Buffer;
 use bytes::Bytes;
+use dispatch::arrays::ViewBuilder;
 use dispatch::env::MAX_INLINE_STRING_VIEW;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 use std::marker::PhantomData;
@@ -33,7 +33,7 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Reads plain-encoded (length-prefixed) byte arrays from scattered buffers,
-/// producing views for a string or binary [`ViewsBuilder`] (per `V`).
+/// producing views for a string or binary [`ViewBuilder`] (per `V`).
 ///
 /// Holds both the raw `Bytes` buffers (for cross-boundary reads via
 /// [`MultiBufferReader`]) and Arrow `Buffer` copies (for zero-copy view
@@ -52,7 +52,7 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
     #[inline(always)]
     fn append_view_across_boundaries(
         &mut self,
-        output: &mut ViewsBuilder<V>,
+        output: &mut ViewBuilder<V>,
         len: u32,
     ) -> Result<(), Error> {
         let mut reader = MultiBufferReader::new(&self.data, &mut self.position);
@@ -78,7 +78,7 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
     /// whose values all inline names no page at all and keeps none alive.
     fn read_from_current_buffer(
         &mut self,
-        output: &mut ViewsBuilder<V>,
+        output: &mut ViewBuilder<V>,
         size: usize,
     ) -> Result<(), Error> {
         let bytes = &self.data[self.position.buffer_index];
@@ -161,7 +161,7 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
 }
 
 impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
-    type Builder = ViewsBuilder<V>;
+    type Builder = ViewBuilder<V>;
     type Delta = DeltaLengthPageDecoder<V>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
@@ -224,11 +224,11 @@ impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
     use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodePlain};
     use arrow_array::types::StringViewType;
     use arrow_array::{Array, StringViewArray};
     use bytes::Bytes;
+    use dispatch::arrays::ViewBuilder;
     use dispatch::memory::SlabAllocator;
     use dispatch::memory::init_test_free_pool;
 
@@ -245,7 +245,7 @@ mod tests {
         buffers.into_iter().map(Bytes::from).collect()
     }
 
-    fn extract(buf: ViewsBuilder<StringViewType>) -> Vec<String> {
+    fn extract(buf: ViewBuilder<StringViewType>) -> Vec<String> {
         let arr = buf.into_array(None);
         let sv = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
         (0..sv.len()).map(|i| sv.value(i).to_string()).collect()
@@ -257,7 +257,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let data = make_data(vec![encode_plain(&["hi", "bye", "ok"])]);
         let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 3);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 3);
 
         dec.read(&mut out, 3);
 
@@ -271,7 +271,7 @@ mod tests {
         let data = make_data(vec![encode_plain(&["a", "b", "c"])]);
         let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
 
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 3);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 3);
         dec.read(&mut out, 2);
         assert_eq!(out.len(), 2);
 
@@ -289,7 +289,7 @@ mod tests {
         let all = encode_plain(&["ab", "hello"]);
         let data = make_data(vec![all[..12].to_vec(), all[12..].to_vec()]);
         let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 2);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 2);
 
         dec.read(&mut out, 2);
 
@@ -305,7 +305,7 @@ mod tests {
         let all = encode_plain(&["ab", "cd"]);
         let data = make_data(vec![all[..8].to_vec(), all[8..].to_vec()]);
         let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 2);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 2);
 
         dec.read(&mut out, 2);
 
@@ -319,7 +319,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let data = make_data(vec![encode_plain(&["ab"]), encode_plain(&["cd"])]);
         let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 2);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 2);
 
         dec.read(&mut out, 2);
 
@@ -342,7 +342,7 @@ mod tests {
         DecodePlain::skip(&mut dec, 2);
 
         // Read the next 2 — should be "v1", "v2"
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 2);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 2);
         dec.read(&mut out, 2);
         assert_eq!(extract(out), vec!["v1", "v2"]);
     }
@@ -363,7 +363,7 @@ mod tests {
         DecodePlain::skip(&mut dec, 2);
 
         // Read the next 2 — should be "v1", "v2"
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 2);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 2);
         dec.read(&mut out, 2);
         assert_eq!(extract(out), vec!["v1", "v2"]);
     }
@@ -382,7 +382,7 @@ mod tests {
         let all = encode_plain(&["a", "b", "hello", "c", "d", "e", "f"]);
         let data = make_data(vec![all[..15].to_vec(), all[15..].to_vec()]);
         let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 4);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 4);
 
         dec.read(&mut out, 4);
 
@@ -400,14 +400,14 @@ mod tests {
         let all = encode_plain(&["x", "y", "hello"]);
         let data = make_data(vec![all[..15].to_vec(), all[15..].to_vec()]);
         let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 3);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 3);
 
         dec.read(&mut out, 3);
 
         assert_eq!(extract(out), vec!["x", "y", "hello"]);
     }
 
-    fn data_buffer_count(builder: ViewsBuilder<StringViewType>) -> usize {
+    fn data_buffer_count(builder: ViewBuilder<StringViewType>) -> usize {
         builder
             .into_array(None)
             .as_any()
@@ -426,7 +426,7 @@ mod tests {
         let long = "a value longer than twelve bytes";
         let data = make_data(vec![encode_plain(&[long; 6])]);
         let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 6);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 6);
 
         for _ in 0..6 {
             dec.read(&mut out, 1);
@@ -443,7 +443,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let data = make_data(vec![encode_plain(&["short", "values", "only"])]);
         let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
-        let mut out = ViewsBuilder::with_capacity(&mut allocator, 3);
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 3);
 
         dec.read(&mut out, 3);
 

@@ -52,10 +52,6 @@ unsafe impl Sync for ChunkedColumn {}
 /// batches as its owner emits.
 pub(super) trait ColumnAccumulator {
     /// Append indexed rows from one batch's column.
-    ///
-    /// `allocator` is drawn on only by an implementation that copies values
-    /// (see [`ValueStorage`](super::ValueStorage)); one that retains the
-    /// source's buffers never touches it.
     fn append_from_indices(
         &mut self,
         column: &ArrayRef,

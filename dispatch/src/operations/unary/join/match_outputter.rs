@@ -96,19 +96,16 @@ impl ProbeMatchOutputter {
         Self {
             output_schema: Arc::new(Schema::new(fields)),
             mark,
-            probe: BatchAccumulator::retaining_source_buffers(
+            probe: BatchAccumulator::new(
                 Arc::new(Schema::new(probe_fields.to_vec())),
                 &mut allocator,
             ),
-            build: BatchAccumulator::retaining_source_buffers(
+            build: BatchAccumulator::new(
                 Arc::new(Schema::new(build_fields.to_vec())),
                 &mut allocator,
             ),
             unmatched_probe: emits_unmatched_probe_rows.then(|| {
-                BatchAccumulator::retaining_source_buffers(
-                    Arc::new(Schema::new(probe_fields.to_vec())),
-                    &mut allocator,
-                )
+                BatchAccumulator::new(Arc::new(Schema::new(probe_fields.to_vec())), &mut allocator)
             }),
             allocator,
             build_rows,
@@ -144,7 +141,7 @@ impl ProbeMatchOutputter {
             "the build schema settles before any build row accumulates"
         );
         let schema = schema_with_types_from(self.build.schema(), first.schema_ref());
-        self.build = BatchAccumulator::retaining_source_buffers(schema, &mut self.allocator);
+        self.build = BatchAccumulator::new(schema, &mut self.allocator);
         self.refresh_output_schema();
     }
 
@@ -166,14 +163,10 @@ impl ProbeMatchOutputter {
             self.emit(sender)?;
         }
         let schema = schema_with_types_from(self.probe.schema(), source_schema);
-        self.probe =
-            BatchAccumulator::retaining_source_buffers(schema.clone(), &mut self.allocator);
+        self.probe = BatchAccumulator::new(schema.clone(), &mut self.allocator);
         if self.unmatched_probe.is_some() {
             self.emit_unmatched_probe_rows(sender)?;
-            self.unmatched_probe = Some(BatchAccumulator::retaining_source_buffers(
-                schema,
-                &mut self.allocator,
-            ));
+            self.unmatched_probe = Some(BatchAccumulator::new(schema, &mut self.allocator));
         }
         self.refresh_output_schema();
         Ok(())
