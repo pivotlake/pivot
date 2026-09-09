@@ -149,7 +149,7 @@ impl JoinKey for DynamicRowKey {
         reader: &DynamicReader,
         verifier: &DynamicVerifier,
         probe_idx: usize,
-        build_row_id: u32,
+        build_row_id: u64,
     ) -> bool {
         let (batch_idx, row) = split_row_id(build_row_id);
         reader

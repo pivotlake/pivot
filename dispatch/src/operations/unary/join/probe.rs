@@ -491,7 +491,7 @@ struct ProbeWindow<
     const EMIT_MARK_COLUMN: bool,
 > {
     keys: &'a MultiSlabBuffer<K::Stored>,
-    rows: &'a MultiSlabBuffer<u32>,
+    rows: &'a MultiSlabBuffer<u64>,
     reader: K::Reader<'b>,
     verifier: K::Verifier<'a>,
     /// The full probed batch, which the residual predicate's probe columns

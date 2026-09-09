@@ -94,7 +94,7 @@ impl ColumnAccumulator for FixedWidthColumn {
     fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u32],
+        ids: &[u64],
         shift: u32,
         destination_start: usize,
         _allocator: &mut SlabAllocator,
@@ -192,8 +192,8 @@ pub(super) unsafe fn gather_fixed_width<T: Copy>(src: *const u8, dst: *mut u8, i
 /// Every id must name an in-bounds row of an in-bounds batch, `dst` must have
 /// room for `ids.len()` elements, and all pointers must be valid for unaligned
 /// `T` access.
-unsafe fn gather_batches<T: Copy>(values: &[*const u8], ids: &[u32], shift: u32, dst: *mut u8) {
-    let mask = (1u32 << shift) - 1;
+unsafe fn gather_batches<T: Copy>(values: &[*const u8], ids: &[u64], shift: u32, dst: *mut u8) {
+    let mask = (1u64 << shift) - 1;
     let dst = dst as *mut T;
     unsafe {
         for (out_idx, &id) in ids.iter().enumerate() {

@@ -267,7 +267,7 @@ unsafe impl<T: Send> Sync for JoinCell<T> {}
 pub(crate) struct JoinTable<K> {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
     pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<K>>>,
-    pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+    pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u64>>>,
     pub(crate) build_rows: Arc<JoinCell<BuildRows>>,
     /// Whether any build worker saw a null key. The final worker at the build
     /// gather barrier writes it before the table is published; probes read it

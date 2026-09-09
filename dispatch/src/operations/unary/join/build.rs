@@ -30,7 +30,7 @@ const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
 pub(crate) struct BuildTuple<K> {
     hash: u64,
     key: K,
-    row: u32,
+    row: u64,
 }
 
 pub(crate) type PartitionBuffers<K> = Vec<SlabVec<BuildTuple<K>>>;
@@ -202,7 +202,7 @@ where
                     BuildTuple {
                         hash,
                         key,
-                        row: first_row_id + i as u32,
+                        row: first_row_id + i as u64,
                     },
                 );
             }
@@ -284,7 +284,7 @@ unsafe impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Send
 pub struct PartitionScatterJob<K: Copy + Send> {
     /// This partition's tuples, one entry per build worker, paired with that
     /// worker's row id base (added to each tuple's local row id).
-    tuples: Vec<(u32, SlabVec<BuildTuple<K>>)>,
+    tuples: Vec<(u64, SlabVec<BuildTuple<K>>)>,
     table: JoinTable<K>,
     arena_offset: usize,
 
@@ -495,7 +495,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
     fn publish_build_rows(
         &mut self,
         worker_outputs: &mut [BuildWorkerOutput<K>],
-    ) -> unary::Result<Vec<u32>> {
+    ) -> unary::Result<Vec<u64>> {
         let (build_rows, row_bases) = BuildRows::new::<TRACK_MATCHED_BUILD_ROWS>(
             worker_outputs
                 .iter_mut()
@@ -528,7 +528,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
         let keys = unsafe { &mut *self.table.keys.get() };
         *keys = arena_alloc.create_multi_slab_buffer::<K>(total_tuples.max(1), false);
         let rows = unsafe { &mut *self.table.rows.get() };
-        *rows = arena_alloc.create_multi_slab_buffer::<u32>(total_tuples.max(1), false);
+        *rows = arena_alloc.create_multi_slab_buffer::<u64>(total_tuples.max(1), false);
         directory_capacity
     }
 
@@ -538,14 +538,14 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
     fn inject_partition_jobs(
         &self,
         worker_outputs: &mut [BuildWorkerOutput<K>],
-        row_bases: &[u32],
+        row_bases: &[u64],
         partition_sizes: &[usize],
         directory_capacity: usize,
     ) {
         let slots_per_partition = directory_capacity / NUM_PARTITIONS;
         let mut arena_offset = 0;
         for (partition, &size) in partition_sizes.iter().enumerate() {
-            let tuples: Vec<(u32, SlabVec<BuildTuple<K>>)> = worker_outputs
+            let tuples: Vec<(u64, SlabVec<BuildTuple<K>>)> = worker_outputs
                 .iter_mut()
                 .zip(row_bases)
                 .map(|(output, &row_base)| {

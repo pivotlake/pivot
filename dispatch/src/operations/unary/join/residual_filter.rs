@@ -52,7 +52,7 @@ impl ResidualFilter {
         probe_batch: &RecordBatch,
         build_batches: &[RecordBatch],
         probe_indices: &mut [u32],
-        build_indices: &mut [u32],
+        build_indices: &mut [u64],
         matched: usize,
     ) -> unary::Result<usize> {
         let combined = self.gather_combined_batch(
@@ -94,7 +94,7 @@ impl ResidualFilter {
         probe_batch: &RecordBatch,
         build_batches: &[RecordBatch],
         probe_indices: &[u32],
-        build_indices: &[u32],
+        build_indices: &[u64],
     ) -> unary::Result<RecordBatch> {
         let mut columns = Vec::with_capacity(
             self.spec.probe_column_indices.len() + self.spec.build_column_indices.len(),

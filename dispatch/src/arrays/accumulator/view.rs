@@ -193,7 +193,7 @@ impl ViewColumn {
     fn append_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u32],
+        ids: &[u64],
         shift: u32,
         destination_start: usize,
     ) {
@@ -213,7 +213,7 @@ impl ViewColumn {
             generation,
             ..
         } = self;
-        let mask = (1u32 << shift) - 1;
+        let mask = (1u64 << shift) - 1;
         // SAFETY: the views slab has capacity for `destination_start` plus the
         // appended rows (checked by the caller).
         unsafe {
@@ -391,7 +391,7 @@ impl ColumnAccumulator for ViewColumn {
     fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u32],
+        ids: &[u64],
         shift: u32,
         destination_start: usize,
         _allocator: &mut SlabAllocator,
