@@ -652,10 +652,10 @@ impl CatalogTable {
         crate::log::deleted_file_retention(&self.snapshot)
     }
 
-    /// Delete commit JSONs from this table's `_delta_log` that a checkpoint has
-    /// made redundant and are past the table's `delta.logRetentionDuration`
-    /// (evaluated against `now_ms`). The checkpoints themselves are written inline
-    /// on the commit path; this is the periodic cleanup the vacuum sweep drives.
+    /// Delete the files in this table's `_delta_log` that a checkpoint has made
+    /// redundant and are past the table's `delta.logRetentionDuration`
+    /// (evaluated against `now_ms`). Writing a checkpoint stays inline on the
+    /// commit path; this is the periodic cleanup the vacuum sweep drives.
     /// The `_delta_log` naming convention lives with the rest of the Delta-format
     /// code in the Delta-format module; returns how many files were deleted.
     pub fn cleanup_log(&self, now_ms: u64) -> crate::Result<usize> {

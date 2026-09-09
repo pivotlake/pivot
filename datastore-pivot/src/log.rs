@@ -99,7 +99,7 @@ const SORT_BY_CONFIGURATION_KEY: &str = "pivot.sortBy";
 /// default.
 const DEFAULT_CHECKPOINT_INTERVAL: u64 = 100;
 
-/// How long a commit file already folded into a checkpoint is kept before the
+/// How long a log file a checkpoint has made redundant is kept before the
 /// vacuum sweep deletes it. Read per table from the standard
 /// `delta.logRetentionDuration` property and falls back to this default. The
 /// window must exceed the longest a reader can lag on (or time-travel to) an
@@ -586,14 +586,65 @@ fn build_null_count_stats(entries: &[DeltaFileEntry]) -> Result<ArrayRef, Error>
     Ok(Arc::new(structure))
 }
 
-/// Delete plain `{version:020}.json` commits strictly below the latest checkpoint
-/// when their file mtime is older than `now_ms` minus the table's
-/// `delta.logRetentionDuration`. The retention window matters because a reader
-/// time-traveling within it may still open an old commit. Checkpoint parquet,
-/// `_last_checkpoint`, CRC and multipart files, and all commits at or after the
-/// checkpoint are kept, so the log remains replayable and published for the next
-/// checkpoint. A table without a checkpoint keeps its whole log. Returns the
-/// number of files deleted.
+/// Every versioned object in a `_delta_log` is spelled `{version:020}.{suffix}`,
+/// whatever kind it is, so one split serves them all: the leading segment is the
+/// version and the suffix names the kind. `None` for a name that does not open
+/// with a version, which covers `_last_checkpoint` and the dot-prefixed
+/// `.{version}.json.crc` some engines write beside their log files.
+fn log_file_version(name: &str) -> Option<u64> {
+    let (version, _) = name.split_once('.')?;
+    version.parse::<u64>().ok()
+}
+
+/// The part of a log object's name after its version, which names its kind.
+/// Empty for a name carrying no version at all, matching no kind below.
+fn log_file_suffix(name: &str) -> &str {
+    name.split_once('.').map_or("", |(_, suffix)| suffix)
+}
+
+/// A commit: `{version:020}.json`. A coalesced commit carries a second version
+/// in its suffix (`{v}.{v}.compacted.json`) and is not one.
+fn is_commit_file(name: &str) -> bool {
+    log_file_suffix(name) == "json"
+}
+
+/// A single-file checkpoint: `{version:020}.checkpoint.parquet`. Multipart and
+/// V2 checkpoints spell extra segments into the suffix
+/// (`checkpoint.{part}.{parts}.parquet`, `checkpoint.{uuid}.parquet`) and are
+/// not one, so a log carrying them keeps them.
+fn is_checkpoint_file(name: &str) -> bool {
+    log_file_suffix(name) == "checkpoint.parquet"
+}
+
+/// A version checksum file: `{version:020}.crc`. It holds a snapshot of table
+/// state at its version, which a reader uses to skip replaying the log for
+/// protocol and metadata, so it is worth exactly as much as the version it
+/// describes and is reclaimed on the same boundary as the checkpoints.
+fn is_checksum_file(name: &str) -> bool {
+    log_file_suffix(name) == "crc"
+}
+
+/// Delete the log files a checkpoint has made redundant, once they are older
+/// than the table's `delta.logRetentionDuration`, measured back from `now_ms`:
+/// every commit, checkpoint and checksum below the anchor. What is left starts
+/// at the anchor and is contiguous, so every version still in the log replays.
+/// A table with no checkpoint keeps its whole log. Returns how many files were
+/// deleted.
+///
+/// The anchor is the oldest checkpoint we keep, and what the remaining log
+/// replays from. It is the newest checkpoint that has itself aged past the
+/// window, rather than the newest checkpoint, because a reader opens whichever
+/// checkpoint the log carries last, however old that one is:
+///
+/// ```text
+///   day 0       checkpoint C1 is written
+///   day 1..20   nothing is written; readers use C1, the only one there is
+///   day 21      a commit crosses the checkpoint interval and writes C2
+/// ```
+///
+/// If C2 were the anchor, C1 would go the moment C2 landed, while readers were
+/// still opening it. C2 is too new to be the anchor, so C1 stays until C2 has
+/// replaced it for a full window. That costs one extra checkpoint.
 ///
 /// The checkpoint version and retention window come off the caller's `snapshot`
 /// rather than a fresh log read. A snapshot behind a checkpoint another writer
@@ -615,20 +666,39 @@ pub(crate) fn cleanup_log(
         .unwrap_or(DEFAULT_LOG_RETENTION);
     let cutoff_ms = now_ms.saturating_sub(retention.as_millis() as u64);
     let log_dir = location.join("_delta_log");
+    let objects = store.list(&log_dir)?.objects;
+
+    // The anchor, per the reasoning above. Checkpoints above the table's own are
+    // not candidates, so a checkpoint another writer published never becomes the
+    // anchor and the one this table reads from always survives. No anchor leaves
+    // every checkpoint in place, which is what a table whose checkpoints are all
+    // inside the window wants.
+    let anchor_checkpoint = objects
+        .iter()
+        .filter(|object| object.modified_unix_ms < cutoff_ms)
+        .filter(|object| is_checkpoint_file(object.file.path.name()))
+        .filter_map(|object| log_file_version(object.file.path.name()))
+        .filter(|version| *version <= checkpoint)
+        .max();
+
     let mut deleted = 0;
-    for object in store.list(&log_dir)?.objects {
-        // Only plain commit JSONs (`{version:020}.json`) are candidates; the
-        // checkpoint parquet, `_last_checkpoint`, and CRC files never match the
-        // `.json` suffix, and a coalesced commit (`{v}.{v}.compacted.json`) fails
-        // the integer parse, so all are kept.
+    for object in &objects {
+        if object.modified_unix_ms >= cutoff_ms {
+            continue;
+        }
         let name = object.file.path.name();
-        let Some(version) = name
-            .strip_suffix(".json")
-            .and_then(|digits| digits.parse::<u64>().ok())
-        else {
+        let Some(version) = log_file_version(name) else {
             continue;
         };
-        if version < checkpoint && object.modified_unix_ms < cutoff_ms {
+        let superseded =
+            if is_commit_file(name) || is_checkpoint_file(name) || is_checksum_file(name) {
+                anchor_checkpoint.is_some_and(|anchor| version < anchor)
+            } else {
+                // A spelling this does not recognise, such as a multipart or V2
+                // checkpoint. Deleting half of one would break the log, so keep it.
+                false
+            };
+        if superseded {
             store.delete(&log_dir.join(name))?;
             deleted += 1;
         }
@@ -1500,6 +1570,64 @@ mod tests {
         })
     }
 
+    /// A wall clock far enough ahead of everything a test just wrote that the
+    /// default log-retention window has expired for all of it.
+    fn well_past_retention() -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        now + 40 * 24 * 60 * 60 * 1000
+    }
+
+    /// The versions of the single-file checkpoints present in `log_dir`, ascending.
+    fn checkpoint_versions(log_dir: &std::path::Path) -> Vec<u64> {
+        let mut versions: Vec<u64> = std::fs::read_dir(log_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.strip_suffix(".checkpoint.parquet")
+                    .and_then(|digits| digits.parse().ok())
+            })
+            .collect();
+        versions.sort_unstable();
+        versions
+    }
+
+    /// Move one log file's mtime `by` into the past, standing in for a table that
+    /// went that long without writing another checkpoint.
+    fn backdate(path: &std::path::Path, by: std::time::Duration) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - by)
+            .unwrap();
+    }
+
+    fn checkpoint_path(log_dir: &std::path::Path, version: u64) -> std::path::PathBuf {
+        log_dir.join(format!("{version:020}.checkpoint.parquet"))
+    }
+
+    fn commit_path(log_dir: &std::path::Path, version: u64) -> std::path::PathBuf {
+        log_dir.join(format!("{version:020}.json"))
+    }
+
+    /// Commit one add per name, checkpointing after each, and hand back the last
+    /// snapshot: a log carrying one checkpoint per version.
+    fn commit_and_checkpoint_each(table: &TestTable, names: &[&str]) -> Arc<Snapshot> {
+        let mut snapshot = table.snapshot.clone();
+        for name in names {
+            let entry = DeltaFileEntry::new(FileRef {
+                path: ObjectPath::new(format!("{name}.parquet")),
+                size: 1,
+            });
+            snapshot = commit_file_changes(&table.engine, &snapshot, &[], &[entry], true)
+                .unwrap()
+                .expect("each add commits on the snapshot the last one handed back");
+            snapshot = snapshot.checkpoint(table.engine.kernel(), None).unwrap().1;
+        }
+        snapshot
+    }
+
     /// The inline checkpoint on the commit path fires only when the committed
     /// version crosses the interval: ordinary commits below it write no
     /// checkpoint, and a version at a multiple of the interval writes one.
@@ -1573,15 +1701,234 @@ mod tests {
 
         // Evaluate cleanup well past the default log-retention window, so every
         // commit below the checkpoint is eligible.
+        let now_ms = well_past_retention();
+        assert!(
+            cleanup_log(&table.store, &table.location, &checkpointed, now_ms).unwrap() > 0,
+            "commits below the anchor are deleted"
+        );
+    }
+
+    /// A checkpoint a later one replaced is reclaimed like the commits it folded
+    /// in, down to the newest checkpoint past the window: without this the log
+    /// keeps every checkpoint a table ever wrote, and they are the largest files
+    /// in it.
+    #[test]
+    fn cleanup_deletes_superseded_checkpoints_and_keeps_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = create_test_table(dir.path());
+        let log_dir = dir.path().join("t").join("_delta_log");
+        let snapshot = commit_and_checkpoint_each(&table, &["a", "b", "c"]);
+        assert_eq!(checkpoint_versions(&log_dir).len(), 3);
+
+        cleanup_log(
+            &table.store,
+            &table.location,
+            &snapshot,
+            well_past_retention(),
+        )
+        .unwrap();
+
+        assert_eq!(checkpoint_versions(&log_dir), vec![snapshot.version()]);
+    }
+
+    /// The retained log still begins at a checkpoint, so the table reloads from
+    /// what cleanup left behind rather than from a log missing its anchor.
+    #[test]
+    fn a_table_reloads_off_the_log_cleanup_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = create_test_table(dir.path());
+        let snapshot = commit_and_checkpoint_each(&table, &["a", "b", "c"]);
+
+        cleanup_log(
+            &table.store,
+            &table.location,
+            &snapshot,
+            well_past_retention(),
+        )
+        .unwrap();
+
+        let state = load_table(&table.uri, &table.engine).unwrap();
+        assert_eq!(state.file_entries.len(), 3);
+    }
+
+    /// Age alone never retires a checkpoint. A table that goes a fortnight
+    /// between checkpoints keeps the old one the moment a new one lands, because
+    /// the old one is still the newest that readers resolving against the log
+    /// before the new one could have picked.
+    #[test]
+    fn a_long_idle_checkpoint_survives_the_moment_its_successor_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = create_test_table(dir.path());
+        let log_dir = dir.path().join("t").join("_delta_log");
+        let snapshot = commit_and_checkpoint_each(&table, &["a", "b"]);
+        let versions = checkpoint_versions(&log_dir);
+        backdate(
+            &checkpoint_path(&log_dir, versions[0]),
+            Duration::from_secs(14 * 24 * 60 * 60),
+        );
+
+        let deleted = cleanup_log(
+            &table.store,
+            &table.location,
+            &snapshot,
+            crate::vacuum::now_unix_ms(),
+        )
+        .unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(checkpoint_versions(&log_dir), versions);
+    }
+
+    /// A checkpoint goes only once a newer one has stood in for it for the whole
+    /// window: with three checkpoints, the newest expired one is the anchor and
+    /// survives, and only what sits below it is reclaimed.
+    #[test]
+    fn a_checkpoint_goes_only_once_its_successor_is_itself_past_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = create_test_table(dir.path());
+        let log_dir = dir.path().join("t").join("_delta_log");
+        let snapshot = commit_and_checkpoint_each(&table, &["a", "b", "c"]);
+        let versions = checkpoint_versions(&log_dir);
+        backdate(
+            &checkpoint_path(&log_dir, versions[0]),
+            Duration::from_secs(14 * 24 * 60 * 60),
+        );
+        backdate(
+            &checkpoint_path(&log_dir, versions[1]),
+            Duration::from_secs(2 * 24 * 60 * 60),
+        );
+
+        cleanup_log(
+            &table.store,
+            &table.location,
+            &snapshot,
+            crate::vacuum::now_unix_ms(),
+        )
+        .unwrap();
+
+        assert_eq!(checkpoint_versions(&log_dir), versions[1..]);
+    }
+
+    /// A checksum file is only worth as much as the version it describes, so it
+    /// goes on the same boundary as the checkpoints: the one at the anchor is
+    /// the state a fresh reader starts from and stays.
+    #[test]
+    fn cleanup_deletes_the_checksums_below_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = create_test_table(dir.path());
+        let log_dir = dir.path().join("t").join("_delta_log");
+        let snapshot = commit_and_checkpoint_each(&table, &["a", "b"]);
+        let versions = checkpoint_versions(&log_dir);
+        for version in &versions {
+            std::fs::write(log_dir.join(format!("{version:020}.crc")), b"{}").unwrap();
+        }
+
+        cleanup_log(
+            &table.store,
+            &table.location,
+            &snapshot,
+            well_past_retention(),
+        )
+        .unwrap();
+
+        assert!(!log_dir.join(format!("{:020}.crc", versions[0])).exists());
+        assert!(log_dir.join(format!("{:020}.crc", versions[1])).exists());
+    }
+
+    /// Commits share the checkpoints' boundary, so one sitting above the anchor
+    /// is kept even though the table's own checkpoint has folded it in. That is
+    /// what leaves the retained log contiguous rather than holed.
+    #[test]
+    fn cleanup_keeps_the_commits_above_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = create_test_table(dir.path());
+        let log_dir = dir.path().join("t").join("_delta_log");
+        let entry = |name: &str| {
+            DeltaFileEntry::new(FileRef {
+                path: ObjectPath::new(name),
+                size: 1,
+            })
+        };
+        let commit = |snapshot: &Arc<Snapshot>, name: &str| {
+            commit_file_changes(&table.engine, snapshot, &[], &[entry(name)], true)
+                .unwrap()
+                .expect("each add commits on the snapshot the last one handed back")
+        };
+        let anchored = commit(&table.snapshot, "a");
+        let anchored = anchored.checkpoint(table.engine.kernel(), None).unwrap().1;
+        let middle = commit(&anchored, "b");
+        let latest = commit(&middle, "c");
+        let latest = latest.checkpoint(table.engine.kernel(), None).unwrap().1;
+        // Everything but the newest checkpoint ages out, so the anchor is the
+        // checkpoint at `anchored` and the commit at `middle` sits above it.
+        let newest = checkpoint_path(&log_dir, latest.version());
+        for file in std::fs::read_dir(&log_dir).unwrap().flatten() {
+            if file.path() != newest {
+                backdate(&file.path(), Duration::from_secs(14 * 24 * 60 * 60));
+            }
+        }
+
+        cleanup_log(
+            &table.store,
+            &table.location,
+            &latest,
+            crate::vacuum::now_unix_ms(),
+        )
+        .unwrap();
+
+        assert!(commit_path(&log_dir, middle.version()).exists());
+        assert!(!commit_path(&log_dir, 0).exists());
+    }
+
+    /// Checkpoints inside the retention window are kept: a reader that resolved
+    /// against one may still be reading it.
+    #[test]
+    fn cleanup_keeps_checkpoints_inside_the_retention_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = create_test_table(dir.path());
+        let log_dir = dir.path().join("t").join("_delta_log");
+        let snapshot = commit_and_checkpoint_each(&table, &["a", "b"]);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64
-            + 40 * 24 * 60 * 60 * 1000;
-        assert!(
-            cleanup_log(&table.store, &table.location, &checkpointed, now_ms).unwrap() > 0,
-            "superseded commits below the checkpoint are deleted"
-        );
+            .as_millis() as u64;
+
+        let deleted = cleanup_log(&table.store, &table.location, &snapshot, now_ms).unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(checkpoint_versions(&log_dir).len(), 2);
+    }
+
+    /// Only the two plain single-file spellings are deletion candidates. A
+    /// multipart checkpoint, a CRC file and `_last_checkpoint` are left alone
+    /// even when they are past the window and below the anchor.
+    #[test]
+    fn cleanup_keeps_log_files_it_does_not_understand() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = create_test_table(dir.path());
+        let log_dir = dir.path().join("t").join("_delta_log");
+        let snapshot = commit_and_checkpoint_each(&table, &["a", "b"]);
+        let opaque = [
+            "00000000000000000001.checkpoint.0000000001.0000000002.parquet",
+            "00000000000000000000.00000000000000000001.compacted.json",
+            ".00000000000000000001.json.crc",
+        ];
+        for name in opaque {
+            std::fs::write(log_dir.join(name), b"opaque").unwrap();
+        }
+
+        cleanup_log(
+            &table.store,
+            &table.location,
+            &snapshot,
+            well_past_retention(),
+        )
+        .unwrap();
+
+        for name in opaque {
+            assert!(log_dir.join(name).exists(), "cleanup deleted {name}");
+        }
+        assert!(log_dir.join("_last_checkpoint").exists());
     }
 
     /// A commit's snapshot names the version that commit landed on, never the
@@ -1644,11 +1991,7 @@ mod tests {
 
         // Past the retention window, so the one commit below the checkpoint (v0)
         // is eligible -- which is only visible if the checkpoint carried forward.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            + 40 * 24 * 60 * 60 * 1000;
+        let now_ms = well_past_retention();
         assert_eq!(
             cleanup_log(&table.store, &table.location, &after, now_ms).unwrap(),
             1
