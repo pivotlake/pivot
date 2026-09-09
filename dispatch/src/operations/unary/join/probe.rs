@@ -60,15 +60,16 @@ use crate::memory::MultiSlabBuffer;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::join::build::{filter_null_keys, split_null_keys};
 use crate::operations::unary::join::build_rows;
 use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
-use crate::operations::unary::join::keys::JoinKey;
+use crate::operations::unary::join::keys::filter_null_keys;
+use crate::operations::unary::join::keys::{JoinKey, combined_key_validity};
 use crate::operations::unary::join::match_outputter::ProbeMatchOutputter;
 use crate::operations::unary::join::residual_filter::ResidualFilter;
 use crate::operations::unary::join::{JoinKind, JoinSpec, JoinTable, UnmatchedScan};
 use ahash::RandomState;
-use arrow_array::RecordBatch;
+use arrow::compute::filter_record_batch;
+use arrow_array::{BooleanArray, RecordBatch};
 use std::cmp::min;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -405,8 +406,14 @@ impl<
         // const-gated arm, so every other kind compiles this method exactly
         // as if unmatched probe rows were not being tracked.
         let batch = if TRACK_UNMATCHED_PROBE_ROWS {
-            let (batch, null_keyed) = split_null_keys(batch, &self.spec.probe_key_indices);
-            if let Some(null_keyed) = null_keyed {
+            if let Some(validity) = combined_key_validity(&batch, &self.spec.probe_key_indices) {
+                let non_null = BooleanArray::new(validity.inner().clone(), None);
+                let nulled = arrow::compute::not(&non_null).expect("a validity mask negates");
+                let non_null_record_batch = filter_record_batch(&batch, &non_null)
+                    .expect("null-key filter mask matches batch length");
+                let null_keyed = filter_record_batch(&batch, &nulled)
+                    .expect("null-key filter mask matches batch length");
+
                 let probe_source = null_keyed.project(&self.spec.probe_output_indices)?;
                 if EMIT_MARK_COLUMN {
                     self.match_outputter.emit_marked_batch_with_constant(
@@ -418,8 +425,11 @@ impl<
                     self.match_outputter
                         .append_probe_rows_padded(&probe_source, sender)?;
                 }
+
+                non_null_record_batch
+            } else {
+                batch
             }
-            batch
         } else {
             filter_null_keys(batch, &self.spec.probe_key_indices)
         };

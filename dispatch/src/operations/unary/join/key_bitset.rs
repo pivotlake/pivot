@@ -8,6 +8,7 @@
 //! would have matched and correctness never depends on it — a consumer that
 //! finds its [`KeyBitsetSlot`] unarmed simply filters nothing.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use arrow_array::cast::AsArray;
@@ -28,10 +29,9 @@ const MAX_DOMAIN: u64 = 1 << 26;
 /// distinct values from above, so the gate needs no pass over the keys.
 const MAX_DENSITY: f64 = 0.9;
 
-/// Most build rows the filter is built from. The set pass runs serially at
-/// the build's final gather arrival while every other worker waits, so a
-/// huge build side would stall the whole flow for longer than the filter
-/// could ever save.
+/// Most build rows the filter is built from. The set pass runs between the
+/// build's gather and its readiness gate, so a huge build side would hold
+/// back the probe for longer than the filter could ever save.
 const MAX_BUILD_ROWS: usize = 1 << 24;
 
 /// One bit per value of `[min, min + domain)`; a set bit means some build row
@@ -44,41 +44,6 @@ pub struct KeyBitset {
 }
 
 impl KeyBitset {
-    /// Build the filter from the build side's key arrays, or `None` when the
-    /// key type is not a supported integer or the domain, row count, or
-    /// density gates say a filter is not worth its cost. `arrays` must hold
-    /// every build key column array and `bounds` the column's non-null
-    /// (min, max); a partial set would reject matching probe rows.
-    ///
-    /// Every gate reads only `bounds` and `total_rows`, so a build side that
-    /// seals no filter pays nothing beyond them; the single pass over the
-    /// keys happens only for a build the gates admit.
-    pub(crate) fn try_build<'arrays>(
-        arrays: impl Iterator<Item = &'arrays ArrayRef>,
-        bounds: Option<(i64, i64)>,
-        total_rows: usize,
-    ) -> Option<KeyBitset> {
-        let (min, max) = bounds?;
-        let domain = max.abs_diff(min) + 1;
-        if domain > MAX_DOMAIN || total_rows > MAX_BUILD_ROWS {
-            return None;
-        }
-        if total_rows as f64 >= MAX_DENSITY * domain as f64 {
-            return None;
-        }
-
-        let mut arrays = arrays.peekable();
-        let data_type = arrays.peek()?.data_type().clone();
-        let mut words = vec![0u64; domain.div_ceil(64) as usize];
-        for array in arrays {
-            for value in integer_values(array, &data_type)?.flatten() {
-                let bit = value.abs_diff(min);
-                words[(bit / 64) as usize] |= 1 << (bit % 64);
-            }
-        }
-        Some(KeyBitset { min, domain, words })
-    }
-
     /// Append the indices of `keys` rows whose value is a present build key
     /// to `survivors`. Nulls and out-of-domain values can never match, so
     /// they are never appended.
@@ -130,6 +95,81 @@ impl KeyBitset {
         // offset and fail the width comparison.
         let bit = (value as u64).wrapping_sub(self.min as u64);
         bit < self.domain && self.words[(bit / 64) as usize] & (1 << (bit % 64)) != 0
+    }
+}
+
+/// A [`KeyBitset`] under construction across the build workers. The final
+/// gather arrival allocates it once the gates (domain width, row count,
+/// density bound) admit a filter, all of which read only the merged key
+/// bounds and the row count; each worker then ORs its own key arrays into
+/// the shared words, in parallel alongside the partition jobs. The last
+/// worker to land publishes the sealed filter to the slot.
+pub(crate) struct PendingKeyBitset {
+    min: i64,
+    domain: u64,
+    data_type: DataType,
+    words: Vec<AtomicU64>,
+    remaining_chunks: AtomicUsize,
+    slot: Arc<KeyBitsetSlot>,
+}
+
+impl PendingKeyBitset {
+    /// Allocate the shared construction state, or `None` when the gates say
+    /// a filter is not worth its cost. `bounds` must be the non-null
+    /// (min, max) over every build key array and `chunks` the number of
+    /// [`apply_chunk`](Self::apply_chunk) calls that will follow, one per
+    /// build worker; together the chunks must cover every build key array,
+    /// since a partial set would reject matching probe rows.
+    pub(crate) fn try_new(
+        data_type: DataType,
+        bounds: (i64, i64),
+        total_rows: usize,
+        chunks: usize,
+        slot: Arc<KeyBitsetSlot>,
+    ) -> Option<Arc<Self>> {
+        let (min, max) = bounds;
+        let domain = max.abs_diff(min) + 1;
+        if domain > MAX_DOMAIN || total_rows > MAX_BUILD_ROWS {
+            return None;
+        }
+        if total_rows as f64 >= MAX_DENSITY * domain as f64 {
+            return None;
+        }
+        Some(Arc::new(PendingKeyBitset {
+            min,
+            domain,
+            data_type,
+            words: (0..domain.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            remaining_chunks: AtomicUsize::new(chunks),
+            slot,
+        }))
+    }
+
+    /// Set the bits for one chunk's key arrays; the call that lands the last
+    /// chunk seals the filter and publishes it to the slot.
+    pub(crate) fn apply_chunk(&self, arrays: &[ArrayRef]) {
+        for array in arrays {
+            let values = integer_values(array, &self.data_type)
+                .expect("the bounds admitted only a supported integer key");
+            for value in values.flatten() {
+                let bit = value.abs_diff(self.min);
+                self.words[(bit / 64) as usize].fetch_or(1 << (bit % 64), Ordering::Relaxed);
+            }
+        }
+        if self.remaining_chunks.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let words = self
+                .words
+                .iter()
+                .map(|word| word.load(Ordering::Relaxed))
+                .collect();
+            self.slot.publish(Some(KeyBitset {
+                min: self.min,
+                domain: self.domain,
+                words,
+            }));
+        }
     }
 }
 

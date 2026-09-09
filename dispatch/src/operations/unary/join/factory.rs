@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Arc, OnceLock};
 
 use ahash::RandomState;
 use arrow_array::RecordBatch;
@@ -13,7 +13,8 @@ use crate::memory::MultiSlabBuffer;
 use crate::operations::UnaryFactory;
 use crate::operations::channels::{ChannelFactory, Sender, StealableChannelFactory};
 use crate::operations::unary::join::build::{
-    BuildWorkerOutput, JoinBuildConsumer, JoinBuilder, NUM_PARTITIONS,
+    BuildWorkerOutput, JoinBuildConsumer, JoinBuilder, NUM_PARTITIONS, PendingKeyBitsets,
+    WorkerFilterArrays,
 };
 use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
@@ -29,6 +30,12 @@ pub struct JoinBuildFactory<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O>
     filter_columns: Vec<usize>,
     hash_state: RandomState,
     outputter: O,
+    /// The cell the consumer fills with its filter key columns at seal time
+    /// and this worker's [`JoinBuilder`] later reads to set its share of the
+    /// key bitsets. Shared between the two directly, whichever outputter
+    /// sits between them, since a normalizer ships the group itself to the
+    /// collector worker.
+    filter_arrays: WorkerFilterArrays,
     _key: PhantomData<fn() -> K>,
 }
 
@@ -201,14 +208,17 @@ pub fn create_for_workers<
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
     let build_ready = Arc::new(AtomicBool::new(false));
-    let remaining_jobs = Arc::new(AtomicUsize::new(NUM_PARTITIONS));
+    // One partition scatter job each, plus one key bitset pass per worker.
+    let remaining_jobs = Arc::new(AtomicUsize::new(NUM_PARTITIONS + worker_count));
     let gather = Arc::new(GatherBarrier::new(worker_count));
+    let pending_key_bitsets: PendingKeyBitsets = Arc::new(OnceLock::new());
 
     let table_clone = table.clone();
     let hs_clone = hash_state.clone();
     let probe_gate = build_ready.clone();
     let build_factories = (0..worker_count)
         .map(|_| {
+            let filter_arrays: WorkerFilterArrays = Arc::new(OnceLock::new());
             let outputter = JoinBuilder::new(
                 table.clone(),
                 injector.clone(),
@@ -218,6 +228,8 @@ pub fn create_for_workers<
                 gather.clone(),
                 spec.build_output_indices.clone(),
                 spec.build_filters.clone(),
+                filter_arrays.clone(),
+                pending_key_bitsets.clone(),
             );
             JoinBuildFactory {
                 key_columns: spec.build_key_indices.clone(),
@@ -228,6 +240,7 @@ pub fn create_for_workers<
                     .collect(),
                 hash_state: hash_state.clone(),
                 outputter,
+                filter_arrays,
                 _key: PhantomData,
             }
         })
@@ -286,6 +299,7 @@ pub(crate) fn create_normalizing_for_workers<
             filter_columns,
             hash_state,
             outputter,
+            filter_arrays,
             _key,
         } = build;
         normalized_builds.push(JoinBuildFactory {
@@ -293,6 +307,7 @@ pub(crate) fn create_normalizing_for_workers<
             filter_columns,
             hash_state,
             outputter: normalizer,
+            filter_arrays,
             _key,
         });
         collectors.push(CollectorFactory::new(outputter, worker == collector_worker));
@@ -315,6 +330,7 @@ where
             self.filter_columns,
             self.hash_state,
             self.outputter,
+            self.filter_arrays,
         ))
     }
 }
