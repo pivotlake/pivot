@@ -3,13 +3,12 @@
 //! A bare `->` returns a sub-variant. A cast turns the full path into one typed
 //! [`VariantGet`], which can read a shredded leaf directly.
 
-use super::{Expression, cast_variant_array};
+use super::{Expression, extract_variant_path};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::{Type, physical_arrow_type};
 use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 use parquet_variant::{VariantPath, VariantPathElement};
-use parquet_variant_compute::{GetOptions, variant_get};
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -62,17 +61,10 @@ impl VariantGet {
                     .iter()
                     .map(|segment| VariantPathElement::field(segment.as_str()))
                     .collect();
-                let options = GetOptions::new_with_path(vpath);
                 // Compiled expressions have no error channel; the dataflow
                 // catches the panic and fails the query with this message.
-                let extracted = variant_get(&variant, options).unwrap_or_else(|e| {
-                    panic!("variant path extraction failed (corrupt variant data?): {e}")
-                });
-                let array = match &target {
-                    Some(target) => cast_variant_array(&extracted, target)
-                        .unwrap_or_else(|e| panic!("variant cast failed: {e}")),
-                    None => extracted,
-                };
+                let array = extract_variant_path(&variant, vpath, target.as_ref())
+                    .unwrap_or_else(|e| panic!("variant path extraction failed: {e}"));
                 ExprResult::Array(array)
             }) as ExprEvalFn
         }))
