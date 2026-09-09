@@ -19,7 +19,7 @@ use arrow_schema::ArrowError;
 
 use arrow_array::make_array;
 
-use super::column::{ChunkedColumn, ColumnAccumulator};
+use super::column::{ChunkedColumn, ColumnAccumulator, EncodedRowIds, split_encoded_id};
 use crate::memory::SlabAllocator;
 
 /// A column held as the arrays it was appended from, concatenated on emit.
@@ -30,6 +30,34 @@ pub(super) struct ConcatenatedColumn {
 impl ConcatenatedColumn {
     pub(super) fn new() -> Self {
         Self { arrays: Vec::new() }
+    }
+}
+
+impl ConcatenatedColumn {
+    fn append_ids<I: Copy + Into<u64>>(&mut self, column: &ChunkedColumn, ids: &[I], shift: u32) {
+        // Consecutive same-batch rows become one slice, as in the indexed
+        // append.
+        let mut push = |batch: usize, start: usize, len: usize| {
+            self.arrays
+                .push(make_array(column.data[batch].slice(start, len)));
+        };
+        let mut run: Option<(usize, usize, usize)> = None;
+        for &id in ids {
+            let (batch, row) = split_encoded_id(id, shift);
+            match run {
+                Some((run_batch, start, end)) if run_batch == batch && row == end => {
+                    run = Some((run_batch, start, end + 1));
+                }
+                Some((run_batch, start, end)) => {
+                    push(run_batch, start, end - start);
+                    run = Some((batch, row, row + 1));
+                }
+                None => run = Some((batch, row, row + 1)),
+            }
+        }
+        if let Some((run_batch, start, end)) = run {
+            push(run_batch, start, end - start);
+        }
     }
 }
 
@@ -74,34 +102,14 @@ impl ColumnAccumulator for ConcatenatedColumn {
     fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u32],
+        ids: EncodedRowIds<'_>,
         shift: u32,
         _destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
-        let mask = (1u32 << shift) - 1;
-        // Consecutive same-batch rows become one slice, as above.
-        let mut push = |batch: usize, start: usize, len: usize| {
-            self.arrays
-                .push(make_array(column.data[batch].slice(start, len)));
-        };
-        let mut run: Option<(usize, usize, usize)> = None;
-        for &id in ids {
-            let batch = (id >> shift) as usize;
-            let row = (id & mask) as usize;
-            match run {
-                Some((run_batch, start, end)) if run_batch == batch && row == end => {
-                    run = Some((run_batch, start, end + 1));
-                }
-                Some((run_batch, start, end)) => {
-                    push(run_batch, start, end - start);
-                    run = Some((batch, row, row + 1));
-                }
-                None => run = Some((batch, row, row + 1)),
-            }
-        }
-        if let Some((run_batch, start, end)) = run {
-            push(run_batch, start, end - start);
+        match ids {
+            EncodedRowIds::Narrow(ids) => self.append_ids(column, ids, shift),
+            EncodedRowIds::Wide(ids) => self.append_ids(column, ids, shift),
         }
     }
 

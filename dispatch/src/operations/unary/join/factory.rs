@@ -20,6 +20,7 @@ use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::join::probe::Probe;
+use crate::operations::unary::join::row_arena::RowArena;
 use crate::operations::unary::join::{JoinCell, JoinKind, JoinSpec, JoinTable, UnmatchedScan};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use crate::operations::unary::{BatchesOutputter, CollectorFactory, Normalizer, UnaryOperator};
@@ -201,7 +202,7 @@ pub fn create_for_workers<
     let table = JoinTable {
         directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
         keys: Arc::new(JoinCell::new(MultiSlabBuffer::<K::Stored>::new(vec![]))),
-        rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
+        rows: Arc::new(JoinCell::new(RowArena::empty())),
         build_rows: Arc::new(JoinCell::new(BuildRows::empty())),
         build_saw_null_key: Arc::new(JoinCell::new(false)),
     };

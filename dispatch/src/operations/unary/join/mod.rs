@@ -65,6 +65,7 @@ mod range;
 pub(crate) use range::create_range_join_factories;
 pub use range::{RangeCompare, RangeJoinSpec};
 mod residual_filter;
+mod row_arena;
 
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -78,6 +79,7 @@ use crate::boundary_slot::BoundarySlot;
 use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
+use crate::operations::unary::join::row_arena::RowArena;
 pub(crate) use factory::create_for_workers as create_join_factories;
 pub(crate) use factory::create_normalizing_for_workers;
 
@@ -267,7 +269,7 @@ unsafe impl<T: Send> Sync for JoinCell<T> {}
 pub(crate) struct JoinTable<K> {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
     pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<K>>>,
-    pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+    pub(crate) rows: Arc<JoinCell<RowArena>>,
     pub(crate) build_rows: Arc<JoinCell<BuildRows>>,
     /// Whether any build worker saw a null key. The final worker at the build
     /// gather barrier writes it before the table is published; probes read it
