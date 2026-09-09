@@ -220,12 +220,22 @@ save_cache() {
 # build-ab-servers.sh: the client links no engine code, so instrumenting it
 # would grow the build and rebuild it under every fresh profile for nothing.
 # It gets a plain build in its own target-client dir instead.
+# The server a tree builds: the `pivot` binary of the `bin` crate, or in a
+# tree that predates the merge into one binary, the `server` crate's
+# `pivotdb-server`. Lets a side reach back to any released commit.
+server_package() {
+    if [[ -d "$1/bin" ]]; then echo bin; else echo server; fi
+}
+server_binary() {
+    if [[ -d "$1/bin" ]]; then echo pivot; else echo pivotdb-server; fi
+}
 build_gen() {
     local dir="$1"
     mkdir -p "$pgo_dir"
     (cd "$dir/benchmarks" && \
         PGO_DIR="$pgo_dir" PGO_GEN_TARGET_DIR=target-pgogen \
-        just pgo-gen-build build --release -p bin --bin pivot && \
+        just pgo-gen-build build --release \
+            -p "$(server_package "$dir")" --bin "$(server_binary "$dir")" && \
         CARGO_TARGET_DIR=target-client \
         cargo build --release -p benchmarks --bin pivot-bench)
 }
@@ -247,7 +257,7 @@ profile_side() {
     LLVM_PROFILE_FILE="$prof_dir/%m-%p.profraw" PIVOT_SPIN_LIMIT=0 \
         "$dir/benchmarks/target-client/release/pivot-bench" \
         --suite "$suite" --suite-dir "$dir/benchmarks/$suite" \
-        --server-bin "$dir/benchmarks/target-pgogen/$host_target/release/pivot" \
+        --server-bin "$dir/benchmarks/target-pgogen/$host_target/release/$(server_binary "$dir")" \
         --source "$source" --iterations 2 --skip-check >/dev/null
     "$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata" \
         merge -o "$work_dir/$side-$run_id.profdata" "$prof_dir"
@@ -257,9 +267,10 @@ build_use() {
     local dir="$1" side="$2"
     (cd "$dir/benchmarks" && \
         PGO_USE_TARGET_DIR=target-pgouse \
-        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release -p bin --bin pivot)
+        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release \
+            -p "$(server_package "$dir")" --bin "$(server_binary "$dir")")
     verify_pgo_applied "$dir" \
-        "$dir/benchmarks/target-pgouse/$host_target/release/pivot" \
+        "$dir/benchmarks/target-pgouse/$host_target/release/$(server_binary "$dir")" \
         "$work_dir/$side-$run_id.profdata" "$side"
 }
 
@@ -282,7 +293,9 @@ verify_pgo_applied() {
 build_release() {
     local dir="$1"
     (cd "$dir/benchmarks" && \
-        cargo build --release -p bin --bin pivot -p benchmarks --bin pivot-bench)
+        cargo build --release \
+            -p "$(server_package "$dir")" --bin "$(server_binary "$dir")" \
+            -p benchmarks --bin pivot-bench)
 }
 
 # Drop the OS page cache (and sync first) so the next read is cold. Needs
