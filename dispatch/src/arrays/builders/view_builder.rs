@@ -1,21 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
-
-//! [`ViewsBuilder`]: an [`ArrayBuilder`] that produces Arrow byte-view
+//! [`ViewBuilder`]: an [`ArrayBuilder`] that produces Arrow byte-view
 //! arrays (`StringViewArray` or `BinaryViewArray`, per the `V` type parameter).
 //!
 //! Each value is stored as a 128-bit *view*. Short values (≤ 12 bytes)
@@ -25,22 +8,22 @@
 //! [`into_array`](ArrayBuilder::into_array). The two flavours share this one
 //! physical layout; `V` only decides the array type the leaf's schema declares.
 
-use crate::reading::decoding::leaf_decoders::ArrayBuilder;
+use std::marker::PhantomData;
+use std::sync::Arc;
+
 use arrow_array::types::ByteViewType;
 use arrow_array::{ArrayRef, GenericByteViewArray, builder::make_view};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
-use dispatch::memory::SlabAllocator;
-use dispatch::memory::SlabBuffer;
-use std::marker::PhantomData;
-use std::ptr::NonNull;
-use std::sync::Arc;
+
+use super::ArrayBuilder;
+use crate::memory::{SlabAllocator, SlabBuffer};
 
 /// Accumulates 128-bit views and their backing data blocks, then finalises
 /// into a `GenericByteViewArray<V>`.
 ///
 /// Does not reuse `GenericByteViewBuilder` because it needs slab-allocated
 /// storage and direct control over the view buffer.
-pub struct ViewsBuilder<V: ByteViewType> {
+pub struct ViewBuilder<V: ByteViewType> {
     /// Slab-allocated buffer of 128-bit views (one per value).
     pub views: SlabBuffer<u128>,
     /// Number of views pushed so far.
@@ -50,7 +33,7 @@ pub struct ViewsBuilder<V: ByteViewType> {
     phantom: PhantomData<V>,
 }
 
-impl<V: ByteViewType> ViewsBuilder<V> {
+impl<V: ByteViewType> ViewBuilder<V> {
     /// Registers a data block and returns its block ID (used in non-inline
     /// views to reference string data).
     ///
@@ -100,7 +83,7 @@ impl<V: ByteViewType> ViewsBuilder<V> {
     }
 }
 
-impl<V: ByteViewType> ArrayBuilder for ViewsBuilder<V> {
+impl<V: ByteViewType> ArrayBuilder for ViewBuilder<V> {
     type Element = u128;
 
     fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
@@ -133,10 +116,7 @@ impl<V: ByteViewType> ArrayBuilder for ViewsBuilder<V> {
 
     fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef {
         let len = self.len;
-        let ptr = NonNull::new(self.views.ptr_at_index(0) as *mut u8).unwrap();
-        let buffer = unsafe {
-            Buffer::from_custom_allocation(ptr, len * size_of::<u128>(), Arc::new(self.views))
-        };
+        let buffer = self.views.into_buffer(len * size_of::<u128>());
         let scalar_buffer = ScalarBuffer::new(buffer, 0, len);
         let nulls = null_buffer
             .map(|b| NullBuffer::new(BooleanBuffer::new(b, 0, len)))
@@ -158,14 +138,14 @@ impl<V: ByteViewType> ArrayBuilder for ViewsBuilder<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::init_test_free_pool;
     use arrow_array::types::StringViewType;
-    use dispatch::memory::init_test_free_pool;
 
     #[test]
     fn registering_the_same_buffer_again_returns_its_existing_id() {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut builder = ViewsBuilder::<StringViewType>::with_capacity(&mut allocator, 4);
+        let mut builder = ViewBuilder::<StringViewType>::with_capacity(&mut allocator, 4);
         let page = Buffer::from(vec![0u8; 64]);
 
         let first = builder.append_block(page.clone());
@@ -179,7 +159,7 @@ mod tests {
     fn a_different_buffer_gets_a_new_id() {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut builder = ViewsBuilder::<StringViewType>::with_capacity(&mut allocator, 4);
+        let mut builder = ViewBuilder::<StringViewType>::with_capacity(&mut allocator, 4);
 
         let first = builder.append_block(Buffer::from(vec![0u8; 64]));
         let second = builder.append_block(Buffer::from(vec![1u8; 64]));

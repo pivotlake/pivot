@@ -368,7 +368,7 @@ impl RecordBatchOperatorSpec {
     /// per `RecordBatch` during execution, returning the batch of surviving rows. The
     /// inner closure also receives the operator'"'"'s [`SlabAllocator`](crate::memory::SlabAllocator)
     /// so survivors can be compacted into slab-backed buffers via
-    /// [`take`](crate::arrays::take::take).
+    /// [`take`](crate::arrays::take).
     ///
     /// This two-level pattern lets each worker own private mutable state (allocated in
     /// the builder):

@@ -1,5 +1,5 @@
 //! [`DeltaLengthPageDecoder`] — reads `DELTA_LENGTH_BYTE_ARRAY` pages into a
-//! [`ViewsBuilder`].
+//! [`ViewBuilder`].
 //!
 //! The page is a `DELTA_BINARY_PACKED` block holding every value's length,
 //! followed by all the value bytes back to back. Splitting it that way is why
@@ -21,13 +21,13 @@ use dispatch::env::MAX_INLINE_STRING_VIEW;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 use std::marker::PhantomData;
 
-use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
 use crate::reading::decoding::leaf_decoders::delta_binary_packed::DeltaDecoder;
 use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeDelta};
 use crate::thrift::general::Encoding;
+use dispatch::arrays::ViewBuilder;
 
 /// Reads `DELTA_LENGTH_BYTE_ARRAY` pages, producing views for a string or
-/// binary [`ViewsBuilder`] (per `V`).
+/// binary [`ViewBuilder`] (per `V`).
 pub struct DeltaLengthPageDecoder<V: ByteViewType> {
     data: Vec<Bytes>,
     /// Arrow `Buffer` wrappers over `data`, registered as view blocks.
@@ -45,7 +45,7 @@ pub struct DeltaLengthPageDecoder<V: ByteViewType> {
 }
 
 impl<V: ByteViewType> DecodeDelta for DeltaLengthPageDecoder<V> {
-    type Builder = ViewsBuilder<V>;
+    type Builder = ViewBuilder<V>;
     const ENCODING: Encoding = Encoding::DELTA_LENGTH_BYTE_ARRAY;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Option<Self> {
@@ -74,7 +74,7 @@ impl<V: ByteViewType> DecodeDelta for DeltaLengthPageDecoder<V> {
         })
     }
 
-    fn read(&mut self, builder: &mut ViewsBuilder<V>, size: usize) {
+    fn read(&mut self, builder: &mut ViewBuilder<V>, size: usize) {
         let mut left = size.min(self.values_left());
         while left > 0 {
             if self.position.offset >= self.data[self.position.buffer_index].len()
@@ -113,7 +113,7 @@ impl<V: ByteViewType> DeltaLengthPageDecoder<V> {
     /// rather than a walk. The run is then written as a run: the block is
     /// looked up once and the views go straight into the builder's slots,
     /// instead of both being redone per value.
-    fn read_from_current_buffer(&mut self, builder: &mut ViewsBuilder<V>, size: usize) -> usize {
+    fn read_from_current_buffer(&mut self, builder: &mut ViewBuilder<V>, size: usize) -> usize {
         let buffer = &self.data[self.position.buffer_index];
         let available = buffer.len();
         if self.position.offset >= available {
@@ -172,7 +172,7 @@ impl<V: ByteViewType> DeltaLengthPageDecoder<V> {
     }
 
     /// Gather one value that spans a buffer boundary and append its view.
-    fn append_view_across_buffers(&mut self, builder: &mut ViewsBuilder<V>) {
+    fn append_view_across_buffers(&mut self, builder: &mut ViewBuilder<V>) {
         let len = (self.ends[self.next + 1] - self.ends[self.next]) as usize;
         self.next += 1;
         let mut reader = MultiBufferReader::new(&self.data, &mut self.position);
@@ -210,7 +210,7 @@ mod tests {
             ReaderPosition::default(),
         )
         .unwrap();
-        let mut builder = ViewsBuilder::with_capacity(&mut allocator, values.len());
+        let mut builder = ViewBuilder::with_capacity(&mut allocator, values.len());
         for _ in 0..values.len().div_ceil(run) {
             decoder.read(&mut builder, run);
         }

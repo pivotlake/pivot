@@ -8,10 +8,10 @@
 //!
 //! Two consequences follow from holding slices, and a caller that cares about
 //! either should know which of its columns land here. The rows are held as
-//! references to the batches they came from, so a
-//! [`CopyValues`](super::ValueStorage::CopyValues) accumulation does *not* let
-//! go of its inputs for these columns; and the concatenation allocates through
-//! Arrow's own allocator, so their values leave the ring.
+//! references to the batches they came from, so an accumulation keeps every
+//! input alive for these columns however few rows it took from it; and the
+//! concatenation allocates through Arrow's own allocator, so their values leave
+//! the ring.
 
 use arrow::compute::kernels::concat::concat;
 use arrow_array::{Array, ArrayRef};

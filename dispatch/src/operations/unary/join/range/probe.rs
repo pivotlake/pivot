@@ -187,11 +187,11 @@ impl JoinedBatchBuilder {
             .collect();
         Self {
             joined_schema: Arc::new(Schema::new(joined_fields)),
-            probe_columns: BatchAccumulator::retaining_source_buffers(
+            probe_columns: BatchAccumulator::new(
                 Arc::new(Schema::new(spec.probe_fields.clone())),
                 &mut allocator,
             ),
-            build_columns: BatchAccumulator::retaining_source_buffers(
+            build_columns: BatchAccumulator::new(
                 Arc::new(Schema::new(spec.build_fields.clone())),
                 &mut allocator,
             ),

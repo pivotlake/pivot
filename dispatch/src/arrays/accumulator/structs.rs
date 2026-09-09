@@ -16,8 +16,8 @@ use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, Fields};
 
 use super::column::{ChunkedColumn, ColumnAccumulator};
+use super::create_column_accumulator;
 use super::validity::ValidityMask;
-use super::{ValueStorage, create_column_accumulator};
 use crate::memory::SlabAllocator;
 
 /// A struct column, accumulated as its children plus its own validity.
@@ -28,19 +28,12 @@ pub(super) struct StructColumn {
 }
 
 impl StructColumn {
-    pub(super) fn new(
-        fields: &Fields,
-        capacity: usize,
-        storage: ValueStorage,
-        allocator: &mut SlabAllocator,
-    ) -> Self {
+    pub(super) fn new(fields: &Fields, capacity: usize, allocator: &mut SlabAllocator) -> Self {
         Self {
             fields: fields.clone(),
             children: fields
                 .iter()
-                .map(|field| {
-                    create_column_accumulator(field.data_type(), capacity, storage, allocator)
-                })
+                .map(|field| create_column_accumulator(field.data_type(), capacity, allocator))
                 .collect(),
             validity: ValidityMask::new(capacity),
         }

@@ -398,10 +398,10 @@ mod tests {
     use crate::reading::decoding::leaf_decoders::ArrayBuilder;
     use crate::reading::decoding::leaf_decoders::Dict;
     use crate::reading::decoding::leaf_decoders::bytes_view::dict::{DictFactory, ViewDict};
-    use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
     use arrow_array::types::StringViewType;
     use arrow_array::{Array, StringViewArray};
     use bytes::Bytes;
+    use dispatch::arrays::ViewBuilder;
     use dispatch::memory::SlabAllocator;
     use dispatch::memory::init_test_free_pool;
 
@@ -427,7 +427,7 @@ mod tests {
         buffers.into_iter().map(Bytes::from).collect()
     }
 
-    fn extract_strings(builder: ViewsBuilder<StringViewType>) -> Vec<String> {
+    fn extract_strings(builder: ViewBuilder<StringViewType>) -> Vec<String> {
         let array = builder.into_array(None);
         let sv = array.as_any().downcast_ref::<StringViewArray>().unwrap();
         (0..sv.len()).map(|i| sv.value(i).to_string()).collect()
@@ -443,7 +443,7 @@ mod tests {
         dict: &ViewDict<StringViewType>,
         size: usize,
     ) -> Vec<String> {
-        let mut buf = ViewsBuilder::with_capacity(allocator, size);
+        let mut buf = ViewBuilder::with_capacity(allocator, size);
         dict.register_onto(&mut buf);
         decoder.read(&mut buf, dict, size);
         extract_strings(buf)

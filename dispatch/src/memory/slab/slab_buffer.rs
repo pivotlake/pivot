@@ -1,6 +1,9 @@
 use crate::memory::slab::Slab;
+use arrow_buffer::Buffer;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 /// Typed buffer backed by a single [`Slab`] (must fit within one 2MB `WriteBuffer`).
 ///
@@ -32,12 +35,14 @@ impl<T> SlabBuffer<T> {
         unsafe { self.slab.ptr.add(byte_offset) as *mut T }
     }
 
-    /// Consumes the buffer and returns the backing [`Slab`].
-    ///
-    /// Useful for zero-copy handoff to Arrow: wrap the returned `Slab` in `Arc`
-    /// and pass to `Buffer::from_custom_allocation`.
-    pub(crate) fn into_slab(self) -> Slab {
-        self.slab
+    /// Hand the buffer's first `byte_len` bytes to Arrow as a zero-copy
+    /// [`Buffer`]. The slab rides in the buffer's allocation `Arc`, so the
+    /// memory returns to the pool when the last downstream reference drops.
+    pub(crate) fn into_buffer(self, byte_len: usize) -> Buffer {
+        let ptr = NonNull::new(self.slab.ptr).unwrap();
+        // SAFETY: the slab owns at least `byte_len` bytes at `ptr` and lives as
+        // long as the returned buffer via the custom-allocation `Arc`.
+        unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::new(self.slab)) }
     }
 }
 
