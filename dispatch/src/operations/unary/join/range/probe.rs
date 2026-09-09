@@ -22,7 +22,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::join::build::filter_null_keys;
+use crate::operations::unary::join::keys::filter_null_keys;
 use crate::operations::unary::join::range::{RangeCompare, RangeJoinSpec, RangeTable, SortedChunk};
 
 pub struct RangeProbe<T: ArrowPrimitiveType> {

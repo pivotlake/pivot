@@ -5,18 +5,18 @@ use crate::operations::unary::join::JoinBuildFilter;
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::JoinDirectory;
-use crate::operations::unary::join::key_bitset::{KeyBitset, integer_scalar};
-use crate::operations::unary::join::keys::{JoinKey, combined_key_validity};
+use crate::operations::unary::join::key_bitset::{PendingKeyBitset, integer_scalar};
+use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::{BatchesOutputter, InitializableOutputter, NormalizationBatches};
 use crate::operations::{Consumer, Outputter, unary};
 use crate::waker::worker_waker;
 use ahash::RandomState;
-use arrow::compute::{concat, filter_record_batch, sort_to_indices, take};
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use arrow::compute::{concat, sort_to_indices, take};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::SortOptions;
 use crossbeam_deque::{Injector, Steal};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tracing::debug;
 
 pub(crate) const NUM_PARTITIONS: usize = 64;
@@ -84,7 +84,24 @@ pub struct JoinBuildConsumer<
     /// Whether this worker saw a null-keyed build row. Published with its
     /// other build output and combined by the final gather arrival.
     saw_null_key: bool,
+    /// Where this worker leaves its filter key columns at seal time. The
+    /// [`JoinBuilder`] that later runs on the same worker reads them back to
+    /// set this worker's share of each filter's key bitset, which cannot be
+    /// built before then because its bounds come from every worker's rows.
+    filter_arrays: WorkerFilterArrays,
 }
+
+/// The filter key columns of one worker's stored build rows: per build
+/// filter, one array per batch. The worker's consumer fills it when it
+/// seals, and the [`JoinBuilder`] on the same worker reads it back to set
+/// that worker's share of each key bitset. The group itself may travel
+/// through a normalizer and land on another worker; this cell stays put.
+pub(crate) type WorkerFilterArrays = Arc<OnceLock<Vec<Vec<ArrayRef>>>>;
+
+/// Per build filter, the key bitset under construction, or `None` when the
+/// filter's bounds or size ruled one out. Decided once by the final gather
+/// arrival, before it publishes the partition jobs.
+pub(crate) type PendingKeyBitsets = Arc<OnceLock<Vec<Option<Arc<PendingKeyBitset>>>>>;
 
 unsafe impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O: Send> Send
     for JoinBuildConsumer<K, TRACK_MATCHED_BUILD_ROWS, O>
@@ -99,6 +116,7 @@ impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O>
         filter_columns: Vec<usize>,
         hash_state: RandomState,
         outputter: O,
+        filter_arrays: WorkerFilterArrays,
     ) -> Self {
         Self {
             key_columns,
@@ -109,6 +127,7 @@ impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O>
             slab_allocator: SlabAllocator::new(false),
             outputter,
             saw_null_key: false,
+            filter_arrays,
         }
     }
 }
@@ -153,38 +172,6 @@ fn combine_extremes(candidates: Vec<ArrayRef>, largest: bool) -> Option<ArrayRef
     let indices = sort_to_indices(&combined, Some(options), Some(1))
         .expect("join key columns support ordering");
     Some(take(&combined, &indices, None).expect("a sort index is in bounds"))
-}
-
-/// Drop rows any of whose join key columns is null: an equi-join can never
-/// match them, and the probe's hot loops read key values without validity
-/// checks. Only the probe side filters; the build side keeps its batches
-/// whole (they become the stored build row batches) and skips null-keyed rows when
-/// generating tuples.
-pub(crate) fn filter_null_keys(batch: RecordBatch, key_columns: &[usize]) -> RecordBatch {
-    let Some(combined_validity) = combined_key_validity(&batch, key_columns) else {
-        return batch;
-    };
-    let mask = BooleanArray::new(combined_validity.inner().clone(), None);
-    filter_record_batch(&batch, &mask).expect("null-key filter mask matches batch length")
-}
-
-/// Split a probe batch into its rows with fully non-null keys and, when any
-/// exist, the null-keyed rest. A probe-side outer join keeps the rest: those
-/// rows can never match, but they still reach the output null-padded.
-pub(crate) fn split_null_keys(
-    batch: RecordBatch,
-    key_columns: &[usize],
-) -> (RecordBatch, Option<RecordBatch>) {
-    let Some(combined_validity) = combined_key_validity(&batch, key_columns) else {
-        return (batch, None);
-    };
-    let keep = BooleanArray::new(combined_validity.inner().clone(), None);
-    let drop = arrow::compute::not(&keep).expect("a validity mask negates");
-    let kept =
-        filter_record_batch(&batch, &keep).expect("null-key filter mask matches batch length");
-    let dropped =
-        filter_record_batch(&batch, &drop).expect("null-key filter mask matches batch length");
-    (kept, (dropped.num_rows() > 0).then_some(dropped))
 }
 
 impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O, Out> Consumer<RecordBatch, Out>
@@ -233,6 +220,22 @@ where
                 max: column_extreme(&self.build_row_batches, column, true),
             })
             .collect();
+        // The key columns stay with this worker for its key bitset pass;
+        // the batches themselves leave with the group.
+        let filter_arrays: Vec<Vec<ArrayRef>> = self
+            .filter_columns
+            .iter()
+            .map(|&column| {
+                self.build_row_batches
+                    .iter()
+                    .map(|batch| batch.column(column).clone())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            self.filter_arrays.set(filter_arrays).is_ok(),
+            "a build worker seals once"
+        );
         let output = BuildWorkerOutput {
             tuples: self.values,
             build_row_batches: self.build_row_batches,
@@ -246,7 +249,11 @@ where
 
 pub struct JoinBuilder<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> {
     table: JoinTable<K>,
-    injector: Arc<Injector<JoinBuildJob<K>>>,
+    injector: Arc<Injector<PartitionScatterJob<K>>>,
+    /// Whether the final gather arrival has finished initializing the shared
+    /// table, decided the pending key bitsets, and pushed the partition
+    /// jobs. Release on that store, Acquire on every load, so the pending
+    /// bitsets are visible to the workers that read them afterwards.
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
@@ -257,6 +264,15 @@ pub struct JoinBuilder<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> {
     /// expose bounds or a key set tighter than the complete build side and
     /// prune probe rows that do match.
     build_filters: Vec<JoinBuildFilter>,
+    /// This worker's filter key columns, left by its consumer at seal time.
+    /// Once the final gather arrival has decided which filters get a key
+    /// bitset, `output` sets the bits for every value in these arrays; the
+    /// rows themselves have long since left with the group.
+    filter_arrays: WorkerFilterArrays,
+    pending_key_bitsets: PendingKeyBitsets,
+    /// Whether this worker has set its share of the key bitsets and counted
+    /// that pass toward the readiness gate.
+    applied_filter_arrays: bool,
 }
 
 unsafe impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Send
@@ -264,9 +280,8 @@ unsafe impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Send
 {
 }
 
-/// One unit of the parallel table-build phase, stolen and run by any build
-/// worker between the gather barrier and the `build_ready` gate.
-pub struct JoinBuildJob<K: Copy + Send> {
+/// Scatters the gathered tuples of one hash partition into the shared table.
+pub struct PartitionScatterJob<K: Copy + Send> {
     /// This partition's tuples, one entry per build worker, paired with that
     /// worker's row id base (added to each tuple's local row id).
     tuples: Vec<(u32, SlabVec<BuildTuple<K>>)>,
@@ -277,9 +292,9 @@ pub struct JoinBuildJob<K: Copy + Send> {
     remaining_jobs: Arc<AtomicUsize>,
 }
 
-unsafe impl<K: Copy + Send> Send for JoinBuildJob<K> {}
+unsafe impl<K: Copy + Send> Send for PartitionScatterJob<K> {}
 
-impl<K: Copy + Send> JoinBuildJob<K> {
+impl<K: Copy + Send> PartitionScatterJob<K> {
     fn run(self) {
         debug!("Running partition job");
         let directory = unsafe { &*self.table.directory.get() };
@@ -348,13 +363,15 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         table: JoinTable<K>,
-        injector: Arc<Injector<JoinBuildJob<K>>>,
+        injector: Arc<Injector<PartitionScatterJob<K>>>,
         jobs_injected: Arc<AtomicBool>,
         build_ready: Arc<AtomicBool>,
         remaining_jobs: Arc<AtomicUsize>,
         gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
         build_output_indices: Vec<usize>,
         build_filters: Vec<JoinBuildFilter>,
+        filter_arrays: WorkerFilterArrays,
+        pending_key_bitsets: PendingKeyBitsets,
     ) -> Self {
         Self {
             table,
@@ -365,6 +382,9 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
             gather,
             build_output_indices,
             build_filters,
+            filter_arrays,
+            pending_key_bitsets,
+            applied_filter_arrays: false,
         }
     }
 
@@ -377,53 +397,10 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
         let build_saw_null_key = worker_outputs.iter().any(|output| output.saw_null_key);
         unsafe { *self.table.build_saw_null_key.get() = build_saw_null_key };
 
-        // Every build row is present here, so each filter's key bounds are
-        // final: merge the per-worker extremes and publish them for the
-        // probe-side scans. A column with no non-null value publishes
-        // nothing, leaving those scans unpruned.
-        let total_rows: usize = worker_outputs
-            .iter()
-            .flat_map(|output| output.build_row_batches.iter())
-            .map(|batch| batch.num_rows())
-            .sum();
-        for (filter_index, filter) in self.build_filters.iter().enumerate() {
-            let worker_extreme = |largest: bool| {
-                let candidates = worker_outputs
-                    .iter()
-                    .map(|output| &output.filter_extremes[filter_index])
-                    .filter_map(|extremes| {
-                        if largest {
-                            &extremes.max
-                        } else {
-                            &extremes.min
-                        }
-                        .clone()
-                    })
-                    .collect();
-                combine_extremes(candidates, largest)
-            };
-            let min = worker_extreme(false);
-            let max = worker_extreme(true);
-            if let Some(min) = &min {
-                filter.min_slot.publish_value(min.clone());
-            }
-            if let Some(max) = &max {
-                filter.max_slot.publish_value(max.clone());
-            }
-            let bounds = min
-                .as_ref()
-                .zip(max.as_ref())
-                .and_then(|(min, max)| Some((integer_scalar(min)?, integer_scalar(max)?)));
-            let key_arrays = worker_outputs
-                .iter()
-                .flat_map(|output| output.build_row_batches.iter())
-                .map(|batch| batch.column(filter.build_column));
-            filter
-                .key_bitset_slot
-                .publish(KeyBitset::try_build(key_arrays, bounds, total_rows));
-        }
-
-        let sizes: Vec<usize> = (0..NUM_PARTITIONS)
+        // The filters read the stored build rows, so they run before those
+        // rows are taken for the merge.
+        self.publish_filter_bounds(&worker_outputs);
+        let partition_sizes: Vec<usize> = (0..NUM_PARTITIONS)
             .map(|partition| {
                 worker_outputs
                     .iter()
@@ -431,15 +408,94 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
                     .sum()
             })
             .collect();
-        let total: usize = sizes.iter().sum();
+        let total_tuples: usize = partition_sizes.iter().sum();
+        let row_bases = self.publish_build_rows(&mut worker_outputs)?;
+        let directory_capacity = self.allocate_directory_and_arenas(total_tuples);
+        self.inject_partition_jobs(
+            &mut worker_outputs,
+            &row_bases,
+            &partition_sizes,
+            directory_capacity,
+        );
+        self.jobs_injected.store(true, Ordering::Release);
+        Ok(())
+    }
 
-        // GatherBarrier returns outputs in worker order. Merge the stored
-        // build rows in that same order, so each worker-local tuple id gets
-        // the corresponding row base during scatter. An empty merge means an
-        // empty build side, and the probe then emits nothing. For a build
-        // whose side is outer, anti, or semi this also allocates one matched
-        // flag per row id (gaps included); null-keyed rows have no tuple and
-        // remain unmatched.
+    /// Every build row is present here, so each filter's key bounds are
+    /// final: merge the per-worker extremes and publish them for the
+    /// probe-side scans. A column with no non-null value publishes
+    /// nothing, leaving those scans unpruned. Also decides, per filter,
+    /// whether a key bitset gets built; every worker then sets its own
+    /// share of it from `output`.
+    fn publish_filter_bounds(&self, worker_outputs: &[BuildWorkerOutput<K>]) {
+        let total_rows: usize = worker_outputs
+            .iter()
+            .flat_map(|output| output.build_row_batches.iter())
+            .map(|batch| batch.num_rows())
+            .sum();
+        let mut pending_key_bitsets = Vec::with_capacity(self.build_filters.len());
+        for (filter_index, filter) in self.build_filters.iter().enumerate() {
+            let min = merge_worker_extremes(worker_outputs, filter_index, false);
+            let max = merge_worker_extremes(worker_outputs, filter_index, true);
+            if let Some(min) = &min {
+                filter.min_slot.publish_value(min.clone());
+            }
+            if let Some(max) = &max {
+                filter.max_slot.publish_value(max.clone());
+            }
+            pending_key_bitsets.push(plan_key_bitset(
+                filter,
+                min,
+                max,
+                total_rows,
+                worker_outputs.len(),
+            ));
+        }
+        assert!(
+            self.pending_key_bitsets.set(pending_key_bitsets).is_ok(),
+            "the final gather arrival decides the key bitsets once"
+        );
+    }
+
+    /// Set this worker's share of every pending key bitset and count the
+    /// pass toward the readiness gate.
+    ///
+    /// A key bitset has one bit per value of the build key domain, kept as
+    /// an array of atomic words. The build rows are spread across the
+    /// workers, so filling it is split the same way: each worker walks the
+    /// key column of every batch it stored and sets the bit of each value
+    /// with an atomic OR, which lets all workers write the same words at
+    /// once. The pass runs alongside the partition jobs, so the filter is
+    /// sealed by the time the probe opens.
+    fn apply_filter_arrays(&mut self) {
+        let pending_key_bitsets = self
+            .pending_key_bitsets
+            .get()
+            .expect("the key bitsets are decided before the jobs are published");
+        let filter_arrays = self
+            .filter_arrays
+            .get()
+            .expect("a build worker seals before its builder runs");
+        for (pending, arrays) in pending_key_bitsets.iter().zip(filter_arrays) {
+            if let Some(pending) = pending {
+                pending.apply_chunk(arrays);
+            }
+        }
+        self.applied_filter_arrays = true;
+        self.remaining_jobs.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Merge the stored build rows and publish them on the shared table.
+    /// GatherBarrier returns outputs in worker order, and the merge keeps
+    /// that order, so each worker-local tuple id gets the corresponding row
+    /// base during scatter. An empty merge means an empty build side, and
+    /// the probe then emits nothing. For a build whose side is outer, anti,
+    /// or semi this also allocates one matched flag per row id (gaps
+    /// included); null-keyed rows have no tuple and remain unmatched.
+    fn publish_build_rows(
+        &mut self,
+        worker_outputs: &mut [BuildWorkerOutput<K>],
+    ) -> unary::Result<Vec<u32>> {
         let (build_rows, row_bases) = BuildRows::new::<TRACK_MATCHED_BUILD_ROWS>(
             worker_outputs
                 .iter_mut()
@@ -447,52 +503,108 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
             &self.build_output_indices,
         )?;
         unsafe { *self.table.build_rows.get() = build_rows };
+        Ok(row_bases)
+    }
 
-        // Pre-allocate directory and arenas.
-        let dir_capacity = ((total as f64 * 1.125) as usize)
+    /// Size the directory for `total_tuples` and allocate it together with
+    /// the key and row arenas the partition jobs scatter into. Returns the
+    /// directory capacity, which fixes each partition's slot range.
+    fn allocate_directory_and_arenas(&mut self, total_tuples: usize) -> usize {
+        let directory_capacity = ((total_tuples as f64 * 1.125) as usize)
             .next_power_of_two()
             .max(NUM_PARTITIONS);
         let directory = unsafe { &mut *self.table.directory.get() };
         let mut directory_alloc = SlabAllocator::new(false);
         *directory = JoinDirectory::new(
-            directory_alloc.create_multi_slab_buffer(dir_capacity + 1, true),
-            dir_capacity,
+            directory_alloc.create_multi_slab_buffer(directory_capacity + 1, true),
+            directory_capacity,
         );
 
         // Sentinel at entry[capacity] holds the end pointer of the last slot.
         // Probe reads end_ptr(slot+1) for slot = capacity-1, which lands here.
-        directory.set_entry(dir_capacity, (total as u64) << 16);
+        directory.set_entry(directory_capacity, (total_tuples as u64) << 16);
 
         let mut arena_alloc = SlabAllocator::new(false);
         let keys = unsafe { &mut *self.table.keys.get() };
-        *keys = arena_alloc.create_multi_slab_buffer::<K>(total.max(1), false);
+        *keys = arena_alloc.create_multi_slab_buffer::<K>(total_tuples.max(1), false);
         let rows = unsafe { &mut *self.table.rows.get() };
-        *rows = arena_alloc.create_multi_slab_buffer::<u32>(total.max(1), false);
+        *rows = arena_alloc.create_multi_slab_buffer::<u32>(total_tuples.max(1), false);
+        directory_capacity
+    }
 
-        // Prefix sums give each partition its arena offset.
-        let mut offsets = vec![0usize; NUM_PARTITIONS];
-        for p in 1..NUM_PARTITIONS {
-            offsets[p] = offsets[p - 1] + sizes[p - 1];
-        }
-
-        let slots_per_partition = dir_capacity / NUM_PARTITIONS;
-        for (i, &arena_offset) in offsets.iter().enumerate() {
+    /// Push one scatter job per partition, each carrying every worker's
+    /// tuples for it along with the partition's arena offset (the running
+    /// sum of the sizes before it) and its share of directory slots.
+    fn inject_partition_jobs(
+        &self,
+        worker_outputs: &mut [BuildWorkerOutput<K>],
+        row_bases: &[u32],
+        partition_sizes: &[usize],
+        directory_capacity: usize,
+    ) {
+        let slots_per_partition = directory_capacity / NUM_PARTITIONS;
+        let mut arena_offset = 0;
+        for (partition, &size) in partition_sizes.iter().enumerate() {
             let tuples: Vec<(u32, SlabVec<BuildTuple<K>>)> = worker_outputs
                 .iter_mut()
-                .zip(&row_bases)
-                .map(|(output, &row_base)| (row_base, std::mem::take(&mut output.tuples[i])))
+                .zip(row_bases)
+                .map(|(output, &row_base)| {
+                    (row_base, std::mem::take(&mut output.tuples[partition]))
+                })
                 .collect();
-            self.injector.push(JoinBuildJob {
+            self.injector.push(PartitionScatterJob {
                 tuples,
                 table: self.table.clone(),
                 arena_offset,
-                slot_start: i * slots_per_partition,
+                slot_start: partition * slots_per_partition,
                 remaining_jobs: self.remaining_jobs.clone(),
             });
+            arena_offset += size;
         }
-        self.jobs_injected.store(true, Ordering::Relaxed);
-        Ok(())
     }
+}
+
+/// The smallest (or largest) of every worker's own extreme for one filter
+/// column; `None` when no worker held a non-null value.
+fn merge_worker_extremes<K: Copy>(
+    worker_outputs: &[BuildWorkerOutput<K>],
+    filter_index: usize,
+    largest: bool,
+) -> Option<ArrayRef> {
+    let candidates = worker_outputs
+        .iter()
+        .map(|output| &output.filter_extremes[filter_index])
+        .filter_map(|extremes| {
+            if largest {
+                &extremes.max
+            } else {
+                &extremes.min
+            }
+            .clone()
+        })
+        .collect();
+    combine_extremes(candidates, largest)
+}
+
+/// The key bitset one filter gets: `None` unless both bounds are integers
+/// and the bitset accepts that range. Every one of the `worker_count`
+/// workers then contributes exactly one pass over its own rows.
+fn plan_key_bitset(
+    filter: &JoinBuildFilter,
+    min: Option<ArrayRef>,
+    max: Option<ArrayRef>,
+    total_rows: usize,
+    worker_count: usize,
+) -> Option<Arc<PendingKeyBitset>> {
+    let (min, max) = min.zip(max)?;
+    let bounds = integer_scalar(&min).zip(integer_scalar(&max))?;
+    PendingKeyBitset::try_new(
+        min.data_type().clone(),
+        bounds,
+        total_rows,
+        worker_count,
+        filter.key_bitset_slot.clone(),
+    )
 }
 
 impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
@@ -519,17 +631,25 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Outputter<()>
     for JoinBuilder<K, TRACK_MATCHED_BUILD_ROWS>
 {
     fn output(&mut self, _sender: &mut dyn Sender<()>) -> unary::Result<bool> {
+        // Nothing to do until the final gather arrival has initialized the
+        // table; the first thing after that is this worker's own key bitset
+        // pass, which no other worker can do for it.
+        if !self.applied_filter_arrays {
+            if !self.jobs_injected.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            self.apply_filter_arrays();
+        }
         match self.injector.steal() {
             Steal::Success(job) => {
                 job.run();
             }
             Steal::Empty => {
                 // An empty queue is not completion: a job stolen by another
-                // worker may still be running, and the table is unreadable
-                // until it lands. Report done only when every job has run.
-                if self.jobs_injected.load(Ordering::Relaxed)
-                    && self.remaining_jobs.load(Ordering::Acquire) == 0
-                {
+                // worker may still be running, or a peer may not have made
+                // its bitset pass yet, and the table is unreadable until
+                // every one of them lands.
+                if self.remaining_jobs.load(Ordering::Acquire) == 0 {
                     if self
                         .build_ready
                         .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
