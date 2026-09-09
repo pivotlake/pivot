@@ -578,18 +578,18 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: pivot-binary-linux-amd64
-          path: server/image/amd64
+          path: bin/image/amd64
 
       - name: Download the released arm64 binary
         uses: actions/download-artifact@v4
         with:
           name: pivot-binary-linux-arm64
-          path: server/image/arm64
+          path: bin/image/arm64
 
       - name: Build & push
         uses: docker/build-push-action@v5
         with:
-          context: server/image
+          context: bin/image
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.docker_tags.outputs.tags }}
