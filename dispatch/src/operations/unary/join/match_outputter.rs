@@ -14,6 +14,7 @@ use crate::operations::unary;
 use crate::operations::unary::join::JoinCell;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::residual_filter::ResidualFilter;
+use crate::operations::unary::join::row_arena::RowId;
 
 /// Owns the buffered matches and accumulators that produce the join's output.
 /// Probe and build columns accumulate separately because their rows come from
@@ -30,7 +31,7 @@ use crate::operations::unary::join::residual_filter::ResidualFilter;
 /// into an accumulator with different physical types would silently drop
 /// fields for which the accumulator has no slot, so both sides must have the
 /// source's types before any append.
-pub(super) struct ProbeMatchOutputter {
+pub(super) struct ProbeMatchOutputter<R: RowId> {
     /// The probe accumulator's fields, then the build accumulator's, then a
     /// mark join's marker. Refreshed whenever either side's schema changes.
     output_schema: SchemaRef,
@@ -43,7 +44,7 @@ pub(super) struct ProbeMatchOutputter {
     /// Matched `(probe row, build row id)` pairs waiting to be drained. A semi
     /// join fills only the probe indices.
     pub(super) probe_indices: Vec<u32>,
-    pub(super) build_indices: Vec<u64>,
+    pub(super) build_indices: Vec<R>,
     pub(super) matched: usize,
     /// The rows of one stored build batch an unmatched-row scan keeps, as
     /// positions within that batch.
@@ -81,7 +82,7 @@ pub(super) struct ProbeMatchOutputter {
     scan_kept_flag: u8,
 }
 
-impl ProbeMatchOutputter {
+impl<R: RowId> ProbeMatchOutputter<R> {
     pub(super) fn new(
         probe_fields: &[Field],
         build_fields: &[Field],
@@ -113,7 +114,7 @@ impl ProbeMatchOutputter {
             allocator,
             build_rows,
             probe_indices: vec![0; RECORD_BATCH_SIZE],
-            build_indices: vec![0; RECORD_BATCH_SIZE],
+            build_indices: vec![R::from_row_id(0); RECORD_BATCH_SIZE],
             matched: 0,
             kept_build_rows: vec![0; RECORD_BATCH_SIZE],
             has_residual: residual_filters.is_some(),
@@ -526,6 +527,7 @@ impl ProbeMatchOutputter {
             // are only read after a barrier that orders them, and atomic only
             // because peer workers write the same bytes concurrently.
             for &row in &self.build_indices[..self.matched] {
+                let row: u64 = row.into();
                 let flag = build_rows.matched.ptr_at_index(row as usize);
                 unsafe { AtomicU8::from_ptr(flag) }.store(1, Ordering::Relaxed);
             }
@@ -548,7 +550,7 @@ impl ProbeMatchOutputter {
             self.build.append_from_batches(
                 &build_rows.output_columns,
                 build_rows::row_id_shift(),
-                &self.build_indices[..self.matched],
+                R::encode(&self.build_indices[..self.matched]),
                 &mut self.allocator,
             );
         }

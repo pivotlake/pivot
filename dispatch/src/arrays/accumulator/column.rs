@@ -43,6 +43,39 @@ fn resolve_values_pointer(data: &ArrayData) -> *const u8 {
 unsafe impl Send for ChunkedColumn {}
 unsafe impl Sync for ChunkedColumn {}
 
+/// Rows to gather from a [`ChunkedColumn`], each encoded as
+/// `batch << shift | row`, in whichever width the caller keeps its ids. The
+/// accumulators are trait objects, so the width reaches them as data and each
+/// gather runs in the width it was handed.
+#[derive(Clone, Copy)]
+pub enum EncodedRowIds<'a> {
+    Narrow(&'a [u32]),
+    Wide(&'a [u64]),
+}
+
+impl EncodedRowIds<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Narrow(ids) => ids.len(),
+            Self::Wide(ids) => ids.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Split an encoded row id into its batch index and the row within it.
+#[inline(always)]
+pub(super) fn split_encoded_id<I: Copy + Into<u64>>(id: I, shift: u32) -> (usize, usize) {
+    let id: u64 = id.into();
+    (
+        (id >> shift) as usize,
+        (id & ((1u64 << shift) - 1)) as usize,
+    )
+}
+
 /// One column of an accumulation. Rows are copied in with the append methods
 /// and handed to Arrow with [`take_array`](ColumnAccumulator::take_array).
 ///
@@ -75,7 +108,7 @@ pub(super) trait ColumnAccumulator {
     fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u64],
+        ids: EncodedRowIds<'_>,
         shift: u32,
         destination_start: usize,
         allocator: &mut SlabAllocator,

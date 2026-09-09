@@ -1,5 +1,5 @@
 use crate::GatherBarrier;
-use crate::memory::{SlabAllocator, SlabVec};
+use crate::memory::{MultiSlabBuffer, SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::unary::join::JoinBuildFilter;
 use crate::operations::unary::join::JoinTable;
@@ -7,6 +7,7 @@ use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::key_bitset::{PendingKeyBitset, integer_scalar};
 use crate::operations::unary::join::keys::JoinKey;
+use crate::operations::unary::join::row_arena::{RowArena, RowId};
 use crate::operations::unary::{BatchesOutputter, InitializableOutputter, NormalizationBatches};
 use crate::operations::{Consumer, Outputter, unary};
 use crate::waker::worker_waker;
@@ -300,7 +301,6 @@ impl<K: Copy + Send> PartitionScatterJob<K> {
         let directory = unsafe { &*self.table.directory.get() };
         let shift = directory.shift;
         let keys = unsafe { &*self.table.keys.get() };
-        let rows = unsafe { &*self.table.rows.get() };
 
         // Pass 1: accumulate counts in upper 48 bits, OR bloom tags into
         // lower 16 bits
@@ -329,12 +329,31 @@ impl<K: Copy + Send> PartitionScatterJob<K> {
             directory.set_entry(i, (cur << 16) | tag);
         }
 
-        // Pass 3: scatter tuples into the parallel key/row arenas. For each
-        // tuple read the directory to get its arena write pointer, advance the
-        // cursor, and write the key and globalized row id. The element
-        // `PREFETCH_AHEAD` positions ahead is used to prefetch its directory
-        // slot before we reach it.
+        // Pass 3 scatters into the row arena of whichever width the build
+        // chose.
+        match unsafe { &*self.table.rows.get() } {
+            RowArena::Narrow(rows) => self.scatter(directory, keys, rows),
+            RowArena::Wide(rows) => self.scatter(directory, keys, rows),
+        }
+
+        // Release-publish this job's writes; the outputter's Acquire load of
+        // the drained counter is what makes the table readable.
+        self.remaining_jobs.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Pass 3: scatter tuples into the parallel key/row arenas. For each
+    /// tuple read the directory to get its arena write pointer, advance the
+    /// cursor, and write the key and globalized row id. The element
+    /// `PREFETCH_AHEAD` positions ahead is used to prefetch its directory
+    /// slot before we reach it.
+    fn scatter<R: RowId>(
+        &self,
+        directory: &JoinDirectory,
+        keys: &MultiSlabBuffer<K>,
+        rows: &MultiSlabBuffer<R>,
+    ) {
         const PREFETCH_AHEAD: usize = 64;
+        let shift = directory.shift;
         for (row_base, worker_tuples) in &self.tuples {
             worker_tuples.for_each_prefetched::<PREFETCH_AHEAD>(|tuple, ahead| {
                 if let Some(ahead_tuple) = ahead {
@@ -346,14 +365,11 @@ impl<K: Copy + Send> PartitionScatterJob<K> {
                 let arena_idx = (entry >> 16) as usize;
                 unsafe {
                     keys.ptr_at_index(arena_idx).write(tuple.key);
-                    rows.ptr_at_index(arena_idx).write(row_base + tuple.row);
+                    rows.ptr_at_index(arena_idx)
+                        .write(R::from_row_id(row_base + tuple.row));
                 }
             });
         }
-
-        // Release-publish this job's writes; the outputter's Acquire load of
-        // the drained counter is what makes the table readable.
-        self.remaining_jobs.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -409,8 +425,8 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
             })
             .collect();
         let total_tuples: usize = partition_sizes.iter().sum();
-        let row_bases = self.publish_build_rows(&mut worker_outputs)?;
-        let directory_capacity = self.allocate_directory_and_arenas(total_tuples);
+        let (row_bases, row_id_space) = self.publish_build_rows(&mut worker_outputs)?;
+        let directory_capacity = self.allocate_directory_and_arenas(total_tuples, row_id_space);
         self.inject_partition_jobs(
             &mut worker_outputs,
             &row_bases,
@@ -492,24 +508,28 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
     /// the probe then emits nothing. For a build whose side is outer, anti,
     /// or semi this also allocates one matched flag per row id (gaps
     /// included); null-keyed rows have no tuple and remain unmatched.
+    /// Returns the row id bases alongside the id space the merged rows
+    /// occupy, which sizes the row arena's width.
     fn publish_build_rows(
         &mut self,
         worker_outputs: &mut [BuildWorkerOutput<K>],
-    ) -> unary::Result<Vec<u64>> {
+    ) -> unary::Result<(Vec<u64>, usize)> {
         let (build_rows, row_bases) = BuildRows::new::<TRACK_MATCHED_BUILD_ROWS>(
             worker_outputs
                 .iter_mut()
                 .map(|output| std::mem::take(&mut output.build_row_batches)),
             &self.build_output_indices,
         )?;
+        let row_id_space = build_rows::row_id_space(&build_rows.batches);
         unsafe { *self.table.build_rows.get() = build_rows };
-        Ok(row_bases)
+        Ok((row_bases, row_id_space))
     }
 
     /// Size the directory for `total_tuples` and allocate it together with
-    /// the key and row arenas the partition jobs scatter into. Returns the
-    /// directory capacity, which fixes each partition's slot range.
-    fn allocate_directory_and_arenas(&mut self, total_tuples: usize) -> usize {
+    /// the key and row arenas the partition jobs scatter into, the row arena
+    /// in the width that addresses `row_id_space`. Returns the directory
+    /// capacity, which fixes each partition's slot range.
+    fn allocate_directory_and_arenas(&mut self, total_tuples: usize, row_id_space: usize) -> usize {
         let directory_capacity = ((total_tuples as f64 * 1.125) as usize)
             .next_power_of_two()
             .max(NUM_PARTITIONS);
@@ -528,7 +548,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
         let keys = unsafe { &mut *self.table.keys.get() };
         *keys = arena_alloc.create_multi_slab_buffer::<K>(total_tuples.max(1), false);
         let rows = unsafe { &mut *self.table.rows.get() };
-        *rows = arena_alloc.create_multi_slab_buffer::<u64>(total_tuples.max(1), false);
+        *rows = RowArena::allocate(&mut arena_alloc, total_tuples.max(1), row_id_space);
         directory_capacity
     }
 

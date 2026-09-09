@@ -40,8 +40,8 @@ use arrow_schema::{ArrowError, DataType, SchemaRef};
 
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{BUFFER_SIZE, SlabAllocator};
-pub use column::ChunkedColumn;
 use column::ColumnAccumulator;
+pub use column::{ChunkedColumn, EncodedRowIds};
 use concatenated::ConcatenatedColumn;
 use fixed_width::FixedWidthColumn;
 use structs::StructColumn;
@@ -140,7 +140,7 @@ impl BatchAccumulator {
         &mut self,
         columns: &[ChunkedColumn],
         shift: u32,
-        ids: &[u64],
+        ids: EncodedRowIds<'_>,
         allocator: &mut SlabAllocator,
     ) {
         assert!(self.len + ids.len() <= COALESCING_CAPACITY);

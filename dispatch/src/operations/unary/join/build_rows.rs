@@ -144,7 +144,7 @@ pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(
 }
 
 /// The id space the stored rows occupy, gaps included.
-fn row_id_space(batches: &[RecordBatch]) -> usize {
+pub(crate) fn row_id_space(batches: &[RecordBatch]) -> usize {
     batches.len() << BATCH_SHIFT
 }
 

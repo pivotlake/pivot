@@ -15,7 +15,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, Fields};
 
-use super::column::{ChunkedColumn, ColumnAccumulator};
+use super::column::{ChunkedColumn, ColumnAccumulator, EncodedRowIds};
 use super::create_column_accumulator;
 use super::validity::ValidityMask;
 use crate::memory::SlabAllocator;
@@ -75,17 +75,26 @@ impl ColumnAccumulator for StructColumn {
     fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u64],
+        ids: EncodedRowIds<'_>,
         shift: u32,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
-        self.validity
-            .append_by_ids(ids, shift, destination_start, |batch| {
-                column.data[batch]
-                    .nulls()
-                    .filter(|nulls| nulls.null_count() > 0)
-            });
+        let batch_nulls = |batch: usize| {
+            column.data[batch]
+                .nulls()
+                .filter(|nulls| nulls.null_count() > 0)
+        };
+        match ids {
+            EncodedRowIds::Narrow(ids) => {
+                self.validity
+                    .append_by_ids(ids, shift, destination_start, batch_nulls)
+            }
+            EncodedRowIds::Wide(ids) => {
+                self.validity
+                    .append_by_ids(ids, shift, destination_start, batch_nulls)
+            }
+        }
         // Each child gets its own prepared column. Materializing it here clones
         // one Arc-backed ArrayData per batch per append, which is fine for the
         // rare struct-typed column.

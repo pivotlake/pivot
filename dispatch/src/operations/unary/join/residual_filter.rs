@@ -4,6 +4,7 @@
 
 use crate::operations::unary;
 use crate::operations::unary::join::build_rows;
+use crate::operations::unary::join::row_arena::RowId;
 use crate::operations::unary::join::{JoinResidualFn, JoinResidualSpec};
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -47,12 +48,12 @@ impl ResidualFilter {
     /// Evaluate the predicate over the collected matches and compact both
     /// index lists to the passing ones, returning how many remain. A NULL
     /// verdict rejects, matching SQL's treatment of a non-TRUE join condition.
-    pub(super) fn filter_combined_batch(
+    pub(super) fn filter_combined_batch<R: RowId>(
         &mut self,
         probe_batch: &RecordBatch,
         build_batches: &[RecordBatch],
         probe_indices: &mut [u32],
-        build_indices: &mut [u64],
+        build_indices: &mut [R],
         matched: usize,
     ) -> unary::Result<usize> {
         let combined = self.gather_combined_batch(
@@ -89,12 +90,12 @@ impl ResidualFilter {
     /// columns taken at the probe indices, followed by its selected build
     /// columns gathered at the build row ids. Its refs were rebound to this
     /// layout once by the caller.
-    fn gather_combined_batch(
+    fn gather_combined_batch<R: RowId>(
         &mut self,
         probe_batch: &RecordBatch,
         build_batches: &[RecordBatch],
         probe_indices: &[u32],
-        build_indices: &[u64],
+        build_indices: &[R],
     ) -> unary::Result<RecordBatch> {
         let mut columns = Vec::with_capacity(
             self.spec.probe_column_indices.len() + self.spec.build_column_indices.len(),
@@ -113,7 +114,7 @@ impl ResidualFilter {
         if !self.spec.build_column_indices.is_empty() {
             let locations: Vec<(usize, usize)> = build_indices
                 .iter()
-                .map(|&row_id| build_rows::split_row_id(row_id))
+                .map(|&row_id| build_rows::split_row_id(row_id.into()))
                 .collect();
             for &column_idx in self.spec.build_column_indices.iter() {
                 let arrays: Vec<&dyn Array> = build_batches

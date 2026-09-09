@@ -2,6 +2,8 @@
 
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 
+use super::column::split_encoded_id;
+
 /// Validity bits for the accumulated rows of one column, one bit per row.
 /// All-ones until a null actually arrives, so null-free streams never touch it
 /// beyond one flag check per append.
@@ -67,19 +69,19 @@ impl ValidityMask {
     /// Record the validity of rows gathered by encoded id: id
     /// `batch << shift | row` reads the validity `batch_nulls(batch)` returns,
     /// landing at accumulated position `at` onward in id order.
-    pub(super) fn append_by_ids<'n>(
+    pub(super) fn append_by_ids<'n, I: Copy + Into<u64>>(
         &mut self,
-        ids: &[u64],
+        ids: &[I],
         shift: u32,
         at: usize,
         batch_nulls: impl Fn(usize) -> Option<&'n NullBuffer>,
     ) {
-        let mask = (1u64 << shift) - 1;
         for (offset, &id) in ids.iter().enumerate() {
-            let Some(nulls) = batch_nulls((id >> shift) as usize) else {
+            let (batch, row) = split_encoded_id(id, shift);
+            let Some(nulls) = batch_nulls(batch) else {
                 continue;
             };
-            if !nulls.is_valid((id & mask) as usize) {
+            if !nulls.is_valid(row) {
                 let position = at + offset;
                 self.words[position / 64] &= !(1 << (position % 64));
                 self.any_null = true;

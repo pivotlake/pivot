@@ -66,6 +66,7 @@ use crate::operations::unary::join::keys::filter_null_keys;
 use crate::operations::unary::join::keys::{JoinKey, combined_key_validity};
 use crate::operations::unary::join::match_outputter::ProbeMatchOutputter;
 use crate::operations::unary::join::residual_filter::ResidualFilter;
+use crate::operations::unary::join::row_arena::{RowArena, RowId};
 use crate::operations::unary::join::{JoinKind, JoinSpec, JoinTable, UnmatchedScan};
 use ahash::RandomState;
 use arrow::compute::filter_record_batch;
@@ -77,6 +78,28 @@ use std::sync::atomic::Ordering;
 const RING_SIZE: usize = 64;
 const MASK: usize = RING_SIZE - 1;
 const PREFETCH_LENGTH: usize = 63;
+
+/// The probe's outputter in the width of the row arena the build chose. The
+/// build publishes the arena after the probe is constructed and before it is
+/// first called, so the outputter is created on that first call.
+enum MatchOutputter {
+    Pending,
+    Narrow(ProbeMatchOutputter<u32>),
+    Wide(ProbeMatchOutputter<u64>),
+}
+
+/// Run `$body` on the created outputter, whichever its width.
+macro_rules! with_outputter {
+    ($outputter:expr, $o:ident => $body:expr) => {
+        match $outputter {
+            MatchOutputter::Narrow($o) => $body,
+            MatchOutputter::Wide($o) => $body,
+            MatchOutputter::Pending => {
+                unreachable!("the outputter is created before the probe's first call")
+            }
+        }
+    };
+}
 
 /// One worker's probe side of the hash join. The five `const bool`s pick the
 /// join kind at compile time so that every branch on them folds out of the
@@ -141,7 +164,7 @@ pub struct Probe<
     hash_state: RandomState,
     spec: Arc<JoinSpec>,
     /// Accumulates matches and outputs them
-    match_outputter: ProbeMatchOutputter,
+    match_outputter: MatchOutputter,
     /// Shared progress of the unmatched pass. Unused by an inner join.
     unmatched: Arc<UnmatchedScan>,
     /// Whether this worker has entered `finish` and will no longer receive new record batches
@@ -226,14 +249,37 @@ impl<
                 "a mark join does not support residual filters"
             );
         }
+        Self {
+            table,
+            hash_state,
+            spec,
+            match_outputter: MatchOutputter::Pending,
+            unmatched,
+            probing_done: false,
+        }
+    }
+
+    /// The outputter, created in the arena's width on the first call.
+    fn outputter(&mut self) -> &mut MatchOutputter {
+        if matches!(self.match_outputter, MatchOutputter::Pending) {
+            self.match_outputter = match unsafe { &*self.table.rows.get() } {
+                RowArena::Narrow(_) => MatchOutputter::Narrow(self.create_outputter()),
+                RowArena::Wide(_) => MatchOutputter::Wide(self.create_outputter()),
+            };
+        }
+        &mut self.match_outputter
+    }
+
+    fn create_outputter<R: RowId>(&self) -> ProbeMatchOutputter<R> {
+        let spec = &self.spec;
         let residual_filters = spec
             .residual_filters
             .as_ref()
             .map(|filters| ResidualFilter::new(filters, matches!(spec.kind, JoinKind::ProbeSemi)));
-        let output = ProbeMatchOutputter::new(
+        ProbeMatchOutputter::new(
             &spec.probe_fields,
             &spec.build_fields,
-            table.build_rows.clone(),
+            self.table.build_rows.clone(),
             residual_filters,
             // Probe outer and anti joins buffer unmatched rows for output.
             // A mark join only retains their indices to build its mark column.
@@ -242,15 +288,7 @@ impl<
             // A build-side semi join's finish scan keeps the flagged build
             // rows, where the outer and anti joins keep the unflagged.
             matches!(spec.kind, JoinKind::BuildSemi),
-        );
-        Self {
-            table,
-            hash_state,
-            spec,
-            match_outputter: output,
-            unmatched,
-            probing_done: false,
-        }
+        )
     }
 
     /// Claim one build row batch, scan its flags, and append the rows the
@@ -264,37 +302,82 @@ impl<
         let build_row_batch_idx = self.unmatched.cursor.fetch_add(1, Ordering::Relaxed);
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_row_batch_idx >= build_rows.output_batches.len() {
-            self.match_outputter.emit_unmatched_build_rows(sender)?;
+            with_outputter!(self.outputter(), o => o.emit_unmatched_build_rows(sender))?;
             return Ok(true);
         }
 
         let batch = &build_rows.output_batches[build_row_batch_idx];
         let first_row_id = build_rows::first_row_id(build_row_batch_idx);
-        self.match_outputter
-            .append_unmatched_build_rows(batch, first_row_id, sender)?;
+        with_outputter!(self.outputter(), o => o.append_unmatched_build_rows(batch, first_row_id, sender))?;
         Ok(false)
     }
 
+    /// Probe one batch against the table, in the probe compiled for the
+    /// width of the row arena the build chose.
     fn probe_batch(
         &mut self,
         batch: &RecordBatch,
         probe_source: &RecordBatch,
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
+        self.outputter();
+        let Self {
+            table,
+            hash_state,
+            spec,
+            match_outputter,
+            ..
+        } = self;
+        match (unsafe { &*table.rows.get() }, match_outputter) {
+            (RowArena::Narrow(rows), MatchOutputter::Narrow(output)) => Self::probe_batch_rows(
+                table,
+                hash_state,
+                spec,
+                output,
+                batch,
+                probe_source,
+                sender,
+                rows,
+            ),
+            (RowArena::Wide(rows), MatchOutputter::Wide(output)) => Self::probe_batch_rows(
+                table,
+                hash_state,
+                spec,
+                output,
+                batch,
+                probe_source,
+                sender,
+                rows,
+            ),
+            _ => unreachable!("the outputter's width follows the arena's"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_batch_rows<R: RowId>(
+        table: &JoinTable<K::Stored>,
+        hash_state: &RandomState,
+        spec: &JoinSpec,
+        output: &mut ProbeMatchOutputter<R>,
+        batch: &RecordBatch,
+        probe_source: &RecordBatch,
+        sender: &mut dyn Sender<RecordBatch>,
+        rows: &MultiSlabBuffer<R>,
+    ) -> unary::Result<()> {
         let len = batch.num_rows();
-        let build_rows = unsafe { &*self.table.build_rows.get() };
-        let reader = K::make_reader(batch, &self.spec.probe_key_indices, &self.hash_state);
-        let verifier = K::make_verifier(&build_rows.batches, &self.spec.build_key_indices);
-        let keys = unsafe { &*self.table.keys.get() };
-        let rows = unsafe { &*self.table.rows.get() };
-        if let Some(residual_filters) = &mut self.match_outputter.residual_filters {
+        let build_rows = unsafe { &*table.build_rows.get() };
+        let reader = K::make_reader(batch, &spec.probe_key_indices, hash_state);
+        let verifier = K::make_verifier(&build_rows.batches, &spec.build_key_indices);
+        let keys = unsafe { &*table.keys.get() };
+        if let Some(residual_filters) = &mut output.residual_filters {
             residual_filters.begin_probe_batch();
         }
         if TRACK_UNMATCHED_PROBE_ROWS {
-            self.match_outputter.begin_unmatched_probe_tracking(len);
+            output.begin_unmatched_probe_tracking(len);
         }
         let probe_window = ProbeWindow::<
             K,
+            R,
             TRACK_MATCHED_BUILD_ROWS,
             STOP_AFTER_FIRST_MATCH,
             TRACK_UNMATCHED_PROBE_ROWS,
@@ -307,15 +390,15 @@ impl<
             verifier,
             probe_batch: batch,
             probe_source,
-            output: &mut self.match_outputter,
+            output,
             sender,
         };
 
         ProbeArray {
             row_idx: 0,
             len,
-            hash_state: self.hash_state.clone(),
-            directory: unsafe { &*self.table.directory.get() },
+            hash_state: hash_state.clone(),
+            directory: unsafe { &*table.directory.get() },
             hashes: [0; RING_SIZE],
             matched_slots: [[(0, 0); PREFETCH_LENGTH]; 2],
             matched_size: [0; 2],
@@ -328,15 +411,10 @@ impl<
         // join emits the whole batch with its markers, a probe-side outer or
         // anti join finalizes the batch's unmatched rows.
         if EMIT_MARK_COLUMN {
-            let build_saw_null_key = unsafe { *self.table.build_saw_null_key.get() };
-            self.match_outputter.emit_marked_batch_from_misses(
-                probe_source,
-                build_saw_null_key,
-                sender,
-            )?;
+            let build_saw_null_key = unsafe { *table.build_saw_null_key.get() };
+            output.emit_marked_batch_from_misses(probe_source, build_saw_null_key, sender)?;
         } else if TRACK_UNMATCHED_PROBE_ROWS {
-            self.match_outputter
-                .finish_probe_outer_batch(probe_source, sender)?;
+            output.finish_probe_outer_batch(probe_source, sender)?;
         }
         Ok(())
     }
@@ -369,10 +447,9 @@ impl<
         // its rows are appended (see the `ProbeMatchOutputter` docs). The build
         // schema settles once from the rows the build phase published; the
         // probe schema follows the batch about to be probed.
-        self.match_outputter.set_build_schema_from_rows();
+        with_outputter!(self.outputter(), o => o.set_build_schema_from_rows());
         let probe_schema = batch.project(&self.spec.probe_output_indices)?.schema();
-        self.match_outputter
-            .switch_probe_schema(&probe_schema, sender)?;
+        with_outputter!(self.outputter(), o => o.switch_probe_schema(&probe_schema, sender))?;
 
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_rows.is_empty() {
@@ -380,11 +457,8 @@ impl<
                 // SQL's `IN` over an empty set is FALSE for every row, even a
                 // null-keyed one.
                 let probe_source = batch.project(&self.spec.probe_output_indices)?;
-                return self.match_outputter.emit_marked_batch_with_constant(
-                    &probe_source,
-                    Some(false),
-                    sender,
-                );
+                return with_outputter!(self.outputter(), o => o
+                    .emit_marked_batch_with_constant(&probe_source, Some(false), sender));
             }
             if !TRACK_UNMATCHED_PROBE_ROWS {
                 // Empty build side, nothing to match
@@ -392,9 +466,8 @@ impl<
             }
             // An empty build side matches nothing, so every probe row pads.
             let probe_source = batch.project(&self.spec.probe_output_indices)?;
-            return self
-                .match_outputter
-                .append_probe_rows_padded(&probe_source, sender);
+            return with_outputter!(self.outputter(), o => o
+                .append_probe_rows_padded(&probe_source, sender));
         }
 
         // A null-keyed probe row can never match. A probe-side outer or anti
@@ -416,14 +489,11 @@ impl<
 
                 let probe_source = null_keyed.project(&self.spec.probe_output_indices)?;
                 if EMIT_MARK_COLUMN {
-                    self.match_outputter.emit_marked_batch_with_constant(
-                        &probe_source,
-                        None,
-                        sender,
-                    )?;
+                    with_outputter!(self.outputter(), o => o
+                        .emit_marked_batch_with_constant(&probe_source, None, sender))?;
                 } else {
-                    self.match_outputter
-                        .append_probe_rows_padded(&probe_source, sender)?;
+                    with_outputter!(self.outputter(), o => o
+                        .append_probe_rows_padded(&probe_source, sender))?;
                 }
 
                 non_null_record_batch
@@ -446,14 +516,14 @@ impl<
             self.probing_done = true;
             // A worker that consumed no probe batches reaches the unmatched
             // build scan below with its accumulators still spec-typed.
-            self.match_outputter.set_build_schema_from_rows();
-            if self.match_outputter.has_buffered_matches() {
-                self.match_outputter.emit(sender)?;
+            with_outputter!(self.outputter(), o => o.set_build_schema_from_rows());
+            if with_outputter!(self.outputter(), o => o.has_buffered_matches()) {
+                with_outputter!(self.outputter(), o => o.emit(sender))?;
             }
             // A mark join settled every batch as it was probed and buffers
             // nothing here.
             if TRACK_UNMATCHED_PROBE_ROWS && !EMIT_MARK_COLUMN {
-                self.match_outputter.emit_unmatched_probe_rows(sender)?;
+                with_outputter!(self.outputter(), o => o.emit_unmatched_probe_rows(sender))?;
             }
             if TRACK_MATCHED_BUILD_ROWS {
                 self.unmatched
@@ -484,6 +554,7 @@ struct ProbeWindow<
     'a,
     'b,
     K: JoinKey,
+    R: RowId,
     const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
@@ -491,14 +562,14 @@ struct ProbeWindow<
     const EMIT_MARK_COLUMN: bool,
 > {
     keys: &'a MultiSlabBuffer<K::Stored>,
-    rows: &'a MultiSlabBuffer<u64>,
+    rows: &'a MultiSlabBuffer<R>,
     reader: K::Reader<'b>,
     verifier: K::Verifier<'a>,
     /// The full probed batch, which the residual predicate's probe columns
     /// gather from; `probe_source` is its output projection.
     probe_batch: &'b RecordBatch,
     probe_source: &'b RecordBatch,
-    output: &'a mut ProbeMatchOutputter,
+    output: &'a mut ProbeMatchOutputter<R>,
     sender: &'a mut dyn Sender<RecordBatch>,
 }
 
@@ -506,6 +577,7 @@ impl<
     'a,
     'b,
     K: JoinKey,
+    R: RowId,
     const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
@@ -516,6 +588,7 @@ impl<
         'a,
         'b,
         K,
+        R,
         TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
@@ -558,7 +631,7 @@ impl<
                     &self.reader,
                     &self.verifier,
                     probe_row,
-                    self.rows[key_index],
+                    self.rows[key_index].into(),
                 );
             // Const-gated so the other kinds' candidate loop compiles exactly
             // as it did before this tracking existed.
@@ -617,6 +690,7 @@ struct ProbeArray<
     'a,
     'b,
     K: JoinKey,
+    R: RowId,
     const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
@@ -643,6 +717,7 @@ struct ProbeArray<
         'a,
         'b,
         K,
+        R,
         TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
@@ -655,6 +730,7 @@ impl<
     'a,
     'b,
     K: JoinKey,
+    R: RowId,
     const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
@@ -665,6 +741,7 @@ impl<
         'a,
         'b,
         K,
+        R,
         TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,

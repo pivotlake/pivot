@@ -10,7 +10,7 @@ use arrow::array::ArrayData;
 use arrow_array::{ArrayRef, make_array};
 use arrow_schema::{ArrowError, DataType};
 
-use super::column::{ChunkedColumn, ColumnAccumulator};
+use super::column::{ChunkedColumn, ColumnAccumulator, EncodedRowIds, split_encoded_id};
 use super::validity::ValidityMask;
 use crate::memory::{SlabAllocator, SlabBuffer};
 
@@ -94,30 +94,14 @@ impl ColumnAccumulator for FixedWidthColumn {
     fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
-        ids: &[u64],
+        ids: EncodedRowIds<'_>,
         shift: u32,
         destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
-        self.validity
-            .append_by_ids(ids, shift, destination_start, |batch| {
-                column.data[batch]
-                    .nulls()
-                    .filter(|nulls| nulls.null_count() > 0)
-            });
-        // SAFETY: each id names an in-bounds row of its batch, and the slab has
-        // capacity for `destination_start` plus the appended rows (checked by
-        // the caller).
-        unsafe {
-            let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * self.width);
-            match self.width {
-                1 => gather_batches::<u8>(&column.values, ids, shift, dst),
-                2 => gather_batches::<u16>(&column.values, ids, shift, dst),
-                4 => gather_batches::<u32>(&column.values, ids, shift, dst),
-                8 => gather_batches::<u64>(&column.values, ids, shift, dst),
-                16 => gather_batches::<u128>(&column.values, ids, shift, dst),
-                _ => unreachable!("built only for the widths above"),
-            }
+        match ids {
+            EncodedRowIds::Narrow(ids) => self.append_ids(column, ids, shift, destination_start),
+            EncodedRowIds::Wide(ids) => self.append_ids(column, ids, shift, destination_start),
         }
     }
 
@@ -192,14 +176,49 @@ pub(super) unsafe fn gather_fixed_width<T: Copy>(src: *const u8, dst: *mut u8, i
 /// Every id must name an in-bounds row of an in-bounds batch, `dst` must have
 /// room for `ids.len()` elements, and all pointers must be valid for unaligned
 /// `T` access.
-unsafe fn gather_batches<T: Copy>(values: &[*const u8], ids: &[u64], shift: u32, dst: *mut u8) {
-    let mask = (1u64 << shift) - 1;
+unsafe fn gather_batches<T: Copy, I: Copy + Into<u64>>(
+    values: &[*const u8],
+    ids: &[I],
+    shift: u32,
+    dst: *mut u8,
+) {
     let dst = dst as *mut T;
     unsafe {
         for (out_idx, &id) in ids.iter().enumerate() {
-            let src = (*values.get_unchecked((id >> shift) as usize) as *const T)
-                .add((id & mask) as usize);
+            let (batch, row) = split_encoded_id(id, shift);
+            let src = (*values.get_unchecked(batch) as *const T).add(row);
             dst.add(out_idx).write_unaligned(src.read_unaligned());
+        }
+    }
+}
+
+impl FixedWidthColumn {
+    fn append_ids<I: Copy + Into<u64>>(
+        &mut self,
+        column: &ChunkedColumn,
+        ids: &[I],
+        shift: u32,
+        destination_start: usize,
+    ) {
+        self.validity
+            .append_by_ids(ids, shift, destination_start, |batch| {
+                column.data[batch]
+                    .nulls()
+                    .filter(|nulls| nulls.null_count() > 0)
+            });
+        // SAFETY: each id names an in-bounds row of its batch, and the slab has
+        // capacity for `destination_start` plus the appended rows (checked by
+        // the caller).
+        unsafe {
+            let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * self.width);
+            match self.width {
+                1 => gather_batches::<u8, I>(&column.values, ids, shift, dst),
+                2 => gather_batches::<u16, I>(&column.values, ids, shift, dst),
+                4 => gather_batches::<u32, I>(&column.values, ids, shift, dst),
+                8 => gather_batches::<u64, I>(&column.values, ids, shift, dst),
+                16 => gather_batches::<u128, I>(&column.values, ids, shift, dst),
+                _ => unreachable!("built only for the widths above"),
+            }
         }
     }
 }
