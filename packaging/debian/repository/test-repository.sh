@@ -21,7 +21,7 @@ docker run --rm \
     --env "PIVOT_DOWNLOAD_URL=$download_url" \
     --env "PIVOT_APT_DISTRIBUTION=$distribution" \
     --env "PIVOT_APT_VERSION=$version" \
-    debian:bullseye-slim \
+    debian:bookworm-slim \
     sh -euxc '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update

@@ -239,7 +239,7 @@ jobs:
           cache-to: type=gha,scope=debian-${{ matrix.deb_arch }}-pgogen,mode=max,ignore-error=true
 
       # The training run executes on the runner host: the binaries link
-      # against Bullseye's glibc 2.31, which any newer host glibc runs.
+      # against the packaging image's glibc 2.28, which any newer host glibc runs.
       # pivot-bench boots the server itself over a scratch datastore.
       - name: Run the PGO training workload
         run: |
@@ -252,9 +252,10 @@ jobs:
       # One build produces both shipped artifacts: `dist/pivot` is the binary
       # uploaded to GCS, and `dist/pivot_*.deb` wraps that exact binary, so the
       # package can never drift from the released server. It runs in the
-      # packaging image's Debian Bullseye environment (glibc 2.31), which keeps
-      # both artifacts usable on Debian 11+ and Ubuntu 20.04+ and sidesteps
-      # ci-runner2's gcc 9.4, which aws-lc-sys rejects (GCC bug 95189).
+      # packaging image's AlmaLinux 8 environment (glibc 2.28, a current GCC
+      # from gcc-toolset), which keeps both artifacts usable on Debian 10+,
+      # Ubuntu 20.04+ and RHEL 8+ and sidesteps ci-runner2's gcc 9.4, which
+      # aws-lc-sys rejects (GCC bug 95189).
       # The profile-use build reads pgo-profiles/ from the context and fails
       # without it, so a release can never silently ship un-PGOed.
       - name: Build release binary + Debian package (${{ matrix.arch }})

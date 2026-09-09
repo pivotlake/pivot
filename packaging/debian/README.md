@@ -100,8 +100,8 @@ pivot-<arch>-<sha>.deb      pivot-<arch>-latest.deb
 ```
 
 to the destination bucket, and attaches the `.deb` as a workflow artifact.
-Building the release inside Bullseye is what keeps the published binary and
-package on the glibc 2.31 floor described below.
+Building the release inside AlmaLinux 8 is what keeps the published binary and
+package on the glibc 2.28 floor described below.
 
 After both architecture legs pass their direct installation tests, the
 workflow uploads the artifacts to managed Google Artifact Registry APT
@@ -117,8 +117,8 @@ in the `.deb`, and users do not need Docker to install or run Pivot.
 Rust binaries can depend on the glibc version provided by the machine that
 compiled them. Building directly on GitHub's Ubuntu runner could therefore
 produce a binary that does not start on an older supported distribution. The
-Dockerfile compiles Pivot on Debian Bullseye with glibc 2.31, making the package
-compatible with Debian 11+ and Ubuntu 20.04+.
+Dockerfile compiles Pivot on AlmaLinux 8 with glibc 2.28, making the package
+compatible with Debian 10+, Ubuntu 20.04+, RHEL 8+ and Amazon Linux 2023.
 
 The final `scratch` stage contains only the generated `.deb` and the binary it
 was built from. GitHub Actions exports both into `dist/`, tests the package, and

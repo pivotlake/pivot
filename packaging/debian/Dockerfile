@@ -3,9 +3,12 @@
 # This is a CI-only build environment. Docker is not included in the package
 # and is not required to install or run Pivot. Building directly on GitHub's
 # Ubuntu runner could link Pivot against a newer glibc than older supported
-# distributions provide. Bullseye uses glibc 2.31, which keeps the binary
-# compatible with Debian 11+ and Ubuntu 20.04+ while still building natively on
-# amd64 and arm64.
+# distributions provide. glibc keeps every old symbol version, so a binary
+# linked against an old glibc runs on every newer one. AlmaLinux 8 carries
+# glibc 2.28, the same floor DuckDB's release binaries use: it covers Debian
+# 10+, Ubuntu 20.04+, RHEL 8+ and Amazon Linux 2023, builds natively on amd64
+# and arm64, and is supported until 2029. test-package.sh refuses a binary
+# that needs anything newer than the floor control.in declares.
 #
 # The release binary is PGO-built in two passes around a training run that the
 # release workflow drives on the runner host:
@@ -17,21 +20,36 @@
 # The package target refuses to build when `pgo-profiles/` holds no profiles:
 # a release binary silently shipped without its profile would only surface as
 # a mystery regression.
-FROM rust:1-slim-bullseye AS builder
+FROM almalinux:8 AS builder
 
-# lld: the instrumented link can outgrow the 128MB aarch64 branch range, which
-# GNU ld fails with relocation overflows. llvm-tools: llvm-profdata, matched to
-# the rustc that instruments, for the merge and the applied-profile check.
-# just runs the shared PGO recipes (pgo.just); Bullseye does not package it,
-# and installing from crates.io adds no host the build does not already trust.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake clang libclang-dev lld pkg-config git ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && rustup component add llvm-tools
+# gcc-toolset: a current GCC that still links against the system's glibc and
+# libstdc++, folding the newer C++ runtime symbols into the binary so it needs
+# only the libstdc++ shipped with glibc 2.28 hosts. clang-devel: libclang for
+# the generated DuckDB bindings. lld: the instrumented link can outgrow the
+# 128MB aarch64 branch range, which GNU ld fails with relocation overflows.
+# dpkg (EPEL): dpkg-deb for building and inspecting the package in this image.
+RUN dnf -y install epel-release \
+    && dnf -y install \
+        gcc-toolset-14-gcc-c++ cmake clang-devel lld binutils pkgconf-pkg-config \
+        git ca-certificates dpkg \
+    && dnf clean all
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:/usr/local/cargo/bin:$PATH \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo
+
+# The Rust version and its llvm-tools (llvm-profdata for the PGO merge and
+# the applied-profile check) come from rust-toolchain.toml, the same pin the
+# developer machines and CI build with. just runs the shared PGO recipes
+# (pgo.just); installing it from crates.io adds no host the build does not
+# already trust.
+WORKDIR /src
+COPY rust-toolchain.toml .
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
+    && rustup toolchain install
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo install just@1.36.0 --locked
 
-WORKDIR /src
 COPY . .
 
 # Each build flavor keeps its own target dir: RUSTFLAGS are part of cargo's
