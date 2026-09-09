@@ -77,13 +77,64 @@ const RING_SIZE: usize = 64;
 const MASK: usize = RING_SIZE - 1;
 const PREFETCH_LENGTH: usize = 63;
 
+/// One worker's probe side of the hash join. The five `const bool`s pick the
+/// join kind at compile time so that every branch on them folds out of the
+/// match loop. `join_dispatch` is the one place that sets them, and the kinds
+/// map onto them as follows:
+///
+/// | kind       | build side | first match | probe misses | discard rows  | mark |
+/// |------------|------------|-------------|--------------|---------------|------|
+/// | Inner      |            |             |              |               |      |
+/// | BuildOuter | x          |             |              |               |      |
+/// | ProbeOuter |            |             | x            |               |      |
+/// | ProbeSemi  |            | x (*)       |              |               |      |
+/// | ProbeAnti  |            |             | x            | x             |      |
+/// | BuildAnti  | x          |             |              | x             |      |
+/// | BuildSemi  | x          |             |              | x             |      |
+/// | ProbeMark  |            | x           | x            |               | x    |
+///
+/// (*) A probe semi join with a residual filter runs as an inner join whose
+/// residual deduplicates, because its first match may still be rejected.
 pub struct Probe<
     K: JoinKey,
-    const OUTER_JOIN_BUILD_SIDE: bool,
+    // The build side keeps one "matched" byte per stored row. Every pair that
+    // survives the residual flags its build row, and once all workers have
+    // finished probing, `finish` walks the build rows in a scan shared with
+    // its peers and emits the rows the kind asks for: the unflagged ones
+    // null-padded (build outer) or bare (build anti), or the flagged ones
+    // bare (build semi). When false, `finish` returns as soon as this
+    // worker's own matches are flushed.
+    const TRACK_MATCHED_BUILD_ROWS: bool,
+    // Leave the candidate loop at a probe row's first verified match and
+    // record only the probe row, never a build row id, which is what makes a
+    // semi join emit each probe row at most once. Sound only when a match
+    // cannot be undone later, so it requires no residual filter. `drain`
+    // skips the build-column gather since nothing was recorded for it.
     const STOP_AFTER_FIRST_MATCH: bool,
+    // Remember, per probe batch, which probe rows ended up with no surviving
+    // match: rows the bloom filter rejects, rows whose every candidate fails
+    // verification or the residual, null-keyed rows, and every row when the
+    // build side is empty. Once the batch is drained those rows come out
+    // null-padded (probe outer), on their own (probe anti), or as the FALSE
+    // and NULL entries of the mark column (mark). This is also why null-keyed
+    // probe rows are split off up front instead of filtered away.
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    // A match is never an output row. Its only effect is the fate
+    // tracking above: settling the probe row or flagging the build row. The
+    // output then comes entirely from one side's unmatched pass (anti joins)
+    // or from the flagged build rows (build semi), so exactly one of
+    // `TRACK_MATCHED_BUILD_ROWS` and `TRACK_UNMATCHED_PROBE_ROWS` must be set,
+    // and `STOP_AFTER_FIRST_MATCH` must not be: every candidate has to be
+    // inspected for the fates to be right.
+    const DISCARD_MATCHED_ROWS: bool,
+    // Emit every probe row of every batch, in input order, with a trailing
+    // nullable boolean column and no build columns: TRUE for a row with a
+    // match, FALSE for a miss, and NULL for a miss that SQL's `IN` leaves
+    // unknown (a null probe key against a non-empty build side, or a build
+    // side that itself held a null key). Rides on the first-match exit for
+    // the hits and on the miss tracking for the misses, so it requires both,
+    // and keeps only miss indices instead of buffering the rows.
+    const EMIT_MARK_COLUMN: bool,
 > {
     table: JoinTable<K::Stored>,
     hash_state: RandomState,
@@ -98,19 +149,19 @@ pub struct Probe<
 
 impl<
     K: JoinKey,
-    const OUTER_JOIN_BUILD_SIDE: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 >
     Probe<
         K,
-        OUTER_JOIN_BUILD_SIDE,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >
 {
     #[allow(clippy::too_many_arguments)]
@@ -131,26 +182,26 @@ impl<
         // Full outer joins are not supported, so unmatched rows may be tracked
         // on the build side or the probe side, but not both.
         debug_assert!(
-            !OUTER_JOIN_BUILD_SIDE || !TRACK_UNMATCHED_PROBE_ROWS,
+            !TRACK_MATCHED_BUILD_ROWS || !TRACK_UNMATCHED_PROBE_ROWS,
             "cannot track unmatched rows on both sides"
         );
 
-        if DISCARD_MATCHED_PAIRS {
+        if DISCARD_MATCHED_ROWS {
             // An anti or build-side semi join emits rows from exactly one
             // side, decided by that side's fate tracking. It must inspect
             // every candidate match, so it cannot use the semi join's
             // first-match shortcut.
             debug_assert!(
                 !STOP_AFTER_FIRST_MATCH,
-                "a pair-discarding join must inspect every candidate match"
+                "a join discarding its matched rows must inspect every candidate match"
             );
             debug_assert_ne!(
-                OUTER_JOIN_BUILD_SIDE, TRACK_UNMATCHED_PROBE_ROWS,
-                "a pair-discarding join must track fates on exactly one side"
+                TRACK_MATCHED_BUILD_ROWS, TRACK_UNMATCHED_PROBE_ROWS,
+                "a join discarding its matched rows must track fates on exactly one side"
             );
         }
 
-        if MARK {
+        if EMIT_MARK_COLUMN {
             // A mark join stops at the first match and marks every unmatched
             // probe row. Residual filters are not supported for mark joins.
             debug_assert!(
@@ -162,11 +213,11 @@ impl<
                 "a mark join must track unmatched probe rows"
             );
             debug_assert!(
-                !DISCARD_MATCHED_PAIRS,
-                "a mark join does not discard matched pairs in the drain"
+                !DISCARD_MATCHED_ROWS,
+                "a mark join does not discard matched rows in the drain"
             );
             debug_assert!(
-                !OUTER_JOIN_BUILD_SIDE,
+                !TRACK_MATCHED_BUILD_ROWS,
                 "a mark join does not track unmatched build rows"
             );
             debug_assert!(
@@ -185,8 +236,8 @@ impl<
             residual_filters,
             // Probe outer and anti joins buffer unmatched rows for output.
             // A mark join only retains their indices to build its mark column.
-            TRACK_UNMATCHED_PROBE_ROWS && !MARK,
-            MARK,
+            TRACK_UNMATCHED_PROBE_ROWS && !EMIT_MARK_COLUMN,
+            EMIT_MARK_COLUMN,
             // A build-side semi join's finish scan keeps the flagged build
             // rows, where the outer and anti joins keep the unflagged.
             matches!(spec.kind, JoinKind::BuildSemi),
@@ -243,11 +294,11 @@ impl<
         }
         let probe_window = ProbeWindow::<
             K,
-            OUTER_JOIN_BUILD_SIDE,
+            TRACK_MATCHED_BUILD_ROWS,
             STOP_AFTER_FIRST_MATCH,
             TRACK_UNMATCHED_PROBE_ROWS,
-            DISCARD_MATCHED_PAIRS,
-            MARK,
+            DISCARD_MATCHED_ROWS,
+            EMIT_MARK_COLUMN,
         > {
             keys,
             rows,
@@ -275,7 +326,7 @@ impl<
         // The batch is fully probed and drained, so settle its output: a mark
         // join emits the whole batch with its markers, a probe-side outer or
         // anti join finalizes the batch's unmatched rows.
-        if MARK {
+        if EMIT_MARK_COLUMN {
             let build_saw_null_key = unsafe { *self.table.build_saw_null_key.get() };
             self.match_outputter.emit_marked_batch_from_misses(
                 probe_source,
@@ -292,19 +343,19 @@ impl<
 
 impl<
     K: JoinKey,
-    const OUTER_JOIN_BUILD_SIDE: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 > Unary<RecordBatch, RecordBatch>
     for Probe<
         K,
-        OUTER_JOIN_BUILD_SIDE,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >
 {
     fn consume(
@@ -324,7 +375,7 @@ impl<
 
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_rows.is_empty() {
-            if MARK {
+            if EMIT_MARK_COLUMN {
                 // SQL's `IN` over an empty set is FALSE for every row, even a
                 // null-keyed one.
                 let probe_source = batch.project(&self.spec.probe_output_indices)?;
@@ -357,7 +408,7 @@ impl<
             let (batch, null_keyed) = split_null_keys(batch, &self.spec.probe_key_indices);
             if let Some(null_keyed) = null_keyed {
                 let probe_source = null_keyed.project(&self.spec.probe_output_indices)?;
-                if MARK {
+                if EMIT_MARK_COLUMN {
                     self.match_outputter.emit_marked_batch_with_constant(
                         &probe_source,
                         None,
@@ -391,16 +442,16 @@ impl<
             }
             // A mark join settled every batch as it was probed and buffers
             // nothing here.
-            if TRACK_UNMATCHED_PROBE_ROWS && !MARK {
+            if TRACK_UNMATCHED_PROBE_ROWS && !EMIT_MARK_COLUMN {
                 self.match_outputter.emit_unmatched_probe_rows(sender)?;
             }
-            if OUTER_JOIN_BUILD_SIDE {
+            if TRACK_MATCHED_BUILD_ROWS {
                 self.unmatched
                     .probes_finished
                     .fetch_sub(1, Ordering::Release);
             }
         }
-        if !OUTER_JOIN_BUILD_SIDE {
+        if !TRACK_MATCHED_BUILD_ROWS {
             return Ok(true);
         }
 
@@ -423,11 +474,11 @@ struct ProbeWindow<
     'a,
     'b,
     K: JoinKey,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 > {
     keys: &'a MultiSlabBuffer<K::Stored>,
     rows: &'a MultiSlabBuffer<u32>,
@@ -445,31 +496,31 @@ impl<
     'a,
     'b,
     K: JoinKey,
-    const OUTER_JOIN_BUILD_SIDE: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 >
     ProbeWindow<
         'a,
         'b,
         K,
-        OUTER_JOIN_BUILD_SIDE,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >
 {
     #[inline(never)]
     fn drain(&mut self) -> unary::Result<()> {
         self.output
             .drain::<
-                OUTER_JOIN_BUILD_SIDE,
+                TRACK_MATCHED_BUILD_ROWS,
                 STOP_AFTER_FIRST_MATCH,
                 TRACK_UNMATCHED_PROBE_ROWS,
-                DISCARD_MATCHED_PAIRS,
+                DISCARD_MATCHED_ROWS,
             >(
                 self.probe_source,
                 self.probe_batch,
@@ -513,7 +564,7 @@ impl<
                     // A mark join's match contributes nothing beyond not
                     // being a miss: the row's marker is TRUE because the
                     // miss list never received it.
-                    if MARK {
+                    if EMIT_MARK_COLUMN {
                         return Ok(());
                     }
                     unsafe {
@@ -556,11 +607,11 @@ struct ProbeArray<
     'a,
     'b,
     K: JoinKey,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 > {
     row_idx: usize,
     /// The probed window's row count.
@@ -582,11 +633,11 @@ struct ProbeArray<
         'a,
         'b,
         K,
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >,
 }
 
@@ -594,21 +645,21 @@ impl<
     'a,
     'b,
     K: JoinKey,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 >
     ProbeArray<
         'a,
         'b,
         K,
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >
 {
     #[inline(always)]

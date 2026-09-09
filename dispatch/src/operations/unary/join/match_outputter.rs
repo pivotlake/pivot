@@ -487,10 +487,10 @@ impl ProbeMatchOutputter {
     /// full batch accumulated.
     #[inline(never)]
     pub(super) fn drain<
-        const OUTER_JOIN_BUILD_SIDE: bool,
+        const TRACK_MATCHED_BUILD_ROWS: bool,
         const STOP_AFTER_FIRST_MATCH: bool,
         const TRACK_UNMATCHED_PROBE_ROWS: bool,
-        const DISCARD_MATCHED_PAIRS: bool,
+        const DISCARD_MATCHED_ROWS: bool,
     >(
         &mut self,
         probe_source: &RecordBatch,
@@ -523,7 +523,7 @@ impl ProbeMatchOutputter {
                 self.probe_row_settled[row as usize] = 1;
             }
         }
-        if OUTER_JOIN_BUILD_SIDE {
+        if TRACK_MATCHED_BUILD_ROWS {
             // These indices are the verified matches, so flagging them here
             // keeps the match loop itself untouched. Relaxed because the flags
             // are only read after a barrier that orders them, and atomic only
@@ -533,9 +533,9 @@ impl ProbeMatchOutputter {
                 unsafe { AtomicU8::from_ptr(flag) }.store(1, Ordering::Relaxed);
             }
         }
-        if DISCARD_MATCHED_PAIRS {
-            // An anti or build-side semi join's matched pairs are not output
-            // rows; the settling and flagging above is all a match
+        if DISCARD_MATCHED_ROWS {
+            // An anti or build-side semi join never outputs a match as a
+            // row; the settling and flagging above is all a match
             // contributes.
             self.matched = 0;
             return Ok(());

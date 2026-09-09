@@ -966,7 +966,7 @@ impl RecordBatchOperatorSpec {
             }
             // A build-side semi join is that anti join with the scan's
             // polarity flipped, a runtime byte in the outputter, so it rides
-            // the same instantiation: matched pairs only flag their build
+            // the same instantiation: a match only flags its build
             // row, and the scan emits the flagged rows instead.
             JoinKind::BuildSemi => {
                 self.join_typed::<K, true, false, false, true, false>(build, spec, normalize_build)
@@ -983,11 +983,11 @@ impl RecordBatchOperatorSpec {
 
     fn join_typed<
         K: JoinKey,
-        const BUILD_OUTER: bool,
+        const TRACK_MATCHED_BUILD_ROWS: bool,
         const STOP_AFTER_FIRST_MATCH: bool,
         const TRACK_UNMATCHED_PROBE_ROWS: bool,
-        const DISCARD_MATCHED_PAIRS: bool,
-        const MARK: bool,
+        const DISCARD_MATCHED_ROWS: bool,
+        const EMIT_MARK_COLUMN: bool,
     >(
         self,
         build: RecordBatchOperatorSpec,
@@ -1017,11 +1017,11 @@ impl RecordBatchOperatorSpec {
             let (build_factories, collector_factories, probe_factories, build_ready) =
                 create_normalizing_join_factories::<
                     K,
-                    BUILD_OUTER,
+                    TRACK_MATCHED_BUILD_ROWS,
                     STOP_AFTER_FIRST_MATCH,
                     TRACK_UNMATCHED_PROBE_ROWS,
-                    DISCARD_MATCHED_PAIRS,
-                    MARK,
+                    DISCARD_MATCHED_ROWS,
+                    EMIT_MARK_COLUMN,
                 >(spec, worker_count, collector_worker);
             let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
             let collector_siblings_left = Arc::new(AtomicUsize::new(worker_count));
@@ -1078,11 +1078,11 @@ impl RecordBatchOperatorSpec {
         } else {
             let (build_factories, probe_factories, build_ready) = create_join_factories::<
                 K,
-                BUILD_OUTER,
+                TRACK_MATCHED_BUILD_ROWS,
                 STOP_AFTER_FIRST_MATCH,
                 TRACK_UNMATCHED_PROBE_ROWS,
-                DISCARD_MATCHED_PAIRS,
-                MARK,
+                DISCARD_MATCHED_ROWS,
+                EMIT_MARK_COLUMN,
             >(spec, worker_count);
             let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
             let build_channels = stealable::<RecordBatch>(topology);

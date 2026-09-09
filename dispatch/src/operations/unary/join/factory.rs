@@ -24,7 +24,7 @@ use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use crate::operations::unary::{BatchesOutputter, CollectorFactory, Normalizer, UnaryOperator};
 
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
-pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool, O> {
+pub struct JoinBuildFactory<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O> {
     key_columns: Vec<usize>,
     filter_columns: Vec<usize>,
     hash_state: RandomState,
@@ -32,67 +32,73 @@ pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool, O> {
     _key: PhantomData<fn() -> K>,
 }
 
-type DirectJoinBuildFactory<K, const BUILD_OUTER: bool> =
-    JoinBuildFactory<K, BUILD_OUTER, JoinBuilder<<K as JoinKey>::Stored, BUILD_OUTER>>;
-type NormalizingJoinBuildFactory<K, const BUILD_OUTER: bool> =
-    JoinBuildFactory<K, BUILD_OUTER, Normalizer<BuildWorkerOutput<<K as JoinKey>::Stored>>>;
-type JoinBuildCollector<K, const BUILD_OUTER: bool> = CollectorFactory<
+type DirectJoinBuildFactory<K, const TRACK_MATCHED_BUILD_ROWS: bool> = JoinBuildFactory<
+    K,
+    TRACK_MATCHED_BUILD_ROWS,
+    JoinBuilder<<K as JoinKey>::Stored, TRACK_MATCHED_BUILD_ROWS>,
+>;
+type NormalizingJoinBuildFactory<K, const TRACK_MATCHED_BUILD_ROWS: bool> = JoinBuildFactory<
+    K,
+    TRACK_MATCHED_BUILD_ROWS,
+    Normalizer<BuildWorkerOutput<<K as JoinKey>::Stored>>,
+>;
+type JoinBuildCollector<K, const TRACK_MATCHED_BUILD_ROWS: bool> = CollectorFactory<
     BuildWorkerOutput<<K as JoinKey>::Stored>,
-    JoinBuilder<<K as JoinKey>::Stored, BUILD_OUTER>,
+    JoinBuilder<<K as JoinKey>::Stored, TRACK_MATCHED_BUILD_ROWS>,
 >;
 type JoinProbeFactories<
     K,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 > = Vec<
     JoinProbeFactory<
         K,
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >,
 >;
 type DirectJoinFactories<
     K,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 > = (
-    Vec<DirectJoinBuildFactory<K, BUILD_OUTER>>,
+    Vec<DirectJoinBuildFactory<K, TRACK_MATCHED_BUILD_ROWS>>,
     JoinProbeFactories<
         K,
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >,
     Arc<AtomicBool>,
 );
 type NormalizingJoinFactories<
     K,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 > = (
-    Vec<NormalizingJoinBuildFactory<K, BUILD_OUTER>>,
-    Vec<JoinBuildCollector<K, BUILD_OUTER>>,
+    Vec<NormalizingJoinBuildFactory<K, TRACK_MATCHED_BUILD_ROWS>>,
+    Vec<JoinBuildCollector<K, TRACK_MATCHED_BUILD_ROWS>>,
     JoinProbeFactories<
         K,
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >,
     Arc<AtomicBool>,
 );
@@ -100,11 +106,11 @@ type NormalizingJoinFactories<
 /// Creates one [`Probe`] per worker, all sharing the same [`JoinTable`].
 pub struct JoinProbeFactory<
     K: JoinKey,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 > {
     pub(crate) table: JoinTable<K::Stored>,
     hash_state: RandomState,
@@ -122,27 +128,27 @@ pub struct JoinProbeFactory<
 ///
 /// The build phase is the same for every kind, so only the probe factories
 /// carry `STOP_AFTER_FIRST_MATCH`, `TRACK_UNMATCHED_PROBE_ROWS`,
-/// `DISCARD_MATCHED_PAIRS`, and `MARK`.
+/// `DISCARD_MATCHED_ROWS`, and `EMIT_MARK_COLUMN`.
 pub fn create_for_workers<
     K: JoinKey,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 >(
     spec: JoinSpec,
     worker_count: usize,
 ) -> DirectJoinFactories<
     K,
-    BUILD_OUTER,
+    TRACK_MATCHED_BUILD_ROWS,
     STOP_AFTER_FIRST_MATCH,
     TRACK_UNMATCHED_PROBE_ROWS,
-    DISCARD_MATCHED_PAIRS,
-    MARK,
+    DISCARD_MATCHED_ROWS,
+    EMIT_MARK_COLUMN,
 > {
     debug_assert_eq!(
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         matches!(
             spec.kind,
             JoinKind::BuildOuter | JoinKind::BuildAnti | JoinKind::BuildSemi
@@ -156,28 +162,28 @@ pub fn create_for_workers<
         )
     );
     debug_assert_eq!(
-        DISCARD_MATCHED_PAIRS,
+        DISCARD_MATCHED_ROWS,
         matches!(
             spec.kind,
             JoinKind::ProbeAnti | JoinKind::BuildAnti | JoinKind::BuildSemi
         )
     );
-    debug_assert_eq!(MARK, matches!(spec.kind, JoinKind::ProbeMark));
+    debug_assert_eq!(EMIT_MARK_COLUMN, matches!(spec.kind, JoinKind::ProbeMark));
     debug_assert!(
         !STOP_AFTER_FIRST_MATCH || spec.build_output_indices.is_empty(),
         "the first-match path does not record build rows"
     );
     debug_assert!(
-        !(DISCARD_MATCHED_PAIRS && TRACK_UNMATCHED_PROBE_ROWS)
+        !(DISCARD_MATCHED_ROWS && TRACK_UNMATCHED_PROBE_ROWS)
             || spec.build_output_indices.is_empty(),
         "a probe-side anti join emits no build columns"
     );
     debug_assert!(
-        !(DISCARD_MATCHED_PAIRS && BUILD_OUTER) || spec.probe_output_indices.is_empty(),
+        !(DISCARD_MATCHED_ROWS && TRACK_MATCHED_BUILD_ROWS) || spec.probe_output_indices.is_empty(),
         "a build-side semi or anti join emits no probe columns"
     );
     debug_assert!(
-        !MARK
+        !EMIT_MARK_COLUMN
             || (spec.build_output_indices.is_empty()
                 && spec.residual_filters.is_none()
                 && spec.probe_key_indices.len() == 1),
@@ -246,30 +252,30 @@ pub fn create_for_workers<
 /// outputter is the ordinary [`JoinBuilder`].
 pub(crate) fn create_normalizing_for_workers<
     K: JoinKey,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 >(
     spec: JoinSpec,
     worker_count: usize,
     collector_worker: usize,
 ) -> NormalizingJoinFactories<
     K,
-    BUILD_OUTER,
+    TRACK_MATCHED_BUILD_ROWS,
     STOP_AFTER_FIRST_MATCH,
     TRACK_UNMATCHED_PROBE_ROWS,
-    DISCARD_MATCHED_PAIRS,
-    MARK,
+    DISCARD_MATCHED_ROWS,
+    EMIT_MARK_COLUMN,
 > {
     let (build_factories, probe_factories, build_ready) = create_for_workers::<
         K,
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >(spec, worker_count);
     let normalizers = Normalizer::create_for_workers(worker_count);
     let mut normalized_builds = Vec::with_capacity(worker_count);
@@ -294,13 +300,14 @@ pub(crate) fn create_normalizing_for_workers<
     (normalized_builds, collectors, probe_factories, build_ready)
 }
 
-impl<K: JoinKey, const BUILD_OUTER: bool, O, Out> UnaryFactory<RecordBatch, Out>
-    for JoinBuildFactory<K, BUILD_OUTER, O>
+impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O, Out> UnaryFactory<RecordBatch, Out>
+    for JoinBuildFactory<K, TRACK_MATCHED_BUILD_ROWS, O>
 where
     O: BatchesOutputter<BuildWorkerOutput<K::Stored>, Out> + Send + 'static,
     Out: 'static,
 {
-    type Unary = PipelineBreaker<RecordBatch, Out, JoinBuildConsumer<K, BUILD_OUTER, O>>;
+    type Unary =
+        PipelineBreaker<RecordBatch, Out, JoinBuildConsumer<K, TRACK_MATCHED_BUILD_ROWS, O>>;
 
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
@@ -314,39 +321,39 @@ where
 
 impl<
     K: JoinKey,
-    const BUILD_OUTER: bool,
+    const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_PAIRS: bool,
-    const MARK: bool,
+    const DISCARD_MATCHED_ROWS: bool,
+    const EMIT_MARK_COLUMN: bool,
 > UnaryFactory<RecordBatch, RecordBatch>
     for JoinProbeFactory<
         K,
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >
 {
     type Unary = Probe<
         K,
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     >;
 
     fn build_unary(
         self,
     ) -> Probe<
         K,
-        BUILD_OUTER,
+        TRACK_MATCHED_BUILD_ROWS,
         STOP_AFTER_FIRST_MATCH,
         TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_PAIRS,
-        MARK,
+        DISCARD_MATCHED_ROWS,
+        EMIT_MARK_COLUMN,
     > {
         Probe::new(self.table, self.hash_state, self.spec, self.unmatched)
     }
