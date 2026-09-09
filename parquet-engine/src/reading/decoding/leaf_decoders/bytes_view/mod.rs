@@ -6,7 +6,7 @@
 //! offset)` into an external buffer list. This module provides the three
 //! components needed by [`TypedLeafDecoder`]:
 //!
-//! - [`ViewsBuilder`] — the [`ArrayBuilder`](super::ArrayBuilder) that
+//! - [`ViewBuilder`] — the [`ArrayBuilder`](super::ArrayBuilder) that
 //!   accumulates views and data blocks.
 //! - [`PlainPageDecoder`] — the [`DecodePlain`](super::DecodePlain) that reads
 //!   length-prefixed byte arrays from plain-encoded pages.
@@ -22,8 +22,7 @@
 use crate::reading::decoding::leaf_decoders::TypedLeafDecoder;
 use crate::reading::decoding::leaf_decoders::bytes_view::dict::ViewDict;
 use crate::reading::decoding::leaf_decoders::bytes_view::plain_page_decoder::PlainPageDecoder;
-use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
-pub(crate) mod views_builder;
+use dispatch::arrays::ViewBuilder;
 
 pub(crate) mod delta_length_page_decoder;
 pub(crate) mod dict;
@@ -33,7 +32,7 @@ mod plain_page_decoder;
 /// (a [`ByteViewType`](arrow_array::types::ByteViewType)) picks whether it
 /// finalises as a `StringViewArray` or a `BinaryViewArray`.
 pub type BytesViewDecoder<V> =
-    TypedLeafDecoder<ViewDict<V>, ViewDict<V>, ViewsBuilder<V>, PlainPageDecoder<V>>;
+    TypedLeafDecoder<ViewDict<V>, ViewDict<V>, ViewBuilder<V>, PlainPageDecoder<V>>;
 
 #[cfg(test)]
 mod tests {

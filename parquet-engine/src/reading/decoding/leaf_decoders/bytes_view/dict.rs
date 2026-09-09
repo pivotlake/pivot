@@ -6,7 +6,6 @@
 //! and builds a `Vec<u128>` of Arrow views so that each RLE index can be
 //! resolved to a view in O(1).
 
-use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
 use crate::reading::decoding::leaf_decoders::{Dict, DictFromBytes, DictFromVecBytes};
 use arrow_array::builder::make_view;
 use arrow_array::types::ByteViewType;
@@ -15,6 +14,7 @@ use arrow_array::{
 };
 use arrow_buffer::{BooleanBuffer, Buffer, ScalarBuffer};
 use bytes::Bytes;
+use dispatch::arrays::ViewBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
 use std::marker::PhantomData;
 
@@ -124,7 +124,7 @@ impl DictFactory {
 ///
 /// `views[i]` is the 128-bit Arrow view for dictionary entry `i`. `data`
 /// holds the backing blocks referenced by non-inline views. `V` names the
-/// flavour of [`ViewsBuilder`] the entries feed into (string or binary).
+/// flavour of [`ViewBuilder`] the entries feed into (string or binary).
 pub struct ViewDict<V: ByteViewType> {
     /// Backing data blocks (original page buffers + any cross-boundary copies).
     data: Vec<Buffer>,
@@ -166,7 +166,7 @@ impl<V: ByteViewType> ViewDict<V> {
 }
 
 impl<V: ByteViewType> Dict for ViewDict<V> {
-    type Builder = ViewsBuilder<V>;
+    type Builder = ViewBuilder<V>;
     type Item = u128;
     type EqConstant = Vec<u8>;
 

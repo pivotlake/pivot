@@ -23,7 +23,7 @@ use std::sync::{Arc, OnceLock};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::ArrowError;
 
-use crate::arrays::take::take_chunked;
+use crate::arrays::take_chunked;
 use crate::memory::SlabAllocator;
 use crate::numa::dominant_node;
 use crate::operations::channels::NodeIdOutput;

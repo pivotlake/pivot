@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{FieldRef, Schema};
-use dispatch::arrays::take::concat_chunks;
+use dispatch::arrays::concat_chunks;
 use dispatch::memory::SlabAllocator;
 use parquet_variant_compute::{VariantArray, shred_variant, unshred_variant};
 

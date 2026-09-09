@@ -29,7 +29,7 @@ use super::compression;
 use super::error::{WriteError, WriteResult};
 use super::stats;
 use super::types::{ColumnChunkJob, EncodedColumnChunk, EncodedLeaf};
-use dispatch::arrays::take::concat_chunks;
+use dispatch::arrays::concat_chunks;
 use leaves::Leaf;
 
 pub(super) type ColumnEncoderFactory = DefaultUnaryFactory<ColumnEncoder>;

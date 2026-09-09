@@ -18,19 +18,13 @@
 //! allocator, so those columns are the exception to both the slab memory above
 //! and the ownership below.
 //!
-//! Two things are decided at construction, because they are what the two callers
-//! differ on:
-//!
-//! - **Capacity.** A slab is [`BUFFER_SIZE`] and every buffer handed to Arrow is
-//!   exactly one of them, so an accumulator holds at most what a slab holds for
-//!   its widest column ([`calculate_row_capacity`]). A caller asking for more gets that
-//!   instead, which for the write path is where a row group is cut.
-//! - **[`ValueStorage`]**, which decides whether the emitted batch keeps its
-//!   inputs alive. A coalescing operator's batch is consumed immediately
-//!   downstream, so its view columns keep pointing at the source batches' data
-//!   buffers and nothing is copied. An accumulation held for a long time (a row
-//!   group waiting for its file to finish encoding) must not pin those buffers,
-//!   so it copies the values into blocks of its own instead.
+//! Whether an emitted batch keeps the batches its rows came from alive is decided
+//! per append, by the column whose values can live outside its own array, which
+//! today means the byte-view columns: a source an append takes a large enough
+//! share of is referenced, a source it takes a few rows from has those rows'
+//! values copied (see [`view`]). A fixed-width value is copied either way, and a
+//! column on the [`concatenated`] path holds slices of its input, so a schema
+//! containing one keeps those batches alive regardless.
 
 mod column;
 mod concatenated;
@@ -42,7 +36,7 @@ mod view;
 pub(in crate::arrays) use view::{DataBlock, INLINE_VIEW_LEN, copy_value};
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{ArrowError, DataType, Fields, SchemaRef};
+use arrow_schema::{ArrowError, DataType, SchemaRef};
 
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{BUFFER_SIZE, SlabAllocator};
@@ -52,30 +46,9 @@ use concatenated::ConcatenatedColumn;
 use fixed_width::FixedWidthColumn;
 use structs::StructColumn;
 use view::ViewColumn;
-
 /// How many rows a coalescing accumulator holds. One full batch to emit, plus
 /// room for an input batch that lands on top of an almost-full accumulator.
 const COALESCING_CAPACITY: usize = 2 * RECORD_BATCH_SIZE;
-
-/// Whether an accumulation keeps the batches its rows came from alive.
-///
-/// This only decides anything for a column whose values live outside its own
-/// array, which today means the byte-view columns. A fixed-width value is copied
-/// either way, and a column on the [`concatenated`] path holds slices of its
-/// input under both settings, so a schema containing one keeps those batches
-/// alive whatever is asked for here.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ValueStorage {
-    /// Reference the source's data buffers rather than copying their bytes. The
-    /// emitted batch keeps every source batch it drew a value from alive, which
-    /// is free and harmless when that batch is consumed straight away.
-    RetainSourceBuffers,
-    /// Copy each value into the accumulator's own blocks, so the emitted batch
-    /// holds nothing of its inputs and they can be dropped as soon as they have
-    /// been appended. The blocks are slab memory, except for a single value too
-    /// large for any slab (see [`view`]).
-    CopyValues,
-}
 
 /// Accumulates rows of many batches and hands them out as one batch (see the
 /// module docs). Rows arrive via
@@ -86,53 +59,21 @@ pub enum ValueStorage {
 pub struct BatchAccumulator {
     schema: SchemaRef,
     columns: Vec<Box<dyn ColumnAccumulator>>,
-    capacity: usize,
     len: usize,
 }
 
 impl BatchAccumulator {
-    /// An accumulator for an operator whose output is consumed straight away:
-    /// [`COALESCING_CAPACITY`] rows, whose view columns reference the source
-    /// batches' data buffers rather than copying their values
-    /// ([`ValueStorage::RetainSourceBuffers`]).
-    pub fn retaining_source_buffers(schema: SchemaRef, allocator: &mut SlabAllocator) -> Self {
-        Self::new(
-            schema,
-            COALESCING_CAPACITY,
-            ValueStorage::RetainSourceBuffers,
-            allocator,
-        )
-    }
-
-    /// An accumulator for rows that outlive the batches they came from, such as
-    /// a Parquet row group held until its file finishes encoding. Its values are
-    /// copied ([`ValueStorage::CopyValues`]), so the batch it hands out holds no
-    /// reference to its inputs and they can be dropped as they are appended. A
-    /// column on the [`concatenated`] path is the exception, and keeps its
-    /// inputs alive until the batch is taken.
-    ///
-    /// It holds `rows` rows, or as many as a slab holds for the widest column
-    /// where that is fewer (see [`capacity`](Self::capacity)).
-    pub fn copying_values(schema: SchemaRef, rows: usize, allocator: &mut SlabAllocator) -> Self {
-        Self::new(schema, rows, ValueStorage::CopyValues, allocator)
-    }
-
-    fn new(
-        schema: SchemaRef,
-        rows: usize,
-        storage: ValueStorage,
-        allocator: &mut SlabAllocator,
-    ) -> Self {
-        let capacity = rows.max(1).min(calculate_row_capacity(schema.fields()));
+    pub fn new(schema: SchemaRef, allocator: &mut SlabAllocator) -> Self {
         let columns = schema
             .fields()
             .iter()
-            .map(|field| create_column_accumulator(field.data_type(), capacity, storage, allocator))
+            .map(|field| {
+                create_column_accumulator(field.data_type(), COALESCING_CAPACITY, allocator)
+            })
             .collect();
         Self {
             schema,
             columns,
-            capacity,
             len: 0,
         }
     }
@@ -147,9 +88,9 @@ impl BatchAccumulator {
     }
 
     /// Rows this accumulator can hold before it must be taken. Not always what
-    /// the caller asked for, see [`copying_values`](Self::copying_values).
+    /// the caller asked for, see [`with_capacity`](Self::with_capacity).
     pub fn capacity(&self) -> usize {
-        self.capacity
+        COALESCING_CAPACITY
     }
 
     /// The schema this accumulator coalesces into. A batch of a different schema
@@ -177,14 +118,14 @@ impl BatchAccumulator {
     /// two rows, so detecting runs adds branches without reducing copying, while
     /// independent loads let the CPU overlap source cache misses.
     ///
-    /// `allocator` is only drawn on by an accumulator that copies values.
+    /// `allocator` is only drawn on by a column that copies values.
     pub fn append_batch_by_indices(
         &mut self,
         batch: &RecordBatch,
         indices: &[u32],
         allocator: &mut SlabAllocator,
     ) {
-        assert!(self.len + indices.len() <= self.capacity);
+        assert!(self.len + indices.len() <= COALESCING_CAPACITY);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
             accumulator.append_from_indices(column, indices, self.len, allocator);
         }
@@ -203,7 +144,7 @@ impl BatchAccumulator {
         ids: &[u32],
         allocator: &mut SlabAllocator,
     ) {
-        assert!(self.len + ids.len() <= self.capacity);
+        assert!(self.len + ids.len() <= COALESCING_CAPACITY);
         for (accumulator, column) in self.columns.iter_mut().zip(columns) {
             accumulator.append_from_batches(column, ids, shift, self.len, allocator);
         }
@@ -223,7 +164,7 @@ impl BatchAccumulator {
         len: usize,
         allocator: &mut SlabAllocator,
     ) {
-        assert!(self.len + len <= self.capacity);
+        assert!(self.len + len <= COALESCING_CAPACITY);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
             accumulator.append_from_range(column, start, len, self.len, allocator);
         }
@@ -243,7 +184,7 @@ impl BatchAccumulator {
     ) -> Result<(), E> {
         let mut remaining = indices;
         while !remaining.is_empty() {
-            let room = self.capacity - self.len;
+            let room = COALESCING_CAPACITY - self.len;
             let (chunk, rest) = remaining.split_at(room.min(remaining.len()));
             self.append_batch_by_indices(batch, chunk, allocator);
             if self.has_full_batch() {
@@ -277,16 +218,13 @@ impl BatchAccumulator {
 fn create_column_accumulator(
     data_type: &DataType,
     capacity: usize,
-    storage: ValueStorage,
     allocator: &mut SlabAllocator,
 ) -> Box<dyn ColumnAccumulator> {
     match data_type {
         DataType::Utf8View | DataType::BinaryView => {
-            Box::new(ViewColumn::new(data_type, capacity, storage, allocator))
+            Box::new(ViewColumn::new(data_type, capacity, allocator))
         }
-        DataType::Struct(fields) => {
-            Box::new(StructColumn::new(fields, capacity, storage, allocator))
-        }
+        DataType::Struct(fields) => Box::new(StructColumn::new(fields, capacity, allocator)),
         other => match other.primitive_width() {
             Some(width @ (1 | 2 | 4 | 8 | 16)) => {
                 Box::new(FixedWidthColumn::new(data_type, width, capacity, allocator))
@@ -294,26 +232,6 @@ fn create_column_accumulator(
             _ => Box::new(ConcatenatedColumn::new()),
         },
     }
-}
-
-/// Rows of `fields` a single slab holds, which is what bounds an accumulator:
-/// every buffer handed to Arrow is one slab, and a column's values buffer is
-/// `rows * width`. A struct's bound is its narrowest child's, a view column's is
-/// set by its 16-byte views rather than by the bytes they point at, and a column
-/// with no slab behind it (the [`ConcatenatedColumn`] path) bounds nothing.
-fn calculate_row_capacity(fields: &Fields) -> usize {
-    fields
-        .iter()
-        .map(|field| match field.data_type() {
-            DataType::Utf8View | DataType::BinaryView => BUFFER_SIZE / size_of::<u128>(),
-            DataType::Struct(children) => calculate_row_capacity(children),
-            other => match other.primitive_width() {
-                Some(width @ (1 | 2 | 4 | 8 | 16)) => BUFFER_SIZE / width,
-                _ => usize::MAX,
-            },
-        })
-        .min()
-        .unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -326,6 +244,7 @@ mod tests {
         BinaryViewArray, BooleanArray, Date32Array, Int64Array, StringViewArray, StructArray,
     };
     use arrow_buffer::{Buffer, NullBuffer};
+    use arrow_schema::Fields;
     use arrow_schema::{Field, Schema};
     use std::sync::Arc;
 
@@ -361,8 +280,7 @@ mod tests {
         let batch = three_column_batch();
         let mask = BooleanArray::from(vec![false, true, true, false, true]);
         let mut allocator = SlabAllocator::new(false);
-        let mut accumulator =
-            BatchAccumulator::retaining_source_buffers(batch.schema(), &mut allocator);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
 
         accumulator.append_batch_by_indices(&batch, &indices_of(&mask), &mut allocator);
         let all: Vec<u32> = (0..batch.num_rows() as u32).collect();
@@ -406,8 +324,7 @@ mod tests {
         .unwrap();
         let mask = BooleanArray::from(vec![true, true, false, true, true]);
         let mut allocator = SlabAllocator::new(false);
-        let mut accumulator =
-            BatchAccumulator::retaining_source_buffers(batch.schema(), &mut allocator);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
 
         accumulator.append_batch_by_indices(&batch, &indices_of(&mask), &mut allocator);
         let emitted = accumulator.take_batch(&mut allocator).unwrap();
@@ -469,8 +386,7 @@ mod tests {
             ],
         );
         let mut allocator = SlabAllocator::new(false);
-        let mut accumulator =
-            BatchAccumulator::retaining_source_buffers(first.schema(), &mut allocator);
+        let mut accumulator = BatchAccumulator::new(first.schema(), &mut allocator);
 
         accumulator.append_batch_by_indices(&first, &[0, 1], &mut allocator);
         accumulator.append_batch_by_indices(&second, &[0, 1], &mut allocator);
@@ -485,8 +401,7 @@ mod tests {
         init_test_free_pool(4);
         let batch = three_column_batch();
         let mut allocator = SlabAllocator::new(false);
-        let mut accumulator =
-            BatchAccumulator::retaining_source_buffers(batch.schema(), &mut allocator);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
 
         accumulator.append_batch_by_indices(&batch, &[1, 2], &mut allocator);
         let first = accumulator.take_batch(&mut allocator).unwrap();
@@ -504,9 +419,8 @@ mod tests {
         init_test_free_pool(4);
         let batch = three_column_batch();
         let mut allocator = SlabAllocator::new(false);
-        let mut ranged = BatchAccumulator::retaining_source_buffers(batch.schema(), &mut allocator);
-        let mut selected =
-            BatchAccumulator::retaining_source_buffers(batch.schema(), &mut allocator);
+        let mut ranged = BatchAccumulator::new(batch.schema(), &mut allocator);
+        let mut selected = BatchAccumulator::new(batch.schema(), &mut allocator);
 
         ranged.append_range(&batch, 1, 3, &mut allocator);
         selected.append_batch_by_indices(&batch, &[1, 2, 3], &mut allocator);
@@ -517,63 +431,146 @@ mod tests {
         );
     }
 
-    /// A copying accumulator holds the same rows without referencing the
-    /// source's data buffers at all, which is what lets its inputs be dropped.
-    #[test]
-    fn a_copying_accumulator_keeps_none_of_the_sources_buffers() {
-        init_test_free_pool(8);
-        let batch = three_column_batch();
-        let mut allocator = SlabAllocator::new(false);
-        let mut accumulator =
-            BatchAccumulator::copying_values(batch.schema(), RECORD_BATCH_SIZE, &mut allocator);
+    /// The data buffers of `batch`'s view column at `column`, by address.
+    fn data_buffer_pointers(batch: &RecordBatch, column: usize) -> Vec<*const u8> {
+        batch
+            .column(column)
+            .as_string_view()
+            .data_buffers()
+            .iter()
+            .map(|buffer| buffer.as_ptr())
+            .collect()
+    }
 
-        accumulator.append_range(&batch, 0, batch.num_rows(), &mut allocator);
+    /// Twenty rows of one long value living at the start of `buffers[0]`.
+    fn twenty_long_rows(buffers: Vec<Buffer>) -> RecordBatch {
+        view_batch(buffers, &[(0, "a value longer than twelve bytes"); 20])
+    }
+
+    fn long_value_buffer() -> Buffer {
+        Buffer::from_slice_ref("a value longer than twelve bytes".as_bytes())
+    }
+
+    /// An append taking a few of a source's rows copies their values, so the
+    /// emitted batch names none of the source's data buffers and keeps none of
+    /// them alive.
+    #[test]
+    fn a_selective_append_copies_the_values() {
+        init_test_free_pool(8);
+        let batch = twenty_long_rows(vec![long_value_buffer()]);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&batch, &[3], &mut allocator);
         let emitted = accumulator.take_batch(&mut allocator).unwrap();
 
-        assert_eq!(emitted, batch);
-        let source: Vec<*const u8> = batch
-            .column(1)
-            .as_string_view()
-            .data_buffers()
-            .iter()
-            .map(|buffer| buffer.as_ptr())
-            .collect();
-        let held: Vec<*const u8> = emitted
-            .column(1)
-            .as_string_view()
-            .data_buffers()
-            .iter()
-            .map(|buffer| buffer.as_ptr())
-            .collect();
+        assert_eq!(emitted, batch.slice(3, 1));
+        let source = data_buffer_pointers(&batch, 0);
         assert!(
-            held.iter().all(|buffer| !source.contains(buffer)),
-            "a copying accumulator must not hold a source data buffer"
+            data_buffer_pointers(&emitted, 0)
+                .iter()
+                .all(|buffer| !source.contains(buffer)),
+            "a selective append must not hold a source data buffer"
         );
     }
 
-    /// A value larger than a slab cannot be stored in one, so it gets a buffer
-    /// of its own rather than a reference to the source's.
+    /// An append taking a large share of a source references its data buffers
+    /// instead of copying.
     #[test]
-    fn a_copying_accumulator_takes_a_value_larger_than_a_slab() {
+    fn a_broad_append_retains_the_source_buffers() {
+        init_test_free_pool(8);
+        let batch = twenty_long_rows(vec![long_value_buffer()]);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&batch, &(0..10).collect::<Vec<_>>(), &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        assert_eq!(emitted, batch.slice(0, 10));
+        assert_eq!(
+            data_buffer_pointers(&emitted, 0),
+            data_buffer_pointers(&batch, 0)
+        );
+    }
+
+    /// A selective append from a source whose buffers are all already held
+    /// references them again: that keeps nothing extra alive, so there is
+    /// nothing to copy.
+    #[test]
+    fn a_selective_append_from_a_source_already_held_retains_it() {
+        init_test_free_pool(8);
+        let batch = twenty_long_rows(vec![long_value_buffer()]);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+        accumulator.append_batch_by_indices(&batch, &(0..10).collect::<Vec<_>>(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&batch.slice(5, 15), &[0], &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        assert_eq!(emitted.num_rows(), 11);
+        assert_eq!(
+            data_buffer_pointers(&emitted, 0),
+            data_buffer_pointers(&batch, 0),
+            "no block was added for the rebased row"
+        );
+    }
+
+    /// Holding some of a source's buffers is not holding the source: a
+    /// selective append from it still copies, so the buffer it would have added
+    /// stays out of the emitted batch.
+    #[test]
+    fn a_selective_append_copies_when_only_some_buffers_are_held() {
+        init_test_free_pool(8);
+        let shared = long_value_buffer();
+        let held = twenty_long_rows(vec![shared.clone()]);
+        let partly_held = twenty_long_rows(vec![shared.clone(), long_value_buffer()]);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(held.schema(), &mut allocator);
+        accumulator.append_batch_by_indices(&held, &(0..10).collect::<Vec<_>>(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&partly_held, &[0], &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        let emitted_buffers = data_buffer_pointers(&emitted, 0);
+        assert_eq!(
+            emitted_buffers.len(),
+            2,
+            "the held buffer plus one copied block"
+        );
+        assert!(!emitted_buffers.contains(&data_buffer_pointers(&partly_held, 0)[1]));
+        assert_eq!(emitted.num_rows(), 11);
+    }
+
+    /// A copied value larger than a slab cannot land in one, so it gets a
+    /// buffer of its own rather than a reference to the source's.
+    #[test]
+    fn a_selective_append_copies_a_value_larger_than_a_slab() {
         init_test_free_pool(8);
         let value = "v".repeat(BUFFER_SIZE + 1024);
+        let mut values = vec!["short"; 20];
+        values[0] = value.as_str();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "name",
                 DataType::Utf8View,
                 false,
             )])),
-            vec![Arc::new(StringViewArray::from(vec![value.as_str()]))],
+            vec![Arc::new(StringViewArray::from(values))],
         )
         .unwrap();
         let mut allocator = SlabAllocator::new(false);
-        let mut accumulator =
-            BatchAccumulator::copying_values(batch.schema(), RECORD_BATCH_SIZE, &mut allocator);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
 
-        accumulator.append_range(&batch, 0, 1, &mut allocator);
+        accumulator.append_batch_by_indices(&batch, &[0], &mut allocator);
         let emitted = accumulator.take_batch(&mut allocator).unwrap();
 
         assert_eq!(emitted.column(0).as_string_view().value(0), value);
+        let source = data_buffer_pointers(&batch, 0);
+        assert!(
+            data_buffer_pointers(&emitted, 0)
+                .iter()
+                .all(|buffer| !source.contains(buffer))
+        );
     }
 
     /// A struct column accumulates through its children rather than falling to
@@ -612,29 +609,11 @@ mod tests {
         )
         .unwrap();
         let mut allocator = SlabAllocator::new(false);
-        let mut accumulator =
-            BatchAccumulator::copying_values(batch.schema(), RECORD_BATCH_SIZE, &mut allocator);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
 
         accumulator.append_range(&batch, 0, 3, &mut allocator);
         let emitted = accumulator.take_batch(&mut allocator).unwrap();
 
         assert_eq!(emitted, batch);
-    }
-
-    /// The capacity is what a slab holds for the widest column, however many
-    /// rows the caller asks for: every buffer handed to Arrow is one slab.
-    #[test]
-    fn capacity_is_capped_at_what_one_slab_holds() {
-        init_test_free_pool(8);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8View, false),
-        ]));
-        let mut allocator = SlabAllocator::new(false);
-
-        let accumulator = BatchAccumulator::copying_values(schema, usize::MAX, &mut allocator);
-
-        // The views (16 bytes a row) are the widest of the two columns.
-        assert_eq!(accumulator.capacity(), BUFFER_SIZE / size_of::<u128>());
     }
 }

@@ -1,12 +1,13 @@
 //! Filter operator: keeps rows the filter closure selects.
 //!
-//! The filter closure receives an owned `RecordBatch` and returns the batch
-//! together with an optional mask of surviving rows. Owning the batch lets
-//! the closure evaluate multiple conditions progressively - shrink the batch
-//! after each condition, so later (often costlier) conditions only see rows
-//! the earlier ones kept (the operator's [`SlabAllocator`] is passed in for
-//! that, see [`take`](crate::arrays::take::take)).
-//! A returned mask is applied by appending the surviving rows to a
+//! The filter closure receives the input batch and writes the positions of
+//! the surviving rows into a scratch vec, or reports that every row survives
+//! ([`RowSelection`]). The closure may evaluate several conditions
+//! progressively, shrinking a working copy of the batch after each one so
+//! later (often costlier) conditions only see rows the earlier ones kept; the
+//! operator's [`SlabAllocator`] is passed in for that, see
+//! [`take`](crate::arrays::take).
+//! A selection is applied by appending the surviving rows to a
 //! [`BatchAccumulator`], which coalesces survivors across input batches and
 //! emits full-size batches, so a selective filter's downstream sees a few
 //! large batches instead of a runt batch per input. Whether to coalesce at all
@@ -163,9 +164,9 @@ where
             }
             self.accumulator = None;
         }
-        let accumulator = self.accumulator.get_or_insert_with(|| {
-            BatchAccumulator::retaining_source_buffers(batch.schema(), &mut self.allocator)
-        });
+        let accumulator = self
+            .accumulator
+            .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), &mut self.allocator));
         accumulator.append_batch_by_indices_flushing::<unary::Error>(
             &batch,
             &self.selection,
@@ -423,6 +424,47 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(i32_col(&out[0]), vec![1, 4]);
+    }
+
+    /// A filter keeping a row per input batch must not hand downstream a batch
+    /// that references every input's data buffers: that would keep each
+    /// source's decompressed page alive for as long as the coalesced batch is.
+    #[test]
+    fn a_selective_filter_emits_no_source_buffer() {
+        use arrow_array::StringViewArray;
+        use arrow_array::cast::AsArray;
+        init_test_free_pool(4);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
+        let string_batch = |value: &str| {
+            let col: ArrayRef = Arc::new(StringViewArray::from(vec![value; 20]));
+            RecordBatch::try_new(schema.clone(), vec![col]).unwrap()
+        };
+        let inputs = vec![
+            string_batch("a value longer than twelve bytes"),
+            string_batch("another value longer than twelve"),
+        ];
+        let source_buffers: Vec<*const u8> = inputs
+            .iter()
+            .flat_map(|batch| batch.column(0).as_string_view().data_buffers().to_vec())
+            .map(|buffer| buffer.as_ptr())
+            .collect();
+        let filter = filter_operator(keep_first_row);
+
+        let out = run_unary_to_completion(filter, inputs);
+
+        assert_eq!(out.len(), 1);
+        let emitted = out[0].column(0).as_string_view();
+        assert_eq!(emitted.len(), 2);
+        assert!(
+            emitted
+                .data_buffers()
+                .iter()
+                .all(|buffer| !source_buffers.contains(&buffer.as_ptr()))
+        );
     }
 
     #[test]

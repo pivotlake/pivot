@@ -4,7 +4,7 @@ use crate::compile::{Error, ExprEvalFn};
 use crate::expression::Expression;
 use arrow_array::{Array, ArrayRef, BooleanArray, NullArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use dispatch::arrays::take::take;
+use dispatch::arrays::take;
 use dispatch::memory::SlabAllocator;
 use dispatch::{RecordBatchOperatorSpec, RowDelivery, RowSelection};
 use std::fmt;

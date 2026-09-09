@@ -15,7 +15,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_row::{OwnedRow, RowConverter, SortField};
 
-use dispatch::arrays::take::{take, take_chunked};
+use dispatch::arrays::{take, take_chunked};
 use dispatch::memory::SlabAllocator;
 use dispatch::{OrderBy, Sender, Topology, Unary, UnaryFactory, UnaryResult, batch_sort_indices};
 
