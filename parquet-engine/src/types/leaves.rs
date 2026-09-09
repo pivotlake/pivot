@@ -8,7 +8,6 @@ use arrow_array::{Array, ArrayRef, BinaryViewArray, Datum, StructArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use dispatch::{Projection, VariantExtract};
-use planner::expression::variant_cast_maps_json_null_to_sql_null;
 
 use crate::RowGroupMetadata;
 use crate::types::metadata::QueryRowGroupMetadata;
@@ -274,7 +273,7 @@ pub fn variant_value_leaf_is_semantically_null(
     if stats.null_count == Some(row_group.num_rows) {
         return true;
     }
-    (!terminal || variant_cast_maps_json_null_to_sql_null(target))
+    (!terminal || !target.is_string())
         && statistic_is_json_null(stats.min().as_ref())
         && statistic_is_json_null(stats.max().as_ref())
 }
