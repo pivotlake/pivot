@@ -345,33 +345,44 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
         let build_saw_null_key = worker_outputs.iter().any(|output| output.saw_null_key);
         unsafe { *self.table.build_saw_null_key.get() = build_saw_null_key };
 
-        // Every build row is present here, so each filter's key bounds are
-        // final: merge the per-worker extremes and publish them for the
-        // probe-side scans. A column with no non-null value publishes
-        // nothing, leaving those scans unpruned.
+        // The filters read the stored build rows, so they run before those
+        // rows are taken for the merge.
+        self.publish_filter_bounds(&worker_outputs);
+        let partition_sizes: Vec<usize> = (0..NUM_PARTITIONS)
+            .map(|partition| {
+                worker_outputs
+                    .iter()
+                    .map(|output| output.tuples[partition].len())
+                    .sum()
+            })
+            .collect();
+        let total_tuples: usize = partition_sizes.iter().sum();
+        let row_bases = self.publish_build_rows(&mut worker_outputs)?;
+        let directory_capacity = self.allocate_directory_and_arenas(total_tuples);
+        self.inject_partition_jobs(
+            &mut worker_outputs,
+            &row_bases,
+            &partition_sizes,
+            directory_capacity,
+        );
+        self.jobs_injected.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Every build row is present here, so each filter's key bounds are
+    /// final: merge the per-worker extremes and publish them for the
+    /// probe-side scans. A column with no non-null value publishes
+    /// nothing, leaving those scans unpruned. The key set itself seals as
+    /// a bitset when the bounds and row count admit one.
+    fn publish_filter_bounds(&self, worker_outputs: &[BuildWorkerOutput<K>]) {
         let total_rows: usize = worker_outputs
             .iter()
             .flat_map(|output| output.build_row_batches.iter())
             .map(|batch| batch.num_rows())
             .sum();
         for (filter_index, filter) in self.build_filters.iter().enumerate() {
-            let worker_extreme = |largest: bool| {
-                let candidates = worker_outputs
-                    .iter()
-                    .map(|output| &output.filter_extremes[filter_index])
-                    .filter_map(|extremes| {
-                        if largest {
-                            &extremes.max
-                        } else {
-                            &extremes.min
-                        }
-                        .clone()
-                    })
-                    .collect();
-                combine_extremes(candidates, largest)
-            };
-            let min = worker_extreme(false);
-            let max = worker_extreme(true);
+            let min = merge_worker_extremes(worker_outputs, filter_index, false);
+            let max = merge_worker_extremes(worker_outputs, filter_index, true);
             if let Some(min) = &min {
                 filter.min_slot.publish_value(min.clone());
             }
@@ -390,24 +401,19 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
                 .key_bitset_slot
                 .publish(KeyBitset::try_build(key_arrays, bounds, total_rows));
         }
+    }
 
-        let sizes: Vec<usize> = (0..NUM_PARTITIONS)
-            .map(|partition| {
-                worker_outputs
-                    .iter()
-                    .map(|output| output.tuples[partition].len())
-                    .sum()
-            })
-            .collect();
-        let total: usize = sizes.iter().sum();
-
-        // GatherBarrier returns outputs in worker order. Merge the stored
-        // build rows in that same order, so each worker-local tuple id gets
-        // the corresponding row base during scatter. An empty merge means an
-        // empty build side, and the probe then emits nothing. For a build
-        // whose side is outer, anti, or semi this also allocates one matched
-        // flag per row id (gaps included); null-keyed rows have no tuple and
-        // remain unmatched.
+    /// Merge the stored build rows and publish them on the shared table.
+    /// GatherBarrier returns outputs in worker order, and the merge keeps
+    /// that order, so each worker-local tuple id gets the corresponding row
+    /// base during scatter. An empty merge means an empty build side, and
+    /// the probe then emits nothing. For a build whose side is outer, anti,
+    /// or semi this also allocates one matched flag per row id (gaps
+    /// included); null-keyed rows have no tuple and remain unmatched.
+    fn publish_build_rows(
+        &mut self,
+        worker_outputs: &mut [BuildWorkerOutput<K>],
+    ) -> unary::Result<Vec<u32>> {
         let (build_rows, row_bases) = BuildRows::new::<TRACK_MATCHED_BUILD_ROWS>(
             worker_outputs
                 .iter_mut()
@@ -415,52 +421,87 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
             &self.build_output_indices,
         )?;
         unsafe { *self.table.build_rows.get() = build_rows };
+        Ok(row_bases)
+    }
 
-        // Pre-allocate directory and arenas.
-        let dir_capacity = ((total as f64 * 1.125) as usize)
+    /// Size the directory for `total_tuples` and allocate it together with
+    /// the key and row arenas the partition jobs scatter into. Returns the
+    /// directory capacity, which fixes each partition's slot range.
+    fn allocate_directory_and_arenas(&mut self, total_tuples: usize) -> usize {
+        let directory_capacity = ((total_tuples as f64 * 1.125) as usize)
             .next_power_of_two()
             .max(NUM_PARTITIONS);
         let directory = unsafe { &mut *self.table.directory.get() };
         let mut directory_alloc = SlabAllocator::new(false);
         *directory = JoinDirectory::new(
-            directory_alloc.create_multi_slab_buffer(dir_capacity + 1, true),
-            dir_capacity,
+            directory_alloc.create_multi_slab_buffer(directory_capacity + 1, true),
+            directory_capacity,
         );
 
         // Sentinel at entry[capacity] holds the end pointer of the last slot.
         // Probe reads end_ptr(slot+1) for slot = capacity-1, which lands here.
-        directory.set_entry(dir_capacity, (total as u64) << 16);
+        directory.set_entry(directory_capacity, (total_tuples as u64) << 16);
 
         let mut arena_alloc = SlabAllocator::new(false);
         let keys = unsafe { &mut *self.table.keys.get() };
-        *keys = arena_alloc.create_multi_slab_buffer::<K>(total.max(1), false);
+        *keys = arena_alloc.create_multi_slab_buffer::<K>(total_tuples.max(1), false);
         let rows = unsafe { &mut *self.table.rows.get() };
-        *rows = arena_alloc.create_multi_slab_buffer::<u32>(total.max(1), false);
+        *rows = arena_alloc.create_multi_slab_buffer::<u32>(total_tuples.max(1), false);
+        directory_capacity
+    }
 
-        // Prefix sums give each partition its arena offset.
-        let mut offsets = vec![0usize; NUM_PARTITIONS];
-        for p in 1..NUM_PARTITIONS {
-            offsets[p] = offsets[p - 1] + sizes[p - 1];
-        }
-
-        let slots_per_partition = dir_capacity / NUM_PARTITIONS;
-        for (i, &arena_offset) in offsets.iter().enumerate() {
+    /// Push one scatter job per partition, each carrying every worker's
+    /// tuples for it along with the partition's arena offset (the running
+    /// sum of the sizes before it) and its share of directory slots.
+    fn inject_partition_jobs(
+        &self,
+        worker_outputs: &mut [BuildWorkerOutput<K>],
+        row_bases: &[u32],
+        partition_sizes: &[usize],
+        directory_capacity: usize,
+    ) {
+        let slots_per_partition = directory_capacity / NUM_PARTITIONS;
+        let mut arena_offset = 0;
+        for (partition, &size) in partition_sizes.iter().enumerate() {
             let tuples: Vec<(u32, SlabVec<BuildTuple<K>>)> = worker_outputs
                 .iter_mut()
-                .zip(&row_bases)
-                .map(|(output, &row_base)| (row_base, std::mem::take(&mut output.tuples[i])))
+                .zip(row_bases)
+                .map(|(output, &row_base)| {
+                    (row_base, std::mem::take(&mut output.tuples[partition]))
+                })
                 .collect();
             self.injector.push(JoinBuildJob {
                 tuples,
                 table: self.table.clone(),
                 arena_offset,
-                slot_start: i * slots_per_partition,
+                slot_start: partition * slots_per_partition,
                 remaining_jobs: self.remaining_jobs.clone(),
             });
+            arena_offset += size;
         }
-        self.jobs_injected.store(true, Ordering::Relaxed);
-        Ok(())
     }
+}
+
+/// The smallest (or largest) of every worker's own extreme for one filter
+/// column; `None` when no worker held a non-null value.
+fn merge_worker_extremes<K: Copy>(
+    worker_outputs: &[BuildWorkerOutput<K>],
+    filter_index: usize,
+    largest: bool,
+) -> Option<ArrayRef> {
+    let candidates = worker_outputs
+        .iter()
+        .map(|output| &output.filter_extremes[filter_index])
+        .filter_map(|extremes| {
+            if largest {
+                &extremes.max
+            } else {
+                &extremes.min
+            }
+            .clone()
+        })
+        .collect();
+    combine_extremes(candidates, largest)
 }
 
 impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
