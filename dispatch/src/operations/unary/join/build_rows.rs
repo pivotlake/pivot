@@ -42,15 +42,15 @@ impl BuildRows {
     /// Merge every worker's stored rows, in the given order, into the
     /// published whole, and prepare them for probing. No bytes move in the
     /// merge. Alongside the rows, returns each worker's row id base: the
-    /// single `u32` added to that worker's local ids at scatter time.
+    /// single `u64` added to that worker's local ids at scatter time.
     pub(crate) fn new<const TRACK_MATCHES: bool>(
         workers: impl IntoIterator<Item = Vec<RecordBatch>>,
         output_indices: &[usize],
-    ) -> Result<(Self, Vec<u32>), ArrowError> {
+    ) -> Result<(Self, Vec<u64>), ArrowError> {
         let mut batches = Vec::new();
         let mut row_id_bases = Vec::new();
         for worker in workers {
-            row_id_bases.push((batches.len() << BATCH_SHIFT) as u32);
+            row_id_bases.push((batches.len() << BATCH_SHIFT) as u64);
             batches.extend(worker);
         }
         assert!(
@@ -127,7 +127,7 @@ pub(crate) fn row_id_shift() -> u32 {
 /// its first row's id, for the caller to generate tuples from. Ids are local
 /// to `batches`; a worker's ids are globalized with the base merge assigns
 /// it.
-pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(u32, RecordBatch)> {
+pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(u64, RecordBatch)> {
     let total = batch.num_rows();
     if total == 0 {
         return Vec::new();
@@ -145,7 +145,7 @@ pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(
             batches.len() < MAX_BATCHES,
             "join build side exceeds the row id space"
         );
-        adopted.push(((batches.len() << BATCH_SHIFT) as u32, stored.clone()));
+        adopted.push(((batches.len() << BATCH_SHIFT) as u64, stored.clone()));
         batches.push(stored);
         offset += rows;
     }
