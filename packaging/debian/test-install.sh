@@ -20,7 +20,7 @@ package_name=$(basename "$package")
 docker run --rm \
     --mount "type=bind,source=$package_directory,target=/packages,readonly" \
     --env "PIVOT_TEST_PACKAGE=$package_name" \
-    debian:bullseye-slim \
+    debian:bookworm-slim \
     sh -euxc '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
