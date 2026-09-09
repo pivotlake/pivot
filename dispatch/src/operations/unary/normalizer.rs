@@ -213,7 +213,14 @@ impl<G: NormalizationBatches> Outputter<G> for Normalizer<G> {
 pub(crate) struct Collector<G, O> {
     groups: Vec<G>,
     outputter: O,
-    initializes: bool,
+    /// Whether this is the one worker the collectors' `to_single_worker_mpsc`
+    /// channel delivers every group to, and so the one that initializes the
+    /// outputter. The flag is decided up front rather than inferred from
+    /// having received groups, because an empty input legitimately delivers
+    /// no groups at all, and the initialization must still run on exactly one
+    /// worker: some outputters, such as the join's build table, can only be
+    /// set up once.
+    is_collector_worker: bool,
 }
 
 impl<G, O, Out> Consumer<G, Out> for Collector<G, O>
@@ -224,18 +231,21 @@ where
 
     fn consume(&mut self, group: G, _sender: &mut dyn Sender<Out>) -> unary::Result<()> {
         debug_assert!(
-            self.initializes,
-            "only the selected collector receives groups"
+            self.is_collector_worker,
+            "the collectors' channel delivers groups to the collector worker alone"
         );
         self.groups.push(group);
         Ok(())
     }
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
-        if self.initializes {
+        if self.is_collector_worker {
             self.outputter.initialize(self.groups)?;
         } else {
-            debug_assert!(self.groups.is_empty());
+            debug_assert!(
+                self.groups.is_empty(),
+                "a worker other than the collector worker received groups"
+            );
         }
         Ok(Some(self.outputter))
     }
@@ -244,15 +254,15 @@ where
 /// Builds one [`Collector`] pipeline breaker.
 pub(crate) struct CollectorFactory<G, O> {
     outputter: O,
-    initializes: bool,
+    is_collector_worker: bool,
     _group: PhantomData<fn() -> G>,
 }
 
 impl<G, O> CollectorFactory<G, O> {
-    pub(crate) fn new(outputter: O, initializes: bool) -> Self {
+    pub(crate) fn new(outputter: O, is_collector_worker: bool) -> Self {
         Self {
             outputter,
-            initializes,
+            is_collector_worker,
             _group: PhantomData,
         }
     }
@@ -270,7 +280,7 @@ where
         PipelineBreaker::Consuming(Collector {
             groups: Vec::new(),
             outputter: self.outputter,
-            initializes: self.initializes,
+            is_collector_worker: self.is_collector_worker,
         })
     }
 }
