@@ -531,10 +531,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![col]).unwrap()
     }
 
-    fn scalar32(v: i32) -> Scalar<ArrayRef> {
-        Scalar::new(Arc::new(Int32Array::from(vec![v])) as ArrayRef)
-    }
-
     fn slot_value(slot: &BoundarySlot) -> Option<i32> {
         slot.boundary().map(|s| {
             s.get()
