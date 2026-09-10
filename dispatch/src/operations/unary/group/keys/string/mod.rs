@@ -3,7 +3,7 @@ mod input_buffers;
 mod live_key;
 
 pub use arena_key::ArenaKey;
-pub(crate) use input_buffers::InputBufferSlots;
+pub use input_buffers::InputBufferSlots;
 pub use live_key::{ResolvedKey, StringKey};
 
 use crate::arrays::SlabColumn;
@@ -24,11 +24,12 @@ use std::sync::Arc;
 /// `StringViewArray` points directly into the arena's ring buffers.
 pub struct StringKeyExtractor;
 
-/// Per-batch reader: the downcast key column plus the arena slots of its
-/// data buffers, registered only if a row is scattered.
+/// Per-batch reader: the downcast key column plus the worker's cache of the
+/// arena slots its data buffers are registered at, filled only if a row is
+/// scattered.
 pub struct StringReader<'b> {
     array: &'b StringViewArray,
-    input_buffers: InputBufferSlots,
+    input_buffers: &'b mut InputBufferSlots,
 }
 
 impl KeyExtractor for StringKeyExtractor {
@@ -40,13 +41,13 @@ impl KeyExtractor for StringKeyExtractor {
     type Stored = ArenaStored;
     type Reader<'b> = StringReader<'b>;
     type ColumnBuilder = StringKeyColumnBuilder;
-    type Scratch = ();
+    type Scratch = InputBufferSlots;
 
     fn make_reader<'b>(
         batch: &'b RecordBatch,
         key_cols: &[usize],
         _config: &(),
-        _scratch: &'b mut (),
+        scratch: &'b mut InputBufferSlots,
     ) -> Self::Reader<'b> {
         StringReader {
             array: batch
@@ -54,7 +55,7 @@ impl KeyExtractor for StringKeyExtractor {
                 .as_any()
                 .downcast_ref::<StringViewArray>()
                 .expect("string key column type mismatch"),
-            input_buffers: InputBufferSlots::default(),
+            input_buffers: scratch,
         }
     }
 

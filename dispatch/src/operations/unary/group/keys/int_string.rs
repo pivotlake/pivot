@@ -137,12 +137,13 @@ impl<N: Copy + Default + PartialEq + Send + Sync + 'static> LiveKey for IntStrRe
     }
 }
 
-/// Per-batch reader: the two downcast key columns plus the arena slots of the
-/// string column's data buffers, registered only if a row is scattered.
+/// Per-batch reader: the two downcast key columns plus the worker's cache of
+/// the arena slots the string column's data buffers are registered at, filled
+/// only if a row is scattered.
 pub struct IntStrReader<'b, T: ArrowPrimitiveType> {
     ints: &'b PrimitiveArray<T>,
     strings: &'b StringViewArray,
-    input_buffers: InputBufferSlots,
+    input_buffers: &'b mut InputBufferSlots,
 }
 
 /// `GROUP BY` over one integer column and one string column, integer first:
@@ -169,13 +170,13 @@ where
     type Stored = IntStrStored<T::Native>;
     type Reader<'b> = IntStrReader<'b, T>;
     type ColumnBuilder = IntStrKeyColumnBuilder<T>;
-    type Scratch = ();
+    type Scratch = InputBufferSlots;
 
     fn make_reader<'b>(
         batch: &'b RecordBatch,
         key_cols: &[usize],
         _config: &(),
-        _scratch: &'b mut (),
+        scratch: &'b mut InputBufferSlots,
     ) -> Self::Reader<'b> {
         let (int_col, str_col) = (key_cols[0], key_cols[1]);
         IntStrReader {
@@ -189,7 +190,7 @@ where
                 .as_any()
                 .downcast_ref::<StringViewArray>()
                 .expect("string key column type mismatch"),
-            input_buffers: InputBufferSlots::default(),
+            input_buffers: scratch,
         }
     }
 

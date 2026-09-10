@@ -518,10 +518,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         // merged at all; on a hierarchical merge it still completes its
         // partition's rendezvous so the other nodes' jobs are not left
         // waiting for it.
-        let pruned = self
+        let partition_totals = self
             .topk_bounds
             .as_ref()
-            .is_some_and(|bounds| bounds.skips_partition(self.index));
+            .and_then(|bounds| bounds.partition_totals(self.index));
+        let pruned = partition_totals
+            .as_ref()
+            .is_some_and(|totals| totals.skips_partition());
         let result_map = if pruned {
             None
         } else {
@@ -533,9 +536,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
                 self.num_partitions,
                 &self.key_arena,
                 &self.shared_context,
-                self.topk_bounds
-                    .as_ref()
-                    .and_then(|bounds| bounds.entry_filter()),
+                partition_totals.as_ref().map(|totals| totals.filter()),
             ))
         };
         let result_map = match &self.cross_node_merge {
@@ -608,9 +609,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // switched worker also holds over-counts, which only over-sizes the
         // merge targets (safe); under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
-        // Under a pruned top-k every worker reports its count totals; summed,
-        // they bound every group of the query.
-        let mut count_totals: Option<SlotCountTotals> = None;
+        // Under a pruned top-k every worker reports its count totals, which
+        // merge jobs sum over their own partition's slots.
+        let mut worker_totals: Vec<SlotCountTotals> = Vec::new();
         for out in outputs {
             if out.buffers.is_none() {
                 non_switched_groups += out.tables.iter().map(|t| t.len()).sum::<usize>();
@@ -621,12 +622,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             }
             hll.merge(&out.hll);
             self.zero_hash_pending |= out.zero_hash_seen;
-            if let Some(worker_totals) = out.count_totals {
-                match &mut count_totals {
-                    Some(totals) => totals.merge_from(&worker_totals),
-                    None => count_totals = Some(worker_totals),
-                }
-            }
+            worker_totals.extend(out.count_totals);
         }
         let any_switched = buffers_by_node.iter().any(|b| !b.is_empty());
         let total_in_place: usize = tables_by_node.iter().flatten().map(|t| t.len()).sum();
@@ -732,16 +728,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // Held by the jobs (and the batches they emit), never by the arena, so
         // there is no `arena -> Buffer -> arena` cycle.
         let output_buffers: Arc<[Buffer]> = self.key_arena.to_arrow_buffers();
-        // Under a pruned top-k the queues are filled heaviest partition first:
-        // the first jobs fill the workers' heaps with the largest groups and
-        // raise the threshold that lets the lighter jobs skip themselves.
-        let topk_bounds =
-            count_totals.map(|totals| Arc::new(TopKBounds::new(totals, num_partitions)));
-        let mut partition_order: Vec<usize> = (0..num_partitions).collect();
-        if let Some(bounds) = &topk_bounds {
-            partition_order
-                .sort_by_key(|&partition| std::cmp::Reverse(bounds.partition_bound(partition)));
-        }
+        let topk_bounds = (!worker_totals.is_empty())
+            .then(|| Arc::new(TopKBounds::new(worker_totals, num_partitions)));
         // All jobs are pushed before the injected flag flips, so a drained
         // queue means a finished phase.
         let push_job = |injector: &Injector<PartitionJob<K, V>>,
@@ -778,7 +766,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             // transient memory the final cross-node merge frees.
             let buffers_by_node: Vec<_> = buffers_by_node.into_iter().map(Arc::new).collect();
             let tables_by_node: Vec<_> = tables_by_node.into_iter().map(Arc::new).collect();
-            for i in partition_order {
+            for i in 0..num_partitions {
                 let cross_node_merge = Arc::new(CrossNodeMerge::new(node_count));
                 for (node, injector) in self.injectors.iter().enumerate() {
                     push_job(
@@ -795,9 +783,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             // the node queues so all workers share the load.
             let buffers = Arc::new(buffers_by_node.into_iter().flatten().collect::<Vec<_>>());
             let tables = Arc::new(tables_by_node.into_iter().flatten().collect::<Vec<_>>());
-            for (queue, i) in partition_order.into_iter().enumerate() {
+            for i in 0..num_partitions {
                 push_job(
-                    &self.injectors[queue % node_count],
+                    &self.injectors[i % node_count],
                     i,
                     None,
                     buffers.clone(),
