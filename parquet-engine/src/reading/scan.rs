@@ -15,17 +15,17 @@ use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
     RecordBatchOperatorSpec, RootUnaryOperatorFactory, UnaryOperatorFactory, return_to_worker_mpsc,
-    stealable, to_single_worker_mpsc,
+    stealable, stealable_fifo, to_single_worker_mpsc,
 };
 
 use crate::{
-    CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
-    MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
-    RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate, ScanOrder,
-    pending_claim_bound,
+    CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
+    IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
+    RowGroupFetcherFactory, RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate,
+    ScanOrder, WorkerAllocator, pending_claim_bound,
 };
 
-/// Append the index → decompress → decode stages onto a source of
+/// Append the index → decompress → cut → decode stages onto a source of
 /// [`RowGroupBuffer`]s, producing decoded `RecordBatch`es.
 pub(crate) fn read_parquet<OF>(
     input: OperatorSpec<RowGroupBuffer, OF>,
@@ -41,6 +41,9 @@ where
 {
     let n = input.dispatcher().worker_count();
     let topology = input.dispatcher().topology();
+    // One allocator per worker, for its range cutter and its decoder alike.
+    let allocators: Vec<Arc<WorkerAllocator>> =
+        (0..n).map(|_| Arc::new(WorkerAllocator::new())).collect();
     let decoded = input
         .chain(
             stealable::<RowGroupBuffer>(topology).into_iter().collect(),
@@ -56,23 +59,39 @@ where
                 .collect(),
             pending_row_groups
                 .into_iter()
-                .map(|pending| DecoderFactory {
-                    batch_size,
+                .zip(&allocators)
+                .map(|(pending, allocator)| RangeCutterFactory {
                     projection: projection.clone(),
-                    add_row_group_metadata,
                     eq_predicates: eq_predicates.clone(),
                     pending_row_groups: pending,
                     outstanding_row_groups: outstanding_row_groups.clone(),
+                    allocator: allocator.clone(),
+                })
+                .collect(),
+        )
+        // A worker takes its own row groups' ranges oldest first, so it
+        // follows each row group as one stream; a peer with nothing to do
+        // takes the oldest range waiting on another worker.
+        .chain(
+            stealable_fifo::<DecodeRange>(topology)
+                .into_iter()
+                .collect(),
+            allocators
+                .into_iter()
+                .map(|allocator| DecoderFactory {
+                    batch_size,
+                    add_row_group_metadata,
+                    allocator,
                 })
                 .collect(),
         );
     RecordBatchOperatorSpec::from_spec(decoded)
 }
 
-/// One claimed-but-not-fully-decoded row-group counter per worker, shared by
-/// the worker's fetcher (increments and gates claims) and its decoder
-/// (decrements as row groups complete). See `RowGroupFetcher` for why claims
-/// are bounded this way.
+/// One claimed-but-not-yet-cut row-group counter per worker, shared by the
+/// worker's fetcher (increments and gates claims) and its range cutter
+/// (decrements as row groups are cut or pruned). See `RowGroupFetcher` for
+/// why claims are bounded this way.
 fn pending_row_group_counters(n: usize) -> Vec<Arc<AtomicUsize>> {
     (0..n).map(|_| Arc::new(AtomicUsize::new(0))).collect()
 }
@@ -137,10 +156,10 @@ pub fn table_input_with_filter_and_eq_predicates(
     if projection.indices().is_empty() {
         return empty_projection_scan(dispatcher, table, filter, add_row_group_metadata);
     }
-    // Counts the row groups the whole scan has claimed but not yet fully
-    // decoded. The injector increments it on claim, the decoders decrement
-    // it, and a Top-N scan throttles its claims against it while its boundary
-    // converges (see `RowGroupInjector`).
+    // Counts the row groups the whole scan has claimed but not yet cut into
+    // decode ranges. The injector increments it on claim, the range cutters
+    // decrement it, and a Top-N scan throttles its claims against it while
+    // its boundary converges (see `RowGroupInjector`).
     let outstanding_row_groups = Arc::new(AtomicUsize::new(0));
     let injector = RowGroupInjectorFactory::new(
         table,
@@ -195,8 +214,8 @@ pub fn materialize(
     let claim_bound = pending_claim_bound(&table);
     // Every surviving-row batch funnels to ONE worker's materializer, so each
     // row group becomes exactly one [`RowGroupRequest`] holding all of its
-    // surviving rows. The decoder relies on that: it tracks row groups by
-    // index and drops pages of a group it already finished, so a second
+    // surviving rows. The range cutter relies on that: it tracks row groups
+    // by index and drops pages of a group it already cut, so a second
     // request for the same group would silently lose its rows. The funneled
     // stage only merges tiny index lists; the fetch and decode stay spread
     // over every worker through the stealable request channel. Successive

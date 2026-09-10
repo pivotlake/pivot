@@ -176,7 +176,8 @@ const SPECULATION_ALLOWANCE_FLOOR: usize = 16;
 /// [`RowGroupInjector::acquire_speculation_ticket`]).
 pub struct SpeculationGate {
     /// Row groups claimed but not yet fully decoded, scan-wide (incremented on
-    /// claim here, decremented by the decoders).
+    /// claim here, decremented as each row group's last decode range is
+    /// decoded, or when it is pruned).
     outstanding: Arc<AtomicUsize>,
     /// Claims admitted so far. Every admitted claim raises the allowance on
     /// outstanding claims (half this count, floored at
@@ -228,20 +229,20 @@ impl RowGroupInjectorFactory {
             Some(order) => steal_order(table, order),
             None => plain_scan_order(table, &projection),
         };
+        let row_groups: Vec<QueryRowGroupMetadata> = order
+            .iter()
+            .map(|&idx| QueryRowGroupMetadata::new(table, idx, RowSelection::All))
+            .collect();
         let speculation = scan_order.map(|_| {
             Arc::new(SpeculationGate {
                 outstanding: outstanding_row_groups,
                 admitted_claims: AtomicUsize::new(0),
-                remaining: AtomicUsize::new(order.len()),
+                remaining: AtomicUsize::new(row_groups.len()),
             })
         });
-        for row_group_idx in order {
-            let node = affinity_node(&table.row_groups[row_group_idx], node_count);
-            row_group_queues[node].push(QueryRowGroupMetadata::new(
-                table,
-                row_group_idx,
-                RowSelection::All,
-            ));
+        for row_group in row_groups {
+            let node = affinity_node(row_group.get_metadata(), node_count);
+            row_group_queues[node].push(row_group);
         }
         Self {
             row_group_queues,
@@ -369,9 +370,9 @@ impl Drop for SpeculationTicket<'_> {
 
 impl SpeculationTicket<'_> {
     /// Hand the reservation over to the claimed row group: it becomes the
-    /// claim's outstanding count, released by the decoder when the row group
-    /// completes instead of by drop.
-    fn transfer_to_decoder(self) {
+    /// claim's outstanding count, released when the row group is decoded
+    /// instead of by drop.
+    fn transfer_to_row_group(self) {
         std::mem::forget(self);
     }
 }
@@ -394,8 +395,8 @@ impl RowGroupInjector {
             return None;
         }
         if let SpeculationTicket::Reserved(gate) = &ticket {
-            // The ticket becomes the claim's outstanding count (the decoder
-            // releases it when the row group completes). While throttled the
+            // The ticket becomes the claim's outstanding count (released when
+            // the row group is decoded). While throttled the
             // pool is mostly parked (gated claims are no-op passes) and a
             // claim, unlike a channel send, wakes nobody on its own; waking
             // one worker per admitted claim lets the working set grow with
@@ -411,7 +412,7 @@ impl RowGroupInjector {
             gate.admitted_claims.fetch_add(1, Ordering::Relaxed);
             dispatch::waker::waker_set().notify_one_near(self.numa_node_idx);
         }
-        ticket.transfer_to_decoder();
+        ticket.transfer_to_row_group();
         Some(RowGroupRequest::from(row_group, &self.projection))
     }
 

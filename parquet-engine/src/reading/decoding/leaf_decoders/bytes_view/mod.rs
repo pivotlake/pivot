@@ -36,8 +36,8 @@ pub type BytesViewDecoder<V> =
 
 #[cfg(test)]
 mod tests {
-    use crate::reading::decoding::leaf_decoders::LeafDecoder;
     use crate::reading::decoding::leaf_decoders::bytes_view::BytesViewDecoder;
+    use crate::reading::decoding::leaf_decoders::{BuiltDictionary, LeafDecoder};
     use crate::test_utils::dummy_metadata;
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
@@ -71,6 +71,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -79,17 +80,18 @@ mod tests {
         }
     }
 
-    fn make_dict_page(entries: &[&str]) -> DecompressedPage {
-        let header = PageHeader::for_dict_page(entries.len() as i32);
-        DecompressedPage {
-            worker_id: 0,
-            query_row_group_metadata: dummy_metadata(RowSelection::All),
-            column_idx: 0,
-            idx: 0,
-            data: DecompressedPageType::Dict {
-                header: header.dictionary_page_header.unwrap(),
-                data: vec![Bytes::from(encode_plain_strings(entries))],
-            },
+    fn load_dictionary(
+        dec: &mut impl LeafDecoder,
+        entries: &[&str],
+        allocator: &mut SlabAllocator,
+    ) {
+        let header = PageHeader::for_dict_page(entries.len() as i32)
+            .dictionary_page_header
+            .unwrap();
+        let data = vec![Bytes::from(encode_plain_strings(entries))];
+        match dec.build_dictionary(header, data, allocator) {
+            BuiltDictionary::Built(dictionary) => dec.adopt_dictionary(dictionary),
+            BuiltDictionary::Pruned => panic!("no constant is set"),
         }
     }
 
@@ -110,7 +112,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let result = dec.read(&mut allocator, 3).unwrap();
         assert_eq!(extract_strings(&result), vec!["hi", "bye", "ok"]);
@@ -131,7 +133,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<BinaryViewType>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
         let result = dec.read(&mut allocator, 2).unwrap();
 
         let bv = result.as_any().downcast_ref::<BinaryViewArray>().unwrap();
@@ -148,7 +150,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let result = dec.read(&mut allocator, 2).unwrap();
         assert_eq!(extract_strings(&result), vec![long1, long2]);
@@ -157,7 +159,6 @@ mod tests {
     #[test]
     fn test_dict_encoded() {
         init_test_free_pool(4);
-        let dict_page = make_dict_page(&["foo", "bar", "baz"]);
 
         // bit_width=2, bit-packed 1 group: indices [2, 0, 1, 0]
         // header=(1<<1)|1=3, packed: byte0=0x12, byte1=0x00
@@ -167,8 +168,8 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(0);
-        dec.insert_page(dict_page, &mut allocator);
-        dec.insert_page(data_page, &mut allocator);
+        load_dictionary(&mut dec, &["foo", "bar", "baz"], &mut allocator);
+        dec.insert_page(data_page);
 
         let result = dec.read(&mut allocator, 4).unwrap();
         assert_eq!(extract_strings(&result), vec!["baz", "foo", "bar", "foo"]);
@@ -182,8 +183,8 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(0);
-        dec.insert_page(page0, &mut allocator);
-        dec.insert_page(page1, &mut allocator);
+        dec.insert_page(page0);
+        dec.insert_page(page1);
         let result = dec.read(&mut allocator, 4).unwrap();
 
         assert_eq!(extract_strings(&result), vec!["a", "b", "c", "d"]);
@@ -201,7 +202,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let r1 = dec.read(&mut allocator, 2).unwrap();
         assert_eq!(extract_strings(&r1), vec!["x", "y"]);
@@ -231,7 +232,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1); // max_def_level = 1
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
         let result = dec.read(&mut allocator, 3).unwrap();
         assert_eq!(extract_strings(&result), vec!["hi", "bye", "ok"]);
     }
@@ -281,7 +282,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let result = dec.read(&mut allocator, 3).unwrap();
         let sv = result.as_any().downcast_ref::<StringViewArray>().unwrap();
@@ -306,7 +307,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let result = dec.read(&mut allocator, 4).unwrap();
         let sv = result.as_any().downcast_ref::<StringViewArray>().unwrap();
@@ -332,7 +333,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let result = dec.read(&mut allocator, 3).unwrap();
         let sv = result.as_any().downcast_ref::<StringViewArray>().unwrap();
@@ -359,8 +360,8 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1);
-        dec.insert_page(page0, &mut allocator);
-        dec.insert_page(page1, &mut allocator);
+        dec.insert_page(page0);
+        dec.insert_page(page1);
         let result = dec.read(&mut allocator, 4).unwrap();
 
         assert_eq!(nulls(&result), vec![false, false, false, true]);
@@ -376,8 +377,8 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1);
-        dec.insert_page(page0, &mut allocator);
-        dec.insert_page(page1, &mut allocator);
+        dec.insert_page(page0);
+        dec.insert_page(page1);
         let result = dec.read(&mut allocator, 4).unwrap();
 
         assert_eq!(nulls(&result), vec![true, false, false, false]);
@@ -392,7 +393,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
         let first = dec.read(&mut allocator, 2).unwrap();
         let rest = dec.read(&mut allocator, 2).unwrap();
 
@@ -418,7 +419,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
         let result = dec.read(&mut allocator, 2).unwrap();
 
         assert_eq!(extract_strings(&result), vec!["a", "c"]);
@@ -436,7 +437,7 @@ mod tests {
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
         let result = dec.read(&mut allocator, 2).unwrap();
 
         assert_eq!(nulls(&result), vec![true, true]);

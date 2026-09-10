@@ -38,6 +38,7 @@ mod typed;
 pub use typed::TypedLeafDecoder;
 
 use crate::thrift::general::Encoding;
+use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::page::DecompressedPage;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
@@ -69,6 +70,22 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A built dictionary, type-erased so one type serves every column type.
+/// Every decoder of a leaf decodes it with the same decoder type, so the
+/// decoder that adopts a dictionary downcasts it to its own dictionary
+/// type; a mismatch is a bug, not a runtime condition.
+pub type SharedDictionary = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
+/// What building a leaf's dictionary from its page found.
+pub enum BuiltDictionary {
+    /// The dictionary, for every decoder of the row group to adopt.
+    Built(SharedDictionary),
+    /// The page excludes the pushed-down equality constant: no row of the
+    /// column can match, so the row group is pruned and the dictionary is
+    /// never materialized.
+    Pruned,
+}
+
 /// Object-safe interface for decoding a single Parquet leaf column from
 /// decompressed pages into Arrow arrays.
 ///
@@ -80,26 +97,36 @@ pub trait LeafDecoder {
     /// buffered so far.
     fn available(&self) -> usize;
 
-    /// Stores a decompressed page (data, dictionary, or skipped) for later
-    /// decoding.
-    fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator);
+    /// Stores a decompressed data or skipped page for later decoding. A
+    /// dictionary page goes through [`Self::build_dictionary`] instead.
+    fn insert_page(&mut self, page: DecompressedPage);
+
+    /// Builds the row group's dictionary from its page, or finds that the
+    /// page excludes the pushed-down equality constant (see
+    /// [`Self::set_eq_constant`]) and prunes the row group instead.
+    fn build_dictionary(
+        &self,
+        header: DictionaryPageHeader,
+        data: Vec<Bytes>,
+        allocator: &mut SlabAllocator,
+    ) -> BuiltDictionary;
+
+    /// Reads through a dictionary built for this leaf.
+    fn adopt_dictionary(&mut self, dictionary: SharedDictionary);
+
+    /// Forgets every page, the one being read included, and expects the
+    /// next pages from `page_idx` on: the decoder is about to read rows
+    /// that do not follow the ones it has emitted.
+    fn restart_at_page(&mut self, page_idx: usize);
 
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
 
     /// Installs a pushed-down equality constant. A constant whose type does
     /// not match the column is ignored (the query's `Filter` still applies
-    /// the condition). Once the dictionary is built the constant decides
-    /// row-group pruning and scan-side batch filtering.
+    /// the condition). The constant decides row-group pruning when the
+    /// dictionary is built and scan-side batch filtering once it is adopted.
     fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>);
-
-    /// Whether the loaded dictionary is known to exclude the pushed-down
-    /// equality constant, meaning no row of this column can match and the row
-    /// group can be pruned. `false` until a dictionary page proves otherwise
-    /// (no constant pushed, dictionary not loaded yet, or constant present).
-    fn dict_excludes_eq_constant(&self) -> bool {
-        false
-    }
 
     /// Drops rows that cannot pass this column's pushed-down equality
     /// constant from a decoded batch, where `column` is this column's
@@ -166,7 +193,7 @@ pub trait DecodeDelta: Sized {
 /// Construction lives in [`DictFromBytes`] / [`DictFromVecBytes`], keyed by
 /// whether the dictionary page's bytes sit in one contiguous buffer or are
 /// scattered across several.
-pub trait Dict {
+pub trait Dict: Send + Sync + 'static {
     type Builder: ArrayBuilder;
     type Item;
     /// How a pushed-down equality constant is represented for this

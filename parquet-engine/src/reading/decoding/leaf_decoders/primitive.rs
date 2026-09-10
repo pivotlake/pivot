@@ -18,10 +18,12 @@ use arrow_array::types::{ArrowPrimitiveType, TimestampMicrosecondType};
 use arrow_array::{ArrayRef, RecordBatch, Scalar, TimestampMicrosecondArray};
 use arrow_buffer::ArrowNativeType;
 
+use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::{
     DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, LeafDecoder,
     Result, TypedLeafDecoder,
 };
+use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::page::DecompressedPage;
 use bytes::Bytes;
 use dispatch::memory::{
@@ -272,10 +274,11 @@ where
 {
     entries: B,
     len: usize,
-    phantom: PhantomData<T>,
+    phantom: PhantomData<fn() -> T>,
 }
 
-impl<T: ArrowPrimitiveType, B: Index<usize, Output = T::Native>> Dict for PrimitiveDict<T, B>
+impl<T: ArrowPrimitiveType, B: Index<usize, Output = T::Native> + Send + Sync + 'static> Dict
+    for PrimitiveDict<T, B>
 where
     T::Native: ReadLeBytes,
 {
@@ -408,8 +411,25 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
         self.inner.available()
     }
 
-    fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
-        self.inner.insert_page(page, allocator);
+    fn insert_page(&mut self, page: DecompressedPage) {
+        self.inner.insert_page(page);
+    }
+
+    fn build_dictionary(
+        &self,
+        header: DictionaryPageHeader,
+        data: Vec<Bytes>,
+        allocator: &mut SlabAllocator,
+    ) -> BuiltDictionary {
+        self.inner.build_dictionary(header, data, allocator)
+    }
+
+    fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {
+        self.inner.adopt_dictionary(dictionary);
+    }
+
+    fn restart_at_page(&mut self, page_idx: usize) {
+        self.inner.restart_at_page(page_idx);
     }
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
@@ -424,10 +444,6 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
         self.inner.set_eq_constant(value);
     }
 
-    fn dict_excludes_eq_constant(&self) -> bool {
-        self.inner.dict_excludes_eq_constant()
-    }
-
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
         self.inner.fast_filter_record_batch(batch, column)
     }
@@ -435,7 +451,6 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
 //
 #[cfg(test)]
 mod tests {
-    use crate::types::metadata::RowSelection;
     use std::sync::Arc;
 
     use crate::thrift::general::Encoding;
@@ -453,8 +468,9 @@ mod tests {
     /// `maybe_contains` scans raw page bytes, so the buffer flavour is
     /// irrelevant; any instantiation works.
     type Int64Dict = PrimitiveDict<Int64Type, SlabBuffer<i64>>;
-    use crate::reading::decoding::leaf_decoders::LeafDecoder;
+    use crate::reading::decoding::leaf_decoders::{BuiltDictionary, LeafDecoder};
     use crate::test_utils::dummy_metadata;
+    use crate::types::metadata::RowSelection;
     use dispatch::memory::SlabAllocator;
     use dispatch::memory::init_test_free_pool;
 
@@ -510,6 +526,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -530,6 +547,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: buffers.into_iter().map(Bytes::from).collect(),
@@ -538,17 +556,18 @@ mod tests {
         }
     }
 
-    fn make_dict_page(data: Vec<u8>, num_values: usize) -> DecompressedPage {
-        let header = PageHeader::for_dict_page(num_values as i32);
-        DecompressedPage {
-            worker_id: 0,
-            query_row_group_metadata: dummy_metadata(RowSelection::All),
-            column_idx: 0,
-            idx: 0,
-            data: DecompressedPageType::Dict {
-                header: header.dictionary_page_header.unwrap(),
-                data: vec![Bytes::from(data)],
-            },
+    fn load_dictionary(
+        dec: &mut impl LeafDecoder,
+        data: Vec<u8>,
+        num_values: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        let header = PageHeader::for_dict_page(num_values as i32)
+            .dictionary_page_header
+            .unwrap();
+        match dec.build_dictionary(header, vec![Bytes::from(data)], allocator) {
+            BuiltDictionary::Built(dictionary) => dec.adopt_dictionary(dictionary),
+            BuiltDictionary::Pruned => panic!("no constant is set"),
         }
     }
 
@@ -589,7 +608,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 5);
         let result = dec.read(&mut allocator, 5).unwrap();
@@ -604,7 +623,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int64Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 5);
         let result = dec.read(&mut allocator, 5).unwrap();
@@ -619,7 +638,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Float32Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 4);
         let result = dec.read(&mut allocator, 4).unwrap();
@@ -636,7 +655,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let r1 = dec.read(&mut allocator, 2).unwrap();
         assert_eq!(extract_i32s(&r1), vec![10, 20]);
@@ -653,8 +672,8 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(page0, &mut allocator);
-        dec.insert_page(page1, &mut allocator);
+        dec.insert_page(page0);
+        dec.insert_page(page1);
 
         assert_eq!(dec.available(), 5);
         let result = dec.read(&mut allocator, 5).unwrap();
@@ -669,7 +688,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let result = dec.read(&mut allocator, 6).unwrap();
         assert_eq!(extract_i32s(&result), values);
@@ -691,7 +710,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let result = dec.read(&mut allocator, 3).unwrap();
         assert_eq!(extract_i32s(&result), vec![10, 20, 30]);
@@ -702,7 +721,6 @@ mod tests {
     #[test]
     fn test_i32_dict_encoded() {
         // Dictionary entries: [100, 200, 300]
-        let dict_page = make_dict_page(encode_i32s(&[100, 200, 300]), 3);
 
         // RLE data page: bit_width=2, 1 group of 8 values
         // Indices: [0, 1, 2, 0, 0, 1, 2, 0]
@@ -716,8 +734,8 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(dict_page, &mut allocator);
-        dec.insert_page(data_page, &mut allocator);
+        load_dictionary(&mut dec, encode_i32s(&[100, 200, 300]), 3, &mut allocator);
+        dec.insert_page(data_page);
 
         assert_eq!(dec.available(), 8);
         let result = dec.read(&mut allocator, 8).unwrap();
@@ -745,6 +763,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -767,7 +786,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 2);
         let result = dec.read(&mut allocator, 2).unwrap();
@@ -788,7 +807,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 1);
         let result = dec.read(&mut allocator, 1).unwrap();
@@ -809,7 +828,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 3);
         let result = dec.read(&mut allocator, 3).unwrap();
@@ -828,9 +847,8 @@ mod tests {
         );
 
         init_test_free_pool(4);
-        let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 0);
     }
@@ -839,8 +857,6 @@ mod tests {
     /// keep [0, 2, 5] → [100, 300, 200].
     #[test]
     fn test_i32_filter_dict_encoded() {
-        let dict_page = make_dict_page(encode_i32s(&[100, 200, 300, 400]), 4);
-
         // bit_width=2, 1 group of 8 values, indices [0,1,2,3,0,1,2,3]
         let mut rle_data = vec![2u8];
         rle_data.extend_from_slice(&[3, 0xE4, 0xE4]);
@@ -856,8 +872,13 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
-        dec.insert_page(dict_page, &mut allocator);
-        dec.insert_page(data_page, &mut allocator);
+        load_dictionary(
+            &mut dec,
+            encode_i32s(&[100, 200, 300, 400]),
+            4,
+            &mut allocator,
+        );
+        dec.insert_page(data_page);
 
         assert_eq!(dec.available(), 3);
         let result = dec.read(&mut allocator, 3).unwrap();
@@ -900,7 +921,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 1);
         let result = dec.read(&mut allocator, 1).unwrap();
@@ -916,7 +937,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 5);
         let result = dec.read(&mut allocator, 5).unwrap();
@@ -931,7 +952,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 5);
         let result = dec.read(&mut allocator, 5).unwrap();
@@ -946,7 +967,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<UInt16Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 5);
         let result = dec.read(&mut allocator, 5).unwrap();
@@ -962,7 +983,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         let r1 = dec.read(&mut allocator, 2).unwrap();
         assert_eq!(extract_i16s(&r1), vec![10, 20]);
@@ -985,7 +1006,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
-        dec.insert_page(page, &mut allocator);
+        dec.insert_page(page);
 
         assert_eq!(dec.available(), 2);
         let result = dec.read(&mut allocator, 2).unwrap();
@@ -1001,8 +1022,8 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
-        dec.insert_page(page0, &mut allocator);
-        dec.insert_page(page1, &mut allocator);
+        dec.insert_page(page0);
+        dec.insert_page(page1);
 
         assert_eq!(dec.available(), 5);
         let result = dec.read(&mut allocator, 5).unwrap();

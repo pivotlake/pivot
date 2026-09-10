@@ -4,7 +4,9 @@
 //!   projected column chunk over the io_uring ring (disk or presigned HTTP).
 //! - [`indexer`] — splits the fetched chunks into compressed pages.
 //! - [`decompressor`] — decompresses each page.
-//! - [`decoding`] — decodes pages into Arrow arrays.
+//! - [`range_cutter`] — collects each row group's pages and cuts its rows
+//!   into decode ranges.
+//! - [`decoding`] — decodes ranges into Arrow arrays.
 //! - [`materializer`] — late materialization: re-reads surviving rows by row id.
 //! - [`scan`] — the builders that chain the stages into one spec.
 //!
@@ -21,7 +23,10 @@ mod decompressor;
 pub use decompressor::{DecompressorFactory, Error as DecompressorError};
 
 pub(crate) mod decoding;
-pub use decoding::{ColumnDecoderError, DecoderFactory, ScanEqualityPredicate};
+pub use decoding::{ColumnDecoderError, DecoderFactory, ScanEqualityPredicate, WorkerAllocator};
+
+mod range_cutter;
+pub use range_cutter::{DecodeRange, RangeCutterFactory};
 
 mod materializer;
 pub use materializer::MaterializerFactory;

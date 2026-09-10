@@ -269,7 +269,6 @@ impl Run {
     /// skipped and the leftover run (if any).
     pub fn skip(
         self,
-        scratch: &mut [u32; 1024],
         data: &[Bytes],
         bit_width: u8,
         position: &mut ReaderPosition,
@@ -288,19 +287,36 @@ impl Run {
             Run::BitPacked {
                 remaining_in_run,
                 partial,
-                partial_count,
+                mut partial_count,
             } => {
-                let (skipped, leftover) = decode_bitpacked(
-                    remaining_in_run,
+                let skipped = amount.min(remaining_in_run);
+                let mut left = skipped;
+                // Values already unpacked into the partial group sit at the
+                // end of the array, so consuming them from the front only
+                // shortens the count.
+                let from_partial = (partial_count as usize).min(left);
+                partial_count -= from_partial as u8;
+                left -= from_partial;
+                // Whole groups are `bit_width` bytes each and need no
+                // unpacking to step over.
+                let groups = left / 8;
+                if groups > 0 {
+                    MultiBufferReader::new(data, position).skip(groups * bit_width as usize);
+                    left -= groups * 8;
+                }
+                // The values past the last whole group come from one more
+                // group, unpacked so its unconsumed tail carries over.
+                let (partial, partial_count) = if left > 0 {
+                    let group = decode_cross_boundary_group(data, bit_width, position);
+                    partial_from_group(&group, left)
+                } else {
+                    (partial, partial_count)
+                };
+                let leftover = (remaining_in_run > skipped).then_some(Run::BitPacked {
+                    remaining_in_run: remaining_in_run - skipped,
                     partial,
                     partial_count,
-                    scratch,
-                    data,
-                    bit_width,
-                    position,
-                    amount,
-                    |_, _| {},
-                );
+                });
                 (skipped, leftover)
             }
         }
@@ -355,13 +371,7 @@ impl RleDecoder {
     pub fn skip(&mut self, mut size: usize) {
         while size > 0 {
             let run = self.get_or_set_next_run();
-            let (skipped, run) = run.skip(
-                &mut self.buffer,
-                &self.data,
-                self.bit_width,
-                &mut self.position,
-                size,
-            );
+            let (skipped, run) = run.skip(&self.data, self.bit_width, &mut self.position, size);
             self.run = run;
             size -= skipped;
         }
@@ -528,6 +538,28 @@ mod tests {
         let result = push_all(&mut allocator, &mut dec, &dict, 8);
 
         assert_eq!(result, vec!["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"]);
+    }
+
+    /// Skipping into the middle of a bit-packed run leaves the decoder at the
+    /// right value, whether the skip ends inside a group or on a group edge,
+    /// and whether it starts with unpacked values pending.
+    #[test]
+    fn skip_lands_inside_bitpacked_run() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        // Header 0x07 = 3 bit-packed groups of AA BB CC DD AA BB CC DD.
+        let mut dec = new_decoder(vec![0x07, 0xE4, 0xE4, 0xE4, 0xE4, 0xE4, 0xE4], 2);
+
+        let head = push_all(&mut allocator, &mut dec, &dict, 3);
+        dec.skip(11);
+        let middle = push_all(&mut allocator, &mut dec, &dict, 2);
+        dec.skip(4);
+        let tail = push_all(&mut allocator, &mut dec, &dict, 4);
+
+        assert_eq!(head, vec!["AA", "BB", "CC"]);
+        assert_eq!(middle, vec!["CC", "DD"]);
+        assert_eq!(tail, vec!["AA", "BB", "CC", "DD"]);
     }
 
     /// Regression: after handling a buffer-boundary overflow, the decoder must
