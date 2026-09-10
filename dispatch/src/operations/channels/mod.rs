@@ -35,7 +35,7 @@ mod shared_work_queue;
 mod stealable;
 pub use node_work_queue::{NodeIdOutput, NodeWorkQueueChannelFactory, node_work_queue};
 pub use shared_work_queue::{SharedWorkQueueChannelFactory, shared_work_queue};
-pub use stealable::{StealableChannelFactory, stealable};
+pub use stealable::{StealableChannelFactory, stealable, stealable_fifo};
 
 mod mpsc;
 pub use mpsc::{MpscReceiver, MpscSender, mpsc_channel};
