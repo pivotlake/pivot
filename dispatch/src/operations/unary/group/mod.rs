@@ -153,17 +153,25 @@ pub enum GroupLimit {
     /// `ORDER BY <slot> DESC LIMIT n`: keep this partition's top-`n` groups by
     /// `V::sort_key(value, slot)`.
     TopK { slot: usize, limit: usize },
+    /// `ORDER BY <slot> DESC, <tiebreaks> LIMIT n`: emit every group that could
+    /// place in the top `n` by `<slot>` alone, and let the sort above apply the
+    /// tiebreaks. A per-partition heap cannot honour the tiebreaks (it would
+    /// keep arbitrary members of a tie at the boundary), but a group strictly
+    /// dominated on `<slot>` by `n` others can never survive the sort, so the
+    /// merge may still skip it.
+    TopKPrune { slot: usize, limit: usize },
     /// Plain `LIMIT n` with no ORDER BY: keep any `n` groups from this partition
     /// (SQL leaves which rows arbitrary, so the first `n` encountered suffice).
     First { limit: usize },
 }
 
 impl GroupLimit {
-    /// The most rows this limit can let through, regardless of form — used to size
-    /// the output builders.
-    pub(crate) fn row_limit(self) -> usize {
+    /// The most rows this limit lets through per worker, used to size the
+    /// output builders; `None` when it only prunes and emits every survivor.
+    pub(crate) fn row_limit(self) -> Option<usize> {
         match self {
-            GroupLimit::TopK { limit, .. } | GroupLimit::First { limit } => limit,
+            GroupLimit::TopK { limit, .. } | GroupLimit::First { limit } => Some(limit),
+            GroupLimit::TopKPrune { .. } => None,
         }
     }
 
@@ -172,7 +180,7 @@ impl GroupLimit {
     /// partial count in a hash range bounds any single group's final count.
     pub(crate) fn prunable_count_slot(self, value_slots: &[AggregationSlot]) -> Option<usize> {
         match self {
-            GroupLimit::TopK { slot, .. }
+            GroupLimit::TopK { slot, .. } | GroupLimit::TopKPrune { slot, .. }
                 if matches!(
                     value_slots[slot].kind,
                     AggregationKind::CountStar | AggregationKind::Count
@@ -1311,6 +1319,35 @@ mod tests {
         for heavy in [(0, 300), (1, 200), (2, 100)] {
             assert!(pairs.contains(&heavy), "missing {heavy:?} in {pairs:?}");
         }
+        assert!(
+            pairs
+                .iter()
+                .all(|&(k, c)| c == [300, 200, 100].get(k as usize).copied().unwrap_or(1)),
+            "every emitted count is exact: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn prune_only_limit_emits_every_group_that_could_place() {
+        // A prune-only limit keeps no heap: every group the merge lets
+        // through is emitted with its exact count, and the heavy groups are
+        // always among them.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+
+        let sender = run_group_full::<IntExtractor, CountValue>(
+            skewed_worker_batches(),
+            vec![0],
+            count_slots(),
+            Some(GroupLimit::TopKPrune { slot: 0, limit: 2 }),
+            radix,
+        );
+
+        let pairs = group_counts(&sender);
+        assert!(pairs.contains(&(0, 300)), "{pairs:?}");
+        assert!(pairs.contains(&(1, 200)), "{pairs:?}");
         assert!(
             pairs
                 .iter()

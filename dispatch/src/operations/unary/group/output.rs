@@ -87,10 +87,49 @@ fn offer_all<K, V, A>(
     }
 }
 
+/// The `k` largest sort keys this worker has emitted, kept only for their
+/// k-th value: a floor the merge prunes against when every surviving group
+/// is streamed rather than held in a heap.
+enum KthBestTracker<V: AggregationValue + ?Sized> {
+    Single(SingleTopK<V::SortKey, ()>),
+    Multi(MultiTopK<V::SortKey, ()>),
+}
+
+impl<V: AggregationValue + ?Sized> KthBestTracker<V> {
+    fn new(allocator: &mut SlabAllocator, limit: usize) -> Self {
+        if limit <= slots_per_slab::<V::SortKey, ()>() {
+            Self::Single(SlabTopK::single(allocator, limit))
+        } else {
+            Self::Multi(SlabTopK::multi(allocator, limit))
+        }
+    }
+
+    #[inline]
+    fn offer(&mut self, allocator: &mut SlabAllocator, sort_key: V::SortKey) {
+        match self {
+            Self::Single(heap) => heap.offer(allocator, sort_key, ()),
+            Self::Multi(heap) => heap.offer(allocator, sort_key, ()),
+        }
+    }
+
+    fn kth_key(&mut self) -> Option<V::SortKey> {
+        match self {
+            Self::Single(heap) => heap.kth_key(),
+            Self::Multi(heap) => heap.kth_key(),
+        }
+    }
+}
+
 /// Per-worker output pruning mode.
 enum OutputMode<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Keeps the worker's best rows for ORDER BY and LIMIT.
     TopK(TopKHeap<K, V>),
+    /// Streams every group the merge let through, tracking the k-th best
+    /// sort key so the merge can prune the rest.
+    PruneOnly {
+        slot: usize,
+        tracker: KthBestTracker<V>,
+    },
     /// Remaining row budget for an unordered LIMIT.
     First { remaining: usize },
     /// No pushdown: stream every group.
@@ -103,6 +142,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputMode<K, V> {
             Some(GroupLimit::TopK { slot, limit }) => {
                 Self::TopK(TopKHeap::new(allocator, slot, limit))
             }
+            Some(GroupLimit::TopKPrune { slot, limit }) => Self::PruneOnly {
+                slot,
+                tracker: KthBestTracker::new(allocator, limit),
+            },
             Some(GroupLimit::First { limit }) => Self::First { remaining: limit },
             None => Self::Unlimited,
         }
@@ -143,9 +186,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
         value_output_types: Arc<[DataType]>,
     ) -> Self {
         // A pushed LIMIT can reduce the required builder capacity.
-        let builder_capacity = output_limit.map_or(OUTPUT_CHUNK_ROWS, |limit| {
-            limit.row_limit().clamp(1, OUTPUT_CHUNK_ROWS)
-        });
+        let builder_capacity = output_limit
+            .and_then(GroupLimit::row_limit)
+            .map_or(OUTPUT_CHUNK_ROWS, |limit| limit.clamp(1, OUTPUT_CHUNK_ROWS));
         Self {
             key_builder: K::ColumnBuilder::with_capacity(allocator, builder_capacity, &key_config),
             value_builder: V::ColumnBuilder::with_capacity(
@@ -221,10 +264,27 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
                     );
                     return Ok(());
                 }
-                OutputMode::First { .. } | OutputMode::Unlimited => {}
+                OutputMode::PruneOnly { .. } | OutputMode::First { .. } | OutputMode::Unlimited => {}
             }
         }
         match &mut self.mode {
+            // Every group streams out; only its sort key is retained, for the
+            // k-th best the merge prunes against.
+            OutputMode::PruneOnly { .. } => {
+                // Taken out for the loop, since pushing rows borrows the
+                // whole accumulator, and put back afterwards.
+                let OutputMode::PruneOnly { slot, mut tracker } =
+                    std::mem::replace(&mut self.mode, OutputMode::Unlimited)
+                else {
+                    unreachable!("mode was just matched as prune-only")
+                };
+                for entry in table.iter(0) {
+                    tracker.offer(allocator, entry.stored.sort_key(slot));
+                    self.push_entry(entry.key, entry.stored);
+                    self.flush_if_full(allocator, sender)?;
+                }
+                self.mode = OutputMode::PruneOnly { slot, tracker };
+            }
             // Preserve the remaining budget for later partitions.
             OutputMode::First { remaining } => {
                 let mut remaining = *remaining;
@@ -343,6 +403,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
         let kth = match &mut self.mode {
             OutputMode::TopK(TopKHeap::Single { heap, .. }) => heap.kth_key()?,
             OutputMode::TopK(TopKHeap::Multi { heap, .. }) => heap.kth_key()?,
+            OutputMode::PruneOnly { tracker, .. } => tracker.kth_key()?,
             OutputMode::First { .. } | OutputMode::Unlimited => return None,
         };
         Some(count_weight(kth))

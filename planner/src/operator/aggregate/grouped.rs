@@ -286,6 +286,10 @@ pub(super) fn build_group_by_operator(
             slot: to_unique[slot],
             limit,
         }),
+        Some(GroupLimit::TopKPrune { slot, limit }) => Some(GroupLimit::TopKPrune {
+            slot: to_unique[slot],
+            limit,
+        }),
         other => other,
     };
 

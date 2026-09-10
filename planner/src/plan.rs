@@ -130,23 +130,24 @@ impl PlanNode {
     /// decodes, and fully sorts every group only to keep `k` — the dominant cost
     /// on such queries.
     ///
-    /// Only fires for a *single* order key (a DESC ref to an aggregate column,
-    /// traced through column-ref-only projections). A multi-key sort falls back to
-    /// the full `TopN`: a per-partition prune by the primary key alone can't honour
-    /// the secondary tiebreakers, so among groups tied on the primary key at the
-    /// limit boundary it would keep arbitrary ones and drop the rows the secondary
-    /// keys actually select, returning the wrong rows. A single key has no such hazard:
-    /// ties under one DESC key are order-ambiguous in SQL, so keeping any of the
-    /// tied boundary groups is a valid answer.
+    /// The per-partition heap only fires for a *single* order key (a DESC ref
+    /// to an aggregate column, traced through column-ref-only projections). A
+    /// heap cannot honour a multi-key sort's secondary tiebreakers: among
+    /// groups tied on the primary key at the limit boundary it would keep
+    /// arbitrary ones and drop the rows the secondary keys actually select. A
+    /// single key has no such hazard: ties under one DESC key are
+    /// order-ambiguous in SQL, so keeping any of the tied boundary groups is a
+    /// valid answer. A multi-key sort instead gets [`GroupLimit::TopKPrune`]:
+    /// every group that could place in the top `k` by the primary key is
+    /// emitted for the full `TopN` above, and only the groups strictly
+    /// dominated by `k` others, which no tiebreak can rescue, are skipped.
     pub(crate) fn annotate_group_topn(&mut self) {
         for child in &mut self.inputs {
             child.annotate_group_topn();
         }
 
-        let (mut col, limit) = match &self.operator {
-            // Single order key only (see the doc comment); multi-key sorts fall
-            // back to the full TopN above.
-            Operator::TopN(t) if t.order_bys.len() == 1 => {
+        let (mut col, limit, single_key) = match &self.operator {
+            Operator::TopN(t) if !t.order_bys.is_empty() => {
                 let ob = &t.order_bys[0];
                 match (&ob.direction, &ob.expression) {
                     // Keep `limit + offset` rows per partition: the downstream
@@ -154,7 +155,7 @@ impl PlanNode {
                     // to only `k` per partition would leave nothing past the
                     // offset (e.g. `LIMIT 10 OFFSET 1000`).
                     (OrderByDirection::Desc, Expression::Ref(r)) => {
-                        (r.column_idx, t.limit + t.offset)
+                        (r.column_idx, t.limit + t.offset, t.order_bys.len() == 1)
                     }
                     _ => return,
                 }
@@ -215,7 +216,11 @@ impl PlanNode {
                             _ => false,
                         };
                         if !unordered_sort_key {
-                            a.output_limit = Some(GroupLimit::TopK { slot, limit });
+                            a.output_limit = Some(if single_key {
+                                GroupLimit::TopK { slot, limit }
+                            } else {
+                                GroupLimit::TopKPrune { slot, limit }
+                            });
                         }
                     }
                     return;
