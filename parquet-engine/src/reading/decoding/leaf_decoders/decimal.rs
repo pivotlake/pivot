@@ -24,11 +24,13 @@ use arrow_array::types::{Decimal64Type, Decimal128Type, DecimalType};
 use arrow_array::{ArrayRef, ArrowPrimitiveType, RecordBatch, Scalar};
 use bytes::Bytes;
 
+use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::primitive::ElemPtr;
 use crate::reading::decoding::leaf_decoders::{
     DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, FromDelta,
     LeafDecoder, Result, TypedLeafDecoder,
 };
+use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::metadata::ColumnChunkMeta;
 use crate::types::page::DecompressedPage;
 use dispatch::arrays::PrimitiveBuilder;
@@ -236,11 +238,14 @@ impl<T: DecimalCarrier, S: DecimalStorage> DecodePlain for DecimalPlainDecoder<T
 pub struct DecimalDict<T: DecimalCarrier, S: DecimalStorage, B> {
     entries: B,
     len: usize,
-    _marker: PhantomData<(T, S)>,
+    _marker: PhantomData<fn() -> (T, S)>,
 }
 
-impl<T: DecimalCarrier, S: DecimalStorage, B: Index<usize, Output = T::Native>> Dict
-    for DecimalDict<T, S, B>
+impl<T, S, B> Dict for DecimalDict<T, S, B>
+where
+    T: DecimalCarrier,
+    S: DecimalStorage,
+    B: Index<usize, Output = T::Native> + Send + Sync + 'static,
 {
     type Builder = PrimitiveBuilder<T>;
     type Item = T::Native;
@@ -378,8 +383,25 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
         self.inner.available()
     }
 
-    fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
-        self.inner.insert_page(page, allocator);
+    fn insert_page(&mut self, page: DecompressedPage) {
+        self.inner.insert_page(page);
+    }
+
+    fn build_dictionary(
+        &self,
+        header: DictionaryPageHeader,
+        data: Vec<Bytes>,
+        allocator: &mut SlabAllocator,
+    ) -> BuiltDictionary {
+        self.inner.build_dictionary(header, data, allocator)
+    }
+
+    fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {
+        self.inner.adopt_dictionary(dictionary);
+    }
+
+    fn restart_at_page(&mut self, page_idx: usize) {
+        self.inner.restart_at_page(page_idx);
     }
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
@@ -394,10 +416,6 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
 
     fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
         self.inner.set_eq_constant(value);
-    }
-
-    fn dict_excludes_eq_constant(&self) -> bool {
-        self.inner.dict_excludes_eq_constant()
     }
 
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {

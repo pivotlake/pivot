@@ -179,6 +179,7 @@ impl Decompressor {
             column_idx: page.column_idx,
             data: payload,
             idx: page.page_idx,
+            first_row: page.first_row,
         })
     }
 }
@@ -287,6 +288,7 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
                 query_row_group_metadata: page.row_group,
                 column_idx: page.column_idx,
                 idx: page.page_idx,
+                first_row: page.first_row,
                 data: DecompressedPageType::SkippedData {
                     header: page.header.data_page_header.unwrap(),
                 },
@@ -329,6 +331,7 @@ mod tests {
             file_offset: 0,
             span: compressed.len(),
             page_idx: 0,
+            first_row: 0,
             header: PageHeader {
                 r#type: PageType::DATA_PAGE,
                 uncompressed_page_size: data.len() as i32,
@@ -393,6 +396,7 @@ mod tests {
             file_offset: 0,
             span: compressed.len(),
             page_idx: 0,
+            first_row: 0,
             header: PageHeader {
                 r#type: PageType::DICTIONARY_PAGE,
                 uncompressed_page_size: data.len() as i32,
@@ -862,6 +866,7 @@ mod tests {
             file_offset: 0,
             span: compressed.len(),
             page_idx: 0,
+            first_row: 0,
             header: PageHeader {
                 r#type: PageType::INDEX_PAGE,
                 uncompressed_page_size: 16,

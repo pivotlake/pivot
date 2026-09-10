@@ -1,27 +1,20 @@
 //! Decodes decompressed Parquet pages into Arrow [`RecordBatch`]es.
 //!
-//! The Decoder is the final stage of the Parquet pipeline, sitting after the Decompressor.
-//! It receives individual [`DecompressedPage`]s (data and dictionary) and groups them by
-//! row group. Each row group is managed by a [`RowGroupDecoder`] that accumulates pages
-//! across all projected columns until a full batch of rows is available.
-//!
-//! ## Batch production
-//!
-//! On every incoming page the Decoder first tries to produce a batch from the row group
-//! that just received the page (exploiting cache locality), then falls back to any other
-//! row group that has enough data. Exhausted row groups are removed immediately.
+//! The Decoder is the final stage of the Parquet pipeline. Its input is a
+//! stream of [`DecodeRange`] jobs: a row group's rows are cut into ranges by
+//! the [`RangeCutter`](super::range_cutter::RangeCutter) on the worker that
+//! claimed the row group, and each range is decoded by whichever worker
+//! takes it, from the pages the range carries. A worker following its own
+//! row group range after range decodes it as one stream; a worker that
+//! took a range from a peer skips into the range's first pages.
 
-use crate::DecompressedPage;
-use crate::types::metadata::QueryRowGroupMetadata;
-use crate::types::projection::Projection;
-use ahash::HashSet;
+use crate::reading::range_cutter::DecodeRange;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use dispatch::Sender;
 use dispatch::WorkStatus;
 use dispatch::memory::SlabAllocator;
 use dispatch::{Unary, UnaryFactory};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub(crate) mod leaf_decoders;
 
@@ -29,6 +22,7 @@ mod column_decoder;
 pub use column_decoder::Error as ColumnDecoderError;
 
 mod row_group_decoder;
+pub(crate) use row_group_decoder::DecodePlan;
 pub use row_group_decoder::RowGroupDecoder;
 
 /// A pushed-down equality predicate (`column == value`) used for dictionary
@@ -48,223 +42,150 @@ pub struct ScanEqualityPredicate {
     pub value: Scalar<ArrayRef>,
 }
 
+/// One worker's slab allocator, shared by the stages on that worker that
+/// allocate: the range cutter's dictionaries and the decoder's batches come
+/// out of one ring buffer instead of one each. Taken from the ring on first
+/// use, on the worker; the lock is never contended, the stages run one at a
+/// time.
+pub struct WorkerAllocator {
+    allocator: Mutex<Option<SlabAllocator>>,
+}
+
+impl WorkerAllocator {
+    pub fn new() -> Self {
+        Self {
+            allocator: Mutex::new(None),
+        }
+    }
+
+    pub fn with<R>(&self, f: impl FnOnce(&mut SlabAllocator) -> R) -> R {
+        let mut allocator = self.allocator.lock().unwrap();
+        f(allocator.get_or_insert_with(|| SlabAllocator::new(true)))
+    }
+}
+
+impl Default for WorkerAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Factory for creating [`Decoder`] instances, one per worker thread.
 pub struct DecoderFactory {
     /// Maximum number of rows per output [`RecordBatch`].
     pub batch_size: usize,
-    /// Which columns to decode.
-    pub projection: Projection,
     /// Whether to append row-group-id and row-index metadata columns to each
     /// output batch (used by the materializer path).
     pub add_row_group_metadata: bool,
-    /// Pushed-down equality predicates for dictionary pruning (may be empty).
-    pub eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
-    /// This worker's claimed-but-not-fully-decoded row-group count, shared
-    /// with its fetcher; decremented as row groups finish so the fetcher's
-    /// claim backpressure releases (see `RowGroupFetcher`).
-    pub pending_row_groups: Arc<AtomicUsize>,
-    /// The scan-wide equivalent, shared with the row-group injector; releases
-    /// the speculative-claim throttle of an unarmed Top-N scan.
-    pub outstanding_row_groups: Arc<AtomicUsize>,
+    /// The worker's allocator, shared with its range cutter.
+    pub allocator: Arc<WorkerAllocator>,
 }
 
-impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
+impl UnaryFactory<DecodeRange, RecordBatch> for DecoderFactory {
     type Unary = Decoder;
 
     fn build_unary(self) -> Self::Unary {
-        Decoder::new(
-            self.batch_size,
-            self.projection,
-            self.add_row_group_metadata,
-            self.eq_predicates,
-            self.pending_row_groups,
-            self.outstanding_row_groups,
-        )
+        Decoder::new(self.batch_size, self.add_row_group_metadata, self.allocator)
     }
 }
 
-/// Accumulates [`DecompressedPage`]s and emits Arrow [`RecordBatch`]es.
+/// Decodes [`DecodeRange`]s and emits Arrow [`RecordBatch`]es.
 ///
-/// Maintains one [`RowGroupDecoder`] per in-flight row group. Pages arriving for a
-/// row group that has already been fully emitted are silently dropped.
+/// Works one range at a time, and takes the next only once the current one
+/// is emitted, so the ranges it has not started stay in the channel for
+/// idle peers to take. A row group's decoder is kept between ranges: the
+/// next range of the same row group usually continues it, and it is dropped
+/// once every range of the row group is decoded, on any worker.
 ///
 /// There is no table-wide output schema here: each [`RowGroupDecoder`] derives
 /// its own from its file, because a variant column's physical layout (its
 /// shredded leaves) can differ file to file.
 pub struct Decoder {
     batch_size: usize,
-    projection: Projection,
-    /// Slab allocator for decoded Arrow buffers.
-    allocator: SlabAllocator,
-    /// One decoder per in-flight row group.
-    row_group_decoders: Vec<RowGroupDecoder>,
-    /// Row groups that have been fully emitted — late-arriving pages for these
-    /// are silently dropped.
-    closed_row_groups: HashSet<usize>,
+    /// Slab allocator for decoded Arrow buffers, the worker's own.
+    allocator: Arc<WorkerAllocator>,
+    /// The decoder of the range being decoded.
+    active: Option<RowGroupDecoder>,
+    /// Decoders that finished a range, kept for the row group's next range.
+    idle: Vec<RowGroupDecoder>,
     add_row_group_metadata: bool,
-    /// Pushed-down equality predicates for dictionary pruning (may be empty).
-    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
-    /// How many claimed row groups this worker has not fully decoded yet.
-    /// Shared with the worker's fetcher, which consults it as claim
-    /// backpressure; decremented once per row group as it completes
-    /// (exhausted or pruned).
-    pending_row_groups: Arc<AtomicUsize>,
-    /// The scan-wide count, shared with the row-group injector.
-    outstanding_row_groups: Arc<AtomicUsize>,
 }
 
 impl Decoder {
     pub fn new(
         batch_size: usize,
-        projection: Projection,
         add_row_group_metadata: bool,
-        eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
-        pending_row_groups: Arc<AtomicUsize>,
-        outstanding_row_groups: Arc<AtomicUsize>,
+        allocator: Arc<WorkerAllocator>,
     ) -> Self {
         Self {
             batch_size,
-            projection,
-            allocator: SlabAllocator::new(true),
-            row_group_decoders: Vec::new(),
-            closed_row_groups: Default::default(),
+            allocator,
+            active: None,
+            idle: Vec::new(),
             add_row_group_metadata,
-            eq_predicates,
-            pending_row_groups,
-            outstanding_row_groups,
         }
     }
 
-    /// Mark one claimed row group fully decoded (or pruned), releasing its
-    /// share of the fetcher's claim backpressure.
-    fn release_claim(&self) {
-        self.outstanding_row_groups.fetch_sub(1, Ordering::Relaxed);
-        let previous = self.pending_row_groups.fetch_sub(1, Ordering::Relaxed);
-        // An underflow means this decoder released a claim its own fetcher
-        // never made, i.e. the row group's decode landed on a different worker
-        // than its claimer. Besides breaking the accounting (the wrapped
-        // counter permanently stops the worker's claims), it would mean the
-        // claim/decode pairing contract broke.
-        debug_assert!(previous > 0, "released a row-group claim never made");
-    }
-
-    /// Returns the index into `row_group_decoders` for the given row group,
-    /// creating a new [`RowGroupDecoder`] if one doesn't already exist.
-    fn get_or_create_row_group_decoder_idx(
-        &mut self,
-        row_group_metadata: &QueryRowGroupMetadata,
-    ) -> dispatch::UnaryResult<usize> {
-        if let Some(pos) = self
-            .row_group_decoders
-            .iter()
-            .position(|r| r.row_group_idx() == row_group_metadata.index())
-        {
-            return Ok(pos);
-        }
-        self.row_group_decoders.push(
-            RowGroupDecoder::new(
-                row_group_metadata.clone(),
-                &self.projection,
-                self.batch_size,
-                self.add_row_group_metadata,
-                &self.eq_predicates,
-            )
-            .map_err(crate::op_err)?,
-        );
-        Ok(self.row_group_decoders.len() - 1)
-    }
-
-    /// Try to send out a single record batch if any row group decoder has available.
-    /// This will also, as a side effect, remove any row group decoders that are exhausted.
-    ///
-    /// # Returns
-    ///
-    /// Whether a record batch has been sent out
-    fn try_produce_batch(
+    /// Emits one batch of the active range, retiring the range once its
+    /// rows are all emitted. Returns whether a batch was sent.
+    fn produce_batch(
         &mut self,
         sender: &mut dyn Sender<RecordBatch>,
     ) -> dispatch::UnaryResult<bool> {
-        let mut exhausted_row_group = None;
-        let mut produced = false;
-
-        let allocator = &mut self.allocator;
-        for decoder in &mut self.row_group_decoders {
-            if let Some(batch) = decoder.try_read(allocator).map_err(crate::op_err)? {
-                sender.send(batch)?;
-                if decoder.exhausted() {
-                    exhausted_row_group = Some(decoder.row_group_idx());
-                }
-                produced = true;
-                break;
-            }
+        let Some(decoder) = self.active.as_mut() else {
+            return Ok(false);
+        };
+        let Some(batch) = self
+            .allocator
+            .with(|allocator| decoder.try_read(allocator))
+            .map_err(crate::op_err)?
+        else {
+            return Ok(false);
+        };
+        if decoder.exhausted() {
+            let mut decoder = self.active.take().unwrap();
+            decoder.finish_range().decoded();
+            self.idle.push(decoder);
+            // A row group whose ranges are all decoded gets no further range
+            // on any worker; its decoders go, and with them the pages they
+            // still hold.
+            self.idle.retain(|idle| !idle.row_group_done());
         }
-
-        if let Some(row_group_idx) = exhausted_row_group {
-            // Mark the removed row group closed, exactly like the consume path:
-            // a masked row group reaches its total while trailing all-false
-            // pages are still in flight, and a late page for an unclosed row
-            // group would resurrect a fresh decoder that waits forever for
-            // rows that were already emitted (and whose eventual removal would
-            // release the row group's claim a second time, wrapping the claim
-            // counters and wedging the scan).
-            self.closed_row_groups.insert(row_group_idx);
-            self.release_claim();
-            self.row_group_decoders
-                .retain(|d| d.row_group_idx() != row_group_idx);
-        }
-        Ok(produced)
+        sender.send(batch)?;
+        Ok(true)
     }
 }
 
-impl Unary<DecompressedPage, RecordBatch> for Decoder {
+impl Unary<DecodeRange, RecordBatch> for Decoder {
     fn consume(
         &mut self,
-        page: DecompressedPage,
+        range: DecodeRange,
         output: &mut dyn Sender<RecordBatch>,
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        if self
-            .closed_row_groups
-            .contains(&page.query_row_group_metadata.index())
+        assert!(self.active.is_none(), "a decoder takes one range at a time");
+        let row_group_index = range.metadata().row_group_index;
+        let mut decoder = match self
+            .idle
+            .iter()
+            .position(|idle| idle.row_group_index() == row_group_index)
         {
-            return Ok(());
-        }
-
-        let pos = self.get_or_create_row_group_decoder_idx(&page.query_row_group_metadata)?;
-        self.row_group_decoders[pos].insert_page(page, &mut self.allocator);
-
-        // A just-inserted dictionary page may have pruned the row group (its
-        // dictionary excludes a pushed-down equality constant). Drop it without
-        // emitting, and ignore its remaining in-flight data pages.
-        if self.row_group_decoders[pos].pruned() {
-            let row_group_idx = self.row_group_decoders[pos].row_group_idx();
-            self.closed_row_groups.insert(row_group_idx);
-            self.row_group_decoders.remove(pos);
-            self.release_claim();
-            return Ok(());
-        }
-
-        // Try sending from the decoder that just got a page; this page might be hot!
-        if let Some(b) = self.row_group_decoders[pos]
-            .try_read(&mut self.allocator)
-            .map_err(crate::op_err)?
-        {
-            if self.row_group_decoders[pos].exhausted() {
-                let row_group_idx = self.row_group_decoders[pos].row_group_idx();
-                self.closed_row_groups.insert(row_group_idx);
-                self.row_group_decoders.remove(pos);
-                self.release_claim();
-            }
-            output.send(b)?;
-            return Ok(());
-        }
-
-        self.try_produce_batch(output)?;
+            Some(pos) => self.idle.swap_remove(pos),
+            None => RowGroupDecoder::new(&range, self.batch_size, self.add_row_group_metadata)
+                .map_err(crate::op_err)?,
+        };
+        decoder.attach(range);
+        self.active = Some(decoder);
+        self.produce_batch(output)?;
         Ok(())
     }
 
+    fn ready_for_more_work(&mut self) -> bool {
+        self.active.is_none()
+    }
+
     fn run(&mut self, sender: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<WorkStatus> {
-        if self.try_produce_batch(sender)? {
+        if self.produce_batch(sender)? {
             Ok(WorkStatus::Ran)
         } else {
             Ok(WorkStatus::Pending)
@@ -272,28 +193,34 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
     }
 
     fn finish(&mut self, _output: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<bool> {
-        Ok(self.row_group_decoders.is_empty())
+        // No range arrives after this, so the decoders kept for a next range
+        // are done with.
+        self.idle.clear();
+        Ok(self.active.is_none())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::reading::decoding::{Decoder, ScanEqualityPredicate};
+pub(crate) mod tests {
+    use super::*;
+    use crate::reading::range_cutter::RangeCutter;
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
-    use crate::types::metadata::RowSelection;
-    use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata};
+    use crate::types::filter_mask::FilterMask;
+    use crate::types::metadata::{
+        ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata, RowSelection,
+    };
     use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
     use crate::types::projection::Projection;
     use crate::types::table::ParquetTable;
-    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, Scalar};
+    use arrow_array::{Array, Int32Array};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use bytes::Bytes;
     use dispatch::memory::init_test_free_pool;
-    use dispatch::test_utils::{CollectSender, run_unary, run_unary_to_completion};
-    use std::sync::Arc;
+    use dispatch::test_utils::CollectSender;
+    use std::sync::atomic::AtomicUsize;
 
-    fn make_test_table(schema: SchemaRef, num_rows: i64) -> Arc<ParquetTable> {
+    pub(crate) fn make_test_table(schema: SchemaRef, num_rows: i64) -> Arc<ParquetTable> {
         let num_cols = schema.fields().len();
         let file = dispatch::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap();
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
@@ -315,20 +242,21 @@ mod tests {
             statistics: Arc::default(),
             num_rows,
             file_row_group_idx: 0,
-            live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
         })]))
     }
 
-    fn encode_i32s(values: &[i32]) -> Vec<u8> {
+    pub(crate) fn encode_i32s(values: &[i32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
-    fn make_data_page(
+    pub(crate) fn make_data_page(
         metadata: QueryRowGroupMetadata,
         column_idx: usize,
         data: Vec<u8>,
         num_values: usize,
         page_idx: usize,
+        first_row: u32,
     ) -> DecompressedPage {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
@@ -336,6 +264,7 @@ mod tests {
             query_row_group_metadata: metadata,
             column_idx,
             idx: page_idx,
+            first_row,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -344,11 +273,12 @@ mod tests {
         }
     }
 
-    fn make_skipped_page(
+    pub(crate) fn make_skipped_page(
         metadata: QueryRowGroupMetadata,
         column_idx: usize,
         num_values: usize,
         page_idx: usize,
+        first_row: u32,
     ) -> DecompressedPage {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
@@ -356,19 +286,20 @@ mod tests {
             query_row_group_metadata: metadata,
             column_idx,
             idx: page_idx,
+            first_row,
             data: DecompressedPageType::SkippedData {
                 header: header.data_page_header.unwrap(),
             },
         }
     }
 
-    fn extract_i32s(batch: &RecordBatch, col: usize) -> Vec<i32> {
+    pub(crate) fn extract_i32s(batch: &RecordBatch, col: usize) -> Vec<i32> {
         let arr = batch.column(col);
         let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
         (0..a.len()).map(|i| a.value(i)).collect()
     }
 
-    fn i32_schema(names: &[&str]) -> SchemaRef {
+    pub(crate) fn i32_schema(names: &[&str]) -> SchemaRef {
         Arc::new(Schema::new(
             names
                 .iter()
@@ -377,37 +308,37 @@ mod tests {
         ))
     }
 
-    /// A table over `(s: Utf8View, v: Int32)` with `s` marked fully
-    /// dictionary encoded (or not), the shape the view-equality tests need.
-    fn string_and_i32_table(num_rows: i64, all_dictionary: bool) -> Arc<ParquetTable> {
+    /// A table over `(s: Utf8View, v: Int32)` with `s` dictionary encoded
+    /// and marked fully so (or not), the shape the view-equality tests need.
+    pub(crate) fn string_and_i32_table(num_rows: i64, all_dictionary: bool) -> Arc<ParquetTable> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("s", DataType::Utf8View, false),
             Field::new("v", DataType::Int32, false),
         ]));
         let file = dispatch::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap();
-        let column = |dict| ColumnChunkMeta {
+        let column = |dictionary: bool, all_dictionary: bool| ColumnChunkMeta {
             codec: crate::thrift::general::CompressionCodec::SNAPPY,
-            dictionary_page_offset: None,
+            dictionary_page_offset: dictionary.then_some(0),
             data_page_offset: 0,
             total_compressed_size: 0,
             total_uncompressed_size: 0,
             max_def_level: 0,
             physical_type: 0,
             fixed_len_byte_width: None,
-            data_pages_all_dictionary: dict,
+            data_pages_all_dictionary: all_dictionary,
         };
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
             open_file: dispatch::io::OpenFile::Local(file),
             schema,
-            columns: vec![column(all_dictionary), column(false)],
+            columns: vec![column(true, all_dictionary), column(false, false)],
             statistics: Arc::default(),
             num_rows,
             file_row_group_idx: 0,
-            live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
         })]))
     }
 
-    fn make_dict_page(
+    pub(crate) fn make_dict_page(
         metadata: QueryRowGroupMetadata,
         column_idx: usize,
         entries: &[&str],
@@ -423,6 +354,7 @@ mod tests {
             query_row_group_metadata: metadata,
             column_idx,
             idx: 0,
+            first_row: 0,
             data: DecompressedPageType::Dict {
                 header: header.dictionary_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -432,7 +364,7 @@ mod tests {
 
     /// An RLE-dictionary data page holding `keys` (bit width 8: one RLE run
     /// per key keeps the encoding trivial).
-    fn make_rle_data_page(
+    pub(crate) fn make_rle_data_page(
         metadata: QueryRowGroupMetadata,
         column_idx: usize,
         keys: &[u8],
@@ -449,6 +381,7 @@ mod tests {
             query_row_group_metadata: metadata,
             column_idx,
             idx: page_idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -457,7 +390,7 @@ mod tests {
         }
     }
 
-    fn string_eq_predicate(column_idx: usize, value: &str) -> ScanEqualityPredicate {
+    pub(crate) fn string_eq_predicate(column_idx: usize, value: &str) -> ScanEqualityPredicate {
         ScanEqualityPredicate {
             column_idx,
             path: Vec::new(),
@@ -467,39 +400,109 @@ mod tests {
         }
     }
 
-    fn new_decoder(table: &Arc<ParquetTable>, batch_size: usize) -> Decoder {
-        Decoder::new(
-            batch_size,
-            Projection::all_from_schema(table.schema()),
-            false,
-            Arc::new(Vec::new()),
-            // A standalone decoder has no fetcher making claims, so seed the
-            // counters high enough that releases never hit the underflow
-            // assertion.
-            Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
-            Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
-        )
-    }
-
-    fn decoder_with_eq(table: &Arc<ParquetTable>, predicate: ScanEqualityPredicate) -> Decoder {
-        Decoder::new(
-            1024,
-            Projection::all_from_schema(table.schema()),
-            false,
-            Arc::new(vec![predicate]),
-            // The claim-release counters; seeded like `new_decoder`'s.
-            Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
-            Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
-        )
-    }
-
-    fn extract_strings(batch: &RecordBatch, col: usize) -> Vec<String> {
+    pub(crate) fn extract_strings(batch: &RecordBatch, col: usize) -> Vec<String> {
         let a = batch
             .column(col)
             .as_any()
             .downcast_ref::<arrow_array::StringViewArray>()
             .unwrap();
         (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    }
+
+    /// Feeds `inputs` through `unary` the way a worker does: an input is
+    /// consumed only once the operator is ready for it, and the operator is
+    /// run and finished until it is done.
+    pub(crate) fn drive<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
+        let mut sender = CollectSender::new();
+        let mut test_io = dispatch::TestOperatorIO::default();
+        let mut io = test_io.io();
+        for item in inputs {
+            while !unary.ready_for_more_work() {
+                unary.run(&mut sender).unwrap();
+            }
+            unary.consume(item, &mut sender, &mut io).unwrap();
+        }
+        loop {
+            unary.run(&mut sender).unwrap();
+            if unary.finish(&mut sender).unwrap() {
+                break;
+            }
+        }
+        sender.items
+    }
+
+    /// Feeds `inputs` to `unary` without running or finishing it, so more
+    /// can follow.
+    pub(crate) fn consume_all<I, O, U: Unary<I, O>>(unary: &mut U, inputs: Vec<I>) -> Vec<O> {
+        let mut sender = CollectSender::new();
+        let mut test_io = dispatch::TestOperatorIO::default();
+        let mut io = test_io.io();
+        for item in inputs {
+            unary.consume(item, &mut sender, &mut io).unwrap();
+        }
+        sender.items
+    }
+
+    /// A cutter for `table` with no fetcher behind it: the claim counters
+    /// are seeded high enough that releases never hit the underflow
+    /// assertion.
+    pub(crate) fn new_cutter(
+        table: &Arc<ParquetTable>,
+        eq_predicates: Vec<ScanEqualityPredicate>,
+    ) -> RangeCutter {
+        RangeCutter::new(
+            Projection::all_from_schema(table.schema()),
+            Arc::new(eq_predicates),
+            Arc::new(AtomicUsize::new(usize::MAX / 2)),
+            Arc::new(AtomicUsize::new(usize::MAX / 2)),
+            Arc::new(WorkerAllocator::new()),
+        )
+    }
+
+    pub(crate) fn new_decoder(batch_size: usize) -> Decoder {
+        Decoder::new(batch_size, false, Arc::new(WorkerAllocator::new()))
+    }
+
+    /// Cuts `pages` into ranges.
+    pub(crate) fn cut(table: &Arc<ParquetTable>, pages: Vec<DecompressedPage>) -> Vec<DecodeRange> {
+        drive(new_cutter(table, Vec::new()), pages)
+    }
+
+    /// Cuts `pages` into ranges and decodes them on one worker.
+    fn decode(
+        table: &Arc<ParquetTable>,
+        pages: Vec<DecompressedPage>,
+        batch_size: usize,
+        eq_predicates: Vec<ScanEqualityPredicate>,
+    ) -> Vec<RecordBatch> {
+        let ranges = drive(new_cutter(table, eq_predicates), pages);
+        drive(new_decoder(batch_size), ranges)
+    }
+
+    /// The rows of a row group as `i32`s equal to their row number, in
+    /// pages of `page_rows`.
+    pub(crate) fn row_number_pages(
+        metadata: &QueryRowGroupMetadata,
+        rows: u32,
+        page_rows: u32,
+    ) -> Vec<DecompressedPage> {
+        (0..rows)
+            .step_by(page_rows as usize)
+            .enumerate()
+            .map(|(idx, first_row)| {
+                let values: Vec<i32> = (first_row..(first_row + page_rows).min(rows))
+                    .map(|row| row as i32)
+                    .collect();
+                make_data_page(
+                    metadata.clone(),
+                    0,
+                    encode_i32s(&values),
+                    values.len(),
+                    idx,
+                    first_row,
+                )
+            })
+            .collect()
     }
 
     /// A pushed string equality filters emitted batches down to matching rows
@@ -511,10 +514,14 @@ mod tests {
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "DELIVER IN PERSON", "SHIP"]);
         let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2, 1, 0], 0);
-        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3, 4, 5]), 5, 0);
-        let decoder = decoder_with_eq(&table, string_eq_predicate(0, "DELIVER IN PERSON"));
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3, 4, 5]), 5, 0, 0);
 
-        let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
+        let out = decode(
+            &table,
+            vec![dict, strings, values],
+            1024,
+            vec![string_eq_predicate(0, "DELIVER IN PERSON")],
+        );
 
         let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
         assert_eq!(rows, vec![2, 4]);
@@ -532,10 +539,14 @@ mod tests {
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let dict = make_dict_page(metadata.clone(), 0, &["AIR", "AIR", "RAIL"]);
         let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2], 0);
-        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0);
-        let decoder = decoder_with_eq(&table, string_eq_predicate(0, "AIR"));
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0, 0);
 
-        let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
+        let out = decode(
+            &table,
+            vec![dict, strings, values],
+            1024,
+            vec![string_eq_predicate(0, "AIR")],
+        );
 
         let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
         assert_eq!(rows, vec![1, 2, 3]);
@@ -550,57 +561,72 @@ mod tests {
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "SHIP"]);
         let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 0], 0);
-        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0);
-        let decoder = decoder_with_eq(&table, string_eq_predicate(0, "MAIL"));
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0, 0);
 
-        let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
+        let out = decode(
+            &table,
+            vec![dict, strings, values],
+            1024,
+            vec![string_eq_predicate(0, "MAIL")],
+        );
 
         let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
         assert_eq!(rows, vec![1, 2, 3]);
     }
 
-    /// Single Int32 column, one page → one RecordBatch with correct values.
+    /// The decoder reads dictionary-encoded pages through the dictionary
+    /// the cutter built from the dictionary page.
     #[test]
-    fn test_single_column_single_page() {
+    fn the_decoder_reads_through_the_dictionary_the_cutter_built() {
         init_test_free_pool(4);
-        let schema = i32_schema(&["a"]);
-        let table = make_test_table(schema, 5);
+        let table = string_and_i32_table(3, true);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
-        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0);
+        let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "SHIP"]);
+        let strings = make_rle_data_page(metadata.clone(), 0, &[1, 0, 1], 0);
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0, 0);
 
-        let out = run_unary(new_decoder(&table, 1024), vec![page]);
+        let out = decode(&table, vec![dict, strings, values], 1024, Vec::new());
+
+        let kept: Vec<String> = out.iter().flat_map(|b| extract_strings(b, 0)).collect();
+        assert_eq!(kept, vec!["SHIP", "MAIL", "SHIP"]);
+    }
+
+    #[test]
+    fn a_single_page_decodes_to_one_batch() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 5);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0, 0);
+
+        let out = decode(&table, vec![page], 1024, Vec::new());
 
         assert_eq!(out.len(), 1);
         assert_eq!(extract_i32s(&out[0], 0), vec![10, 20, 30, 40, 50]);
     }
 
-    /// Two Int32 columns — batch produced only after both columns have data.
     #[test]
-    fn test_two_columns_batch_on_completion() {
+    fn a_batch_holds_every_column() {
         init_test_free_pool(4);
-        let schema = i32_schema(&["a", "b"]);
-        let table = make_test_table(schema, 3);
+        let table = make_test_table(i32_schema(&["a", "b"]), 3);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
-        let page_a = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0);
-        let page_b = make_data_page(metadata, 1, encode_i32s(&[40, 50, 60]), 3, 0);
+        let page_a = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0, 0);
+        let page_b = make_data_page(metadata, 1, encode_i32s(&[40, 50, 60]), 3, 0, 0);
 
-        let out = run_unary(new_decoder(&table, 1024), vec![page_a, page_b]);
+        let out = decode(&table, vec![page_a, page_b], 1024, Vec::new());
 
         assert_eq!(out.len(), 1);
         assert_eq!(extract_i32s(&out[0], 0), vec![10, 20, 30]);
         assert_eq!(extract_i32s(&out[0], 1), vec![40, 50, 60]);
     }
 
-    /// batch_size smaller than available rows → multiple batches produced via finish().
     #[test]
-    fn test_batch_size_splits_output() {
+    fn the_batch_size_splits_the_output() {
         init_test_free_pool(4);
-        let schema = i32_schema(&["a"]);
-        let table = make_test_table(schema, 5);
+        let table = make_test_table(i32_schema(&["a"]), 5);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
-        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0);
+        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0, 0);
 
-        let out = run_unary_to_completion(new_decoder(&table, 2), vec![page]);
+        let out = decode(&table, vec![page], 2, Vec::new());
 
         assert_eq!(out.len(), 3);
         assert_eq!(extract_i32s(&out[0], 0), vec![10, 20]);
@@ -608,64 +634,46 @@ mod tests {
         assert_eq!(extract_i32s(&out[2], 0), vec![50]);
     }
 
-    /// Two data pages for a single column — values from both pages concatenated.
     #[test]
-    fn test_multiple_pages_single_column() {
+    fn the_pages_of_a_column_decode_in_order() {
         init_test_free_pool(4);
-        let schema = i32_schema(&["a"]);
-        let table = make_test_table(schema, 5);
+        let table = make_test_table(i32_schema(&["a"]), 5);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
-        let page0 = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0);
-        let page1 = make_data_page(metadata, 0, encode_i32s(&[40, 50]), 2, 1);
+        let page1 = make_data_page(metadata.clone(), 0, encode_i32s(&[40, 50]), 2, 1, 3);
+        let page0 = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30]), 3, 0, 0);
 
-        let out = run_unary_to_completion(new_decoder(&table, 1024), vec![page0, page1]);
+        let out = decode(&table, vec![page1, page0], 1024, Vec::new());
 
-        // Each page is eagerly emitted as a separate batch during consume.
-        assert_eq!(out.len(), 2);
-        assert_eq!(extract_i32s(&out[0], 0), vec![10, 20, 30]);
-        assert_eq!(extract_i32s(&out[1], 0), vec![40, 50]);
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 0)).collect();
+        assert_eq!(rows, vec![10, 20, 30, 40, 50]);
     }
 
-    /// Pages from an already-exhausted row group are silently dropped.
     #[test]
-    fn test_pages_from_exhausted_row_group_dropped() {
+    fn an_index_selection_emits_only_its_rows() {
         init_test_free_pool(4);
-        let schema = i32_schema(&["a"]);
-        let table = make_test_table(schema, 3);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
-        let page = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0);
-        let late_page = make_data_page(metadata, 0, encode_i32s(&[99]), 1, 1);
+        let table = make_test_table(i32_schema(&["a"]), 5);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::Indices(vec![3, 4]));
+        let skipped = make_skipped_page(metadata.clone(), 0, 3, 0, 0);
+        let mut kept = make_data_page(metadata.clone(), 0, encode_i32s(&[40, 50]), 2, 1, 3);
+        if let DecompressedPageType::Data(data) = &mut kept.data {
+            data.filter_mask = Some(FilterMask::new(3, 5, &[3, 4]));
+        }
 
-        let out = run_unary(new_decoder(&table, 1024), vec![page, late_page]);
+        let out = decode(&table, vec![skipped, kept], 1024, Vec::new());
 
-        assert_eq!(out.len(), 1);
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 0)).collect();
+        assert_eq!(rows, vec![40, 50]);
     }
 
-    /// SkippedData page (all-false filter mask) produces no output.
     #[test]
-    fn test_skipped_data_page() {
+    fn the_output_schema_follows_the_projection() {
         init_test_free_pool(4);
-        let schema = i32_schema(&["a"]);
-        let table = make_test_table(schema, 3);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::Indices(vec![]));
-        let page = make_skipped_page(metadata, 0, 3, 0);
-
-        let out = run_unary(new_decoder(&table, 1024), vec![page]);
-
-        assert_eq!(out.len(), 0);
-    }
-
-    /// Output schema has correct field names and types.
-    #[test]
-    fn test_output_schema() {
-        init_test_free_pool(4);
-        let schema = i32_schema(&["x", "y"]);
-        let table = make_test_table(schema, 2);
+        let table = make_test_table(i32_schema(&["x", "y"]), 2);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
-        let page_x = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20]), 2, 0);
-        let page_y = make_data_page(metadata, 1, encode_i32s(&[30, 40]), 2, 0);
+        let page_x = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20]), 2, 0, 0);
+        let page_y = make_data_page(metadata, 1, encode_i32s(&[30, 40]), 2, 0, 0);
 
-        let out = run_unary(new_decoder(&table, 1024), vec![page_x, page_y]);
+        let out = decode(&table, vec![page_x, page_y], 1024, Vec::new());
 
         assert_eq!(out[0].schema().fields().len(), 2);
         assert_eq!(out[0].schema().field(0).name(), "x");
@@ -673,56 +681,30 @@ mod tests {
         assert_eq!(*out[0].schema().field(0).data_type(), DataType::Int32);
     }
 
-    /// A masked row group reaches its total while a trailing all-false page is
-    /// still in flight, and the exhaustion is detected on the drain path (not
-    /// while consuming the row group's own page). The late skipped page must be
-    /// dropped, not resurrect a fresh decoder that waits forever.
+    /// The ranges of one row group decoded on two workers: the second worker
+    /// takes the middle range, which starts inside a page, and the first
+    /// worker goes on past the hole it left.
     #[test]
-    fn test_late_skipped_page_after_drain_exhaustion_is_dropped() {
+    fn a_range_taken_by_another_worker_decodes_its_rows_from_inside_a_page() {
         init_test_free_pool(4);
-        let schema = i32_schema(&["a"]);
-        let table = make_test_table(schema, 5);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::Indices(vec![0, 1, 2]));
-        let mut decoder = new_decoder(&table, 2);
-        let mut sink = CollectSender::<RecordBatch>::default();
-
-        // The first page holds every kept row; consuming it emits one bounded
-        // batch (2 of 3) and leaves the decoder one row short of its total.
-        let kept = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0);
-        dispatch::Unary::consume(
-            &mut decoder,
-            kept,
-            &mut sink,
-            &mut dispatch::TestOperatorIO::default().io(),
-        )
-        .unwrap();
-        // The drain pass emits the last row, exhausting the row group while
-        // its trailing skipped page has not arrived yet.
-        dispatch::Unary::run(&mut decoder, &mut sink).unwrap();
-        let late_skipped = make_skipped_page(metadata, 0, 2, 1);
-        dispatch::Unary::consume(
-            &mut decoder,
-            late_skipped,
-            &mut sink,
-            &mut dispatch::TestOperatorIO::default().io(),
-        )
-        .unwrap();
-
-        assert_eq!(sink.items.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
-        assert!(dispatch::Unary::finish(&mut decoder, &mut sink).unwrap());
-    }
-
-    /// finish() drains remaining batches when batch_size < total rows.
-    #[test]
-    fn test_finish_drains_remaining() {
-        init_test_free_pool(4);
-        let schema = i32_schema(&["a"]);
-        let table = make_test_table(schema, 3);
+        let table = make_test_table(i32_schema(&["a"]), 40_000);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
-        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30]), 3, 0);
+        let mut ranges = cut(&table, row_number_pages(&metadata, 40_000, 20_000));
+        let middle = ranges.remove(1);
 
-        let out = run_unary_to_completion(new_decoder(&table, 2), vec![page]);
+        let first_worker = drive(new_decoder(8192), ranges);
+        let second_worker = drive(new_decoder(8192), vec![middle]);
 
-        assert_eq!(out.len(), 2);
+        let first: Vec<i32> = first_worker
+            .iter()
+            .flat_map(|b| extract_i32s(b, 0))
+            .collect();
+        let second: Vec<i32> = second_worker
+            .iter()
+            .flat_map(|b| extract_i32s(b, 0))
+            .collect();
+        let expected_first: Vec<i32> = (0..16_384).chain(32_768..40_000).collect();
+        assert_eq!(first, expected_first);
+        assert_eq!(second, (16_384..32_768).collect::<Vec<i32>>());
     }
 }

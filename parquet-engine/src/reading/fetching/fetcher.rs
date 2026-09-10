@@ -25,16 +25,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// depth.
 const MAX_DISK_IN_FLIGHT: usize = 1;
 
-/// Row groups a worker may hold "claimed but not yet fully decoded" before it
-/// stops claiming more, when the table's files are local: the one it is
-/// decoding plus one prefetched next, the minimum that keeps its pipeline
-/// overlapped. A row group's page decode runs only on the worker that claimed
-/// it (the decoder holds per-row-group state), so every claim beyond this
-/// bound serializes decode work on one worker while others may sit idle. That
-/// matters most when a scan has few row groups per worker: its wall time is
-/// `max claims per worker x per-row-group cost`, and a single worker hoarding
-/// a third row group while the queue runs dry sets the whole query's critical
-/// path.
+/// Row groups a worker may hold "claimed but not yet cut into decode ranges"
+/// before it stops claiming more, when the table's files are local: the one
+/// whose pages are arriving plus one prefetched next, the minimum that keeps
+/// its pipeline overlapped. A row group's pages are collected only on the
+/// worker that claimed it (the range cutter holds per-row-group state), so
+/// every claim beyond this bound queues more pages behind one worker while
+/// others may sit idle. That matters most when a scan has few row groups per
+/// worker, where a single worker hoarding a third row group while the queue
+/// runs dry sets the whole query's critical path.
 const MAX_PENDING_LOCAL_ROW_GROUPS: usize = 2;
 
 /// The remote-file counterpart of [`MAX_PENDING_LOCAL_ROW_GROUPS`]. A remote
@@ -61,9 +60,10 @@ pub fn pending_claim_bound(table: &crate::ParquetTable) -> usize {
 
 pub struct RowGroupFetcher {
     in_flight: HashMap<ReadRequestId, RowGroupRequest>,
-    /// How many row groups this worker has claimed but not fully decoded.
-    /// Incremented here per claim, decremented by the worker's `Decoder` when
-    /// a row group finishes (or prunes), and consulted as claim backpressure.
+    /// How many row groups this worker has claimed but not yet cut into
+    /// decode ranges. Incremented here per claim, decremented by the worker's
+    /// range cutter when a row group is cut (or pruned), and consulted as
+    /// claim backpressure.
     pending_row_groups: Arc<AtomicUsize>,
     /// The claim bound for this scan (see [`pending_claim_bound`]).
     max_pending_row_groups: usize,

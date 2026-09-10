@@ -11,11 +11,13 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
 use arrow_array::{BooleanArray, Int32Array, RunArray};
 use std::cmp::min;
+use std::ops::Range;
 
 /// A run-length encoded boolean mask over the rows of a single page.
 ///
 /// Each run is either `true` (keep / decode these rows) or `false` (skip).
 /// Internally backed by an Arrow [`RunArray<Int32Type>`] whose values are booleans.
+#[derive(Clone)]
 pub struct FilterMask {
     total_rows: usize,
     filters: RunArray<Int32Type>,
@@ -69,6 +71,37 @@ impl FilterMask {
 
         Self {
             total_rows: relevant.len(),
+            filters: RunArray::try_new(&Int32Array::from(run_ends), &BooleanArray::from(values))
+                .unwrap(),
+        }
+    }
+
+    /// Build a mask for the page spanning `[start_index, end_index)` that keeps
+    /// the rows inside `row_range` (row group row indices): at most one kept
+    /// run, between a skipped head and a skipped tail.
+    pub fn for_row_range(start_index: u32, end_index: u32, row_range: &Range<u32>) -> Self {
+        let len = end_index - start_index;
+        let kept_start = row_range.start.max(start_index);
+        let kept_end = row_range.end.min(end_index);
+        let mut run_ends: Vec<i32> = Vec::with_capacity(3);
+        let mut values = Vec::with_capacity(3);
+        if kept_start >= kept_end {
+            run_ends.push(len as i32);
+            values.push(false);
+        } else {
+            if kept_start > start_index {
+                run_ends.push((kept_start - start_index) as i32);
+                values.push(false);
+            }
+            run_ends.push((kept_end - start_index) as i32);
+            values.push(true);
+            if kept_end < end_index {
+                run_ends.push(len as i32);
+                values.push(false);
+            }
+        }
+        Self {
+            total_rows: kept_end.saturating_sub(kept_start) as usize,
             filters: RunArray::try_new(&Int32Array::from(run_ends), &BooleanArray::from(values))
                 .unwrap(),
         }
@@ -199,6 +232,50 @@ mod tests {
         let mask = FilterMask::new(10, 15, &[3, 7, 12, 20]);
 
         assert_eq!(mask.rows(), 1);
+    }
+
+    // ── FilterMask::for_row_range ──
+
+    /// A range strictly inside the page keeps one run between two skipped runs.
+    #[test]
+    fn row_range_inside_page_keeps_the_middle() {
+        let mask = FilterMask::for_row_range(100, 110, &(103..107));
+
+        assert_eq!(mask.rows(), 4);
+        assert_eq!(mask.get_run_type_and_run_end(0), (false, 3));
+        assert_eq!(mask.get_run_type_and_run_end(1), (true, 7));
+        assert_eq!(mask.get_run_type_and_run_end(2), (false, 10));
+    }
+
+    /// A range covering the whole page keeps everything in a single run.
+    #[test]
+    fn row_range_covering_page_keeps_all() {
+        let mask = FilterMask::for_row_range(100, 110, &(50..200));
+
+        assert_eq!(mask.rows(), 10);
+        assert_eq!(mask.get_run_type_and_run_end(0), (true, 10));
+    }
+
+    /// A range that ends before the page or starts after it keeps nothing.
+    #[test]
+    fn row_range_outside_page_keeps_nothing() {
+        let before = FilterMask::for_row_range(100, 110, &(0..100));
+        let after = FilterMask::for_row_range(100, 110, &(110..300));
+
+        assert!(before.all_false());
+        assert_eq!(before.rows(), 0);
+        assert!(after.all_false());
+        assert_eq!(after.rows(), 0);
+    }
+
+    /// A range starting inside the page and running past it skips only the head.
+    #[test]
+    fn row_range_past_page_end_skips_only_the_head() {
+        let mask = FilterMask::for_row_range(100, 110, &(108..500));
+
+        assert_eq!(mask.rows(), 2);
+        assert_eq!(mask.get_run_type_and_run_end(0), (false, 8));
+        assert_eq!(mask.get_run_type_and_run_end(1), (true, 10));
     }
 
     // ── FilterMask::get_run_type_and_run_end ──
