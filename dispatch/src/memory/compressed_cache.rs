@@ -185,28 +185,97 @@ impl CacheLookup {
 pub struct MissingExtent {
     /// The extent to read: which file blocks map to which slot blocks.
     extent: Extent,
-    /// Whether this lookup inserted the extent and therefore owns its fill.
-    /// An invalid extent found in the map is already being filled elsewhere.
-    fill_owner: bool,
+    /// The fill this lookup is responsible for, when it inserted the extent.
+    /// `None` for a follower: an invalid extent found in the map is already
+    /// being filled elsewhere.
+    ownership: Option<Arc<FillOwnership>>,
     /// Keeps the destination slot pinned for the read's whole lifetime.
     _pin: Arc<ReadBuffer>,
+}
+
+/// The fill an owning lookup answers for. Registering the extent published it
+/// to every other reader of the range as "a fill is in flight", and they
+/// subscribe and wait for it to commit or fail. A fill can be abandoned with
+/// no code of the owner's running: the read that would have issued it unwinds
+/// after a panic on the way to the ring, or is dropped from a backlog with the
+/// dataflow that queued it. So the ownership itself settles the extent when
+/// dropped: unless a commit or an explicit removal settled it first, it
+/// publishes failure, removes the extent so a later reader starts a fill of
+/// its own, and wakes the followers, who then fail the way they do for a fill
+/// whose read failed.
+struct FillOwnership {
+    open_file: OpenFile,
+    extent: Extent,
+    settled: AtomicBool,
+}
+
+impl FillOwnership {
+    /// Give the fill up: publish failure, take the extent out of the map so a
+    /// later reader starts a fill of its own, and wake the followers.
+    fn remove_from_cache(&self) {
+        self.settled.store(true, Ordering::Release);
+        memory_ctx()
+            .compressed_cache()
+            .remove_extent(&self.open_file, &self.extent);
+        self.extent.wake_subscribers();
+    }
+}
+
+impl Drop for FillOwnership {
+    fn drop(&mut self) {
+        if self.settled.load(Ordering::Acquire) || !crate::memory::has_memory_context() {
+            return;
+        }
+        self.remove_from_cache();
+    }
+}
+
+impl Extent {
+    /// Wake every worker that subscribed to this extent's outcome.
+    fn wake_subscribers(&self) {
+        loop {
+            match self.subscribing_workers.steal() {
+                Steal::Success(worker_id) => crate::waker::waker_set().notify_worker(worker_id),
+                Steal::Retry => continue,
+                Steal::Empty => return,
+            }
+        }
+    }
 }
 
 impl MissingExtent {
     /// The missing `extent`, backed by the slot `pin` holds; `extent.slot_idx` is `pin`'s
     /// slot, and `pin`'s base address gives [`dest`](Self::dest).
-    fn new(extent: Extent, pin: Arc<ReadBuffer>, fill_owner: bool) -> Self {
+    fn new(extent: Extent, pin: Arc<ReadBuffer>, ownership: Option<Arc<FillOwnership>>) -> Self {
         MissingExtent {
             extent,
-            fill_owner,
+            ownership,
             _pin: pin,
         }
+    }
+
+    /// The extent `open_file`'s lookup just inserted, owned by that lookup.
+    fn owned(extent: Extent, pin: Arc<ReadBuffer>, open_file: &OpenFile) -> Self {
+        let ownership = FillOwnership {
+            open_file: open_file.clone(),
+            extent: extent.clone(),
+            settled: AtomicBool::new(false),
+        };
+        Self::new(extent, pin, Some(Arc::new(ownership)))
     }
 
     /// Whether this lookup is responsible for filling the extent. A non-owner
     /// follows the request that inserted the extent instead of issuing another.
     pub(crate) fn fill_owner(&self) -> bool {
-        self.fill_owner
+        self.ownership.is_some()
+    }
+
+    /// Note that the fill reached an outcome the followers can see, so dropping
+    /// the ownership has nothing left to publish.
+    fn settle(&self) {
+        if let Some(ownership) = &self.ownership {
+            ownership.settled.store(true, Ordering::Release);
+        }
     }
 
     /// Register a worker to be woken when the owning fill finishes.
@@ -270,7 +339,7 @@ impl MissingExtent {
                 failed: self.extent.failed.clone(),
                 subscribing_workers: self.extent.subscribing_workers.clone(),
             },
-            fill_owner: self.fill_owner,
+            ownership: self.ownership.clone(),
             _pin: self._pin.clone(),
         }
     }
@@ -302,6 +371,7 @@ impl MissingExtent {
             .slot_metadata(self.extent.slot_idx as usize)
             .valid
             .set(self.extent.first_slot_block as usize, blocks);
+        self.settle();
     }
 
     /// Whether a contiguous `bytes`-byte prefix reaches the extent's final 4 KB
@@ -319,20 +389,22 @@ impl MissingExtent {
     /// Mark this fill failed, remove its extent, and wake its followers. A later
     /// lookup can then allocate a fresh extent and issue a new request.
     pub(crate) fn remove_from_cache(&self, open_file: &OpenFile) {
-        memory_ctx()
-            .compressed_cache()
-            .remove_extent(open_file, self);
-        self.wake_subscribers();
+        match &self.ownership {
+            Some(ownership) => {
+                debug_assert_eq!(&ownership.open_file, open_file);
+                ownership.remove_from_cache();
+            }
+            None => {
+                memory_ctx()
+                    .compressed_cache()
+                    .remove_extent(open_file, &self.extent);
+                self.extent.wake_subscribers();
+            }
+        }
     }
 
     pub(crate) fn wake_subscribers(&self) {
-        loop {
-            match self.extent.subscribing_workers.steal() {
-                Steal::Success(worker_id) => crate::waker::waker_set().notify_worker(worker_id),
-                Steal::Retry => continue,
-                Steal::Empty => return,
-            }
-        }
+        self.extent.wake_subscribers();
     }
 }
 
@@ -481,25 +553,34 @@ impl CompressedCache {
         lookups
     }
 
-    fn remove_extent(&self, open_file: &OpenFile, missing: &MissingExtent) {
-        let file_maps = self.file_maps.read().unwrap();
+    /// Mark `missing` failed and take it out of `open_file`'s map. Runs from an
+    /// unwinding owner's drop as well, so a lock another thread poisoned is
+    /// used anyway: the map is only ever read and written under it here, and
+    /// leaving the extent published would be the worse outcome.
+    fn remove_extent(&self, open_file: &OpenFile, missing: &Extent) {
+        let file_maps = self
+            .file_maps
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(extents_lock) = file_maps.get(open_file) else {
-            missing.extent.failed.store(true, Ordering::Release);
+            missing.failed.store(true, Ordering::Release);
             return;
         };
-        let mut extents = extents_lock.write().unwrap();
+        let mut extents = extents_lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Publish failure while holding the map write lock that excludes a new
         // lookup from discovering this extent. New readers can allocate a fresh
         // fill after removal; existing followers retain this shared flag.
-        missing.extent.failed.store(true, Ordering::Release);
+        missing.failed.store(true, Ordering::Release);
         let key = extents
-            .range(..=missing.extent.first_file_block)
+            .range(..=missing.first_file_block)
             .next_back()
             .filter(|(_, extent)| {
-                extent.last_file_block() >= missing.extent.first_file_block
-                    && extent.slot_idx == missing.extent.slot_idx
-                    && extent.slot_block_of(missing.extent.first_file_block)
-                        == missing.extent.first_slot_block as usize
+                extent.last_file_block() >= missing.first_file_block
+                    && extent.slot_idx == missing.slot_idx
+                    && extent.slot_block_of(missing.first_file_block)
+                        == missing.first_slot_block as usize
             })
             .map(|(&key, _)| key);
         if let Some(key) = key {
@@ -558,7 +639,7 @@ impl CompressedCache {
             subscribing_workers: found_extent.subscribing_workers.clone(),
         };
         let data = extent.clipped_bytes(&pin, start_offset, end_offset);
-        let missing = (!is_valid).then(|| MissingExtent::new(extent.clone(), pin, false));
+        let missing = (!is_valid).then(|| MissingExtent::new(extent.clone(), pin, None));
         Some(CacheLookupStep {
             lookup: CacheLookup { data, missing },
             next_file_block: file_block + extent.block_count as usize,
@@ -604,7 +685,7 @@ impl CompressedCache {
         Some(CacheLookupStep {
             lookup: CacheLookup {
                 data,
-                missing: Some(MissingExtent::new(extent.clone(), pin, true)),
+                missing: Some(MissingExtent::owned(extent.clone(), pin, open_file)),
             },
             next_file_block: file_block + extent.block_count as usize,
         })
@@ -1069,6 +1150,47 @@ mod tests {
         std::iter::from_fn(|| memory_ctx().pop_free_idx(true))
             .map(|idx| memory_ctx().ring().try_write(idx).unwrap())
             .collect()
+    }
+
+    /// An owning lookup dropped before it commits (a read that unwound or was
+    /// dropped with its dataflow before it was issued) fails its followers and
+    /// frees the range for a fresh fill, instead of leaving them waiting on a
+    /// fill nobody will make.
+    #[test]
+    fn an_abandoned_fill_fails_its_followers_and_frees_the_range() {
+        init_test_free_pool(8);
+        let file = new_file();
+        let owner = cache().get(&file, 0, BLOCK_SIZE);
+        let follower = cache().get(&file, 0, BLOCK_SIZE);
+        let followed = follower[0].missing().unwrap().clone();
+        assert!(owner[0].missing().unwrap().fill_owner());
+        assert!(!followed.fill_owner());
+
+        drop(owner);
+
+        assert!(followed.failed());
+        let fresh = cache().get(&file, 0, BLOCK_SIZE);
+        assert!(fresh[0].missing().unwrap().fill_owner());
+    }
+
+    /// A committed fill settles its ownership: dropping the owner afterwards
+    /// leaves the extent in place for the followers and later hits.
+    #[test]
+    fn a_committed_fill_survives_its_owner_being_dropped() {
+        init_test_free_pool(8);
+        let file = new_file();
+        let owner = cache().get(&file, 0, BLOCK_SIZE);
+        let followed = cache().get(&file, 0, BLOCK_SIZE)[0]
+            .missing()
+            .unwrap()
+            .clone();
+        fill_pattern(&owner);
+
+        drop(owner);
+
+        assert!(followed.is_committed());
+        assert!(!followed.failed());
+        assert!(!has_misses(&cache().get(&file, 0, BLOCK_SIZE)));
     }
 
     #[test]
