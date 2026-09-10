@@ -130,7 +130,7 @@ pub struct ViewDict<V: ByteViewType> {
     data: Vec<Buffer>,
     /// One 128-bit view per dictionary entry.
     views: Vec<u128>,
-    phantom: PhantomData<V>,
+    phantom: PhantomData<fn() -> V>,
 }
 
 impl<V: ByteViewType> ViewDict<V> {

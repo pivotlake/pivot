@@ -22,7 +22,7 @@ pub(crate) mod bytes_view;
 pub use bytes_view::BytesViewDecoder;
 
 mod decimal;
-pub use decimal::{DecimalStorage, decimal_decoder};
+pub use decimal::{DecimalStorage, decimal_leaf_kind};
 
 pub(crate) mod delta_binary_packed;
 pub use delta_binary_packed::{DecimalDeltaDecoder, DeltaDecoder, FromDelta};
@@ -69,6 +69,29 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A built dictionary, type-erased so one type serves every column type.
+/// Every decoder of a leaf decodes it with the same decoder type, so the
+/// decoder that adopts a dictionary downcasts it to its own dictionary
+/// type; a mismatch is a bug, not a runtime condition.
+pub type SharedDictionary = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
+/// A leaf's dictionary type, answering its dictionary page without a
+/// decoder: whether the dictionary leaves out a pushed-down constant, and
+/// the built dictionary for the leaf's decoders to adopt.
+pub trait DictionaryKind: Send + Sync {
+    /// Whether the dictionary of `size` entries in `data` provably holds no
+    /// entry equal to `value`. `false` when the type cannot tell (a string
+    /// dictionary, or a constant of another type).
+    fn excludes(&self, data: &[Bytes], size: usize, value: &Scalar<ArrayRef>) -> bool;
+
+    fn build(
+        &self,
+        data: Vec<Bytes>,
+        size: usize,
+        allocator: &mut SlabAllocator,
+    ) -> SharedDictionary;
+}
+
 /// Object-safe interface for decoding a single Parquet leaf column from
 /// decompressed pages into Arrow arrays.
 ///
@@ -81,8 +104,16 @@ pub trait LeafDecoder {
     fn available(&self) -> usize;
 
     /// Stores a decompressed page (data, dictionary, or skipped) for later
-    /// decoding.
+    /// decoding. A dictionary page builds the dictionary.
     fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator);
+
+    /// Reads through a dictionary another decoder of the same leaf built.
+    fn adopt_dictionary(&mut self, dictionary: SharedDictionary);
+
+    /// Forgets every page, the one being read included, and expects the
+    /// next pages from `page_idx` on: the decoder is about to read rows
+    /// that do not follow the ones it has emitted.
+    fn restart_at_page(&mut self, page_idx: usize);
 
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
@@ -92,14 +123,6 @@ pub trait LeafDecoder {
     /// the condition). Once the dictionary is built the constant decides
     /// row-group pruning and scan-side batch filtering.
     fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>);
-
-    /// Whether the loaded dictionary is known to exclude the pushed-down
-    /// equality constant, meaning no row of this column can match and the row
-    /// group can be pruned. `false` until a dictionary page proves otherwise
-    /// (no constant pushed, dictionary not loaded yet, or constant present).
-    fn dict_excludes_eq_constant(&self) -> bool {
-        false
-    }
 
     /// Drops rows that cannot pass this column's pushed-down equality
     /// constant from a decoded batch, where `column` is this column's
@@ -166,7 +189,7 @@ pub trait DecodeDelta: Sized {
 /// Construction lives in [`DictFromBytes`] / [`DictFromVecBytes`], keyed by
 /// whether the dictionary page's bytes sit in one contiguous buffer or are
 /// scattered across several.
-pub trait Dict {
+pub trait Dict: Send + Sync + 'static {
     type Builder: ArrayBuilder;
     type Item;
     /// How a pushed-down equality constant is represented for this

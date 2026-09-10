@@ -71,6 +71,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -86,6 +87,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
+            first_row: 0,
             data: DecompressedPageType::Dict {
                 header: header.dictionary_page_header.unwrap(),
                 data: vec![Bytes::from(encode_plain_strings(entries))],

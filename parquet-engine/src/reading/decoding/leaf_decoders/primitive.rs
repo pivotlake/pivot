@@ -18,6 +18,7 @@ use arrow_array::types::{ArrowPrimitiveType, TimestampMicrosecondType};
 use arrow_array::{ArrayRef, RecordBatch, Scalar, TimestampMicrosecondArray};
 use arrow_buffer::ArrowNativeType;
 
+use super::SharedDictionary;
 use crate::reading::decoding::leaf_decoders::{
     DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, LeafDecoder,
     Result, TypedLeafDecoder,
@@ -272,10 +273,11 @@ where
 {
     entries: B,
     len: usize,
-    phantom: PhantomData<T>,
+    phantom: PhantomData<fn() -> T>,
 }
 
-impl<T: ArrowPrimitiveType, B: Index<usize, Output = T::Native>> Dict for PrimitiveDict<T, B>
+impl<T: ArrowPrimitiveType, B: Index<usize, Output = T::Native> + Send + Sync + 'static> Dict
+    for PrimitiveDict<T, B>
 where
     T::Native: ReadLeBytes,
 {
@@ -412,6 +414,14 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
         self.inner.insert_page(page, allocator);
     }
 
+    fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {
+        self.inner.adopt_dictionary(dictionary);
+    }
+
+    fn restart_at_page(&mut self, page_idx: usize) {
+        self.inner.restart_at_page(page_idx);
+    }
+
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
         let array = self.inner.read(allocator, size)?;
         Ok(Arc::new(attach_timestamp_timezone(
@@ -424,10 +434,6 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
         self.inner.set_eq_constant(value);
     }
 
-    fn dict_excludes_eq_constant(&self) -> bool {
-        self.inner.dict_excludes_eq_constant()
-    }
-
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
         self.inner.fast_filter_record_batch(batch, column)
     }
@@ -435,7 +441,6 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
 //
 #[cfg(test)]
 mod tests {
-    use crate::types::metadata::RowSelection;
     use std::sync::Arc;
 
     use crate::thrift::general::Encoding;
@@ -455,6 +460,7 @@ mod tests {
     type Int64Dict = PrimitiveDict<Int64Type, SlabBuffer<i64>>;
     use crate::reading::decoding::leaf_decoders::LeafDecoder;
     use crate::test_utils::dummy_metadata;
+    use crate::types::metadata::RowSelection;
     use dispatch::memory::SlabAllocator;
     use dispatch::memory::init_test_free_pool;
 
@@ -510,6 +516,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -530,6 +537,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: buffers.into_iter().map(Bytes::from).collect(),
@@ -545,6 +553,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
+            first_row: 0,
             data: DecompressedPageType::Dict {
                 header: header.dictionary_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -745,6 +754,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],

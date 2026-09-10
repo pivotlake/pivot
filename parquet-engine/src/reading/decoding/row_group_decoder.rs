@@ -1,107 +1,76 @@
-//! Per-row-group decoder that accumulates decompressed pages and produces
-//! Arrow [`RecordBatch`]es.
+//! Per-row-group decoder that decodes the ranges of a row group into Arrow
+//! [`RecordBatch`]es.
 //!
-//! The parent [`Decoder`](super::Decoder) owns one [`RowGroupDecoder`] per
-//! in-flight row group. Pages are inserted as they arrive from the
-//! decompressor. When every projected column has enough buffered rows,
-//! [`try_read`](RowGroupDecoder::try_read) decodes the next batch.
+//! The parent [`Decoder`](super::Decoder) keeps one [`RowGroupDecoder`] per
+//! row group it has decoded rows of. A [`DecodeRange`] that starts where the
+//! decoder stopped goes on from the page it has open; any other range
+//! repositions it, which costs a skip into the range's first page of every
+//! column.
 
 use crate::reading::decoding::ScanEqualityPredicate;
-use crate::reading::decoding::column_decoder::{ColumnDecoder, Result, create_leaf_decoder};
-use crate::reading::decoding::leaf_decoders::LeafDecoder;
+use crate::reading::decoding::column_decoder::{ColumnDecoder, LeafKind, Result, leaf_kind};
+use crate::reading::decoding::leaf_decoders::{LeafDecoder, SharedDictionary};
+use crate::reading::decoding::row_group_pages::{DecodeRange, PageContent, StoredPage};
 use crate::reading::record_batch_metadata::with_row_group_metadata;
+use crate::thrift::headers::DictionaryPageHeader;
+use crate::types::filter_mask::FilterMask;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
-use crate::types::page::DecompressedPage;
+use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_schema::{Fields, Schema, SchemaRef};
+use bytes::Bytes;
 use dispatch::memory::SlabAllocator;
 use std::cmp::min;
+use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// An output column whose pushed-down equality constant can prune the row
 /// group, and the decoded leaf that constant was installed on.
 #[derive(Clone, Copy)]
-struct PrunableColumn {
+pub(crate) struct PrunableColumn {
     /// The column's position in the emitted batch.
-    output_idx: usize,
+    pub output_idx: usize,
     /// The leaf whose dictionary decides the pruning.
-    leaf: usize,
+    pub leaf: usize,
 }
 
-/// Decodes pages for a single row group into [`RecordBatch`]es.
-///
-/// Pages are inserted out-of-order via [`insert_page`](Self::insert_page).
-/// Each call to [`try_read`](Self::try_read) checks whether all column
-/// decoders have at least `batch_size` rows available and, if so, produces one
-/// batch. The decoder tracks how many rows have been emitted (`row_offset`)
-/// and is [`exhausted`](Self::exhausted) once all rows have been read.
-pub struct RowGroupDecoder {
-    /// Global row-group index (used for routing and metadata tagging).
-    row_group_idx: usize,
-    /// One decoder per distinct leaf column chunk, in the order the fetcher
-    /// requested them, so a page's `column_idx` indexes straight into this.
-    leaf_decoders: Vec<Box<dyn LeafDecoder>>,
+/// How a row group's projected columns decode: which leaves are read, one
+/// view per output column, and the leaves whose dictionaries can prune the
+/// row group. Built once per row group and shared by every decoder of its
+/// rows; each decoder creates its own leaf decoders from it.
+pub(crate) struct DecodePlan {
+    /// The kinds of the leaves read, in the order the fetcher requested
+    /// them, so a page's `column_idx` indexes straight into this.
+    leaf_kinds: Vec<LeafKind>,
+    /// The file leaves the decoders read, in the same order.
+    pub file_leaves: Vec<usize>,
     /// One view per output column, in projection order. Several can fold the
     /// same decoded leaf.
     column_decoders: Vec<ColumnDecoder>,
     /// Output schema (projected). A pushed-down extract column carries the
     /// type the extract emits, not the variant it was read from.
     schema: SchemaRef,
-    /// Max rows per batch.
-    batch_size: usize,
-    /// Total rows to emit (filtered count, or full row-group count).
-    total: usize,
-    /// Rows emitted so far.
-    row_offset: usize,
-    /// Whether to append row-group-id / row-index metadata columns.
-    add_row_group_metadata: bool,
-    /// The output columns carrying a pushed-down equality constant whose chunk
-    /// is sound to prune by (all data pages dictionary encoded), each with the
-    /// leaf holding that constant. When any such leaf's dictionary excludes it,
-    /// the whole row group is pruned.
-    prunable: Vec<PrunableColumn>,
-    /// The row group's shared pruned flag is the same `Arc` every page of this
-    /// row group carries. It is set here when a prunable column's dictionary
-    /// excludes its constant: the row group cannot contain a matching row, so
-    /// it emits nothing and is treated as exhausted. The decompressor reads it
-    /// so it can skip the row group's remaining, not-yet-decompressed pages
-    /// instead of decompressing them only for this decoder to discard.
-    pruned: Arc<AtomicBool>,
-    /// Whether emitted batches may drop rows that fail a pushed-down
-    /// equality constant. The materializer path must not: it addresses rows
-    /// by their position inside the row group, so every row has to stay in
-    /// place.
-    filter_batches: bool,
+    pub prunable: Vec<PrunableColumn>,
+    /// The pushed-down equality constant each prunable leaf's decoder gets.
+    eq_constants: Vec<(usize, Scalar<ArrayRef>)>,
 }
 
-impl RowGroupDecoder {
+impl DecodePlan {
     pub fn new(
-        row_group_metadata: QueryRowGroupMetadata,
+        row_group_metadata: &QueryRowGroupMetadata,
         projection: &Projection,
-        batch_size: usize,
-        add_row_group_metadata: bool,
         eq_predicates: &[ScanEqualityPredicate],
     ) -> Result<Self> {
-        let pruned = row_group_metadata.pruned_flag();
         // Expand projected columns into this file's leaves. Variant layouts can
         // differ between files, so each row group resolves them independently,
         // and the fetcher resolved them the same way.
         let fields = row_group_metadata.get_metadata().schema.fields();
         let leaves = leaf_fields(fields);
-        let reads = resolve_output_reads(fields, &row_group_metadata, projection);
+        let reads = resolve_output_reads(fields, row_group_metadata, projection);
         let plan = plan_leaves(&reads);
-        let filter_batches = !add_row_group_metadata
-            && !matches!(row_group_metadata.selection(), RowSelection::Indices(_));
-
-        let column_chunks = row_group_metadata.columns();
-        let mut leaf_decoders = plan
-            .file_leaves
-            .iter()
-            .map(|&leaf| create_leaf_decoder(leaves[leaf].data_type(), &column_chunks[leaf]))
-            .collect::<Result<Vec<_>>>()?;
 
         let mut column_decoders = Vec::with_capacity(projection.column_indices.len());
         for ((output_idx, &column), positions) in projection
@@ -120,11 +89,10 @@ impl RowGroupDecoder {
             )?);
         }
 
-        let prunable = install_eq_constants(
+        let (prunable, eq_constants) = prunable_columns(
             &column_decoders,
-            &mut leaf_decoders,
             &plan.file_leaves,
-            column_chunks,
+            row_group_metadata.columns(),
             projection,
             eq_predicates,
         );
@@ -133,55 +101,243 @@ impl RowGroupDecoder {
             .iter()
             .map(|decoder| decoder.output_field().clone())
             .collect();
+        let column_chunks = row_group_metadata.columns();
+        let leaf_kinds = plan
+            .file_leaves
+            .iter()
+            .map(|&leaf| leaf_kind(leaves[leaf].data_type(), &column_chunks[leaf]))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            row_group_idx: row_group_metadata.index(),
-            leaf_decoders,
+            leaf_kinds,
+            file_leaves: plan.file_leaves,
             column_decoders,
             schema: Arc::new(Schema::new(output_fields)),
-            batch_size,
-            total: row_group_metadata.rows_to_read(),
-            row_offset: 0,
-            add_row_group_metadata,
             prunable,
-            pruned,
-            filter_batches,
+            eq_constants,
         })
     }
 
-    /// Returns the global row-group index this decoder is responsible for.
-    pub fn row_group_idx(&self) -> usize {
-        self.row_group_idx
+    /// How many leaves are decoded.
+    pub fn leaf_count(&self) -> usize {
+        self.file_leaves.len()
     }
 
-    /// Returns `true` when the row group has been pruned (no row can match a
-    /// pushed-down equality predicate) or all its rows have been emitted.
-    pub fn exhausted(&self) -> bool {
-        self.pruned() || self.total - self.row_offset == 0
+    /// Whether each decoded leaf's chunk has a dictionary page.
+    pub fn expects_dictionary(&self, row_group_metadata: &QueryRowGroupMetadata) -> Vec<bool> {
+        let column_chunks = row_group_metadata.columns();
+        self.file_leaves
+            .iter()
+            .map(|&leaf| column_chunks[leaf].dictionary_page_offset.is_some())
+            .collect()
     }
 
-    /// Returns `true` if this row group was pruned by dictionary pushdown and
-    /// should be dropped without emitting any rows.
-    pub fn pruned(&self) -> bool {
-        self.pruned.load(Ordering::Relaxed)
-    }
-
-    /// Routes a decompressed page to the appropriate column decoder, then
-    /// re-evaluates dictionary pruning (a just-loaded dictionary page may
-    /// exclude a pushed-down constant, allowing the whole row group to be
-    /// dropped before its data pages are decoded).
-    pub fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
-        self.leaf_decoders[page.column_idx].insert_page(page, allocator);
-        if !self.pruned()
-            && self
-                .prunable
-                .iter()
-                .any(|p| self.leaf_decoders[p.leaf].dict_excludes_eq_constant())
-        {
-            // Publish to the shared flag (seen by every page of this row group):
-            // the decoder discards the rest, and the decompressor can skip the
-            // row group's remaining, not-yet-decompressed pages.
-            self.pruned.store(true, Ordering::Relaxed);
+    /// Fresh leaf decoders, one per decoded leaf, with the pushed-down
+    /// constants installed on the prunable ones.
+    pub fn create_leaf_decoders(&self) -> Vec<Box<dyn LeafDecoder>> {
+        let mut leaf_decoders: Vec<_> = self
+            .leaf_kinds
+            .iter()
+            .map(LeafKind::create_decoder)
+            .collect();
+        for (leaf, constant) in &self.eq_constants {
+            leaf_decoders[*leaf].set_eq_constant(constant);
         }
+        leaf_decoders
+    }
+
+    /// Whether the dictionary page of `leaf` prunes the row group: the leaf
+    /// carries a pushed-down constant and the dictionary provably holds no
+    /// entry equal to it.
+    pub fn dictionary_prunes(
+        &self,
+        leaf: usize,
+        header: &DictionaryPageHeader,
+        data: &[Bytes],
+    ) -> bool {
+        self.eq_constants.iter().any(|(prunable, constant)| {
+            *prunable == leaf && self.leaf_kinds[leaf].dictionary_excludes(header, data, constant)
+        })
+    }
+
+    pub fn build_dictionary(
+        &self,
+        leaf: usize,
+        header: &DictionaryPageHeader,
+        data: Vec<Bytes>,
+        allocator: &mut SlabAllocator,
+    ) -> SharedDictionary {
+        self.leaf_kinds[leaf].build_dictionary(header, data, allocator)
+    }
+}
+
+/// Decodes the ranges of a single row group into [`RecordBatch`]es.
+pub struct RowGroupDecoder {
+    metadata: QueryRowGroupMetadata,
+    plan: Arc<DecodePlan>,
+    leaf_decoders: Vec<Box<dyn LeafDecoder>>,
+    /// Per leaf, whether its dictionary is loaded.
+    dictionary_loaded: Vec<bool>,
+    /// Max rows per batch.
+    batch_size: usize,
+    /// The next row to emit and the row the attached range ends at, in
+    /// decoded-row terms (see [`DecodeRange::rows`]).
+    next_row: usize,
+    end_row: usize,
+    /// The range being decoded.
+    range: Option<DecodeRange>,
+    /// The row group's ranges still to decode, on any worker.
+    ranges_left: Arc<AtomicUsize>,
+    /// Per leaf, the index of the next page to hand the leaf decoder.
+    next_page: Vec<usize>,
+    /// Whether to append row-group-id / row-index metadata columns.
+    add_row_group_metadata: bool,
+    /// Whether emitted batches may drop rows that fail a pushed-down
+    /// equality constant. The materializer path must not: it addresses rows
+    /// by their position inside the row group, so every row has to stay in
+    /// place.
+    filter_batches: bool,
+}
+
+impl RowGroupDecoder {
+    /// A decoder for the row group of `range`, ready to take it on.
+    pub fn new(
+        range: &DecodeRange,
+        batch_size: usize,
+        add_row_group_metadata: bool,
+    ) -> Result<Self> {
+        let metadata = range.metadata().clone();
+        let plan = range.plan().clone();
+        let filter_batches =
+            !add_row_group_metadata && !matches!(metadata.selection(), RowSelection::Indices(_));
+        Ok(Self {
+            next_page: vec![0; plan.leaf_count()],
+            dictionary_loaded: vec![false; plan.leaf_count()],
+            leaf_decoders: plan.create_leaf_decoders(),
+            plan,
+            batch_size,
+            next_row: 0,
+            end_row: 0,
+            range: None,
+            ranges_left: range.ranges_left().clone(),
+            add_row_group_metadata,
+            filter_batches,
+            metadata,
+        })
+    }
+
+    /// Adopts the dictionaries the leaves still lack from `range`.
+    fn load_dictionaries(&mut self, range: &DecodeRange) {
+        for (leaf, decoder) in self.leaf_decoders.iter_mut().enumerate() {
+            if self.dictionary_loaded[leaf] {
+                continue;
+            }
+            let Some(dictionary) = &range.column(leaf).dictionary else {
+                continue;
+            };
+            decoder.adopt_dictionary(dictionary.clone());
+            self.dictionary_loaded[leaf] = true;
+        }
+    }
+
+    pub fn row_group_index(&self) -> usize {
+        self.metadata.row_group_index
+    }
+
+    /// Whether every range of the row group is decoded, on any worker, so
+    /// no further range can arrive.
+    pub fn row_group_done(&self) -> bool {
+        self.ranges_left.load(Ordering::Acquire) == 0
+    }
+
+    /// Takes on `range`. A range starting at the row this decoder stopped
+    /// at continues from the page it has open; any other range repositions
+    /// every leaf at the range's first page.
+    pub fn attach(&mut self, range: DecodeRange, allocator: &mut SlabAllocator) {
+        assert!(self.exhausted(), "a decoder takes on one range at a time");
+        self.load_dictionaries(&range);
+        let rows = range.rows();
+        let continues = rows.start as usize == self.end_row;
+        self.next_row = rows.start as usize;
+        self.end_row = rows.end as usize;
+        for leaf in 0..self.leaf_decoders.len() {
+            let pages = &range.column(leaf).pages;
+            if !continues {
+                let first = pages
+                    .first()
+                    .expect("a ready range has pages in every column")
+                    .idx;
+                self.leaf_decoders[leaf].restart_at_page(first);
+                self.next_page[leaf] = first;
+            }
+            for page in pages {
+                if page.idx < self.next_page[leaf] {
+                    continue;
+                }
+                self.next_page[leaf] = page.idx + 1;
+                let decompressed = self.page_to_decode(leaf, page, &rows);
+                self.leaf_decoders[leaf].insert_page(decompressed, allocator);
+            }
+        }
+        self.range = Some(range);
+    }
+
+    /// Gives back the range once every row of it is emitted.
+    pub fn finish_range(&mut self) -> DecodeRange {
+        assert!(
+            self.exhausted(),
+            "a range is finished once its rows are emitted"
+        );
+        self.range
+            .take()
+            .expect("a range is finished once, after being attached")
+    }
+
+    /// The stored page as the leaf decoder takes it. The first page of a
+    /// range that starts inside it gets a mask skipping the rows before the
+    /// range; an index selection's pages carry their own masks.
+    fn page_to_decode(
+        &self,
+        leaf: usize,
+        page: &StoredPage,
+        rows: &Range<u32>,
+    ) -> DecompressedPage {
+        let data = match &page.content {
+            PageContent::Data(data) => {
+                let filter_mask = match self.metadata.selection() {
+                    RowSelection::All if page.first_row < rows.start => {
+                        let span = page.row_span();
+                        Some(FilterMask::for_row_range(
+                            span.start,
+                            span.end,
+                            &(rows.start..span.end),
+                        ))
+                    }
+                    RowSelection::All => None,
+                    RowSelection::Indices(_) => data.filter_mask.clone(),
+                };
+                DecompressedPageType::Data(DataPage {
+                    header: data.header.clone(),
+                    data: data.data.clone(),
+                    filter_mask,
+                })
+            }
+            PageContent::Skipped(header) => DecompressedPageType::SkippedData {
+                header: header.clone(),
+            },
+        };
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: self.metadata.clone(),
+            column_idx: leaf,
+            idx: page.idx,
+            first_row: page.first_row,
+            data,
+        }
+    }
+
+    /// Whether every row of the attached range has been emitted.
+    pub fn exhausted(&self) -> bool {
+        self.next_row == self.end_row
     }
 
     /// Attempts to produce the next [`RecordBatch`].
@@ -190,10 +346,7 @@ impl RowGroupDecoder {
     /// rows, `Ok(None)` if more pages are needed, or an error if decoding
     /// fails.
     pub fn try_read(&mut self, allocator: &mut SlabAllocator) -> Result<Option<RecordBatch>> {
-        if self.pruned() {
-            return Ok(None);
-        }
-        let size = min(self.batch_size, self.total - self.row_offset);
+        let size = min(self.batch_size, self.end_row - self.next_row);
         let available = min(
             self.leaf_decoders
                 .iter()
@@ -213,11 +366,12 @@ impl RowGroupDecoder {
                 .map(|leaf| leaf.read(allocator, available).map_err(Into::into))
                 .collect::<Result<Vec<_>>>()?;
             let columns = self
+                .plan
                 .column_decoders
                 .iter()
                 .map(|decoder| decoder.read(&decoded))
                 .collect::<Result<Vec<_>>>()?;
-            let record_batch = RecordBatch::try_new(self.schema.clone(), columns)?;
+            let record_batch = RecordBatch::try_new(self.plan.schema.clone(), columns)?;
             // Give each column carrying a pushed-down equality constant a
             // chance to drop rows that provably fail it, before the batch
             // travels any further. Dictionary encoded string columns filter it
@@ -225,18 +379,18 @@ impl RowGroupDecoder {
             // done on the materializer path, which needs every row to stay in
             // place.
             let record_batch = if self.filter_batches {
-                self.prunable.iter().fold(record_batch, |batch, p| {
+                self.plan.prunable.iter().fold(record_batch, |batch, p| {
                     self.leaf_decoders[p.leaf].fast_filter_record_batch(batch, p.output_idx)
                 })
             } else {
                 record_batch
             };
             let batch = if self.add_row_group_metadata {
-                with_row_group_metadata(record_batch, self.row_group_idx, self.row_offset)
+                with_row_group_metadata(record_batch, self.row_group_index(), self.next_row)
             } else {
                 record_batch
             };
-            self.row_offset += available;
+            self.next_row += available;
             Ok(Some(batch))
         } else {
             Ok(None)
@@ -244,8 +398,8 @@ impl RowGroupDecoder {
     }
 }
 
-/// Installs each pushed-down equality constant on the leaf that answers it, and
-/// returns the columns the row group can then be pruned by.
+/// Decides which output columns the row group can be pruned by, and the
+/// constant each one's leaf decoder gets.
 ///
 /// A constant only goes in when its output column emits exactly one decoded
 /// leaf unchanged, because that is the only shape both uses of the constant can
@@ -264,15 +418,15 @@ impl RowGroupDecoder {
 /// A constant whose type does not match the leaf is dropped by the leaf decoder,
 /// which forgoes the pushdown; the query's `Filter` still applies the
 /// comparison.
-fn install_eq_constants(
+fn prunable_columns(
     column_decoders: &[ColumnDecoder],
-    leaf_decoders: &mut [Box<dyn LeafDecoder>],
     file_leaves: &[usize],
     column_chunks: &[ColumnChunkMeta],
     projection: &Projection,
     eq_predicates: &[ScanEqualityPredicate],
-) -> Vec<PrunableColumn> {
+) -> (Vec<PrunableColumn>, Vec<(usize, Scalar<ArrayRef>)>) {
     let mut prunable = Vec::new();
+    let mut eq_constants = Vec::new();
     for (output_idx, &column) in projection.column_indices.iter().enumerate() {
         let Some(leaf) = column_decoders[output_idx].untransformed_leaf() else {
             continue;
@@ -292,8 +446,8 @@ fn install_eq_constants(
         if !column_chunks[file_leaves[leaf]].data_pages_all_dictionary {
             continue;
         }
-        leaf_decoders[leaf].set_eq_constant(&predicate.value);
+        eq_constants.push((leaf, predicate.value.clone()));
         prunable.push(PrunableColumn { output_idx, leaf });
     }
-    prunable
+    (prunable, eq_constants)
 }

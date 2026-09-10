@@ -184,20 +184,34 @@ pub struct QueryRowGroupMetadata {
     /// The row group's global index — its position in the table's flat
     /// `row_groups` list, which is how the materializer addresses it back.
     pub row_group_index: usize,
-    /// Shared across every page of this row group: the decoder flips it once the
-    /// row group is pruned (e.g. a dictionary excludes a pushed-down equality
-    /// constant), letting the decompressor skip the remaining, not-yet-touched
-    /// pages instead of decompressing them only for the decoder to discard.
+    /// Shared across every page of this row group: flipped once the row group
+    /// is pruned (a dictionary excludes a pushed-down equality constant), so
+    /// the decompressor skips the remaining, not-yet-touched pages instead of
+    /// decompressing them only to be discarded.
     pruned: Arc<AtomicBool>,
 }
 
 impl QueryRowGroupMetadata {
+    /// Metadata for reading the `selection` of row group `index`.
     pub fn new(table: &ParquetTable, index: usize, selection: RowSelection) -> Self {
         Self {
             row_group_metadata: table.row_groups[index].clone(),
             selection,
             row_group_index: index,
             pruned: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The rows read through this metadata.
+    pub fn selection(&self) -> &RowSelection {
+        &self.selection
+    }
+
+    /// How many rows are emitted.
+    pub fn rows_to_read(&self) -> usize {
+        match &self.selection {
+            RowSelection::All => self.row_group_metadata.num_rows as usize,
+            RowSelection::Indices(indices) => indices.len(),
         }
     }
 
@@ -211,12 +225,6 @@ impl QueryRowGroupMetadata {
     /// this metadata — in particular to the decompressor handling later pages.
     pub fn mark_pruned(&self) {
         self.pruned.store(true, Ordering::Relaxed);
-    }
-
-    /// A handle to the shared pruned flag, for a holder (the row-group decoder)
-    /// that needs to flip it later. Cloning is cheap — an `Arc` bump.
-    pub fn pruned_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.pruned)
     }
 
     /// Get the corresponding RowGroupMetadata from the table
@@ -234,18 +242,5 @@ impl QueryRowGroupMetadata {
 
     pub fn index(&self) -> usize {
         self.row_group_index
-    }
-
-    /// The rows read through this metadata.
-    pub fn selection(&self) -> &RowSelection {
-        &self.selection
-    }
-
-    /// How many rows are emitted.
-    pub fn rows_to_read(&self) -> usize {
-        match &self.selection {
-            RowSelection::All => self.row_group_metadata.num_rows as usize,
-            RowSelection::Indices(indices) => indices.len(),
-        }
     }
 }

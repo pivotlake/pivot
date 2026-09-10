@@ -14,6 +14,7 @@
 //! are type aliases over `TypedLeafDecoder` with the appropriate type
 //! parameters.
 
+use super::{DictionaryKind, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::levels::decode_def_levels;
 use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::reading::decoding::leaf_decoders::{
@@ -29,6 +30,7 @@ use bytes::Bytes;
 use dispatch::arrays::ValidityBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// Which encoding strategy to use for a data page's values.
 pub enum ValueDecoder<P: DecodePlain> {
@@ -196,6 +198,30 @@ impl<P: DecodePlain> ReadPage<P> {
     }
 }
 
+/// The dictionary type of a [`TypedLeafDecoder`], see
+/// [`DictionaryKind`].
+pub struct TypedDictionaryKind<DC, DS>(PhantomData<fn() -> (DC, DS)>);
+
+impl<DC, DS> DictionaryKind for TypedDictionaryKind<DC, DS>
+where
+    DC: DictFromBytes,
+    DS: DictFromVecBytes<EqConstant = DC::EqConstant>,
+{
+    fn excludes(&self, data: &[Bytes], size: usize, value: &Scalar<ArrayRef>) -> bool {
+        DC::eq_constant_from_scalar(value)
+            .is_some_and(|needle| !DC::maybe_contains(data, size, &needle))
+    }
+
+    fn build(
+        &self,
+        data: Vec<Bytes>,
+        size: usize,
+        allocator: &mut SlabAllocator,
+    ) -> SharedDictionary {
+        Arc::new(DictStorage::<DC, DS>::build(data, size, allocator))
+    }
+}
+
 /// Tracks whether a page slot holds decodable data or was fully filtered out.
 #[allow(clippy::large_enum_variant)]
 enum PageSlot {
@@ -247,16 +273,13 @@ where
     max_def_level: i16,
     /// The page currently being consumed, if any.
     read_page: Option<ReadPage<P>>,
-    /// Dictionary built from a dictionary page, if one has been received.
-    dict: Option<DictStorage<DC, DS>>,
+    /// The dictionary, once built here or adopted from another reader of the
+    /// row group on this node.
+    dict: Option<Arc<DictStorage<DC, DS>>>,
     /// The pushed-down equality constant, in this dictionary flavour's own
     /// representation (see [`Dict::EqConstant`]). Drives row-group pruning
     /// and scan-side batch filtering once the dictionary is built.
     eq_const: Option<DC::EqConstant>,
-    /// Whether the dictionary was scanned and found to exclude
-    /// [`Self::eq_const`]. Stays `false` until a dictionary page proves the
-    /// constant absent.
-    dict_excludes_eq_constant: bool,
     phantom_data: PhantomData<B>,
 }
 
@@ -277,11 +300,28 @@ where
             read_page: None,
             dict: None,
             eq_const: None,
-            dict_excludes_eq_constant: false,
             phantom_data: Default::default(),
         }
     }
 
+    /// Queues page `idx` for reading. Pages are handed over in reading
+    /// order, never one already read.
+    fn queue_page(&mut self, idx: usize, slot: PageSlot) {
+        assert!(idx >= self.page_idx, "a page is queued before it is read");
+        if idx >= self.pages.len() {
+            self.pages.resize_with(idx + 1, || None);
+        }
+        self.pages[idx] = Some(slot);
+    }
+
+    /// This decoder type's dictionary type, for building and judging a
+    /// dictionary page without a decoder.
+    pub fn dictionary_kind() -> TypedDictionaryKind<DC, DS> {
+        TypedDictionaryKind(PhantomData)
+    }
+
+    /// Takes a dictionary another reader of the row group built on this
+    /// node. Every reader of a leaf decodes it with the same decoder type.
     /// Selects the appropriate [`ValueDecoder`] (plain, RLE-dictionary, or
     /// delta) based on the page header's encoding.
     fn create_decoder(
@@ -379,12 +419,8 @@ where
         self.eq_const = DC::eq_constant_from_scalar(value);
     }
 
-    fn dict_excludes_eq_constant(&self) -> bool {
-        self.dict_excludes_eq_constant
-    }
-
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
-        match (&self.eq_const, &self.dict) {
+        match (&self.eq_const, self.dict.as_deref()) {
             (Some(needle), Some(DictStorage::Contiguous(dict))) => {
                 dict.filter_record_batch_by_const(batch, column, needle)
             }
@@ -428,48 +464,31 @@ where
         match page.data {
             DecompressedPageType::Dict { header, data } => {
                 let size = header.num_values as usize;
-                if let Some(needle) = self.eq_const.as_ref() {
-                    // Equality pushdown: scan the raw dictionary for the constant
-                    // before materializing it. If absent, the row group is pruned
-                    // — so skip building the dictionary entirely (no allocation,
-                    // no copy of values we'd never read).
-                    let present = DC::maybe_contains(&data, size, needle);
-                    self.dict_excludes_eq_constant = !present;
-                    if !present {
-                        // Row group will be pruned. Install an *empty* dictionary
-                        // instead of the real one: this skips the copy but keeps
-                        // the invariant that a dict-encoded column has
-                        // `dict.is_some()`, so `available()` and worker scheduling
-                        // behave exactly as on the build path. (Leaving `dict`
-                        // `None` makes `available()` report 0, parking every
-                        // worker before the prune completes → lost-wakeup hang.)
-                        // The dictionary is never read — the row group is pruned.
-                        self.dict = Some(DictStorage::build(data, 0, allocator));
-                        return;
-                    }
-                }
-                self.dict = Some(DictStorage::build(data, size, allocator));
+                self.dict = Some(Arc::new(DictStorage::build(data, size, allocator)));
             }
-            DecompressedPageType::Data(data) => {
-                let idx = page.idx;
-                if idx >= self.pages.len() {
-                    self.pages.resize_with(idx + 1, || None);
-                }
-                self.pages[idx] = Some(PageSlot::Data(data));
-            }
+            DecompressedPageType::Data(data) => self.queue_page(page.idx, PageSlot::Data(data)),
             DecompressedPageType::SkippedData { .. } => {
-                let idx = page.idx;
-                if idx >= self.pages.len() {
-                    self.pages.resize_with(idx + 1, || None);
-                }
-                self.pages[idx] = Some(PageSlot::Skipped);
+                self.queue_page(page.idx, PageSlot::Skipped)
             }
         }
     }
 
+    fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {
+        let dictionary = dictionary
+            .downcast::<DictStorage<DC, DS>>()
+            .unwrap_or_else(|_| panic!("a shared dictionary is adopted by its own decoder type"));
+        self.dict = Some(dictionary);
+    }
+
+    fn restart_at_page(&mut self, page_idx: usize) {
+        self.pages.clear();
+        self.read_page = None;
+        self.page_idx = page_idx;
+    }
+
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
         let mut builder = B::with_capacity(allocator, size);
-        match &self.dict {
+        match self.dict.as_deref() {
             Some(DictStorage::Contiguous(d)) => d.register_onto(&mut builder),
             Some(DictStorage::Scattered(d)) => d.register_onto(&mut builder),
             None => {}
@@ -481,6 +500,17 @@ where
         let mut validity: Option<ValidityBuilder> = None;
 
         while builder.len() < size {
+            // A page whose kept rows are all decoded is left in place until
+            // the next read, so a reader that stops at the end of its rows
+            // can continue from the same cursor.
+            if self
+                .read_page
+                .as_ref()
+                .is_some_and(|read_page| read_page.remaining == 0)
+            {
+                self.read_page = None;
+                self.page_idx += 1;
+            }
             if self.read_page.is_none() {
                 match self.create_next_read_page()? {
                     Some(()) => {}
@@ -498,7 +528,7 @@ where
                     vb.append_n(builder.len(), true);
                     vb
                 });
-                match &self.dict {
+                match self.dict.as_deref() {
                     Some(DictStorage::Contiguous(d)) => {
                         read_page.read_into_nullable(Some(d), &mut builder, v, remaining)
                     }
@@ -509,7 +539,7 @@ where
                 }
             } else {
                 let before = builder.len();
-                match &self.dict {
+                match self.dict.as_deref() {
                     Some(DictStorage::Contiguous(d)) => {
                         read_page.read_into(Some(d), &mut builder, remaining)
                     }
@@ -521,11 +551,6 @@ where
                 if let Some(v) = &mut validity {
                     v.append_n(builder.len() - before, true);
                 }
-            }
-
-            if read_page.remaining == 0 {
-                self.read_page = None;
-                self.page_idx += 1;
             }
         }
 
@@ -570,6 +595,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -590,6 +616,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -605,6 +632,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
+            first_row: 0,
             data: DecompressedPageType::SkippedData {
                 header: header.data_page_header.unwrap(),
             },
@@ -618,6 +646,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
+            first_row: 0,
             data: DecompressedPageType::Dict {
                 header: header.dictionary_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
@@ -685,6 +714,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(vec![2u8, 3, 0x00, 0x00])],
@@ -698,48 +728,26 @@ mod tests {
 
     // -- Dictionary pruning (pushed-down equality constant) --
 
-    /// No constant set → never prunes.
+    /// The dictionary kind judges a dictionary page against a constant
+    /// without a decoder: absent prunes, present or untyped does not.
     #[test]
-    fn test_dict_excludes_false_without_constant() {
-        init_test_free_pool(4);
-        let mut alloc = SlabAllocator::new(true);
-        let mut dec = Dec::new(0);
-        dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
+    fn a_dictionary_excludes_a_constant_only_when_provably_absent() {
+        let kind = Dec::dictionary_kind();
+        let data = vec![Bytes::from(encode_i32s(&[10, 20, 30]))];
 
-        assert!(!dec.dict_excludes_eq_constant());
-    }
+        let absent = kind.excludes(&data, 3, &int_scalar(99));
+        let present = kind.excludes(&data, 3, &int_scalar(20));
+        let other_type = kind.excludes(
+            &data,
+            3,
+            &Scalar::new(
+                std::sync::Arc::new(arrow_array::StringArray::from(vec!["x"])) as ArrayRef,
+            ),
+        );
 
-    /// Constant set but dictionary not yet loaded → not prunable yet.
-    #[test]
-    fn test_dict_excludes_false_before_dict_loaded() {
-        let mut dec = Dec::new(0);
-        dec.set_eq_constant(&int_scalar(20));
-
-        assert!(!dec.dict_excludes_eq_constant());
-    }
-
-    /// Constant present in the dictionary → cannot prune.
-    #[test]
-    fn test_dict_excludes_false_when_present() {
-        init_test_free_pool(4);
-        let mut alloc = SlabAllocator::new(true);
-        let mut dec = Dec::new(0);
-        dec.set_eq_constant(&int_scalar(20));
-        dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
-
-        assert!(!dec.dict_excludes_eq_constant());
-    }
-
-    /// Constant absent from the dictionary → the row group is prunable.
-    #[test]
-    fn test_dict_excludes_true_when_absent() {
-        init_test_free_pool(4);
-        let mut alloc = SlabAllocator::new(true);
-        let mut dec = Dec::new(0);
-        dec.set_eq_constant(&int_scalar(99));
-        dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
-
-        assert!(dec.dict_excludes_eq_constant());
+        assert!(absent);
+        assert!(!present);
+        assert!(!other_type);
     }
 
     // -- Page insertion order --
@@ -872,6 +880,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(vec![2u8, 3, 0x24, 0x24])],
@@ -889,6 +898,46 @@ mod tests {
     }
 
     /// available() returns 0 until dict page arrives, then reports the full count.
+    fn rle_page_over_three_entries(idx: usize) -> DecompressedPage {
+        let header = PageHeader::for_data_page(8, Encoding::RLE_DICTIONARY);
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
+            column_idx: 0,
+            idx,
+            first_row: 0,
+            data: DecompressedPageType::Data(DataPage {
+                header: header.data_page_header.unwrap(),
+                data: vec![Bytes::from(vec![2u8, 3, 0x24, 0x24])],
+                filter_mask: None,
+            }),
+        }
+    }
+
+    /// A decoder handed a dictionary built outside it reads through it, not
+    /// through a dictionary page of its own.
+    #[test]
+    fn a_decoder_adopts_a_dictionary_built_outside_it() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let dictionary_data = vec![Bytes::from(encode_i32s(&[100, 200, 300]))];
+        let dictionary = Dec::dictionary_kind().build(dictionary_data, 3, &mut alloc);
+        let mut decoder = Dec::new(0);
+
+        decoder.adopt_dictionary(dictionary);
+        decoder.insert_page(rle_page_over_three_entries(0), &mut alloc);
+        let values = decoder.read(&mut alloc, 8).unwrap();
+
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[100, 200, 300, 100, 100, 200, 300, 100]
+        );
+    }
+
     #[test]
     fn test_dict_page_unblocks_availability() {
         init_test_free_pool(4);
@@ -901,6 +950,7 @@ mod tests {
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
+            first_row: 0,
             data: DecompressedPageType::Data(DataPage {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(vec![2u8, 3, 0x24, 0x24])],

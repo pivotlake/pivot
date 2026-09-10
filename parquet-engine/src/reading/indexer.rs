@@ -126,6 +126,7 @@ impl ColumnPageBuilder {
             file_offset,
             span,
             page_idx,
+            first_row: row_offset,
             data,
             decompressed,
             filter_mask,

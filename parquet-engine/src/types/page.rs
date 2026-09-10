@@ -49,6 +49,9 @@ pub struct CompressedPage {
     pub span: usize,
     /// Sequential page index within the column chunk.
     pub page_idx: usize,
+    /// The row group row of a data page's first value; zero for a
+    /// dictionary page.
+    pub first_row: u32,
     /// Thrift page header (type, sizes, encoding info).
     pub header: PageHeader,
     /// Raw compressed byte buffers making up the page body. Empty when
@@ -134,6 +137,9 @@ pub struct DecompressedPage {
     pub column_idx: usize,
     /// Sequential page index within the column chunk.
     pub idx: usize,
+    /// The row group row of a data page's first value; zero for a
+    /// dictionary page.
+    pub first_row: u32,
     /// The decompressed page payload (dict, data, or skipped).
     pub data: DecompressedPageType,
 }
