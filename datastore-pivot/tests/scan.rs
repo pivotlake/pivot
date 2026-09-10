@@ -38,6 +38,40 @@ fn scan_all_columns() {
     assert_eq!(results[0].num_columns(), 2);
 }
 
+/// One row group cut into several decode ranges, with more workers than
+/// row groups to take them, still scans every row once.
+#[test]
+fn single_row_group_is_split_across_workers_without_losing_rows() {
+    let dispatch = dispatch(4);
+    let rows = 100_000i64;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8View, false),
+            Field::new("value", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringViewArray::from_iter_values(
+                (0..rows).map(|i| format!("row-{i}")),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..rows)),
+        ],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut values = collect_i64s(&results, 1);
+    values.sort_unstable();
+    assert_eq!(values, (0..rows).collect::<Vec<_>>());
+    let names = collect_strings(&results, 0);
+    let paired: std::collections::HashSet<(String, i64)> =
+        names.into_iter().zip(collect_i64s(&results, 1)).collect();
+    assert!((0..rows).all(|i| paired.contains(&(format!("row-{i}"), i))));
+}
+
 #[test]
 fn limit_can_abandon_parquet_reads() {
     let dispatch = dispatch(4);

@@ -38,9 +38,10 @@ pub use external::bind_read_parquet;
 
 pub(crate) mod reading;
 pub use reading::{
-    ColumnDecoderError, DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory,
-    MaterializerFactory, RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate,
-    materialize, pending_claim_bound, table_input, table_input_with_filter,
+    ColumnDecoderError, DecodeRange, DecoderFactory, DecompressorError, DecompressorFactory,
+    IndexerFactory, MaterializerFactory, RangeCutterFactory, RowGroupFetcherFactory,
+    RowGroupInjectorFactory, ScanEqualityPredicate, WorkerAllocator, materialize,
+    pending_claim_bound, table_input, table_input_with_filter,
     table_input_with_filter_and_eq_predicates,
 };
 
