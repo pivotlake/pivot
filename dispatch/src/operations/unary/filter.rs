@@ -6,7 +6,7 @@
 //! progressively, shrinking a working copy of the batch after each one so
 //! later (often costlier) conditions only see rows the earlier ones kept; the
 //! operator's [`SlabAllocator`] is passed in for that, see
-//! [`take`](crate::arrays::take).
+//! [`take`].
 //! A selection is applied by appending the surviving rows to a
 //! [`BatchAccumulator`], which coalesces survivors across input batches and
 //! emits full-size batches, so a selective filter's downstream sees a few

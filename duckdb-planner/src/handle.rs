@@ -1131,7 +1131,7 @@ pub struct JoinPushdownColumn {
     /// The target scan's table index (a second pairing check besides the set).
     pub probe_table_index: usize,
     /// Index into the target get's `column_ids`; resolve to a storage column
-    /// via [`TableScan::storage_column`].
+    /// via [`TableScan::storage_columns`].
     pub probe_column: usize,
     /// The join condition whose build-side values bound this column.
     pub condition_index: usize,
