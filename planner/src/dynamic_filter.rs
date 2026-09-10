@@ -1,7 +1,7 @@
 //! Logical runtime-filter wiring stored in a query plan.
 //!
 //! These structures describe connections, not live filter state. A producer
-//! and its consumer scans carry the same `slot_id`; [`Plan::compile`] resolves
+//! and its consumer scans carry the same `slot_id`; [`Plan::compile`](crate::Plan::compile) resolves
 //! that ID through its runtime-slot registry so both ends receive the same
 //! shared [`BoundarySlot`](dispatch::BoundarySlot) or key-bitset slot.
 //!
