@@ -1,0 +1,44 @@
+name: Feature proposal
+description: Propose a capability or improvement for Pivot
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the problem rather than the implementation. This helps us understand which solution best fits Pivot.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to accomplish?
+      description: Describe the use case, limitation, or workflow that prompted this proposal.
+      placeholder: Explain who needs this and why the current behavior gets in the way.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Pivot to do?
+      description: Describe the desired behavior or outcome. A complete technical design is not required.
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: What would using it look like?
+      description: If useful, show example SQL, CLI commands, configuration, or API calls.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What alternatives or workarounds have you considered?
+      description: Tell us how you handle this today and where that approach falls short.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add relevant links, compatibility considerations, sketches, benchmarks, or related issues.
