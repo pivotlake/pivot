@@ -162,18 +162,25 @@ impl RowGroupMetadata {
     }
 }
 
+/// Which rows of a row group are read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowSelection {
+    /// Every row of the row group.
+    All,
+    /// The sorted row indices that survived predicate evaluation.
+    Indices(Vec<u32>),
+}
+
 /// Row-group metadata augmented with per-query filtering state.
 ///
-/// Wraps a shared [`RowGroupMetadata`] and optionally carries the sorted row
-/// indices that survived predicate evaluation. When `filtered_indices` is
-/// `None`, the entire row group is read; when `Some`, only those rows are
-/// materialized.
+/// Wraps a shared [`RowGroupMetadata`] and the [`RowSelection`] describing
+/// which of the row group's rows are read through it.
 #[derive(Clone)]
 pub struct QueryRowGroupMetadata {
     /// The underlying static row-group metadata.
     pub row_group_metadata: Arc<RowGroupMetadata>,
-    /// Sorted row indices to read, or `None` to read the full row group.
-    pub filtered_indices: Option<Vec<u32>>,
+    /// The rows read through this metadata.
+    selection: RowSelection,
     /// The row group's global index — its position in the table's flat
     /// `row_groups` list, which is how the materializer addresses it back.
     pub row_group_index: usize,
@@ -185,10 +192,10 @@ pub struct QueryRowGroupMetadata {
 }
 
 impl QueryRowGroupMetadata {
-    pub fn new(table: &ParquetTable, index: usize, filtered_indices: Option<Vec<u32>>) -> Self {
+    pub fn new(table: &ParquetTable, index: usize, selection: RowSelection) -> Self {
         Self {
             row_group_metadata: table.row_groups[index].clone(),
-            filtered_indices,
+            selection,
             row_group_index: index,
             pruned: Arc::new(AtomicBool::new(false)),
         }
@@ -229,7 +236,16 @@ impl QueryRowGroupMetadata {
         self.row_group_index
     }
 
-    pub fn filtered_indices(&self) -> &Option<Vec<u32>> {
-        &self.filtered_indices
+    /// The rows read through this metadata.
+    pub fn selection(&self) -> &RowSelection {
+        &self.selection
+    }
+
+    /// How many rows are emitted.
+    pub fn rows_to_read(&self) -> usize {
+        match &self.selection {
+            RowSelection::All => self.row_group_metadata.num_rows as usize,
+            RowSelection::Indices(indices) => indices.len(),
+        }
     }
 }

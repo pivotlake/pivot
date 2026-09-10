@@ -23,7 +23,7 @@ use dispatch::{
 
 use crate::RowGroupFilter;
 use crate::reading::record_batch_metadata::with_row_group_metadata;
-use crate::types::metadata::QueryRowGroupMetadata;
+use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use crate::types::table::ParquetTable;
 
 /// Build a scan that emits the rows of an empty (zero-data-column) projection.
@@ -36,7 +36,7 @@ pub(crate) fn empty_projection_scan(
     let n = dispatcher.worker_count();
     let row_groups = Arc::new(Injector::new());
     for idx in 0..table.row_groups.len() {
-        row_groups.push(QueryRowGroupMetadata::new(table, idx, None));
+        row_groups.push(QueryRowGroupMetadata::new(table, idx, RowSelection::All));
     }
     let factories = (0..n).map(|_| EmptyProjectionScanFactory {
         row_groups: row_groups.clone(),

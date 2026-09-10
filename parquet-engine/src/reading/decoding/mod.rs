@@ -281,6 +281,7 @@ mod tests {
     use crate::reading::decoding::{Decoder, ScanEqualityPredicate};
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
+    use crate::types::metadata::RowSelection;
     use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata};
     use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
     use crate::types::projection::Projection;
@@ -507,7 +508,7 @@ mod tests {
     fn view_eq_filters_batches_to_matching_rows() {
         init_test_free_pool(4);
         let table = string_and_i32_table(5, true);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "DELIVER IN PERSON", "SHIP"]);
         let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2, 1, 0], 0);
         let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3, 4, 5]), 5, 0);
@@ -528,7 +529,7 @@ mod tests {
     fn duplicate_dictionary_entries_disable_view_eq() {
         init_test_free_pool(4);
         let table = string_and_i32_table(3, true);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let dict = make_dict_page(metadata.clone(), 0, &["AIR", "AIR", "RAIL"]);
         let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2], 0);
         let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0);
@@ -546,7 +547,7 @@ mod tests {
     fn mixed_encoding_chunk_is_not_view_filtered() {
         init_test_free_pool(4);
         let table = string_and_i32_table(3, false);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "SHIP"]);
         let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 0], 0);
         let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0);
@@ -564,7 +565,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["a"]);
         let table = make_test_table(schema, 5);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0);
 
         let out = run_unary(new_decoder(&table, 1024), vec![page]);
@@ -579,7 +580,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["a", "b"]);
         let table = make_test_table(schema, 3);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page_a = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0);
         let page_b = make_data_page(metadata, 1, encode_i32s(&[40, 50, 60]), 3, 0);
 
@@ -596,7 +597,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["a"]);
         let table = make_test_table(schema, 5);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0);
 
         let out = run_unary_to_completion(new_decoder(&table, 2), vec![page]);
@@ -613,7 +614,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["a"]);
         let table = make_test_table(schema, 5);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page0 = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0);
         let page1 = make_data_page(metadata, 0, encode_i32s(&[40, 50]), 2, 1);
 
@@ -631,7 +632,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["a"]);
         let table = make_test_table(schema, 3);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0);
         let late_page = make_data_page(metadata, 0, encode_i32s(&[99]), 1, 1);
 
@@ -646,7 +647,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["a"]);
         let table = make_test_table(schema, 3);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, Some(vec![]));
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::Indices(vec![]));
         let page = make_skipped_page(metadata, 0, 3, 0);
 
         let out = run_unary(new_decoder(&table, 1024), vec![page]);
@@ -660,7 +661,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["x", "y"]);
         let table = make_test_table(schema, 2);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page_x = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20]), 2, 0);
         let page_y = make_data_page(metadata, 1, encode_i32s(&[30, 40]), 2, 0);
 
@@ -681,7 +682,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["a"]);
         let table = make_test_table(schema, 5);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, Some(vec![0, 1, 2]));
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::Indices(vec![0, 1, 2]));
         let mut decoder = new_decoder(&table, 2);
         let mut sink = CollectSender::<RecordBatch>::default();
 
@@ -717,7 +718,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["a"]);
         let table = make_test_table(schema, 3);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30]), 3, 0);
 
         let out = run_unary_to_completion(new_decoder(&table, 2), vec![page]);

@@ -86,7 +86,7 @@ pub use values::{
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
+    use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata, RowSelection};
     use crate::types::table::ParquetTable;
     use arrow_schema::Schema;
     use dispatch::io::{LocalFile, OpenFile};
@@ -106,8 +106,8 @@ pub(crate) mod test_utils {
         })
     }
 
-    pub fn dummy_metadata(filtered_indices: Option<Vec<u32>>) -> QueryRowGroupMetadata {
+    pub fn dummy_metadata(selection: RowSelection) -> QueryRowGroupMetadata {
         let table = ParquetTable::new(vec![dummy_row_group()]);
-        QueryRowGroupMetadata::new(&table, 0, filtered_indices)
+        QueryRowGroupMetadata::new(&table, 0, selection)
     }
 }

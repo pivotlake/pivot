@@ -307,6 +307,7 @@ mod tests {
     use crate::thrift::general::{CompressionCodec, Encoding};
     use crate::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
     use crate::types::filter_mask::FilterMask;
+    use crate::types::metadata::RowSelection;
     use dispatch::memory::init_test_free_pool;
     use dispatch::test_utils::{CollectSender, run_unary};
     use snap::raw::Encoder;
@@ -323,7 +324,7 @@ mod tests {
         CompressedPage {
             worker_id: 0,
             codec: CompressionCodec::SNAPPY,
-            row_group: dummy_metadata(None),
+            row_group: dummy_metadata(RowSelection::All),
             column_idx: 0,
             file_offset: 0,
             span: compressed.len(),
@@ -387,7 +388,7 @@ mod tests {
         CompressedPage {
             worker_id: 0,
             codec: CompressionCodec::SNAPPY,
-            row_group: dummy_metadata(None),
+            row_group: dummy_metadata(RowSelection::All),
             column_idx: 0,
             file_offset: 0,
             span: compressed.len(),
@@ -717,7 +718,7 @@ mod tests {
     #[test]
     fn test_cached_page_counts_live_on_its_row_group() {
         init_test_free_pool(4);
-        let metadata = dummy_metadata(None);
+        let metadata = dummy_metadata(RowSelection::All);
         let mut page = compressed_data_page(&[7u8; 64], 10, None);
         page.row_group = metadata.clone();
 
@@ -738,7 +739,7 @@ mod tests {
     fn test_same_page_is_cached_and_reused() {
         init_test_free_pool(8);
         let payload = vec![0x5Au8; 200];
-        let metadata = dummy_metadata(None);
+        let metadata = dummy_metadata(RowSelection::All);
         let make_page = || {
             let mut page = compressed_data_page(&payload, 10, None);
             page.row_group = metadata.clone();
@@ -769,7 +770,7 @@ mod tests {
     fn test_cache_hit_attaches_the_query_filter_mask() {
         init_test_free_pool(8);
         let payload = vec![0u8; 64];
-        let metadata = dummy_metadata(None);
+        let metadata = dummy_metadata(RowSelection::All);
         let mut first_page = compressed_data_page(&payload, 10, None);
         first_page.row_group = metadata.clone();
         run_unary(Decompressor::default(), vec![first_page]);
@@ -792,7 +793,7 @@ mod tests {
     #[test]
     fn test_distinct_columns_sharing_column_idx_do_not_collide() {
         init_test_free_pool(8);
-        let metadata = dummy_metadata(None);
+        let metadata = dummy_metadata(RowSelection::All);
         let mut col_a = compressed_data_page(&[0xAAu8; 64], 10, None);
         col_a.row_group = metadata.clone();
         col_a.file_offset = 100;
@@ -821,7 +822,7 @@ mod tests {
     #[test]
     fn test_same_offset_different_column_idx_hits() {
         init_test_free_pool(8);
-        let metadata = dummy_metadata(None);
+        let metadata = dummy_metadata(RowSelection::All);
         let payload = vec![0xC7u8; 80];
         let mut first = compressed_data_page(&payload, 10, None);
         first.row_group = metadata.clone();
@@ -856,7 +857,7 @@ mod tests {
         let page = CompressedPage {
             worker_id: 0,
             codec: CompressionCodec::SNAPPY,
-            row_group: dummy_metadata(None),
+            row_group: dummy_metadata(RowSelection::All),
             column_idx: 0,
             file_offset: 0,
             span: compressed.len(),
