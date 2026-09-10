@@ -127,6 +127,28 @@ jobs:
 
       - run: ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
 
+  # Keep branch protection independent of the dynamic check×crate matrix. This
+  # job runs after every matrix cell and exposes one stable required check.
+  summary:
+    name: Summary
+    needs: [matrix, check]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify CI results
+        env:
+          MATRIX_RESULT: ${{ needs.matrix.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+        run: |
+          if [ "$MATRIX_RESULT" != "success" ]; then
+            echo "Matrix generation finished with: $MATRIX_RESULT"
+            exit 1
+          fi
+          if [ "$CHECK_RESULT" != "success" ]; then
+            echo "CI check matrix finished with: $CHECK_RESULT"
+            exit 1
+          fi
+
   # NOTE: we deliberately do NOT suspend the VM here. ci-runner2 runs an hourly
   # `suspend-if-unused` cron that suspends it only when no ci/deploy run is active
   # (across pivotdb + epsio). An unconditional stop job here would suspend the box
