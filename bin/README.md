@@ -134,7 +134,7 @@ candidates, while an individual row group may exceed the target.
 `compact_merge_bytes` sets the accumulated small-file bytes that immediately
 trigger a merge (by default 1.3 times `compact_bytes`), and
 `compact_min_files` sets when the balance fallback is allowed (100 by default).
-`compact_parallelism` limits concurrent, disjoint merge rewrites (3 by default);
+`compact_parallelism` limits concurrent, disjoint merge rewrites (1 by default);
 each merge in flight holds its decoded input rows in memory. Compaction is on by
 default and should run in only one process per datastore (set `compact: false`
 on the others):
