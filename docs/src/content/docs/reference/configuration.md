@@ -41,7 +41,7 @@ unknown fields nested inside a section.
 | `server.bind` | `127.0.0.1:5432` | Address for the Postgres wire endpoint. |
 | `server.memory` | 80% of total memory | Buffer-pool budget. Overrides `PIVOT_MEMORY_PCT`. |
 | `server.workers` | Machine core count | Dispatch worker threads. |
-| `server.refresh_interval` | `30s` | How often in-memory catalogs refresh commits made by other processes. |
+| `server.refresh_interval` | `30s` | How often catalogs refresh commits made by other processes. |
 
 ## Size and duration values
 

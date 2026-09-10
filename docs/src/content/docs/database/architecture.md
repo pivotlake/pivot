@@ -7,12 +7,12 @@ sidebar:
 
 ## System architecture
 
-Pivot separates query execution, data access, and server metadata into distinct layers. This allows the same execution engine to operate with different data sources (such as Iceberg and Delta Lake) and deployment models (such as a local shell or a server cluster).
+Pivot separates query execution, data access, and server metadata into distinct layers. This separation allows the same execution engine to work with different data sources, such as Iceberg and Delta Lake, and across different deployment models, from a local shell to a server cluster. It also allows multiple deployments to share some or all of their underlying data sources, a common metadata layer, or both.
 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 492" role="img" aria-labelledby="map-title map-desc">
 <title id="map-title">Pivot architecture</title>
-<desc id="map-desc">Inside Pivot, the catalog holds a snapshot per query, the planner binds and prunes against it, and the dispatch pool runs the scan on worker threads. The metastore supplies configuration and identity to Pivot; the datastore is the transactional data source Pivot scans and commits to, layered as a Pivot manifest, a Delta log, and Parquet files.</desc>
+<desc id="map-desc">Inside Pivot, the catalog holds a snapshot per query, the planner binds and prunes against it, and the Dispatch pool runs the scan on worker threads. The metastore supplies configuration and identity to Pivot; the datastore is the transactional data source Pivot scans and commits to, layered as a Pivot manifest, a Delta log, and Parquet files.</desc>
 <defs>
 <marker id="map-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
@@ -25,7 +25,6 @@ Pivot separates query execution, data access, and server metadata into distinct 
 <rect x="65" y="225" width="238" height="23" class="arch-strip" />
 <line x1="65" y1="248" x2="303" y2="248" class="arch-rule" />
 <text x="76" y="241" class="arch-label">Catalog</text>
-<text x="292" y="241" text-anchor="end" class="arch-tiny">in memory</text>
 <text x="76" y="270" class="arch-tiny">datastores by name</text>
 <text x="76" y="288" class="arch-tiny">snapshot per query</text>
 <rect x="340" y="224" width="240" height="104" rx="2" class="arch-inner" />
@@ -104,11 +103,11 @@ These responsibilities are divided across five core components:
 
 ### Dispatch execution pool
 
-The dispatch execution engine is responsible for receiving a query’s physical execution plan and reliably executing it across a set of dispatch workers: a collection of workers, one per CPU core, that perform the computation, networking, and I/O required to execute a query.
+The Dispatch execution engine is responsible for receiving a query’s physical execution plan and reliably executing it across a set of Dispatch workers: a collection of workers, one per CPU core, that perform the computation, networking, and I/O required to execute a query.
 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 352" role="img" aria-labelledby="dispatch-pool-title dispatch-pool-desc">
-<title id="dispatch-pool-title">A physical execution plan runs across the dispatch worker pool</title>
+<title id="dispatch-pool-title">A physical execution plan runs across the Dispatch worker pool</title>
 <desc id="dispatch-pool-desc">The query's physical execution plan is dispatched to a pool with one worker per CPU core. Workers 1, 2, and N each perform computation, networking, and other I/O.</desc>
 <defs>
 <marker id="dispatch-pool-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -147,9 +146,13 @@ The dispatch execution engine is responsible for receiving a query’s physical 
 </svg>
 </figure>
 
-Once a query has been "dispatched" to the pool, each CPU worker is in charge of executing its share of the physical plan and scheduling the operations within it so that the query runs as efficiently as possible. For example, if a worker has just emitted an output that is hot in the CPU's cache, that worker will prefer to run the next operator in line over another unrelated operator that works on data which is not cache-resident. Conversely, when multiple queries are running at the same time, workers split the available CPU resources between all running queries in a "smart" way, striking a balance between cache efficiency and making sure that one query doesn't starve the other.
+Once a query has been dispatched to the pool, each CPU worker is responsible for executing its share of the physical plan and scheduling operations to make efficient use of the CPU caches. If a worker has just produced an output that is still hot in cache, for example, it will prefer to continue with the next operator in the pipeline rather than switch to unrelated work whose data is not cache-resident.
 
-Beyond CPU work, the dispatch worker also handles IO requests and prioritizes between them. For example, a "Materialize" operator that enriches existing data with additional columns, takes precedence over the input operator feeding it, to prevent a scenario where the channel between the two fills up and takes all available memory.
+Workers try to preserve this locality whenever possible, but not at the expense of parallelism. Cross-worker work stealing allows idle workers to pick up work from busier ones, keeping execution balanced and preventing a single worker from becoming a bottleneck while other CPU cores sit idle.
+
+When multiple queries run concurrently, workers try to balance how CPU resources are shared between them. Scheduling favors cache locality when possible, while ensuring that no single query monopolizes the available CPU time or causes other queries to starve.
+
+Beyond CPU work, the Dispatch worker also handles IO requests and prioritizes between them. For example, a "Materialize" operator that enriches existing data with additional columns, takes precedence over the input operator feeding it, to prevent a scenario where the channel between the two fills up and takes all available memory.
 
 <figure class="arch-figure" style="max-width: 620px;">
 <svg viewBox="0 0 620 104" role="img" aria-labelledby="materialize-priority-title materialize-priority-desc">
@@ -178,10 +181,6 @@ Beyond CPU work, the dispatch worker also handles IO requests and prioritizes be
 
 <span id="dispatch"></span>
 
-Dispatch splits the surviving row groups across worker threads. A single row
-group can be split across workers when its decode is expensive enough to be
-worth sharing.
-
 ### Planner
 
 Pivot's planner uses a fork of DuckDB to parse SQL, resolve table and column references, and optimize the logical plan. Pivot then translates that plan into its own execution operators.
@@ -191,12 +190,12 @@ A query passes through four stages:
 1. Parsing - DuckDB's PostgreSQL-derived parser checks the SQL syntax and builds an abstract syntax tree (AST) representing the statement's expressions and clauses, such as projections, filters, joins, and ordering.
 2. Binding and logical planning - the binder resolves table and column references against the query's catalog snapshot, resolves aliases and function calls, and checks expression types. It produces a logical plan describing the operations needed to answer the query.
 3. Logical optimization - the optimizer rewrites the plan to reduce unnecessary work. This includes evaluating constant expressions in advance, pushing filters closer to table scans, removing unused columns, choosing join order using available row-count estimates, and more.
-4. Physical translation and compilation - Pivot converts the optimized logical plan into its own operators and expressions, then applies additional refinements, such as pushing eligible limits into grouped aggregations. It selects execution implementations for scans, joins, and aggregations and connects the operators into a parallel dataflow ready to run on the dispatch worker pool.
+4. Physical translation and compilation - Pivot converts the optimized logical plan into its own operators and expressions, then applies additional refinements, such as pushing eligible limits into grouped aggregations. It selects execution implementations for scans, joins, and aggregations and connects the operators into a parallel dataflow ready to run on the Dispatch worker pool.
 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 290" role="img" aria-labelledby="planner-flow-title planner-flow-desc">
 <title id="planner-flow-title">From SQL to a Pivot execution plan</title>
-<desc id="planner-flow-desc">SQL passes through four stages in the query planner: parsing into an AST, binding and logical planning using the catalog snapshot, logical optimization, and physical translation and compilation into a dataflow for the dispatch pool. The dashed arrow supplies catalog metadata to binding.</desc>
+<desc id="planner-flow-desc">SQL passes through four stages in the query planner: parsing into an AST, binding and logical planning using the catalog snapshot, logical optimization, and physical translation and compilation into a dataflow for the Dispatch pool. The dashed arrow supplies catalog metadata to binding.</desc>
 <defs>
 <marker id="planner-flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
@@ -242,7 +241,7 @@ any column data is decoded.
 
 ### Catalog
 
-The catalog is Pivot's in-memory bridge between the [planner](#planner) and the
+The catalog is Pivot's bridge between the [planner](#planner) and the
 [datastores](#datastore).
 It keeps track of the datastores available on a server and routes table lookups
 to the right one. Through this interface, the planner discovers schemas and
@@ -358,7 +357,7 @@ Thanks to the separation of datastores and metastore, different instances / depl
 </svg>
 </figure>
 
-#### Sharing a metastore across a cluster of instances
+#### Sharing a metastore across deployments
 
 > **Upcoming:** PostgreSQL-backed metastores are under development and are not
 > available in the current release. The configuration may change before the
@@ -426,3 +425,83 @@ Keeping this metadata in a simple to setup PostgreSQL endpoint makes a Pivot clu
 Any user or datastore created on one instance is immediately visible to all other instances. Scaling rules and other cluster-wide configuration can be coordinated from a single central location.
 
 ## Deployment Architecture
+
+Pivot can run as a standalone SQL shell on top of a [datastore](#datastore) or as a server accepting client connections. Both modes use the same Catalog, Planner, and Dispatch pool, running together in a single process. Cluster deployments with a shared PostgreSQL metastore are planned.
+
+### Standalone
+
+`pivot open` starts an interactive SQL shell with its own query engine. It
+opens one datastore and uses an ephemeral metastore for the session. Queries
+execute on the machine running the shell, including when the data is stored
+remotely.
+
+Open a local datastore with:
+
+```sh
+pivot open ./pivot-data
+```
+
+Or open a datastore in object storage, with credentials supplied through the
+environment:
+
+```sh
+pivot open s3://my-bucket/pivot-data
+```
+
+Tables and data remain in the datastore after the shell exits. The
+`--memory` and `--workers` options control the shell's memory budget and
+Dispatch worker count. See the [Quickstart](/docs/quickstart/) for installation
+and credential setup.
+
+A local datastore directory can be opened by only one Pivot process at a
+time. Use a remote datastore when multiple instances need to access the same
+data.
+
+### Server
+
+`pivot server` runs a persistent SQL endpoint that accepts connections from
+applications, BI tools, and PostgreSQL clients. Each connection submits its
+queries to the server's query engine; concurrent connections share that
+instance's compute resources.
+
+Create a YAML configuration using the
+[server configuration example](/docs/reference/configuration/#example), then
+start the server:
+
+```sh
+pivot server --config pivot.yaml
+```
+
+With the example configuration, connect from another terminal using:
+
+```sh
+psql -h 127.0.0.1 -p 5432 -U pivot
+```
+
+The `server` configuration controls the listening address, memory budget,
+worker count, and other instance settings. The `metastore` configuration
+defines the datastores, storage credentials, and users available through
+that server. A server can expose multiple datastores and execute queries
+across them.
+
+Separate servers can access the same remote datastores while using their own
+configuration. Commits made by another instance become visible through
+background refresh, controlled by `server.refresh_interval`. Enable
+compaction and vacuum in one process per shared datastore, as described in
+[datastore maintenance](/docs/reference/server/datastores/#maintenance).
+
+### Cluster (upcoming)
+
+The planned cluster deployment places multiple Pivot server instances behind
+a common SQL endpoint. A load balancer routes each client connection to an
+instance, which plans and executes that connection's queries using its own
+compute resources.
+
+Instances will share remote datastores and a PostgreSQL-backed metastore for
+datastore definitions, credentials, and users. Adding instances will provide
+more capacity for concurrent workloads while keeping the data in shared
+storage. See [Sharing a metastore across deployments](#sharing-a-metastore-across-deployments)
+for the proposed architecture.
+
+Distributing a single query across multiple instances through MPP execution
+is a separate, longer-term [roadmap item](/docs/database/roadmap/#execution-enhancements).
