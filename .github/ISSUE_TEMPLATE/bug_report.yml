@@ -1,0 +1,73 @@
+name: Bug report
+description: Report incorrect, unexpected, or unstable behavior in Pivot
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Pivot. A small, self-contained reproduction is the fastest way for us to investigate.
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened?
+      description: Describe the behavior you observed and its impact.
+      placeholder: Tell us what went wrong, including any error message or incorrect result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How can we reproduce it?
+      description: Include the smallest SQL, schema, sample data, commands, and non-default configuration that demonstrate the problem.
+      placeholder: |
+        1. Start Pivot with ...
+        2. Create or load ...
+        3. Run ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+      description: Explain the result or behavior you expected.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Pivot version
+      description: Paste the output of `pivot --version`, or provide the commit SHA for a source build.
+      placeholder: 0.1.0 or commit abc1234
+    validations:
+      required: true
+
+  - type: dropdown
+    id: run_mode
+    attributes:
+      label: How are you running Pivot?
+      options:
+        - pivot open
+        - pivot server
+        - Docker
+        - Another setup
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the operating system, architecture, and deployment details that may be relevant.
+      placeholder: Ubuntu 24.04, x86_64, installed from the APT repository
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Logs and additional context
+      description: Add relevant logs, query plans, screenshots, profiles, or links to related issues. Remove credentials and sensitive data.
