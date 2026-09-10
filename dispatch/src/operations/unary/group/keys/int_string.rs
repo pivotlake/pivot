@@ -22,7 +22,7 @@ use crate::arrays::{ArrayBuilder, PrimitiveBuilder, SlabColumn};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::{LiveKey, PersistedKey};
-use crate::operations::unary::group::keys::string::ArenaKey;
+use crate::operations::unary::group::keys::string::{ArenaKey, InputBufferSlots};
 use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor, StoredKey};
 use ahash::RandomState;
 use arrow_array::types::ArrowPrimitiveType;
@@ -137,10 +137,12 @@ impl<N: Copy + Default + PartialEq + Send + Sync + 'static> LiveKey for IntStrRe
     }
 }
 
-/// Per-batch reader: the two downcast key columns.
+/// Per-batch reader: the two downcast key columns plus the arena slots of the
+/// string column's data buffers, registered only if a row is scattered.
 pub struct IntStrReader<'b, T: ArrowPrimitiveType> {
     ints: &'b PrimitiveArray<T>,
     strings: &'b StringViewArray,
+    input_buffers: InputBufferSlots,
 }
 
 /// `GROUP BY` over one integer column and one string column, integer first:
@@ -187,6 +189,7 @@ where
                 .as_any()
                 .downcast_ref::<StringViewArray>()
                 .expect("string key column type mismatch"),
+            input_buffers: InputBufferSlots::default(),
         }
     }
 
@@ -215,6 +218,21 @@ where
             int: unsafe { reader.ints.value_unchecked(idx) },
             string: unsafe { reader.strings.value_unchecked(idx) },
         }
+    }
+
+    /// A scattered key's string points into the input batch's own buffer.
+    #[inline(always)]
+    fn scatter_key(
+        reader: &mut Self::Reader<'_>,
+        idx: usize,
+        arena: &mut WorkerArena,
+    ) -> IntStrKey<T::Native> {
+        IntStrKey::from_parts(
+            unsafe { reader.ints.value_unchecked(idx) },
+            reader
+                .input_buffers
+                .key_at(reader.strings, idx, arena.shared()),
+        )
     }
 }
 

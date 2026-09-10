@@ -88,7 +88,9 @@
 //! - [`factory`] — [`GroupFactory`] for creating per-worker [`Group`] instances
 
 pub(crate) mod arena;
+mod count_bounds;
 mod hll;
+use count_bounds::{SlotCountTotals, TopKBounds};
 use hll::Hll;
 mod factory;
 mod keys;
@@ -162,6 +164,23 @@ impl GroupLimit {
     pub(crate) fn row_limit(self) -> usize {
         match self {
             GroupLimit::TopK { limit, .. } | GroupLimit::First { limit } => limit,
+        }
+    }
+
+    /// The value slot a pruned merge can bound, when this is a top-k over a
+    /// COUNT: counts are additive and never negative, so summing every
+    /// partial count in a hash range bounds any single group's final count.
+    pub(crate) fn prunable_count_slot(self, value_slots: &[AggregationSlot]) -> Option<usize> {
+        match self {
+            GroupLimit::TopK { slot, .. }
+                if matches!(
+                    value_slots[slot].kind,
+                    AggregationKind::CountStar | AggregationKind::Count
+                ) =>
+            {
+                Some(slot)
+            }
+            _ => None,
         }
     }
 }
@@ -257,6 +276,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         } else {
             radix
         };
+        let topk_count_slot =
+            output_limit.and_then(|limit| limit.prunable_count_slot(&value_slots));
         // The per-worker write context is spawned from the shared one (a fresh
         // `WorkerArena` for a string value, `()` for numeric).
         let aggregated_table = AggregatedTable::new(
@@ -265,6 +286,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
             shared_context.clone(),
             shared_context.worker(),
             radix,
+            topk_count_slot,
         );
         Self {
             key_cols,
@@ -394,6 +416,9 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// `None` when this job's merge result is already final (single-node pool
     /// or direct merge).
     cross_node_merge: Option<Arc<CrossNodeMerge<K, V>>>,
+    /// Under a pruned top-k, the bounds this job checks before and while
+    /// merging, shared by every job of the query.
+    topk_bounds: Option<Arc<TopKBounds>>,
     key_arena: Arc<SharedArena>,
     /// The arena's ring buffers wrapped as Arrow `Buffer`s, built once for the
     /// whole output phase and shared by every partition job. String-key output
@@ -441,7 +466,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
         }
     }
 
-    /// Send this node's merged table. Exactly one call - the last - returns
+    /// Send this node's merged table, or `None` when this node's job was
+    /// pruned and has nothing to merge. Exactly one call - the last - returns
     /// the full set; that caller must run the final merge. Each sender's push
     /// happens-before its countdown decrement, and the last sender's
     /// decrement observes all of them, so the drain below is guaranteed to
@@ -449,9 +475,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
     /// the queue).
     fn send(
         &self,
-        table: MultiSlabTable<K::Persisted, V>,
+        table: Option<MultiSlabTable<K::Persisted, V>>,
     ) -> Option<Vec<MultiSlabTable<K::Persisted, V>>> {
-        self.node_tables.push(table);
+        if let Some(table) = table {
+            self.node_tables.push(table);
+        }
         if self.pending_sends.fetch_sub(1, Ordering::AcqRel) != 1 {
             return None;
         }
@@ -478,29 +506,48 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
-        let result_map = merge::merge_combined::<K::Stored, V>(
-            self.index,
-            &self.buffers,
-            &self.tables,
-            self.partition_capacity,
-            self.num_partitions,
-            &self.key_arena,
-            &self.shared_context,
-        );
+        // A partition no group of which can reach the k-th best is not
+        // merged at all; on a hierarchical merge it still completes its
+        // partition's rendezvous so the other nodes' jobs are not left
+        // waiting for it.
+        let pruned = self
+            .topk_bounds
+            .as_ref()
+            .is_some_and(|bounds| bounds.skips_partition(self.index));
+        let result_map = if pruned {
+            None
+        } else {
+            Some(merge::merge_combined::<K::Stored, V>(
+                self.index,
+                &self.buffers,
+                &self.tables,
+                self.partition_capacity,
+                self.num_partitions,
+                &self.key_arena,
+                &self.shared_context,
+                self.topk_bounds
+                    .as_ref()
+                    .and_then(|bounds| bounds.entry_filter()),
+            ))
+        };
         let result_map = match &self.cross_node_merge {
             None => result_map,
             Some(cross_node) => match cross_node.send(result_map) {
                 // Another node's job for this partition is still running; it
                 // will receive the tables and run the final merge.
                 None => return Ok(()),
-                Some(node_tables) => merge::merge_node_aggregated_tables::<K::Stored, V>(
+                Some(node_tables) if node_tables.is_empty() => None,
+                Some(node_tables) => Some(merge::merge_node_aggregated_tables::<K::Stored, V>(
                     node_tables,
                     self.partition_capacity,
                     self.num_partitions.trailing_zeros(),
                     &self.key_arena,
                     &self.shared_context,
-                ),
+                )),
             },
+        };
+        let Some(result_map) = result_map else {
+            return Ok(());
         };
         if result_map.len() == 0 {
             return Ok(());
@@ -521,7 +568,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
                 self.value_output_types.clone(),
             )
         });
-        acc.extend_from_table(result_map, allocator, &mut *sender)
+        acc.extend_from_table(result_map, allocator, &mut *sender)?;
+        // This worker's heap now holds `k` exact groups, so its k-th value
+        // is a floor on the final k-th best that later jobs can prune by.
+        if let (Some(bounds), Some(kth_best)) = (&self.topk_bounds, acc.kth_best()) {
+            bounds.threshold().raise(kth_best);
+        }
+        Ok(())
     }
 }
 
@@ -547,6 +600,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // switched worker also holds over-counts, which only over-sizes the
         // merge targets (safe); under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
+        // Under a pruned top-k every worker reports its count totals; summed,
+        // they bound every group of the query.
+        let mut count_totals: Option<SlotCountTotals> = None;
         for out in outputs {
             if out.buffers.is_none() {
                 non_switched_groups += out.tables.iter().map(|t| t.len()).sum::<usize>();
@@ -557,6 +613,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             }
             hll.merge(&out.hll);
             self.zero_hash_pending |= out.zero_hash_seen;
+            if let Some(worker_totals) = out.count_totals {
+                match &mut count_totals {
+                    Some(totals) => totals.merge_from(&worker_totals),
+                    None => count_totals = Some(worker_totals),
+                }
+            }
         }
         let any_switched = buffers_by_node.iter().any(|b| !b.is_empty());
         let total_in_place: usize = tables_by_node.iter().flatten().map(|t| t.len()).sum();
@@ -662,6 +724,16 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // Held by the jobs (and the batches they emit), never by the arena, so
         // there is no `arena -> Buffer -> arena` cycle.
         let output_buffers: Arc<[Buffer]> = self.key_arena.to_arrow_buffers();
+        // Under a pruned top-k the queues are filled heaviest partition first:
+        // the first jobs fill the workers' heaps with the largest groups and
+        // raise the threshold that lets the lighter jobs skip themselves.
+        let topk_bounds =
+            count_totals.map(|totals| Arc::new(TopKBounds::new(totals, num_partitions)));
+        let mut partition_order: Vec<usize> = (0..num_partitions).collect();
+        if let Some(bounds) = &topk_bounds {
+            partition_order
+                .sort_by_key(|&partition| std::cmp::Reverse(bounds.partition_bound(partition)));
+        }
         // All jobs are pushed before the injected flag flips, so a drained
         // queue means a finished phase.
         let push_job = |injector: &Injector<PartitionJob<K, V>>,
@@ -674,6 +746,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 tables,
                 index,
                 cross_node_merge,
+                topk_bounds: topk_bounds.clone(),
                 key_arena: self.key_arena.clone(),
                 output_buffers: output_buffers.clone(),
                 partition_capacity,
@@ -697,7 +770,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             // transient memory the final cross-node merge frees.
             let buffers_by_node: Vec<_> = buffers_by_node.into_iter().map(Arc::new).collect();
             let tables_by_node: Vec<_> = tables_by_node.into_iter().map(Arc::new).collect();
-            for i in 0..num_partitions {
+            for i in partition_order {
                 let cross_node_merge = Arc::new(CrossNodeMerge::new(node_count));
                 for (node, injector) in self.injectors.iter().enumerate() {
                     push_job(
@@ -714,9 +787,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             // the node queues so all workers share the load.
             let buffers = Arc::new(buffers_by_node.into_iter().flatten().collect::<Vec<_>>());
             let tables = Arc::new(tables_by_node.into_iter().flatten().collect::<Vec<_>>());
-            for i in 0..num_partitions {
+            for (queue, i) in partition_order.into_iter().enumerate() {
                 push_job(
-                    &self.injectors[i % node_count],
+                    &self.injectors[queue % node_count],
                     i,
                     None,
                     buffers.clone(),
@@ -1190,6 +1263,136 @@ mod tests {
             pairs.iter().all(|&(k, c)| (0..1000).contains(&k) && c == 1),
             "every survivor is a real group"
         );
+    }
+
+    /// Two workers' halves of a skewed key stream: three heavy keys (0, 1, 2
+    /// with 300, 200 and 100 rows) among 2000 keys seen once, interleaved so
+    /// both workers hold part of every heavy group.
+    fn skewed_worker_batches() -> Vec<Vec<RecordBatch>> {
+        let mut values: Vec<i32> = Vec::new();
+        for i in 0..2000 {
+            values.push(i + 3);
+            if i < 300 {
+                values.push(0);
+            }
+            if i < 200 {
+                values.push(1);
+            }
+            if i < 100 {
+                values.push(2);
+            }
+        }
+        let (left, right) = values.split_at(values.len() / 2);
+        vec![
+            vec![batch_with_column(left)],
+            vec![batch_with_column(right)],
+        ]
+    }
+
+    #[test]
+    fn pruned_top_k_finds_the_heaviest_groups_across_the_radix_switch() {
+        // The small radix config makes both workers switch to raw scatter
+        // partway through, so the heavy groups are split between in-place
+        // tables and scattered rows on both sides of the merge.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+
+        let sender = run_group_full::<IntExtractor, CountValue>(
+            skewed_worker_batches(),
+            vec![0],
+            count_slots(),
+            Some(GroupLimit::TopK { slot: 0, limit: 3 }),
+            radix,
+        );
+
+        let pairs = group_counts(&sender);
+        for heavy in [(0, 300), (1, 200), (2, 100)] {
+            assert!(pairs.contains(&heavy), "missing {heavy:?} in {pairs:?}");
+        }
+        assert!(
+            pairs
+                .iter()
+                .all(|&(k, c)| c == [300, 200, 100].get(k as usize).copied().unwrap_or(1)),
+            "every emitted count is exact: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn pruned_top_k_over_long_string_keys_scatters_without_copying() {
+        // Every key is longer than the inline view, so scattered rows point
+        // at the input batches' own buffers. Two workers each see part of the
+        // heavy keys, and the merge must resolve keys from both sources.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+        let key = |i: i32| format!("string-key-number-{i:05}");
+        let mut values: Vec<String> = Vec::new();
+        for i in 0..2000 {
+            values.push(key(i + 3));
+            if i < 300 {
+                values.push(key(0));
+            }
+            if i < 100 {
+                values.push(key(1));
+            }
+        }
+        let strs: Vec<&str> = values.iter().map(String::as_str).collect();
+        let (left, right) = strs.split_at(strs.len() / 2);
+
+        let sender = run_group_full::<StringKeyExtractor, CountValue>(
+            vec![vec![string_key_batch(left)], vec![string_key_batch(right)]],
+            vec![0],
+            count_slots(),
+            Some(GroupLimit::TopK { slot: 0, limit: 2 }),
+            radix,
+        );
+
+        let pairs = string_group_pairs(&sender);
+        assert!(pairs.contains(&(key(0), 300)), "{pairs:?}");
+        assert!(pairs.contains(&(key(1), 100)), "{pairs:?}");
+    }
+
+    #[test]
+    fn pruned_top_k_over_int_string_keys_scatters_without_copying() {
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+        let long = "a-string-well-over-twelve-bytes";
+        let mut ids: Vec<i64> = Vec::new();
+        let mut names: Vec<&str> = Vec::new();
+        for i in 0..2000 {
+            ids.push(i + 10_000);
+            names.push(long);
+            if i < 300 {
+                ids.push(7);
+                names.push(long);
+            }
+            if i < 100 {
+                ids.push(7);
+                names.push("short");
+            }
+        }
+        let mid = ids.len() / 2;
+        let vals = vec![0; ids.len()];
+
+        let sender = run_group_full::<IntStrKeyExtractor<arrow_array::types::Int64Type>, CountValue>(
+            vec![
+                vec![mixed_key_batch(&ids[..mid], &names[..mid], &vals[..mid])],
+                vec![mixed_key_batch(&ids[mid..], &names[mid..], &vals[mid..])],
+            ],
+            vec![0, 1],
+            count_slots(),
+            Some(GroupLimit::TopK { slot: 0, limit: 2 }),
+            radix,
+        );
+
+        let rows = row_key_rows(&sender);
+        assert!(rows.contains(&(7, long.to_string(), 300)), "{rows:?}");
+        assert!(rows.contains(&(7, "short".to_string(), 100)), "{rows:?}");
     }
 
     // ---- Row-encoded multi-column keys (`RowKeyExtractor`) ----

@@ -8,22 +8,41 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Pointer-table slots reserved beyond the ring's own buffers for input
+/// buffers registered by [`SharedArena::register_input_buffer`]. The table is
+/// allocated zeroed and backed lazily, so unused headroom costs nothing.
+const INPUT_BUFFER_SLOTS: usize = 1 << 20;
+
+/// One registered buffer: where its bytes start and how many there are.
+#[derive(Clone, Copy)]
+struct BufferSlot {
+    ptr: *mut u8,
+    len: usize,
+}
+
 /// Shared arena holding all string buffers across workers.
 ///
-/// Buffer pointers are stored in a plain pointer array for zero-overhead resolution.
+/// Buffer pointers are stored in a plain array for zero-overhead resolution.
 /// Safety: `next_idx` (atomic) guarantees each slot is written by exactly one thread.
 /// Cross-thread visibility is ensured by the gather barrier between consume and merge phases.
+///
+/// A slot is either a ring buffer a worker wrote strings into, or an input
+/// batch's own string buffer registered as-is so scattered keys can point at
+/// it without copying a byte. Keys resolve through the table the same way
+/// either way.
 pub struct SharedArena {
     /// We want to have all u128 views point to a centralized place shared by all workers;
     /// this allows us in merge time to simply copy the u128s as is when creating the record batch,
     /// instead of needing to recreate pointers (if we need to shuffle pointers around). We also want
     /// all `resolve` calls (get a pointer from a u128) to be lock-free.
     ///
-    /// We therefore need a ptrs array *that is initialized in advance*, i.e., that it is never moved
-    ptrs: Box<[UnsafeCell<*mut u8>]>,
+    /// We therefore need a slot array *that is initialized in advance*, i.e., that it is never moved
+    slots: Box<[UnsafeCell<BufferSlot>]>,
     next_idx: AtomicU32,
     /// Owns WriteBuffers so ring memory stays alive until the arena is dropped.
     buffers: Mutex<Vec<WriteBuffer>>,
+    /// Keeps registered input buffers alive until the arena is dropped.
+    input_buffers: Mutex<Vec<Buffer>>,
 }
 
 unsafe impl Send for SharedArena {}
@@ -31,44 +50,54 @@ unsafe impl Sync for SharedArena {}
 impl std::panic::RefUnwindSafe for SharedArena {}
 
 impl SharedArena {
-    /// Create a new shared arena with space for up to `ring()` amount of write buffers.
-    pub fn new(buffers: usize) -> Arc<Self> {
-        // The pointer table must never move (`resolve` reads it lock-free), so
-        // it is sized up front for the worst case: every ring slot. Allocate
-        // it zeroed rather than writing nulls (a null pointer is the all-zero
-        // pattern), so the OS backs its pages lazily: a typical query touches
-        // only the first handful of entries, and eagerly writing close to a
-        // megabyte of nulls per arena per query is a measurable fixed cost
-        // on short queries.
-        let ptrs: Box<[UnsafeCell<*mut u8>]> = if buffers == 0 {
-            Box::new([])
-        } else {
-            let layout = std::alloc::Layout::array::<UnsafeCell<*mut u8>>(buffers).unwrap();
-            unsafe {
-                let raw = std::alloc::alloc_zeroed(layout);
-                if raw.is_null() {
-                    std::alloc::handle_alloc_error(layout);
-                }
-                Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                    raw as *mut UnsafeCell<*mut u8>,
-                    buffers,
-                ))
+    /// Create a new shared arena with room for `ring_buffers` write buffers
+    /// plus [`INPUT_BUFFER_SLOTS`] registered input buffers.
+    pub fn new(ring_buffers: usize) -> Arc<Self> {
+        let capacity = ring_buffers + INPUT_BUFFER_SLOTS;
+        // The slot table must never move (`resolve` reads it lock-free), so
+        // it is sized up front for the worst case. Allocate it zeroed rather
+        // than writing empty slots (a null pointer and zero length are the
+        // all-zero pattern), so the OS backs its pages lazily: a typical query
+        // touches only the first handful of entries, and eagerly writing
+        // megabytes of empty slots per arena per query is a measurable fixed
+        // cost on short queries.
+        let layout = std::alloc::Layout::array::<UnsafeCell<BufferSlot>>(capacity).unwrap();
+        let slots: Box<[UnsafeCell<BufferSlot>]> = unsafe {
+            let raw = std::alloc::alloc_zeroed(layout);
+            if raw.is_null() {
+                std::alloc::handle_alloc_error(layout);
             }
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                raw as *mut UnsafeCell<BufferSlot>,
+                capacity,
+            ))
         };
         Arc::new(Self {
-            ptrs,
+            slots,
             next_idx: AtomicU32::new(0),
             buffers: Mutex::new(Vec::new()),
+            input_buffers: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Claims the next slot and stores the buffer's location in it.
+    fn claim_slot(&self, ptr: *mut u8, len: usize) -> u32 {
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            (idx as usize) < self.slots.len(),
+            "arena slot table exhausted after {} buffers",
+            self.slots.len()
+        );
+        // Safety: fetch_add guarantees unique idx per caller; no two threads write the same slot.
+        unsafe { *self.slots[idx as usize].get() = BufferSlot { ptr, len } };
+        idx
     }
 
     /// Allocate a new write buffer, register its pointer, and return it with its index.
     /// The caller owns the buffer for writing; call [`Self::return_buffer`] when done.
     pub fn take_buffer(&self) -> (WriteBuffer, u32) {
         let wb = memory_ctx().get_write_buffer(false);
-        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
-        // Safety: fetch_add guarantees unique idx per caller; no two threads write the same slot.
-        unsafe { *self.ptrs[idx as usize].get() = wb.ptr };
+        let idx = self.claim_slot(wb.ptr, BUFFER_SIZE);
         (wb, idx)
     }
 
@@ -77,10 +106,19 @@ impl SharedArena {
         self.buffers.lock().unwrap().push(wb);
     }
 
+    /// Registers an input batch's buffer so keys can point into it directly,
+    /// and returns the slot index those keys carry. The arena holds the buffer
+    /// alive for its whole lifetime.
+    pub fn register_input_buffer(&self, buffer: &Buffer) -> u32 {
+        let idx = self.claim_slot(buffer.as_ptr().cast_mut(), buffer.len());
+        self.input_buffers.lock().unwrap().push(buffer.clone());
+        idx
+    }
+
     /// Resolve a non-inline key's buffer slice.
     #[inline]
     pub fn resolve(&self, buffer_index: u32, offset: u32, len: u32) -> &[u8] {
-        let ptr = unsafe { *self.ptrs[buffer_index as usize].get() };
+        let ptr = unsafe { (*self.slots[buffer_index as usize].get()).ptr };
         unsafe { std::slice::from_raw_parts(ptr.add(offset as usize), len as usize) }
     }
 
@@ -90,7 +128,11 @@ impl SharedArena {
     /// only be valid, not currently mapped.
     #[inline(always)]
     pub fn prefetch(&self, buffer_index: u32, offset: u32) {
-        let ptr = unsafe { (*self.ptrs[buffer_index as usize].get()).add(offset as usize) };
+        let ptr = unsafe {
+            (*self.slots[buffer_index as usize].get())
+                .ptr
+                .add(offset as usize)
+        };
         #[cfg(target_arch = "x86_64")]
         unsafe {
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
@@ -104,27 +146,27 @@ impl SharedArena {
         let _ = ptr;
     }
 
-    /// Wrap every registered ring buffer as a shared `Arc<[Buffer]>` for zero-copy
+    /// Wrap every registered buffer as a shared `Arc<[Buffer]>` for zero-copy
     /// `StringViewArray` output. Each `Buffer` holds a clone of the owning
-    /// `Arc<SharedArena>`, so the ring memory stays alive as long as any output
+    /// `Arc<SharedArena>`, so the memory stays alive as long as any output
     /// array points into it. Valid once consume has finished and `next_idx` is final.
     pub fn to_arrow_buffers(self: &Arc<Self>) -> Arc<[Buffer]> {
         let count = self.next_idx.load(Ordering::Acquire) as usize;
         (0..count)
             .map(|i| {
-                let ptr = unsafe { *self.ptrs[i].get() };
+                let slot = unsafe { *self.slots[i].get() };
                 // Each slot in `0..next_idx` is fully written by the time consume
-                // finishes; a null here means this ran before a `take_buffer` that
+                // finishes; a null here means this ran before a `claim_slot` that
                 // reserved slot `i` stored its pointer (a caller-contract violation),
                 // which `new_unchecked` would turn into silent UB.
                 debug_assert!(
-                    !ptr.is_null(),
+                    !slot.ptr.is_null(),
                     "arena buffer {i} read before its pointer was stored"
                 );
                 unsafe {
                     Buffer::from_custom_allocation(
-                        NonNull::new_unchecked(ptr),
-                        BUFFER_SIZE,
+                        NonNull::new_unchecked(slot.ptr),
+                        slot.len,
                         self.clone(),
                     )
                 }

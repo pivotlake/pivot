@@ -131,6 +131,22 @@ pub trait KeyExtractor: Send + 'static {
         idx: usize,
         arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'r>;
+
+    /// Persist row `idx`'s key for a raw scatter row, which is written once
+    /// and never compared against the input again.
+    ///
+    /// The default persists the live key the way a new table entry would. An
+    /// extractor whose keys point at bytes in the input batch can instead
+    /// register the batch's buffers with the arena and hand out keys that
+    /// point straight into them, which is why the reader is mutable here.
+    #[inline(always)]
+    fn scatter_key(
+        reader: &mut Self::Reader<'_>,
+        idx: usize,
+        arena: &mut WorkerArena,
+    ) -> Self::Persisted {
+        Self::live_key(reader, idx, arena).persist()
+    }
 }
 
 /// How a key is stored in a table and read back out of one.

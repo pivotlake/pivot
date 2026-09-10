@@ -236,6 +236,13 @@ impl<K: Ord + Copy, V: Copy, A: HeapBuffer<Ranked<K, V>>> SlabTopK<K, V, A> {
         self.buffer_cap = new_cap;
     }
 
+    /// The smallest retained key once the heap is full: the k-th largest key
+    /// offered so far. `None` while fewer than `cap` items are retained.
+    #[inline]
+    pub fn kth_key(&mut self) -> Option<K> {
+        (self.cap > 0 && self.len == self.cap).then(|| self.buf.cursor()[0].key)
+    }
+
     /// The retained values, in arbitrary (heap) order.
     pub fn values(&mut self) -> impl Iterator<Item = V> + '_ {
         let len = self.len;

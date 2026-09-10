@@ -1,7 +1,9 @@
 mod arena_key;
+mod input_buffers;
 mod live_key;
 
 pub use arena_key::ArenaKey;
+pub(crate) use input_buffers::InputBufferSlots;
 pub use live_key::{ResolvedKey, StringKey};
 
 use crate::arrays::SlabColumn;
@@ -22,6 +24,13 @@ use std::sync::Arc;
 /// `StringViewArray` points directly into the arena's ring buffers.
 pub struct StringKeyExtractor;
 
+/// Per-batch reader: the downcast key column plus the arena slots of its
+/// data buffers, registered only if a row is scattered.
+pub struct StringReader<'b> {
+    array: &'b StringViewArray,
+    input_buffers: InputBufferSlots,
+}
+
 impl KeyExtractor for StringKeyExtractor {
     // Dedup before scatter since strings cost more to write
     const RADIX_DEDUP_BEFORE_SCATTER: bool = true;
@@ -29,7 +38,7 @@ impl KeyExtractor for StringKeyExtractor {
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;
     type Stored = ArenaStored;
-    type Reader<'b> = &'b StringViewArray;
+    type Reader<'b> = StringReader<'b>;
     type ColumnBuilder = StringKeyColumnBuilder;
     type Scratch = ();
 
@@ -39,17 +48,20 @@ impl KeyExtractor for StringKeyExtractor {
         _config: &(),
         _scratch: &'b mut (),
     ) -> Self::Reader<'b> {
-        batch
-            .column(key_cols[0])
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("string key column type mismatch")
+        StringReader {
+            array: batch
+                .column(key_cols[0])
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("string key column type mismatch"),
+            input_buffers: InputBufferSlots::default(),
+        }
     }
 
     #[inline(always)]
     fn prepare_and_hash(reader: &mut Self::Reader<'_>, state: &RandomState, hashes: &mut [u64]) {
         for (i, h) in hashes.iter_mut().enumerate() {
-            *h = state.hash_one(unsafe { reader.value_unchecked(i) });
+            *h = state.hash_one(unsafe { reader.array.value_unchecked(i) });
         }
     }
 
@@ -59,8 +71,16 @@ impl KeyExtractor for StringKeyExtractor {
         idx: usize,
         arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'r> {
-        let val = unsafe { reader.value_unchecked(idx) };
+        let val = unsafe { reader.array.value_unchecked(idx) };
         StringKey::new(arena, val)
+    }
+
+    /// A scattered key points into the input batch's own buffer.
+    #[inline(always)]
+    fn scatter_key(reader: &mut Self::Reader<'_>, idx: usize, arena: &mut WorkerArena) -> ArenaKey {
+        reader
+            .input_buffers
+            .key_at(reader.array, idx, arena.shared())
     }
 }
 

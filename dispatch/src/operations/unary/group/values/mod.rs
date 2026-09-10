@@ -255,8 +255,9 @@ pub trait AggregationValue: Send + Sync + 'static {
     type SharedContext: SharedContext<Worker = Self::WorkerContext>;
     /// Builders for the result's aggregation columns.
     type ColumnBuilder: ValueColumnBuilder<Value = Self, Context = Self::SharedContext>;
-    /// Scalar used by pushed-down ORDER BY and LIMIT.
-    type SortKey: Ord + Copy;
+    /// Scalar used by pushed-down ORDER BY and LIMIT. Widens to `i128` so a
+    /// pruned top-k can turn a COUNT slot into a slot-total weight.
+    type SortKey: Ord + Copy + Into<i128>;
     /// Per-worker consume state.
     type WorkerContext: WorkerContext;
 

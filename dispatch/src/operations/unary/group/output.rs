@@ -17,6 +17,7 @@ use crate::memory::{
 };
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
+use crate::operations::unary::group::count_bounds::count_weight;
 use crate::operations::unary::group::hashtables::Table;
 use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
 use crate::operations::unary::group::values::{
@@ -334,6 +335,17 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
         sender.send(batch)?;
         Ok(())
+    }
+
+    /// The k-th best value in this worker's top-k heap once it holds `k`
+    /// groups, as a slot-total weight; `None` before then or without a heap.
+    pub(crate) fn kth_best(&mut self) -> Option<u64> {
+        let kth = match &mut self.mode {
+            OutputMode::TopK(TopKHeap::Single { heap, .. }) => heap.kth_key()?,
+            OutputMode::TopK(TopKHeap::Multi { heap, .. }) => heap.kth_key()?,
+            OutputMode::First { .. } | OutputMode::Unlimited => return None,
+        };
+        Some(count_weight(kth))
     }
 
     /// Take the top-k heap if in `TopK` mode, switching to `Unlimited` so the heap

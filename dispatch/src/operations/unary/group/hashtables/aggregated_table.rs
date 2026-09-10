@@ -20,9 +20,10 @@ use crate::RECORD_BATCH_SIZE;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
+use crate::operations::unary::group::count_bounds::{SlotCountTotals, count_weight};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, PersistedKey,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, PersistedKey,
     StridedScatterRows,
 };
 use crate::operations::unary::group::hll::Hll;
@@ -82,6 +83,9 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
     /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
     pub zero_hash_seen: bool,
+    /// Under a pruned top-k, every partial count this worker holds, by hash
+    /// slot: the scattered rows plus the in-place entries.
+    pub count_totals: Option<SlotCountTotals>,
 }
 
 /// Per-worker aggregation state.
@@ -102,6 +106,15 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     hll: Hll,
     /// Whether this worker has entered radix mode.
     switched_to_radix: bool,
+    /// Whether radix mode keeps deduplicating in the bounded table and
+    /// scatters distinct entries, or scatters every row raw. The extractor's
+    /// preference, except under a pruned top-k, which always scatters raw so
+    /// the count totals see each row once and no string is copied.
+    dedup_before_scatter: bool,
+    /// Under a pruned top-k, the running count totals by hash slot, and the
+    /// value slot whose partial counts feed them.
+    count_totals: Option<SlotCountTotals>,
+    topk_count_slot: usize,
     /// Radix threshold and partition count.
     radix_config: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
@@ -124,9 +137,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         shared_context: V::SharedContext,
         worker_context: V::WorkerContext,
         radix_config: RadixConfig,
+        topk_count_slot: Option<usize>,
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = BaseHashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
+        let count_totals = topk_count_slot.map(|_| SlotCountTotals::new(&mut allocator));
         Self {
             hash_state,
             shared_context,
@@ -137,6 +152,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             buffers: None,
             hll: Hll::new(),
             switched_to_radix: false,
+            dedup_before_scatter: K::RADIX_DEDUP_BEFORE_SCATTER && topk_count_slot.is_none(),
+            count_totals,
+            topk_count_slot: topk_count_slot.unwrap_or(0),
             radix_config,
             hashes: vec![0u64; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
@@ -294,14 +312,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 &mut self.hashes[..length],
             );
 
-            // Fixed-width keys scatter directly after the transition. Keys on
-            // the abandon route continue through the in-place table.
-            if self.switched_to_radix && !K::RADIX_DEDUP_BEFORE_SCATTER {
-                self.scatter_range(0, length, &key_reader, &value_reader);
+            // Raw-scatter keys scatter directly after the transition. Keys
+            // that deduplicate first continue through the in-place table.
+            if self.switched_to_radix && !self.dedup_before_scatter {
+                self.scatter_range(0, length, &mut key_reader, &value_reader);
             } else {
                 self.consume_in_place::<INLINE_PROBE>(
                     length,
-                    &key_reader,
+                    &mut key_reader,
                     &value_reader,
                     shared_context,
                 );
@@ -315,7 +333,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     fn consume_in_place<'b, const INLINE_PROBE: bool>(
         &mut self,
         length: usize,
-        key_reader: &K::Reader<'b>,
+        key_reader: &mut K::Reader<'b>,
         value_reader: &V::Reader<'b>,
         shared_context: &V::SharedContext,
     ) {
@@ -341,7 +359,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                         zero_hash_seen,
                         next_row: &mut i,
                         length,
-                        key_reader,
+                        key_reader: &*key_reader,
                         value_reader,
                         shared_context,
                     },
@@ -359,8 +377,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     /// Grows the in-place stack or enters radix mode.
     ///
     /// Returns `true` when the caller should scatter the remaining raw rows.
-    /// Abandon-route keys instead drain the deduplicated table and return
-    /// `false`, allowing the caller to continue probing with the cleared table.
+    /// Keys that deduplicate first instead drain the deduplicated table and
+    /// return `false`, allowing the caller to continue probing with the
+    /// cleared table.
     #[inline(always)]
     fn grow_or_radix(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
@@ -382,7 +401,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             );
         }
         self.switched_to_radix = true;
-        if K::RADIX_DEDUP_BEFORE_SCATTER {
+        if self.dedup_before_scatter {
             self.scatter_active_table_to_radix_partitions();
             false
         } else {
@@ -396,7 +415,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         &mut self,
         start: usize,
         end: usize,
-        key_reader: &K::Reader<'b>,
+        key_reader: &mut K::Reader<'b>,
         value_reader: &V::Reader<'b>,
     ) {
         let shift = u64::BITS - self.radix_config.partitions.trailing_zeros();
@@ -408,6 +427,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             hll,
             hashes,
             shared_context,
+            count_totals,
+            topk_count_slot,
             ..
         } = self;
         V::dispatch_arity(
@@ -419,6 +440,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 allocator,
                 hll,
                 hashes,
+                count_totals: count_totals.as_mut(),
+                topk_count_slot: *topk_count_slot,
                 shift,
                 start,
                 end,
@@ -467,6 +490,18 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 }
             }
         }
+        // Scattered rows were folded into the totals as they were written;
+        // the in-place entries hold the rest of this worker's partial counts.
+        if let Some(count_totals) = &mut self.count_totals {
+            for table in &self.tables {
+                for entry in table.iter(0) {
+                    count_totals.fold(
+                        entry.hash,
+                        count_weight(entry.stored.sort_key(self.topk_count_slot)),
+                    );
+                }
+            }
+        }
         self.key_arena.flush();
         self.worker_context.flush();
         AggregatedTableOutput {
@@ -475,6 +510,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             buffers: self.buffers.map(PartitionBuffers),
             hll: self.hll,
             zero_hash_seen: self.zero_hash_seen,
+            count_totals: self.count_totals,
         }
     }
 }
@@ -654,10 +690,12 @@ struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
     allocator: &'a mut SlabAllocator,
     hll: &'a mut Hll,
     hashes: &'a [u64; RECORD_BATCH_SIZE],
+    count_totals: Option<&'a mut SlotCountTotals>,
+    topk_count_slot: usize,
     shift: u32,
     start: usize,
     end: usize,
-    key_reader: &'a K::Reader<'b>,
+    key_reader: &'a mut K::Reader<'b>,
     value_reader: &'a V::Reader<'b>,
     shared_context: &'a V::SharedContext,
 }
@@ -673,6 +711,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
             allocator,
             hll,
             hashes,
+            mut count_totals,
+            topk_count_slot,
             shift,
             start,
             end,
@@ -690,10 +730,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
             let hash = hashes[i];
             hll.add(hash);
             let partition = (hash >> shift) as usize;
-            let key = K::live_key(key_reader, i, key_arena).persist();
-            // Seed directly into the destination row.
+            let key = K::scatter_key(key_reader, i, key_arena);
+            // Seed directly into the destination row, and fold the seeded
+            // partial count into its slot total.
             buffers[partition].push_with(scatter_layout, allocator, hash, key, |stored| {
-                stored.seed(value_reader, i, worker_context)
+                stored.seed(value_reader, i, worker_context);
+                if let Some(count_totals) = &mut count_totals {
+                    count_totals.fold(hash, count_weight(stored.sort_key(topk_count_slot)));
+                }
             });
         }
     }
