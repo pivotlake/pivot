@@ -435,6 +435,7 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
 //
 #[cfg(test)]
 mod tests {
+    use crate::types::metadata::RowSelection;
     use std::sync::Arc;
 
     use crate::thrift::general::Encoding;
@@ -506,7 +507,7 @@ mod tests {
         let header = PageHeader::for_data_page(num_values as i32, encoding);
         DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
             data: DecompressedPageType::Data(DataPage {
@@ -526,7 +527,7 @@ mod tests {
         let header = PageHeader::for_data_page(num_values as i32, encoding);
         DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
             data: DecompressedPageType::Data(DataPage {
@@ -541,7 +542,7 @@ mod tests {
         let header = PageHeader::for_dict_page(num_values as i32);
         DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
             data: DecompressedPageType::Dict {
@@ -741,7 +742,7 @@ mod tests {
         let header = PageHeader::for_data_page(num_values as i32, encoding);
         DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
             data: DecompressedPageType::Data(DataPage {

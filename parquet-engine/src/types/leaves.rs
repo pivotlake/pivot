@@ -683,6 +683,7 @@ fn find_present_rows(array: &ArrayRef) -> Option<BooleanBuffer> {
 mod tests {
     use super::*;
     use crate::test_utils::dummy_metadata;
+    use crate::types::metadata::RowSelection;
     use arrow_array::{BinaryViewArray, Int64Array};
     use arrow_schema::Field;
 
@@ -866,7 +867,7 @@ mod tests {
             &fields,
             0,
             &build_path(&["age"]),
-            &dummy_metadata(None),
+            &dummy_metadata(RowSelection::All),
             None,
         )
         .unwrap();
@@ -927,7 +928,7 @@ mod tests {
             &fields,
             0,
             &build_path(&["user", "id"]),
-            &dummy_metadata(None),
+            &dummy_metadata(RowSelection::All),
             None,
         )
         .unwrap();
@@ -954,7 +955,7 @@ mod tests {
             &fields,
             0,
             &build_path(&["missing"]),
-            &dummy_metadata(None),
+            &dummy_metadata(RowSelection::All),
             None,
         )
         .unwrap();

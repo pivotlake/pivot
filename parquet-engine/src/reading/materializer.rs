@@ -9,7 +9,7 @@
 //! reading them sequentially within each row group for optimal IO.
 
 use crate::reading::record_batch_metadata::{global_row_group, row_index};
-use crate::types::metadata::QueryRowGroupMetadata;
+use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use crate::types::projection::Projection;
 use crate::{ParquetTable, RowGroupRequest};
 use ahash::HashMap;
@@ -127,7 +127,11 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
         for (group, mut indices) in pending_row_groups {
             indices.sort_unstable();
             sender.send(RowGroupRequest::from(
-                QueryRowGroupMetadata::new(&self.table, group as usize, Some(indices)),
+                QueryRowGroupMetadata::new(
+                    &self.table,
+                    group as usize,
+                    RowSelection::Indices(indices),
+                ),
                 &self.projection_to_materialize,
             ))?;
         }

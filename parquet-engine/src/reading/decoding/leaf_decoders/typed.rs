@@ -542,6 +542,7 @@ mod tests {
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
     use crate::types::filter_mask::FilterMask;
+    use crate::types::metadata::RowSelection;
     use crate::types::page::{DataPage, DecompressedPageType};
     use arrow_array::Int32Array;
     use arrow_array::types::Int32Type;
@@ -566,7 +567,7 @@ mod tests {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
             data: DecompressedPageType::Data(DataPage {
@@ -586,7 +587,7 @@ mod tests {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
             data: DecompressedPageType::Data(DataPage {
@@ -601,7 +602,7 @@ mod tests {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx,
             data: DecompressedPageType::SkippedData {
@@ -614,7 +615,7 @@ mod tests {
         let header = PageHeader::for_dict_page(num_values as i32);
         DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
             data: DecompressedPageType::Dict {
@@ -681,7 +682,7 @@ mod tests {
         let header = PageHeader::for_data_page(8, Encoding::RLE_DICTIONARY);
         let page = DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
             data: DecompressedPageType::Data(DataPage {
@@ -868,7 +869,7 @@ mod tests {
         let header = PageHeader::for_data_page(8, Encoding::RLE_DICTIONARY);
         let rle_page = DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
             data: DecompressedPageType::Data(DataPage {
@@ -897,7 +898,7 @@ mod tests {
         let header = PageHeader::for_data_page(8, Encoding::RLE_DICTIONARY);
         let rle_page = DecompressedPage {
             worker_id: 0,
-            query_row_group_metadata: dummy_metadata(None),
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
             idx: 0,
             data: DecompressedPageType::Data(DataPage {

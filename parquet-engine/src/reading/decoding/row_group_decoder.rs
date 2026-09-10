@@ -11,7 +11,7 @@ use crate::reading::decoding::column_decoder::{ColumnDecoder, Result, create_lea
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::record_batch_metadata::with_row_group_metadata;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
-use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
+use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
 use crate::types::page::DecompressedPage;
 use crate::types::projection::Projection;
 use arrow_array::RecordBatch;
@@ -93,8 +93,8 @@ impl RowGroupDecoder {
         let leaves = leaf_fields(fields);
         let reads = resolve_output_reads(fields, &row_group_metadata, projection);
         let plan = plan_leaves(&reads);
-        let filter_batches =
-            !add_row_group_metadata && row_group_metadata.filtered_indices().is_none();
+        let filter_batches = !add_row_group_metadata
+            && !matches!(row_group_metadata.selection(), RowSelection::Indices(_));
 
         let column_chunks = row_group_metadata.columns();
         let mut leaf_decoders = plan
@@ -139,11 +139,7 @@ impl RowGroupDecoder {
             column_decoders,
             schema: Arc::new(Schema::new(output_fields)),
             batch_size,
-            total: row_group_metadata
-                .filtered_indices()
-                .as_ref()
-                .map(|f| f.len())
-                .unwrap_or(row_group_metadata.num_rows() as usize),
+            total: row_group_metadata.rows_to_read(),
             row_offset: 0,
             add_row_group_metadata,
             prunable,

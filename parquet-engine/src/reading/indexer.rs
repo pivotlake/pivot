@@ -27,7 +27,7 @@ use crate::thrift::general::{CompressionCodec, PageType};
 use crate::thrift::headers::PageHeader;
 use crate::thrift::parquet_thrift::{ParquetError, ThriftReadInputProtocol};
 use crate::types::filter_mask::FilterMask;
-use crate::types::metadata::QueryRowGroupMetadata;
+use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use crate::types::page::CompressedPage;
 use crate::types::requests::{ColumnBuffer, ColumnPart, RowGroupBuffer};
 use bytes::Bytes;
@@ -96,18 +96,17 @@ impl ColumnPageBuilder {
         payload: PagePayload,
     ) -> CompressedPage {
         let (page_idx, row_offset) = self.cursor.advance(&header);
+        // A whole row group carries no mask; the materializer's row groups
+        // mask down to their surviving rows.
         let filter_mask = (header.r#type == PageType::DATA_PAGE)
             .then(|| {
-                self.query_row_group_metadata
-                    .filtered_indices()
-                    .as_ref()
-                    .map(|f| {
-                        FilterMask::new(
-                            row_offset,
-                            row_offset + header.data_page_num_values() as u32,
-                            f,
-                        )
-                    })
+                let page_end = row_offset + header.data_page_num_values() as u32;
+                match self.query_row_group_metadata.selection() {
+                    RowSelection::All => None,
+                    RowSelection::Indices(indices) => {
+                        Some(FilterMask::new(row_offset, page_end, indices))
+                    }
+                }
             })
             .flatten();
         let (data, decompressed) = match payload {
@@ -341,10 +340,10 @@ mod tests {
 
     fn make_row_group_buffer(
         columns: Vec<Vec<ColumnPart>>,
-        filtered_indices: Option<Vec<u32>>,
+        selection: RowSelection,
     ) -> RowGroupBuffer {
         RowGroupBuffer {
-            metadata: dummy_metadata(filtered_indices),
+            metadata: dummy_metadata(selection),
             columns: columns
                 .into_iter()
                 .map(|parts| ColumnBuffer {
@@ -362,7 +361,7 @@ mod tests {
         let payload = vec![1u8, 2, 3, 4, 5];
         let header = data_page_header(10, payload.len() as i32);
         let col = make_column_buffer(&[(header, payload.clone())]);
-        let buffer = make_row_group_buffer(vec![col], None);
+        let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -387,7 +386,7 @@ mod tests {
             .map(|p| (data_page_header(5, p.len() as i32), p.clone()))
             .collect();
         let col = make_column_buffer(&pages);
-        let buffer = make_row_group_buffer(vec![col], None);
+        let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -419,7 +418,7 @@ mod tests {
                 data_payload_1,
             ),
         ]);
-        let buffer = make_row_group_buffer(vec![col], None);
+        let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -434,7 +433,7 @@ mod tests {
     fn test_two_columns_interleaved() {
         let col_a = make_column_buffer(&[(data_page_header(100, 2), vec![0xAA, 0xAA])]);
         let col_b = make_column_buffer(&[(data_page_header(100, 2), vec![0xBB, 0xBB])]);
-        let buffer = make_row_group_buffer(vec![col_a, col_b], None);
+        let buffer = make_row_group_buffer(vec![col_a, col_b], RowSelection::All);
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -453,7 +452,7 @@ mod tests {
             (data_page_header(50, 1), vec![0xA1]),
         ]);
         let col_b = make_column_buffer(&[(data_page_header(100, 1), vec![0xB0])]);
-        let buffer = make_row_group_buffer(vec![col_a, col_b], None);
+        let buffer = make_row_group_buffer(vec![col_a, col_b], RowSelection::All);
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -462,14 +461,14 @@ mod tests {
         assert_eq!(col_ids, vec![0, 1, 0]);
     }
 
-    /// With filtered_indices, data pages get a FilterMask; dict pages don't.
+    /// With an index selection, data pages get a FilterMask; dict pages don't.
     #[test]
     fn test_filter_mask_on_data_pages_only() {
         let col = make_column_buffer(&[
             (dict_page_header(3, 1), vec![0xDD]),
             (data_page_header(10, 1), vec![0xAA]),
         ]);
-        let buffer = make_row_group_buffer(vec![col], Some(vec![2, 5]));
+        let buffer = make_row_group_buffer(vec![col], RowSelection::Indices(vec![2, 5]));
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -490,7 +489,7 @@ mod tests {
     #[test]
     fn test_no_filter_mask_without_indices() {
         let col = make_column_buffer(&[(data_page_header(10, 2), vec![0xAA, 0xBB])]);
-        let buffer = make_row_group_buffer(vec![col], None);
+        let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -505,7 +504,7 @@ mod tests {
             (data_page_header(5, 1), vec![0xA0]),
             (data_page_header(5, 1), vec![0xA1]),
         ]);
-        let buffer = make_row_group_buffer(vec![col], None);
+        let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -530,7 +529,7 @@ mod tests {
             header: Box::new(header),
             data: data.clone(),
         }];
-        let buffer = make_row_group_buffer(vec![col], None);
+        let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -554,7 +553,7 @@ mod tests {
             header: Box::new(data_page_header(10, 0)),
             data: vec![Bytes::from(vec![1u8])],
         });
-        let buffer = make_row_group_buffer(vec![parts], Some(vec![15]));
+        let buffer = make_row_group_buffer(vec![parts], RowSelection::Indices(vec![15]));
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 

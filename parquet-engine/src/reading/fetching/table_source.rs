@@ -17,7 +17,7 @@
 //! remote for a later query).
 
 use crate::RowGroupRequest;
-use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
+use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata, RowSelection};
 use crate::types::projection::Projection;
 use crate::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Datum, Scalar};
@@ -237,7 +237,11 @@ impl RowGroupInjectorFactory {
         });
         for row_group_idx in order {
             let node = affinity_node(&table.row_groups[row_group_idx], node_count);
-            row_group_queues[node].push(QueryRowGroupMetadata::new(table, row_group_idx, None));
+            row_group_queues[node].push(QueryRowGroupMetadata::new(
+                table,
+                row_group_idx,
+                RowSelection::All,
+            ));
         }
         Self {
             row_group_queues,
