@@ -85,7 +85,8 @@ impl<I> Receiver<I> for StealableReceiver<I> {
         self.worker.is_empty()
     }
 
-    /// Pop a message from the local deque (LIFO).
+    /// Pop a message from the local deque (newest first, or oldest first for
+    /// a [`stealable_fifo`] channel).
     fn try_recv(&self) -> Option<I> {
         self.worker.pop()
     }
@@ -122,12 +123,28 @@ impl<I> Receiver<I> for StealableReceiver<I> {
 
 /// Create one [`StealableChannelFactory`] per worker, each wired to steal from
 /// its same-node peers only (see the module docs for why stealing never
-/// crosses NUMA nodes).
+/// crosses NUMA nodes). The local worker pops its newest message first.
 pub fn stealable<T: Send>(
     topology: Topology,
 ) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
+    stealable_with(topology, Worker::new_lifo)
+}
+
+/// Like [`stealable`], but the local worker pops its oldest message first,
+/// for messages that form a sequence the worker should follow in order.
+/// Thieves take the oldest message in both flavours.
+pub fn stealable_fifo<T: Send>(
+    topology: Topology,
+) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
+    stealable_with(topology, Worker::new_fifo)
+}
+
+fn stealable_with<T: Send>(
+    topology: Topology,
+    new_worker: fn() -> Worker<T>,
+) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
     let workers: Vec<_> = (0..topology.total_workers())
-        .map(|_| Worker::new_lifo())
+        .map(|_| new_worker())
         .collect();
     let stealers: Arc<[Stealer<T>]> = workers.iter().map(Worker::stealer).collect();
 
@@ -169,6 +186,24 @@ mod tests {
         endpoints[0].0.send(7).unwrap();
 
         assert_eq!(endpoints[1].1.steal(), Some(7));
+    }
+
+    #[test]
+    fn a_fifo_channel_hands_the_owner_its_oldest_message() {
+        crate::waker::install_test_worker_waker();
+        let mut endpoints: Vec<Endpoint<i64>> = stealable_fifo::<i64>(Topology {
+            workers_per_node: 2,
+            node_count: 1,
+        })
+        .into_iter()
+        .map(ChannelFactory::build)
+        .collect();
+        endpoints[0].0.send(1).unwrap();
+        endpoints[0].0.send(2).unwrap();
+
+        let own = endpoints[0].1.try_recv();
+
+        assert_eq!(own, Some(1));
     }
 
     #[test]
