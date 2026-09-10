@@ -160,10 +160,15 @@ const MIN_BALANCE_RATIO: f64 = 5.0;
 /// when a flush commits a new version, so seconds-scale is plenty.
 pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 
-/// Default number of merges a datastore runs at once. Concurrent merges keep
-/// the worker pool busy while another waits on object storage, but each merge
-/// in flight also holds its inputs' decoded rows in memory.
-pub const DEFAULT_COMPACT_PARALLELISM: usize = 3;
+/// Default number of merges a datastore runs at once. A merge holds its whole
+/// input decoded on the memory ring until its output is encoded, and the
+/// decoded form is many times the input (a merge of 300 MB of compressed
+/// OTLP logs with variant columns pinned about 6 GB). Several merges landing
+/// together can take the entire ring, and then every read that needs a
+/// buffer, the merges' own footer loads and the ingest included, fails with
+/// nothing left to evict. One merge at a time keeps that footprint bounded;
+/// a deployment that has the memory to spare raises it in its config.
+pub const DEFAULT_COMPACT_PARALLELISM: usize = 1;
 
 /// Default size of the clique a routine round merges, and the cap on a
 /// final sweep's connected group: one more than the bar's reciprocal, the
