@@ -469,7 +469,7 @@ mod tests {
             (dict_page_header(3, 1), vec![0xDD]),
             (data_page_header(10, 1), vec![0xAA]),
         ]);
-        let buffer = make_row_group_buffer(vec![col], RowSelection::Indices(vec![2, 5]));
+        let buffer = make_row_group_buffer(vec![col], RowSelection::Indices(vec![2, 5].into()));
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
@@ -554,7 +554,7 @@ mod tests {
             header: Box::new(data_page_header(10, 0)),
             data: vec![Bytes::from(vec![1u8])],
         });
-        let buffer = make_row_group_buffer(vec![parts], RowSelection::Indices(vec![15]));
+        let buffer = make_row_group_buffer(vec![parts], RowSelection::Indices(vec![15].into()));
 
         let pages = run_unary(Indexer {}, vec![buffer]);
 
