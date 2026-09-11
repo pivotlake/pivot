@@ -10,6 +10,7 @@
 
 use crate::reading::decoding::DecodePlan;
 use crate::reading::decoding::leaf_decoders::SharedDictionary;
+use crate::thrift::general::Encoding;
 use crate::thrift::headers::DataPageHeader;
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use crate::types::page::DataPage;
@@ -28,6 +29,20 @@ pub const DECODE_RANGE_ROWS: u32 = 16 * 1024;
 pub enum PageContent {
     Data(DataPage),
     Skipped(DataPageHeader),
+}
+
+impl PageContent {
+    /// Whether the page's values are indices into a dictionary, so decoding
+    /// it needs the dictionary.
+    pub fn is_dictionary_encoded(&self) -> bool {
+        match self {
+            PageContent::Data(page) => matches!(
+                page.header.encoding,
+                Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+            ),
+            PageContent::Skipped(_) => false,
+        }
+    }
 }
 
 /// A decompressed data page.
@@ -117,6 +132,10 @@ impl DecodeRange {
 
 struct ColumnPages {
     dictionary: Option<SharedDictionary>,
+    /// Whether a data page of the column is dictionary encoded. Such a
+    /// column's ranges are not ready until its dictionary has arrived,
+    /// whatever the footer says about a dictionary page.
+    needs_dictionary: bool,
     /// Indexed by page number; `None` until the page arrives, and again
     /// once the last range over it has been cut.
     pages: Vec<Option<Arc<StoredPage>>>,
@@ -131,9 +150,6 @@ pub(crate) struct RowGroupPages {
     metadata: QueryRowGroupMetadata,
     plan: Arc<DecodePlan>,
     columns: Vec<ColumnPages>,
-    /// Whether each column's chunk has a dictionary page; a range is not
-    /// ready until the dictionaries its decoder needs have arrived.
-    expects_dictionary: Vec<bool>,
     /// The decode ranges, in decoded-row terms (see [`DecodeRange::rows`]).
     ranges: Vec<Range<u32>>,
     /// Per range, how many row group rows every column must have contiguous
@@ -151,7 +167,6 @@ impl RowGroupPages {
         plan: Arc<DecodePlan>,
         outstanding_row_groups: Arc<AtomicUsize>,
     ) -> Self {
-        let expects_dictionary = plan.expects_dictionary(&metadata);
         let row_group_rows = metadata.num_rows().max(0) as u32;
         let (ranges, rows_needed) = match metadata.selection() {
             RowSelection::All => {
@@ -171,10 +186,10 @@ impl RowGroupPages {
                 (vec![every_surviving_row], vec![row_group_rows])
             }
         };
-        let columns = expects_dictionary
-            .iter()
+        let columns = (0..plan.leaf_count())
             .map(|_| ColumnPages {
                 dictionary: None,
+                needs_dictionary: false,
                 pages: Vec::new(),
                 contiguous_pages: 0,
                 contiguous_rows: 0,
@@ -184,7 +199,6 @@ impl RowGroupPages {
             metadata,
             plan,
             columns,
-            expects_dictionary,
             ranges_left: Arc::new(AtomicUsize::new(ranges.len())),
             ranges,
             rows_needed,
@@ -219,6 +233,9 @@ impl RowGroupPages {
             pages.pages.resize_with(idx + 1, || None);
         }
         assert!(pages.pages[idx].is_none(), "a page arrives once");
+        if content.is_dictionary_encoded() {
+            pages.needs_dictionary = true;
+        }
         pages.pages[idx] = Some(Arc::new(StoredPage {
             idx,
             first_row,
@@ -236,9 +253,8 @@ impl RowGroupPages {
         let rows_ready = self
             .columns
             .iter()
-            .zip(&self.expects_dictionary)
-            .map(|(pages, expects_dictionary)| {
-                if *expects_dictionary && pages.dictionary.is_none() {
+            .map(|pages| {
+                if pages.needs_dictionary && pages.dictionary.is_none() {
                     0
                 } else {
                     pages.contiguous_rows
@@ -300,7 +316,7 @@ impl RowGroupPages {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reading::decoding::tests::{i32_schema, make_test_table, string_and_i32_table};
+    use crate::reading::decoding::tests::{i32_schema, make_test_table};
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
     use crate::types::projection::Projection;
@@ -314,7 +330,11 @@ mod tests {
     }
 
     fn data_page(rows: u32) -> PageContent {
-        let header = PageHeader::for_data_page(rows as i32, Encoding::PLAIN);
+        encoded_page(rows, Encoding::PLAIN)
+    }
+
+    fn encoded_page(rows: u32, encoding: Encoding) -> PageContent {
+        let header = PageHeader::for_data_page(rows as i32, encoding);
         PageContent::Data(DataPage {
             header: header.data_page_header.unwrap(),
             data: Vec::new(),
@@ -335,10 +355,18 @@ mod tests {
         assert_eq!((before, after), (0, 3));
     }
 
+    /// The footer of this table records no dictionary page: the pages
+    /// themselves say the column needs one.
     #[test]
-    fn a_column_with_a_dictionary_is_not_ready_before_it() {
-        let mut pages = pages_of(&string_and_i32_table(1_000, false));
-        pages.insert_page(0, 0, 0, 1_000, data_page(1_000));
+    fn a_dictionary_encoded_column_is_not_ready_before_its_dictionary() {
+        let mut pages = pages_of(&make_test_table(i32_schema(&["a", "b"]), 1_000));
+        pages.insert_page(
+            0,
+            0,
+            0,
+            1_000,
+            encoded_page(1_000, Encoding::RLE_DICTIONARY),
+        );
         pages.insert_page(1, 0, 0, 1_000, data_page(1_000));
 
         let before = pages.ready_ranges();

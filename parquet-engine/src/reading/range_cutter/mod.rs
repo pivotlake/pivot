@@ -245,8 +245,8 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
 mod tests {
     use super::*;
     use crate::reading::decoding::tests::{
-        consume_all, cut, drive, encode_i32s, i32_schema, make_data_page, make_test_table,
-        new_cutter, row_number_pages,
+        consume_all, cut, drive, encode_i32s, i32_schema, make_data_page, make_rle_data_page,
+        make_test_table, new_cutter, row_number_pages,
     };
     use crate::thrift::headers::PageHeader;
     use crate::types::metadata::{
@@ -416,5 +416,25 @@ mod tests {
         assert!(ranges.is_empty());
         assert!(metadata.is_pruned());
         assert_eq!(pending.load(Ordering::Relaxed), 0);
+    }
+
+    /// The footer records no dictionary page, yet the chunk has one and a
+    /// data page indexing it overtakes it: the range waits for the
+    /// dictionary and carries it.
+    #[test]
+    fn a_range_waits_for_a_dictionary_the_footer_does_not_record() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 3);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let page = make_rle_data_page(metadata.clone(), 0, &[1, 0, 1], 0);
+        let dict = i32_dict_page(metadata, &[10, 20]);
+        let mut cutter = new_cutter(&table, Vec::new());
+
+        let before = consume_all(&mut cutter, vec![page]);
+        let ranges = consume_all(&mut cutter, vec![dict]);
+
+        assert!(before.is_empty());
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].column(0).dictionary.is_some());
     }
 }

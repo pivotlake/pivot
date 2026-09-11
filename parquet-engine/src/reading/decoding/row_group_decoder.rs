@@ -8,7 +8,7 @@
 //! column.
 
 use crate::reading::decoding::ScanEqualityPredicate;
-use crate::reading::decoding::column_decoder::{ColumnDecoder, Result, create_leaf_decoder};
+use crate::reading::decoding::column_decoder::{ColumnDecoder, Error, Result, create_leaf_decoder};
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
 use crate::reading::record_batch_metadata::with_row_group_metadata;
@@ -118,15 +118,6 @@ impl DecodePlan {
         self.file_leaves.len()
     }
 
-    /// Whether each decoded leaf's chunk has a dictionary page.
-    pub fn expects_dictionary(&self, row_group_metadata: &QueryRowGroupMetadata) -> Vec<bool> {
-        let column_chunks = row_group_metadata.columns();
-        self.file_leaves
-            .iter()
-            .map(|&leaf| column_chunks[leaf].dictionary_page_offset.is_some())
-            .collect()
-    }
-
     /// Fresh leaf decoders, one per decoded leaf, with the pushed-down
     /// constants installed on the prunable ones.
     pub fn create_leaf_decoders(
@@ -152,8 +143,6 @@ pub struct RowGroupDecoder {
     metadata: QueryRowGroupMetadata,
     plan: Arc<DecodePlan>,
     leaf_decoders: Vec<Box<dyn LeafDecoder>>,
-    /// Per leaf, whether its dictionary is loaded.
-    dictionary_loaded: Vec<bool>,
     /// Max rows per batch.
     batch_size: usize,
     /// The next row to emit and the row the attached range ends at, in
@@ -176,7 +165,9 @@ pub struct RowGroupDecoder {
 }
 
 impl RowGroupDecoder {
-    /// A decoder for the row group of `range`, ready to take it on.
+    /// A decoder for the row group of `range`, ready to take it on, reading
+    /// through the dictionaries the range carries. Every range of a row
+    /// group carries the same dictionaries, built once by the cutter.
     pub fn new(
         range: &DecodeRange,
         batch_size: usize,
@@ -186,10 +177,15 @@ impl RowGroupDecoder {
         let plan = range.plan().clone();
         let filter_batches =
             !add_row_group_metadata && !matches!(metadata.selection(), RowSelection::Indices(_));
+        let mut leaf_decoders = plan.create_leaf_decoders(&metadata)?;
+        for (leaf, decoder) in leaf_decoders.iter_mut().enumerate() {
+            if let Some(dictionary) = &range.column(leaf).dictionary {
+                decoder.adopt_dictionary(dictionary.clone());
+            }
+        }
         Ok(Self {
             next_page: vec![0; plan.leaf_count()],
-            dictionary_loaded: vec![false; plan.leaf_count()],
-            leaf_decoders: plan.create_leaf_decoders(&metadata)?,
+            leaf_decoders,
             plan,
             batch_size,
             next_row: 0,
@@ -200,20 +196,6 @@ impl RowGroupDecoder {
             filter_batches,
             metadata,
         })
-    }
-
-    /// Adopts the dictionaries the leaves still lack from `range`.
-    fn load_dictionaries(&mut self, range: &DecodeRange) {
-        for (leaf, decoder) in self.leaf_decoders.iter_mut().enumerate() {
-            if self.dictionary_loaded[leaf] {
-                continue;
-            }
-            let Some(dictionary) = &range.column(leaf).dictionary else {
-                continue;
-            };
-            decoder.adopt_dictionary(dictionary.clone());
-            self.dictionary_loaded[leaf] = true;
-        }
     }
 
     pub fn row_group_index(&self) -> usize {
@@ -229,9 +211,22 @@ impl RowGroupDecoder {
     /// Takes on `range`. A range starting at the row this decoder stopped
     /// at continues from the page it has open; any other range repositions
     /// every leaf at the range's first page.
-    pub fn attach(&mut self, range: DecodeRange) {
+    ///
+    /// A dictionary encoded page in a range that carries no dictionary
+    /// could never be decoded, so it is an error rather than a wait.
+    pub fn attach(&mut self, range: DecodeRange) -> Result<()> {
         assert!(self.exhausted(), "a decoder takes on one range at a time");
-        self.load_dictionaries(&range);
+        for leaf in 0..self.leaf_decoders.len() {
+            let column = range.column(leaf);
+            if column.dictionary.is_none()
+                && column
+                    .pages
+                    .iter()
+                    .any(|page| page.content.is_dictionary_encoded())
+            {
+                return Err(Error::MissingDictionary { leaf });
+            }
+        }
         let rows = range.rows();
         let continues = rows.start as usize == self.end_row;
         self.next_row = rows.start as usize;
@@ -256,6 +251,7 @@ impl RowGroupDecoder {
             }
         }
         self.range = Some(range);
+        Ok(())
     }
 
     /// Gives back the range once every row of it is emitted.
