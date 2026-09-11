@@ -217,7 +217,7 @@ pub(crate) mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use bytes::Bytes;
     use dispatch::memory::init_test_free_pool;
-    use dispatch::test_utils::CollectSender;
+    use dispatch::test_utils::run_unary_to_completion;
     use std::sync::atomic::AtomicUsize;
 
     pub(crate) fn make_test_table(schema: SchemaRef, num_rows: i64) -> Arc<ParquetTable> {
@@ -409,40 +409,6 @@ pub(crate) mod tests {
         (0..a.len()).map(|i| a.value(i).to_string()).collect()
     }
 
-    /// Feeds `inputs` through `unary` the way a worker does: an input is
-    /// consumed only once the operator is ready for it, and the operator is
-    /// run and finished until it is done.
-    pub(crate) fn drive<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
-        let mut sender = CollectSender::new();
-        let mut test_io = dispatch::TestOperatorIO::default();
-        let mut io = test_io.io();
-        for item in inputs {
-            while !unary.ready_for_more_work() {
-                unary.run(&mut sender).unwrap();
-            }
-            unary.consume(item, &mut sender, &mut io).unwrap();
-        }
-        loop {
-            unary.run(&mut sender).unwrap();
-            if unary.finish(&mut sender).unwrap() {
-                break;
-            }
-        }
-        sender.items
-    }
-
-    /// Feeds `inputs` to `unary` without running or finishing it, so more
-    /// can follow.
-    pub(crate) fn consume_all<I, O, U: Unary<I, O>>(unary: &mut U, inputs: Vec<I>) -> Vec<O> {
-        let mut sender = CollectSender::new();
-        let mut test_io = dispatch::TestOperatorIO::default();
-        let mut io = test_io.io();
-        for item in inputs {
-            unary.consume(item, &mut sender, &mut io).unwrap();
-        }
-        sender.items
-    }
-
     /// A cutter for `table` with no fetcher behind it: the claim counters
     /// are seeded high enough that releases never hit the underflow
     /// assertion.
@@ -465,7 +431,7 @@ pub(crate) mod tests {
 
     /// Cuts `pages` into ranges.
     pub(crate) fn cut(table: &Arc<ParquetTable>, pages: Vec<DecompressedPage>) -> Vec<DecodeRange> {
-        drive(new_cutter(table, Vec::new()), pages)
+        run_unary_to_completion(new_cutter(table, Vec::new()), pages)
     }
 
     /// Cuts `pages` into ranges and decodes them on one worker.
@@ -475,8 +441,8 @@ pub(crate) mod tests {
         batch_size: usize,
         eq_predicates: Vec<ScanEqualityPredicate>,
     ) -> Vec<RecordBatch> {
-        let ranges = drive(new_cutter(table, eq_predicates), pages);
-        drive(new_decoder(batch_size), ranges)
+        let ranges = run_unary_to_completion(new_cutter(table, eq_predicates), pages);
+        run_unary_to_completion(new_decoder(batch_size), ranges)
     }
 
     /// The rows of a row group as `i32`s equal to their row number, in
@@ -652,7 +618,8 @@ pub(crate) mod tests {
     fn an_index_selection_emits_only_its_rows() {
         init_test_free_pool(4);
         let table = make_test_table(i32_schema(&["a"]), 5);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::Indices(vec![3, 4]));
+        let metadata =
+            QueryRowGroupMetadata::new(&table, 0, RowSelection::Indices(vec![3, 4].into()));
         let skipped = make_skipped_page(metadata.clone(), 0, 3, 0, 0);
         let mut kept = make_data_page(metadata.clone(), 0, encode_i32s(&[40, 50]), 2, 1, 3);
         if let DecompressedPageType::Data(data) = &mut kept.data {
@@ -692,8 +659,8 @@ pub(crate) mod tests {
         let mut ranges = cut(&table, row_number_pages(&metadata, 40_000, 20_000));
         let middle = ranges.remove(1);
 
-        let first_worker = drive(new_decoder(8192), ranges);
-        let second_worker = drive(new_decoder(8192), vec![middle]);
+        let first_worker = run_unary_to_completion(new_decoder(8192), ranges);
+        let second_worker = run_unary_to_completion(new_decoder(8192), vec![middle]);
 
         let first: Vec<i32> = first_worker
             .iter()
