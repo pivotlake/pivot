@@ -38,6 +38,8 @@ pub enum Error {
     LeafDecoder(#[from] leaf_decoders::Error),
     #[error("{0}")]
     Arrow(#[from] ArrowError),
+    #[error("leaf {leaf} has dictionary encoded pages but no dictionary")]
+    MissingDictionary { leaf: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
