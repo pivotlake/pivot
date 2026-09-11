@@ -97,6 +97,16 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     /// by [`AggregatedTable::flush`] and added into the pool-wide totals
     /// before the gather).
     pub has_bin_totals: bool,
+    /// With bin totals and a raw-scatter fallback: this worker's raw row
+    /// count per scatter bucket. Raw rows are not in the totals, and at
+    /// worst one group absorbed a whole bucket of them, so the merge adds a
+    /// bucket's count to the bound of every bin the bucket covers.
+    ///
+    /// This is most definitely a hack and a patch. It keeps the bounds valid
+    /// without touching the per-row scatter path, at the price of loosening
+    /// them by a whole bucket's rows. It will not be relevant once raw rows
+    /// are summed into the totals properly.
+    pub raw_scatter_rows: Option<Vec<u64>>,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
     /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
     pub zero_hash_seen: bool,
@@ -124,9 +134,9 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// form: its partials are nonnegative and additive, so bin sums stay valid
     /// upper bounds (see [`prunable_topk_slot`](crate::operations::unary::group::output::topk_pruning::prunable_topk_slot)). `None` builds
     /// no totals, including for a pushed top-k on any other aggregate.
-    /// Cleared when the worker falls back to raw scatter: raw rows would
-    /// each cost a totals update, and a worker that stopped deduplicating
-    /// holds keys too spread out for any bin bound to prune.
+    /// Kept across the raw-scatter fallback: raw rows are not folded (each
+    /// would cost a totals update), the flush reports their count per
+    /// scatter bucket instead (see [`AggregatedTableOutput::raw_scatter_rows`]).
     topk_aggregation_slot: Option<usize>,
     /// Hash-bin totals of that slot's partials, allocated on first use.
     /// Every partial the merge will see feeds it: drained table entries as
@@ -434,12 +444,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         self.create_scatter_buffers();
         self.scatter_active_table_to_radix_partitions();
         self.scatter_raw = almost_no_dedup;
-        if almost_no_dedup {
-            // Raw rows are never folded into the bin totals, so this worker
-            // reports none at flush and the merge runs without pruning.
-            self.topk_aggregation_slot = None;
-            self.topk_bin_totals = None;
-        }
         almost_no_dedup
     }
 
@@ -455,8 +459,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     }
 
     /// Scatters rows into radix partitions without deduplicating them. Only
-    /// a worker that fell back to raw scatter gets here, and that fallback
-    /// switched top-k pruning off, so no bin totals are kept for these rows.
+    /// a worker that fell back to raw scatter gets here. The rows are not
+    /// folded into the bin totals; the flush reports their count per bucket
+    /// instead.
     #[inline(always)]
     fn scatter_range<'b>(
         &mut self,
@@ -568,6 +573,17 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             }
             Some(totals)
         });
+        // Raw-scattered rows never reached the totals. Report each bucket's
+        // row count so the merge can widen its bounds by them (a hack, see
+        // `AggregatedTableOutput::raw_scatter_rows`). The bucket counts also
+        // include the drained partials scattered before the fallback, which
+        // only loosens the bounds further.
+        let raw_scatter_rows = match (&self.buffers, topk_bin_totals.is_some(), self.scatter_raw) {
+            (Some(buffers), true, true) => {
+                Some(buffers.iter().map(|bucket| bucket.len() as u64).collect())
+            }
+            _ => None,
+        };
         self.key_arena.flush();
         self.worker_context.flush();
         let output = AggregatedTableOutput {
@@ -576,6 +592,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             buffers: self.buffers.map(PartitionBuffers),
             hll: self.hll,
             has_bin_totals: topk_bin_totals.is_some(),
+            raw_scatter_rows,
             zero_hash_seen: self.zero_hash_seen,
         };
         (output, topk_bin_totals)
@@ -941,15 +958,18 @@ mod tests {
         );
 
         // Unique keys make every post-switch fill 100% distinct: the worker
-        // must fall back to raw scatter, which switches pruning off, so it
-        // reports no bin totals and the merge cannot build bounds.
+        // must fall back to raw scatter, keep the totals of what it drained
+        // before, and report the raw row count per bucket for the merge to
+        // widen its bounds with.
         let values: Vec<i32> = (0..6000).collect();
         consume_all(&mut table, &values);
         let (output, totals) = table.flush();
 
         assert!(output.buffers.is_some(), "fallback allocates buffers");
         assert!(scatter_row_count(&output) > 1000, "tail rows scatter raw");
-        assert!(totals.is_none(), "a raw-scatter worker keeps no bin totals");
-        assert!(!output.has_bin_totals);
+        assert!(totals.is_some(), "drained fills keep the bin totals");
+        assert!(output.has_bin_totals);
+        let bucket_rows: u64 = output.raw_scatter_rows.as_ref().unwrap().iter().sum();
+        assert_eq!(bucket_rows as usize, scatter_row_count(&output));
     }
 }

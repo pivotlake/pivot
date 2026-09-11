@@ -54,6 +54,33 @@ impl HashBinTotals {
         }
     }
 
+    /// Adds each scatter bucket's raw-scattered row count to every bin the
+    /// bucket covers. Buckets and bins are both prefixes of the same top
+    /// hash bits, so a bucket covers a contiguous run of bins (or a bin a
+    /// run of buckets).
+    ///
+    /// This is most definitely a hack and a patch. Raw-scattered rows never
+    /// reach the totals, and at worst one group absorbed a whole bucket of
+    /// them, so the bucket's row count is added to each of its bins to keep
+    /// the bounds valid. It will not be relevant once raw rows are summed
+    /// into the totals properly.
+    pub(crate) fn add_raw_bucket_rows(&mut self, bucket_rows: &[u64]) {
+        let buckets = bucket_rows.len();
+        if buckets <= HASH_BINS {
+            let bins_per_bucket = HASH_BINS / buckets;
+            for bin in 0..HASH_BINS {
+                let rows = bucket_rows[bin / bins_per_bucket];
+                self.sums[bin] = self.sums[bin].saturating_add(rows);
+            }
+        } else {
+            let buckets_per_bin = buckets / HASH_BINS;
+            for (bucket, rows) in bucket_rows.iter().enumerate() {
+                let bin = bucket / buckets_per_bin;
+                self.sums[bin] = self.sums[bin].saturating_add(*rows);
+            }
+        }
+    }
+
     /// Copies the bin totals out of the slab, freeing it for reuse.
     pub(crate) fn into_bin_totals(self) -> Vec<u64> {
         self.as_slice().to_vec()
@@ -97,5 +124,19 @@ mod tests {
         a.merge(&b);
 
         assert_eq!(a.sums[9], 42);
+    }
+
+    #[test]
+    fn raw_bucket_rows_widen_every_bin_of_the_bucket() {
+        let (_allocator, mut totals) = test_bin_totals();
+        totals.add(0, 5);
+        let mut bucket_rows = vec![0u64; HASH_BINS / 4];
+        bucket_rows[0] = 100;
+
+        totals.add_raw_bucket_rows(&bucket_rows);
+
+        assert_eq!(totals.sums[0], 105);
+        assert_eq!(totals.sums[3], 100);
+        assert_eq!(totals.sums[4], 0);
     }
 }
