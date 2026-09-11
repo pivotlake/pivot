@@ -167,8 +167,9 @@ impl RowGroupMetadata {
 pub enum RowSelection {
     /// Every row of the row group.
     All,
-    /// The sorted row indices that survived predicate evaluation.
-    Indices(Vec<u32>),
+    /// The sorted row indices that survived predicate evaluation, shared
+    /// by every page and range of the row group.
+    Indices(Arc<[u32]>),
 }
 
 /// Row-group metadata augmented with per-query filtering state.
@@ -205,14 +206,6 @@ impl QueryRowGroupMetadata {
     /// The rows read through this metadata.
     pub fn selection(&self) -> &RowSelection {
         &self.selection
-    }
-
-    /// How many rows are emitted.
-    pub fn rows_to_read(&self) -> usize {
-        match &self.selection {
-            RowSelection::All => self.row_group_metadata.num_rows as usize,
-            RowSelection::Indices(indices) => indices.len(),
-        }
     }
 
     /// Whether this row group has been pruned (no row can match a pushed-down

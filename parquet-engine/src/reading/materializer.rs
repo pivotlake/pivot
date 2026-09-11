@@ -130,7 +130,7 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
                 QueryRowGroupMetadata::new(
                     &self.table,
                     group as usize,
-                    RowSelection::Indices(indices),
+                    RowSelection::Indices(indices.into()),
                 ),
                 &self.projection_to_materialize,
             ))?;
