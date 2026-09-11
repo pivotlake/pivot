@@ -115,6 +115,12 @@ impl<T> Sender<T> for CollectSender<T> {
 
 /// Feed `inputs` through a [`Unary`] operator and return all output items.
 pub fn run_unary<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
+    feed_unary(&mut unary, inputs)
+}
+
+/// Feed `inputs` to a [`Unary`] operator without running or finishing it,
+/// so more can follow, and return the output items it produced meanwhile.
+pub fn feed_unary<I, O, U: Unary<I, O>>(unary: &mut U, inputs: Vec<I>) -> Vec<O> {
     let mut sender = CollectSender::new();
     let mut test_io = crate::io::TestOperatorIO::default();
     let mut io = test_io.io();
@@ -124,16 +130,21 @@ pub fn run_unary<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
     sender.items
 }
 
-/// Feed `inputs` through a [`Unary`] operator, then drain via `finish()`.
+/// Feed `inputs` through a [`Unary`] operator the way a worker does, then
+/// drain via `finish()`.
 ///
-/// Unlike [`run_unary`], this also calls `finish()` in a loop to collect
-/// output that the operator produces lazily after consumption (e.g. the
-/// Decoder which batches across multiple pages).
+/// Unlike [`run_unary`], an input is consumed only once the operator is
+/// ready for it, running it until then, and `finish()` is called in a loop
+/// to collect output the operator produces lazily after consumption (e.g.
+/// the Decoder which batches across multiple pages).
 pub fn run_unary_to_completion<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
     let mut sender = CollectSender::new();
     let mut test_io = crate::io::TestOperatorIO::default();
     let mut io = test_io.io();
     for item in inputs {
+        while !unary.ready_for_more_work() {
+            unary.run(&mut sender).unwrap();
+        }
         unary.consume(item, &mut sender, &mut io).unwrap();
     }
     loop {
