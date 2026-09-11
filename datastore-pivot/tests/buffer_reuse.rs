@@ -1,5 +1,6 @@
 mod common;
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray};
@@ -95,10 +96,13 @@ fn decompressed_string_buffer_is_reused() {
     // construction.
     unsafe { std::env::set_var("PIVOT_DECOMPRESSED_CACHE", "false") };
     let dispatcher = dispatch(1);
-    // ~50K unique strings > 12 bytes → just over 1MB raw, forcing exactly 2 Parquet pages.
-    // Each page gets its own decompressed WriteBuffer. After page 1's batches are
-    // dropped, page 2's decompression should reuse that same WriteBuffer.
-    let n = 50_000;
+    // 100K unique strings over 12 bytes each are five Parquet pages. Each page
+    // decompresses into a WriteBuffer that goes back to the pool once the
+    // batches over it are dropped, so the scan cycles through a bounded set of
+    // buffers rather than taking a fresh one per page. A decode range that
+    // straddles a page boundary keeps the earlier page alive while the next
+    // one is decompressed, so the bound is two.
+    let n = 100_000;
     let owned: Vec<String> = (0..n)
         .map(|i| format!("long-string-value-{i:06}"))
         .collect();
@@ -149,5 +153,6 @@ fn decompressed_string_buffer_is_reused() {
     assert_eq!(extract_count(&res), n as i64);
 
     let ptrs = ptrs.lock().unwrap();
-    assert!(ptrs.windows(2).all(|w| w[0] == w[1]));
+    let distinct: HashSet<usize> = ptrs.iter().copied().collect();
+    assert!(distinct.len() <= 2, "{} distinct buffers", distinct.len());
 }
