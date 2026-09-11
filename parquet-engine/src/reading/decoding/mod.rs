@@ -174,7 +174,7 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
             None => RowGroupDecoder::new(&range, self.batch_size, self.add_row_group_metadata)
                 .map_err(crate::op_err)?,
         };
-        decoder.attach(range);
+        decoder.attach(range).map_err(crate::op_err)?;
         self.active = Some(decoder);
         self.produce_batch(output)?;
         Ok(())
