@@ -245,8 +245,8 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
 mod tests {
     use super::*;
     use crate::reading::decoding::tests::{
-        consume_all, cut, drive, encode_i32s, i32_schema, make_data_page, make_rle_data_page,
-        make_test_table, new_cutter, row_number_pages,
+        cut, encode_i32s, i32_schema, make_data_page, make_rle_data_page, make_test_table,
+        new_cutter, row_number_pages,
     };
     use crate::thrift::headers::PageHeader;
     use crate::types::metadata::{
@@ -256,6 +256,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, Scalar};
     use bytes::Bytes;
     use dispatch::memory::init_test_free_pool;
+    use dispatch::test_utils::{feed_unary, run_unary_to_completion};
 
     /// A table over one dictionary encoded `Int32` column.
     fn i32_dictionary_table(num_rows: i64) -> Arc<ParquetTable> {
@@ -331,8 +332,8 @@ mod tests {
         let first_page = pages.remove(0);
         let mut cutter = new_cutter(&table, Vec::new());
 
-        let before = consume_all(&mut cutter, pages);
-        let ranges = consume_all(&mut cutter, vec![first_page]);
+        let before = feed_unary(&mut cutter, pages);
+        let ranges = feed_unary(&mut cutter, vec![first_page]);
 
         assert!(before.is_empty());
         assert_eq!(range_starts(&ranges), vec![0, 16_384, 32_768]);
@@ -347,8 +348,8 @@ mod tests {
         let page_b = make_data_page(metadata, 1, encode_i32s(&[40, 50, 60]), 3, 0, 0);
         let mut cutter = new_cutter(&table, Vec::new());
 
-        let after_one = consume_all(&mut cutter, vec![page_a]);
-        let after_both = consume_all(&mut cutter, vec![page_b]);
+        let after_one = feed_unary(&mut cutter, vec![page_a]);
+        let after_both = feed_unary(&mut cutter, vec![page_b]);
 
         assert!(after_one.is_empty());
         assert_eq!(after_both.len(), 1);
@@ -385,7 +386,7 @@ mod tests {
             Arc::new(WorkerAllocator::new()),
         );
 
-        let mut ranges = drive(cutter, vec![page]);
+        let mut ranges = run_unary_to_completion(cutter, vec![page]);
 
         assert_eq!(pending.load(Ordering::Relaxed), 0);
         let before_decode = outstanding.load(Ordering::Relaxed);
@@ -411,7 +412,7 @@ mod tests {
             Arc::new(WorkerAllocator::new()),
         );
 
-        let ranges = drive(cutter, vec![dict]);
+        let ranges = run_unary_to_completion(cutter, vec![dict]);
 
         assert!(ranges.is_empty());
         assert!(metadata.is_pruned());
@@ -430,8 +431,8 @@ mod tests {
         let dict = i32_dict_page(metadata, &[10, 20]);
         let mut cutter = new_cutter(&table, Vec::new());
 
-        let before = consume_all(&mut cutter, vec![page]);
-        let ranges = consume_all(&mut cutter, vec![dict]);
+        let before = feed_unary(&mut cutter, vec![page]);
+        let ranges = feed_unary(&mut cutter, vec![dict]);
 
         assert!(before.is_empty());
         assert_eq!(ranges.len(), 1);
