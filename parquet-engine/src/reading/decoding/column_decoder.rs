@@ -11,23 +11,19 @@
 
 use crate::reading::decoding::leaf_decoders;
 use crate::reading::decoding::leaf_decoders::{
-    BytesViewDecoder, DictionaryKind, LeafDecoder, PrimitiveLeafDecoder, SharedDictionary,
-    TimestampMicrosecondLeafDecoder, decimal_leaf_kind,
+    BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder, TimestampMicrosecondLeafDecoder,
+    decimal_decoder,
 };
-use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::leaves::{OutputRead, reconstruct_column_from_leaves};
 use crate::types::metadata::ColumnChunkMeta;
 use arrow_array::types::{
     BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
-    Int16Type, Int32Type, Int64Type, StringViewType, TimestampMicrosecondType, UInt8Type,
-    UInt16Type, UInt32Type, UInt64Type,
+    Int16Type, Int32Type, Int64Type, StringViewType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
-use arrow_array::{ArrayRef, Scalar, StructArray, new_null_array};
+use arrow_array::{ArrayRef, StructArray, new_null_array};
 use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, TimeUnit};
-use bytes::Bytes;
 use dispatch::VariantExtract;
-use dispatch::memory::SlabAllocator;
 use parquet_variant::{VariantPath, VariantPathElement};
 use parquet_variant_compute::cast_to_variant;
 use planner::expression::cast_variant_array;
@@ -273,62 +269,17 @@ fn variant_path_output_type(variant_field: &FieldRef, path: &[String]) -> Result
         .clone())
 }
 
-/// What a leaf's data type resolves to, chosen once per leaf: it makes the
-/// leaf's decoders, and builds and judges the leaf's dictionary page
-/// without one.
-pub struct LeafKind {
-    make_decoder: Box<dyn Fn() -> Box<dyn LeafDecoder> + Send + Sync>,
-    dictionary: Box<dyn DictionaryKind>,
-}
-
-impl LeafKind {
-    pub fn new(
-        make_decoder: impl Fn() -> Box<dyn LeafDecoder> + Send + Sync + 'static,
-        dictionary: impl DictionaryKind + 'static,
-    ) -> Self {
-        Self {
-            make_decoder: Box::new(make_decoder),
-            dictionary: Box::new(dictionary),
-        }
-    }
-
-    pub fn create_decoder(&self) -> Box<dyn LeafDecoder> {
-        (self.make_decoder)()
-    }
-
-    /// Whether the dictionary page provably holds no entry equal to
-    /// `value`, so a row group whose data pages are all dictionary encoded
-    /// has no matching row.
-    pub fn dictionary_excludes(
-        &self,
-        header: &DictionaryPageHeader,
-        data: &[Bytes],
-        value: &Scalar<ArrayRef>,
-    ) -> bool {
-        self.dictionary
-            .excludes(data, header.num_values as usize, value)
-    }
-
-    pub fn build_dictionary(
-        &self,
-        header: &DictionaryPageHeader,
-        data: Vec<Bytes>,
-        allocator: &mut SlabAllocator,
-    ) -> SharedDictionary {
-        self.dictionary
-            .build(data, header.num_values as usize, allocator)
-    }
-}
-
-/// The [`LeafKind`] of a leaf of `data_type` stored as `chunk` describes.
-pub fn leaf_kind(data_type: &DataType, chunk: &ColumnChunkMeta) -> Result<LeafKind> {
+/// Creates a leaf decoder for `data_type`.
+///
+/// The chunk metadata disambiguates a decimal's physical storage.
+pub fn create_leaf_decoder(
+    data_type: &DataType,
+    chunk: &ColumnChunkMeta,
+) -> Result<Box<dyn LeafDecoder>> {
     let max_def_level = chunk.max_def_level;
     macro_rules! primitive {
         ($t:ty) => {
-            LeafKind::new(
-                move || Box::new(PrimitiveLeafDecoder::<$t>::new(max_def_level)),
-                PrimitiveLeafDecoder::<$t>::dictionary_kind(),
-            )
+            Box::new(PrimitiveLeafDecoder::<$t>::new(max_def_level)) as Box<dyn LeafDecoder>
         };
     }
     match data_type {
@@ -341,35 +292,24 @@ pub fn leaf_kind(data_type: &DataType, chunk: &ColumnChunkMeta) -> Result<LeafKi
         DataType::Int32 => Ok(primitive!(Int32Type)),
         DataType::Int64 => Ok(primitive!(Int64Type)),
         DataType::Date32 => Ok(primitive!(Date32Type)),
-        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
-            let timezone = timezone.clone();
-            Ok(LeafKind::new(
-                move || {
-                    Box::new(TimestampMicrosecondLeafDecoder::new(
-                        max_def_level,
-                        timezone.clone(),
-                    ))
-                },
-                PrimitiveLeafDecoder::<TimestampMicrosecondType>::dictionary_kind(),
-            ))
-        }
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => Ok(Box::new(
+            TimestampMicrosecondLeafDecoder::new(max_def_level, timezone.clone()),
+        )),
         DataType::Float32 => Ok(primitive!(Float32Type)),
         DataType::Float64 => Ok(primitive!(Float64Type)),
-        DataType::Decimal64(precision, scale) => Ok(decimal_leaf_kind::<Decimal64Type>(
-            chunk, *precision, *scale,
-        )?),
-        DataType::Decimal128(precision, scale) => Ok(decimal_leaf_kind::<Decimal128Type>(
+        DataType::Decimal64(precision, scale) => {
+            Ok(decimal_decoder::<Decimal64Type>(chunk, *precision, *scale)?)
+        }
+        DataType::Decimal128(precision, scale) => Ok(decimal_decoder::<Decimal128Type>(
             chunk, *precision, *scale,
         )?),
         // The byte-view decoder matches the leaf's declared string or binary
         // type, so no finishing conversion is needed.
-        DataType::Utf8View | DataType::Utf8 | DataType::LargeUtf8 => Ok(LeafKind::new(
-            move || Box::new(BytesViewDecoder::<StringViewType>::new(max_def_level)),
-            BytesViewDecoder::<StringViewType>::dictionary_kind(),
+        DataType::Utf8View | DataType::Utf8 | DataType::LargeUtf8 => Ok(Box::new(
+            BytesViewDecoder::<StringViewType>::new(max_def_level),
         )),
-        DataType::BinaryView | DataType::Binary | DataType::LargeBinary => Ok(LeafKind::new(
-            move || Box::new(BytesViewDecoder::<BinaryViewType>::new(max_def_level)),
-            BytesViewDecoder::<BinaryViewType>::dictionary_kind(),
+        DataType::BinaryView | DataType::Binary | DataType::LargeBinary => Ok(Box::new(
+            BytesViewDecoder::<BinaryViewType>::new(max_def_level),
         )),
         other => Err(Error::UnsupportedColumnType(other.clone())),
     }

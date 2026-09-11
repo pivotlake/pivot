@@ -25,7 +25,6 @@ use arrow_array::{ArrayRef, ArrowPrimitiveType, RecordBatch, Scalar};
 use bytes::Bytes;
 
 use super::SharedDictionary;
-use crate::reading::decoding::column_decoder::LeafKind;
 use crate::reading::decoding::leaf_decoders::primitive::ElemPtr;
 use crate::reading::decoding::leaf_decoders::{
     DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, FromDelta,
@@ -387,6 +386,10 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
         self.inner.insert_page(page, allocator);
     }
 
+    fn dictionary(&self) -> Option<SharedDictionary> {
+        self.inner.dictionary()
+    }
+
     fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {
         self.inner.adopt_dictionary(dictionary);
     }
@@ -409,6 +412,10 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
         self.inner.set_eq_constant(value);
     }
 
+    fn dict_excludes_eq_constant(&self) -> bool {
+        self.inner.dict_excludes_eq_constant()
+    }
+
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
         self.inner.fast_filter_record_batch(batch, column)
     }
@@ -419,38 +426,39 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
 /// big-endian in the schema's declared byte width). The carrier `T` is chosen
 /// by the caller from the leaf's arrow type; the leaf's declared precision
 /// and scale complete the decoder.
-pub fn decimal_leaf_kind<T: DecimalCarrier>(
+pub fn decimal_decoder<T: DecimalCarrier>(
     chunk: &ColumnChunkMeta,
     precision: u8,
     scale: i8,
-) -> Result<LeafKind> {
+) -> Result<Box<dyn LeafDecoder>> {
     use crate::thrift::general::Type as PhysicalType;
-    let max_def_level = chunk.max_def_level;
-    macro_rules! kind {
-        ($storage:ty) => {
-            LeafKind::new(
-                move || {
-                    Box::new(DecimalLeafDecoder::<T, $storage>::new(
-                        max_def_level,
-                        precision,
-                        scale,
-                    ))
-                },
-                DecimalPageDecoder::<T, $storage>::dictionary_kind(),
-            )
-        };
-    }
     if chunk.physical_type == PhysicalType::INT32 as i32 {
-        return Ok(kind!(DecimalFromInt32));
+        return Ok(Box::new(DecimalLeafDecoder::<T, DecimalFromInt32>::new(
+            chunk.max_def_level,
+            precision,
+            scale,
+        )));
     }
     if chunk.physical_type == PhysicalType::INT64 as i32 {
-        return Ok(kind!(DecimalFromInt64));
+        return Ok(Box::new(DecimalLeafDecoder::<T, DecimalFromInt64>::new(
+            chunk.max_def_level,
+            precision,
+            scale,
+        )));
     }
     if chunk.physical_type == PhysicalType::FIXED_LEN_BYTE_ARRAY as i32 {
         macro_rules! fixed_len {
             ($($len:literal),+) => {
                 match chunk.fixed_len_byte_width {
-                    $(Some($len) => return Ok(kind!(DecimalFromFixedLen<$len>)),)+
+                    $(Some($len) => {
+                        return Ok(Box::new(
+                            DecimalLeafDecoder::<T, DecimalFromFixedLen<$len>>::new(
+                                chunk.max_def_level,
+                                precision,
+                                scale,
+                            ),
+                        ));
+                    })+
                     _ => {}
                 }
             };

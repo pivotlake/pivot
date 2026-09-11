@@ -14,6 +14,7 @@
 //! row group there and then: none of its data pages is decoded, and the
 //! decompressor drops the ones still to come.
 
+use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::decoding::row_group_pages::{DecodeRange, PageContent, RowGroupPages};
 use crate::reading::decoding::{DecodePlan, ScanEqualityPredicate, WorkerAllocator};
 use crate::types::page::{DecompressedPage, DecompressedPageType};
@@ -62,6 +63,9 @@ struct OpenRowGroup {
     pages: RowGroupPages,
     /// How many ranges, from the first, have been emitted.
     emitted: usize,
+    /// The cutter's own leaf decoders, which build the dictionaries and
+    /// decide the pruning.
+    leaf_decoders: Vec<Box<dyn LeafDecoder>>,
 }
 
 /// Collects the pages of this worker's row groups and emits their
@@ -156,7 +160,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
         output: &mut dyn Sender<DecodeRange>,
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        let metadata = page.query_row_group_metadata;
+        let metadata = page.query_row_group_metadata.clone();
         let row_group_index = metadata.row_group_index;
         if self.closed.contains(&row_group_index) {
             return Ok(());
@@ -166,28 +170,47 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
                 DecodePlan::new(&metadata, &self.projection, &self.eq_predicates)
                     .map_err(crate::op_err)?,
             );
+            let leaf_decoders = plan
+                .create_leaf_decoders(&metadata)
+                .map_err(crate::op_err)?;
             let pages =
                 RowGroupPages::new(metadata.clone(), plan, self.outstanding_row_groups.clone());
-            self.open
-                .insert(row_group_index, OpenRowGroup { pages, emitted: 0 });
+            self.open.insert(
+                row_group_index,
+                OpenRowGroup {
+                    pages,
+                    emitted: 0,
+                    leaf_decoders,
+                },
+            );
         }
         let open = self.open.get_mut(&row_group_index).unwrap();
         let column = page.column_idx;
         match page.data {
-            DecompressedPageType::Dict { header, data } => {
-                // Looked at for pruning before any range is cut, then built
-                // once here for every decoder of the row group.
-                let plan = open.pages.plan().clone();
-                if plan.dictionary_prunes(column, &header, &data) {
-                    // Seen by every page of this row group still in flight:
-                    // the decompressor drops its remaining data pages.
+            DecompressedPageType::Dict { .. } => {
+                // Built once here, for every decoder of the row group to
+                // read through, and looked at for pruning before any range
+                // is cut.
+                let leaf = &mut open.leaf_decoders[column];
+                self.allocator
+                    .with(|allocator| leaf.insert_page(page, allocator));
+                let prunable = open
+                    .pages
+                    .plan()
+                    .prunable
+                    .iter()
+                    .any(|prunable| prunable.leaf == column);
+                if prunable && leaf.dict_excludes_eq_constant() {
+                    // Seen by every page of this row group still in
+                    // flight: the decompressor drops its remaining data
+                    // pages.
                     metadata.mark_pruned();
                     self.close(row_group_index);
                     return Ok(());
                 }
-                let dictionary = self
-                    .allocator
-                    .with(|allocator| plan.build_dictionary(column, &header, data, allocator));
+                let dictionary = leaf
+                    .dictionary()
+                    .expect("a dictionary page builds the dictionary");
                 open.pages.insert_dictionary(column, dictionary);
             }
             DecompressedPageType::Data(data) => {

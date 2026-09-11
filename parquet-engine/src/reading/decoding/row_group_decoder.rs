@@ -8,19 +8,17 @@
 //! column.
 
 use crate::reading::decoding::ScanEqualityPredicate;
-use crate::reading::decoding::column_decoder::{ColumnDecoder, LeafKind, Result, leaf_kind};
-use crate::reading::decoding::leaf_decoders::{LeafDecoder, SharedDictionary};
+use crate::reading::decoding::column_decoder::{ColumnDecoder, Result, create_leaf_decoder};
+use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::decoding::row_group_pages::{DecodeRange, PageContent, StoredPage};
 use crate::reading::record_batch_metadata::with_row_group_metadata;
-use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::filter_mask::FilterMask;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
-use arrow_schema::{Fields, Schema, SchemaRef};
-use bytes::Bytes;
+use arrow_schema::{FieldRef, Fields, Schema, SchemaRef};
 use dispatch::memory::SlabAllocator;
 use std::cmp::min;
 use std::ops::Range;
@@ -42,9 +40,9 @@ pub(crate) struct PrunableColumn {
 /// row group. Built once per row group and shared by every decoder of its
 /// rows; each decoder creates its own leaf decoders from it.
 pub(crate) struct DecodePlan {
-    /// The kinds of the leaves read, in the order the fetcher requested
+    /// The fields of the leaves read, in the order the fetcher requested
     /// them, so a page's `column_idx` indexes straight into this.
-    leaf_kinds: Vec<LeafKind>,
+    leaf_fields: Vec<FieldRef>,
     /// The file leaves the decoders read, in the same order.
     pub file_leaves: Vec<usize>,
     /// One view per output column, in projection order. Several can fold the
@@ -101,14 +99,12 @@ impl DecodePlan {
             .iter()
             .map(|decoder| decoder.output_field().clone())
             .collect();
-        let column_chunks = row_group_metadata.columns();
-        let leaf_kinds = plan
-            .file_leaves
-            .iter()
-            .map(|&leaf| leaf_kind(leaves[leaf].data_type(), &column_chunks[leaf]))
-            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            leaf_kinds,
+            leaf_fields: plan
+                .file_leaves
+                .iter()
+                .map(|&leaf| leaves[leaf].clone())
+                .collect(),
             file_leaves: plan.file_leaves,
             column_decoders,
             schema: Arc::new(Schema::new(output_fields)),
@@ -133,40 +129,21 @@ impl DecodePlan {
 
     /// Fresh leaf decoders, one per decoded leaf, with the pushed-down
     /// constants installed on the prunable ones.
-    pub fn create_leaf_decoders(&self) -> Vec<Box<dyn LeafDecoder>> {
-        let mut leaf_decoders: Vec<_> = self
-            .leaf_kinds
+    pub fn create_leaf_decoders(
+        &self,
+        row_group_metadata: &QueryRowGroupMetadata,
+    ) -> Result<Vec<Box<dyn LeafDecoder>>> {
+        let column_chunks = row_group_metadata.columns();
+        let mut leaf_decoders = self
+            .leaf_fields
             .iter()
-            .map(LeafKind::create_decoder)
-            .collect();
+            .zip(&self.file_leaves)
+            .map(|(field, &leaf)| create_leaf_decoder(field.data_type(), &column_chunks[leaf]))
+            .collect::<Result<Vec<_>>>()?;
         for (leaf, constant) in &self.eq_constants {
             leaf_decoders[*leaf].set_eq_constant(constant);
         }
-        leaf_decoders
-    }
-
-    /// Whether the dictionary page of `leaf` prunes the row group: the leaf
-    /// carries a pushed-down constant and the dictionary provably holds no
-    /// entry equal to it.
-    pub fn dictionary_prunes(
-        &self,
-        leaf: usize,
-        header: &DictionaryPageHeader,
-        data: &[Bytes],
-    ) -> bool {
-        self.eq_constants.iter().any(|(prunable, constant)| {
-            *prunable == leaf && self.leaf_kinds[leaf].dictionary_excludes(header, data, constant)
-        })
-    }
-
-    pub fn build_dictionary(
-        &self,
-        leaf: usize,
-        header: &DictionaryPageHeader,
-        data: Vec<Bytes>,
-        allocator: &mut SlabAllocator,
-    ) -> SharedDictionary {
-        self.leaf_kinds[leaf].build_dictionary(header, data, allocator)
+        Ok(leaf_decoders)
     }
 }
 
@@ -212,7 +189,7 @@ impl RowGroupDecoder {
         Ok(Self {
             next_page: vec![0; plan.leaf_count()],
             dictionary_loaded: vec![false; plan.leaf_count()],
-            leaf_decoders: plan.create_leaf_decoders(),
+            leaf_decoders: plan.create_leaf_decoders(&metadata)?,
             plan,
             batch_size,
             next_row: 0,

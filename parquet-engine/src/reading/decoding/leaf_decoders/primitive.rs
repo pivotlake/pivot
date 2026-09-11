@@ -414,6 +414,10 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
         self.inner.insert_page(page, allocator);
     }
 
+    fn dictionary(&self) -> Option<SharedDictionary> {
+        self.inner.dictionary()
+    }
+
     fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {
         self.inner.adopt_dictionary(dictionary);
     }
@@ -432,6 +436,10 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
 
     fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
         self.inner.set_eq_constant(value);
+    }
+
+    fn dict_excludes_eq_constant(&self) -> bool {
+        self.inner.dict_excludes_eq_constant()
     }
 
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
