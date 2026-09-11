@@ -32,7 +32,8 @@ use crate::operations::unary::group::output::topk_pruning::{
 use crate::operations::unary::group::values::{AggregationSlot, ArityBody, WorkerContext};
 use ahash::RandomState;
 use arrow_array::RecordBatch;
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 /// Table capacity at which eligible keys switch to radix scatter.
 const SWITCH_THRESHOLD: usize = 32768;
@@ -75,11 +76,73 @@ impl RadixConfig {
     }
 }
 
-/// One worker's scatter buffer for each radix partition.
-pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized>(
-    pub Vec<StridedScatterRows<KP, V>>,
-);
-unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for PartitionBuffers<KP, V> {}
+/// One worker's scatter buffer for each radix partition, as the merge reads
+/// them.
+///
+/// Each bucket sits behind a lock so the partition job that merges it can
+/// drop it right after. The pool holds workers times buckets of them, each
+/// owning its chunk list, and dropping them all from whichever worker drops
+/// the shared merge state last is a serial tail that grows with the worker
+/// count; released per partition, the teardown spreads over the jobs.
+pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
+    buckets: Vec<Mutex<Option<StridedScatterRows<KP, V>>>>,
+    /// Rows across every bucket, counted by the flushing worker so the merge
+    /// coordinator sums one number per worker rather than walking the
+    /// pool's buckets.
+    total_rows: usize,
+}
+
+impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
+    pub fn new(buckets: Vec<StridedScatterRows<KP, V>>) -> Self {
+        let total_rows = buckets.iter().map(|bucket| bucket.len()).sum();
+        Self {
+            buckets: buckets
+                .into_iter()
+                .map(|bucket| Mutex::new(Some(bucket)))
+                .collect(),
+            total_rows,
+        }
+    }
+
+    /// How many scatter buckets the worker holds.
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Rows scattered across every bucket.
+    pub fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    /// The scatter buckets of `partition`, given the merge's partition count.
+    /// Both counts are powers of two, so partitions cover equal, contiguous
+    /// bucket ranges.
+    pub fn bucket_range(&self, partition: usize, num_partitions: usize) -> Range<usize> {
+        let buckets_per_partition = (self.buckets.len() / num_partitions).max(1);
+        let first = partition * buckets_per_partition;
+        first..first + buckets_per_partition
+    }
+
+    /// Runs `f` over the rows of bucket `index`. A bucket is released only by
+    /// the job that merged it, so a bucket being read is still held.
+    pub fn with_bucket<R>(
+        &self,
+        index: usize,
+        f: impl FnOnce(&StridedScatterRows<KP, V>) -> R,
+    ) -> R {
+        let bucket = self.buckets[index].lock().unwrap();
+        f(bucket
+            .as_ref()
+            .expect("a scatter bucket is released only after its partition merged it"))
+    }
+
+    /// Drops the buckets of `partition` once its merge has read them.
+    pub fn release_partition(&self, partition: usize, num_partitions: usize) {
+        for index in self.bucket_range(partition, num_partitions) {
+            *self.buckets[index].lock().unwrap() = None;
+        }
+    }
+}
 
 /// Tables, optional scatter buffers, and sizing data produced by one worker.
 pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> {
@@ -589,7 +652,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let output = AggregatedTableOutput {
             node: crate::worker::current_node(),
             tables: self.tables,
-            buffers: self.buffers.map(PartitionBuffers),
+            buffers: self.buffers.map(PartitionBuffers::new),
             hll: self.hll,
             has_bin_totals: topk_bin_totals.is_some(),
             raw_scatter_rows,
@@ -863,10 +926,14 @@ mod tests {
 
     fn scatter_row_count(output: &AggregatedTableOutput<IntExtractor, CountValue>) -> usize {
         let layout = StridedScatterRows::<i32, CountValue>::layout::<0>(&());
+        let buffers = output.buffers.as_ref().expect("worker switched");
         let mut rows = 0;
-        for bucket in &output.buffers.as_ref().expect("worker switched").0 {
-            bucket.for_each(layout, |_, _, _| rows += 1);
+        for bucket in 0..buffers.bucket_count() {
+            buffers.with_bucket(bucket, |rows_in_bucket| {
+                rows_in_bucket.for_each(layout, |_, _, _| rows += 1)
+            });
         }
+        assert_eq!(rows, buffers.total_rows());
         rows
     }
 

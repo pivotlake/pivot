@@ -45,7 +45,7 @@ impl<V: AggregationValue + ?Sized> Copy for ScatterLayout<V> {}
 /// value's stride comes from the query. The buffer stores only allocation
 /// state and the current chunk's fill; the caller supplies [`ScatterLayout`].
 pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
-    chunks: Vec<Slab>,
+    chunks: ChunkList,
     /// Base address of the chunk being filled.
     ///
     /// The push loop hops between thousands of partition buffers in random
@@ -62,6 +62,51 @@ pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     completed_rows: usize,
     // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
     _phantom: PhantomData<(KP, *const V)>,
+}
+
+/// A bucket's chunks, the first two held inline.
+///
+/// A pool has workers times buckets of these, and a heap-allocated list per
+/// bucket costs an allocation on the scatter path and, when the buckets are
+/// released, a free that contends on the allocator's locks across every
+/// worker at once. The small first chunk and one full chunk cover a bucket
+/// holding a worker's even share of rows, so only a skewed bucket spills to
+/// the heap.
+struct ChunkList {
+    inline: [Option<Slab>; 2],
+    spilled: Vec<Slab>,
+    /// Chunks held, inline and spilled; the push path reads it per row.
+    len: usize,
+}
+
+impl ChunkList {
+    const fn new() -> Self {
+        Self {
+            inline: [None, None],
+            spilled: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push(&mut self, chunk: Slab) {
+        match self.inline.get_mut(self.len) {
+            Some(slot) => *slot = Some(chunk),
+            None => self.spilled.push(chunk),
+        }
+        self.len += 1;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Slab> {
+        self.inline.iter().flatten().chain(self.spilled.iter())
+    }
 }
 
 // SAFETY: cached row pointers refer to address-stable slabs owned by `chunks`.
@@ -112,7 +157,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
     /// Creates an empty, lazily allocated buffer.
     pub fn new() -> Self {
         Self {
-            chunks: Vec::new(),
+            chunks: ChunkList::new(),
             current_chunk_base: std::ptr::null_mut(),
             last_rows: 0,
             completed_rows: 0,

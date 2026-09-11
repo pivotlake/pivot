@@ -157,8 +157,27 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
     /// into `allocator`). Accumulating across partition jobs, rather than emitting
     /// one batch per job, keeps the radix path's many small partitions from each
     /// producing a tiny `RecordBatch`.
+    ///
+    /// Whether it merged the partition or pruned it, the job then drops the
+    /// partition's scatter buckets on its node. Each job frees its own share
+    /// so the teardown runs on every worker instead of on the one that drops
+    /// the shared state last.
     pub(super) fn run_into(
         self,
+        acc: &mut Option<OutputAccumulator<K, V>>,
+        sender: &mut dyn Sender<RecordBatch>,
+        allocator: &mut SlabAllocator,
+    ) -> Result<()> {
+        let outcome = self.merge_and_emit(acc, sender, allocator);
+        let (buffers, _) = &self.shared.sources[self.node];
+        for worker_buffers in buffers {
+            worker_buffers.release_partition(self.index, self.shared.num_partitions);
+        }
+        outcome
+    }
+
+    fn merge_and_emit(
+        &self,
         acc: &mut Option<OutputAccumulator<K, V>>,
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,

@@ -240,8 +240,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 .flatten()
                 .next()
                 .expect("a worker switched, so some node has scatter buffers")
-                .0
-                .len();
+                .bucket_count();
             let merge_partitions = (estimate / target_groups_per_partition)
                 .clamp(worker_count, scatter_buckets)
                 .max(MIN_MERGE_PARTITIONS)
@@ -265,14 +264,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // so merge every node's sources directly and pay the remote reads
         // once. An all-in-place merge is always direct: its tables are
         // per-worker aggregated already and their estimate equals their
-        // total, so the test is never met. Counting the scattered rows walks
-        // every switched worker's every bucket, so only pay for it when a
-        // second node exists at all.
+        // total, so the test is never met.
         let hierarchical = node_count > 1 && {
             let scatter_rows: usize = buffers_by_node
                 .iter()
                 .flatten()
-                .map(|b| b.0.iter().map(|bucket| bucket.len()).sum::<usize>())
+                .map(|b| b.total_rows())
                 .sum();
             total_in_place + scatter_rows > 2 * estimate
         };
