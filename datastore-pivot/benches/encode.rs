@@ -356,6 +356,7 @@ fn insert(dispatch: &Dispatch, catalog: &PivotCatalog, input: Vec<RecordBatch>) 
             schema: planner::DEFAULT_SCHEMA_NAME.to_string(),
             table: TABLE.to_string(),
         })
+        .expect("table lookup succeeds")
         .expect("the table was created");
     let rows = values_input(dispatch.dispatcher(), input).record_batches();
     table
