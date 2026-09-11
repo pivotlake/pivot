@@ -124,10 +124,13 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// form: its partials are nonnegative and additive, so bin sums stay valid
     /// upper bounds (see [`prunable_topk_slot`](crate::operations::unary::group::output::topk_pruning::prunable_topk_slot)). `None` builds
     /// no totals, including for a pushed top-k on any other aggregate.
+    /// Cleared when the worker falls back to raw scatter: raw rows would
+    /// each cost a totals update, and a worker that stopped deduplicating
+    /// holds keys too spread out for any bin bound to prune.
     topk_aggregation_slot: Option<usize>,
     /// Hash-bin totals of that slot's partials, allocated on first use.
-    /// Every partial the merge will see feeds it: drained table entries and
-    /// raw rows as they scatter, surviving table entries at flush.
+    /// Every partial the merge will see feeds it: drained table entries as
+    /// they scatter, surviving table entries at flush.
     topk_bin_totals: Option<HashBinTotals>,
     /// Whether this worker has entered radix mode.
     switched_to_radix: bool,
@@ -431,6 +434,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         self.create_scatter_buffers();
         self.scatter_active_table_to_radix_partitions();
         self.scatter_raw = almost_no_dedup;
+        if almost_no_dedup {
+            // Raw rows are never folded into the bin totals, so this worker
+            // reports none at flush and the merge runs without pruning.
+            self.topk_aggregation_slot = None;
+            self.topk_bin_totals = None;
+        }
         almost_no_dedup
     }
 
@@ -445,9 +454,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         }
     }
 
-    /// Scatters rows into radix partitions without deduplicating them. With
-    /// a pushed top-k, each row's seeded partial is folded into the bin
-    /// totals as it scatters, so the bounds cover raw rows too.
+    /// Scatters rows into radix partitions without deduplicating them. Only
+    /// a worker that fell back to raw scatter gets here, and that fallback
+    /// switched top-k pruning off, so no bin totals are kept for these rows.
     #[inline(always)]
     fn scatter_range<'b>(
         &mut self,
@@ -457,9 +466,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         value_reader: &V::Reader<'b>,
     ) {
         let shift = u64::BITS - self.radix_config.partitions.trailing_zeros();
-        if self.topk_aggregation_slot.is_some() && self.topk_bin_totals.is_none() {
-            self.topk_bin_totals = Some(HashBinTotals::new(&mut self.allocator));
-        }
         let Self {
             key_arena,
             worker_context,
@@ -468,8 +474,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             hll,
             hashes,
             shared_context,
-            topk_bin_totals,
-            topk_aggregation_slot,
             ..
         } = self;
         V::dispatch_arity(
@@ -481,8 +485,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 allocator,
                 hll,
                 hashes,
-                bin_totals: topk_aggregation_slot
-                    .map(|slot| (topk_bin_totals.as_mut().unwrap(), slot)),
                 shift,
                 start,
                 end,
@@ -548,9 +550,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             }
         }
         // Fold the entries still sitting in the in-place tables into the
-        // top-k bin totals (scattered rows folded as they scattered). A worker
-        // this small skips the totals (and thereby turns pruning off) rather
-        // than pay the allocation on a query too small to prune.
+        // top-k bin totals (drained entries were folded as they scattered). A
+        // worker this small skips the totals (and thereby turns pruning off)
+        // rather than pay the allocation on a query too small to prune.
         let table_entries: usize = self.tables.iter().map(|t| t.len()).sum();
         let allocator = &mut self.allocator;
         let taken_totals = self.topk_bin_totals.take();
@@ -755,9 +757,6 @@ struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
     allocator: &'a mut SlabAllocator,
     hll: &'a mut Hll,
     hashes: &'a [u64; RECORD_BATCH_SIZE],
-    /// With a pushed top-k: the bin totals and the ordering slot each seeded
-    /// row's partial is folded in by.
-    bin_totals: Option<(&'a mut HashBinTotals, usize)>,
     shift: u32,
     start: usize,
     end: usize,
@@ -777,7 +776,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
             allocator,
             hll,
             hashes,
-            mut bin_totals,
             shift,
             start,
             end,
@@ -798,10 +796,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
             let key = K::live_key(key_reader, i, key_arena).persist();
             // Seed directly into the destination row.
             buffers[partition].push_with(scatter_layout, allocator, hash, key, |stored| {
-                stored.seed(value_reader, i, worker_context);
-                if let Some((totals, slot)) = &mut bin_totals {
-                    totals.add(hash, stored.sort_key(*slot).saturating_weight());
-                }
+                stored.seed(value_reader, i, worker_context)
             });
         }
     }
@@ -946,19 +941,15 @@ mod tests {
         );
 
         // Unique keys make every post-switch fill 100% distinct: the worker
-        // must fall back to raw scatter, and the raw rows must still be
-        // folded into the bin totals as they scatter.
+        // must fall back to raw scatter, which switches pruning off, so it
+        // reports no bin totals and the merge cannot build bounds.
         let values: Vec<i32> = (0..6000).collect();
         consume_all(&mut table, &values);
         let (output, totals) = table.flush();
 
         assert!(output.buffers.is_some(), "fallback allocates buffers");
         assert!(scatter_row_count(&output) > 1000, "tail rows scatter raw");
-        let mass: u64 = totals
-            .expect("raw rows keep the bin totals fed")
-            .into_bin_totals()
-            .iter()
-            .sum();
-        assert_eq!(mass, 6000, "every row is binned exactly once");
+        assert!(totals.is_none(), "a raw-scatter worker keeps no bin totals");
+        assert!(!output.has_bin_totals);
     }
 }
