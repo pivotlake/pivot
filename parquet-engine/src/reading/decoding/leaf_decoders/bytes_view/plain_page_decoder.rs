@@ -226,6 +226,10 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
 
     /// Skip values within the current buffer. Returns the number of values
     /// fully skipped and an optional error if a value straddled the boundary.
+    ///
+    /// The skip is the same dependent chain of length loads as the read, so
+    /// it prefetches the same distance ahead; a range taken over mid-page
+    /// skips up to a page of strings before its first row.
     fn skip_within_buffer(&mut self, size: usize) -> (usize, Option<Error>) {
         let bytes = &self.data[self.position.buffer_index];
 
@@ -235,6 +239,11 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
         while self.position.offset < bytes.len() && skipped != size {
             if self.position.offset + 4 > bytes.len() {
                 return (skipped, Some(Error::Len));
+            }
+            if self.position.offset + WALK_PREFETCH_BYTES < bytes.len() {
+                prefetch_line(unsafe {
+                    buf.as_ptr().add(self.position.offset + WALK_PREFETCH_BYTES)
+                });
             }
             let len_bytes: [u8; 4] = unsafe {
                 buf.get_unchecked(self.position.offset..self.position.offset + 4)
