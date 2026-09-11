@@ -17,7 +17,7 @@
 //! ```
 
 use crate::RECORD_BATCH_SIZE;
-use crate::memory::SlabAllocator;
+use crate::memory::{SlabAllocator, SlabBuffer};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
@@ -216,7 +216,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Radix threshold and partition count.
     radix_config: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
-    hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    hashes: HashScratch,
     /// Per-worker reusable key-extraction scratch (e.g. the row extractor's
     /// encode buffers). Lent to the reader each batch and reused, never
     /// reallocated. `()` for extractors that read columns directly.
@@ -226,6 +226,42 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// here. There is at most one such key (the hash is a bijection), so this
     /// boolean adds 0 or 1 to the distinct count at output.
     zero_hash_seen: bool,
+}
+
+/// The per-batch hash scratch, carved from the worker's ring memory.
+///
+/// A heap allocation of this size is a large one for the allocator, and a
+/// zeroed large allocation is served by unmapping the pages rather than
+/// writing them, which shoots down the TLB of every core running the process
+/// and then faults the pages back in on first use. One such allocation per
+/// worker at the start of every query adds up on a wide machine; the ring's
+/// buffers are already mapped and zeroed.
+struct HashScratch(SlabBuffer<u64>);
+
+impl HashScratch {
+    fn new(allocator: &mut SlabAllocator) -> Self {
+        // The hashes of a batch are written before they are read, so the
+        // slab does not need to be zeroed.
+        Self(allocator.create_slab_buffer(RECORD_BATCH_SIZE, false))
+    }
+}
+
+impl std::ops::Deref for HashScratch {
+    type Target = [u64; RECORD_BATCH_SIZE];
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the slab holds exactly `RECORD_BATCH_SIZE` u64s, aligned for u64.
+        unsafe { &*(self.0.ptr_at_index(0) as *const [u64; RECORD_BATCH_SIZE]) }
+    }
+}
+
+impl std::ops::DerefMut for HashScratch {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as in `deref`, and `&mut self` makes this the only access.
+        unsafe { &mut *(self.0.ptr_at_index(0) as *mut [u64; RECORD_BATCH_SIZE]) }
+    }
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
@@ -239,6 +275,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = BaseHashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
+        let hashes = HashScratch::new(&mut allocator);
         Self {
             hash_state,
             shared_context,
@@ -254,10 +291,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             scatter_raw: false,
             rows_since_clear: 0,
             radix_config,
-            hashes: vec![0u64; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
+            hashes,
             scratch: K::Scratch::default(),
             zero_hash_seen: false,
         }
