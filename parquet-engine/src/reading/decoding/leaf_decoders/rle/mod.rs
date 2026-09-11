@@ -18,6 +18,7 @@ use bytes::Bytes;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
 mod bit_pack_decoder;
+use bit_pack_decoder::unpack8;
 pub use bit_pack_decoder::{BitDecoderOverflow, BitPackDecoder};
 
 /// Writes `dict`'s entry for each key into `dest` (same length).
@@ -379,13 +380,24 @@ impl RleDecoder {
 
     /// Decodes `size` values, looking up each index in `dict` and pushing
     /// the result into `builder`.
+    ///
+    /// A page held in one buffer (the common case) decodes through
+    /// [`read_contiguous`](Self::read_contiguous); a page scattered across
+    /// buffers goes through the general run-at-a-time path.
     pub fn read<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
         &mut self,
         builder: &mut B,
         dict: &D,
         size: usize,
     ) {
+        if size == 0 {
+            return;
+        }
         let target = builder.len() + size;
+        if self.data.len() == 1 {
+            self.read_contiguous(builder, dict, target);
+            return;
+        }
         while builder.len() < target {
             let size = target - builder.len();
             let run = self.get_or_set_next_run();
@@ -400,6 +412,389 @@ impl RleDecoder {
             );
         }
     }
+
+    /// Decodes from the single buffer holding this page until `builder` holds
+    /// `target` values, resuming any run left over from an earlier call.
+    ///
+    /// Sorted or clustered data encodes as a long alternation of short RLE runs
+    /// and one- or two-group bit-packed runs, so the general path's per-run
+    /// work (a reader over the buffer list, a run value passed in and out,
+    /// a decoder set up per run, a chunk callback and two calls per chunk)
+    /// outweighs the decoding itself. This loop reads headers straight off the
+    /// slice, fills RLE runs in place, and unpacks bit-packed groups into the
+    /// builder as it goes. Bit widths up to 16 (every low-cardinality
+    /// dictionary) get a monomorphized group unpack; wider ones keep the bulk
+    /// unpacker, whose long runs amortize its call.
+    fn read_contiguous<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+        &mut self,
+        builder: &mut B,
+        dict: &D,
+        target: usize,
+    ) {
+        macro_rules! specialized {
+            ($($n:literal),*) => {
+                match self.bit_width {
+                    $($n => self.read_contiguous_with::<$n, I, B, D>(builder, dict, target),)*
+                    _ => self.read_contiguous_with::<0, I, B, D>(builder, dict, target),
+                }
+            };
+        }
+        specialized!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    }
+
+    /// [`read_contiguous`](Self::read_contiguous) for one bit width. `BW` is
+    /// the width when the group unpack is specialized for it, and zero for the
+    /// generic path (bit width zero, or wider than the specialized set).
+    ///
+    /// The page is a sequence of runs, each starting with a varint header
+    /// whose low bit tells the kind: `0` is an RLE run (`header >> 1` copies
+    /// of one value, stored after the header in `byte_width` bytes), `1` is a
+    /// bit-packed run (`header >> 1` groups of eight values, each `bit_width`
+    /// bits, stored as `bit_width` bytes per group). The loop walks these runs
+    /// with a plain slice and offset until the builder holds `target` values.
+    ///
+    /// A call may end in the middle of a run, and even in the middle of a
+    /// bit-packed group; whatever is left is stored in `self.run` so the next
+    /// call carries on from the same value. The decoder therefore keeps two
+    /// kinds of "leftover" for a bit-packed run: how many values of the run
+    /// are still unemitted, and up to seven values already unpacked from the
+    /// group that was cut (see [`BitPackedRun`]).
+    #[inline(never)]
+    fn read_contiguous_with<
+        const BW: usize,
+        I,
+        B: ArrayBuilder<Element = I>,
+        D: Dict<Builder = B, Item = I>,
+    >(
+        &mut self,
+        builder: &mut B,
+        dict: &D,
+        target: usize,
+    ) {
+        debug_assert!(self.position.buffer_index == 0);
+        // Whatever an earlier call left unfinished is emitted (RLE) or handed
+        // to the loop as its first run (bit-packed) before `buf` borrows
+        // `self.data`, so this can still be a method on `self`.
+        let mut pending = self.resume_leftover_run(builder, dict, target);
+        let bit_width = self.bit_width as usize;
+        let buf: &[u8] = self.data[0].as_ref();
+        let mut pos = self.position.offset;
+        // Every packed key is below 2^bit_width. When the dictionary has at
+        // least that many entries no key can be out of range, so the lookups
+        // can skip the per-group range check.
+        let keys_in_range = (1u64 << bit_width) as usize <= dict.len();
+        while builder.len() < target {
+            let remaining = target - builder.len();
+            let run = match pending.take() {
+                Some(run) => run,
+                None => {
+                    let header = read_varint(buf, &mut pos);
+                    if header & 1 == 0 {
+                        let count = (header >> 1) as usize;
+                        let value = read_rle_value(buf, &mut pos, byte_width(self.bit_width));
+                        emit_rle_run(builder, dict, &mut self.run, value, count, remaining);
+                        continue;
+                    }
+                    BitPackedRun {
+                        values: ((header >> 1) as usize) * 8,
+                        partial: [0; 7],
+                        partial_count: 0,
+                    }
+                }
+            };
+            let take = run.values.min(remaining);
+            let (partial, partial_count) = if BW != 0 {
+                unpack_run_specialized::<BW, I, B, D>(
+                    buf,
+                    &mut pos,
+                    builder,
+                    dict,
+                    keys_in_range,
+                    run.partial,
+                    run.partial_count,
+                    take,
+                )
+            } else {
+                unpack_run_bulk(
+                    buf,
+                    &mut pos,
+                    &mut self.buffer,
+                    self.bit_width,
+                    builder,
+                    dict,
+                    keys_in_range,
+                    run.partial,
+                    run.partial_count,
+                    take,
+                )
+            };
+            if take < run.values {
+                // The request ended inside this run: remember how much of it
+                // is left, plus any values unpacked from its cut group.
+                self.run = Some(Run::BitPacked {
+                    remaining_in_run: run.values - take,
+                    partial,
+                    partial_count,
+                });
+            }
+        }
+        self.position.offset = pos;
+    }
+
+    /// Finishes off the run an earlier `read` call stopped inside, if any.
+    ///
+    /// An RLE leftover is pushed here (bounded by `target`, and stored back if
+    /// even that does not finish it). A bit-packed leftover is returned so the
+    /// caller's loop decodes it as its first run, since it needs the slice and
+    /// offset the loop works with.
+    fn resume_leftover_run<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+        &mut self,
+        builder: &mut B,
+        dict: &D,
+        target: usize,
+    ) -> Option<BitPackedRun> {
+        match self.run.take() {
+            Some(Run::Rle { value, count }) => {
+                let limit = target - builder.len();
+                emit_rle_run(builder, dict, &mut self.run, value, count, limit);
+                None
+            }
+            Some(Run::BitPacked {
+                remaining_in_run,
+                partial,
+                partial_count,
+            }) => Some(BitPackedRun {
+                values: remaining_in_run,
+                partial,
+                partial_count,
+            }),
+            None => None,
+        }
+    }
+}
+
+/// A bit-packed run the contiguous loop is about to decode: `values` still
+/// unemitted, the first `partial_count` of which are already unpacked and sit
+/// in `partial[7 - partial_count..]` (the layout [`BitPackDecoder`] resumes
+/// from). The rest are whole groups at the decoder's current offset.
+struct BitPackedRun {
+    values: usize,
+    partial: [u32; 7],
+    partial_count: u8,
+}
+
+/// Pushes up to `limit` copies of `dict[value]` and stores the unemitted rest
+/// of the run in `leftover` for the next call.
+#[inline(always)]
+fn emit_rle_run<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+    builder: &mut B,
+    dict: &D,
+    leftover: &mut Option<Run>,
+    value: u32,
+    count: usize,
+    limit: usize,
+) {
+    let emit = count.min(limit);
+    builder.push(&dict.entry(value as usize), emit);
+    if emit < count {
+        *leftover = Some(Run::Rle {
+            value,
+            count: count - emit,
+        });
+    }
+}
+
+/// Decodes `take` values of a bit-packed run with the group unpacker
+/// monomorphized for `BW`, writing the looked-up entries into `builder`.
+///
+/// Returns the partial-group state to carry into the next call: the values
+/// unpacked from the last group that `take` did not reach.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn unpack_run_specialized<
+    const BW: usize,
+    I,
+    B: ArrayBuilder<Element = I>,
+    D: Dict<Builder = B, Item = I>,
+>(
+    buf: &[u8],
+    pos: &mut usize,
+    builder: &mut B,
+    dict: &D,
+    keys_in_range: bool,
+    partial: [u32; 7],
+    mut partial_count: u8,
+    take: usize,
+) -> ([u32; 7], u8) {
+    // Values already unpacked from a cut group come first. A preceding skip
+    // may have unpacked them without validating the keys. Check the consumed
+    // values here: dictionary entry() implementations can index unchecked.
+    let from_partial = (partial_count as usize).min(take);
+    let start = 7 - partial_count as usize;
+    let keys = &partial[start..start + from_partial];
+    if !keys_in_range && !keys.is_empty() {
+        check_keys(keys, dict.len());
+    }
+    for (slot, &key) in builder.spare_mut(from_partial).iter_mut().zip(keys) {
+        // SAFETY: keys fit by the bit-width bound or the check above.
+        *slot = unsafe { dict.entry_unchecked(key as usize) };
+    }
+    partial_count -= from_partial as u8;
+
+    // The rest come from whole groups in the page: `full_groups` emitted in
+    // their entirety, plus one more group if `take` ends inside it. Checking
+    // all of them against the page length once here is what lets each
+    // `unpack8` read without bounds checks.
+    let packed = take - from_partial;
+    let full_groups = packed / 8;
+    let rest = packed - full_groups * 8;
+    let groups_needed = full_groups + usize::from(rest > 0);
+    assert!(
+        *pos + groups_needed * BW <= buf.len(),
+        "bit-packed run at {pos} runs past the page ({} bytes)",
+        buf.len()
+    );
+    let mut group = [0u32; 8];
+    let dest = builder.spare_mut(full_groups * 8);
+    for chunk in dest.as_chunks_mut::<8>().0 {
+        // SAFETY: the groups were checked to lie inside `buf`.
+        unsafe { gather_group::<BW, I, B, D>(buf, pos, dict, keys_in_range, &mut group, chunk) };
+    }
+    if rest == 0 {
+        // `take` ended on a group edge; the partial state is whatever was
+        // left after the tail above (zero unless `take` ended inside it).
+        return (partial, partial_count);
+    }
+    // `take` ends inside the last group: emit its first `rest` values and
+    // keep the others for the next call.
+    let dest = builder.spare_mut(rest);
+    // SAFETY: this group was included in the length check above.
+    unsafe { gather_group::<BW, I, B, D>(buf, pos, dict, keys_in_range, &mut group, dest) };
+    partial_from_group(&group, rest)
+}
+
+/// Unpacks one group of eight keys at `pos` and writes their dictionary
+/// entries to `dest`, which holds eight slots for a whole group or fewer for
+/// the emitted head of a cut group. `group` receives all eight keys so the
+/// caller can keep the unemitted tail.
+///
+/// # Safety
+/// `BW` bytes at `pos` must lie inside `buf`.
+#[inline(always)]
+unsafe fn gather_group<
+    const BW: usize,
+    I,
+    B: ArrayBuilder<Element = I>,
+    D: Dict<Builder = B, Item = I>,
+>(
+    buf: &[u8],
+    pos: &mut usize,
+    dict: &D,
+    keys_in_range: bool,
+    group: &mut [u32; 8],
+    dest: &mut [I],
+) {
+    // SAFETY: the caller guarantees `BW` bytes at `pos` lie inside `buf`.
+    unsafe { unpack8::<BW>(buf, pos, group.as_mut_ptr()) };
+    if !keys_in_range {
+        check_keys(group, dict.len());
+    }
+    for (slot, &key) in dest.iter_mut().zip(group.iter()) {
+        // SAFETY: keys are below the dictionary length by the bit-width
+        // bound or the check above.
+        *slot = unsafe { dict.entry_unchecked(key as usize) };
+    }
+}
+
+/// Decodes `take` values of a bit-packed run through the bulk
+/// [`BitPackDecoder`], for bit widths without a specialized group unpack.
+/// Keys are decoded into `scratch` a chunk at a time and gathered from there.
+///
+/// Returns the partial-group state to carry into the next call, as
+/// [`unpack_run_specialized`] does.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn unpack_run_bulk<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+    buf: &[u8],
+    pos: &mut usize,
+    scratch: &mut [u32; 1024],
+    bit_width: u8,
+    builder: &mut B,
+    dict: &D,
+    keys_in_range: bool,
+    partial: [u32; 7],
+    partial_count: u8,
+    take: usize,
+) -> ([u32; 7], u8) {
+    // The decoder serves the already unpacked tail first, then reads whole
+    // groups from the page; only the latter need to fit in it.
+    let groups_needed = (take - (partial_count as usize).min(take)).div_ceil(8);
+    assert!(
+        *pos + groups_needed * bit_width as usize <= buf.len(),
+        "bit-packed run at {pos} runs past the page ({} bytes)",
+        buf.len()
+    );
+    let mut decoder = BitPackDecoder::new(buf, *pos, bit_width, partial, partial_count);
+    let mut left = take;
+    while left > 0 {
+        let chunk = left.min(scratch.len());
+        let count = decoder
+            .decode(&mut scratch[..chunk])
+            .expect("the run was checked to lie inside the buffer");
+        let keys = &scratch[..count];
+        if !keys_in_range {
+            check_keys(keys, dict.len());
+        }
+        let dest = builder.spare_mut(count);
+        // SAFETY: every key is below the dictionary length.
+        unsafe { gather_entries(dict, keys, dest) };
+        left -= count;
+    }
+    *pos = decoder.pos();
+    (*decoder.partial_values(), decoder.partial_count())
+}
+
+/// Reads a ULEB128 varint from `buf` at `pos`, advancing past it.
+#[inline(always)]
+fn read_varint(buf: &[u8], pos: &mut usize) -> u32 {
+    let first = buf[*pos];
+    *pos += 1;
+    if first & 0x80 == 0 {
+        return first as u32;
+    }
+    let mut result = (first & 0x7F) as u32;
+    let mut shift = 7;
+    loop {
+        let byte = buf[*pos];
+        *pos += 1;
+        result |= ((byte & 0x7F) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return result;
+        }
+        shift += 7;
+    }
+}
+
+/// Reads an RLE run's repeated value: `byte_width` little-endian bytes.
+#[inline(always)]
+fn read_rle_value(buf: &[u8], pos: &mut usize, byte_width: u8) -> u32 {
+    let mut value = 0u32;
+    for i in 0..byte_width as usize {
+        value |= (buf[*pos + i] as u32) << (8 * i);
+    }
+    *pos += byte_width as usize;
+    value
+}
+
+/// Panics when any key reaches `dict_len`, so the unchecked lookups that
+/// follow stay in bounds for a dictionary smaller than its bit width allows.
+#[inline(always)]
+fn check_keys(keys: &[u32], dict_len: usize) {
+    let max = keys.iter().copied().max().unwrap_or(0);
+    assert!(
+        (max as usize) < dict_len,
+        "dictionary key {max} out of range ({dict_len} entries)"
+    );
 }
 
 #[cfg(test)]
@@ -514,6 +909,71 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_read_preserves_pending_bitpacked_run() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        // Exercise both the specialized and bulk unpackers, with a partial
+        // group or only whole groups pending, and both buffer layouts.
+        for bit_width in [8, 32] {
+            let mut stream = vec![0x05]; // Two bit-packed groups.
+            for key in (0..4u32).cycle().take(16) {
+                stream.extend_from_slice(&key.to_le_bytes()[..byte_width(bit_width) as usize]);
+            }
+            for first in [1, 8] {
+                for scattered in [false, true] {
+                    let data = if scattered {
+                        make_data_multi_buffer(vec![stream[..2].to_vec(), stream[2..].to_vec()])
+                    } else {
+                        make_data(stream.clone())
+                    };
+                    let mut dec = RleDecoder::new(data, ReaderPosition::default(), bit_width);
+                    let mut builder = ViewBuilder::with_capacity(&mut allocator, 16);
+                    dict.register_onto(&mut builder);
+                    dec.read(&mut builder, &dict, first);
+                    dec.read(&mut builder, &dict, 0);
+                    assert_eq!(builder.len(), first);
+                    dec.read(&mut builder, &dict, 16 - first);
+                    let expected: Vec<_> = ["AA", "BB", "CC", "DD"]
+                        .into_iter()
+                        .cycle()
+                        .take(16)
+                        .collect();
+                    assert_eq!(extract_strings(builder), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "dictionary key 3 out of range (3 entries)")]
+    fn partial_key_after_skip_is_checked_before_lookup() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC"]);
+        // Keys [0, 3, 0, 0, 0, 0, 0, 0]: skip unpacks the invalid key
+        // without validating it, leaving it as the first partial value.
+        let mut dec = new_decoder(vec![0x03, 0x0C, 0x00], 2);
+        dec.skip(1);
+        // A checked ViewDict lookup would panic with a different message;
+        // primitive dictionaries instead index their slabs unchecked.
+        push_all(&mut allocator, &mut dec, &dict, 1);
+    }
+
+    #[test]
+    fn partial_key_check_only_validates_consumed_values() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC"]);
+        // Keys [0, 1, 3, 2, 2, 2, 2, 2]: the invalid third key is skipped.
+        let mut dec = new_decoder(vec![0x03, 0xB4, 0xAA], 2);
+        dec.skip(1);
+        assert_eq!(push_all(&mut allocator, &mut dec, &dict, 1), vec!["BB"]);
+        dec.skip(1);
+        assert_eq!(push_all(&mut allocator, &mut dec, &dict, 5), vec!["CC"; 5]);
+    }
+
+    #[test]
     fn test_rle_then_bitpacked() {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
@@ -538,6 +998,97 @@ mod tests {
         let result = push_all(&mut allocator, &mut dec, &dict, 8);
 
         assert_eq!(result, vec!["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"]);
+    }
+
+    /// A fragmented stream (short RLE runs between one- and two-group
+    /// bit-packed runs) decodes the same values whether it is read in one
+    /// call or in pieces that end inside runs and groups.
+    #[test]
+    fn fragmented_stream_reads_the_same_in_any_piece_sizes() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        // RLE 5 x DD, 2 groups of AA BB CC DD .., RLE 3 x BB, 1 group.
+        let stream = vec![10, 3, 0x05, 0xE4, 0xE4, 0xE4, 0xE4, 6, 1, 0x03, 0xE4, 0xE4];
+        let mut whole = new_decoder(stream.clone(), 2);
+        let mut pieces = new_decoder(stream, 2);
+
+        let all = push_all(&mut allocator, &mut whole, &dict, 32);
+        let mut in_pieces = Vec::new();
+        for size in [2, 5, 4, 6, 3, 9, 3] {
+            in_pieces.extend(push_all(&mut allocator, &mut pieces, &dict, size));
+        }
+
+        let mut expected: Vec<&str> = vec!["DD"; 5];
+        expected.extend(["AA", "BB", "CC", "DD"].iter().copied().cycle().take(16));
+        expected.extend(["BB"; 3]);
+        expected.extend(["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"]);
+        assert_eq!(all, expected);
+        assert_eq!(in_pieces, expected);
+    }
+
+    /// The single-buffer path agrees with the scattered-buffer path on random
+    /// run streams at every bit width, including widths past the specialized
+    /// set and dictionaries smaller than the width allows.
+    #[test]
+    fn contiguous_and_scattered_paths_agree() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for bit_width in 1..=20u8 {
+            let dict_len = ((1usize << bit_width) - next(3) as usize).max(1);
+            let entries: Vec<String> = (0..dict_len).map(|i| format!("v{i}")).collect();
+            let entry_refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+            let dict = make_dict(&entry_refs);
+            let mut stream = Vec::new();
+            let mut total = 0usize;
+            for _ in 0..12 {
+                if next(2) == 0 {
+                    let count = 1 + next(20) as usize;
+                    let value = next(dict_len as u64) as u32;
+                    stream.push((count << 1) as u8);
+                    stream.extend(&value.to_le_bytes()[..byte_width(bit_width) as usize]);
+                    total += count;
+                } else {
+                    let groups = 1 + next(3) as usize;
+                    stream.push(((groups << 1) | 1) as u8);
+                    let mut bits = 0u128;
+                    let mut filled = 0;
+                    for _ in 0..groups * 8 {
+                        bits |= (next(dict_len as u64) as u128) << filled;
+                        filled += bit_width as usize;
+                        while filled >= 8 {
+                            stream.push(bits as u8);
+                            bits >>= 8;
+                            filled -= 8;
+                        }
+                    }
+                    total += groups * 8;
+                }
+            }
+            let split = stream.len() / 2;
+            let scattered =
+                make_data_multi_buffer(vec![stream[..split].to_vec(), stream[split..].to_vec()]);
+            let mut contiguous = new_decoder(stream, bit_width);
+            let mut reference = RleDecoder::new(scattered, ReaderPosition::default(), bit_width);
+
+            let mut got = Vec::new();
+            let mut want = Vec::new();
+            let mut left = total;
+            while left > 0 {
+                let size = left.min(1 + next(13) as usize);
+                got.extend(push_all(&mut allocator, &mut contiguous, &dict, size));
+                want.extend(push_all(&mut allocator, &mut reference, &dict, size));
+                left -= size;
+            }
+            assert_eq!(got, want, "bit width {bit_width}");
+        }
     }
 
     /// Skipping into the middle of a bit-packed run leaves the decoder at the
