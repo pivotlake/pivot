@@ -851,7 +851,7 @@ impl CatalogTable {
         );
         // Drive encode → upload to completion; the emitted row-count batch is
         // ignored, and the uploaded files arrive on `uploaded_files`.
-        spec.collect()?;
+        let outcome = spec.collect().map(|_| ()).map_err(crate::Error::Merge);
 
         let mut added: Vec<TableFile> = Vec::new();
         loop {
@@ -877,6 +877,22 @@ impl CatalogTable {
                 Steal::Retry => continue,
                 Steal::Empty => break,
             }
+        }
+
+        // A merge that failed part way has uploaded some of its outputs. They
+        // will never be committed, so delete them rather than leave orphans.
+        if let Err(error) = outcome {
+            for file in &added {
+                if let Err(cleanup_error) = self.delete_data_file(&file.entry.file.path) {
+                    tracing::warn!(
+                        merge_error = %error,
+                        cleanup_error = %cleanup_error,
+                        file = %file.entry.file.path,
+                        "compaction: deleting an output of a merge that will not commit failed (orphan left)"
+                    );
+                }
+            }
+            return Err(error);
         }
         Ok(added)
     }

@@ -33,7 +33,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Instant;
 use std::{panic, result};
 use thiserror::Error;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// One node of the operator graph. Owns its operator; edges are tracked
 /// in the parent `DataFlow` as index lists.
@@ -97,6 +97,8 @@ pub enum Error {
     IORequester(#[from] crate::io::IORequesterError),
     #[error("{0}")]
     Panic(String),
+    #[error("the worker pool shut down before the dataflow finished")]
+    Shutdown,
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;
@@ -429,6 +431,20 @@ impl DataFlow {
     /// dataflow's behalf (e.g. a remote read) fails terminally.
     pub fn bail_and_cancel(&self, err: Error) {
         error!("DataFlow {:?} failed: {err}", self.id());
+        self.send_error_and_cancel(err);
+    }
+
+    /// Fail the dataflow because the worker pool is shutting down under it.
+    /// Whoever is collecting its output then gets an error instead of a clean
+    /// end of stream, so a caller cannot mistake the rows it received before
+    /// the shutdown for the dataflow's whole result. Expected during shutdown,
+    /// so it is not reported as a failure.
+    pub fn fail_for_shutdown(&self) {
+        info!("DataFlow {:?} cut short by shutdown", self.id());
+        self.send_error_and_cancel(Error::Shutdown);
+    }
+
+    fn send_error_and_cancel(&self, err: Error) {
         if self.err_tx.send(err).is_err() {
             warn!("Unable to send error...");
         }

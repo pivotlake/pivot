@@ -139,6 +139,8 @@ pub enum Error {
     Delta(#[from] crate::log::Error),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
+    #[error("running a compaction merge: {0}")]
+    Merge(#[source] DataFlowError),
     #[error(
         "table at `{location}`: file `{file}` has no loaded row-group metadata; the copy was not synced to its manifest"
     )]
