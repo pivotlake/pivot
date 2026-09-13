@@ -82,7 +82,7 @@
 //! - [`values`] — the [`AggregationValue`] trait and its container
 //!   implementations (`Compiled`, `Dynamic`), the per-op folds (`Count`, `Sum`,
 //!   …), plus [`AggregationKind`]/[`AggregationSlot`]
-//! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`],
+//! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`](hashtables::MultiSlabTable),
 //!   and associated type machinery
 //! - [`output`] — the merge phase: [`GroupOutputter`] drives it, one
 //!   [`PartitionJob`] per hash partition merges its sources
