@@ -2,8 +2,10 @@
 //!
 //! [`KWayMergePlan`] represents a complete merge level. Zero runs produce no
 //! output, one run passes through without copying, and multiple runs produce
-//! independent [`KWayMergeTask`]s. Each task retains the exact inputs and slice
-//! boundaries it was planned against.
+//! independent [`KWayMergeTask`]s. Each task owns the input batches its slice
+//! reads and the slice boundaries it was planned against, so an input batch is
+//! freed as soon as the last task reading it has run, and a merge holds its
+//! input and its output together only for the rows still being merged.
 //!
 //! Planning repeatedly bisects the largest remaining run. Its midpoint is the
 //! pivot, and binary searches locate the corresponding boundary in every other
@@ -21,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, SchemaRef};
 
 use crate::arrays::take_chunked;
 use crate::memory::SlabAllocator;
@@ -38,6 +40,9 @@ use super::keys::{
 /// part of the merged output.
 struct KWayMergeSlice {
     run_rows: Vec<Range<usize>>,
+    /// The batches the slice reads, as one range of batch indices per run
+    /// that contributes rows to it.
+    batches: Vec<Range<usize>>,
     target_node: usize,
 }
 
@@ -51,7 +56,14 @@ impl KWayMergeSlice {
 /// An immutable plan for merging sorted runs.
 struct ParallelKWayMerge {
     order_by: Arc<[OrderBy]>,
-    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+    /// How many input batches the runs hold in total. The plan keeps none of
+    /// them: each task owns the batches its slice reads.
+    batch_count: usize,
+    /// Stands in for every batch a slice does not read when it assembles its
+    /// view of the inputs: the key orderings and the gather index batches by
+    /// position and never touch the rows of a batch outside the slice.
+    absent_batch: RecordBatch,
     run_indexes: Vec<RunIndex>,
     slices: Vec<KWayMergeSlice>,
     row_count: usize,
@@ -59,9 +71,14 @@ struct ParallelKWayMerge {
 
 impl ParallelKWayMerge {
     /// Builds all slice boundaries for `runs`. Every run may contain several
-    /// batches, but its rows must already be ordered by `order_by`.
+    /// batches, but its rows must already be ordered by `order_by`. Returns the
+    /// plan beside the input batches in run order, for the caller to hand each
+    /// task the ones its slice reads.
     #[cfg(test)]
-    fn try_new(order_by: Arc<[OrderBy]>, runs: Vec<Vec<RecordBatch>>) -> Result<Self, ArrowError> {
+    fn try_new(
+        order_by: Arc<[OrderBy]>,
+        runs: Vec<Vec<RecordBatch>>,
+    ) -> Result<(Self, Vec<Arc<RecordBatch>>), ArrowError> {
         let run_count = runs.len();
         Self::try_new_on_nodes(order_by, runs, vec![0; run_count], 1)
     }
@@ -71,7 +88,7 @@ impl ParallelKWayMerge {
         runs: Vec<Vec<RecordBatch>>,
         run_nodes: Vec<usize>,
         node_count: usize,
-    ) -> Result<Self, ArrowError> {
+    ) -> Result<(Self, Vec<Arc<RecordBatch>>), ArrowError> {
         assert!(node_count > 0, "a merge needs at least one NUMA node");
         assert_eq!(runs.len(), run_nodes.len());
         assert!(run_nodes.iter().all(|&node| node < node_count));
@@ -88,6 +105,7 @@ impl ParallelKWayMerge {
             if row_count > 0 {
                 slices.push(KWayMergeSlice {
                     run_rows: all_run_rows,
+                    batches: Vec::new(),
                     target_node: 0,
                 });
             }
@@ -109,15 +127,20 @@ impl ParallelKWayMerge {
                 rows_by_node[run_nodes[run_index]] += rows.len();
             }
             slice.target_node = dominant_node(&rows_by_node);
+            slice.batches = batches_read_by(&slice.run_rows, &run_indexes);
         }
 
-        Ok(Self {
+        let schema = batches[0].schema();
+        let plan = Self {
             order_by,
-            batches,
+            batch_count: batches.len(),
+            absent_batch: RecordBatch::new_empty(schema.clone()),
+            schema,
             run_indexes,
             slices,
             row_count,
-        })
+        };
+        Ok((plan, batches.into_iter().map(Arc::new).collect()))
     }
 
     /// Number of independently executable slices in this plan.
@@ -130,12 +153,28 @@ impl ParallelKWayMerge {
         self.row_count
     }
 
-    /// Executes one slice and returns its rows as one independently owned
-    /// record batch.
+    /// The input batches slice `slice_index` reads, with their positions in
+    /// run order, as handles for the task that will run the slice to own.
+    fn inputs_of_slice(
+        &self,
+        slice_index: usize,
+        batches: &[Arc<RecordBatch>],
+    ) -> Vec<(usize, Arc<RecordBatch>)> {
+        self.slices[slice_index]
+            .batches
+            .iter()
+            .flat_map(Clone::clone)
+            .map(|batch_index| (batch_index, batches[batch_index].clone()))
+            .collect()
+    }
+
+    /// Executes one slice over `inputs`, the batches it reads at their
+    /// positions, and returns its rows as one independently owned record batch.
     fn merge_slice(
         &self,
         allocator: &mut SlabAllocator,
         slice_index: usize,
+        inputs: &[(usize, Arc<RecordBatch>)],
     ) -> Result<RecordBatch, ArrowError> {
         let slice = self.slices.get(slice_index).ok_or_else(|| {
             ArrowError::ComputeError(format!(
@@ -143,22 +182,32 @@ impl ParallelKWayMerge {
                 self.slices.len()
             ))
         })?;
+        let batches = self.position_inputs(inputs);
         let mapping = with_key_ordering!(
-            select_key_ordering(&self.order_by, &self.batches, &self.batches)?,
+            select_key_ordering(&self.order_by, &batches, &batches)?,
             |ordering| slice_mapping(&mut ordering, &self.run_indexes, &slice.run_rows)
         );
 
-        let schema = self.batches[0].schema();
-        let mut output_columns = Vec::with_capacity(schema.fields().len());
-        for column_index in 0..schema.fields().len() {
-            let input_columns: Vec<ArrayRef> = self
-                .batches
+        let mut output_columns = Vec::with_capacity(self.schema.fields().len());
+        for column_index in 0..self.schema.fields().len() {
+            let input_columns: Vec<ArrayRef> = batches
                 .iter()
                 .map(|batch| batch.column(column_index).clone())
                 .collect();
             output_columns.push(take_chunked(allocator, &input_columns, &mapping)?);
         }
-        RecordBatch::try_new(schema, output_columns)
+        RecordBatch::try_new(self.schema.clone(), output_columns)
+    }
+
+    /// The inputs as a slice sees them: its own batches at their positions,
+    /// and the empty stand-in at every other position so batch indices keep
+    /// their meaning.
+    fn position_inputs(&self, inputs: &[(usize, Arc<RecordBatch>)]) -> Vec<RecordBatch> {
+        let mut batches = vec![self.absent_batch.clone(); self.batch_count];
+        for (batch_index, batch) in inputs {
+            batches[*batch_index] = RecordBatch::clone(batch);
+        }
+        batches
     }
 }
 
@@ -298,16 +347,20 @@ impl KWayMergePlan {
         }
         let run_nodes = runs.iter().map(|run| run.node_id).collect();
         let batches = runs.into_iter().map(|run| run.batches).collect();
-        let plan = ParallelKWayMerge::try_new_on_nodes(order_by, batches, run_nodes, node_count)?;
+        let (plan, batches) =
+            ParallelKWayMerge::try_new_on_nodes(order_by, batches, run_nodes, node_count)?;
         let slice_count = plan.slice_count();
         let stage = Arc::new(KWayMergeStage {
             output: (0..slice_count).map(|_| OnceLock::new()).collect(),
             remaining: AtomicUsize::new(slice_count),
             plan,
         });
+        // The tasks are the only owners of the batches from here on: the last
+        // task reading a batch frees it when it finishes.
         Ok(Self::Parallel(
             (0..slice_count)
                 .map(|slice_index| KWayMergeTask {
+                    inputs: stage.plan.inputs_of_slice(slice_index, &batches),
                     stage: stage.clone(),
                     slice_index,
                 })
@@ -347,10 +400,13 @@ struct KWayMergeStage {
     remaining: AtomicUsize,
 }
 
-/// One independently executable output slice of a merge level.
+/// One independently executable output slice of a merge level. It owns the
+/// input batches its slice reads; dropping the task, finished or not, lets go
+/// of them, and the batch is freed once no task reads it any more.
 pub struct KWayMergeTask {
     stage: Arc<KWayMergeStage>,
     slice_index: usize,
+    inputs: Vec<(usize, Arc<RecordBatch>)>,
 }
 
 impl KWayMergeTask {
@@ -358,16 +414,24 @@ impl KWayMergeTask {
         self,
         allocator: &mut SlabAllocator,
     ) -> Result<Option<MergedOutput>, ArrowError> {
-        let batch = self.stage.plan.merge_slice(allocator, self.slice_index)?;
-        self.stage.output[self.slice_index]
-            .set(LocatedBatch::new(batch, self.node_id()))
-            .unwrap_or_else(|_| panic!("merge slice {} executed twice", self.slice_index));
-        if self.stage.remaining.fetch_sub(1, AtomicOrdering::AcqRel) != 1 {
+        let target_node = self.node_id();
+        let Self {
+            stage,
+            slice_index,
+            inputs,
+        } = self;
+        let batch = stage.plan.merge_slice(allocator, slice_index, &inputs)?;
+        // The slice's rows are gathered into `batch`, so its share of the
+        // inputs goes now rather than when the stage's output is assembled.
+        drop(inputs);
+        stage.output[slice_index]
+            .set(LocatedBatch::new(batch, target_node))
+            .unwrap_or_else(|_| panic!("merge slice {slice_index} executed twice"));
+        if stage.remaining.fetch_sub(1, AtomicOrdering::AcqRel) != 1 {
             return Ok(None);
         }
 
-        let batches = self
-            .stage
+        let batches = stage
             .output
             .iter()
             .map(|batch| {
@@ -379,8 +443,18 @@ impl KWayMergeTask {
             .collect();
         Ok(Some(MergedOutput {
             batches,
-            row_count: self.stage.plan.row_count(),
+            row_count: stage.plan.row_count(),
         }))
+    }
+
+    /// Weak handles to the input batches this task owns, so a test can watch
+    /// them be freed.
+    #[cfg(test)]
+    fn input_handles(&self) -> Vec<std::sync::Weak<RecordBatch>> {
+        self.inputs
+            .iter()
+            .map(|(_, batch)| Arc::downgrade(batch))
+            .collect()
     }
 }
 
@@ -388,6 +462,21 @@ impl NodeIdOutput for KWayMergeTask {
     fn node_id(&self) -> usize {
         self.stage.plan.slices[self.slice_index].target_node
     }
+}
+
+/// The batches `run_rows` spans, as one range of batch indices per run that
+/// contributes rows.
+fn batches_read_by(run_rows: &[Range<usize>], run_indexes: &[RunIndex]) -> Vec<Range<usize>> {
+    run_rows
+        .iter()
+        .zip(run_indexes)
+        .filter(|(rows, _)| !rows.is_empty())
+        .map(|(rows, run)| {
+            let first = run.locate(rows.start).chunk;
+            let last = run.locate(rows.end - 1).chunk;
+            first..last + 1
+        })
+        .collect()
 }
 
 /// Locates the rows of one run in the plan's flattened batch list.
@@ -451,6 +540,7 @@ fn split_into_slices<K: KeyOrdering>(
         if row_count <= MERGE_SLICE_ROWS {
             slices.push(KWayMergeSlice {
                 run_rows,
+                batches: Vec::new(),
                 target_node: 0,
             });
             return;
@@ -652,10 +742,15 @@ mod tests {
     }
 
     fn merge_all(order_by: &[OrderBy], runs: &[Vec<RecordBatch>]) -> Vec<RecordBatch> {
-        let plan = ParallelKWayMerge::try_new(order_by.to_vec().into(), runs.to_vec()).unwrap();
+        let (plan, batches) =
+            ParallelKWayMerge::try_new(order_by.to_vec().into(), runs.to_vec()).unwrap();
         let mut allocator = SlabAllocator::new(false);
         (0..plan.slice_count())
-            .map(|slice_index| plan.merge_slice(&mut allocator, slice_index).unwrap())
+            .map(|slice_index| {
+                let inputs = plan.inputs_of_slice(slice_index, &batches);
+                plan.merge_slice(&mut allocator, slice_index, &inputs)
+                    .unwrap()
+            })
             .collect()
     }
 
@@ -734,7 +829,7 @@ mod tests {
         };
         let runs = vec![build_run(0), build_run(1), build_run(2)];
 
-        let plan = ParallelKWayMerge::try_new(ascending().into(), runs.clone()).unwrap();
+        let (plan, _) = ParallelKWayMerge::try_new(ascending().into(), runs.clone()).unwrap();
 
         assert!(plan.slice_count() > 1);
         assert!(
@@ -774,7 +869,7 @@ mod tests {
             repeated_key_run(50),
         ];
 
-        let plan = ParallelKWayMerge::try_new(ascending().into(), runs).unwrap();
+        let (plan, _) = ParallelKWayMerge::try_new(ascending().into(), runs).unwrap();
 
         assert!(
             plan.slices
@@ -841,5 +936,59 @@ mod tests {
             output.batches()[1].batch().column(0),
             &second_column
         ));
+    }
+
+    #[test]
+    fn input_batches_are_freed_as_the_tasks_reading_them_finish() {
+        init_test_free_pool(64);
+        let rows_per_run = MERGE_SLICE_ROWS * 2;
+        let runs = (0..3)
+            .map(|run| {
+                let batches = (0..4)
+                    .map(|batch| {
+                        let first = (batch * rows_per_run / 4) as i64 * 3 + run;
+                        int_batch(
+                            &(0..rows_per_run as i64 / 4)
+                                .map(|i| first + i * 3)
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect();
+                MergeRun::new(batches, 0)
+            })
+            .collect();
+        let KWayMergePlan::Parallel(tasks) =
+            KWayMergePlan::try_new(ascending().into(), runs, 1).unwrap()
+        else {
+            panic!("three interleaved runs need a real merge");
+        };
+        let mut allocator = SlabAllocator::new(false);
+        let handles: Vec<_> = tasks
+            .iter()
+            .flat_map(KWayMergeTask::input_handles)
+            .collect();
+        let task_count = tasks.len();
+        assert!(task_count > 1);
+
+        let mut output = None;
+        let mut freed_before_last_task = false;
+        for (task_index, task) in tasks.into_iter().enumerate() {
+            if task_index + 1 == task_count {
+                freed_before_last_task = handles.iter().any(|handle| handle.strong_count() == 0);
+            }
+            output = task.execute(&mut allocator).unwrap().or(output);
+        }
+
+        assert!(freed_before_last_task);
+        assert!(handles.iter().all(|handle| handle.strong_count() == 0));
+        let merged: Vec<RecordBatch> = output
+            .unwrap()
+            .into_batches()
+            .into_iter()
+            .map(LocatedBatch::into_batch)
+            .collect();
+        let keys = int_column(&merged, 0);
+        assert_eq!(keys.len(), 3 * rows_per_run);
+        assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 }
