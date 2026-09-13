@@ -378,6 +378,23 @@ impl Worker {
         }
     }
 
+    /// Fail every dataflow this worker still runs because the pool is
+    /// shutting down. A dataflow dropped without this closes its output channel
+    /// like one that finished, and a collector then takes whatever it received
+    /// so far for the whole result: a compaction merge cut short this way
+    /// committed the removal of its inputs with no outputs. Specs already
+    /// queued for this worker are built first so they fail the same way.
+    fn fail_live_dataflows_for_shutdown(&mut self) {
+        self.try_receiving_new_dataflow();
+        let live: Vec<DataFlow> = self.data_flows.drain().map(|(_, flow)| flow).collect();
+        for mut flow in live {
+            flow.fail_for_shutdown();
+            flow.stats().report();
+            drop(flow);
+            self.release_live_dataflow();
+        }
+    }
+
     /// Decrements the pool-wide count after a dataflow instance is dropped.
     ///
     /// When the count reaches zero, wake parked workers so they can zero the
@@ -520,6 +537,7 @@ impl Worker {
             // and we exit cleanly so the thread can be reaped.
             if self.should_exit.load(Ordering::Relaxed) {
                 debug!("Worker {} exiting via shutdown flag", self.id);
+                self.fail_live_dataflows_for_shutdown();
                 return Ok(());
             }
             self.did_work_last_iteration = false;
