@@ -99,7 +99,7 @@ fn copy_value_field_to_slabs(
 /// describe, and each variant column's inferred layout for the encode workers
 /// to apply. Plain columns, and variants with nothing worth shredding, carry
 /// `None`.
-pub(super) struct FileShredding {
+pub struct FileShredding {
     pub(super) schema: arrow_schema::SchemaRef,
     pub(super) column_shredding: Vec<Option<Arc<arrow_schema::DataType>>>,
 }

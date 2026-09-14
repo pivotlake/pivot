@@ -54,6 +54,7 @@ mod compression;
 pub(crate) mod encoder;
 pub(crate) mod error;
 mod file_collector;
+mod file_cursor_merge;
 mod file_merge;
 mod leaves;
 mod partition_sorter;
@@ -61,8 +62,10 @@ mod presorted_run;
 mod row_group_planner;
 mod shredder;
 mod shredding;
+pub use shredding::FileShredding;
 mod stats;
 pub use stats::aggregate_file_stats;
+mod streaming;
 mod types;
 
 pub use types::AssembledFile;
@@ -73,8 +76,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use dispatch::memory::SlabAllocator;
 use dispatch::{
-    DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy, RecordBatchOperatorSpec,
-    node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, to_single_worker_mpsc,
+    DataFlowDispatcher, DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy,
+    RecordBatchOperatorSpec, node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable,
+    to_single_worker_mpsc, values_input,
 };
 
 use partition_sorter::{PartitionSorterFactory, SortedPartitionRun};
@@ -180,6 +184,121 @@ pub fn encode_compaction_batches_spec(
             ),
         );
     encode_files_spec(files)
+}
+
+/// How many input row groups a compaction's shredding plan samples rows from,
+/// and how many rows of each.
+const PLAN_SAMPLE_ROW_GROUPS: usize = 32;
+const PLAN_SAMPLE_ROWS_PER_GROUP: usize = 128;
+
+/// Plan the shredding of a compaction's output from rows sampled evenly
+/// across its input row groups, the spread a write over the whole file
+/// samples, so the layout does not hinge on whichever rows sort first.
+pub fn plan_compaction_shredding(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<crate::ParquetTable>,
+) -> Result<Arc<FileShredding>, dispatch::DataFlowError> {
+    use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
+    let projection = crate::types::projection::Projection::all(table.schema().fields().len());
+    let groups = table.row_groups();
+    let group_stride = groups.len().div_ceil(PLAN_SAMPLE_ROW_GROUPS).max(1);
+    let requests: Vec<crate::RowGroupRequest> = (0..groups.len())
+        .step_by(group_stride)
+        .map(|group| {
+            let rows = groups[group].num_rows as usize;
+            let row_stride = rows.div_ceil(PLAN_SAMPLE_ROWS_PER_GROUP).max(1);
+            let rows: Vec<u32> = (0..rows)
+                .step_by(row_stride)
+                .map(|row| row as u32)
+                .collect();
+            crate::RowGroupRequest::from(
+                QueryRowGroupMetadata::new(table, group, RowSelection::Indices(rows.into())),
+                &projection,
+            )
+        })
+        .collect();
+    let sample =
+        crate::fetch_row_groups(values_input(dispatcher, requests), table, projection, false);
+    let batches = unshred_batches_spec(sample).collect()?;
+    let shredding = shredding::plan_file_shredding(&batches).map_err(|error| {
+        dispatch::DataFlowError::Operation(dispatch::UnaryError::from(error).into())
+    })?;
+    Ok(Arc::new(shredding))
+}
+
+/// Parquet construction for a compaction of sorted files: the files are
+/// k-way merged by walking each in order (see [`file_cursor_merge`]), with
+/// their row groups fetched as the cursors need them and let go of behind
+/// them, and the merged rows are laid out and encoded a row group at a time
+/// (see [`streaming`]), so the whole decoded input is never held at once.
+/// `shredding` is the output's plan (see [`plan_compaction_shredding`]).
+pub fn encode_sorted_files_spec(
+    dispatcher: &DataFlowDispatcher,
+    table: Arc<crate::ParquetTable>,
+    shredding: Arc<FileShredding>,
+    partition: Option<crate::PartitionValues>,
+    key_columns: Arc<[usize]>,
+    target_rows_per_group: usize,
+    max_file_size: usize,
+) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
+    let worker_count = dispatcher.worker_count();
+    let topology = dispatcher.topology();
+    let files = file_cursor_merge::files_of(&table);
+    let demand = file_cursor_merge::initial_demand(&files);
+    let group_rows: Arc<[u32]> = table
+        .row_groups()
+        .iter()
+        .map(|group| u32::try_from(group.num_rows).expect("a row group's rows fit u32"))
+        .collect();
+    let file_rows = group_rows.iter().map(|&rows| rows as usize).sum();
+    let projection = crate::types::projection::Projection::all(table.schema().fields().len());
+
+    let issuing_worker = dispatcher.next_worker();
+    let requests = values_input(dispatcher, std::iter::empty::<()>()).chain(
+        to_single_worker_mpsc::<()>(worker_count, issuing_worker)
+            .into_iter()
+            .collect(),
+        (0..worker_count)
+            .map(|worker| file_cursor_merge::RequestIssuerFactory {
+                table: table.clone(),
+                projection: projection.clone(),
+                demand: demand.clone(),
+                issuing: worker == issuing_worker,
+            })
+            .collect(),
+    );
+    let rows = crate::fetch_row_groups(requests, &table, projection, true);
+    let (dispatcher, heads) = unshred_batches_spec(rows).into_parts();
+    let merge_worker = dispatcher.next_worker();
+    let jobs = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>())
+        .chain(
+            stealable::<RecordBatch>(topology).into_iter().collect(),
+            (0..worker_count)
+                .map(|_| file_cursor_merge::KeyerFactory {
+                    key_columns: key_columns.clone(),
+                })
+                .collect(),
+        )
+        .chain(
+            to_single_worker_mpsc::<file_cursor_merge::KeyedBatch>(worker_count, merge_worker)
+                .into_iter()
+                .collect(),
+            (0..worker_count)
+                .map(|_| file_cursor_merge::FileCursorMergeFactory {
+                    files: files.clone(),
+                    group_rows: group_rows.clone(),
+                    demand: demand.clone(),
+                    file_rows,
+                })
+                .collect(),
+        );
+    streaming::encode_gathered_spec(
+        jobs,
+        shredding,
+        partition,
+        target_rows_per_group,
+        max_file_size,
+    )
 }
 
 pub fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {

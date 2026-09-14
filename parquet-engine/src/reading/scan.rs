@@ -88,6 +88,46 @@ where
     RecordBatchOperatorSpec::from_spec(decoded)
 }
 
+/// Fetch and decode the row groups that `requests` name. The requests keep
+/// their order on the way to the fetchers, so the row groups decode in about
+/// the order they were asked for, and the decoded batches carry the metadata
+/// columns when `add_row_group_metadata` so a consumer can tell which row
+/// group and rows each holds.
+pub fn fetch_row_groups<OF>(
+    requests: OperatorSpec<RowGroupRequest, OF>,
+    table: &ParquetTable,
+    projection: Projection,
+    add_row_group_metadata: bool,
+) -> RecordBatchOperatorSpec
+where
+    OF: OperatorFactory<RowGroupRequest> + 'static,
+{
+    let n = requests.dispatcher().worker_count();
+    let topology = requests.dispatcher().topology();
+    let pending_row_groups = pending_row_group_counters(n);
+    let claim_bound = pending_claim_bound(table);
+    let buffers = requests.chain(
+        stealable_fifo::<RowGroupRequest>(topology)
+            .into_iter()
+            .collect(),
+        pending_row_groups
+            .iter()
+            .map(|pending| RowGroupFetcherFactory::new(pending.clone(), claim_bound))
+            .collect(),
+    );
+    read_parquet(
+        buffers,
+        projection,
+        RECORD_BATCH_SIZE,
+        add_row_group_metadata,
+        Arc::new(Vec::new()),
+        pending_row_groups,
+        // Row groups are claimed by explicit request, not by the injector,
+        // so this count is never consulted.
+        Arc::new(AtomicUsize::new(0)),
+    )
+}
+
 /// One claimed-but-not-yet-cut row-group counter per worker, shared by the
 /// worker's fetcher (increments and gates claims) and its range cutter
 /// (decrements as row groups are cut or pruned). See `RowGroupFetcher` for

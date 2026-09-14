@@ -39,6 +39,10 @@ pub(crate) enum WriteError {
     /// An array did not have the Arrow type its column's schema declared.
     #[error("array downcast to {expected} failed")]
     Downcast { expected: &'static str },
+    /// A compaction input whose rows are not in the table's sort order, which
+    /// a merge that walks each file in order would silently misorder.
+    #[error("compaction input file {file} is not sorted on the table's sort columns")]
+    UnsortedInput { file: usize },
 }
 
 pub(crate) type WriteResult<T> = Result<T, WriteError>;
