@@ -8,6 +8,7 @@
 use crate::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::thrift::general::{Encoding, PageType};
 use crate::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
+use crate::types::columns::{ColumnResolution, TableColumns};
 use crate::types::metadata::{ColumnChunkMeta, FileLeafStatistics, RowGroupMetadata};
 use arrow_array::builder::{BinaryViewBuilder, StringViewBuilder};
 use arrow_array::types::{
@@ -23,6 +24,7 @@ use dispatch::DataFlowDispatcher;
 use object_storage::DataFile;
 use planner::catalog::Column;
 use planner::types::Type;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
@@ -135,9 +137,12 @@ impl ParquetTable {
         files: Vec<DataFile>,
         declared_columns: &[Column],
     ) -> Result<Self> {
-        let loaded =
-            crate::metadata::load_file_row_groups(dispatcher, &files, declared_columns.into())
-                .map_err(|e| Error::Materialize(e.to_string()))?;
+        let loaded = crate::metadata::load_file_row_groups(
+            dispatcher,
+            &files,
+            TableColumns::by_name(declared_columns),
+        )
+        .map_err(|e| Error::Materialize(e.to_string()))?;
         let row_groups = loaded
             .iter()
             .flat_map(|f| f.row_groups.iter().cloned())
@@ -203,15 +208,15 @@ pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 
 /// Parse raw thrift footer bytes into this file's row groups (file-local
 /// indices), tying each to `open_file` for the column-chunk reads that follow.
-/// `declared_columns` is the table's declared schema (empty when the table has
-/// none), reconciled with the file's own schema by [`apply_declared_types`].
+/// `table_columns` is the table's declared schema and how the file's columns
+/// match it (see [`resolve_column_layout`]).
 pub(crate) fn row_groups_from_footer(
     footer: &[u8],
     open_file: dispatch::io::OpenFile,
-    declared_columns: &[Column],
+    table_columns: &TableColumns,
 ) -> Result<Vec<RowGroupMetadata>> {
     let file_meta = parse_footer_thrift(footer)?;
-    row_groups_from_metadata(file_meta, open_file, declared_columns)
+    row_groups_from_metadata(file_meta, open_file, table_columns)
 }
 
 /// Build the per-row-group metadata from a parsed footer and the (local or
@@ -219,38 +224,51 @@ pub(crate) fn row_groups_from_footer(
 /// upload path, which already holds the footer metadata it wrote and so skips the
 /// parse. Row groups carry only their *file-local* index; the global index is the
 /// row group's eventual position in the table's flat list.
+///
+/// The file's leaves are read in the file's own order, then laid out as
+/// `table_columns` resolves them: a row group's `schema`, `columns` and
+/// statistics all follow that layout, so every reader addresses a column the
+/// same way whatever the file stored.
 pub(crate) fn row_groups_from_metadata(
     file_meta: FileMetaData,
     open_file: dispatch::io::OpenFile,
-    declared_columns: &[Column],
+    table_columns: &TableColumns,
 ) -> Result<Vec<RowGroupMetadata>> {
-    let (schema, leaf_infos) = schema_elements_to_arrow(&file_meta.schema)?;
-    // Use reconciled types for statistics, decoders, and output fields.
-    let schema = Arc::new(apply_declared_types(schema, declared_columns)?);
+    let (file_schema, file_field_ids, leaf_infos) = schema_elements_to_arrow(&file_meta.schema)?;
+    let file_leaf_count = leaf_infos.len();
+    let ColumnLayout {
+        schema,
+        file_leaves,
+    } = resolve_column_layout(file_schema, &file_field_ids, table_columns)?;
+    let schema = Arc::new(schema);
+    let layout_is_identity = file_leaves
+        .iter()
+        .enumerate()
+        .all(|(leaf, file_leaf)| *file_leaf == leaf);
     // Statistics belong to leaf chunks, not top-level columns.
     let leaves = super::leaves::leaf_fields(schema.fields());
 
     let row_group_count = file_meta.row_groups.len();
-    // Statistics are gathered per leaf rather than per row group, so each leaf's
-    // bounds decode into one array covering the whole file. See
+    // Statistics are gathered per file leaf rather than per row group, so each
+    // leaf's bounds decode into one array covering the whole file. See
     // [`FileStatistics`].
-    let mut leaf_stats: Vec<Vec<Option<Statistics>>> = (0..leaves.len())
+    let mut leaf_stats: Vec<Vec<Option<Statistics>>> = (0..file_leaf_count)
         .map(|_| Vec::with_capacity(row_group_count))
         .collect();
-    let mut leaf_physical_types = vec![0_i32; leaves.len()];
+    let mut leaf_physical_types = vec![0_i32; file_leaf_count];
     let mut row_groups = Vec::with_capacity(row_group_count);
 
     for (i, rg) in file_meta.row_groups.into_iter().enumerate() {
         // Chunks are per leaf; a row group with a different count is a
         // malformed footer and would index out of bounds below.
-        if rg.columns.len() != leaves.len() {
+        if rg.columns.len() != file_leaf_count {
             return Err(Error::InvalidFooter(format!(
                 "row group {i} has {} column chunks but the schema has {} leaves",
                 rg.columns.len(),
-                leaves.len()
+                file_leaf_count
             )));
         }
-        let mut columns: Vec<ColumnChunkMeta> = rg
+        let mut file_chunks: Vec<ColumnChunkMeta> = rg
             .columns
             .into_iter()
             .enumerate()
@@ -274,19 +292,32 @@ pub(crate) fn row_groups_from_metadata(
                 }
             })
             .collect();
-        // The collect runs in place over the buffer the footer parse allocated
+        // The collect ran in place over the buffer the footer parse allocated
         // for the chunks, which is several times wider per element than what is
-        // kept. The surplus lives as long as the table does, so release it here.
-        columns.shrink_to_fit();
+        // kept. The surplus lives as long as the table does, so release it.
+        file_chunks.shrink_to_fit();
+        // Lay the chunks out as the resolved schema orders its leaves.
+        let columns: Vec<ColumnChunkMeta> = if layout_is_identity {
+            file_chunks
+        } else {
+            file_leaves
+                .iter()
+                .map(|file_leaf| file_chunks[*file_leaf].clone())
+                .collect()
+        };
         row_groups.push((rg.num_rows, columns));
     }
 
     let statistics = Arc::new(
-        leaf_stats
-            .into_iter()
+        file_leaves
+            .iter()
             .enumerate()
-            .map(|(j, chunks)| {
-                decode_leaf_statistics(chunks, leaves[j].data_type(), leaf_physical_types[j])
+            .map(|(leaf, file_leaf)| {
+                decode_leaf_statistics(
+                    std::mem::take(&mut leaf_stats[*file_leaf]),
+                    leaves[leaf].data_type(),
+                    leaf_physical_types[*file_leaf],
+                )
             })
             .collect::<Vec<_>>(),
     );
@@ -304,6 +335,88 @@ pub(crate) fn row_groups_from_metadata(
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
         })
         .collect())
+}
+
+/// A file's schema as the table sees it, and where each of its leaves comes
+/// from.
+#[derive(Debug)]
+struct ColumnLayout {
+    schema: Schema,
+    /// One entry per leaf of `schema`, in leaf order: the index of the file's
+    /// leaf it comes from, in the file's own leaf order.
+    file_leaves: Vec<usize>,
+}
+
+/// Lay a file's columns out as `table_columns` resolves them against the
+/// declared schema (see [`ColumnResolution`]), then reconcile the declared
+/// column types with what the file stores ([`apply_declared_types`]).
+/// `file_field_ids` is each top-level file column's Parquet field id, in
+/// `file_schema` order.
+fn resolve_column_layout(
+    file_schema: Schema,
+    file_field_ids: &[Option<i32>],
+    table_columns: &TableColumns,
+) -> Result<ColumnLayout> {
+    let field_ids = match table_columns.resolution() {
+        ColumnResolution::ByName => {
+            let leaf_count = super::leaves::leaf_fields(file_schema.fields()).len();
+            return Ok(ColumnLayout {
+                schema: apply_declared_types(file_schema, table_columns.columns())?,
+                file_leaves: (0..leaf_count).collect(),
+            });
+        }
+        ColumnResolution::ByFieldId(field_ids) => field_ids,
+    };
+
+    let file_fields = file_schema.fields();
+    // A file written without field ids is matched by name; one written with
+    // them is matched by id alone, so a renamed column still finds its data.
+    let mut file_column_by_id = HashMap::with_capacity(file_field_ids.len());
+    for (index, field_id) in file_field_ids.iter().enumerate() {
+        let Some(field_id) = field_id else { continue };
+        if let Some(first) = file_column_by_id.insert(*field_id, index) {
+            return Err(Error::InvalidFooter(format!(
+                "columns '{}' and '{}' both carry field id {field_id}",
+                file_fields[first].name(),
+                file_fields[index].name()
+            )));
+        }
+    }
+    let file_column_of_declared: Vec<Option<usize>> = if file_column_by_id.is_empty() {
+        table_columns
+            .columns()
+            .iter()
+            .map(|declared| {
+                file_fields
+                    .iter()
+                    .position(|field| field.name().eq_ignore_ascii_case(&declared.name))
+            })
+            .collect()
+    } else {
+        field_ids
+            .iter()
+            .map(|field_id| file_column_by_id.get(field_id).copied())
+            .collect()
+    };
+
+    let mut fields = Vec::with_capacity(table_columns.columns().len());
+    let mut file_leaves = Vec::new();
+    for (declared, file_column) in table_columns.columns().iter().zip(file_column_of_declared) {
+        match file_column {
+            Some(index) => {
+                let file_field = &file_fields[index];
+                fields.push(Arc::new(
+                    file_field.as_ref().clone().with_name(declared.name.clone()),
+                ));
+                file_leaves.extend(super::leaves::leaf_range(file_fields, index));
+            }
+            None => return Err(Error::ColumnNotFound(declared.name.clone())),
+        }
+    }
+    Ok(ColumnLayout {
+        schema: apply_declared_types(Schema::new(fields), table_columns.columns())?,
+        file_leaves,
+    })
 }
 
 /// Returns `true` when `encoding_stats` proves every *data* page in the chunk
@@ -597,11 +710,11 @@ struct LeafSchemaInfo {
     type_length: Option<i32>,
 }
 
-/// Converts footer schema elements into an Arrow schema and per-leaf schema
-/// facts.
+/// Converts footer schema elements into an Arrow schema, each top-level
+/// column's Parquet field id (in schema order), and per-leaf schema facts.
 fn schema_elements_to_arrow(
     elements: &[crate::thrift::footer::SchemaElement],
-) -> Result<(Schema, Vec<LeafSchemaInfo>)> {
+) -> Result<(Schema, Vec<Option<i32>>, Vec<LeafSchemaInfo>)> {
     if elements.is_empty() {
         return Err(Error::IO(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -611,12 +724,14 @@ fn schema_elements_to_arrow(
     let mut leaf_infos = Vec::new();
     let mut cursor = 1; // element 0 is the root group
     let mut fields = Vec::new();
+    let mut field_ids = Vec::new();
     for _ in 0..elements[0].num_children.unwrap_or(0) {
+        field_ids.push(elements.get(cursor).and_then(|element| element.field_id));
         let (field, next) = parse_schema_element(elements, cursor, 0, 0, &mut leaf_infos)?;
         fields.push(field);
         cursor = next;
     }
-    Ok((Schema::new(fields), leaf_infos))
+    Ok((Schema::new(fields), field_ids, leaf_infos))
 }
 
 /// Deepest schema nesting accepted. Real schemas stay far below this (a
@@ -1044,6 +1159,7 @@ mod tests {
             converted_type: None,
             scale: None,
             precision: None,
+            field_id: None,
             logical_type: None,
         }
     }
@@ -1343,5 +1459,165 @@ mod tests {
         let (_dir, table) = write_parquet(&batch, EnabledStatistics::None);
 
         assert!(table.row_groups[0].leaf_statistics(0).is_none());
+    }
+
+    fn declared_by_field_id(columns: Vec<(&str, Type, i32)>) -> TableColumns {
+        let (columns, field_ids): (Vec<Column>, Vec<i32>) = columns
+            .into_iter()
+            .map(|(name, col_type, field_id)| (column(name, col_type), field_id))
+            .unzip();
+        TableColumns::by_field_id(columns, field_ids)
+    }
+
+    fn field_names(schema: &Schema) -> Vec<&str> {
+        schema.fields().iter().map(|f| f.name().as_str()).collect()
+    }
+
+    #[test]
+    fn field_ids_rename_and_reorder_file_columns() {
+        let file = Schema::new(vec![
+            Field::new("b_old", DataType::Int64, true),
+            Field::new("a_old", DataType::Int32, false),
+        ]);
+        let declared = declared_by_field_id(vec![("a", Type::Int32, 1), ("b", Type::Int64, 2)]);
+
+        let layout = resolve_column_layout(file, &[Some(2), Some(1)], &declared).unwrap();
+
+        assert_eq!(field_names(&layout.schema), ["a", "b"]);
+        assert_eq!(layout.file_leaves, [1, 0]);
+    }
+
+    #[test]
+    fn an_undeclared_file_column_is_dropped() {
+        let file = Schema::new(vec![
+            Field::new("retired", DataType::Int64, true),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let declared = declared_by_field_id(vec![("a", Type::Int32, 1)]);
+
+        let layout = resolve_column_layout(file, &[Some(9), Some(1)], &declared).unwrap();
+
+        assert_eq!(field_names(&layout.schema), ["a"]);
+        assert_eq!(layout.file_leaves, [1]);
+    }
+
+    #[test]
+    fn a_file_without_field_ids_matches_by_name() {
+        let file = Schema::new(vec![
+            Field::new("B", DataType::Int64, true),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let declared = declared_by_field_id(vec![("a", Type::Int32, 1), ("b", Type::Int64, 2)]);
+
+        let layout = resolve_column_layout(file, &[None, None], &declared).unwrap();
+
+        assert_eq!(field_names(&layout.schema), ["a", "b"]);
+        assert_eq!(layout.file_leaves, [1, 0]);
+    }
+
+    #[test]
+    fn duplicate_field_ids_in_a_file_are_rejected() {
+        let file = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("a_copy", DataType::Int32, false),
+        ]);
+        let declared = declared_by_field_id(vec![("a", Type::Int32, 1)]);
+
+        let error = resolve_column_layout(file, &[Some(1), Some(1)], &declared).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidFooter(_)), "{error}");
+    }
+
+    /// A file whose columns carry field ids, written in an order that differs
+    /// from the declared one.
+    fn write_evolved_file(dir: &TempDir) -> Arc<ParquetTable> {
+        let with_id = |field: Field, id: i32| {
+            field.with_metadata(std::collections::HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                id.to_string(),
+            )]))
+        };
+        let schema = Arc::new(Schema::new(vec![
+            with_id(Field::new("b_old", DataType::Int64, true), 2),
+            with_id(Field::new("a_old", DataType::Int32, false), 1),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let path = dir.path().join("evolved.parquet");
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let declared = declared_by_field_id(vec![("a", Type::Int32, 1), ("b", Type::Int64, 2)]);
+        let loaded = crate::load_file_row_groups(
+            test_dispatcher(),
+            &[DataFile::local(path, size)],
+            declared.clone(),
+        )
+        .unwrap();
+        let row_groups = loaded
+            .into_iter()
+            .flat_map(|file| file.row_groups)
+            .collect();
+        Arc::new(ParquetTable::new(row_groups))
+    }
+
+    fn scan(table: &Arc<ParquetTable>, column_indices: Vec<usize>) -> RecordBatch {
+        let projection = dispatch::Projection {
+            column_indices,
+            extracts: Vec::new(),
+        };
+        let batches = crate::table_input(test_dispatcher(), table, projection, false)
+            .collect()
+            .unwrap();
+        arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap()
+    }
+
+    #[test]
+    fn a_declared_column_the_file_lacks_refuses_the_file() {
+        let file = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let declared = declared_by_field_id(vec![("a", Type::Int32, 1), ("c", Type::Utf8, 3)]);
+
+        let error = resolve_column_layout(file, &[Some(1)], &declared).unwrap_err();
+
+        assert!(
+            matches!(&error, Error::ColumnNotFound(column) if column == "c"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_file_scans_in_the_declared_layout() {
+        let dir = TempDir::new().unwrap();
+        let table = write_evolved_file(&dir);
+
+        let batch = scan(&table, vec![0, 1]);
+
+        assert_eq!(field_names(batch.schema().as_ref()), ["a", "b"]);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[1, 2, 3]
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[10, 20, 30]
+        );
     }
 }

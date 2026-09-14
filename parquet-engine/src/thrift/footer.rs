@@ -224,6 +224,9 @@ thrift_struct!(
         6: optional i32 converted_type;
         7: optional i32 scale;
         8: optional i32 precision;
+        /// The writer's stable identifier for the column. Table formats that
+        /// track columns through renames match a file's columns by it.
+        9: optional i32 field_id;
         10: optional LogicalType logical_type;
     }
 );
@@ -321,6 +324,7 @@ mod tests {
             converted_type: Some(5),
             scale: Some(2),
             precision: Some(38),
+            field_id: None,
             logical_type: Some(LogicalType::Decimal {
                 scale: 2,
                 precision: 38,
@@ -344,6 +348,7 @@ mod tests {
             converted_type: Some(10),
             scale: None,
             precision: None,
+            field_id: None,
             logical_type: Some(LogicalType::Timestamp {
                 unit: TimeUnit::MICROS,
                 is_adjusted_to_utc: true,
@@ -367,6 +372,7 @@ mod tests {
                 converted_type: None,
                 scale: None,
                 precision: None,
+                field_id: None,
                 logical_type: Some(LogicalType::Timestamp {
                     unit,
                     is_adjusted_to_utc: false,

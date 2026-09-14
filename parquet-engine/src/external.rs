@@ -330,7 +330,9 @@ fn load_strict_table(
     files: Vec<DataFile>,
 ) -> Result<(Vec<Column>, ParquetTable), Error> {
     let file_order: Vec<ObjectPath> = files.iter().map(|file| file.file.path.clone()).collect();
-    let loaded = crate::load_file_row_groups(dispatcher, &files, Arc::from([]))
+    // No declared columns: every file column passes through as it is stored.
+    let columns = crate::TableColumns::by_name(Vec::new());
+    let loaded = crate::load_file_row_groups(dispatcher, &files, columns)
         .map_err(|error| Error::Metadata(error.to_string()))?;
     let mut loaded_by_path: HashMap<_, _> = loaded
         .into_iter()

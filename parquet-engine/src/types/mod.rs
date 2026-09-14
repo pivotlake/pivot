@@ -1,4 +1,5 @@
 pub mod arrow_map;
+pub mod columns;
 pub mod filter_mask;
 pub(crate) mod leaves;
 pub mod metadata;

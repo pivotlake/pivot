@@ -24,6 +24,7 @@
 mod fetcher;
 mod writer;
 
+use crate::types::columns::TableColumns;
 use crate::types::metadata::RowGroupMetadata;
 use dispatch::{
     DataFlowDispatcher, OperatorSpec, RecordBatchOperatorSpec, RootUnaryOperatorFactory,
@@ -32,7 +33,6 @@ use dispatch::{
 use fetcher::FileRowGroupsFetcher;
 use object_storage::file_injector::FileInjectorFactory;
 use object_storage::{DataFile, DataFileLocation, FileRef};
-use planner::catalog::Column;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use writer::FileRowGroupsSinkFactory;
@@ -46,16 +46,16 @@ pub struct FileRowGroups {
 }
 
 /// Builds each worker's [`FileRowGroupsFetcher`], carrying the table's
-/// declared column types so every parsed footer is reconciled with them.
+/// declared columns so every parsed footer is reconciled with them.
 struct MetadataFetcherFactory {
-    declared_columns: Arc<[Column]>,
+    table_columns: TableColumns,
 }
 
 impl UnaryFactory<DataFile, FileRowGroups> for MetadataFetcherFactory {
     type Unary = FileRowGroupsFetcher;
 
     fn build_unary(self) -> Self::Unary {
-        FileRowGroupsFetcher::new(self.declared_columns)
+        FileRowGroupsFetcher::new(self.table_columns)
     }
 }
 
@@ -68,13 +68,13 @@ pub fn file_row_groups_from_metadata(
     file: FileRef,
     source: DataFileLocation,
     metadata: crate::thrift::footer::FileMetaData,
-    declared_columns: &[Column],
+    table_columns: &TableColumns,
 ) -> Result<FileRowGroups, crate::ParquetTableError> {
     let open_file = source
         .open_read(file.size)
         .map_err(crate::ParquetTableError::IO)?;
     let row_groups =
-        crate::types::table::row_groups_from_metadata(metadata, open_file, declared_columns)?
+        crate::types::table::row_groups_from_metadata(metadata, open_file, table_columns)?
             .into_iter()
             .map(Arc::new)
             .collect();
@@ -87,7 +87,7 @@ pub fn file_row_groups_from_metadata(
 fn fetch_file_row_group_factories(
     files: &[DataFile],
     workers: usize,
-    declared_columns: Arc<[Column]>,
+    table_columns: TableColumns,
 ) -> Vec<
     RootUnaryOperatorFactory<DataFile, FileRowGroups, MetadataFetcherFactory, FileInjectorFactory>,
 > {
@@ -97,7 +97,7 @@ fn fetch_file_row_group_factories(
         .map(|_| {
             RootUnaryOperatorFactory::new(
                 MetadataFetcherFactory {
-                    declared_columns: declared_columns.clone(),
+                    table_columns: table_columns.clone(),
                 },
                 injector.clone(),
                 siblings.clone(),
@@ -115,7 +115,7 @@ fn fetch_file_row_group_factories(
 pub fn load_file_row_groups(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
-    declared_columns: Arc<[Column]>,
+    table_columns: TableColumns,
 ) -> Result<Vec<FileRowGroups>, dispatch::DataFlowError> {
     // When there is nothing to fetch, skip the dataflow round-trip entirely.
     // Every query's compile resolves its table through here, and a warm
@@ -125,7 +125,7 @@ pub fn load_file_row_groups(
     }
     OperatorSpec::new(
         dispatcher.clone(),
-        fetch_file_row_group_factories(files, dispatcher.worker_count(), declared_columns),
+        fetch_file_row_group_factories(files, dispatcher.worker_count(), table_columns),
     )
     .collect()
 }
@@ -138,7 +138,7 @@ pub fn load_file_row_groups(
 pub fn create_load_and_stage_spec<C>(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
-    declared_columns: Arc<[Column]>,
+    table_columns: TableColumns,
     stage: C,
 ) -> RecordBatchOperatorSpec
 where
@@ -146,7 +146,7 @@ where
 {
     let fetch = OperatorSpec::new(
         dispatcher.clone(),
-        fetch_file_row_group_factories(files, dispatcher.worker_count(), declared_columns),
+        fetch_file_row_group_factories(files, dispatcher.worker_count(), table_columns),
     );
 
     // One worker receives every row group and the staging closure; the channel

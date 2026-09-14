@@ -482,7 +482,7 @@ impl CatalogTable {
         Ok(parquet_engine::load_file_row_groups(
             &self.dispatcher,
             &to_fetch,
-            columns.to_vec().into(),
+            parquet_engine::TableColumns::by_name(columns.to_vec()),
         )?)
     }
 
