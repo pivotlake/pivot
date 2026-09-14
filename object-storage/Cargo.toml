@@ -7,6 +7,8 @@ description = "PivotDB object-store backends and ring-readable data-file locatio
 
 [dependencies]
 dispatch = { workspace = true }
+# The whole-object fetch dataflow's work-stealing file queue.
+crossbeam-deque = { workspace = true }
 arrow-cast = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

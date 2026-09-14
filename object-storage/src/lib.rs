@@ -22,14 +22,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod file_injector;
 mod gcs;
 mod local;
+mod object_fetcher;
 mod object_path;
 mod s3;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub use gcs::GcsStore;
 pub use local::LocalStore;
+pub use object_fetcher::{LoadedObject, load_objects};
 pub use object_path::ObjectPath;
 pub use s3::{S3Credentials, S3Store};
 

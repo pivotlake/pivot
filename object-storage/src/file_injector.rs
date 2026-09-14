@@ -1,19 +1,20 @@
 //! Source stage: a work-stealing queue that hands out every input file exactly
-//! once, to whatever worker steals it next.
+//! once, to whatever worker steals it next. Shared by every dataflow that reads
+//! a list of files over the pool: a table's footer load, a whole-object fetch.
 
+use crate::DataFile;
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{Receiver, RootChannelFactory};
-use object_storage::DataFile;
 use std::sync::Arc;
 
 /// Builds a [`FileInjector`] per worker, all sharing one queue of the files.
 #[derive(Clone)]
-pub(super) struct FileInjectorFactory {
+pub struct FileInjectorFactory {
     files: Arc<Injector<DataFile>>,
 }
 
 impl FileInjectorFactory {
-    pub(super) fn new(files: &[DataFile]) -> Self {
+    pub fn new(files: &[DataFile]) -> Self {
         let injector = Injector::new();
         for file in files {
             injector.push(file.clone());
@@ -32,7 +33,7 @@ impl RootChannelFactory<DataFile> for FileInjectorFactory {
     }
 }
 
-pub(super) struct FileInjector {
+pub struct FileInjector {
     files: Arc<Injector<DataFile>>,
 }
 
@@ -41,15 +42,15 @@ impl FileInjector {
     ///
     /// A worker whose `try_finish` saw the queue non-empty (so it did not
     /// decrement its finish counter) can park in the window before it re-checks,
-    /// just as another worker claims the final file. Claiming a file emits a
-    /// `FileRowGroups` only to the single fan-in worker, so nothing else wakes that
+    /// just as another worker claims the final file. Claiming a file emits its
+    /// result only to the worker consuming it, so nothing else wakes that
     /// parked worker to run its finish. Broadcasting when the queue empties wakes
     /// it (and, via the wake-count bump, any worker mid-park) so every worker
     /// reaches its finish and the stage's sibling counter can drain to zero.
     /// Without it the query hangs with the pool parked one step short of done.
     ///
     /// The queue is filled once at construction and only drains, so the claim
-    /// that empties it always sees `is_empty` here — no separate counter needed.
+    /// that empties it always sees `is_empty` here; no separate counter is needed.
     /// Two final claims racing may both observe it and broadcast twice, which
     /// costs only a redundant wake.
     fn wake_if_drained(&self) {
@@ -65,12 +66,12 @@ impl Receiver<DataFile> for FileInjector {
     }
 
     fn try_recv(&self) -> Option<DataFile> {
-        // Drive footer loading from the eager `run_cpu_work` path (which calls
-        // `try_recv`), not only the worker's idle `steal` path — otherwise each
-        // worker fetches one footer at a time and a large catch-up (many new
+        // Drive the fetch from the eager `run_cpu_work` path (which calls
+        // `try_recv`), not only the worker's idle `steal` path; otherwise each
+        // worker fetches one file at a time and a large catch-up (many new
         // files committed since the last query) serialises into ~1s. A single
         // non-spinning attempt keeps the hot loop from spinning on `Steal::Retry`;
-        // the next iteration retries. Mirrors the `RowGroupInjector` fix.
+        // the next iteration retries.
         match self.files.steal() {
             Steal::Success(file) => {
                 self.wake_if_drained();
@@ -97,8 +98,8 @@ impl Receiver<DataFile> for FileInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DataFileLocation, FileRef, ObjectPath};
     use dispatch::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
-    use object_storage::{DataFileLocation, FileRef, ObjectPath};
     use std::path::PathBuf;
 
     /// The injector only ever hands these out, so they need no file behind them.
@@ -126,9 +127,9 @@ mod tests {
     /// A worker whose `try_finish` saw the queue non-empty returns without
     /// decrementing its stage's sibling counter. If a peer then claims the last
     /// file, that worker parks on an empty queue still owing its decrement, and
-    /// claiming a file only sends a `FileRowGroups` to the single fan-in worker — so
+    /// claiming a file only sends its result to the worker consuming it, so
     /// nothing else would wake it. Without this broadcast the sibling counter
-    /// never reaches zero and `CREATE TABLE` hangs with the pool parked one step
+    /// never reaches zero and a table load hangs with the pool parked one step
     /// short of done.
     #[test]
     fn claiming_the_last_file_wakes_the_pool() {
