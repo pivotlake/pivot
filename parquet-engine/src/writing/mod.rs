@@ -58,23 +58,28 @@ mod file_merge;
 mod leaves;
 mod partition_sorter;
 mod presorted_run;
+mod reorder;
 mod row_group_planner;
 mod shredder;
 mod shredding;
+pub use shredding::FileShredding;
 mod stats;
 pub use stats::aggregate_file_stats;
+mod streaming;
 mod types;
 
 pub use types::AssembledFile;
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use dispatch::memory::SlabAllocator;
 use dispatch::{
-    DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy, RecordBatchOperatorSpec,
-    node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, to_single_worker_mpsc,
+    DataFlowDispatcher, DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy,
+    RecordBatchOperatorSpec, node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable,
+    to_single_worker_mpsc, values_input,
 };
 
 use partition_sorter::{PartitionSorterFactory, SortedPartitionRun};
@@ -180,6 +185,119 @@ pub fn encode_compaction_batches_spec(
             ),
         );
     encode_files_spec(files)
+}
+
+/// How far ahead of the rows laid out so far a sorted compaction requests
+/// its input row groups, in output row groups.
+const LOOKAHEAD_ROW_GROUPS: usize = 4;
+
+/// How many input row groups a compaction's shredding plan samples rows from,
+/// and how many rows of each.
+const PLAN_SAMPLE_ROW_GROUPS: usize = 32;
+const PLAN_SAMPLE_ROWS_PER_GROUP: usize = 128;
+
+/// Plan the shredding of a compaction's output from rows sampled evenly
+/// across its input row groups, the spread a write over the whole file
+/// samples, so the layout does not hinge on whichever rows sort first. Only
+/// the variant columns are sampled, and a table without any reads nothing.
+pub fn plan_compaction_shredding(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<crate::ParquetTable>,
+) -> Result<Arc<FileShredding>, dispatch::DataFlowError> {
+    use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
+    let schema = table.schema();
+    let fields = schema.fields().to_vec();
+    let variant_columns: Vec<usize> = (0..fields.len())
+        .filter(|&column| crate::is_variant_field(&fields[column]))
+        .collect();
+    if variant_columns.is_empty() {
+        return Ok(Arc::new(FileShredding {
+            schema: Arc::new(arrow_schema::Schema::new(fields)),
+            column_shredding: vec![None; schema.fields().len()],
+        }));
+    }
+    let projection = crate::types::projection::Projection::columns(variant_columns.clone());
+    let groups = table.row_groups();
+    let group_stride = groups.len().div_ceil(PLAN_SAMPLE_ROW_GROUPS).max(1);
+    let requests: Vec<crate::RowGroupRequest> = (0..groups.len())
+        .step_by(group_stride)
+        .map(|group| {
+            let rows = groups[group].num_rows as usize;
+            let row_stride = rows.div_ceil(PLAN_SAMPLE_ROWS_PER_GROUP).max(1);
+            let rows: Vec<u32> = (0..rows)
+                .step_by(row_stride)
+                .map(|row| row as u32)
+                .collect();
+            crate::RowGroupRequest::from(
+                QueryRowGroupMetadata::new(table, group, RowSelection::Indices(rows.into())),
+                &projection,
+            )
+        })
+        .collect();
+    let sample =
+        crate::fetch_row_groups(values_input(dispatcher, requests), table, projection, false);
+    let batches = unshred_batches_spec(sample).collect()?;
+    let sampled_columns: Vec<(usize, usize)> = variant_columns
+        .into_iter()
+        .enumerate()
+        .map(|(chunk_column, column)| (column, chunk_column))
+        .collect();
+    let shredding =
+        shredding::plan_shredding(fields, Default::default(), &batches, &sampled_columns).map_err(
+            |error| dispatch::DataFlowError::Operation(dispatch::UnaryError::from(error).into()),
+        )?;
+    Ok(Arc::new(shredding))
+}
+
+/// Appends Parquet construction to a compaction scan of a sorted table's sort
+/// columns alone: the keys are sorted with their `(row group, row)` metadata,
+/// then every input row group is fetched whole in the order the sorted rows
+/// first need it, and the rows are laid out and encoded a row group at a
+/// time (see [`streaming`]), so the whole decoded input is never held at
+/// once. `shredding` is the output's plan (see [`plan_compaction_shredding`]).
+pub fn encode_sorted_by_keys_spec(
+    keys: RecordBatchOperatorSpec,
+    table: Arc<crate::ParquetTable>,
+    shredding: Arc<FileShredding>,
+    schema: SchemaRef,
+    partition: Option<crate::PartitionValues>,
+    sort_column_count: usize,
+    target_rows_per_group: usize,
+    max_file_size: usize,
+) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
+    let order_by: Vec<OrderBy> = (0..sort_column_count)
+        .map(|column| OrderBy::new(column, false, true))
+        .collect();
+    let sorted = keys
+        .project(|| crate::plain_row_group_column)
+        .order_by(order_by);
+    let fetch = crate::OrderedFetch {
+        order: Arc::new(OnceLock::new()),
+        consumed: Arc::new(AtomicUsize::new(0)),
+        lookahead_rows: LOOKAHEAD_ROW_GROUPS * target_rows_per_group,
+    };
+    let rows = crate::materialize_in_order(
+        sorted,
+        table,
+        crate::types::projection::Projection::all(schema.fields().len()),
+        fetch.clone(),
+    );
+    let (dispatcher, heads) = unshred_batches_spec(rows).into_parts();
+    let worker_count = heads.len();
+    let reorder_worker = dispatcher.next_worker();
+    let jobs = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>()).chain(
+        to_single_worker_mpsc::<RecordBatch>(worker_count, reorder_worker)
+            .into_iter()
+            .collect(),
+        reorder::factories(fetch, worker_count),
+    );
+    streaming::encode_gathered_spec(
+        jobs,
+        shredding,
+        partition,
+        target_rows_per_group,
+        max_file_size,
+    )
 }
 
 pub fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {

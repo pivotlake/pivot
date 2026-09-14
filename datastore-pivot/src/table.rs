@@ -842,12 +842,6 @@ impl CatalogTable {
         // recorded tuple can key every decoded batch without repartitioning it.
         let parquet = self.parquet_table_for(inputs);
         let columns = parquet.schema().fields().len();
-        let scan = parquet_engine::table_input(
-            &self.dispatcher,
-            &parquet,
-            Projection::all(columns),
-            false,
-        );
         let partition = inputs.first().and_then(|input| {
             self.files
                 .iter()
@@ -858,7 +852,45 @@ impl CatalogTable {
                 .clone()
         });
         let max_output_file_size = usize::try_from(max_output_file_size).unwrap_or(usize::MAX);
-        let uploaded_files = Arc::new(Injector::new());
+        if !self.sort_by().is_empty() {
+            // Sort the keys alone, then fetch the rows in that order.
+            let key_columns: Vec<usize> = self
+                .sort_by()
+                .iter()
+                .map(|name| {
+                    parquet
+                        .schema()
+                        .index_of(name)
+                        .expect("sort columns name declared columns")
+                })
+                .collect();
+            let keys = parquet_engine::table_input(
+                &self.dispatcher,
+                &parquet,
+                Projection::columns(key_columns.clone()),
+                true,
+            );
+            let shredding =
+                parquet_engine::writing::plan_compaction_shredding(&self.dispatcher, &parquet)
+                    .map_err(crate::Error::Merge)?;
+            let encoded = parquet_engine::writing::encode_sorted_by_keys_spec(
+                keys,
+                parquet.clone(),
+                shredding,
+                parquet.schema().clone(),
+                partition,
+                key_columns.len(),
+                target_rows_per_group,
+                max_output_file_size,
+            );
+            return self.upload_and_collect(encoded);
+        }
+        let scan = parquet_engine::table_input(
+            &self.dispatcher,
+            &parquet,
+            Projection::all(columns),
+            false,
+        );
         let encoded = parquet_engine::writing::encode_compaction_batches_spec(
             scan,
             parquet.schema().clone(),
@@ -868,6 +900,20 @@ impl CatalogTable {
             target_rows_per_group,
             max_output_file_size,
         );
+        self.upload_and_collect(encoded)
+    }
+
+    /// Drive `encoded` through upload to completion and return the uploaded
+    /// files as table files; a merge that failed part way has its uploaded
+    /// outputs deleted rather than left as orphans.
+    fn upload_and_collect<OF>(
+        &self,
+        encoded: dispatch::OperatorSpec<parquet_engine::writing::AssembledFile, OF>,
+    ) -> crate::Result<Vec<TableFile>>
+    where
+        OF: dispatch::OperatorFactory<parquet_engine::writing::AssembledFile> + 'static,
+    {
+        let uploaded_files = Arc::new(Injector::new());
         let spec = super::insert_sink::upload_files_spec(
             self.store(),
             self.location.clone(),

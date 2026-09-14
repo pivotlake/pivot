@@ -2411,3 +2411,60 @@ fn late_materialization_rows_satisfy_their_own_predicate() {
         .collect();
     assert_eq!(bands, vec![6; 4]);
 }
+
+/// A sorted compaction plans the output's shredding from the variant column
+/// alone, wherever it sits among the table's columns.
+#[test]
+fn compact_sorted_table_shreds_a_variant_column_after_a_plain_one() {
+    let columns = vec![
+        Column {
+            name: "id".to_string(),
+            col_type: Type::Int32,
+        },
+        Column {
+            name: "doc".to_string(),
+            col_type: Type::Variant,
+        },
+    ];
+    let (_database, datastore) = empty_datastore();
+    let mut request = empty_request("t", columns);
+    request
+        .options
+        .insert("sort_by".to_string(), "id".to_string());
+    create_table(&datastore, request).unwrap();
+    run_sql(
+        &datastore,
+        r#"INSERT INTO t VALUES (30, '{"age":3}'::VARIANT), (10, '{"age":1}'::VARIANT)"#,
+    );
+    run_sql(
+        &datastore,
+        r#"INSERT INTO t VALUES (20, '{"age":2}'::VARIANT)"#,
+    );
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    table.refresh().unwrap();
+    let inputs = table.file_refs();
+
+    datastore_pivot::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024, 128 * 1024)
+        .unwrap();
+
+    let parquet = current_parquet(&datastore, "t");
+    let DataType::Struct(doc_fields) = parquet.schema().field(1).data_type() else {
+        panic!("a variant column is a struct");
+    };
+    assert!(
+        doc_fields.find("typed_value").is_some(),
+        "`age` is shredded"
+    );
+    let batches = run_sql(&datastore, "SELECT id, CAST(doc->'age' AS INTEGER) FROM t");
+    let rows: Vec<(i32, i32)> = batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch.column(0).as_primitive::<Int32Type>().clone();
+            let ages = batch.column(1).as_primitive::<Int32Type>().clone();
+            (0..batch.num_rows()).map(move |row| (ids.value(row), ages.value(row)))
+        })
+        .collect();
+    assert_eq!(rows, [(10, 1), (20, 2), (30, 3)]);
+}

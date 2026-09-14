@@ -20,9 +20,9 @@ use dispatch::{
 
 use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
-    IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
-    RowGroupFetcherFactory, RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate,
-    ScanOrder, WorkerAllocator, pending_claim_bound,
+    IndexerFactory, MaterializerFactory, OrderedFetch, ParquetTable, RangeCutterFactory,
+    RowGroupBuffer, RowGroupFetcherFactory, RowGroupInjectorFactory, RowGroupRequest,
+    ScanEqualityPredicate, ScanOrder, WorkerAllocator, pending_claim_bound,
 };
 
 /// Append the index → decompress → cut → decode stages onto a source of
@@ -92,6 +92,46 @@ where
                 .collect(),
         );
     RecordBatchOperatorSpec::from_spec(decoded)
+}
+
+/// Fetch and decode the row groups that `requests` name. The requests keep
+/// their order on the way to the fetchers, so the row groups decode in about
+/// the order they were asked for, and the decoded batches carry the metadata
+/// columns when `add_row_group_metadata` so a consumer can tell which row
+/// group and rows each holds.
+pub fn fetch_row_groups<OF>(
+    requests: OperatorSpec<RowGroupRequest, OF>,
+    table: &ParquetTable,
+    projection: Projection,
+    add_row_group_metadata: bool,
+) -> RecordBatchOperatorSpec
+where
+    OF: OperatorFactory<RowGroupRequest> + 'static,
+{
+    let n = requests.dispatcher().worker_count();
+    let topology = requests.dispatcher().topology();
+    let pending_row_groups = pending_row_group_counters(n);
+    let claim_bound = pending_claim_bound(table);
+    let buffers = requests.chain(
+        stealable_fifo::<RowGroupRequest>(topology)
+            .into_iter()
+            .collect(),
+        pending_row_groups
+            .iter()
+            .map(|pending| RowGroupFetcherFactory::new(pending.clone(), claim_bound))
+            .collect(),
+    );
+    read_parquet(
+        buffers,
+        projection,
+        RECORD_BATCH_SIZE,
+        add_row_group_metadata,
+        Arc::new(Vec::new()),
+        pending_row_groups,
+        // Row groups are claimed by explicit request, not by the injector,
+        // so this count is never consulted.
+        Arc::new(AtomicUsize::new(0)),
+    )
 }
 
 /// One claimed-but-not-yet-cut row-group counter per worker, shared by the
@@ -211,6 +251,30 @@ pub fn materialize(
     table: Arc<ParquetTable>,
     projection: Projection,
 ) -> RecordBatchOperatorSpec {
+    materialize_with(spec, table, projection, None)
+}
+
+/// [`materialize`] for every row of `table` in the order `spec` delivers
+/// them: the rows' `(row group, row)` are recorded into `fetch.order`, every
+/// touched row group is read whole as the consumer gets near it, and the
+/// metadata columns stay on the decoded batches so the consumer can find
+/// each row again.
+pub fn materialize_in_order(
+    spec: RecordBatchOperatorSpec,
+    table: Arc<ParquetTable>,
+    projection: Projection,
+    fetch: OrderedFetch,
+) -> RecordBatchOperatorSpec {
+    materialize_with(spec, table, projection, Some(fetch))
+}
+
+fn materialize_with(
+    spec: RecordBatchOperatorSpec,
+    table: Arc<ParquetTable>,
+    projection: Projection,
+    order: Option<OrderedFetch>,
+) -> RecordBatchOperatorSpec {
+    let keep_metadata = order.is_some();
     let (dispatcher, mut heads) = spec.into_parts();
     let n = dispatcher.worker_count();
     let siblings_materializer = Arc::new(AtomicUsize::new(n));
@@ -228,15 +292,30 @@ pub fn materialize(
     // materializes take turns hosting the merge, so concurrent queries do not
     // all pin one worker.
     let host = dispatcher.next_worker();
+    // Ordered requests keep their order on the way to the fetchers, so the
+    // row groups decode in about the order the rows are laid out in.
+    let request_channels: Vec<_> = if keep_metadata {
+        stealable_fifo::<RowGroupRequest>(dispatcher.topology())
+            .into_iter()
+            .collect()
+    } else {
+        stealable::<RowGroupRequest>(dispatcher.topology())
+            .into_iter()
+            .collect()
+    };
     let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(n, host)
         .into_iter()
-        .zip(stealable::<RowGroupRequest>(dispatcher.topology()))
+        .zip(request_channels)
         .zip(pending_row_groups.iter())
         .map(|((rb_ch, rq_ch), pending)| {
             UnaryOperatorFactory::new(
                 UnaryOperatorFactory::new(
                     heads.pop_front().unwrap(),
-                    MaterializerFactory::new(projection.clone(), table.clone()),
+                    match &order {
+                        Some(order) => MaterializerFactory::new(projection.clone(), table.clone())
+                            .recording_order(order.clone()),
+                        None => MaterializerFactory::new(projection.clone(), table.clone()),
+                    },
                     rb_ch,
                     siblings_materializer.clone(),
                 ),
@@ -251,7 +330,7 @@ pub fn materialize(
         input,
         projection,
         RECORD_BATCH_SIZE,
-        false,
+        keep_metadata,
         Arc::new(Vec::new()),
         pending_row_groups,
         // The materializer path claims by explicit row-group requests, not the
