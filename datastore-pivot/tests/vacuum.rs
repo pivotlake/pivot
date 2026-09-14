@@ -19,7 +19,7 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction as _;
-use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir};
+use common::{DispatchGuard, commit_datastore_transaction, dispatch, open_datastore, table_dir};
 use datastore_pivot::{DEFAULT_VACUUM_POLL, PivotDatastore, Vacuumer};
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 
@@ -97,7 +97,7 @@ fn unreferenced_file_past_retention_is_deleted_and_the_live_file_is_kept() {
     let adopted_dir = db.path().join("events");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("live.parquet"));
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     // Dropped into the table's own directory after CREATE, so no Add references
     // it: an unreferenced orphan.
@@ -123,7 +123,7 @@ fn unreferenced_file_within_retention_is_kept() {
     let adopted_dir = db.path().join("events");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("live.parquet"));
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     write_parquet(&table_dir.join("orphan.parquet"));
 
@@ -145,7 +145,7 @@ fn a_file_in_the_adopted_directory_is_never_deleted() {
     let adopted_dir = db.path().join("events");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("live.parquet"));
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     write_parquet(&adopted_dir.join("theirs.parquet"));
 
@@ -168,7 +168,7 @@ fn compaction_merges_adopted_files_without_deleting_them() {
     for name in ["a.parquet", "b.parquet"] {
         write_parquet(&adopted_dir.join(name));
     }
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     let name = SchemaQualifiedTableName::in_default_schema("events");
     let inputs = datastore.table_files(&name).unwrap();
@@ -226,7 +226,7 @@ fn a_retired_file_is_kept_while_its_tombstone_is_inside_the_window() {
     let adopted_dir = db.path().join("events");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("a.parquet"));
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     let name = SchemaQualifiedTableName::in_default_schema("events");
     let retired = table_dir.join(rewrite_table_files(&datastore, &name));
@@ -252,14 +252,14 @@ fn a_reopened_datastore_dates_a_retired_file_by_the_log_tombstone() {
     write_parquet(&adopted_dir.join("a.parquet"));
     let name = SchemaQualifiedTableName::in_default_schema("events");
     let retired = {
-        let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+        let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
         let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
         let retired = table_dir.join(rewrite_table_files(&datastore, &name));
         rewrite_table_files(&datastore, &name);
         retired
     };
     backdate_past_retention(&retired);
-    let reopened = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let reopened = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
 
     Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, reopened)).vacuum_all(now_ms());
 
@@ -278,7 +278,7 @@ fn a_retired_file_is_deleted_once_its_tombstone_is_past_the_window() {
     let adopted_dir = db.path().join("events");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("a.parquet"));
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     let name = SchemaQualifiedTableName::in_default_schema("events");
     let retired = table_dir.join(rewrite_table_files(&datastore, &name));

@@ -335,6 +335,10 @@ impl PivotDatastore {
     /// manifest (schema + file list) and fetch its files' footers, building the
     /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.
     /// No background maintenance runs (see [`from_store`](Self::from_store)).
+    ///
+    /// Call it from inside a multi-thread tokio runtime: the datastore's Delta
+    /// engine runs its log I/O on the ambient runtime and fails to build
+    /// without one.
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Arc<Self>> {
         let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
         Self::from_store(store, dispatcher, None)
@@ -344,7 +348,8 @@ impl PivotDatastore {
     /// seam a metastore uses: it constructs the
     /// store (local dir / S3, with whatever credentials it holds) and hands
     /// it in, rather than having the datastore re-derive one from a URI. Reloads
-    /// every table the manifest records, exactly as [`open`](Self::open) does.
+    /// every table the manifest records, exactly as [`open`](Self::open) does,
+    /// and like it must be called from inside a multi-thread tokio runtime.
     pub fn from_store(
         store: Arc<dyn ObjectStore>,
         dispatcher: &DataFlowDispatcher,

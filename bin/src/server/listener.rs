@@ -311,7 +311,7 @@ mod tests {
         Arc::new(TestMetastore)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_signal_returns_ok() {
         let (tx, rx) = oneshot::channel::<()>();
         let dispatch = Dispatch::spin_up(1, 32, None);

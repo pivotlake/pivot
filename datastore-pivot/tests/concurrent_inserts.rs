@@ -13,7 +13,7 @@ use dispatch::DataFlowDispatcher;
 use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction;
-use common::{commit_datastore_transaction, insert_batches, shared_dispatcher};
+use common::{commit_datastore_transaction, insert_batches, open_datastore, shared_dispatcher};
 use datastore_pivot::PivotDatastore;
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 use planner::types::Type;
@@ -32,8 +32,7 @@ fn dispatcher() -> DataFlowDispatcher {
 /// version number counts the commits made since.
 fn open_datastore_with_empty_table() -> (TempDir, Arc<PivotDatastore>) {
     let database = TempDir::new().unwrap();
-    let datastore =
-        PivotDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = open_datastore(&database.path().to_string_lossy(), &dispatcher()).unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(CreateTableRequest {

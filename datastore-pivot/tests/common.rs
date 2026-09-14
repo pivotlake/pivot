@@ -11,6 +11,7 @@ use tempfile::TempDir;
 
 use catalog::datastore::{Datastore, DatastoreTransaction};
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
+pub use datastore_pivot::test_support::open_datastore;
 use dispatch::{DataFlowDispatcher, Dispatch};
 use parquet_engine::ParquetTable;
 use planner::catalog::{Result as CatalogResult, SchemaQualifiedTableName};
@@ -326,8 +327,7 @@ pub fn write_parquet_files(
         })
         .collect();
 
-    let datastore =
-        datastore_pivot::PivotDatastore::open(&database_root.to_string_lossy(), dispatch).unwrap();
+    let datastore = open_datastore(&database_root.to_string_lossy(), dispatch).unwrap();
     let creation = datastore.clone().begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {

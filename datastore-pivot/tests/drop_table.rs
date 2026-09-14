@@ -18,7 +18,7 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction as _;
-use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir};
+use common::{DispatchGuard, commit_datastore_transaction, dispatch, open_datastore, table_dir};
 use datastore_pivot::{DEFAULT_VACUUM_POLL, PivotDatastore, Vacuumer};
 use planner::catalog::{
     Column, CreateTableRequest, DropTableRequest, Result as CatalogResult, SchemaQualifiedTableName,
@@ -124,7 +124,7 @@ fn dropped_table_is_gone_from_the_catalog_but_keeps_its_storage() {
     let adopted_dir = db.path().join("adopted");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("live.parquet"));
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_table(&datastore, &dispatch, db.path(), "t", Some(&adopted_dir));
     let name = SchemaQualifiedTableName::in_default_schema("t");
 
@@ -142,7 +142,7 @@ fn dropped_table_is_gone_from_the_catalog_but_keeps_its_storage() {
 fn drop_is_visible_only_after_commit_and_survives_a_reopen() {
     let dispatch = dispatch(2);
     let db = TempDir::new().unwrap();
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     create_table(&datastore, &dispatch, db.path(), "t", None);
     let name = SchemaQualifiedTableName::in_default_schema("t");
     let transaction = datastore.clone().begin_transaction();
@@ -161,7 +161,7 @@ fn drop_is_visible_only_after_commit_and_survives_a_reopen() {
 
     assert!(!datastore.contains_table(&name));
     drop(datastore);
-    let reopened = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let reopened = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     assert!(!reopened.contains_table(&name));
 }
 
@@ -169,7 +169,7 @@ fn drop_is_visible_only_after_commit_and_survives_a_reopen() {
 fn rolling_back_a_drop_keeps_the_table() {
     let dispatch = dispatch(2);
     let db = TempDir::new().unwrap();
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     create_table(&datastore, &dispatch, db.path(), "t", None);
     let transaction = datastore.clone().begin_transaction();
     transaction
@@ -190,7 +190,7 @@ fn rolling_back_a_drop_keeps_the_table() {
 fn dropping_a_missing_table_fails() {
     let dispatch = dispatch(2);
     let db = TempDir::new().unwrap();
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
 
     let err = drop_table(&datastore, &dispatch, drop_request("missing", false))
         .unwrap_err()
@@ -203,7 +203,7 @@ fn dropping_a_missing_table_fails() {
 fn dropping_a_missing_table_with_if_exists_succeeds() {
     let dispatch = dispatch(2);
     let db = TempDir::new().unwrap();
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
 
     drop_table(&datastore, &dispatch, drop_request("missing", true)).unwrap();
 }
@@ -212,7 +212,7 @@ fn dropping_a_missing_table_with_if_exists_succeeds() {
 fn recreating_a_dropped_name_mints_a_fresh_identity() {
     let dispatch = dispatch(2);
     let db = TempDir::new().unwrap();
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     create_table(&datastore, &dispatch, db.path(), "t", None);
     let name = SchemaQualifiedTableName::in_default_schema("t");
     let first_id = datastore.table_handle(&name).unwrap().id();
@@ -232,7 +232,7 @@ fn vacuum_reclaims_a_dropped_tables_storage_only_after_retention() {
     let adopted_dir = db.path().join("adopted");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("live.parquet"));
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_table(&datastore, &dispatch, db.path(), "t", Some(&adopted_dir));
     drop_table(&datastore, &dispatch, drop_request("t", false)).unwrap();
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
@@ -258,7 +258,7 @@ fn vacuum_reclaims_a_dropped_tables_storage_only_after_retention() {
 fn refresh_removes_a_table_another_process_dropped() {
     let dispatch = dispatch(2);
     let db = TempDir::new().unwrap();
-    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let datastore = open_datastore(&db.path().to_string_lossy(), &dispatch).unwrap();
     create_table(&datastore, &dispatch, db.path(), "t", None);
     let name = SchemaQualifiedTableName::in_default_schema("t");
     // Rewrite the manifest the way another process's drop would, leaving this

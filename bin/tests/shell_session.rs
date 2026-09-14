@@ -159,8 +159,9 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
     assert_eq!((ids.value(0), names.value(0)), (1, "alice"));
     assert_eq!((ids.value(1), names.value(1)), (2, "bob"));
 
-    let error = match ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
-    {
+    let error = match runtime.block_on(async {
+        ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
+    }) {
         Ok(_) => panic!("a second instance opened the locked datastore"),
         Err(error) => error,
     };

@@ -757,6 +757,7 @@ fn partition_values_equal(
 mod tests {
     use super::*;
     use crate::PivotDatastore;
+    use crate::test_support::open_datastore;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, Scalar};
     use arrow_schema::{DataType, Field, Schema};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
@@ -1212,8 +1213,7 @@ mod tests {
         std::fs::create_dir_all(&adopted).unwrap();
         write_parquet_file(&adopted, "a.parquet", vec![1]);
         write_parquet_file(&adopted, "b.parquet", vec![2]);
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1263,8 +1263,7 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
         write_parquet_file(&adopted_dir, "c.parquet", vec![1_000, 1_100]);
         write_parquet_file(&adopted_dir, "d.parquet", vec![1_000, 1_100]);
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1308,8 +1307,7 @@ mod tests {
         ] {
             write_parquet_file(&adopted_dir, file, rows);
         }
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1344,8 +1342,7 @@ mod tests {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let encoded = tempfile::tempdir().unwrap();
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let mut table = datastore.table_handle(&name).unwrap();
@@ -1410,8 +1407,7 @@ mod tests {
         write_parquet_file_with_row_group_size(&adopted, "b.parquet", (12..32).collect(), 1);
         write_parquet_file_with_row_group_size(&adopted, "c.parquet", (100..120).collect(), 1);
         write_parquet_file_with_row_group_size(&adopted, "d.parquet", (119..139).collect(), 1);
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1481,8 +1477,7 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![4, 5]);
         write_parquet_file(&adopted_dir, "c.parquet", vec![6, 7, 8, 9]);
 
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1542,8 +1537,7 @@ mod tests {
         write_wide_parquet_file(&adopted, "b.parquet", ROWS_PER_INPUT, 29);
         write_wide_parquet_file(&adopted, "c.parquet", ROWS_PER_INPUT, 47);
 
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1590,8 +1584,7 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
         write_parquet_file(&adopted_dir, "c.parquet", vec![1_000, 1_100]);
 
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1634,8 +1627,7 @@ mod tests {
         write_wide_parquet_file(&adopted, "left.parquet", ROWS_PER_INPUT, 11);
         write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
 
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1784,8 +1776,7 @@ mod tests {
         write_wide_parquet_file(&adopted, "first.parquet", ROWS_PER_INPUT, 11);
         write_wide_parquet_file(&adopted, "second.parquet", ROWS_PER_INPUT, 29);
         write_wide_parquet_file(&adopted, "third.parquet", ROWS_PER_INPUT, 47);
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1878,8 +1869,7 @@ mod tests {
         std::fs::create_dir_all(&adopted_dir).unwrap();
         write_parquet_file(&adopted_dir, "a.parquet", vec![0, 100]);
         write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1944,8 +1934,7 @@ mod tests {
         write_parquet_file(&adopted, "s1.parquet", vec![2, 3]);
         write_parquet_file(&adopted, "s2.parquet", vec![8, 9]);
         write_parquet_file(&adopted, "s3.parquet", vec![14, 15]);
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -2028,8 +2017,7 @@ mod tests {
         write_wide_parquet_file(&adopted, "left.parquet", ROWS_PER_INPUT, 11);
         write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
 
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let table = datastore
             .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
@@ -2061,8 +2049,7 @@ mod tests {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let encoded = tempfile::tempdir().unwrap();
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
 
         // Two inputs in each partition. If batching crossed the partition
@@ -2217,8 +2204,7 @@ mod tests {
         write_parquet_file(&adopted_dir, "a.parquet", vec![1, 2]);
         write_parquet_file(&adopted_dir, "b.parquet", vec![3]);
 
-        let datastore =
-            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         // A relative adoption path: the files are read at `events` under the
         // store root, rather than at an absolute path of their own.
         create_table(

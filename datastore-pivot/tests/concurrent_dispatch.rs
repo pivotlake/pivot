@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 use catalog::datastore::{Datastore, DatastoreTransaction};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
-use common::commit_datastore_transaction;
+use common::{commit_datastore_transaction, open_datastore};
 use datastore_pivot::PivotDatastore;
 use planner::Planner;
 use planner::catalog::{Column, CreateTableRequest};
@@ -59,7 +59,7 @@ fn make_datastore() -> (TempDir, Arc<PivotDatastore>) {
         .unwrap();
     writer.close().unwrap();
 
-    let datastore = PivotDatastore::open(&dir.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = open_datastore(&dir.path().to_string_lossy(), &dispatcher()).unwrap();
     let mut options = HashMap::new();
     options.insert(
         "with_pre_existing_parquets".to_string(),

@@ -36,21 +36,23 @@ fn start_server_on(root: &str) -> u16 {
     let root = root.to_string();
     thread::spawn(move || {
         let dispatch = Dispatch::spin_up(workers, 32, None);
-        let datastore: Arc<dyn Datastore> =
-            PivotDatastore::open(&root, dispatch.dispatcher()).unwrap();
-        let catalog = Arc::new(
-            PivotCatalog::new(
-                HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
-                DEFAULT_DATASTORE_NAME.to_string(),
-                common::pivot_metastore(),
-            )
-            .unwrap(),
-        );
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async move {
+            // The datastore opens inside the runtime: its Delta engine runs on
+            // the ambient one.
+            let datastore: Arc<dyn Datastore> =
+                PivotDatastore::open(&root, dispatch.dispatcher()).unwrap();
+            let catalog = Arc::new(
+                PivotCatalog::new(
+                    HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
+                    DEFAULT_DATASTORE_NAME.to_string(),
+                    common::pivot_metastore(),
+                )
+                .unwrap(),
+            );
             let server = Server::new(bind, dispatch, catalog, pivot_metastore());
             let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
         });

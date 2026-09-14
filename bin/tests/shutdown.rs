@@ -30,18 +30,6 @@ fn shutdown_signal_drains_all_worker_threads() {
 
     let server_thread = thread::spawn(move || {
         let dispatch = Dispatch::spin_up(workers, 32, None);
-        let data_dir = tempfile::tempdir().unwrap();
-        let datastore: Arc<dyn Datastore> =
-            PivotDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
-                .unwrap();
-        let catalog = Arc::new(
-            PivotCatalog::new(
-                HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
-                DEFAULT_DATASTORE_NAME.to_string(),
-                common::pivot_metastore(),
-            )
-            .unwrap(),
-        );
         assert_eq!(
             dispatch.workers(),
             workers,
@@ -52,6 +40,20 @@ fn shutdown_signal_drains_all_worker_threads() {
             .build()
             .unwrap();
         rt.block_on(async move {
+            // The datastore opens inside the runtime: its Delta engine runs on
+            // the ambient one.
+            let data_dir = tempfile::tempdir().unwrap();
+            let datastore: Arc<dyn Datastore> =
+                PivotDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
+                    .unwrap();
+            let catalog = Arc::new(
+                PivotCatalog::new(
+                    HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
+                    DEFAULT_DATASTORE_NAME.to_string(),
+                    common::pivot_metastore(),
+                )
+                .unwrap(),
+            );
             let server = Server::new(bind, dispatch, catalog, pivot_metastore());
             server
                 .serve(Box::pin(async move {

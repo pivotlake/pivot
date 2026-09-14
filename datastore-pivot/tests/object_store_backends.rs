@@ -27,7 +27,7 @@ use parquet::file::properties::WriterProperties;
 use catalog::datastore::DatastoreTransaction;
 use common::{
     DispatchGuard, collect_i64s, commit_datastore_transaction, current_parquet,
-    dispatch_with_buffers, strings_and_ints,
+    dispatch_with_buffers, open_datastore, strings_and_ints,
 };
 use datastore_pivot::PivotDatastore;
 use dispatch::Projection;
@@ -87,7 +87,7 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Ar
             .put(&ObjectPath::new(format!("events/{name}")), &pq(values))
             .unwrap();
     }
-    let datastore = PivotDatastore::open(&b.root, d).unwrap();
+    let datastore = open_datastore(&b.root, d).unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(adopting_request("events", "events"))
@@ -157,7 +157,7 @@ mod bodies {
         b.store
             .put(&ObjectPath::new("events/p1.parquet"), &pq(&[1, 2, 3]))
             .unwrap();
-        let datastore = PivotDatastore::open(&b.root, &d).unwrap();
+        let datastore = open_datastore(&b.root, &d).unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -184,7 +184,7 @@ mod bodies {
             .unwrap();
         let absolute = b.store.absolute_key(&ObjectPath::new("outside")).unwrap();
         assert!(absolute.is_absolute(), "the store yields an absolute key");
-        let datastore = PivotDatastore::open(&b.root, &d).unwrap();
+        let datastore = open_datastore(&b.root, &d).unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -205,7 +205,7 @@ mod bodies {
         let d = dispatch_with_buffers(2, 32);
         drop(create_events(&d, b, &[("p1.parquet", &[1, 2, 3])]));
 
-        let reopened = PivotDatastore::open(&b.root, &d).unwrap();
+        let reopened = open_datastore(&b.root, &d).unwrap();
 
         assert_eq!(scan(&d, &reopened, "events"), vec![1, 2, 3]);
     }

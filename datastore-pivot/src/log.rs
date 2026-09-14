@@ -82,6 +82,14 @@ pub enum Error {
     },
     #[error("Delta log commit {version} has a `{field}` that is missing or not a string")]
     CorruptLogField { version: u64, field: &'static str },
+    #[error(
+        "the Delta engine runs on the ambient tokio runtime and there is none here: open the datastore from inside a multi-thread runtime"
+    )]
+    NoRuntime,
+    #[error(
+        "the Delta engine runs on the ambient tokio runtime and this one is current-thread, which its checkpoint writes would deadlock: open the datastore from inside a multi-thread runtime"
+    )]
+    CurrentThreadRuntime,
 }
 
 /// How Delta serializes timestamp partition values (and how Delta Kernel
@@ -941,20 +949,17 @@ impl DeltaEngine {
     /// backend supplies the object-store client, so the engine and the reader
     /// serving the tables' data are configured alike.
     ///
-    /// It runs on the process's ambient Tokio runtime when there is one, so the
-    /// engine shares the server's runtime rather than standing up a second.
-    /// Kernel's engine needs a multi-threaded runtime -- a checkpoint/commit runs
-    /// a log read and the write concurrently, and a single-thread runtime
-    /// deadlocks it -- so a single-thread ambient runtime (a current-thread test)
-    /// is declined in favour of [`ENGINE_RUNTIME`], which is also the fallback
-    /// when there is no ambient runtime at all (a sync test, a standalone tool).
+    /// The engine runs its log I/O (reads and, crucially, checkpoint and commit
+    /// writes) on the ambient Tokio runtime, so it shares the process's runtime
+    /// rather than standing up one of its own. That runtime has to be
+    /// multi-threaded: a checkpoint runs a log read and the write concurrently,
+    /// and a current-thread runtime deadlocks it. Building the engine outside a
+    /// runtime, or inside a current-thread one, is an error.
     pub(crate) fn new(store: &dyn ObjectStore) -> Result<Self, Error> {
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                handle
-            }
-            _ => ENGINE_RUNTIME.handle().clone(),
-        };
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(Error::CurrentThreadRuntime);
+        }
         let executor = Arc::new(TokioMultiThreadExecutor::new(handle));
         let engine = DefaultEngineBuilder::new(build_delta_object_store(store.connection())?)
             .with_task_executor(executor)
@@ -1013,22 +1018,6 @@ fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObject
     };
     Ok(store)
 }
-
-/// Fallback multi-threaded runtime for Kernel's engine I/O (log reads and,
-/// crucially, checkpoint/commit writes) when no suitable ambient runtime is
-/// available: a sync test, a standalone tool, or a single-thread test runtime the
-/// engine would deadlock on. Under the server, [`DeltaEngine::new`] uses the
-/// server's runtime instead and this is never built. A `static` so it is never dropped
-/// (dropping an owned runtime inside an async context panics). Two workers is
-/// enough for a checkpoint's concurrent read+write. The hot data path never
-/// touches this -- it stays on the io_uring ring.
-static ENGINE_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build the Delta engine runtime")
-});
 
 fn collect_scan_file(files: &mut Vec<ScanFile>, file: ScanFile) {
     files.push(file);
@@ -1475,6 +1464,7 @@ mod tests {
         use delta_kernel::transaction::CommitResult;
         use delta_kernel::transaction::create_table::create_table;
 
+        let _runtime = crate::test_support::enter_test_runtime();
         let dir = tempfile::tempdir().unwrap();
         let store = object_storage::LocalStore::new(dir.path()).unwrap();
         let uri = Url::from_directory_path(dir.path()).unwrap();
@@ -1616,6 +1606,7 @@ mod tests {
     /// Create a bare kernel-authored table at a store-relative location (no
     /// `delta.*` maintenance properties, which Kernel forbids setting at CREATE).
     fn create_test_table(dir: &std::path::Path) -> TestTable {
+        let _runtime = crate::test_support::enter_test_runtime();
         let store = object_storage::LocalStore::new(dir).unwrap();
         let location = ObjectPath::new("t");
         store.create_dir(&location).unwrap();

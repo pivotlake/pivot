@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 use catalog::datastore::{Datastore, DatastoreTransaction};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
-use common::{commit_datastore_transaction, current_parquet};
+use common::{commit_datastore_transaction, current_parquet, open_datastore};
 use datastore_pivot::{ColumnStatFilter, PartitionEqFilter, PivotDatastore, TableBinding};
 use object_storage::ObjectPath;
 use planner::PlanNode;
@@ -52,8 +52,7 @@ fn dispatcher() -> DataFlowDispatcher {
 /// guard next to the datastore makes its storage lifetime explicit.
 fn empty_datastore() -> (TempDir, Arc<PivotDatastore>) {
     let database = TempDir::new().unwrap();
-    let datastore =
-        PivotDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = open_datastore(&database.path().to_string_lossy(), &dispatcher()).unwrap();
     (database, datastore)
 }
 
@@ -400,7 +399,7 @@ fn opening_an_unwritable_database_fails() {
     // Opening takes and records the datastore lock before loading catalog state,
     // so an unwritable root is rejected immediately.
     let bogus = "/definitely/not/a/real/path/for/datastore/tests";
-    let err = PivotDatastore::open(bogus, &dispatcher())
+    let err = open_datastore(bogus, &dispatcher())
         .unwrap_err()
         .to_string();
 
@@ -1678,12 +1677,12 @@ fn reopened_database_restores_appended_files_from_manifest() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), &dispatcher()).unwrap();
         create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
         let new_file = write_ids(data_dir.path(), "later.parquet", &[40]);
         append(&datastore, "t", &new_file);
     }
-    let reopened = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = open_datastore(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     assert_eq!(current_parquet(&reopened, "t").row_groups().len(), 4);
 }
 
@@ -1694,7 +1693,7 @@ fn reopened_database_restores_sort_by() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = open_datastore(db.path().to_str().unwrap(), &dispatcher()).unwrap();
         let mut request = create_request("t", data_dir.path(), columns);
         request
             .options
@@ -1702,7 +1701,7 @@ fn reopened_database_restores_sort_by() {
         create_table(&datastore, request).unwrap();
     }
 
-    let reopened = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = open_datastore(db.path().to_str().unwrap(), &dispatcher()).unwrap();
 
     assert_eq!(
         reopened
@@ -1719,7 +1718,7 @@ fn reopened_database_restores_sort_by() {
 fn unlogged_leftover_file_is_invisible_after_swap() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
-    let datastore = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let datastore = open_datastore(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
 
     // "Compact" the adopted file into merged.parquet but crash before deleting
@@ -1739,7 +1738,7 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
 
     drop(table);
     drop(datastore);
-    let reopened = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = open_datastore(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     let parquet = current_parquet(&reopened, "t");
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the committed merged file is read");
