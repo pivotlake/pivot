@@ -31,14 +31,17 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
+use datastore_iceberg::IcebergCatalogAuth;
 use object_storage::{S3Credentials, S3Keys, StoreScheme};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-/// One secret as a file spells it. `type` names the backend it authenticates
-/// to and carries exactly that backend's fields, so an S3 secret cannot name a
-/// Google key file and a GCS secret cannot carry an access key.
+/// One secret as a file spells it. `type` names what it authenticates to and
+/// carries exactly that type's fields, so an S3 secret cannot name a Google
+/// key file and a GCS secret cannot carry an access key. A storage secret is
+/// matched to the locations its `scope` covers; an `iceberg` secret has no
+/// scope, since the datastore over the catalog names it.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub(crate) enum SecretConfig {
@@ -68,6 +71,23 @@ pub(crate) enum SecretConfig {
         /// A Google service-account (or authorized-user) JSON key file.
         credentials_file: String,
     },
+    #[serde(rename = "iceberg")]
+    Iceberg {
+        /// A bearer token sent on every catalog request. Exactly one of
+        /// `token` and `credential` is written.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        /// An OAuth2 client credential (`client_id:client_secret`) exchanged
+        /// for a token at the catalog's token endpoint.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        credential: Option<String>,
+        /// The OAuth2 token endpoint, when it is not the catalog's own.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        oauth2_server_uri: Option<String>,
+        /// The OAuth2 scope requested with `credential`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        oauth2_scope: Option<String>,
+    },
 }
 
 /// By hand with the S3 keys redacted: a secret must not leak into a log
@@ -95,6 +115,18 @@ impl std::fmt::Debug for SecretConfig {
                 .debug_struct("Gcs")
                 .field("scope", scope)
                 .field("credentials_file", credentials_file)
+                .finish(),
+            Self::Iceberg {
+                token,
+                credential,
+                oauth2_server_uri,
+                oauth2_scope,
+            } => f
+                .debug_struct("Iceberg")
+                .field("token", &token.as_ref().map(|_| "redacted"))
+                .field("credential", &credential.as_ref().map(|_| "redacted"))
+                .field("oauth2_server_uri", oauth2_server_uri)
+                .field("oauth2_scope", oauth2_scope)
                 .finish(),
         }
     }
@@ -192,8 +224,9 @@ struct Named<T> {
     secret: T,
 }
 
-/// Every secret of a metastore, split by the backend it authenticates to and
-/// keyed within each by the scope it covers.
+/// Every secret of a metastore: the storage secrets split by the backend they
+/// authenticate to and keyed within each by the scope they cover, and the
+/// catalog secrets keyed by name.
 ///
 /// A scope keying at most one secret is what makes "the most specific scope
 /// covering a location" one secret rather than a race between two, and it is
@@ -202,6 +235,7 @@ struct Named<T> {
 pub(crate) struct Secrets {
     s3: HashMap<SecretScope, Named<S3Secret>>,
     gcs: HashMap<SecretScope, Named<GcsSecret>>,
+    iceberg: HashMap<String, IcebergCatalogAuth>,
 }
 
 impl Secrets {
@@ -245,9 +279,44 @@ impl Secrets {
                         credentials_file: credentials_file.clone(),
                     },
                 )?,
+                SecretConfig::Iceberg {
+                    token,
+                    credential,
+                    oauth2_server_uri,
+                    oauth2_scope,
+                } => {
+                    let auth = match (token, credential) {
+                        (Some(token), None) => IcebergCatalogAuth::Token(token.clone()),
+                        (None, Some(credential)) => IcebergCatalogAuth::OAuth2 {
+                            credential: credential.clone(),
+                            server_uri: oauth2_server_uri.clone(),
+                            scope: oauth2_scope.clone(),
+                        },
+                        _ => {
+                            return Err(Error::IcebergSecretCredential { name: name.clone() });
+                        }
+                    };
+                    secrets.iceberg.insert(name.clone(), auth);
+                }
             }
         }
         Ok(secrets)
+    }
+
+    /// What the `iceberg` secret `secret` authenticates to a catalog with, for
+    /// the datastore `datastore` that names it.
+    pub(crate) fn find_iceberg_secret(
+        &self,
+        datastore: &str,
+        secret: &str,
+    ) -> Result<IcebergCatalogAuth> {
+        self.iceberg
+            .get(secret)
+            .cloned()
+            .ok_or_else(|| Error::UnknownIcebergSecret {
+                datastore: datastore.to_string(),
+                secret: secret.to_string(),
+            })
     }
 
     /// The credentials an S3 `location` is opened with, from the most specific
