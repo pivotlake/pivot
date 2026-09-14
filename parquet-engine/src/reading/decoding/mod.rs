@@ -237,6 +237,7 @@ pub(crate) mod tests {
                     physical_type: 0,
                     fixed_len_byte_width: None,
                     data_pages_all_dictionary: false,
+                    absent: false,
                 })
                 .collect(),
             statistics: Arc::default(),
@@ -326,6 +327,7 @@ pub(crate) mod tests {
             physical_type: 0,
             fixed_len_byte_width: None,
             data_pages_all_dictionary: all_dictionary,
+            absent: false,
         };
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
             open_file: dispatch::io::OpenFile::Local(file),

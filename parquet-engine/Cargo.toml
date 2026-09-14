@@ -16,6 +16,7 @@ arrow-arith = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-data = { workspace = true }
 arrow-select = { workspace = true }
 parquet-variant = { workspace = true }
 parquet-variant-compute = { workspace = true }

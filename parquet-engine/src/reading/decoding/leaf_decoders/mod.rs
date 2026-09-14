@@ -18,6 +18,9 @@
 //! - [`primitive::PrimitiveLeafDecoder`] for fixed-width numeric types.
 //! - [`bytes_view::BytesViewDecoder`] for variable-length string / binary types.
 
+mod absent;
+pub use absent::AbsentLeafDecoder;
+
 pub(crate) mod bytes_view;
 pub use bytes_view::BytesViewDecoder;
 

@@ -491,6 +491,7 @@ mod tests {
                 physical_type: 0,
                 fixed_len_byte_width: None,
                 data_pages_all_dictionary: false,
+                absent: false,
             }],
             statistics: Arc::default(),
             num_rows: 0,

@@ -99,6 +99,33 @@ pub struct ColumnChunkMeta {
     /// not contain a pushed-down equality constant — otherwise a non-dictionary
     /// data page could hold a matching value absent from the dictionary.
     pub data_pages_all_dictionary: bool,
+    /// True for a leaf the file has no chunk for: a declared column the file
+    /// predates (see [`ColumnResolution::ByFieldId`]). Nothing is read for it;
+    /// every row decodes as NULL.
+    ///
+    /// [`ColumnResolution::ByFieldId`]: crate::ColumnResolution::ByFieldId
+    pub absent: bool,
+}
+
+impl ColumnChunkMeta {
+    /// The chunk of a leaf the file has no chunk for. Its layout fields are
+    /// placeholders: no reader dereferences them, because the leaf is never
+    /// fetched. `max_def_level` is one, the level of an optional leaf, since an
+    /// absent column is nullable by construction.
+    pub fn absent() -> Self {
+        Self {
+            codec: CompressionCodec::UNCOMPRESSED,
+            dictionary_page_offset: None,
+            data_page_offset: 0,
+            total_compressed_size: 0,
+            total_uncompressed_size: 0,
+            max_def_level: 1,
+            physical_type: 0,
+            fixed_len_byte_width: None,
+            data_pages_all_dictionary: false,
+            absent: true,
+        }
+    }
 }
 
 /// Static, file-level metadata for a single Parquet row group.
