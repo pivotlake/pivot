@@ -1,6 +1,7 @@
-//! Vacuum deletes files the current table version no longer references once their
-//! storage mtime is older than the retention window, and never touches a live
-//! file. Age is judged against `now_ms`, threaded in so the window is exercised
+//! Vacuum deletes files the current table version no longer references once they
+//! have been unreferenced for the retention window, and never touches a live
+//! file. A retired file is dated by its tombstone, an orphan by its storage
+//! mtime. Age is judged against `now_ms`, threaded in so the window is exercised
 //! without waiting on the wall clock.
 
 mod common;
@@ -8,7 +9,7 @@ mod common;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
@@ -189,4 +190,106 @@ fn compaction_merges_adopted_files_without_deleting_them() {
             "compaction must not delete {name}"
         );
     }
+}
+
+/// Rewrite the table's current files into one new file in the table's own
+/// directory, retiring the inputs, and return the new file's path.
+fn rewrite_table_files(
+    datastore: &Arc<PivotDatastore>,
+    name: &SchemaQualifiedTableName,
+) -> PathBuf {
+    let inputs = datastore.table_files(name).unwrap();
+    let id = datastore.table_handle(name).unwrap().id();
+    datastore_pivot::compact_table_files(datastore, id, &inputs, 128 * 1024, 128 * 1024).unwrap();
+    let outputs = datastore.table_files(name).unwrap();
+    assert_eq!(outputs.len(), 1);
+    PathBuf::from(outputs[0].path.as_str())
+}
+
+/// Backdate a file's storage mtime past the retention window, so only its
+/// tombstone can still date it as recently retired.
+fn backdate_past_retention(path: &Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_millis(FIVE_HOURS_MS))
+        .unwrap();
+}
+
+/// A file that was live for longer than the window and was then retired is
+/// kept while its tombstone is inside the window, however old its bytes are.
+#[test]
+fn a_retired_file_is_kept_while_its_tombstone_is_inside_the_window() {
+    let dispatch = dispatch(2);
+    let db = TempDir::new().unwrap();
+    let adopted_dir = db.path().join("events");
+    std::fs::create_dir_all(&adopted_dir).unwrap();
+    write_parquet(&adopted_dir.join("a.parquet"));
+    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
+    let name = SchemaQualifiedTableName::in_default_schema("events");
+    let retired = table_dir.join(rewrite_table_files(&datastore, &name));
+    rewrite_table_files(&datastore, &name);
+    backdate_past_retention(&retired);
+
+    Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone())).vacuum_all(now_ms());
+
+    assert!(
+        retired.exists(),
+        "a file retired inside the window is kept whatever its storage mtime says"
+    );
+}
+
+/// A datastore that did not make the retiring commit learns the tombstone from
+/// the log when it loads the table, and keeps the file the same way.
+#[test]
+fn a_reopened_datastore_dates_a_retired_file_by_the_log_tombstone() {
+    let dispatch = dispatch(2);
+    let db = TempDir::new().unwrap();
+    let adopted_dir = db.path().join("events");
+    std::fs::create_dir_all(&adopted_dir).unwrap();
+    write_parquet(&adopted_dir.join("a.parquet"));
+    let name = SchemaQualifiedTableName::in_default_schema("events");
+    let retired = {
+        let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+        let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
+        let retired = table_dir.join(rewrite_table_files(&datastore, &name));
+        rewrite_table_files(&datastore, &name);
+        retired
+    };
+    backdate_past_retention(&retired);
+    let reopened = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+
+    Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, reopened)).vacuum_all(now_ms());
+
+    assert!(
+        retired.exists(),
+        "a file whose tombstone was read from the log is kept inside the window"
+    );
+}
+
+/// Once the tombstone is past the window the retired file goes, and the file
+/// that replaced it stays.
+#[test]
+fn a_retired_file_is_deleted_once_its_tombstone_is_past_the_window() {
+    let dispatch = dispatch(2);
+    let db = TempDir::new().unwrap();
+    let adopted_dir = db.path().join("events");
+    std::fs::create_dir_all(&adopted_dir).unwrap();
+    write_parquet(&adopted_dir.join("a.parquet"));
+    let datastore = PivotDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
+    let name = SchemaQualifiedTableName::in_default_schema("events");
+    let retired = table_dir.join(rewrite_table_files(&datastore, &name));
+    let live = table_dir.join(rewrite_table_files(&datastore, &name));
+
+    Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()))
+        .vacuum_all(now_ms() + FIVE_HOURS_MS);
+
+    assert!(
+        !retired.exists(),
+        "a file retired past the window is deleted"
+    );
+    assert!(live.exists(), "the file that replaced it is live and kept");
 }
