@@ -1507,6 +1507,17 @@ impl DatastoreTransaction for PivotTransaction {
             .await?)
     }
 
+    async fn vacuum(&self) -> CatalogResult<()> {
+        let datastore = self.datastore.clone();
+        tokio::task::spawn_blocking(move || {
+            datastore.refresh_from_store()?;
+            Vacuumer::new(DEFAULT_VACUUM_POLL, datastore).vacuum_all(vacuum::now_unix_ms())
+        })
+        .await
+        .map_err(|error| CatalogError::Other(Box::new(error)))??;
+        Ok(())
+    }
+
     async fn commit(&self) -> CatalogResult<()> {
         // Marked at entry, not on success: the swap refuses a second commit,
         // and a failed commit has already drained the staged state, so the

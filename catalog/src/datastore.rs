@@ -151,6 +151,15 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Run one vacuum sweep against the latest state, even without background
+    /// maintenance. Retention still applies to every deletion.
+    async fn vacuum(&self) -> Result<()> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this datastore does not support VACUUM",
+        )
+        .into())
+    }
+
     /// Resolve a `CREATE TABLE` against this datastore into a [`TableCreation`]
     /// the caller compiles into the dataflow that writes the new table. Resolution
     /// runs on the coordinator (validating the request and locating the table's

@@ -53,6 +53,7 @@ pub enum Command {
     CreateUser,
     DropTable,
     Compact,
+    Vacuum,
     /// `BEGIN`, `COMMIT` or `ROLLBACK`, answered without doing anything:
     /// every statement commits individually, so there is no transaction to
     /// open or resolve. Accepted so PostgreSQL drivers that wrap statements
@@ -72,6 +73,7 @@ impl Command {
             Self::CreateUser => "CREATE USER".to_string(),
             Self::DropTable => "DROP TABLE".to_string(),
             Self::Compact => "COMPACT".to_string(),
+            Self::Vacuum => "VACUUM".to_string(),
             Self::Begin => "BEGIN".to_string(),
             Self::Commit => "COMMIT".to_string(),
             Self::Rollback => "ROLLBACK".to_string(),

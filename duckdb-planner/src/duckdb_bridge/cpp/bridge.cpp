@@ -36,6 +36,7 @@
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
 #include "duckdb/planner/operator/logical_compact.hpp"
+#include "duckdb/planner/operator/logical_vacuum.hpp"
 #include "duckdb/planner/operator/logical_create_user.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -943,6 +944,15 @@ rust::String lo_reset_name(const LogicalOperator &op) {
 
 uint8_t lo_transaction_type(const LogicalOperator &op) {
 	return static_cast<uint8_t>(as<duckdb::LogicalSimple>(op).info->Cast<duckdb::TransactionInfo>().type);
+}
+
+// ---- Vacuum ----
+
+void lo_vacuum_validate(const LogicalOperator &op) {
+	const auto &info = *as<duckdb::LogicalVacuum>(op).info;
+	if (!info.options.vacuum || info.options.analyze || info.has_table) {
+		throw duckdb::NotImplementedException("Only VACUUM without a table or ANALYZE is supported");
+	}
 }
 
 // ---- Compact ----
