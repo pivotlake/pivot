@@ -484,6 +484,7 @@ impl PivotDatastore {
             state.partition_by,
             state.sort_by,
             files,
+            state.tombstones,
             store.clone(),
             dispatcher.clone(),
             engine.clone(),

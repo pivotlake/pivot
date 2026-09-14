@@ -94,6 +94,14 @@ pub struct CatalogTable {
     /// The active files: each a log entry (identity + partition + stats) paired
     /// with its materialized footers.
     pub(super) files: Vec<TableFile>,
+    /// The files the log retired but still remembers, each by the Unix ms its
+    /// commit retired it: what vacuum ages a retired file by, so the retention
+    /// window runs from the moment the file stopped being referenced rather
+    /// than from its storage mtime. Rebuilt from the log alongside `files`,
+    /// which bounds it to what the log still carries, and extended by every
+    /// commit this copy makes, which drops the entries a window older than
+    /// itself.
+    tombstones: HashMap<ObjectPath, u64>,
     store: Arc<dyn ObjectStore>,
     /// The pool a reload/commit fetches footers on, so the mutators need no
     /// dispatcher passed in.
@@ -121,6 +129,7 @@ impl CatalogTable {
         partition_by: Vec<String>,
         sort_by: Vec<String>,
         files: Vec<TableFile>,
+        tombstones: HashMap<ObjectPath, u64>,
         store: Arc<dyn ObjectStore>,
         dispatcher: DataFlowDispatcher,
         engine: crate::log::DeltaEngine,
@@ -133,6 +142,7 @@ impl CatalogTable {
             partition_by,
             sort_by,
             files,
+            tombstones,
             store,
             dispatcher,
             engine,
@@ -196,6 +206,7 @@ impl CatalogTable {
             partition_by,
             sort_by,
             files,
+            tombstones: HashMap::new(),
             store,
             dispatcher,
             engine,
@@ -223,6 +234,7 @@ impl CatalogTable {
             partition_by,
             sort_by,
             file_entries,
+            tombstones,
         } = state;
         // Reconcile the files first: it is the only step that can fail, and it
         // leaves this copy untouched when it does, so a copy never ends up at a
@@ -232,6 +244,7 @@ impl CatalogTable {
         self.columns = columns;
         self.partition_by = partition_by;
         self.sort_by = sort_by;
+        self.tombstones = tombstones;
         Ok(true)
     }
 
@@ -290,6 +303,7 @@ impl CatalogTable {
                 })
                 .collect();
             let entries: Vec<DeltaFileEntry> = added.iter().map(|f| f.entry.clone()).collect();
+            let retired_at_ms = crate::vacuum::now_unix_ms();
             if let Some(committed) = crate::log::commit_file_changes(
                 &self.engine,
                 &self.snapshot,
@@ -300,10 +314,30 @@ impl CatalogTable {
                 self.snapshot = committed;
                 self.files.retain(|f| !removed.contains(&f.entry.file.path));
                 self.files.extend(added);
+                self.record_retirements(removed, retired_at_ms);
                 return Ok(());
             }
             self.refresh()?;
         }
+    }
+
+    /// Fold the files a commit from this copy retired into its tombstones, dated
+    /// `retired_at_ms`: a clock reading taken just before the transaction was
+    /// opened, back to back with the one Kernel stamps their `Remove` tombstones
+    /// with, so the copy dates them within milliseconds of what a reload from
+    /// the log would. The same reading retires the tombstones a full retention
+    /// window older than this commit: any sweep run after it sees them past the
+    /// window, so they date nothing, and dropping them is what bounds a writer's
+    /// copy, which only ever extends its tombstones between reloads, to one
+    /// window's worth of retirements.
+    fn record_retirements(&mut self, removed: &[ObjectPath], retired_at_ms: u64) {
+        if removed.is_empty() {
+            return;
+        }
+        let cutoff = retired_at_ms.saturating_sub(self.deleted_file_retention().as_millis() as u64);
+        self.tombstones.retain(|_, at| *at > cutoff);
+        self.tombstones
+            .extend(removed.iter().map(|path| (path.clone(), retired_at_ms)));
     }
 
     /// Commit bare log `entries` whose footers are not yet in hand: like
@@ -343,6 +377,7 @@ impl CatalogTable {
                         .clone()
                 })
                 .collect();
+            let retired_at_ms = crate::vacuum::now_unix_ms();
             if let Some(committed) = crate::log::commit_file_changes(
                 &self.engine,
                 &self.snapshot,
@@ -373,6 +408,7 @@ impl CatalogTable {
                 self.snapshot = committed;
                 self.files.retain(|f| !removed.contains(&f.entry.file.path));
                 self.files.extend(committed_files);
+                self.record_retirements(removed, retired_at_ms);
                 return Ok(());
             }
             self.refresh()?;
@@ -650,6 +686,13 @@ impl CatalogTable {
     /// against this window.
     pub fn deleted_file_retention(&self) -> std::time::Duration {
         crate::log::deleted_file_retention(&self.snapshot)
+    }
+
+    /// The files this copy's version no longer references but the log retired
+    /// inside the retention window, each by the Unix ms it was retired. Held
+    /// with the version, so a caller wanting the latest refreshes first.
+    pub fn tombstones(&self) -> &HashMap<ObjectPath, u64> {
+        &self.tombstones
     }
 
     /// Delete the files in this table's `_delta_log` that a checkpoint has made

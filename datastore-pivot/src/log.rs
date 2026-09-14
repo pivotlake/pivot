@@ -18,10 +18,13 @@ use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields};
 use delta_kernel::EngineData;
 use delta_kernel::Snapshot;
+use delta_kernel::actions::{REMOVE_NAME, get_commit_schema};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::engine_data::TypedGetData as _;
+use delta_kernel::expressions::ColumnName;
 use delta_kernel::expressions::Scalar as DeltaScalar;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::aws::AmazonS3Builder;
@@ -35,6 +38,7 @@ use delta_kernel::schema::{
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::{CommitResult, Transaction};
+use delta_kernel::{DeltaResult, GetData, RowVisitor};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use planner::catalog::Column;
@@ -127,6 +131,9 @@ pub(crate) struct DeltaTableState {
     pub partition_by: Vec<String>,
     pub sort_by: Vec<String>,
     pub file_entries: Vec<DeltaFileEntry>,
+    /// The files the log retired but still remembers, each by the Unix ms its
+    /// commit retired it.
+    pub tombstones: HashMap<ObjectPath, u64>,
 }
 
 /// Initialize version 0 for `CREATE TABLE`. Data files already exist; this
@@ -412,6 +419,74 @@ pub(crate) fn deleted_file_retention(snapshot: &Snapshot) -> Duration {
         .table_properties()
         .deleted_file_retention_duration
         .unwrap_or(DEFAULT_DELETED_FILE_RETENTION)
+}
+
+/// The files the snapshot's log retired but still remembers, each dated by the
+/// `deletionTimestamp` (Unix ms) its `Remove` tombstone carries: when the file
+/// stopped being referenced. Replayed off the log's commits and the checkpoint
+/// under them; a checkpoint keeps a tombstone for the deleted-file retention
+/// window, so every file retired inside the window is listed whether or not its
+/// commit JSON still exists. A tombstone written without a timestamp dates
+/// nothing and is left out; a file retired more than once keeps its latest
+/// retirement.
+fn read_remove_tombstones(
+    snapshot: &Snapshot,
+    engine: &DeltaEngine,
+) -> Result<HashMap<ObjectPath, u64>, Error> {
+    let remove_schema = get_commit_schema().project(&[REMOVE_NAME])?;
+    let mut visitor = RemoveTombstoneVisitor::default();
+    for batch in snapshot
+        .log_segment()
+        .read_actions(engine.kernel(), remove_schema)?
+    {
+        visitor.visit_rows_of(batch?.actions())?;
+    }
+    Ok(visitor.retired_at_ms)
+}
+
+/// Collects the path and deletion timestamp of every dated `Remove` row it is
+/// shown; rows of other action kinds carry no `remove.path` and are skipped.
+#[derive(Default)]
+struct RemoveTombstoneVisitor {
+    retired_at_ms: HashMap<ObjectPath, u64>,
+}
+
+impl RowVisitor for RemoveTombstoneVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DeltaDataType]) {
+        static SELECTED: LazyLock<(Vec<ColumnName>, Vec<DeltaDataType>)> = LazyLock::new(|| {
+            (
+                vec![
+                    ColumnName::new(["remove", "path"]),
+                    ColumnName::new(["remove", "deletionTimestamp"]),
+                ],
+                vec![DeltaDataType::STRING, DeltaDataType::LONG],
+            )
+        });
+        (&SELECTED.0, &SELECTED.1)
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for row in 0..row_count {
+            let Some(path): Option<String> = getters[0].get_opt(row, "remove.path")? else {
+                continue;
+            };
+            let Some(deletion_timestamp_ms): Option<i64> =
+                getters[1].get_opt(row, "remove.deletionTimestamp")?
+            else {
+                continue;
+            };
+            let retired_at_ms = u64::try_from(deletion_timestamp_ms).map_err(|_| {
+                delta_kernel::Error::generic(format!(
+                    "Remove tombstone for {path} carries a negative deletionTimestamp {deletion_timestamp_ms}"
+                ))
+            })?;
+            self.retired_at_ms
+                .entry(ObjectPath::new(path))
+                .and_modify(|at| *at = (*at).max(retired_at_ms))
+                .or_insert(retired_at_ms);
+        }
+        Ok(())
+    }
 }
 
 /// Build the `add_files` metadata batch Kernel expects for a set of
@@ -776,8 +851,8 @@ pub(crate) fn refresh_table(
     read_state(latest, engine).map(Some)
 }
 
-/// Materialize one snapshot's schema, layout, and active file list: the state a
-/// catalog table is rebuilt from.
+/// Materialize one snapshot's schema, layout, active file list, and retired-file
+/// tombstones: the state a catalog table is rebuilt from.
 fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTableState, Error> {
     let schema = snapshot.schema();
     let delta_types = schema
@@ -837,12 +912,17 @@ fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTabl
         entry.stats = stats_by_path.remove(entry.file.path.as_str()).map(Arc::new);
     }
 
+    // The files this version no longer references but the log still dates, off
+    // the same segment the scan replayed, so the two always agree.
+    let tombstones = read_remove_tombstones(&snapshot, engine)?;
+
     Ok(DeltaTableState {
         snapshot,
         columns,
         partition_by,
         sort_by,
         file_entries: entries,
+        tombstones,
     })
 }
 
