@@ -13,7 +13,9 @@ use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
 use crate::reading::record_batch_metadata::with_row_group_metadata;
 use crate::types::filter_mask::FilterMask;
-use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
+use crate::types::leaves::{
+    leaf_fields, plan_leaves, resolve_output_reads, short_lived_variant_leaves,
+};
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
@@ -45,6 +47,10 @@ pub(crate) struct DecodePlan {
     leaf_fields: Vec<FieldRef>,
     /// The file leaves the decoders read, in the same order.
     pub file_leaves: Vec<usize>,
+    /// Per decoded leaf, whether its array is dropped as soon as its variant
+    /// is reassembled, so it is carved from the worker's short-lived
+    /// allocator rather than beside the columns that outlive it.
+    short_lived: Vec<bool>,
     /// One view per output column, in projection order. Several can fold the
     /// same decoded leaf.
     column_decoders: Vec<ColumnDecoder>,
@@ -99,11 +105,17 @@ impl DecodePlan {
             .iter()
             .map(|decoder| decoder.output_field().clone())
             .collect();
+        let short_lived_leaves = short_lived_variant_leaves(fields);
         Ok(Self {
             leaf_fields: plan
                 .file_leaves
                 .iter()
                 .map(|&leaf| leaves[leaf].clone())
+                .collect(),
+            short_lived: plan
+                .file_leaves
+                .iter()
+                .map(|&leaf| short_lived_leaves[leaf])
                 .collect(),
             file_leaves: plan.file_leaves,
             column_decoders,
@@ -318,7 +330,11 @@ impl RowGroupDecoder {
     /// Returns `Ok(Some(batch))` if every column decoder has enough buffered
     /// rows, `Ok(None)` if more pages are needed, or an error if decoding
     /// fails.
-    pub fn try_read(&mut self, allocator: &mut SlabAllocator) -> Result<Option<RecordBatch>> {
+    pub fn try_read(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        short_lived: &mut SlabAllocator,
+    ) -> Result<Option<RecordBatch>> {
         let size = min(self.batch_size, self.end_row - self.next_row);
         let available = min(
             self.leaf_decoders
@@ -336,7 +352,15 @@ impl RowGroupDecoder {
             let decoded = self
                 .leaf_decoders
                 .iter_mut()
-                .map(|leaf| leaf.read(allocator, available).map_err(Into::into))
+                .zip(&self.plan.short_lived)
+                .map(|(leaf, &is_short_lived)| {
+                    let allocator = if is_short_lived {
+                        &mut *short_lived
+                    } else {
+                        &mut *allocator
+                    };
+                    leaf.read(allocator, available).map_err(Into::into)
+                })
                 .collect::<Result<Vec<_>>>()?;
             let columns = self
                 .plan

@@ -42,25 +42,38 @@ pub struct ScanEqualityPredicate {
     pub value: Scalar<ArrayRef>,
 }
 
-/// One worker's slab allocator, shared by the stages on that worker that
+/// One worker's slab allocators, shared by the stages on that worker that
 /// allocate: the range cutter's dictionaries and the decoder's batches come
 /// out of one ring buffer instead of one each. Taken from the ring on first
 /// use, on the worker; the lock is never contended, the stages run one at a
 /// time.
+///
+/// A second allocator carves the leaves a shredded variant's reassembly
+/// drops as soon as it has read them. A slab returns to the pool only when
+/// every array carved from it is gone, so packing those leaves beside the
+/// batch's other columns would keep their bytes pinned for as long as the
+/// batch lives; on their own they free with the reassembly.
 pub struct WorkerAllocator {
-    allocator: Mutex<Option<SlabAllocator>>,
+    allocators: Mutex<Option<(SlabAllocator, SlabAllocator)>>,
 }
 
 impl WorkerAllocator {
     pub fn new() -> Self {
         Self {
-            allocator: Mutex::new(None),
+            allocators: Mutex::new(None),
         }
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut SlabAllocator) -> R) -> R {
-        let mut allocator = self.allocator.lock().unwrap();
-        f(allocator.get_or_insert_with(|| SlabAllocator::new(true)))
+        self.with_both(|allocator, _| f(allocator))
+    }
+
+    /// The long-lived allocator and the short-lived one, in that order.
+    pub fn with_both<R>(&self, f: impl FnOnce(&mut SlabAllocator, &mut SlabAllocator) -> R) -> R {
+        let mut allocators = self.allocators.lock().unwrap();
+        let (allocator, short_lived) =
+            allocators.get_or_insert_with(|| (SlabAllocator::new(true), SlabAllocator::new(true)));
+        f(allocator, short_lived)
     }
 }
 
@@ -137,7 +150,7 @@ impl Decoder {
         };
         let Some(batch) = self
             .allocator
-            .with(|allocator| decoder.try_read(allocator))
+            .with_both(|allocator, short_lived| decoder.try_read(allocator, short_lived))
             .map_err(crate::op_err)?
         else {
             return Ok(false);

@@ -517,6 +517,28 @@ fn leaf_is_semantically_null(
 ///
 /// The offset counts the leaves of preceding siblings. This returns `None`
 /// when `field` is not a struct or does not contain the named child.
+/// Per file leaf, whether it belongs to a shredded variant and is not its
+/// `metadata`: the leaves a reassembly of the variant reads once and drops.
+/// Their arrays are short-lived while every other leaf's lives as long as
+/// the batch, so a decoder keeps them apart (see
+/// [`WorkerAllocator`](crate::reading::decoding::WorkerAllocator)).
+pub(crate) fn short_lived_variant_leaves(fields: &Fields) -> Vec<bool> {
+    let mut short_lived = vec![false; fields.iter().map(leaf_count).sum()];
+    for (column, field) in fields.iter().enumerate() {
+        if !crate::is_variant_field(field) || find_child_leaf_offset(field, "typed_value").is_none()
+        {
+            continue;
+        }
+        let range = leaf_range(fields, column);
+        let metadata =
+            find_child_leaf_offset(field, "metadata").map(|(offset, _)| range.start + offset);
+        for leaf in range {
+            short_lived[leaf] = Some(leaf) != metadata;
+        }
+    }
+    short_lived
+}
+
 fn find_child_leaf_offset<'a>(field: &'a FieldRef, name: &str) -> Option<(usize, &'a FieldRef)> {
     let DataType::Struct(children) = field.data_type() else {
         return None;
