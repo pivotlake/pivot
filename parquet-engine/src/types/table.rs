@@ -238,13 +238,13 @@ pub(crate) fn row_groups_from_metadata(
     let file_leaf_count = leaf_infos.len();
     let ColumnLayout {
         schema,
-        file_leaves,
+        leaf_sources,
     } = resolve_column_layout(file_schema, &file_field_ids, table_columns)?;
     let schema = Arc::new(schema);
-    let layout_is_identity = file_leaves
+    let layout_is_identity = leaf_sources
         .iter()
         .enumerate()
-        .all(|(leaf, file_leaf)| *file_leaf == leaf);
+        .all(|(leaf, source)| *source == LeafSource::File(leaf));
     // Statistics belong to leaf chunks, not top-level columns.
     let leaves = super::leaves::leaf_fields(schema.fields());
 
@@ -289,6 +289,7 @@ pub(crate) fn row_groups_from_metadata(
                     physical_type,
                     fixed_len_byte_width: leaf_infos[j].type_length,
                     data_pages_all_dictionary,
+                    absent: false,
                 }
             })
             .collect();
@@ -300,24 +301,29 @@ pub(crate) fn row_groups_from_metadata(
         let columns: Vec<ColumnChunkMeta> = if layout_is_identity {
             file_chunks
         } else {
-            file_leaves
+            leaf_sources
                 .iter()
-                .map(|file_leaf| file_chunks[*file_leaf].clone())
+                .map(|source| match source {
+                    LeafSource::File(leaf) => file_chunks[*leaf].clone(),
+                    LeafSource::Absent => ColumnChunkMeta::absent(),
+                })
                 .collect()
         };
         row_groups.push((rg.num_rows, columns));
     }
 
+    let row_counts: Vec<i64> = row_groups.iter().map(|(num_rows, _)| *num_rows).collect();
     let statistics = Arc::new(
-        file_leaves
+        leaf_sources
             .iter()
             .enumerate()
-            .map(|(leaf, file_leaf)| {
-                decode_leaf_statistics(
+            .map(|(leaf, source)| match source {
+                LeafSource::File(file_leaf) => decode_leaf_statistics(
                     std::mem::take(&mut leaf_stats[*file_leaf]),
                     leaves[leaf].data_type(),
                     leaf_physical_types[*file_leaf],
-                )
+                ),
+                LeafSource::Absent => Some(absent_leaf_statistics(&row_counts)),
             })
             .collect::<Vec<_>>(),
     );
@@ -337,14 +343,34 @@ pub(crate) fn row_groups_from_metadata(
         .collect())
 }
 
+/// The statistics of a leaf the file has no chunk for: every row is NULL, so
+/// each row group's null count is its row count and there are no bounds.
+fn absent_leaf_statistics(row_counts: &[i64]) -> FileLeafStatistics {
+    FileLeafStatistics {
+        min: None,
+        max: None,
+        null_counts: row_counts.iter().map(|rows| Some(*rows)).collect(),
+        distinct_counts: row_counts.iter().map(|_| Some(0)).collect(),
+    }
+}
+
+/// Where a row group's leaf comes from, in the layout
+/// [`resolve_column_layout`] produced.
+#[derive(Debug, PartialEq, Eq)]
+enum LeafSource {
+    /// The file's leaf at this index, in the file's own leaf order.
+    File(usize),
+    /// A leaf the file has no chunk for; it reads as NULL.
+    Absent,
+}
+
 /// A file's schema as the table sees it, and where each of its leaves comes
 /// from.
 #[derive(Debug)]
 struct ColumnLayout {
     schema: Schema,
-    /// One entry per leaf of `schema`, in leaf order: the index of the file's
-    /// leaf it comes from, in the file's own leaf order.
-    file_leaves: Vec<usize>,
+    /// One entry per leaf of `schema`, in leaf order.
+    leaf_sources: Vec<LeafSource>,
 }
 
 /// Lay a file's columns out as `table_columns` resolves them against the
@@ -362,7 +388,7 @@ fn resolve_column_layout(
             let leaf_count = super::leaves::leaf_fields(file_schema.fields()).len();
             return Ok(ColumnLayout {
                 schema: apply_declared_types(file_schema, table_columns.columns())?,
-                file_leaves: (0..leaf_count).collect(),
+                leaf_sources: (0..leaf_count).map(LeafSource::File).collect(),
             });
         }
         ColumnResolution::ByFieldId(field_ids) => field_ids,
@@ -400,7 +426,7 @@ fn resolve_column_layout(
     };
 
     let mut fields = Vec::with_capacity(table_columns.columns().len());
-    let mut file_leaves = Vec::new();
+    let mut leaf_sources = Vec::new();
     for (declared, file_column) in table_columns.columns().iter().zip(file_column_of_declared) {
         match file_column {
             Some(index) => {
@@ -408,14 +434,28 @@ fn resolve_column_layout(
                 fields.push(Arc::new(
                     file_field.as_ref().clone().with_name(declared.name.clone()),
                 ));
-                file_leaves.extend(super::leaves::leaf_range(file_fields, index));
+                leaf_sources
+                    .extend(super::leaves::leaf_range(file_fields, index).map(LeafSource::File));
             }
-            None => return Err(Error::ColumnNotFound(declared.name.clone())),
+            None => {
+                let data_type = planner::types::physical_arrow_type(&declared.col_type);
+                // A nested column spans several leaves whose reconstruction
+                // reads real values (a variant's metadata blob); there is no
+                // all-NULL shape to synthesize for it.
+                if matches!(data_type, DataType::Struct(_)) {
+                    return Err(Error::UnsupportedType(format!(
+                        "column '{}' is absent from the file and its {} type cannot be read as NULL",
+                        declared.name, declared.col_type
+                    )));
+                }
+                fields.push(Arc::new(Field::new(declared.name.clone(), data_type, true)));
+                leaf_sources.push(LeafSource::Absent);
+            }
         }
     }
     Ok(ColumnLayout {
         schema: apply_declared_types(Schema::new(fields), table_columns.columns())?,
-        file_leaves,
+        leaf_sources,
     })
 }
 
@@ -1484,7 +1524,26 @@ mod tests {
         let layout = resolve_column_layout(file, &[Some(2), Some(1)], &declared).unwrap();
 
         assert_eq!(field_names(&layout.schema), ["a", "b"]);
-        assert_eq!(layout.file_leaves, [1, 0]);
+        assert_eq!(
+            layout.leaf_sources,
+            [LeafSource::File(1), LeafSource::File(0)]
+        );
+    }
+
+    #[test]
+    fn a_declared_column_the_file_lacks_is_an_absent_nullable_leaf() {
+        let file = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let declared = declared_by_field_id(vec![("a", Type::Int32, 1), ("c", Type::Utf8, 3)]);
+
+        let layout = resolve_column_layout(file, &[Some(1)], &declared).unwrap();
+
+        assert_eq!(field_names(&layout.schema), ["a", "c"]);
+        assert_eq!(*layout.schema.field(1).data_type(), DataType::Utf8View);
+        assert!(layout.schema.field(1).is_nullable());
+        assert_eq!(
+            layout.leaf_sources,
+            [LeafSource::File(0), LeafSource::Absent]
+        );
     }
 
     #[test]
@@ -1498,7 +1557,7 @@ mod tests {
         let layout = resolve_column_layout(file, &[Some(9), Some(1)], &declared).unwrap();
 
         assert_eq!(field_names(&layout.schema), ["a"]);
-        assert_eq!(layout.file_leaves, [1]);
+        assert_eq!(layout.leaf_sources, [LeafSource::File(1)]);
     }
 
     #[test]
@@ -1512,7 +1571,10 @@ mod tests {
         let layout = resolve_column_layout(file, &[None, None], &declared).unwrap();
 
         assert_eq!(field_names(&layout.schema), ["a", "b"]);
-        assert_eq!(layout.file_leaves, [1, 0]);
+        assert_eq!(
+            layout.leaf_sources,
+            [LeafSource::File(1), LeafSource::File(0)]
+        );
     }
 
     #[test]
@@ -1528,8 +1590,18 @@ mod tests {
         assert!(matches!(error, Error::InvalidFooter(_)), "{error}");
     }
 
+    #[test]
+    fn an_absent_nested_column_is_rejected() {
+        let file = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let declared = declared_by_field_id(vec![("a", Type::Int32, 1), ("v", Type::Variant, 2)]);
+
+        let error = resolve_column_layout(file, &[Some(1)], &declared).unwrap_err();
+
+        assert!(matches!(error, Error::UnsupportedType(_)), "{error}");
+    }
+
     /// A file whose columns carry field ids, written in an order that differs
-    /// from the declared one.
+    /// from the declared one and lacking one declared column.
     fn write_evolved_file(dir: &TempDir) -> Arc<ParquetTable> {
         let with_id = |field: Field, id: i32| {
             field.with_metadata(std::collections::HashMap::from([(
@@ -1555,7 +1627,11 @@ mod tests {
         writer.close().unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
 
-        let declared = declared_by_field_id(vec![("a", Type::Int32, 1), ("b", Type::Int64, 2)]);
+        let declared = declared_by_field_id(vec![
+            ("a", Type::Int32, 1),
+            ("c", Type::Int64, 3),
+            ("b", Type::Int64, 2),
+        ]);
         let loaded = crate::load_file_row_groups(
             test_dispatcher(),
             &[DataFile::local(path, size)],
@@ -1581,26 +1657,13 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_column_the_file_lacks_refuses_the_file() {
-        let file = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
-        let declared = declared_by_field_id(vec![("a", Type::Int32, 1), ("c", Type::Utf8, 3)]);
-
-        let error = resolve_column_layout(file, &[Some(1)], &declared).unwrap_err();
-
-        assert!(
-            matches!(&error, Error::ColumnNotFound(column) if column == "c"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn a_file_scans_in_the_declared_layout() {
+    fn a_file_scans_in_the_declared_layout_with_absent_columns_null() {
         let dir = TempDir::new().unwrap();
         let table = write_evolved_file(&dir);
 
-        let batch = scan(&table, vec![0, 1]);
+        let batch = scan(&table, vec![0, 1, 2]);
 
-        assert_eq!(field_names(batch.schema().as_ref()), ["a", "b"]);
+        assert_eq!(field_names(batch.schema().as_ref()), ["a", "c", "b"]);
         assert_eq!(
             batch
                 .column(0)
@@ -1610,14 +1673,50 @@ mod tests {
                 .values(),
             &[1, 2, 3]
         );
+        assert_eq!(batch.column(1).null_count(), 3);
         assert_eq!(
             batch
-                .column(1)
+                .column(2)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap()
                 .values(),
             &[10, 20, 30]
         );
+    }
+
+    #[test]
+    fn a_projection_of_only_absent_columns_yields_null_rows_without_reading() {
+        let dir = TempDir::new().unwrap();
+        let table = write_evolved_file(&dir);
+        let projection = dispatch::Projection {
+            column_indices: vec![1],
+            extracts: Vec::new(),
+        };
+
+        let request = crate::RowGroupRequest::from(
+            crate::types::metadata::QueryRowGroupMetadata::new(
+                &table,
+                0,
+                crate::types::metadata::RowSelection::All,
+            ),
+            &projection,
+        );
+        let batch = scan(&table, vec![1]);
+
+        assert!(request.reads_nothing());
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.column(0).null_count(), 3);
+    }
+
+    #[test]
+    fn an_absent_column_reports_every_row_null_in_its_statistics() {
+        let dir = TempDir::new().unwrap();
+        let table = write_evolved_file(&dir);
+
+        let stats = table.row_groups[0].column_statistics(1).unwrap();
+
+        assert_eq!(stats.null_count, Some(3));
+        assert!(stats.min().is_none() && stats.max().is_none());
     }
 }

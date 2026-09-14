@@ -86,10 +86,15 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         sender: &mut dyn Sender<RowGroupBuffer>,
         io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        let id = io.read(request.open_file().clone(), request.file_ranges())?;
         self.pending_row_groups.fetch_add(1, Ordering::Relaxed);
+        if request.reads_nothing() {
+            // Every projected leaf is absent from this file, so the buffer is
+            // built straight away and the indexer stands in its pages.
+            sender.send(request.into_row_group_buffer(None))?;
+            return Ok(());
+        }
+        let id = io.read(request.open_file().clone(), request.file_ranges())?;
         self.in_flight.insert(id, request);
-        let _ = sender;
         Ok(())
     }
 
@@ -115,7 +120,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
             .in_flight
             .remove(&response.id())
             .expect("response for an unknown row-group request");
-        sender.send(request.into_row_group_buffer(response))?;
+        sender.send(request.into_row_group_buffer(Some(response)))?;
         Ok(())
     }
 

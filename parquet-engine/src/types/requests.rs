@@ -55,10 +55,22 @@ fn parse_page_header(bytes: &[Bytes]) -> PageHeader {
 pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
     open_file: OpenFile,
-    /// Each projected leaf's file range, paired with the page codec its footer
-    /// entry recorded so the buffer built from the response can tag every
-    /// column's parts with it.
-    locations: Vec<(CompressionCodec, FileRange)>,
+    /// Where each projected leaf's chunk is, in leaf order.
+    locations: Vec<ChunkLocation>,
+}
+
+/// Where one projected leaf's chunk is in the file.
+enum ChunkLocation {
+    /// The chunk's byte range, paired with the page codec its footer entry
+    /// recorded so the buffer built from the response can tag the column's
+    /// parts with it.
+    InFile {
+        codec: CompressionCodec,
+        range: FileRange,
+    },
+    /// The file has no chunk for the leaf (see [`ColumnChunkMeta::absent`]):
+    /// nothing is read for it, and its column of the buffer comes back empty.
+    Absent,
 }
 
 impl RowGroupRequest {
@@ -76,11 +88,16 @@ impl RowGroupRequest {
             .iter()
             .map(|&leaf| {
                 let meta: &ColumnChunkMeta = &columns[leaf];
-                let range = FileRange::new(
-                    meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize,
-                    meta.total_compressed_size as usize,
-                );
-                (meta.codec, range)
+                if meta.absent {
+                    return ChunkLocation::Absent;
+                }
+                ChunkLocation::InFile {
+                    codec: meta.codec,
+                    range: FileRange::new(
+                        meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize,
+                        meta.total_compressed_size as usize,
+                    ),
+                }
             })
             .collect();
 
@@ -95,44 +112,52 @@ impl RowGroupRequest {
         &self.open_file
     }
 
+    /// The byte ranges to read, one per projected leaf the file holds.
     pub fn file_ranges(&self) -> impl Iterator<Item = FileRange> + '_ {
-        self.locations.iter().map(|&(_, range)| range)
+        self.locations.iter().filter_map(|location| match location {
+            ChunkLocation::InFile { range, .. } => Some(*range),
+            ChunkLocation::Absent => None,
+        })
     }
 
-    /// Pair this row group's domain metadata with dispatch's resolved response.
+    /// Whether every projected leaf is absent from the file, so there is
+    /// nothing to read and the buffer is built with no response
+    /// ([`into_row_group_buffer`](Self::into_row_group_buffer) with `None`).
+    pub fn reads_nothing(&self) -> bool {
+        self.locations
+            .iter()
+            .all(|location| matches!(location, ChunkLocation::Absent))
+    }
+
+    /// Pair this row group's domain metadata with dispatch's resolved
+    /// `response`, `None` for a request that [reads nothing](Self::reads_nothing).
     /// Runs on the claiming worker (the fetcher emits from the worker that
     /// admitted the request), so the buffer records it as the decode owner.
-    pub fn into_row_group_buffer(self, response: ReadResponse) -> RowGroupBuffer {
-        let resolved = response.into_locations();
-        assert_eq!(resolved.len(), self.locations.len());
+    pub fn into_row_group_buffer(self, response: Option<ReadResponse>) -> RowGroupBuffer {
+        let mut resolved = response
+            .map(|response| response.into_locations())
+            .unwrap_or_default()
+            .into_iter();
+        let columns = self
+            .locations
+            .iter()
+            .map(|location| match location {
+                ChunkLocation::InFile { codec, .. } => ColumnBuffer::resolved(
+                    *codec,
+                    resolved
+                        .next()
+                        .expect("the response resolves every requested range"),
+                ),
+                ChunkLocation::Absent => ColumnBuffer::Absent,
+            })
+            .collect();
+        assert!(
+            resolved.next().is_none(),
+            "the response resolves only the requested ranges"
+        );
         RowGroupBuffer {
             metadata: self.metadata,
-            columns: resolved
-                .into_iter()
-                .zip(self.locations)
-                .map(|(parts, (codec, _))| ColumnBuffer {
-                    codec,
-                    parts: parts
-                        .into_iter()
-                        .map(|part| match part {
-                            ReadData::Compressed { offset, bytes } => {
-                                ColumnPart::Compressed { offset, bytes }
-                            }
-                            ReadData::Decompressed {
-                                offset,
-                                span,
-                                header,
-                                data,
-                            } => ColumnPart::Decompressed {
-                                offset,
-                                span,
-                                header: Box::new(parse_page_header(&header)),
-                                data,
-                            },
-                        })
-                        .collect(),
-                })
-                .collect(),
+            columns,
             worker_id: dispatch::worker::WORKER_IDX.get(),
         }
     }
@@ -150,10 +175,44 @@ pub struct RowGroupBuffer {
     pub worker_id: usize,
 }
 
-/// One projected column's resolved parts, tagged with the codec its compressed
-/// pages were written with (from the column chunk's footer metadata).
-pub struct ColumnBuffer {
-    pub codec: CompressionCodec,
-    /// The column's resolved parts, in file order.
-    pub parts: Vec<ColumnPart>,
+/// One projected column of a row group as the ring resolved it.
+pub enum ColumnBuffer {
+    /// The column's parts, in file order, tagged with the codec its compressed
+    /// pages were written with (from the column chunk's footer metadata).
+    Resolved {
+        codec: CompressionCodec,
+        parts: Vec<ColumnPart>,
+    },
+    /// A leaf the file has no chunk for (see [`ColumnChunkMeta::absent`]):
+    /// nothing was read, and the indexer stands in one page spanning every row
+    /// so the column decodes as NULL.
+    Absent,
+}
+
+impl ColumnBuffer {
+    /// A column the response resolved, its parts as dispatch returned them.
+    fn resolved(codec: CompressionCodec, parts: Vec<ReadData>) -> Self {
+        Self::Resolved {
+            codec,
+            parts: parts
+                .into_iter()
+                .map(|part| match part {
+                    ReadData::Compressed { offset, bytes } => {
+                        ColumnPart::Compressed { offset, bytes }
+                    }
+                    ReadData::Decompressed {
+                        offset,
+                        span,
+                        header,
+                        data,
+                    } => ColumnPart::Decompressed {
+                        offset,
+                        span,
+                        header: Box::new(parse_page_header(&header)),
+                        data,
+                    },
+                })
+                .collect(),
+        }
+    }
 }

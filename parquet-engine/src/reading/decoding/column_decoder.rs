@@ -11,8 +11,8 @@
 
 use crate::reading::decoding::leaf_decoders;
 use crate::reading::decoding::leaf_decoders::{
-    BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder, TimestampMicrosecondLeafDecoder,
-    decimal_decoder,
+    AbsentLeafDecoder, BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder,
+    TimestampMicrosecondLeafDecoder, decimal_decoder,
 };
 use crate::types::leaves::{OutputRead, reconstruct_column_from_leaves};
 use crate::types::metadata::ColumnChunkMeta;
@@ -278,6 +278,9 @@ pub fn create_leaf_decoder(
     data_type: &DataType,
     chunk: &ColumnChunkMeta,
 ) -> Result<Box<dyn LeafDecoder>> {
+    if chunk.absent {
+        return Ok(Box::new(AbsentLeafDecoder::new(data_type.clone())));
+    }
     let max_def_level = chunk.max_def_level;
     macro_rules! primitive {
         ($t:ty) => {

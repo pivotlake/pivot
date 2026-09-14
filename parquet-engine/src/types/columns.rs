@@ -23,8 +23,8 @@ pub enum ColumnResolution {
     /// By Parquet field id: `field_ids[i]` identifies declared column `i`, allowing
     /// columns to be tracked across renames. File columns are mapped to the declared
     /// schema by field id, renamed to their declared names, and reordered accordingly.
-    /// Unknown file columns are dropped, while missing declared columns cause the file
-    /// to be rejected. If the file has no field ids, columns are matched by name instead.
+    /// Unknown file columns are dropped, while missing declared columns are read as
+    /// NULL. If the file has no field ids, columns are matched by name instead.
     ByFieldId(Arc<[i32]>),
 }
 

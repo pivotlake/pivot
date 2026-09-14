@@ -23,8 +23,8 @@
 //! 2. **Dictionary pages** — sent last so they arrive first, ensuring the decoder has the
 //!    dictionary before any RLE-dictionary-encoded data page.
 
-use crate::thrift::general::{CompressionCodec, PageType};
-use crate::thrift::headers::PageHeader;
+use crate::thrift::general::{CompressionCodec, Encoding, PageType};
+use crate::thrift::headers::{DataPageHeader, PageHeader};
 use crate::thrift::parquet_thrift::{ParquetError, ThriftReadInputProtocol};
 use crate::types::filter_mask::FilterMask;
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
@@ -175,21 +175,61 @@ impl ColumnPageBuilder {
 }
 
 /// Build one column's pages, in file order, from its resolved parts.
+///
+/// A column the file has no chunk for gets one stand-in data page spanning
+/// every row of the row group, carrying no bytes: it moves through the
+/// pipeline like any page, so the row group's ranges become ready and the
+/// column's decoder emits a NULL per row.
 fn build_column_pages(
     col_idx: usize,
     query_row_group_metadata: QueryRowGroupMetadata,
     column: ColumnBuffer,
     worker_id: usize,
 ) -> Result<Vec<CompressedPage>, ParquetError> {
+    let (codec, parts) = match column {
+        ColumnBuffer::Resolved { codec, parts } => (codec, parts),
+        ColumnBuffer::Absent => {
+            let mut builder = ColumnPageBuilder {
+                col_idx,
+                codec: CompressionCodec::UNCOMPRESSED,
+                query_row_group_metadata,
+                worker_id,
+                cursor: PageCursor::default(),
+            };
+            let rows = builder.query_row_group_metadata.num_rows().max(0) as i32;
+            let header = PageHeader {
+                r#type: PageType::DATA_PAGE,
+                uncompressed_page_size: 0,
+                compressed_page_size: 0,
+                crc: None,
+                data_page_header: Some(DataPageHeader {
+                    num_values: rows,
+                    encoding: Encoding::PLAIN,
+                    definition_level_encoding: Encoding::RLE,
+                    repetition_level_encoding: Encoding::RLE,
+                    statistics: None,
+                }),
+                index_page_header: None,
+                dictionary_page_header: None,
+                data_page_header_v2: None,
+            };
+            return Ok(vec![builder.build_page(
+                0,
+                0,
+                header,
+                PagePayload::Decompressed(Vec::new()),
+            )]);
+        }
+    };
     let mut builder = ColumnPageBuilder {
         col_idx,
-        codec: column.codec,
+        codec,
         query_row_group_metadata,
         worker_id,
         cursor: PageCursor::default(),
     };
     let mut pages = Vec::with_capacity(128);
-    for part in column.parts {
+    for part in parts {
         match part {
             ColumnPart::Compressed { offset, bytes } => {
                 builder.parse_compressed_pages(offset, &bytes, &mut pages)?
@@ -347,7 +387,7 @@ mod tests {
             metadata: dummy_metadata(selection),
             columns: columns
                 .into_iter()
-                .map(|parts| ColumnBuffer {
+                .map(|parts| ColumnBuffer::Resolved {
                     codec: CompressionCodec::SNAPPY,
                     parts,
                 })
