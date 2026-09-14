@@ -403,6 +403,7 @@ fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> 
         converted_type: None,
         scale: None,
         precision: None,
+        field_id: None,
         logical_type: None,
     }];
     for field in schema.fields() {
@@ -431,6 +432,7 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
                 converted_type: None,
                 scale: None,
                 precision: None,
+                field_id: None,
                 // The VARIANT annotation is the whole difference between a
                 // variant column and a plain struct of binary leaves: it is what
                 // a reader keys off to treat the group as semi-structured.
@@ -454,6 +456,7 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
                 converted_type: annotation.converted_type,
                 scale: annotation.scale,
                 precision: annotation.precision,
+                field_id: None,
                 logical_type: annotation.logical_type,
             })
         }

@@ -68,6 +68,7 @@ pub use types::arrow_map::{
     DECIMAL_FIXED_LEN, DecimalWriteStorage, LeafAnnotation, arrow_to_annotation,
     arrow_to_parquet_physical, decimal_write_storage,
 };
+pub use types::columns::{ColumnResolution, TableColumns};
 pub use types::leaves::{
     ShreddedScalarPath, first_leaf, leaf_count, leaf_fields, variant_shredded_leaves,
     variant_value_leaf_is_semantically_null,

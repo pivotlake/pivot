@@ -277,7 +277,7 @@ impl Upload {
             pending.file.clone(),
             source,
             pending.metadata,
-            &self.declared_columns,
+            &parquet_engine::TableColumns::by_name(self.declared_columns.clone()),
         )
         .map_err(parquet_engine::op_err)?;
         // Data-file IO is complete, but publication belongs to the statement's

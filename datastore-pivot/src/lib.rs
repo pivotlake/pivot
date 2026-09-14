@@ -452,7 +452,7 @@ impl PivotDatastore {
             .iter()
             .map(|e| e.file.clone().into_data_file(store.as_ref(), location))
             .collect::<object_storage::Result<Vec<DataFile>>>()?;
-        let declared_columns: Arc<[planner::catalog::Column]> = state.columns.clone().into();
+        let declared_columns = parquet_engine::TableColumns::by_name(state.columns.clone());
         // The footer fetch returns each file's row groups keyed by identity; join
         // each back to its log entry (partition tuple) by path.
         let mut footers: HashMap<ObjectPath, Vec<Arc<parquet_engine::RowGroupMetadata>>> =
@@ -1681,7 +1681,7 @@ impl TableCreation for PivotTableCreation {
         let partition_by = self.partition_by.clone();
         let sort_by = self.sort_by.clone();
         let if_not_exists = self.if_not_exists;
-        let declared_columns: Arc<[planner::catalog::Column]> = columns.clone().into();
+        let declared_columns = parquet_engine::TableColumns::by_name(columns.clone());
         Ok(parquet_engine::create_load_and_stage_spec(
             dispatcher,
             &self.files,
