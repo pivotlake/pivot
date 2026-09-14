@@ -1,16 +1,24 @@
-//! Turns rows fetched in row-group order back into a file in sorted order.
+//! Lays fetched rows out in sorted order, a batch at a time.
 //!
-//! The sort ran over the keys alone and left its order with the ordered
-//! materializer as `(row group, row)` pairs. The fetched batches arrive
-//! carrying the metadata columns that say which row group and rows each
-//! holds, so once every batch is in, the order resolves to `(batch, row)`
-//! over them and the file is ready for row-group planning.
+//! The sort ran over the keys alone and left its order with the materializer
+//! as `(row group, row)` pairs. The fetched batches arrive carrying the
+//! metadata columns that say which row group and rows each holds, roughly in
+//! the order the rows are needed. The collector keeps them, and whenever the
+//! next stretch of the order is wholly resident it gathers that stretch into
+//! one sorted batch and lets go of every row group the stretch finished
+//! with. The sorted batches make the file, in order, so the rows are copied
+//! once and the decoded input shrinks as the copy grows.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, UInt32Array};
-use dispatch::{LocatedBatch, Sender, Topology, Unary, UnaryFactory, UnaryResult};
+use arrow_schema::Schema;
+use dispatch::arrays::take_chunked;
+use dispatch::memory::SlabAllocator;
+use dispatch::{
+    LocatedBatch, RECORD_BATCH_SIZE, Sender, Topology, Unary, UnaryFactory, UnaryResult,
+};
 
 use super::error::WriteError;
 use super::types::{FilePlan, FileRows, ReadyFile};
@@ -53,9 +61,20 @@ impl UnaryFactory<RecordBatch, ReadyFile> for MaterializedFileCollectorFactory {
             target_rows_per_group: self.target_rows_per_group,
             max_file_size: self.max_file_size,
             node_id: self.node_id,
-            batches: Vec::new(),
+            resident: HashMap::new(),
+            rows_left: HashMap::new(),
+            cursor: 0,
+            sorted: Vec::new(),
+            allocator: None,
+            schema: None,
         }
     }
+}
+
+/// One fetched batch of a row group: its first row index, and the batch.
+struct ResidentBatch {
+    first_row: u32,
+    batch: RecordBatch,
 }
 
 pub(super) struct MaterializedFileCollector {
@@ -64,7 +83,90 @@ pub(super) struct MaterializedFileCollector {
     target_rows_per_group: usize,
     max_file_size: usize,
     node_id: usize,
-    batches: Vec<RecordBatch>,
+    /// The fetched batches of each row group still needed, by first row.
+    resident: HashMap<u32, Vec<ResidentBatch>>,
+    /// Per row group, how many of its rows the cursor has yet to pass.
+    rows_left: HashMap<u32, usize>,
+    /// The next row of the order to lay out.
+    cursor: usize,
+    /// The file so far, in order.
+    sorted: Vec<RecordBatch>,
+    allocator: Option<SlabAllocator>,
+    /// The data columns\' schema, without the metadata columns.
+    schema: Option<Arc<Schema>>,
+}
+
+impl MaterializedFileCollector {
+    /// Lay out every stretch of the order that is wholly resident.
+    fn advance(&mut self) -> Result<(), WriteError> {
+        let order = self
+            .order
+            .get()
+            .expect("the order is published before any row is fetched");
+        if self.rows_left.is_empty() {
+            for &(group, _) in order {
+                *self.rows_left.entry(group).or_default() += 1;
+            }
+        }
+        while self.cursor < order.len() {
+            let end = (self.cursor + RECORD_BATCH_SIZE).min(order.len());
+            let stretch = &order[self.cursor..end];
+            // Each row of the stretch as (resident batch, row in it), with the
+            // batches numbered as the gather will see them.
+            let mut chunks: Vec<(u32, usize)> = Vec::new();
+            let mut chunk_of: HashMap<(u32, usize), u32> = HashMap::new();
+            let mut mapping = Vec::with_capacity(stretch.len());
+            for &(group, row) in stretch {
+                let Some(batches) = self.resident.get(&group) else {
+                    return Ok(());
+                };
+                let position = batches.partition_point(|batch| batch.first_row <= row);
+                if position == 0 {
+                    return Ok(());
+                }
+                let position = position - 1;
+                let batch = &batches[position];
+                if row >= batch.first_row + batch.batch.num_rows() as u32 {
+                    return Ok(());
+                }
+                let chunk = *chunk_of.entry((group, position)).or_insert_with(|| {
+                    chunks.push((group, position));
+                    chunks.len() as u32 - 1
+                });
+                mapping.push((chunk, row - batch.first_row));
+            }
+            let allocator = self
+                .allocator
+                .get_or_insert_with(|| SlabAllocator::new(false));
+            let schema = self
+                .schema
+                .clone()
+                .expect("a resident batch set the schema");
+            let mut columns = Vec::with_capacity(schema.fields().len());
+            for column in 0..schema.fields().len() {
+                let sources: Vec<_> = chunks
+                    .iter()
+                    .map(|&(group, position)| {
+                        self.resident[&group][position].batch.column(column).clone()
+                    })
+                    .collect();
+                columns.push(take_chunked(allocator, &sources, &mapping)?);
+            }
+            self.sorted.push(RecordBatch::try_new(schema, columns)?);
+            for &(group, _) in stretch {
+                let left = self
+                    .rows_left
+                    .get_mut(&group)
+                    .expect("every row group of the order is counted");
+                *left -= 1;
+                if *left == 0 {
+                    self.resident.remove(&group);
+                }
+            }
+            self.cursor = end;
+        }
+        Ok(())
+    }
 }
 
 impl Unary<RecordBatch, ReadyFile> for MaterializedFileCollector {
@@ -74,59 +176,44 @@ impl Unary<RecordBatch, ReadyFile> for MaterializedFileCollector {
         _sender: &mut dyn Sender<ReadyFile>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
-        if batch.num_rows() > 0 {
-            self.batches.push(batch);
+        if batch.num_rows() == 0 {
+            return Ok(());
         }
+        let groups = global_row_group(&batch);
+        let group = groups
+            .values()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("row group ids are unsigned")
+            .value(groups.run_ends().get_start_physical_index());
+        let first_row = row_index(&batch).value(0);
+        if self.schema.is_none() {
+            let data_columns = batch.num_columns() - 2;
+            self.schema = Some(Arc::new(Schema::new(
+                batch.schema().fields()[..data_columns].to_vec(),
+            )));
+        }
+        let batches = self.resident.entry(group).or_default();
+        let at = batches.partition_point(|resident| resident.first_row < first_row);
+        batches.insert(at, ResidentBatch { first_row, batch });
+        self.advance()?;
         Ok(())
     }
 
     fn finish(&mut self, sender: &mut dyn Sender<ReadyFile>) -> UnaryResult<bool> {
-        if self.batches.is_empty() {
+        if self.schema.is_none() {
             return Ok(true);
         }
-        let order = self
-            .order
-            .get()
-            .expect("the order is published before any row is fetched");
-        // Where each row group\'s rows sit: the first row index of every batch
-        // holding some of them, in row order.
-        let mut batches_by_group: HashMap<u32, Vec<(u32, usize)>> = HashMap::new();
-        for (batch_index, batch) in self.batches.iter().enumerate() {
-            let groups = global_row_group(batch);
-            let group = groups
-                .values()
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .expect("row group ids are unsigned")
-                .value(groups.run_ends().get_start_physical_index());
-            let first_row = row_index(batch).value(0);
-            batches_by_group
-                .entry(group)
-                .or_default()
-                .push((first_row, batch_index));
-        }
-        for batches in batches_by_group.values_mut() {
-            batches.sort_unstable();
-        }
-        let mapping: Vec<(u32, u32)> = order
-            .iter()
-            .map(|&(group, row)| {
-                let batches = &batches_by_group[&group];
-                let position = batches.partition_point(|&(first_row, _)| first_row <= row) - 1;
-                let (first_row, batch_index) = batches[position];
-                (batch_index as u32, row - first_row)
-            })
-            .collect();
-        let data_columns = self.batches[0].num_columns() - 2;
-        let batches = std::mem::take(&mut self.batches)
+        self.advance()?;
+        let order_len = self.order.get().map_or(0, Vec::len);
+        assert_eq!(
+            self.cursor, order_len,
+            "every row of the order was fetched before the file finished"
+        );
+        let batches: Vec<LocatedBatch> = std::mem::take(&mut self.sorted)
             .into_iter()
-            .map(|batch| {
-                let batch = batch
-                    .project(&(0..data_columns).collect::<Vec<_>>())
-                    .map_err(WriteError::from)?;
-                Ok(LocatedBatch::new(batch, self.node_id))
-            })
-            .collect::<Result<Vec<_>, WriteError>>()?;
+            .map(|batch| LocatedBatch::new(batch, self.node_id))
+            .collect();
         sender.send(ReadyFile {
             plan: FilePlan {
                 file_id: 0,
@@ -136,9 +223,9 @@ impl Unary<RecordBatch, ReadyFile> for MaterializedFileCollector {
                 target_rows_per_group: self.target_rows_per_group,
                 max_file_size: Some(self.max_file_size),
             },
+            row_count: order_len,
             batches,
-            row_count: mapping.len(),
-            rows: FileRows::Mapped(Arc::new(mapping)),
+            rows: FileRows::InOrder,
             target_node: self.node_id,
         })?;
         Ok(true)

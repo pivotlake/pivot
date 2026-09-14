@@ -245,9 +245,20 @@ fn materialize_with(
     // materializes take turns hosting the merge, so concurrent queries do not
     // all pin one worker.
     let host = dispatcher.next_worker();
+    // Ordered requests keep their order on the way to the fetchers, so the
+    // row groups decode in about the order the rows are laid out in.
+    let request_channels: Vec<_> = if keep_metadata {
+        stealable_fifo::<RowGroupRequest>(dispatcher.topology())
+            .into_iter()
+            .collect()
+    } else {
+        stealable::<RowGroupRequest>(dispatcher.topology())
+            .into_iter()
+            .collect()
+    };
     let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(n, host)
         .into_iter()
-        .zip(stealable::<RowGroupRequest>(dispatcher.topology()))
+        .zip(request_channels)
         .zip(pending_row_groups.iter())
         .map(|((rb_ch, rq_ch), pending)| {
             UnaryOperatorFactory::new(

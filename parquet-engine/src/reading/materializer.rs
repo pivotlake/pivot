@@ -156,6 +156,9 @@ pub struct Materializer {
     /// Where to publish the rows\' order, when it is kept; `rows` collects it.
     order: Option<RowOrder>,
     rows: Vec<(u32, u32)>,
+    /// Row groups in the order the rows first name them, so the requests go
+    /// out in the order a consumer of the rows will need them.
+    groups_by_first_row: Vec<u32>,
 }
 
 impl Materializer {
@@ -172,6 +175,7 @@ impl Materializer {
             table,
             order: None,
             rows: Vec::new(),
+            groups_by_first_row: Vec::new(),
         }
     }
 }
@@ -188,6 +192,9 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
         let row_indices = row_index(&batch);
         let mut logical = 0usize;
         for (group, logical_end) in row_group_runs(&batch) {
+            if self.order.is_some() && !self.pending_row_groups.contains_key(&group) {
+                self.groups_by_first_row.push(group);
+            }
             let entries = self.pending_row_groups.entry(group).or_default();
             // `row_indices` is logically indexed, so `value(logical)` accounts
             // for any slice offset. A kept order needs no per-group indices:
@@ -215,8 +222,14 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
                 .set(mem::take(&mut self.rows))
                 .unwrap_or_else(|_| panic!("a file\'s row order is published once"));
         }
-        let pending_row_groups = mem::take(&mut self.pending_row_groups);
-        for (group, mut indices) in pending_row_groups {
+        let mut pending_row_groups = mem::take(&mut self.pending_row_groups);
+        let groups: Vec<u32> = if self.order.is_some() {
+            mem::take(&mut self.groups_by_first_row)
+        } else {
+            pending_row_groups.keys().copied().collect()
+        };
+        for group in groups {
+            let mut indices = pending_row_groups.remove(&group).unwrap_or_default();
             let selection = if self.order.is_some() {
                 RowSelection::All
             } else {
