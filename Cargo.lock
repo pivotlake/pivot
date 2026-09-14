@@ -3134,6 +3134,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "base64",
+ "crossbeam-deque",
  "dispatch",
  "quick-xml 0.37.5",
  "ring",

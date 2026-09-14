@@ -6,7 +6,8 @@
 //! of any table log: the owning table format joins each result with its file
 //! entry afterward.
 //!
-//! - [`injector`] — the source: hands out the input files.
+//! - [`FileInjectorFactory`] (from `object_storage::file_injector`) — the source: hands
+//!   out the input files.
 //! - [`fetcher`] — reads each file's footer (over the io_uring ring, through the
 //!   compressed cache) on whatever worker steals it, emitting one [`FileRowGroups`].
 //! - [`writer`] — the terminal fan-in sink: gathers the [`FileRowGroups`] on one
@@ -21,7 +22,6 @@
 //! for the `CREATE TABLE` transaction.
 
 mod fetcher;
-mod injector;
 mod writer;
 
 use crate::types::metadata::RowGroupMetadata;
@@ -30,7 +30,7 @@ use dispatch::{
     UnaryFactory, fan_in,
 };
 use fetcher::FileRowGroupsFetcher;
-use injector::FileInjectorFactory;
+use object_storage::file_injector::FileInjectorFactory;
 use object_storage::{DataFile, DataFileLocation, FileRef};
 use planner::catalog::Column;
 use std::sync::Arc;
