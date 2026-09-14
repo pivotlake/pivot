@@ -259,10 +259,4 @@ pub fn aggregate_file_stats(row_groups: &[Arc<crate::RowGroupMetadata>]) -> crat
     }
 }
 
-/// `a < b` for two single-value scalar bounds, compared in their shared physical
-/// type. A null, type mismatch, or kernel error reads as `false`, so folding a
-/// column's per-row-group bounds gets a well-defined, never-panicking answer.
-fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
-    arrow_ord::cmp::lt(a as &dyn Datum, b as &dyn Datum)
-        .is_ok_and(|result| result.len() == 1 && result.is_valid(0) && result.value(0))
-}
+use crate::types::table::scalar_lt;

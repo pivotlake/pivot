@@ -788,31 +788,15 @@ impl CatalogTable {
             .collect()
     }
 
-    /// Whether any loaded row group can hold a NULL in `name`. A column that is
-    /// `REQUIRED` everywhere cannot; an `OPTIONAL` one (writers like DuckDB mark
-    /// every column `OPTIONAL` even when no value is ever NULL) is refined by
-    /// the chunk's `null_count` statistic when the schema is flat enough to map
-    /// fields to leaves; a file missing the column entirely reads as all-NULL.
+    /// Whether any loaded row group can hold a NULL in `name`; a file missing
+    /// the column entirely reads as all-NULL.
     fn column_may_hold_nulls(&self, name: &str) -> bool {
         self.files
             .iter()
             .flat_map(|file| file.row_groups.iter())
-            .any(|rg| {
-                let Ok(field_idx) = rg.schema.index_of(name) else {
-                    return true;
-                };
-                if !rg.schema.field(field_idx).is_nullable() {
-                    return false;
-                }
-                // Nested fields (e.g. a shredded variant) span several leaves,
-                // so the field-to-chunk mapping below does not hold; stay
-                // conservative for the whole row group.
-                if rg.columns.len() != rg.schema.fields().len() {
-                    return true;
-                }
-                rg.leaf_statistics(field_idx)
-                    .and_then(|stats| stats.null_count)
-                    .is_none_or(|null_count| null_count > 0)
+            .any(|rg| match rg.schema.index_of(name) {
+                Ok(field_idx) => rg.column_may_hold_nulls(field_idx),
+                Err(_) => true,
             })
     }
 

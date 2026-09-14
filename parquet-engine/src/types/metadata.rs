@@ -142,6 +142,25 @@ impl RowGroupMetadata {
         self.leaf_statistics(super::leaves::first_leaf(self.schema.fields(), column))
     }
 
+    /// Whether the top-level column `column` can hold a NULL in this row group.
+    /// A `REQUIRED` column cannot; an `OPTIONAL` one (writers like DuckDB mark
+    /// every column `OPTIONAL` even when no value is ever NULL) is refined by
+    /// the chunk's `null_count` statistic when the schema is flat enough to map
+    /// fields to leaves. Nested fields (a shredded variant) span several leaves,
+    /// so the field-to-chunk mapping does not hold and the answer stays
+    /// conservative.
+    pub fn column_may_hold_nulls(&self, column: usize) -> bool {
+        if !self.schema.field(column).is_nullable() {
+            return false;
+        }
+        if self.columns.len() != self.schema.fields().len() {
+            return true;
+        }
+        self.leaf_statistics(column)
+            .and_then(|stats| stats.null_count)
+            .is_none_or(|null_count| null_count > 0)
+    }
+
     /// This row group's statistics for the chunk at `leaf`, a raw column-chunk
     /// index. For pruning by a leaf that isn't a column's first (a shredded
     /// variant path's typed leaf); resolve the index against this row group's

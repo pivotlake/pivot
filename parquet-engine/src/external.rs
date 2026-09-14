@@ -14,12 +14,12 @@ use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
     TableRevision,
 };
-use planner::expression::{CompareType, TableFilter};
+use planner::expression::TableFilter;
 use planner::types::{Type, type_from_physical};
 
 use crate::{
-    ParquetTable, PushedPredicate, ScanEqualityPredicate, is_variant_field, materialize,
-    prune_parquet, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, is_variant_field, materialize, prune_parquet,
+    table_input_with_filter_and_eq_predicates,
 };
 use object_storage::{
     DataFile, ExternalStoreFactory, FileRef, ObjectPath, ObjectStore, StoreScheme, local_path,
@@ -105,16 +105,7 @@ impl BoundTable for ExternalParquetTable {
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        let equality_predicates = self
-            .predicates
-            .iter()
-            .filter(|predicate| matches!(predicate.compare_type, CompareType::Equal))
-            .map(|predicate| ScanEqualityPredicate {
-                column_idx: predicate.column_idx,
-                path: predicate.path.clone(),
-                value: predicate.value.clone(),
-            })
-            .collect();
+        let equality_predicates = crate::equality_predicates(&self.predicates);
         let parquet = Arc::new(prune_parquet(&self.parquet, &self.predicates));
         Ok(table_input_with_filter_and_eq_predicates(
             dispatcher,
@@ -166,23 +157,11 @@ impl BoundTable for ExternalParquetTable {
         if !self.predicates.is_empty() {
             return None;
         }
-        Some(
-            self.parquet
-                .row_groups()
-                .iter()
-                .map(|group| group.num_rows)
-                .sum(),
-        )
+        Some(self.parquet.total_rows())
     }
 
     fn estimate_row_count(&self) -> Option<u64> {
-        Some(
-            self.parquet
-                .row_groups()
-                .iter()
-                .map(|group| group.num_rows as u64)
-                .sum(),
-        )
+        Some(self.parquet.total_rows() as u64)
     }
 }
 

@@ -19,6 +19,7 @@ use super::types::leaves::{
 };
 use super::types::metadata::RowGroupMetadata;
 use super::types::table::ParquetTable;
+use crate::ScanEqualityPredicate;
 
 /// A single-column constant comparison offered by DuckDB during filter
 /// pushdown. Parquet-backed bindings record it and apply it when they compile,
@@ -150,6 +151,20 @@ impl PushedPredicate {
             })
             .then_some(leaves.typed_leaf)
     }
+}
+
+/// The equality predicates among `predicates`, in the shape a scan applies
+/// per row group (dictionary pruning and batch pre-filtering).
+pub fn equality_predicates(predicates: &[PushedPredicate]) -> Vec<ScanEqualityPredicate> {
+    predicates
+        .iter()
+        .filter(|predicate| matches!(predicate.compare_type, CompareType::Equal))
+        .map(|predicate| ScanEqualityPredicate {
+            column_idx: predicate.column_idx,
+            path: predicate.path.clone(),
+            value: predicate.value.clone(),
+        })
+        .collect()
 }
 
 /// Clone a table and retain only the row groups which the recorded predicates
