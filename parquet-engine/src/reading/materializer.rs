@@ -7,16 +7,110 @@
 //! one [`QueryRowGroupMetadata`] per row group with sorted indices so that the
 //! downstream Parquet reader can fetch only the rows that passed a filter,
 //! reading them sequentially within each row group for optimal IO.
+//!
+//! A materializer can also keep the order the rows arrived in: fed from one
+//! worker below a sort, it records every row's `(row group, row)` in that
+//! order and publishes the list on `finish`, for a consumer that lays the
+//! fetched rows out again in it. Such a consumer needs every row, so the
+//! materializer then requests each touched row group whole.
 
 use crate::ParquetTable;
-use crate::reading::record_batch_metadata::{global_row_group, row_index};
+use crate::reading::record_batch_metadata::row_index;
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use ahash::HashMap;
-use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_array::types::Int32Type;
+use arrow_array::{Array, RecordBatch, RunArray, UInt32Array};
+use arrow_schema::{DataType, Field, Schema};
 use dispatch::Sender;
 use dispatch::{Unary, UnaryFactory};
+use std::collections::VecDeque;
 use std::mem;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+
+/// The `(row group, row)` of every row of a file, in the order the rows
+/// reached the materializer, set once on `finish` for a consumer to read.
+pub type RowOrder = Arc<OnceLock<Vec<(u32, u32)>>>;
+
+/// How the rows of a kept order are handed on: the row groups are requested
+/// in the order the rows first name them, and a row group goes out once its
+/// first row lies within `lookahead_rows` of the row the consumer has laid
+/// out up to, which it publishes in `consumed`. Whatever row the consumer
+/// needs next is therefore always requested, so it never waits on a request
+/// that cannot go out, and the decoded rows ahead of it stay bounded.
+#[derive(Clone)]
+pub struct OrderedFetch {
+    pub order: RowOrder,
+    pub consumed: Arc<AtomicUsize>,
+    pub lookahead_rows: usize,
+}
+
+/// Replaces a batch's run-encoded row-group column with a plain one, so a
+/// sort above the materializer can gather it as a fixed-width column.
+pub fn plain_row_group_column(batch: RecordBatch) -> RecordBatch {
+    let mut plain = Vec::with_capacity(batch.num_rows());
+    for (group, run_end) in row_group_runs(&batch) {
+        plain.resize(run_end, group);
+    }
+    let group_column = batch.num_columns() - 2;
+    let (schema, mut columns, row_count) = batch.into_parts();
+    columns[group_column] = Arc::new(UInt32Array::from(plain));
+    let mut fields = schema.fields().to_vec();
+    fields[group_column] = Arc::new(Field::new(
+        schema.field(group_column).name(),
+        DataType::UInt32,
+        false,
+    ));
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )
+    .expect("the plain column has the batch's rows")
+}
+
+/// The batch's rows as runs of one row group: `(group, logical end)` pairs,
+/// whether the row-group column is still run-encoded or was made plain.
+fn row_group_runs(batch: &RecordBatch) -> Vec<(u32, usize)> {
+    let column = batch.column(batch.num_columns() - 2);
+    if let Some(groups) = column.as_any().downcast_ref::<RunArray<Int32Type>>() {
+        // The batch may be a logical slice (e.g. a `LIMIT` above the scan),
+        // so walk the *logical* runs via `RunEndBuffer::sliced_values()`, run
+        // ends already adjusted by the slice offset and capped at the slice
+        // length, and map each run to its physical group value from
+        // `get_start_physical_index()`.
+        let run_ends = groups.run_ends();
+        let physical_start = run_ends.get_start_physical_index();
+        let group_values = groups
+            .values()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("row group ids are unsigned");
+        return run_ends
+            .sliced_values()
+            .enumerate()
+            .map(|(run_offset, logical_end)| {
+                (
+                    group_values.value(physical_start + run_offset),
+                    logical_end as usize,
+                )
+            })
+            .collect();
+    }
+    let groups = column
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .expect("a row group column is run-encoded or plain unsigned");
+    let mut runs: Vec<(u32, usize)> = Vec::new();
+    for row in 0..groups.len() {
+        let group = groups.value(row);
+        match runs.last_mut() {
+            Some((run_group, run_end)) if *run_group == group => *run_end = row + 1,
+            _ => runs.push((group, row + 1)),
+        }
+    }
+    runs
+}
 
 /// Factory for creating [`Materializer`] instances within the unary pipeline.
 ///
@@ -25,6 +119,7 @@ use std::sync::Arc;
 /// Consumed once via [`UnaryFactory::build_unary`].
 pub struct MaterializerFactory {
     table: Arc<ParquetTable>,
+    order: Option<OrderedFetch>,
 }
 
 impl MaterializerFactory {
@@ -32,7 +127,14 @@ impl MaterializerFactory {
     ///
     /// * `table` – shared handle to the Parquet table metadata.
     pub fn new(table: Arc<ParquetTable>) -> Self {
-        Self { table }
+        Self { table, order: None }
+    }
+
+    /// Record the rows' order and request their row groups whole, ahead of
+    /// the consumer by `fetch.lookahead_rows` (see the module docs).
+    pub fn recording_order(mut self, fetch: OrderedFetch) -> Self {
+        self.order = Some(fetch);
+        self
     }
 }
 
@@ -40,7 +142,9 @@ impl UnaryFactory<RecordBatch, QueryRowGroupMetadata> for MaterializerFactory {
     type Unary = Materializer;
 
     fn build_unary(self) -> Materializer {
-        Materializer::new(self.table)
+        let mut materializer = Materializer::new(self.table);
+        materializer.order = self.order;
+        materializer
     }
 }
 
@@ -56,6 +160,13 @@ pub struct Materializer {
     /// Row group ID -> collected row indices within that group.
     pending_row_groups: HashMap<u32, Vec<u32>>,
     table: Arc<ParquetTable>,
+    /// Where to publish the rows' order, when it is kept; `rows` collects it.
+    order: Option<OrderedFetch>,
+    rows: Vec<(u32, u32)>,
+    /// Row groups with the position of the row that first names each, in
+    /// that order, so the requests go out in the order a consumer of the rows
+    /// will need them; requested ones are popped from the front.
+    groups_by_first_row: VecDeque<(u32, usize)>,
 }
 
 impl Materializer {
@@ -67,6 +178,9 @@ impl Materializer {
         Self {
             pending_row_groups: HashMap::default(),
             table,
+            order: None,
+            rows: Vec::new(),
+            groups_by_first_row: VecDeque::new(),
         }
     }
 }
@@ -80,33 +194,23 @@ impl Unary<RecordBatch, QueryRowGroupMetadata> for Materializer {
         _sender: &mut dyn Sender<QueryRowGroupMetadata>,
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        // The row-group column is a `RunArray` (consecutive same-group rows = one
-        // run). The batch may be a logical slice (e.g. a `LIMIT` above the scan),
-        // so walk the *logical* runs via `RunEndBuffer::sliced_values()` — run
-        // ends already adjusted by the slice offset and capped at the slice
-        // length — and map each run to its physical group value from
-        // `get_start_physical_index()`. Reading the raw (physical) `run_ends`
-        // would treat them as logical bounds and overrun the (shorter) sliced
-        // `row_indices`.
-        let groups = global_row_group(&batch);
-        let run_ends = groups.run_ends();
-        let physical_start = run_ends.get_start_physical_index();
-        let group_values = groups
-            .values()
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
         let row_indices = row_index(&batch);
-
         let mut logical = 0usize;
-        for (run_offset, logical_end) in run_ends.sliced_values().enumerate() {
-            let logical_end = logical_end as usize;
-            let group = group_values.value(physical_start + run_offset);
+        for (group, logical_end) in row_group_runs(&batch) {
+            if self.order.is_some() && !self.pending_row_groups.contains_key(&group) {
+                self.groups_by_first_row.push_back((group, self.rows.len()));
+            }
             let entries = self.pending_row_groups.entry(group).or_default();
             // `row_indices` is logically indexed, so `value(logical)` accounts
-            // for any slice offset.
+            // for any slice offset. A kept order needs no per-group indices:
+            // the group is read whole.
             while logical < logical_end {
-                entries.push(row_indices.value(logical));
+                let row = row_indices.value(logical);
+                if self.order.is_some() {
+                    self.rows.push((group, row));
+                } else {
+                    entries.push(row);
+                }
                 logical += 1;
             }
         }
@@ -119,13 +223,36 @@ impl Unary<RecordBatch, QueryRowGroupMetadata> for Materializer {
         &mut self,
         sender: &mut dyn Sender<QueryRowGroupMetadata>,
     ) -> dispatch::UnaryResult<bool> {
-        let pending_row_groups = mem::take(&mut self.pending_row_groups);
-        for (group, mut indices) in pending_row_groups {
-            indices.sort_unstable();
+        let Some(fetch) = self.order.clone() else {
+            for (group, mut indices) in mem::take(&mut self.pending_row_groups) {
+                indices.sort_unstable();
+                sender.send(QueryRowGroupMetadata::new(
+                    &self.table,
+                    group as usize,
+                    RowSelection::Indices(indices.into()),
+                ))?;
+            }
+            return Ok(true);
+        };
+        // Only the materializer the sorted rows funnel to has rows to
+        // publish; its peers have nothing to request.
+        if !self.rows.is_empty() {
+            fetch
+                .order
+                .set(mem::take(&mut self.rows))
+                .unwrap_or_else(|_| panic!("a file's row order is published once"));
+            self.pending_row_groups.clear();
+        }
+        // Called again until every request is out.
+        while let Some(&(group, first_row)) = self.groups_by_first_row.front() {
+            if first_row >= fetch.consumed.load(Ordering::Acquire) + fetch.lookahead_rows {
+                return Ok(false);
+            }
+            self.groups_by_first_row.pop_front();
             sender.send(QueryRowGroupMetadata::new(
                 &self.table,
                 group as usize,
-                RowSelection::Indices(indices.into()),
+                RowSelection::All,
             ))?;
         }
         Ok(true)
