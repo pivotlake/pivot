@@ -15,7 +15,7 @@ use arrow_array::types::{
     Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{
-    ArrayRef, BooleanArray, Decimal64Array, Decimal128Array, PrimitiveArray,
+    Array, ArrayRef, BooleanArray, Decimal64Array, Decimal128Array, PrimitiveArray, Scalar,
     TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -145,11 +145,55 @@ impl ParquetTable {
         Ok(Self::new(row_groups))
     }
 
+    /// How many rows the table holds, summed over its row groups' footers: the
+    /// exact count with no data pages read.
+    pub fn total_rows(&self) -> i64 {
+        self.row_groups
+            .iter()
+            .map(|row_group| row_group.num_rows)
+            .sum()
+    }
+
+    /// The `column`'s lower and upper bound over every row group, folded from
+    /// the row-group statistics, or `None` when any row group lacks a bound
+    /// (or the table has none): only a complete set of bounds answers a
+    /// query's MIN/MAX without a scan. The scalars carry the column's physical
+    /// storage type.
+    pub fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+        if self.row_groups.is_empty() {
+            return None;
+        }
+        let mut min: Option<Scalar<ArrayRef>> = None;
+        let mut max: Option<Scalar<ArrayRef>> = None;
+        for row_group in &self.row_groups {
+            let stats = row_group.column_statistics(column)?;
+            let (group_min, group_max) = (stats.min()?, stats.max()?);
+            min = Some(match min {
+                Some(held) if scalar_lt(&held, &group_min) => held,
+                _ => group_min,
+            });
+            max = Some(match max {
+                Some(held) if scalar_lt(&group_max, &held) => held,
+                _ => group_max,
+            });
+        }
+        Some((min?, max?))
+    }
+
     /// Returns the table's Arrow schema. Preserved across pruning, so a table
     /// whose row groups were all eliminated still reports its real schema.
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
+}
+
+/// `a < b` for two single-value scalar bounds, compared in their shared
+/// physical type. A null, a type mismatch or a kernel error reads as `false`,
+/// so folding or ordering a column's per-row-group bounds gets a well-defined,
+/// never-panicking answer.
+pub(crate) fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
+    arrow_ord::cmp::lt(a, b)
+        .is_ok_and(|result| result.len() == 1 && result.is_valid(0) && result.value(0))
 }
 
 /// How much of a file's tail to fetch when probing for the footer. Almost every

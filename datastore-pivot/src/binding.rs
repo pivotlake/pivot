@@ -5,11 +5,11 @@
 use std::sync::Arc;
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
-use arrow_array::{Array, ArrayRef, Scalar};
+use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, ScanEqualityPredicate, materialize, prune_parquet,
+    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
@@ -169,16 +169,7 @@ impl BoundTable for TableBinding {
 
         // A variant path predicate reaches its shredded typed leaf only in the
         // files that shred it, so each row group resolves the path itself.
-        let eq_predicates: Vec<ScanEqualityPredicate> = self
-            .predicates
-            .iter()
-            .filter(|p| matches!(p.compare_type, CompareType::Equal))
-            .map(|p| ScanEqualityPredicate {
-                column_idx: p.column_idx,
-                path: p.path.clone(),
-                value: p.value.clone(),
-            })
-            .collect();
+        let eq_predicates = equality_predicates(&self.predicates);
 
         // Prune the row groups by the pushed-down predicates' stats.
         let parquet = Arc::new(self.pruned_parquet(&current));
@@ -261,28 +252,7 @@ impl BoundTable for TableBinding {
         }
         // Read the captured snapshot files, the same view a scan would see; an
         // unresolvable view means "scan".
-        let parquet = self.resolve_files().ok()?;
-        let row_groups = parquet.row_groups();
-        if row_groups.is_empty() {
-            return None;
-        }
-        // Every row group must carry both bounds; fold them with the arrow
-        // comparison kernels (stats come back typed as the physical column).
-        let mut min: Option<Scalar<ArrayRef>> = None;
-        let mut max: Option<Scalar<ArrayRef>> = None;
-        for rg in row_groups {
-            let stats = rg.column_statistics(column)?;
-            let (rg_min, rg_max) = (stats.min()?, stats.max()?);
-            min = Some(match min {
-                Some(m) if scalar_lt(&m, &rg_min) => m,
-                _ => rg_min,
-            });
-            max = Some(match max {
-                Some(m) if scalar_lt(&rg_max, &m) => m,
-                _ => rg_max,
-            });
-        }
-        Some((min?, max?))
+        self.resolve_files().ok()?.column_min_max(column)
     }
 
     fn row_count(&self) -> Option<i64> {
@@ -294,7 +264,7 @@ impl BoundTable for TableBinding {
         // The parquet footer carries each row group's exact row count, so the
         // table's count is their sum, with no data pages read.
         let parquet = self.resolve_files().ok()?;
-        Some(parquet.row_groups().iter().map(|rg| rg.num_rows).sum())
+        Some(parquet.total_rows())
     }
 
     fn estimate_row_count(&self) -> Option<u64> {
@@ -312,17 +282,6 @@ impl BoundTable for TableBinding {
                 .sum(),
         )
     }
-}
-
-/// `a < b` over two single-value scalars of the same physical type. A null,
-/// type mismatch, or kernel error reads as `false`. In [`column_min_max`] every
-/// comparison is between two same-typed integer/temporal stat bounds, where the
-/// kernel never errors and the bounds are non-null. (Mirrors the stricter,
-/// private `scalar_lt` in `parquet::reading::fetching`; worth consolidating.)
-///
-/// [`column_min_max`]: TableBinding::column_min_max
-fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
-    arrow_ord::cmp::lt(a, b).is_ok_and(|r| r.len() == 1 && r.is_valid(0) && r.value(0))
 }
 
 impl TableBinding {

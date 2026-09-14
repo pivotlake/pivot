@@ -20,7 +20,7 @@ use crate::RowGroupRequest;
 use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata, RowSelection};
 use crate::types::projection::Projection;
 use crate::types::table::ParquetTable;
-use arrow_array::{Array, ArrayRef, Datum, Scalar};
+use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{Receiver, RootChannelFactory};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
@@ -41,15 +41,7 @@ fn affinity_node(row_group: &RowGroupMetadata, node_count: usize) -> usize {
     (hasher.finish() % node_count as u64) as usize
 }
 
-/// Whether scalar `a` orders strictly before `b` (`a < b`). Used to build a
-/// total order over per-row-group stat bounds; a null or type-mismatched
-/// comparison is treated as "not less" so the sort stays well-defined.
-fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
-    matches!(
-        arrow_ord::cmp::lt(a as &dyn Datum, b as &dyn Datum),
-        Ok(arr) if arr.len() == 1 && arr.is_valid(0) && arr.value(0)
-    )
-}
+use crate::types::table::scalar_lt;
 
 /// Steal order for the row groups of `table` under a Top-N's [`ScanOrder`]:
 /// indices sorted so the most-promising row group (smallest `min` ascending,
