@@ -21,7 +21,9 @@ use dispatch::{
 
 use super::error::WriteError;
 use super::partition_sorter::SortedPartitionRun;
-use super::types::{FileMergeContext, FileOrderInput, FilePlan, NodeMergeRequest, ReadyFile};
+use super::types::{
+    FileMergeContext, FileOrderInput, FilePlan, FileRows, NodeMergeRequest, ReadyFile,
+};
 use crate::scalar_values_from_row;
 
 pub(super) struct FileCollectorFactory {
@@ -153,6 +155,7 @@ impl FileCollector {
             sender.send(FileOrderInput::Ready(ReadyFile {
                 plan,
                 batches,
+                rows: FileRows::InOrder,
                 row_count: pending_file.row_count,
                 target_node,
             }))?;
@@ -168,6 +171,7 @@ impl FileCollector {
             plan,
             order_by: self.order_by.clone(),
             row_count: pending_file.row_count,
+            in_memory_bytes: pending_file.in_memory_bytes,
             local_outputs: (0..self.topology.node_count)
                 .map(|_| OnceLock::new())
                 .collect(),

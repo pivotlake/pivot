@@ -11,7 +11,9 @@ use dispatch::{Sender, Topology, Unary, UnaryFactory, UnaryResult};
 
 use super::leaves;
 use super::shredding;
-use super::types::{ColumnChunkJob, FileAssemblyInfo, ReadyFile, RowGroupContext};
+use super::types::{
+    ColumnChunkJob, FileAssemblyInfo, FileRows, ReadyFile, RowGroupContext, RowGroupRows,
+};
 
 pub(super) struct RowGroupPlannerFactory {
     node_count: usize,
@@ -58,8 +60,9 @@ fn emit_column_chunk_jobs(
     let ReadyFile {
         plan,
         batches,
+        rows,
         row_count,
-        ..
+        target_node,
     } = file;
     debug_assert!(row_count > 0);
     let record_batches: Vec<RecordBatch> =
@@ -88,35 +91,65 @@ fn emit_column_chunk_jobs(
         max_file_size: plan.max_file_size,
     });
 
-    let mut rows_remaining = row_count;
+    // Every row group's column job takes from the same per-column chunk list
+    // and the same row order, so both are shared rather than sliced.
+    let column_chunks: Vec<Arc<[ArrayRef]>> = (0..leaf_counts.len())
+        .map(|column_index| {
+            batches
+                .iter()
+                .map(|batch| batch.batch().column(column_index).clone())
+                .collect()
+        })
+        .collect();
+    let mapping = match rows {
+        FileRows::InOrder => None,
+        FileRows::Mapped(mapping) => {
+            debug_assert_eq!(mapping.len(), row_count);
+            Some(mapping)
+        }
+    };
+    // Rows in order are cut at batch boundaries as the cursor walks them.
     let mut batch_index = 0;
     let mut rows_consumed_from_batch = 0;
     for row_group_index in 0..row_group_count {
-        let mut rows_remaining_in_group = plan.target_rows_per_group.min(rows_remaining);
-        rows_remaining -= rows_remaining_in_group;
-        let mut row_group_batches = Vec::new();
-        let mut rows_by_node = vec![0usize; node_count];
-        while rows_remaining_in_group > 0 {
-            let located_batch = &batches[batch_index];
-            let batch = located_batch.batch();
-            let rows_available = batch.num_rows() - rows_consumed_from_batch;
-            let rows_taken = rows_available.min(rows_remaining_in_group);
-            row_group_batches.push(
-                if rows_consumed_from_batch == 0 && rows_taken == batch.num_rows() {
-                    batch.clone()
-                } else {
-                    batch.slice(rows_consumed_from_batch, rows_taken)
+        let first_row = row_group_index * plan.target_rows_per_group;
+        let rows = first_row..(first_row + plan.target_rows_per_group).min(row_count);
+        let (row_group_rows, target_node) = match &mapping {
+            Some(mapping) => (
+                RowGroupRows::Gather {
+                    mapping: mapping.clone(),
+                    rows,
                 },
-            );
-            rows_by_node[located_batch.node_id()] += rows_taken;
-            rows_consumed_from_batch += rows_taken;
-            rows_remaining_in_group -= rows_taken;
-            if rows_consumed_from_batch == batch.num_rows() {
-                batch_index += 1;
-                rows_consumed_from_batch = 0;
+                target_node,
+            ),
+            None => {
+                let mut runs = Vec::new();
+                let mut rows_by_node = vec![0usize; node_count];
+                let mut rows_remaining_in_group = rows.len();
+                while rows_remaining_in_group > 0 {
+                    let located_batch = &batches[batch_index];
+                    let batch_rows = located_batch.batch().num_rows();
+                    let rows_taken =
+                        (batch_rows - rows_consumed_from_batch).min(rows_remaining_in_group);
+                    runs.push((
+                        batch_index,
+                        rows_consumed_from_batch..rows_consumed_from_batch + rows_taken,
+                    ));
+                    rows_by_node[located_batch.node_id()] += rows_taken;
+                    rows_consumed_from_batch += rows_taken;
+                    rows_remaining_in_group -= rows_taken;
+                    if rows_consumed_from_batch == batch_rows {
+                        batch_index += 1;
+                        rows_consumed_from_batch = 0;
+                    }
+                }
+                (
+                    RowGroupRows::Slices(runs),
+                    dispatch::dominant_node(&rows_by_node),
+                )
             }
-        }
-        let target_node = dispatch::dominant_node(&rows_by_node);
+        };
+        let row_group_rows = Arc::new(row_group_rows);
 
         let context = Arc::new(RowGroupContext {
             row_group_id: plan.base_row_group_id + row_group_index as u64,
@@ -126,21 +159,38 @@ fn emit_column_chunk_jobs(
             file_info: file_info.clone(),
         });
         let mut first_leaf_index = 0;
+        let mut jobs: Vec<ColumnChunkJob> = Vec::with_capacity(leaf_counts.len());
         for (column_index, &column_leaf_count) in leaf_counts.iter().enumerate() {
-            let column_batches: Arc<[ArrayRef]> = row_group_batches
-                .iter()
-                .map(|batch| batch.column(column_index).clone())
-                .collect();
-            sender.send(ColumnChunkJob {
+            jobs.push(ColumnChunkJob {
                 context: context.clone(),
                 column_index,
                 first_leaf_index,
-                batches: column_batches,
+                chunks: column_chunks[column_index].clone(),
+                rows: row_group_rows.clone(),
                 shredding: shredding_plan.column_shredding[column_index].clone(),
                 target_node,
-            })?;
+            });
             first_leaf_index += column_leaf_count;
+        }
+        // Heaviest columns first, so the light ones fill in behind them
+        // rather than a heavy one running alone at the row group's end.
+        jobs.sort_by_key(|job| {
+            std::cmp::Reverse(column_weight(shredding_plan.schema.field(job.column_index)))
+        });
+        for job in jobs {
+            sender.send(job)?;
         }
     }
     Ok(())
+}
+
+/// A rough cost of taking and shredding a column, for ordering a row group's
+/// jobs: a variant or byte-view column moves its values, a fixed-width one
+/// only its cells.
+fn column_weight(field: &arrow_schema::Field) -> usize {
+    match field.data_type() {
+        arrow_schema::DataType::Struct(_) => 3,
+        arrow_schema::DataType::Utf8View | arrow_schema::DataType::BinaryView => 2,
+        _ => 1,
+    }
 }

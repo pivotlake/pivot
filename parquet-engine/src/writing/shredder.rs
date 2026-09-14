@@ -16,13 +16,14 @@
 //! is split and sent on within the call that received it.
 
 use arrow_array::{Array, ArrayRef};
+use dispatch::arrays::take_chunked;
 use dispatch::memory::SlabAllocator;
 use dispatch::{DefaultUnaryFactory, RECORD_BATCH_SIZE, Sender, Unary, UnaryResult, WorkStatus};
 
 use super::error::WriteResult;
 use super::leaves::{self, Leaf};
 use super::shredding;
-use super::types::{ColumnChunkJob, LeafChunkJob};
+use super::types::{ColumnChunkJob, LeafChunkJob, RowGroupRows};
 
 pub(super) type ShredderFactory = DefaultUnaryFactory<Shredder>;
 
@@ -50,7 +51,10 @@ impl Unary<ColumnChunkJob, LeafChunkJob> for Shredder {
             self.held.is_none(),
             "a shredder holding a column is not fed another"
         );
-        let mut column = HeldColumn::new(job);
+        let allocator = self
+            .allocator
+            .get_or_insert_with(|| SlabAllocator::new(false));
+        let mut column = HeldColumn::new(job, allocator)?;
         if column.job.shredding.is_none() {
             while !column.is_exhausted() {
                 column.convert_next_slice(usize::MAX, &mut self.allocator)?;
@@ -106,6 +110,8 @@ fn send_leaves(column: HeldColumn, sender: &mut dyn Sender<LeafChunkJob>) -> Una
 /// values and levels gathered so far for each of its leaves.
 struct HeldColumn {
     job: ColumnChunkJob,
+    /// The chunk's rows, gathered from the job's chunks in row order.
+    batches: Vec<ArrayRef>,
     batch_index: usize,
     rows_consumed_from_batch: usize,
     /// One per leaf of the column, depth-first, created from the first slice.
@@ -121,18 +127,39 @@ struct LeafAccumulator {
 }
 
 impl HeldColumn {
-    fn new(job: ColumnChunkJob) -> Self {
-        debug_assert!(!job.batches.is_empty(), "a row group column has rows");
-        Self {
+    fn new(job: ColumnChunkJob, allocator: &mut SlabAllocator) -> WriteResult<Self> {
+        let batches = match job.rows.as_ref() {
+            RowGroupRows::Slices(runs) => runs
+                .iter()
+                .map(|(batch, rows)| {
+                    let chunk = &job.chunks[*batch];
+                    if rows.start == 0 && rows.end == chunk.len() {
+                        chunk.clone()
+                    } else {
+                        chunk.slice(rows.start, rows.len())
+                    }
+                })
+                .collect(),
+            RowGroupRows::Gather { mapping, rows } => {
+                vec![take_chunked(
+                    allocator,
+                    &job.chunks,
+                    &mapping[rows.clone()],
+                )?]
+            }
+        };
+        debug_assert!(!batches.is_empty(), "a row group column has rows");
+        Ok(Self {
             job,
+            batches,
             batch_index: 0,
             rows_consumed_from_batch: 0,
             leaves: Vec::new(),
-        }
+        })
     }
 
     fn is_exhausted(&self) -> bool {
-        self.batch_index == self.job.batches.len()
+        self.batch_index == self.batches.len()
     }
 
     /// Shred (if the column is shredded) and convert the next slice of at most
@@ -168,7 +195,7 @@ impl HeldColumn {
     /// Move the cursor past the next slice and return it: the rest of the
     /// current batch, capped at `row_cap` rows.
     fn next_slice(&mut self, row_cap: usize) -> ArrayRef {
-        let batch = &self.job.batches[self.batch_index];
+        let batch = &self.batches[self.batch_index];
         let rows = (batch.len() - self.rows_consumed_from_batch).min(row_cap);
         let slice = if self.rows_consumed_from_batch == 0 && rows == batch.len() {
             batch.clone()
@@ -231,7 +258,7 @@ mod tests {
     use arrow_array::{Int64Array, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields, Schema};
     use dispatch::TestOperatorIO;
-    use dispatch::memory::init_test_free_pool;
+    use dispatch::memory::{has_memory_context, init_test_free_pool};
     use dispatch::test_utils::CollectSender;
     use parquet_variant_compute::{
         ShreddedSchemaBuilder, VariantArray, json_to_variant, shred_variant,
@@ -243,6 +270,11 @@ mod tests {
     /// A job over a one-column row group of `field`, whose rows arrive as
     /// `batches`, with the column's leaves numbered from `first_leaf_index`.
     fn column_job(field: Field, batches: Vec<ArrayRef>, first_leaf_index: usize) -> ColumnChunkJob {
+        // The shredder gathers the job's rows onto slabs, so a test ring is
+        // needed even when nothing is shredded.
+        if !has_memory_context() {
+            init_test_free_pool(16);
+        }
         let leaf_count = leaves::count_leaves(&field);
         ColumnChunkJob {
             context: Arc::new(RowGroupContext {
@@ -259,7 +291,19 @@ mod tests {
             }),
             column_index: 0,
             first_leaf_index,
-            batches: batches.into(),
+            rows: Arc::new(RowGroupRows::Gather {
+                rows: 0..batches.iter().map(|batch| batch.len()).sum(),
+                mapping: Arc::new(
+                    batches
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(batch, rows)| {
+                            (0..rows.len() as u32).map(move |row| (batch as u32, row))
+                        })
+                        .collect(),
+                ),
+            }),
+            chunks: batches.into(),
             shredding: None,
             target_node: 0,
         }
@@ -343,24 +387,25 @@ mod tests {
         assert_eq!(leaf.def_levels.as_deref(), Some([1, 0, 1, 0, 1].as_slice()));
     }
 
-    /// Each turn shreds one batch, and the column's leaves go out whole once
-    /// the last batch is done.
+    /// A column's rows are gathered from however many batches hold them, so
+    /// a column that fits one record batch takes one turn whatever its
+    /// batches were, and its leaves go out whole once it is done.
     #[test]
-    fn a_shredded_column_takes_one_turn_per_batch_and_emits_its_leaves_once_done() {
+    fn a_shredded_column_gathered_from_several_batches_takes_one_turn() {
         let mut shredder = Shredder::default();
         let mut sender = CollectSender::new();
         let job = shredded_variant_job(vec![documents(0..2), documents(2..3), documents(3..5)]);
 
         let turns = drive(&mut shredder, job, &mut sender);
 
-        assert_eq!(turns, 3);
+        assert_eq!(turns, 1);
         assert!(!shredder.has_pending_work());
         let typed_id = sender
             .items
             .iter()
             .find(|leaf| leaf.path == ["attrs", "typed_value", "id", "typed_value"])
             .expect("the id leaf is one of the column's leaves");
-        assert_eq!(typed_id.value_chunks.len(), 3);
+        assert_eq!(typed_id.value_chunks.len(), 1);
         assert_eq!(present_rows(typed_id), 5);
     }
 

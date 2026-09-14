@@ -14,7 +14,9 @@ mod batch_sort;
 mod k_way_merge;
 mod keys;
 
-pub use k_way_merge::{KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput};
+pub use k_way_merge::{
+    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedMapping, MergedOutput, key_order_by,
+};
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
