@@ -210,6 +210,9 @@ rust::String lo_reset_name(const LogicalOperator &op);
 // ---- Transaction ----
 uint8_t lo_transaction_type(const LogicalOperator &op);
 
+// ---- Vacuum ----
+void lo_vacuum_validate(const LogicalOperator &op);
+
 // ---- Compact ----
 rust::String lo_compact_datastore(const LogicalOperator &op);
 rust::String lo_compact_schema(const LogicalOperator &op);

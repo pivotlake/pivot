@@ -237,13 +237,13 @@ fn vacuum_reclaims_a_dropped_tables_storage_only_after_retention() {
     drop_table(&datastore, &dispatch, drop_request("t", false)).unwrap();
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
 
-    vacuumer.vacuum_all(now_ms());
+    vacuumer.vacuum_all(now_ms()).unwrap();
     assert!(
         table_dir.exists(),
         "within the retention window the dropped table's storage is kept"
     );
 
-    vacuumer.vacuum_all(now_ms() + FIVE_HOURS_MS);
+    vacuumer.vacuum_all(now_ms() + FIVE_HOURS_MS).unwrap();
     assert!(
         !table_dir.exists(),
         "past the retention window the dropped table's storage is deleted"

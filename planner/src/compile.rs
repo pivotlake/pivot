@@ -174,6 +174,8 @@ pub enum Error {
     SetVariableNotCompilable,
     #[error("COMPACT runs as its own statement and cannot be part of a query")]
     CompactNotCompilable,
+    #[error("VACUUM runs as its own statement and cannot be part of a query")]
+    VacuumNotCompilable,
     #[error(
         "COPY FROM STDIN compiles to no dataflow; the server drives the ingest from the protocol"
     )]
@@ -367,6 +369,7 @@ impl PlanNode {
             // So is COMPACT: its sweeps drive dataflows of their own, so the
             // server runs them on the coordinator, never inside a dataflow.
             crate::Operator::Compact(_) => Err(Error::CompactNotCompilable),
+            crate::Operator::Vacuum => Err(Error::VacuumNotCompilable),
             crate::Operator::CopyFromStdin(_) => Err(Error::CopyFromStdinNotCompilable),
             // And BEGIN/COMMIT/ROLLBACK: the server answers them directly
             // without compiling anything.

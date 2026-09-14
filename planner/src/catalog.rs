@@ -278,6 +278,15 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Run one vacuum sweep of the datastore's latest state, respecting retention.
+    /// This is independent of whether background vacuum is enabled.
+    async fn vacuum(&self, _datastore: &str) -> Result<()> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support VACUUM",
+        )
+        .into())
+    }
+
     /// Resolve a `CREATE TABLE` by routing to the datastore
     /// [`CreateTableRequest::datastore_name`] names (the default when unqualified)
     /// and deferring to that datastore's own `bind_create_table`.

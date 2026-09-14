@@ -177,9 +177,9 @@ impl ShellInstance {
     ///
     /// The instance reloads its tables from the store every `refresh_interval`,
     /// the same background sweep the server runs, so data another process
-    /// commits to a shared store becomes visible to later queries. Compaction
-    /// and vacuum stay off: those belong to one owning process per datastore,
-    /// and an interactive shell over a shared store is not it. The sweep spawns
+    /// commits to a shared store becomes visible to later queries. Background
+    /// compaction and vacuum stay off: those belong to one owning process per
+    /// datastore, and a shell over a shared store is not it. The sweep spawns
     /// onto the ambient tokio runtime, so call this from within one.
     pub fn open_with_resources(
         location: &str,

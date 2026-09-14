@@ -59,6 +59,11 @@ written to disk.
 
 Results use psql's aligned layout and are written directly to the terminal.
 
+Run `VACUUM;` to wait for one cleanup sweep of the current datastore. This works
+in `pivot open` and on servers with `vacuum: false`. It removes unreferenced data
+files, superseded log files, and dropped-table storage only after their retention
+windows have elapsed. Background vacuum remains configured separately.
+
 ## Server
 
 The same executable runs a configured server in the foreground: a

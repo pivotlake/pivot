@@ -1650,6 +1650,37 @@ async fn compact_of_a_missing_table_errors(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn vacuum_runs_without_background_maintenance(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE vacuum_me (id BIGINT)")
+        .await
+        .unwrap();
+    let orphan = table_dir("vacuum_me").join("old.parquet");
+    std::fs::write(&orphan, b"orphan").unwrap();
+    File::open(&orphan)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(5 * 3600),
+            ),
+        )
+        .unwrap();
+    let port = server_port();
+
+    let messages = tokio::task::spawn_blocking(move || {
+        let mut client = common::RawConn::connect(port);
+        client.query("VACUUM;");
+        client.read_until_ready()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(common::command_tag(&messages).as_deref(), Some("VACUUM"));
+    assert!(!orphan.exists());
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn compact_accepts_a_fully_qualified_table_name(#[future] conn: Conn) {
     conn.simple_query("CREATE TABLE compact_qualified (id BIGINT)")
         .await

@@ -224,6 +224,10 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
             L::LOGICAL_TRANSACTION => Operator::Transaction(Transaction { raw: self.raw }),
             L::LOGICAL_COMPACT => Operator::Compact(Compact { raw: self.raw }),
+            L::LOGICAL_VACUUM => {
+                ffi::lo_vacuum_validate(self.raw)?;
+                Operator::Vacuum
+            }
             L::LOGICAL_COPY_FROM_STDIN => Operator::CopyFromStdin(CopyFromStdin { raw: self.raw }),
             L::LOGICAL_CREATE_USER => Operator::CreateUser(CreateUser { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
@@ -277,6 +281,8 @@ pub enum Operator<'plan> {
     Transaction(Transaction<'plan>),
     /// `COMPACT <table> [FINAL]`.
     Compact(Compact<'plan>),
+    /// `VACUUM`: one sweep of the current datastore.
+    Vacuum,
     /// `COPY <table> [(columns)] FROM STDIN [WITH (...)]`.
     CopyFromStdin(CopyFromStdin<'plan>),
     /// `CREATE USER <name> [PASSWORD '<password>']`.

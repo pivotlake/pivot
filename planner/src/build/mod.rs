@@ -206,6 +206,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             }
         }),
         DuckOperator::Compact(c) => Operator::Compact(Compact::from_handle(c)?),
+        DuckOperator::Vacuum => Operator::Vacuum,
         DuckOperator::CopyFromStdin(c) => Operator::CopyFromStdin(CopyFromStdin::from_handle(c)?),
         DuckOperator::CreateUser(c) => Operator::CreateUser(CreateUser::from_handle(c)?),
         // No view to construct from: this carries no kind-specific payload.

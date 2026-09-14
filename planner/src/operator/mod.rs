@@ -122,6 +122,8 @@ pub enum Operator {
     SetVariable(SetVariable),
     /// `COMPACT <table> [FINAL]` — handled by the server, not compiled.
     Compact(Compact),
+    /// `VACUUM`: handled by the executor without compiling a dataflow.
+    Vacuum,
     /// `COPY <table> FROM STDIN` — handled by the server, not compiled.
     CopyFromStdin(CopyFromStdin),
     /// `BEGIN`/`COMMIT`/`ROLLBACK`, answered by the server, not compiled.
@@ -209,6 +211,7 @@ impl Operator {
             | Operator::CreateUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
+            | Operator::Vacuum
             | Operator::CopyFromStdin(_)
             | Operator::Transaction(_) => Ok(Vec::new()),
         }
@@ -304,6 +307,7 @@ impl Operator {
             | Operator::CreateUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
+            | Operator::Vacuum
             | Operator::CopyFromStdin(_)
             | Operator::Transaction(_) => Vec::new(),
         }
@@ -336,6 +340,7 @@ impl fmt::Display for Operator {
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Compact(c) => write!(f, "{c}"),
+            Operator::Vacuum => f.write_str("Vacuum"),
             Operator::CopyFromStdin(c) => write!(f, "{c}"),
             Operator::Transaction(t) => write!(f, "{t}"),
             Operator::Materialize(m) => write!(f, "{m}"),

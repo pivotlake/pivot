@@ -95,7 +95,7 @@ impl Executor {
 
     /// Plan a statement without executing it and report its result shape:
     /// `Some` with the row description for statements that return rows,
-    /// `None` for those that do not (commands, SET, COMPACT, COPY FROM
+    /// `None` for those that do not (commands, SET, COMPACT, VACUUM, COPY FROM
     /// STDIN). Planning runs in its own transaction, rolled back before
     /// returning.
     pub async fn describe(&self, sql: &str) -> Result<Option<Vec<ResultColumn>>> {
@@ -112,6 +112,7 @@ impl Executor {
 
         if plan.as_set_variable().is_some()
             || plan.as_compact().is_some()
+            || plan.is_vacuum()
             || plan.as_copy_from_stdin().is_some()
             || plan.as_transaction_stmt().is_some()
         {
@@ -179,6 +180,21 @@ impl Executor {
             execute_compact(&self.catalog, transaction.as_ref(), request).await?;
             return Ok(Execution {
                 output: StatementOutput::Command(Command::Compact),
+                stats: ExecutionStats {
+                    plan: plan_time,
+                    execute: started.elapsed(),
+                    ..ExecutionStats::default()
+                },
+            });
+        }
+
+        if plan.is_vacuum() {
+            let started = Instant::now();
+            transaction
+                .vacuum(self.catalog.default_datastore_name())
+                .await?;
+            return Ok(Execution {
+                output: StatementOutput::Command(Command::Vacuum),
                 stats: ExecutionStats {
                     plan: plan_time,
                     execute: started.elapsed(),

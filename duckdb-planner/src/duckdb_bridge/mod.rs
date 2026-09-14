@@ -407,6 +407,10 @@ pub mod ffi {
         /// ROLLBACK).
         fn lo_transaction_type(op: &LogicalOperator) -> Result<u8>;
 
+        // ---- Vacuum ----
+        /// Reject table-specific vacuum and ANALYZE, which Pivot does not implement.
+        fn lo_vacuum_validate(op: &LogicalOperator) -> Result<()>;
+
         // ---- Compact ----
         /// The datastore `COMPACT db.s.t` named, or empty when unqualified.
         fn lo_compact_datastore(op: &LogicalOperator) -> Result<String>;

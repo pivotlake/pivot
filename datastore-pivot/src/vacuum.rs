@@ -37,7 +37,7 @@ use tracing::{info, warn};
 
 use planner::catalog::SchemaQualifiedTableName;
 
-use crate::{CatalogTable, PivotDatastore};
+use crate::{CatalogTable, PivotDatastore, Result};
 use object_storage::ObjectPath;
 
 /// Default cadence for re-scanning the tables for newly-expired files and
@@ -100,10 +100,10 @@ impl Vacuumer {
             let vacuumer = self.clone();
             // Store list/get/delete and the log reads are synchronous (blocking
             // HTTP for S3), so the sweep runs off the reactor.
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || vacuumer.vacuum_all(now_unix_ms())).await
-            {
-                warn!(error = %e, "vacuum sweep panicked");
+            match tokio::task::spawn_blocking(move || vacuumer.vacuum_all(now_unix_ms())).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(error = %error, "vacuum sweep failed"),
+                Err(error) => warn!(error = %error, "vacuum sweep panicked"),
             }
         }
     }
@@ -111,10 +111,15 @@ impl Vacuumer {
     /// One poll round over every table the datastore knows, evaluated against
     /// `now_ms` (threaded in so tests are deterministic -- there is no mockable
     /// clock). Public so tests and a standalone vacuumer binary can drive one
-    /// round without the loop.
-    pub fn vacuum_all(&self, now_ms: u64) {
+    /// round without the loop. Continues after individual failures and returns
+    /// the first error, so a manual sweep can report incomplete cleanup.
+    pub fn vacuum_all(&self, now_ms: u64) -> Result<()> {
+        let mut first_error = None;
         for (name, table) in self.datastore.tables() {
-            self.vacuum_table(&name, table, now_ms);
+            if let Err(error) = self.vacuum_table(&name, table, now_ms) {
+                warn!(table = %name, error = %error, "vacuum: table cleanup failed");
+                first_error.get_or_insert(error);
+            }
         }
         // Dropped tables are no longer in the live set above; their storage is
         // reclaimed off the manifest's tombstones once each retention window
@@ -124,8 +129,12 @@ impl Vacuumer {
                 info!(tables = reclaimed, "reclaimed dropped tables' storage");
             }
             Ok(_) => {}
-            Err(e) => warn!(error = %e, "vacuum: reclaiming dropped tables failed"),
+            Err(error) => {
+                warn!(error = %error, "vacuum: reclaiming dropped tables failed");
+                first_error.get_or_insert(error);
+            }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// One table's round: reload it to its latest log version (so a vacuumer on
@@ -135,12 +144,14 @@ impl Vacuumer {
     /// `deletedFileRetentionDuration`): a retired file's window runs from the
     /// tombstone the table holds for it, an orphan's from its storage mtime.
     /// Finally delete the superseded commit JSONs past the log-retention window.
-    /// Errors are logged and end the round; the next poll retries.
-    fn vacuum_table(&self, name: &SchemaQualifiedTableName, mut table: CatalogTable, now_ms: u64) {
-        if let Err(e) = table.refresh() {
-            warn!(table = %name, error = %e, "vacuum: table refresh failed");
-            return;
-        }
+    /// Failed deletions are retried by the next sweep.
+    fn vacuum_table(
+        &self,
+        name: &SchemaQualifiedTableName,
+        mut table: CatalogTable,
+        now_ms: u64,
+    ) -> Result<()> {
+        table.refresh()?;
 
         let cutoff = now_ms.saturating_sub(table.deleted_file_retention().as_millis() as u64);
 
@@ -149,14 +160,9 @@ impl Vacuumer {
         // ever adopted -- and therefore a deletion candidate.
         let live: HashSet<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
 
-        let files = match table.list_data_files() {
-            Ok(files) => files,
-            Err(e) => {
-                warn!(table = %name, error = %e, "vacuum: listing data files failed");
-                return;
-            }
-        };
+        let files = table.list_data_files()?;
         let mut deleted = 0u64;
+        let mut first_error = None;
         for (path, modified_ms) in files {
             if live.contains(&path) {
                 continue;
@@ -181,6 +187,7 @@ impl Vacuumer {
             }
             if let Err(e) = table.delete_data_file(&path) {
                 warn!(table = %name, file = %path, error = %e, "vacuum: deleting file failed");
+                first_error.get_or_insert(e);
                 continue;
             }
             deleted += 1;
@@ -198,7 +205,11 @@ impl Vacuumer {
                 info!(table = %name, log_files = cleaned, "cleaned up superseded log files");
             }
             Ok(_) => {}
-            Err(e) => warn!(table = %name, error = %e, "vacuum: log cleanup failed"),
+            Err(error) => {
+                warn!(table = %name, error = %error, "vacuum: log cleanup failed");
+                first_error.get_or_insert(error);
+            }
         }
+        first_error.map_or(Ok(()), Err)
     }
 }

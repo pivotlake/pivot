@@ -76,6 +76,7 @@ impl PlanNode {
             | Operator::CreateUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
+            | Operator::Vacuum
             | Operator::CopyFromStdin(_)
             | Operator::Transaction(_)
             | Operator::TableFunctionScan(_) => false,
@@ -389,6 +390,11 @@ impl Plan {
             Operator::Compact(compact) => Some(compact),
             _ => None,
         }
+    }
+
+    /// Whether this is a standalone `VACUUM`, run directly by the executor.
+    pub fn is_vacuum(&self) -> bool {
+        matches!(self.root.operator, Operator::Vacuum)
     }
 
     /// This plan as a `COPY ... FROM STDIN` statement, if that's what it is.
