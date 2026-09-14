@@ -29,13 +29,14 @@ mod range_cutter;
 pub use range_cutter::{DecodeRange, RangeCutterFactory};
 
 mod materializer;
-pub use materializer::MaterializerFactory;
+pub use materializer::{MaterializerFactory, RowOrder, plain_row_group_column};
 
-mod record_batch_metadata;
+pub(crate) mod record_batch_metadata;
 
 mod empty_projection_scan;
 
 mod scan;
 pub use scan::{
-    materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    materialize, materialize_in_order, table_input, table_input_with_filter,
+    table_input_with_filter_and_eq_predicates,
 };

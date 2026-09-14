@@ -21,8 +21,8 @@ use dispatch::{
 use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
     IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
-    RowGroupFetcherFactory, RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate,
-    ScanOrder, WorkerAllocator, pending_claim_bound,
+    RowGroupFetcherFactory, RowGroupInjectorFactory, RowGroupRequest, RowOrder,
+    ScanEqualityPredicate, ScanOrder, WorkerAllocator, pending_claim_bound,
 };
 
 /// Append the index → decompress → cut → decode stages onto a source of
@@ -205,6 +205,29 @@ pub fn materialize(
     table: Arc<ParquetTable>,
     projection: Projection,
 ) -> RecordBatchOperatorSpec {
+    materialize_with(spec, table, projection, None)
+}
+
+/// [`materialize`] for every row of `table` in the order `spec` delivers
+/// them: the rows\' `(row group, row)` are recorded into `order`, every
+/// touched row group is read whole, and the metadata columns stay on the
+/// decoded batches so a consumer can find each row again.
+pub fn materialize_in_order(
+    spec: RecordBatchOperatorSpec,
+    table: Arc<ParquetTable>,
+    projection: Projection,
+    order: RowOrder,
+) -> RecordBatchOperatorSpec {
+    materialize_with(spec, table, projection, Some(order))
+}
+
+fn materialize_with(
+    spec: RecordBatchOperatorSpec,
+    table: Arc<ParquetTable>,
+    projection: Projection,
+    order: Option<RowOrder>,
+) -> RecordBatchOperatorSpec {
+    let keep_metadata = order.is_some();
     let (dispatcher, mut heads) = spec.into_parts();
     let n = dispatcher.worker_count();
     let siblings_materializer = Arc::new(AtomicUsize::new(n));
@@ -230,7 +253,11 @@ pub fn materialize(
             UnaryOperatorFactory::new(
                 UnaryOperatorFactory::new(
                     heads.pop_front().unwrap(),
-                    MaterializerFactory::new(projection.clone(), table.clone()),
+                    match &order {
+                        Some(order) => MaterializerFactory::new(projection.clone(), table.clone())
+                            .recording_order(order.clone()),
+                        None => MaterializerFactory::new(projection.clone(), table.clone()),
+                    },
                     rb_ch,
                     siblings_materializer.clone(),
                 ),
@@ -245,7 +272,7 @@ pub fn materialize(
         input,
         projection,
         RECORD_BATCH_SIZE,
-        false,
+        keep_metadata,
         Arc::new(Vec::new()),
         pending_row_groups,
         // The materializer path claims by explicit row-group requests, not the

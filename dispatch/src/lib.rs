@@ -130,7 +130,8 @@ pub use operations::channels::{
 pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::unary::{
-    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, batch_sort_indices,
+    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedMapping, MergedOutput,
+    batch_sort_indices, key_order_by,
 };
 pub use operations::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot,

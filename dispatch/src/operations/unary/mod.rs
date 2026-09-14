@@ -105,8 +105,8 @@ pub(crate) use normalizer::{
 };
 pub(crate) use order_by::create_normalizing_for_workers as create_normalizing_order_by_factories;
 pub use order_by::{
-    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, OrderByFactory,
-    batch_sort_indices,
+    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedMapping, MergedOutput,
+    OrderByFactory, batch_sort_indices, key_order_by,
 };
 pub use order_by_limit::{OrderBy, OrderByLimitFactory};
 

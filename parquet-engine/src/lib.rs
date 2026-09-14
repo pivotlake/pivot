@@ -40,9 +40,9 @@ pub(crate) mod reading;
 pub use reading::{
     ColumnDecoderError, DecodeRange, DecoderFactory, DecompressorError, DecompressorFactory,
     IndexerFactory, MaterializerFactory, RangeCutterFactory, RowGroupFetcherFactory,
-    RowGroupInjectorFactory, ScanEqualityPredicate, WorkerAllocator, materialize,
-    pending_claim_bound, table_input, table_input_with_filter,
-    table_input_with_filter_and_eq_predicates,
+    RowGroupInjectorFactory, RowOrder, ScanEqualityPredicate, WorkerAllocator, materialize,
+    materialize_in_order, pending_claim_bound, plain_row_group_column, table_input,
+    table_input_with_filter, table_input_with_filter_and_eq_predicates,
 };
 
 pub mod writing;

@@ -15,7 +15,7 @@ use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use dispatch::memory::{FileBytes, Slab};
 use dispatch::{
-    Identifier, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, NodeIdOutput, OrderBy,
+    Identifier, KWayMergeTask, LocatedBatch, MergeRun, MergedMapping, NodeIdOutput, OrderBy,
     WorkerIdOutput,
 };
 
@@ -73,12 +73,24 @@ pub(crate) struct FilePlan {
     pub(crate) max_file_size: Option<usize>,
 }
 
-/// A file whose row order is final and ready for row-group planning.
+/// A file whose row order is final and ready for row-group planning: its
+/// rows are `batches` read in `rows` order. The rows are taken a column and
+/// a row group at a time, as each is encoded, never whole.
 pub(crate) struct ReadyFile {
     pub(crate) plan: FilePlan,
     pub(crate) batches: Vec<LocatedBatch>,
+    pub(crate) rows: FileRows,
     pub(crate) row_count: usize,
     pub(crate) target_node: usize,
+}
+
+/// The order a file's rows are read from its batches in.
+pub(crate) enum FileRows {
+    /// The batches as they are, one after the other.
+    InOrder,
+    /// The i-th row is row `.1` of batch `.0` of the i-th entry (see
+    /// [`MergedMapping`](dispatch::MergedMapping)).
+    Mapped(Arc<Vec<(u32, u32)>>),
 }
 
 impl NodeIdOutput for ReadyFile {
@@ -92,7 +104,11 @@ pub(crate) struct FileMergeContext {
     pub(crate) plan: FilePlan,
     pub(crate) order_by: Arc<[OrderBy]>,
     pub(crate) row_count: usize,
-    pub(crate) local_outputs: Box<[OnceLock<MergedOutput>]>,
+    /// The decoded size of the file's rows, which decides whether a merge
+    /// gathers them whole or orders them by mapping (see
+    /// [`file_merge`](super::file_merge)).
+    pub(crate) in_memory_bytes: usize,
+    pub(crate) local_outputs: Box<[OnceLock<MergedMapping>]>,
     pub(crate) nodes_remaining: AtomicUsize,
 }
 
@@ -123,7 +139,7 @@ pub(crate) enum LocalMergeJob {
     Identity {
         context: Arc<FileMergeContext>,
         node_id: usize,
-        output: MergedOutput,
+        output: MergedMapping,
     },
     Task {
         context: Arc<FileMergeContext>,
@@ -147,7 +163,7 @@ pub(crate) enum LocalMergeResult {
     Merged {
         context: Arc<FileMergeContext>,
         node_id: usize,
-        output: MergedOutput,
+        output: MergedMapping,
     },
 }
 
@@ -156,7 +172,7 @@ pub(crate) enum GlobalMergeJob {
     Ready(ReadyFile),
     Identity {
         context: Arc<FileMergeContext>,
-        output: MergedOutput,
+        output: MergedMapping,
         node_id: usize,
     },
     Task {
@@ -175,6 +191,19 @@ impl NodeIdOutput for GlobalMergeJob {
     }
 }
 
+/// Which rows of a file's batches make up one row group, in row order.
+pub(crate) enum RowGroupRows {
+    /// Runs of consecutive rows of single batches, as `(batch, rows)`: the
+    /// row group is those slices of the batches, copied nowhere.
+    Slices(Vec<(usize, std::ops::Range<usize>)>),
+    /// Rows scattered over the batches, `rows` of the file's row order, to be
+    /// gathered into a copy.
+    Gather {
+        mapping: Arc<Vec<(u32, u32)>>,
+        rows: std::ops::Range<usize>,
+    },
+}
+
 /// One top-level column of one row group, ready to be split into its primitive
 /// leaves.
 pub(crate) struct ColumnChunkJob {
@@ -183,9 +212,11 @@ pub(crate) struct ColumnChunkJob {
     /// Where this column's leaves start in the row group's depth-first leaf
     /// numbering.
     pub(crate) first_leaf_index: usize,
-    /// Array slices in row order. The shredder walks them a bounded number of
-    /// rows per step.
-    pub(crate) batches: Arc<[ArrayRef]>,
+    /// The column across every batch of the file, and which of their rows are
+    /// the row group's. The shredder takes them on receipt and walks them a
+    /// bounded number of rows per step.
+    pub(crate) chunks: Arc<[ArrayRef]>,
+    pub(crate) rows: Arc<RowGroupRows>,
     pub(crate) shredding: Option<Arc<arrow_schema::DataType>>,
     pub(crate) target_node: usize,
 }

@@ -20,7 +20,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::ArrowError;
 
 use crate::arrays::take_chunked;
@@ -137,29 +137,110 @@ impl ParallelKWayMerge {
         allocator: &mut SlabAllocator,
         slice_index: usize,
     ) -> Result<RecordBatch, ArrowError> {
+        let mapping = self.slice_mapping(slice_index)?;
+        let schema = self.batches[0].schema();
+        let columns = (0..schema.fields().len()).collect::<Vec<_>>();
+        let output_columns = self.gather_columns(allocator, &mapping, &columns)?;
+        RecordBatch::try_new(schema, output_columns)
+    }
+
+    /// The `(batch, row)` of every row of one slice, in sorted order.
+    fn slice_mapping(&self, slice_index: usize) -> Result<Vec<(u32, u32)>, ArrowError> {
         let slice = self.slices.get(slice_index).ok_or_else(|| {
             ArrowError::ComputeError(format!(
                 "k-way merge slice {slice_index} is outside a {}-slice plan",
                 self.slices.len()
             ))
         })?;
-        let mapping = with_key_ordering!(
+        Ok(with_key_ordering!(
             select_key_ordering(&self.order_by, &self.batches, &self.batches)?,
             |ordering| slice_mapping(&mut ordering, &self.run_indexes, &slice.run_rows)
-        );
-
-        let schema = self.batches[0].schema();
-        let mut output_columns = Vec::with_capacity(schema.fields().len());
-        for column_index in 0..schema.fields().len() {
-            let input_columns: Vec<ArrayRef> = self
-                .batches
-                .iter()
-                .map(|batch| batch.column(column_index).clone())
-                .collect();
-            output_columns.push(take_chunked(allocator, &input_columns, &mapping)?);
-        }
-        RecordBatch::try_new(schema, output_columns)
+        ))
     }
+
+    /// Gathers `columns` of the input batches in `mapping` order.
+    fn gather_columns(
+        &self,
+        allocator: &mut SlabAllocator,
+        mapping: &[(u32, u32)],
+        columns: &[usize],
+    ) -> Result<Vec<ArrayRef>, ArrowError> {
+        columns
+            .iter()
+            .map(|&column_index| {
+                let input_columns: Vec<ArrayRef> = self
+                    .batches
+                    .iter()
+                    .map(|batch| batch.column(column_index).clone())
+                    .collect();
+                take_chunked(allocator, &input_columns, mapping)
+            })
+            .collect()
+    }
+
+    /// One slice's sort keys in sorted order, as a batch of only the sort
+    /// columns (see [`MergedMapping::keys`]).
+    fn gather_keys(
+        &self,
+        allocator: &mut SlabAllocator,
+        mapping: &[(u32, u32)],
+    ) -> Result<RecordBatch, ArrowError> {
+        let key_columns: Vec<usize> = self.order_by.iter().map(OrderBy::column_idx).collect();
+        let columns = self.gather_columns(allocator, mapping, &key_columns)?;
+        let schema = self.batches[0].schema().project(&key_columns)?;
+        RecordBatch::try_new_with_options(
+            Arc::new(schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(mapping.len())),
+        )
+    }
+}
+
+/// A merge level's output as an order over its inputs rather than a copy of
+/// them: the i-th sorted row is row `mapping[i].1` of `batches[mapping[i].0]`.
+/// A consumer gathers the columns it needs, for the rows it needs, when it
+/// needs them, so the sorted rows are never held whole.
+///
+/// `keys` holds only the sort columns, gathered in sorted order, so that a
+/// merge level above can order this level's output without reading its rows;
+/// [`key_order_by`] names those columns for it.
+pub struct MergedMapping {
+    pub batches: Vec<RecordBatch>,
+    /// Empty when `in_order`: the batches as they are need no mapping.
+    pub mapping: Arc<Vec<(u32, u32)>>,
+    pub keys: Vec<RecordBatch>,
+    pub row_count: usize,
+    /// Whether the rows are `batches` read as they are, one after the other.
+    pub in_order: bool,
+}
+
+impl MergedMapping {
+    /// `batches` already in order: the rows are the batches one after the
+    /// other, so no mapping is built.
+    pub fn identity(order_by: &[OrderBy], batches: Vec<RecordBatch>) -> Result<Self, ArrowError> {
+        let key_columns: Vec<usize> = order_by.iter().map(OrderBy::column_idx).collect();
+        let keys = batches
+            .iter()
+            .map(|batch| batch.project(&key_columns))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            row_count: batches.iter().map(RecordBatch::num_rows).sum(),
+            batches,
+            mapping: Arc::new(Vec::new()),
+            keys,
+            in_order: true,
+        })
+    }
+}
+
+/// The sort order over a [`MergedMapping`]'s `keys`, whose columns are the
+/// sort columns in `order_by` order.
+pub fn key_order_by(order_by: &[OrderBy]) -> Arc<[OrderBy]> {
+    order_by
+        .iter()
+        .enumerate()
+        .map(|(column, order)| OrderBy::new(column, order.descending(), order.nulls_first()))
+        .collect()
 }
 
 /// One input run and the NUMA node holding its batches.
@@ -302,6 +383,7 @@ impl KWayMergePlan {
         let slice_count = plan.slice_count();
         let stage = Arc::new(KWayMergeStage {
             output: (0..slice_count).map(|_| OnceLock::new()).collect(),
+            mapped: (0..slice_count).map(|_| OnceLock::new()).collect(),
             remaining: AtomicUsize::new(slice_count),
             plan,
         });
@@ -344,6 +426,9 @@ fn runs_concatenate_in_order(order_by: &[OrderBy], runs: &[MergeRun]) -> Result<
 struct KWayMergeStage {
     plan: ParallelKWayMerge,
     output: Box<[OnceLock<LocatedBatch>]>,
+    /// Each slice's sorted `(batch, row)`s and gathered keys, for
+    /// [`KWayMergeTask::execute_mapping`]; a stage is driven one way or the other.
+    mapped: Box<[OnceLock<(Vec<(u32, u32)>, RecordBatch)>]>,
     remaining: AtomicUsize,
 }
 
@@ -380,6 +465,42 @@ impl KWayMergeTask {
         Ok(Some(MergedOutput {
             batches,
             row_count: self.stage.plan.row_count(),
+        }))
+    }
+}
+
+impl KWayMergeTask {
+    /// Like [`execute`](Self::execute), but the level's output is the sorted
+    /// order over its inputs and their keys, not a copy of the rows.
+    pub fn execute_mapping(
+        self,
+        allocator: &mut SlabAllocator,
+    ) -> Result<Option<MergedMapping>, ArrowError> {
+        let mapping = self.stage.plan.slice_mapping(self.slice_index)?;
+        let keys = self.stage.plan.gather_keys(allocator, &mapping)?;
+        self.stage.mapped[self.slice_index]
+            .set((mapping, keys))
+            .unwrap_or_else(|_| panic!("merge slice {} executed twice", self.slice_index));
+        if self.stage.remaining.fetch_sub(1, AtomicOrdering::AcqRel) != 1 {
+            return Ok(None);
+        }
+
+        let row_count = self.stage.plan.row_count();
+        let mut mapping = Vec::with_capacity(row_count);
+        let mut keys = Vec::with_capacity(self.stage.mapped.len());
+        for slice in self.stage.mapped.iter() {
+            let (slice_mapping, slice_keys) = slice
+                .get()
+                .expect("the final merge task observes every output slice");
+            mapping.extend_from_slice(slice_mapping);
+            keys.push(slice_keys.clone());
+        }
+        Ok(Some(MergedMapping {
+            batches: self.stage.plan.batches.clone(),
+            mapping: Arc::new(mapping),
+            keys,
+            row_count,
+            in_order: false,
         }))
     }
 }

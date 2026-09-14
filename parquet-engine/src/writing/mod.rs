@@ -56,6 +56,7 @@ pub(crate) mod error;
 mod file_collector;
 mod file_merge;
 mod leaves;
+mod materialized_file;
 mod partition_sorter;
 mod presorted_run;
 mod row_group_planner;
@@ -73,8 +74,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use dispatch::memory::SlabAllocator;
 use dispatch::{
-    DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy, RecordBatchOperatorSpec,
-    node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, to_single_worker_mpsc,
+    DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy, Projection,
+    RecordBatchOperatorSpec, node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable,
+    to_single_worker_mpsc,
 };
 
 use partition_sorter::{PartitionSorterFactory, SortedPartitionRun};
@@ -182,6 +184,54 @@ pub fn encode_compaction_batches_spec(
     encode_files_spec(files)
 }
 
+/// Compaction over a sort key with the rows fetched after the sort: `keys`
+/// scans only the sort columns, with the row-group and row-index metadata
+/// columns, so the sort moves a few bytes per row; the sorted order is then
+/// materialized by reading every input row group whole, and the file is laid
+/// out from those rows in the recorded order. The sort never holds a wide
+/// row, so the only copy of the rows is the decoded input.
+pub fn encode_sorted_by_keys_spec(
+    keys: RecordBatchOperatorSpec,
+    table: Arc<crate::ParquetTable>,
+    schema: SchemaRef,
+    partition: Option<crate::PartitionValues>,
+    sort_column_count: usize,
+    target_rows_per_group: usize,
+    max_file_size: usize,
+) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
+    let order_by: Vec<OrderBy> = (0..sort_column_count)
+        .map(|column| OrderBy::new(column, false, true))
+        .collect();
+    let sorted = keys
+        .project(|| crate::plain_row_group_column)
+        .order_by(order_by);
+    let order: crate::RowOrder = Arc::new(std::sync::OnceLock::new());
+    let rows = crate::materialize_in_order(
+        sorted,
+        table,
+        Projection::all(schema.fields().len()),
+        order.clone(),
+    );
+    let rows = unshred_batches_spec(rows);
+    let (dispatcher, heads) = rows.into_parts();
+    let worker_count = heads.len();
+    let collector_worker = dispatcher.next_worker();
+    let topology = dispatcher.topology();
+    let files = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>()).chain(
+        to_single_worker_mpsc::<RecordBatch>(worker_count, collector_worker)
+            .into_iter()
+            .collect(),
+        materialized_file::factories(
+            order,
+            partition,
+            target_rows_per_group,
+            max_file_size,
+            topology,
+        ),
+    );
+    encode_ready_files_spec(files)
+}
+
 pub fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
     spec.project(|| {
         // Built on the first batch rather than here: `SlabAllocator::new` takes
@@ -219,7 +269,7 @@ where
 {
     let worker_count = files.dispatcher().worker_count();
     let topology = files.dispatcher().topology();
-    files
+    let ready = files
         .chain(
             node_work_queue::<FileOrderInput>(topology)
                 .into_iter()
@@ -245,7 +295,21 @@ where
             DefaultUnaryFactory::<file_merge::GlobalMergeExecutor>::create_for_workers(
                 worker_count,
             ),
-        )
+        );
+    encode_ready_files_spec(ready)
+}
+
+/// The tail every write shares once a file\'s row order is final: divide it
+/// into row groups, shred and encode the columns, assemble the bytes.
+fn encode_ready_files_spec<OF>(
+    ready: OperatorSpec<ReadyFile, OF>,
+) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static>
+where
+    OF: OperatorFactory<ReadyFile> + 'static,
+{
+    let worker_count = ready.dispatcher().worker_count();
+    let topology = ready.dispatcher().topology();
+    ready
         .chain(
             node_work_queue::<ReadyFile>(topology).into_iter().collect(),
             row_group_planner::factories(topology),
