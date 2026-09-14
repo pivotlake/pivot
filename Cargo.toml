@@ -4,6 +4,7 @@ members = [
     "benchmarks",
     "bin",
     "catalog",
+    "datastore-iceberg",
     "datastore-pivot",
     "dispatch",
     "duckdb-planner",
@@ -24,6 +25,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # Sibling crates.
 catalog = { path = "catalog" }
+datastore-iceberg = { path = "datastore-iceberg" }
 datastore-pivot = { path = "datastore-pivot" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }

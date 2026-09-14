@@ -92,18 +92,18 @@ jobs:
           workspaces: .
 
       # The datastore-pivot/bin object-store tests bring up MinIO + fake-gcs-server
-      # via testcontainers. Cache the image tarballs (keyed on the pinned tags)
+      # via testcontainers, and the datastore-iceberg tests MinIO + the REST fixture. Cache the image tarballs (keyed on the pinned tags)
       # and docker-load them, so a cache hit never pulls from Docker Hub — faster
       # and free of anonymous pull rate limits. On a miss (first run, or a tag
       # bump) we pull once and save for next time.
       - name: Cache object-store test images
-        if: matrix.check == 'test' && (matrix.crate == 'datastore-pivot' || matrix.crate == 'bin')
+        if: matrix.check == 'test' && (matrix.crate == 'datastore-pivot' || matrix.crate == 'datastore-iceberg' || matrix.crate == 'bin')
         uses: actions/cache@v4
         with:
           path: ~/docker-images
           key: docker-images-${{ hashFiles('.github/docker-images.txt') }}
       - name: Load or pull object-store test images
-        if: matrix.check == 'test' && (matrix.crate == 'datastore-pivot' || matrix.crate == 'bin')
+        if: matrix.check == 'test' && (matrix.crate == 'datastore-pivot' || matrix.crate == 'datastore-iceberg' || matrix.crate == 'bin')
         run: |
           mkdir -p ~/docker-images
           grep -v '^[[:space:]]*#' .github/docker-images.txt | grep -v '^[[:space:]]*$' | while read -r image; do

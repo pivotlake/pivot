@@ -19,23 +19,32 @@
 //! is the operator's, and the metastore file is the server's own to rewrite
 //! (which is exactly serialising its section back out).
 //!
-//! `kind` selects the datastore implementation (only `pivot` today). The storage backend is
-//! chosen from `location`: a plain path (or `file://`) opens a local store, an
-//! `s3://` URI opens an S3 store, a `gs://` URI opens a Google Cloud Storage
-//! store. A datastore carries no credentials of its own; they come from the
-//! `secrets` section below.
+//! `kind` selects the datastore implementation: `pivot`, or `iceberg` for the
+//! read-only tables of an Iceberg REST catalog. A `pivot` datastore's storage
+//! backend is chosen from `location`: a plain path (or `file://`) opens a local
+//! store, an `s3://` URI opens an S3 store, a `gs://` URI opens a Google Cloud
+//! Storage store. An `iceberg` datastore names its catalog by `uri` (and
+//! `warehouse`, when the catalog serves several), names the `iceberg` secret it
+//! authenticates to the catalog with by `secret`, and reads the tables' files
+//! from wherever the catalog says they are; it asks the catalog what it holds
+//! on the same refresh interval a `pivot` datastore rereads its store on. A
+//! datastore carries no credentials
+//! of its own; they come from the `secrets` section below, storage secrets
+//! matched to the files' locations and catalog secrets named by the datastore.
 //!
 //! Exactly one datastore must set `default = true`; it becomes the current
 //! database, so unqualified table names and DDL resolve against it. Its name is
 //! free (it need not be called `default`).
 //!
-//! Each entry under `secrets` holds the credentials for the paths its `scope`
-//! covers, so a bucket's keys are written once however many datastores sit in
-//! it. `type` names the backend (`s3` or `gcs`) and carries that backend's
-//! fields. The most specific scope covering a location authenticates it; two
-//! secrets may not claim the same scope, so which one that is never depends on
-//! the order they were written in. A secret with no `scope` covers every
-//! location of its type.
+//! Each storage entry under `secrets` holds the credentials for the paths its
+//! `scope` covers, so a bucket's keys are written once however many datastores
+//! sit in it. `type` names the backend (`s3` or `gcs`) and carries that
+//! backend's fields. The most specific scope covering a location authenticates
+//! it; two secrets may not claim the same scope, so which one that is never
+//! depends on the order they were written in. A secret with no `scope` covers
+//! every location of its type. An `iceberg` secret has no scope: it carries a
+//! catalog's `token` or OAuth2 `credential`, and the datastore over that
+//! catalog names it.
 //!
 //! ```yaml
 //! metastore:
@@ -51,7 +60,15 @@
 //!     cold:
 //!       kind: pivot
 //!       location: gs://my-bucket/pivot/
+//!     lake:
+//!       kind: iceberg
+//!       uri: https://catalog.example.com/api
+//!       warehouse: s3://my-bucket/warehouse/
+//!       secret: lake-catalog          # omit for a catalog needing no auth
 //!   secrets:
+//!     lake-catalog:
+//!       type: iceberg
+//!       credential: client-id:client-secret
 //!     my-bucket:
 //!       type: s3
 //!       scope: s3://my-bucket/       # omit to cover every s3:// location
@@ -117,6 +134,7 @@ use catalog::metastore::{
     DEFAULT_USER_NAME, Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth,
     format_scram_verifier, parse_scram_verifier,
 };
+use datastore_iceberg::{IcebergCatalogAuth, IcebergCatalogConfig, IcebergDatastore};
 use datastore_pivot::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
     DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, MaintenanceConfig,
@@ -274,16 +292,23 @@ impl DiskMetastore {
             .iter()
             .chain(metastore_config.datastores.iter())
             .map(|(name, config)| {
-                let store = config.open_store(name, &self.secrets)?;
-                let maintenance = MaintenanceConfig {
-                    refresh_interval: self.refresh_interval,
-                    compaction: config.compaction(),
-                    vacuum: config.vacuum(),
-                };
-                let datastore: Arc<dyn Datastore> = match config.kind {
-                    DatastoreKind::Pivot => {
+                let datastore: Arc<dyn Datastore> = match config {
+                    DatastoreConfig::Pivot(config) => {
+                        let store = config.open_store(name, &self.secrets)?;
+                        let maintenance = MaintenanceConfig {
+                            refresh_interval: self.refresh_interval,
+                            compaction: config.compaction(),
+                            vacuum: config.vacuum(),
+                        };
                         PivotDatastore::from_store(store, dispatcher, Some(maintenance))?
                     }
+                    DatastoreConfig::Iceberg(config) => IcebergDatastore::open(
+                        name,
+                        &config.catalog_config(name, &self.secrets)?,
+                        self.external_store_factory(),
+                        dispatcher,
+                        self.refresh_interval,
+                    )?,
                 };
                 Ok((name.clone(), datastore))
             })
@@ -324,7 +349,7 @@ fn find_default_datastore(
         .datastores
         .iter()
         .chain(metastore_config.datastores.iter())
-        .filter(|(_, datastore)| datastore.is_default)
+        .filter(|(_, datastore)| datastore.is_default())
         .map(|(name, _)| name.clone())
         .collect();
     if defaults.len() > 1 {
@@ -447,6 +472,10 @@ pub enum Error {
         scope: String,
         expected: &'static str,
     },
+    #[error("secret `{name}`: an iceberg secret carries exactly one of `token` and `credential`")]
+    IcebergSecretCredential { name: String },
+    #[error("datastore `{datastore}` names secret `{secret}`, which is not an iceberg secret")]
+    UnknownIcebergSecret { datastore: String, secret: String },
     #[error("user `{name}` already exists")]
     UserExists { name: String },
     #[error("creating a user requires a metastore file; start the server with --metastore-file")]
@@ -463,6 +492,8 @@ pub enum Error {
     Store(#[from] object_storage::StoreError),
     #[error(transparent)]
     Pivot(#[from] datastore_pivot::Error),
+    #[error(transparent)]
+    Iceberg(#[from] datastore_iceberg::Error),
 }
 
 /// The datastores and users of a metastore, as written: the config file's
@@ -571,14 +602,83 @@ enum UserAuthConfig {
     ScramSha256 { verifier: String },
 }
 
-/// One datastore's configuration. `kind` is the datastore format; the storage
-/// backend (local filesystem, S3, GCS) is inferred from `location`'s scheme,
-/// and the credentials a remote one is opened with come from the secret scoped
-/// to that location rather than from the datastore itself.
+/// One datastore's configuration, by `kind`: the datastore implementation,
+/// which decides what else the entry says. Adding an implementation is a new
+/// variant plus its arm in [`build_datastores`](DiskMetastore::build_datastores).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DatastoreConfig {
+    Pivot(PivotDatastoreConfig),
+    Iceberg(IcebergDatastoreConfig),
+}
+
+impl DatastoreConfig {
+    /// Whether the entry is flagged as the default datastore.
+    fn is_default(&self) -> bool {
+        match self {
+            DatastoreConfig::Pivot(config) => config.is_default,
+            DatastoreConfig::Iceberg(config) => config.is_default,
+        }
+    }
+}
+
+/// The read-only tables of an Iceberg REST catalog. The catalog is named by
+/// `uri` and authenticated to with the `iceberg` secret `secret` names, when it
+/// requires one; the tables' files are read from the locations the catalog
+/// reports, with the credentials the catalog vends or those of the storage
+/// secret scoped to each location.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct DatastoreConfig {
-    kind: DatastoreKind,
+struct IcebergDatastoreConfig {
+    /// The catalog's base URI, such as `https://catalog.example.com/api`.
+    uri: String,
+    /// The warehouse to serve, when the catalog serves several.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warehouse: Option<String>,
+    /// The `iceberg` secret the catalog is authenticated to with. Omitted for
+    /// a catalog that requires none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
+    /// Further REST client properties, passed through as written.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    properties: HashMap<String, String>,
+    /// Marks this datastore as the default: the current database, the target of
+    /// unqualified table names. Exactly one datastore must set it.
+    #[serde(rename = "default", default)]
+    is_default: bool,
+}
+
+impl IcebergDatastoreConfig {
+    /// What the catalog is authenticated to with: the secret `secret` names,
+    /// resolved for the datastore `datastore`.
+    fn catalog_auth(
+        &self,
+        datastore: &str,
+        secrets: &Secrets,
+    ) -> Result<Option<IcebergCatalogAuth>> {
+        self.secret
+            .as_deref()
+            .map(|secret| secrets.find_iceberg_secret(datastore, secret))
+            .transpose()
+    }
+
+    fn catalog_config(&self, datastore: &str, secrets: &Secrets) -> Result<IcebergCatalogConfig> {
+        Ok(IcebergCatalogConfig {
+            uri: self.uri.clone(),
+            warehouse: self.warehouse.clone(),
+            auth: self.catalog_auth(datastore, secrets)?,
+            properties: self.properties.clone(),
+        })
+    }
+}
+
+/// A Pivot datastore. The storage backend (local filesystem, S3, GCS) is
+/// inferred from `location`'s scheme, and the credentials a remote one is
+/// opened with come from the secret scoped to that location rather than from
+/// the datastore itself.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PivotDatastoreConfig {
     location: String,
     /// Marks this datastore as the default: the current database, the target of
     /// unqualified table names and DDL. Exactly one datastore must set it.
@@ -624,7 +724,7 @@ fn default_true() -> bool {
     true
 }
 
-impl DatastoreConfig {
+impl PivotDatastoreConfig {
     /// This datastore's compaction settings, or `None` when `compact` is off.
     /// Fills the tuning fields' defaults.
     fn compaction(&self) -> Option<CompactionConfig> {
@@ -663,16 +763,7 @@ impl DatastoreConfig {
     }
 }
 
-/// The datastore implementation. Only [`Pivot`](Self::Pivot) is supported today; adding
-/// another (Iceberg, ...) is a new variant plus its arm in
-/// [`build_datastores`](DiskMetastore::build_datastores).
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DatastoreKind {
-    Pivot,
-}
-
-impl DatastoreConfig {
+impl PivotDatastoreConfig {
     /// Build this datastore's object store. The backend is chosen from
     /// `location`: an `s3://` (or `s3a://`) URI opens an S3 store, a `gs://`
     /// URI a Google Cloud Storage store, and a path with no scheme (or a
@@ -750,11 +841,19 @@ mod tests {
     }
 
     /// A datastore's definition, whichever config holds it.
-    fn datastore(store: &DiskMetastore, name: &str) -> DatastoreConfig {
+    fn datastore_config(store: &DiskMetastore, name: &str) -> DatastoreConfig {
         if let Some(datastore) = store.server_config.datastores.get(name) {
             return datastore.clone();
         }
         store.metastore_config.read().unwrap().datastores[name].clone()
+    }
+
+    /// A Pivot datastore's definition, whichever config holds it.
+    fn datastore(store: &DiskMetastore, name: &str) -> PivotDatastoreConfig {
+        match datastore_config(store, name) {
+            DatastoreConfig::Pivot(config) => config,
+            DatastoreConfig::Iceberg(_) => panic!("datastore `{name}` is not a pivot datastore"),
+        }
     }
 
     /// Open a config `section` merged with a metastore file holding `disk`,
@@ -914,13 +1013,206 @@ datastores:
         let yaml = r#"
 datastores:
   default:
-    kind: iceberg
+    kind: hive
     location: /tmp/default
 "#;
 
         let result = from_yaml(yaml);
 
         assert!(matches!(result, Err(Error::Parse { .. })));
+    }
+
+    #[test]
+    fn an_iceberg_datastore_names_its_catalog_and_the_secret_it_authenticates_with() {
+        let yaml = r#"
+datastores:
+  hot:
+    kind: pivot
+    location: /tmp/hot
+  lake:
+    kind: iceberg
+    uri: https://catalog.example.com/api
+    warehouse: s3://lake/warehouse
+    secret: lake-catalog
+    properties:
+      header.X-Iceberg-Access-Delegation: none
+    default: true
+secrets:
+  lake-catalog:
+    type: iceberg
+    credential: client:secret
+    oauth2_scope: PRINCIPAL_ROLE:ALL
+"#;
+
+        let store = from_yaml(yaml).unwrap();
+
+        let DatastoreConfig::Iceberg(lake) = datastore_config(&store, "lake") else {
+            panic!("lake is an iceberg datastore");
+        };
+        let catalog = lake.catalog_config("lake", &store.secrets).unwrap();
+        assert_eq!(catalog.uri, "https://catalog.example.com/api");
+        assert_eq!(catalog.warehouse.as_deref(), Some("s3://lake/warehouse"));
+        assert!(matches!(
+            catalog.auth,
+            Some(IcebergCatalogAuth::OAuth2 { ref credential, ref scope, server_uri: None })
+                if credential == "client:secret" && scope.as_deref() == Some("PRINCIPAL_ROLE:ALL")
+        ));
+        assert_eq!(
+            catalog.properties["header.X-Iceberg-Access-Delegation"],
+            "none"
+        );
+        assert_eq!(store.default_datastore_name(), "lake");
+    }
+
+    #[test]
+    fn an_iceberg_secret_may_carry_a_bearer_token() {
+        let yaml = r#"
+datastores:
+  lake:
+    kind: iceberg
+    uri: https://catalog.example.com/api
+    secret: lake-catalog
+    default: true
+secrets:
+  lake-catalog:
+    type: iceberg
+    token: bearer-token
+"#;
+
+        let store = from_yaml(yaml).unwrap();
+
+        let DatastoreConfig::Iceberg(lake) = datastore_config(&store, "lake") else {
+            panic!("lake is an iceberg datastore");
+        };
+        let catalog = lake.catalog_config("lake", &store.secrets).unwrap();
+        assert!(matches!(
+            catalog.auth,
+            Some(IcebergCatalogAuth::Token(ref token)) if token == "bearer-token"
+        ));
+    }
+
+    #[test]
+    fn an_iceberg_datastore_without_a_secret_authenticates_with_nothing() {
+        let yaml = r#"
+datastores:
+  lake:
+    kind: iceberg
+    uri: http://localhost:8181
+    default: true
+"#;
+
+        let store = from_yaml(yaml).unwrap();
+
+        let DatastoreConfig::Iceberg(lake) = datastore_config(&store, "lake") else {
+            panic!("lake is an iceberg datastore");
+        };
+        let catalog = lake.catalog_config("lake", &store.secrets).unwrap();
+        assert!(catalog.auth.is_none());
+    }
+
+    #[test]
+    fn an_iceberg_datastore_naming_a_secret_that_is_not_an_iceberg_secret_is_rejected() {
+        let yaml = r#"
+datastores:
+  lake:
+    kind: iceberg
+    uri: https://catalog.example.com/api
+    secret: lake-bucket
+    default: true
+secrets:
+  lake-bucket:
+    type: s3
+    scope: s3://lake/
+    access_key_id: AKIA
+    secret_access_key: secret
+"#;
+
+        let store = from_yaml(yaml).unwrap();
+
+        let DatastoreConfig::Iceberg(lake) = datastore_config(&store, "lake") else {
+            panic!("lake is an iceberg datastore");
+        };
+        let error = lake.catalog_config("lake", &store.secrets).err().unwrap();
+        assert!(
+            matches!(&error, Error::UnknownIcebergSecret { datastore, secret }
+                if datastore == "lake" && secret == "lake-bucket"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_iceberg_secret_carries_a_token_or_a_credential_but_not_both() {
+        let yaml = r#"
+datastores:
+  lake:
+    kind: iceberg
+    uri: https://catalog.example.com/api
+    secret: lake-catalog
+    default: true
+secrets:
+  lake-catalog:
+    type: iceberg
+    token: t
+    credential: c
+"#;
+
+        let error = from_yaml(yaml).err().unwrap();
+
+        assert!(
+            matches!(&error, Error::IcebergSecretCredential { name } if name == "lake-catalog"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_iceberg_secret_takes_no_scope() {
+        let yaml = r#"
+datastores:
+  lake:
+    kind: iceberg
+    uri: https://catalog.example.com/api
+    secret: lake-catalog
+    default: true
+secrets:
+  lake-catalog:
+    type: iceberg
+    token: t
+    scope: https://catalog.example.com/
+"#;
+
+        let error = from_yaml(yaml).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn an_iceberg_datastore_takes_no_pivot_settings() {
+        let yaml = r#"
+datastores:
+  lake:
+    kind: iceberg
+    uri: https://catalog.example.com/api
+    location: /tmp/lake
+    default: true
+"#;
+
+        let error = from_yaml(yaml).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn an_iceberg_datastore_requires_a_catalog_uri() {
+        let yaml = r#"
+datastores:
+  lake:
+    kind: iceberg
+    default: true
+"#;
+
+        let error = from_yaml(yaml).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
     }
 
     #[test]

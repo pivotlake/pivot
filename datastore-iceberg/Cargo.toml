@@ -1,0 +1,45 @@
+[package]
+name = "datastore-iceberg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A read-only Iceberg datastore: tables of a REST catalog, read through Pivot's Parquet engine and object caches."
+
+[dependencies]
+planner = { workspace = true }
+catalog = { workspace = true }
+dispatch = { workspace = true }
+object-storage = { workspace = true }
+parquet-engine = { workspace = true }
+arrow-array = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
+tracing = { workspace = true }
+# The REST catalog client is async: catalog calls block on the ambient runtime
+# from the blocking pool, or on a runtime of this crate's own when there is
+# none; the background refresh is a timer task on the ambient runtime.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+# Spec types (table metadata, manifest lists, manifests, schemas) and the REST
+# catalog client. The catalog's own storage layer is never used: every file is
+# read through Pivot's ring and caches.
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+# The REST client's reqwest carries no TLS backend of its own; a catalog behind
+# https needs one.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+# The integration tests stand up a real REST catalog (apache/iceberg-rest-fixture)
+# in Docker, backed by the MinIO the object-storage harness starts, and write
+# tables into it through the iceberg crate's own writer and S3 storage.
+object-storage = { workspace = true, features = ["test-support"] }
+iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3"] }
+testcontainers = { version = "0.24", features = ["blocking"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+parquet = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+ureq = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+url = { workspace = true }
