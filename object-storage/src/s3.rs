@@ -5,9 +5,10 @@
 //! endpoints that do not require authentication.
 //!
 //! Credentials come from one of two places. [`S3Store::with_env_credentials`]
-//! reads them from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`;
-//! optional region from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
-//! `AWS_ENDPOINT_URL` selects a path-style S3-compatible endpoint like MinIO).
+//! reads them from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+//! and `AWS_SESSION_TOKEN` when the keys are an STS session's; optional region
+//! from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional `AWS_ENDPOINT_URL`
+//! selects a path-style S3-compatible endpoint like MinIO).
 //! [`S3Store::with_credentials`] takes them explicitly, so a metastore can supply
 //! a datastore's own key/secret/region/endpoint rather than relying on whatever
 //! the process was started with.
@@ -41,10 +42,8 @@ pub struct S3Store {
     /// In-bucket prefix under which this datastore's keys live.
     prefix: String,
     region: String,
-    /// Both keys are present for signed access and both are absent for
-    /// anonymous access. Constructors preserve that invariant.
-    access_key: Option<String>,
-    secret_key: Option<String>,
+    /// What requests are signed with; `None` for anonymous access.
+    keys: Option<S3Keys>,
     /// The path-style endpoint override this store was opened with, if any.
     endpoint: Option<String>,
     /// Base origin, e.g. `https://bucket.s3.us-east-1.amazonaws.com` (virtual
@@ -62,11 +61,45 @@ pub struct S3Credentials {
     /// Optional signing region. When not set, it is discovered with an
     /// unsigned `HeadBucket` request before the store is opened.
     pub region: Option<String>,
-    pub access_key: String,
-    pub secret_key: String,
+    pub keys: S3Keys,
     /// A path-style S3-compatible endpoint (e.g. MinIO). `None` uses AWS
     /// virtual-hosted style.
     pub endpoint: Option<String>,
+}
+
+/// The keys a store signs with: a long-lived pair, or an STS session's pair
+/// with the token every request signed by it must carry.
+#[derive(Clone)]
+pub struct S3Keys {
+    pub access_key: String,
+    pub secret_key: String,
+    /// The session token that accompanies an STS session's keys (temporary
+    /// credentials from an assumed role, or vended by a catalog). `None` for
+    /// long-lived keys.
+    pub session_token: Option<String>,
+}
+
+/// Redacted: the keys must not leak into a log through a `{:?}` of the store
+/// or the connection that holds them.
+impl std::fmt::Debug for S3Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("S3Keys(redacted)")
+    }
+}
+
+impl S3Keys {
+    /// The credentials the SigV4 signer signs as. `Static` is the SDK's own name
+    /// for keys handed over directly rather than resolved by a credentials
+    /// provider; a session token rides along as `x-amz-security-token`.
+    fn credentials(&self) -> Credentials {
+        Credentials::new(
+            &self.access_key,
+            &self.secret_key,
+            self.session_token.clone(),
+            None,
+            "Static",
+        )
+    }
 }
 
 impl S3Store {
@@ -77,14 +110,12 @@ impl S3Store {
         let (bucket, prefix) = parse_s3_uri(uri)?;
 
         let region = env_any(&["AWS_REGION", "AWS_DEFAULT_REGION"]);
-        let (access_key, secret_key) = env_credentials()?;
         Self::build(
             uri,
             bucket,
             prefix,
             region,
-            access_key,
-            secret_key,
+            env_credentials()?,
             std::env::var("AWS_ENDPOINT_URL").ok(),
         )
     }
@@ -95,7 +126,7 @@ impl S3Store {
     /// location to be read.
     pub fn anonymous(uri: &str) -> Result<Self> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
-        Self::build(uri, bucket, prefix, None, None, None, None)
+        Self::build(uri, bucket, prefix, None, None, None)
     }
 
     /// Open anonymously with explicit connection parameters. Useful for an
@@ -106,20 +137,12 @@ impl S3Store {
         endpoint: Option<String>,
     ) -> Result<Self> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
-        Self::build(
-            uri,
-            bucket,
-            prefix,
-            Some(region.into()),
-            None,
-            None,
-            endpoint,
-        )
+        Self::build(uri, bucket, prefix, Some(region.into()), None, endpoint)
     }
 
     /// Whether this store sends S3 requests without SigV4 authentication.
     pub fn is_anonymous(&self) -> bool {
-        self.access_key.is_none()
+        self.keys.is_none()
     }
 
     /// Parse `s3://bucket/prefix` but take credentials/region/endpoint from
@@ -132,8 +155,7 @@ impl S3Store {
             bucket,
             prefix,
             credentials.region,
-            Some(credentials.access_key),
-            Some(credentials.secret_key),
+            Some(credentials.keys),
             credentials.endpoint,
         )
     }
@@ -146,8 +168,7 @@ impl S3Store {
         bucket: &str,
         prefix: &str,
         region: Option<String>,
-        access_key: Option<String>,
-        secret_key: Option<String>,
+        keys: Option<S3Keys>,
         endpoint: Option<String>,
     ) -> Result<Self> {
         let agent = ureq::AgentBuilder::new().build();
@@ -180,8 +201,7 @@ impl S3Store {
             uri: uri.to_string(),
             prefix: prefix.to_string(),
             region,
-            access_key,
-            secret_key,
+            keys,
             endpoint,
             base,
             host,
@@ -204,16 +224,10 @@ impl S3Store {
         extra_headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Vec<(String, String)>> {
-        let (access_key, secret_key) = match (&self.access_key, &self.secret_key) {
-            (Some(access_key), Some(secret_key)) => (access_key, secret_key),
-            (None, None) => return Ok(Vec::new()),
-            _ => unreachable!("S3 credentials are either both present or both absent"),
+        let Some(keys) = &self.keys else {
+            return Ok(Vec::new());
         };
-        // Long-lived keys only, so neither a session token nor an expiry.
-        // `Static` is the SDK's own name for keys handed over directly rather
-        // than resolved by a credentials provider.
-        let creds = Credentials::new(access_key, secret_key, None, None, "Static");
-        let identity = creds.into();
+        let identity = keys.credentials().into();
 
         let mut settings = SigningSettings::default();
         settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
@@ -280,13 +294,9 @@ impl ObjectStore for S3Store {
         StoreConnection::S3 {
             uri: self.uri.clone(),
             region: self.region.clone(),
-            credentials: self.access_key.as_ref().map(|access_key| S3Credentials {
+            credentials: self.keys.as_ref().map(|keys| S3Credentials {
                 region: Some(self.region.clone()),
-                access_key: access_key.clone(),
-                secret_key: self
-                    .secret_key
-                    .clone()
-                    .expect("an access key always has a matching secret key"),
+                keys: keys.clone(),
                 endpoint: self.endpoint.clone(),
             }),
             endpoint: self.endpoint.clone(),
@@ -505,20 +515,11 @@ impl S3Store {
     fn presign(&self, method: &str, key: &ObjectPath) -> Result<url::Url> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
-        let (access_key, secret_key) = match (&self.access_key, &self.secret_key) {
-            (Some(access_key), Some(secret_key)) => (access_key, secret_key),
-            (None, None) => {
-                return url::Url::parse(&url)
-                    .map_err(|e| StoreError::Http(format!("parsing anonymous S3 url: {e}")));
-            }
-            _ => unreachable!("S3 credentials are either both present or both absent"),
+        let Some(keys) = &self.keys else {
+            return url::Url::parse(&url)
+                .map_err(|e| StoreError::Http(format!("parsing anonymous S3 url: {e}")));
         };
-
-        // Long-lived keys only, so neither a session token nor an expiry.
-        // `Static` is the SDK's own name for keys handed over directly rather
-        // than resolved by a credentials provider.
-        let creds = Credentials::new(access_key, secret_key, None, None, "Static");
-        let identity = creds.into();
+        let identity = keys.credentials().into();
 
         let mut settings = SigningSettings::default();
         settings.signature_location = SignatureLocation::QueryParams;
@@ -636,13 +637,19 @@ fn env_any(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| std::env::var(k).ok())
 }
 
-fn env_credentials() -> Result<(Option<String>, Option<String>)> {
+/// The keys the environment carries, or `None` for anonymous access. A
+/// session token without keys is meaningless and is ignored with them absent.
+fn env_credentials() -> Result<Option<S3Keys>> {
     match (
         std::env::var("AWS_ACCESS_KEY_ID").ok(),
         std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
     ) {
-        (Some(access_key), Some(secret_key)) => Ok((Some(access_key), Some(secret_key))),
-        (None, None) => Ok((None, None)),
+        (Some(access_key), Some(secret_key)) => Ok(Some(S3Keys {
+            access_key,
+            secret_key,
+            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+        })),
+        (None, None) => Ok(None),
         _ => Err(StoreError::Config(
             "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together".to_string(),
         )),
@@ -721,8 +728,11 @@ mod tests {
             "s3://private-bucket/root",
             S3Credentials {
                 region: None,
-                access_key: "access".to_string(),
-                secret_key: "secret".to_string(),
+                keys: S3Keys {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                },
                 endpoint: Some(endpoint),
             },
         )
@@ -758,8 +768,11 @@ mod tests {
             "s3://private-bucket/root",
             S3Credentials {
                 region: Some("us-east-1".to_string()),
-                access_key: "access".to_string(),
-                secret_key: "secret".to_string(),
+                keys: S3Keys {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                },
                 endpoint: Some("http://objects.example".to_string()),
             },
         )
@@ -791,6 +804,45 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn session_credentials_carry_their_token_in_signatures_and_presigned_urls() {
+        let store = S3Store::with_credentials(
+            "s3://private-bucket/root",
+            S3Credentials {
+                region: Some("us-east-1".to_string()),
+                keys: S3Keys {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: Some("session-token".to_string()),
+                },
+                endpoint: Some("http://objects.example".to_string()),
+            },
+        )
+        .unwrap();
+
+        let headers = store
+            .sign(
+                "GET",
+                "http://objects.example/private-bucket/root/part.parquet",
+                &[],
+                &[],
+            )
+            .unwrap();
+        let DataFileLocation::Remote { url, .. } =
+            store.source(&ObjectPath::new("part.parquet")).unwrap()
+        else {
+            panic!("S3 source must be remote");
+        };
+
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-amz-security-token") && value == "session-token"
+        }));
+        assert!(
+            url.query_pairs()
+                .any(|(name, value)| name == "X-Amz-Security-Token" && value == "session-token")
+        );
     }
 
     #[test]
