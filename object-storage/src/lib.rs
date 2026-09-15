@@ -34,7 +34,7 @@ pub use gcs::GcsStore;
 pub use local::LocalStore;
 pub use object_fetcher::{LoadedObject, load_objects};
 pub use object_path::ObjectPath;
-pub use s3::{S3Credentials, S3Store};
+pub use s3::{S3Credentials, S3Keys, S3Store};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

@@ -982,8 +982,11 @@ fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObject
             let mut builder = AmazonS3Builder::new().with_url(uri).with_region(region);
             if let Some(credentials) = credentials {
                 builder = builder
-                    .with_access_key_id(credentials.access_key)
-                    .with_secret_access_key(credentials.secret_key);
+                    .with_access_key_id(credentials.keys.access_key)
+                    .with_secret_access_key(credentials.keys.secret_key);
+                if let Some(session_token) = credentials.keys.session_token {
+                    builder = builder.with_token(session_token);
+                }
             } else {
                 builder = builder.with_skip_signature(true);
             }
