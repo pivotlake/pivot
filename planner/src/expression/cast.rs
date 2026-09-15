@@ -274,8 +274,10 @@ fn render_shredded_strings(
     variant: &VariantArray,
     strings: &StringViewArray,
 ) -> Result<StringViewArray, ArrowError> {
-    let metadata = variant.metadata_field();
-    let residual = variant.value_field();
+    // A variant array always stores these two fields as binary views, so the
+    // downcast holds and belongs outside the row loop.
+    let metadata = variant.metadata_field().as_binary_view();
+    let residual = variant.value_field().map(|value| value.as_binary_view());
     let mut json = StringViewBuilder::with_capacity(variant.len());
     let mut text = Vec::new();
     for row in 0..variant.len() {
