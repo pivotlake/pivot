@@ -35,7 +35,8 @@
 #
 # Re-running is cheap: the cargo builds are no-ops when nothing changed, and
 # the profiling run - the one expensive non-cargo step - is skipped when a
-# merged profile already exists. Pass --regen-profile to force it.
+# merged profile already exists for the selected Cargo profile. Pass
+# --regen-profile to force it.
 #
 # Meant to be launched detached and polled from a short-lived ssh session, so
 # it writes its PID and emits a sentinel on every exit path.
@@ -128,15 +129,13 @@ command -v ld.lld >/dev/null || {
 baseline="$root/baseline"
 working="$root/working"
 profdata="$baseline/pgo/merged.profdata"
+profile_marker="$baseline/pgo/cargo-profile"
 # The profile the compiler actually reads. Both sides name this one path, since
 # the path is part of RUSTFLAGS and giving each side its own would change the
 # flags hash and rebuild every crate. Each side's own profile is kept under its
 # pgo/ directory and copied into this slot when it should be the one in force.
 active="$root/pgo/active.profdata"
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
-# The instrumented server is always release: the profile records which branches
-# are hot, and debug info neither helps that nor survives into the final build.
-instrumented="$baseline/target-pgogen/$host_target/release/pivot"
 client="$root/target-client/release/pivot-bench"
 # Cargo names most profiles' directories after the profile, but not the two
 # built-in ones that predate named profiles.
@@ -145,6 +144,9 @@ case "$cargo_profile" in
     bench)    profile_dir="release" ;;
     *)        profile_dir="$cargo_profile" ;;
 esac
+# Training and profile-use builds need the same Cargo profile: profile settings
+# affect crate hashes in mangled symbols, which LLVM uses to match PGO records.
+instrumented="$baseline/target-pgogen/$host_target/$profile_dir/pivot"
 
 if [[ -e "$working" && $force -eq 0 ]]; then
     echo "error: $working already exists; pass --force to replace it" >&2
@@ -172,7 +174,7 @@ export PGO_GEN_TARGET_DIR="$baseline/target-pgogen"
 export PGO_USE_TARGET_DIR="$baseline/target-pgouse"
 
 begin "building instrumented pivot server"
-( cd "$crate_dir" && just pgo-gen-build build --release -p bin --bin pivot )
+( cd "$crate_dir" && just pgo-gen-build build --profile "$cargo_profile" -p bin --bin pivot )
 elapsed "instrumented build"
 
 begin "building the client (plain release, no profile flags)"
@@ -180,12 +182,13 @@ begin "building the client (plain release, no profile flags)"
     cargo build --release -p benchmarks --bin pivot-bench )
 elapsed "client build"
 
-if [[ -f "$profdata" && $regen_profile -eq 0 ]]; then
+if [[ -f "$profdata" && -f "$profile_marker" && $regen_profile -eq 0 ]] \
+    && [[ "$(cat "$profile_marker")" == "$cargo_profile" ]]; then
     echo
     echo ">>> reusing existing profile $profdata (pass --regen-profile to rebuild it)"
 else
     begin "profiling run over $pgo_source (instrumented server, expect it to crawl)"
-    rm -f "$baseline"/pgo/*.profraw "$profdata"
+    rm -f "$baseline"/pgo/*.profraw "$profdata" "$profile_marker"
     query_args=()
     [[ -n "$queries" ]] && query_args=(--query "$queries")
     # PIVOT_SPIN_LIMIT=0 parks idle workers immediately instead of spinning,
@@ -203,6 +206,7 @@ else
     # The shared recipe fails loudly when the run produced no .profraw files,
     # so a build can never quietly proceed un-PGOed.
     ( cd "$crate_dir" && just pgo-merge "$profdata" "$baseline/pgo" )
+    printf '%s\n' "$cargo_profile" >"$profile_marker"
     elapsed "merge"
 fi
 
