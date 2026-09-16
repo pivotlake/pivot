@@ -144,13 +144,19 @@ impl HeldColumn {
         row_cap: usize,
         allocator: &mut Option<SlabAllocator>,
     ) -> WriteResult<()> {
-        let slice = self.next_slice(row_cap);
-        let values = match &self.job.shredding {
+        let values = match self.job.shredding.clone() {
             Some(shredding) => {
+                // Shred a slice of the size asked for, not whatever one input
+                // batch happens to hold. The write path can deliver a batch per
+                // row, and shredding builds a whole tree, with a value block per
+                // leaf, for every call.
+                let slice = self.gather_slice(row_cap, allocator)?;
                 let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
-                shredding::shred_column(&slice, shredding, allocator)?
+                shredding::shred_column(&slice, &shredding, allocator)?
             }
-            None => slice,
+            // Splitting a plain column into leaves costs a pass over its null
+            // bitmap, so it gains nothing from gathering and stays per batch.
+            None => self.next_batch_slice(row_cap),
         };
         let field = self.job.context.schema.field(self.job.column_index);
         let pieces = leaves::to_parquet_leaves(field, &values)?;
@@ -165,9 +171,31 @@ impl HeldColumn {
         Ok(())
     }
 
+    /// Up to `row_cap` rows, gathered across as many input batches as that
+    /// spans and concatenated when it spans more than one.
+    fn gather_slice(
+        &mut self,
+        row_cap: usize,
+        allocator: &mut Option<SlabAllocator>,
+    ) -> WriteResult<ArrayRef> {
+        let first = self.next_batch_slice(row_cap);
+        let mut rows_gathered = first.len();
+        let mut gathered = vec![first];
+        while rows_gathered < row_cap && !self.is_exhausted() {
+            let piece = self.next_batch_slice(row_cap - rows_gathered);
+            rows_gathered += piece.len();
+            gathered.push(piece);
+        }
+        if gathered.len() == 1 {
+            return Ok(gathered.pop().expect("the first slice"));
+        }
+        let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
+        Ok(dispatch::arrays::concat_chunks(allocator, &gathered)?)
+    }
+
     /// Move the cursor past the next slice and return it: the rest of the
     /// current batch, capped at `row_cap` rows.
-    fn next_slice(&mut self, row_cap: usize) -> ArrayRef {
+    fn next_batch_slice(&mut self, row_cap: usize) -> ArrayRef {
         let batch = &self.job.batches[self.batch_index];
         let rows = (batch.len() - self.rows_consumed_from_batch).min(row_cap);
         let slice = if self.rows_consumed_from_batch == 0 && rows == batch.len() {
@@ -343,24 +371,27 @@ mod tests {
         assert_eq!(leaf.def_levels.as_deref(), Some([1, 0, 1, 0, 1].as_slice()));
     }
 
-    /// Each turn shreds one batch, and the column's leaves go out whole once
-    /// the last batch is done.
+    /// A turn shreds up to a record batch of rows, gathering across as many
+    /// input batches as that spans, and the column's leaves go out whole once
+    /// the last row is done. Shredding builds a tree, and a value block for
+    /// each of its leaves, per call, so a turn per batch would cost that per
+    /// row on a write path that delivers a batch per row.
     #[test]
-    fn a_shredded_column_takes_one_turn_per_batch_and_emits_its_leaves_once_done() {
+    fn a_shredded_column_gathers_small_batches_into_one_turn() {
         let mut shredder = Shredder::default();
         let mut sender = CollectSender::new();
         let job = shredded_variant_job(vec![documents(0..2), documents(2..3), documents(3..5)]);
 
         let turns = drive(&mut shredder, job, &mut sender);
 
-        assert_eq!(turns, 3);
+        assert_eq!(turns, 1);
         assert!(!shredder.has_pending_work());
         let typed_id = sender
             .items
             .iter()
             .find(|leaf| leaf.path == ["attrs", "typed_value", "id", "typed_value"])
             .expect("the id leaf is one of the column's leaves");
-        assert_eq!(typed_id.value_chunks.len(), 3);
+        assert_eq!(typed_id.value_chunks.len(), 1);
         assert_eq!(present_rows(typed_id), 5);
     }
 
