@@ -139,10 +139,8 @@ pub enum Error {
     StagedTable { table: String },
     #[error("table `{table}` could not be indexed at the last refresh: {message}")]
     TableUnavailable { table: String, message: String },
-    #[error(
-        "table `{table}` is Iceberg format version {version}; only versions 1 and 2 are supported"
-    )]
-    UnsupportedFormatVersion { table: String, version: u8 },
+    #[error("table `{table}` is encrypted; encrypted tables are not read")]
+    EncryptedTable { table: String },
     #[error(
         "table `{table}` column `{column}` has Iceberg type `{iceberg_type}`, which Pivot cannot represent"
     )]
@@ -150,6 +148,14 @@ pub enum Error {
         table: String,
         column: String,
         iceberg_type: String,
+    },
+    #[error(
+        "table `{table}` column `{column}` has initial default {default}; a column absent from a file is only read as NULL, so the table is not served"
+    )]
+    UnsupportedColumnDefault {
+        table: String,
+        column: String,
+        default: String,
     },
     #[error(
         "table `{table}` carries delete files in its current snapshot (manifest `{manifest}`); row-level deletes are not applied, so the table is not served"
