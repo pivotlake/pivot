@@ -119,7 +119,10 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         Ok(())
     }
 
-    fn finish(&mut self, _sender: &mut dyn Sender<RowGroupBuffer>) -> dispatch::UnaryResult<bool> {
-        Ok(self.in_flight.is_empty())
+    /// Row-group reads still on the ring keep this worker at the finish
+    /// barrier, where it waits on the ring for them, rather than spinning on
+    /// `finish` until the completions show up.
+    fn has_pending_work(&self) -> bool {
+        !self.in_flight.is_empty()
     }
 }

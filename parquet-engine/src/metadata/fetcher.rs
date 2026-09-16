@@ -121,8 +121,11 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
         Ok(())
     }
 
-    fn finish(&mut self, _sender: &mut dyn Sender<FileRowGroups>) -> dispatch::UnaryResult<bool> {
-        Ok(self.in_flight.is_empty())
+    /// Footer reads still on the ring keep this worker at the finish barrier,
+    /// where it waits on the ring for them, rather than spinning on `finish`
+    /// until the completions show up.
+    fn has_pending_work(&self) -> bool {
+        !self.in_flight.is_empty()
     }
 }
 

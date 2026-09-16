@@ -2,6 +2,7 @@ use crate::stats::DataFlowStats;
 use crate::waker::WakerSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+use std::time::Instant;
 
 /// A handle to a running dataflow that produces items of type `T`.
 ///
@@ -20,6 +21,9 @@ pub struct DataFlowHandle<T> {
     /// Wakers of every node the dataflow runs on, so that cancel callers (which
     /// may not be on a worker thread) can wake all parked workers.
     wakers: WakerSet,
+    /// When the dataflow was pushed to the workers, so a collect can log how
+    /// long the pool took to pick it up and to release it.
+    launched_at: Instant,
 }
 
 impl<T> DataFlowHandle<T> {
@@ -36,6 +40,7 @@ impl<T> DataFlowHandle<T> {
             stats_rx,
             cancelled,
             wakers,
+            launched_at: Instant::now(),
         }
     }
 
@@ -73,17 +78,20 @@ impl<T> DataFlowHandle<T> {
     pub fn collect_with_stats(mut self) -> crate::data_flow::Result<(Vec<T>, DataFlowStats)> {
         let mut items = Vec::new();
         let mut error = None;
+        let mut first_item_at = None;
         // Drain to channel close (every worker has dropped its sender, finished
         // or cancelled) so all stats have been reported before we fold them. Keep
         // the first error rather than returning on it, so a failed query's IO is
         // still tallied.
         for item in &mut self {
+            first_item_at.get_or_insert_with(Instant::now);
             match item {
                 Ok(value) => items.push(value),
                 Err(e) if error.is_none() => error = Some(e),
                 Err(_) => {}
             }
         }
+        let output_closed_at = Instant::now();
         // A worker that panicked (or otherwise failed without queueing an `Err`
         // item) reports on the separate error channel before dropping its
         // sender, so check it once the output channel has closed. Without this a
@@ -97,6 +105,21 @@ impl<T> DataFlowHandle<T> {
         while let Ok(worker_stats) = self.stats_rx.recv() {
             stats.merge(&worker_stats);
         }
+        let stats_closed_at = Instant::now();
+        let micros = |at: Instant| (at - self.launched_at).as_micros() as u64;
+        tracing::debug!(
+            items = items.len(),
+            first_item_us = first_item_at.map(micros),
+            output_closed_us = micros(output_closed_at),
+            stats_closed_us = micros(stats_closed_at),
+            disk_cache_requests = stats.disk_cache_requests,
+            disk_cache_us = stats.disk_cache_time.as_micros() as u64,
+            disk_requests = stats.disk_requests,
+            disk_read_us = stats.disk_read_time.as_micros() as u64,
+            http_requests = stats.http_requests,
+            cpu_us = stats.cpu.as_micros() as u64,
+            "collected dataflow"
+        );
         match error {
             // The success path reports via the server's stats NOTICE; a failed
             // query has no such path, so log what IO it did before failing.
