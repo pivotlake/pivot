@@ -10,7 +10,8 @@ use crate::{Error, Result};
 /// `schema`'s top-level fields as the table's declared columns, each matched
 /// to a file's columns by its Iceberg field id. A field whose type Pivot
 /// cannot represent refuses the whole table: a schema quietly missing a column
-/// is a wrong answer to `SELECT *`.
+/// is a wrong answer to `SELECT *`. So does a field with an initial default,
+/// which files predating it would have to read instead of NULL.
 pub(crate) fn table_columns(table: &str, schema: &Schema) -> Result<TableColumns> {
     let mut columns = Vec::new();
     let mut field_ids = Vec::new();
@@ -21,6 +22,13 @@ pub(crate) fn table_columns(table: &str, schema: &Schema) -> Result<TableColumns
                 column: field.name.clone(),
                 iceberg_type: field.field_type.to_string(),
             })?;
+        if let Some(default) = &field.initial_default {
+            return Err(Error::UnsupportedColumnDefault {
+                table: table.to_string(),
+                column: field.name.clone(),
+                default: format!("{default:?}"),
+            });
+        }
         columns.push(Column {
             name: field.name.clone(),
             col_type,
@@ -63,7 +71,7 @@ fn to_pivot_type(iceberg_type: &IcebergType) -> Option<Type> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{ListType, NestedField};
+    use iceberg::spec::{ListType, Literal, NestedField};
     use parquet_engine::ColumnResolution;
     use std::sync::Arc;
 
@@ -106,6 +114,22 @@ mod tests {
                 precision: 10,
                 scale: 2
             }
+        );
+    }
+
+    #[test]
+    fn a_field_with_an_initial_default_refuses_the_table_naming_the_column() {
+        let schema = schema(vec![
+            NestedField::required(1, "id", IcebergType::Primitive(PrimitiveType::Long)),
+            NestedField::optional(2, "score", IcebergType::Primitive(PrimitiveType::Long))
+                .with_initial_default(Literal::long(7)),
+        ]);
+
+        let error = table_columns("t", &schema).unwrap_err();
+
+        assert!(
+            matches!(&error, Error::UnsupportedColumnDefault { column, .. } if column == "score"),
+            "{error}"
         );
     }
 

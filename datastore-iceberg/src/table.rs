@@ -94,11 +94,8 @@ impl LoadedTable {
                 table: table_name.clone(),
             })?
             .to_string();
-        if metadata.format_version() == FormatVersion::V3 {
-            return Err(Error::UnsupportedFormatVersion {
-                table: table_name,
-                version: metadata.format_version() as u8,
-            });
+        if metadata.encryption_keys_iter().len() > 0 {
+            return Err(Error::EncryptedTable { table: table_name });
         }
         let schema = metadata.current_schema();
         let columns = table_columns(&table_name, schema)?;

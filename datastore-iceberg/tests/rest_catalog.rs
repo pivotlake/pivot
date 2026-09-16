@@ -18,9 +18,10 @@ use datastore_iceberg::{IcebergCatalogConfig, IcebergDatastore};
 use dispatch::{DataFlowDispatcher, Dispatch};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{
-    DataFile, DataFileFormat, Literal, ManifestList, ManifestListWriter, ManifestWriterBuilder,
-    NestedField, NestedFieldRef, Operation, PartitionKey, PrimitiveType, Schema, Snapshot,
-    SnapshotReference, SnapshotRetention, Struct, Summary, Transform, Type, UnboundPartitionSpec,
+    DataFile, DataFileFormat, FormatVersion, Literal, ManifestList, ManifestListWriter,
+    ManifestWriterBuilder, NestedField, NestedFieldRef, Operation, PartitionKey, PrimitiveType,
+    Schema, Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary, Transform, Type,
+    UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -185,6 +186,25 @@ impl Harness {
             .build();
         self.block_on(self.writer.create_table(namespace, creation))
             .expect("create table");
+    }
+
+    /// A namespace of the test's own with one table of Iceberg format
+    /// version 3.
+    fn v3_namespace(&self, name: &str, table: &str, schema: Schema) -> NamespaceIdent {
+        let namespace = NamespaceIdent::new(name.to_string());
+        self.block_on(self.writer.create_namespace(&namespace, HashMap::new()))
+            .expect("create namespace");
+        let creation = TableCreation::builder()
+            .name(table.to_string())
+            .schema(schema)
+            .properties(HashMap::from([(
+                "format-version".to_string(),
+                "3".to_string(),
+            )]))
+            .build();
+        self.block_on(self.writer.create_table(&namespace, creation))
+            .expect("create table");
+        namespace
     }
 
     /// A namespace of the test's own with one table, partitioned by the
@@ -791,6 +811,83 @@ fn renamed_and_added_columns_read_by_field_id() {
         ]
     );
     assert_eq!(int64_column(&batches, 2), [None, None, Some(7)]);
+}
+
+#[test]
+fn a_v3_table_reads_with_null_for_a_column_its_older_files_predate() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.v3_namespace("v3", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    let evolved = schema(
+        1,
+        vec![
+            field(1, "id", PrimitiveType::Long),
+            field(2, "customer", PrimitiveType::String),
+            field(3, "amount", PrimitiveType::Double),
+            field(4, "score", PrimitiveType::Long),
+        ],
+    );
+    harness.set_schema(&namespace, "orders", &evolved);
+    let evolved_arrow = Arc::new(schema_to_arrow_schema(&evolved).unwrap());
+    harness.append(
+        &namespace,
+        "orders",
+        RecordBatch::try_new(
+            evolved_arrow,
+            vec![
+                Arc::new(Int64Array::from(vec![3])),
+                Arc::new(StringArray::from(vec!["cy"])),
+                Arc::new(Float64Array::from(vec![3.0])),
+                Arc::new(Int64Array::from(vec![9])),
+            ],
+        )
+        .unwrap(),
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let batches = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id, score FROM v3.orders ORDER BY id",
+    );
+
+    assert_eq!(
+        harness
+            .load(&namespace, "orders")
+            .metadata()
+            .format_version(),
+        FormatVersion::V3
+    );
+    assert_eq!(int64_column(&batches, 0), [Some(1), Some(2), Some(3)]);
+    assert_eq!(int64_column(&batches, 1), [None, None, Some(9)]);
+}
+
+#[test]
+fn a_column_with_an_initial_default_refuses_the_table_by_name() {
+    let Some(harness) = harness() else { return };
+    let scored = schema(
+        0,
+        vec![
+            field(1, "id", PrimitiveType::Long),
+            Arc::new(
+                NestedField::optional(2, "score", Type::Primitive(PrimitiveType::Long))
+                    .with_initial_default(Literal::long(7)),
+            ),
+        ],
+    );
+    let _namespace = harness.v3_namespace("defaults", "orders", scored);
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM defaults.orders");
+
+    assert!(
+        error.contains("score") && error.contains("initial default"),
+        "{error}"
+    );
 }
 
 #[test]
