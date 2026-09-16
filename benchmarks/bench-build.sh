@@ -104,6 +104,7 @@ client="$root/target-client/release/pivot-bench"
 active="$root/pgo/active.profdata"
 # This side's own profile, kept for provenance and copied into the slot above.
 profdata="$working/pgo/merged.profdata"
+profile_marker="$working/pgo/cargo-profile"
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
 # Cargo names most profiles' directories after the profile, but not the two
 # built-in ones that predate named profiles.
@@ -119,6 +120,12 @@ for required in "$working" "$active"; do
         exit 2
     fi
 done
+
+if [[ $regen_profile -eq 0 ]] && \
+    { [[ ! -f "$profile_marker" ]] || [[ "$(cat "$profile_marker")" != "$cargo_profile" ]]; }; then
+    echo "error: working PGO data was not generated for --profile $cargo_profile; rerun with --regen-profile --pgo-source <directory>" >&2
+    exit 2
+fi
 
 phase_start=0
 begin() { phase_start=$SECONDS; echo; echo ">>> $*"; }
@@ -158,7 +165,7 @@ if [[ $regen_profile -eq 1 ]]; then
     begin "building instrumented pivot server"
     ( cd "$crate_dir" \
         && PGO_DIR="$baseline/pgo" PGO_GEN_TARGET_DIR="$working/target-pgogen" \
-           just pgo-gen-build build --release -p bin --bin pivot )
+           just pgo-gen-build build --profile "$cargo_profile" -p bin --bin pivot )
     elapsed "instrumented build"
 
     begin "building the client (plain release, no profile flags)"
@@ -167,7 +174,7 @@ if [[ $regen_profile -eq 1 ]]; then
     elapsed "client build"
 
     begin "profiling run over $pgo_source"
-    rm -f "$working"/pgo/*.profraw
+    rm -f "$working"/pgo/*.profraw "$profile_marker"
     query_args=()
     [[ -n "$queries" ]] && query_args=(--query "$queries")
     # PIVOT_SPIN_LIMIT=0 parks idle workers immediately instead of spinning,
@@ -178,7 +185,7 @@ if [[ $regen_profile -eq 1 ]]; then
     # itself is not instrumented and writes nothing.
     LLVM_PROFILE_FILE="$working/pgo/default_%m_%p.profraw" PIVOT_SPIN_LIMIT=0 \
         "$client" --suite "$suite" \
-        --server-bin "$working/target-pgogen/$host_target/release/pivot" \
+        --server-bin "$working/target-pgogen/$host_target/$profile_dir/pivot" \
         --source "$pgo_source" \
         --iterations "$iterations" --skip-check "${query_args[@]}"
     elapsed "profiling run"
@@ -196,6 +203,7 @@ if [[ $regen_profile -eq 1 ]]; then
     cp "$profdata" "$active"
     touch -r "$mtime_ref" "$active"
     rm -f "$mtime_ref"
+    printf '%s\n' "$cargo_profile" >"$profile_marker"
 
     # Cargo now considers everything fresh, our crates included, so nothing
     # would pick the new profile up. Touching their roots is what forces them.
