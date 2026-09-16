@@ -88,8 +88,8 @@ fn null_array_on_slabs(
         }
         DataType::Utf8View | DataType::BinaryView => vec![zeroed_buffer(allocator, len * 16)],
         fixed_width => {
-            // The layout stage refuses a nested absent column, and every other
-            // declared type is fixed-width, boolean or bytes.
+            // A nested column is decoded leaf by leaf, and every leaf type is
+            // fixed-width, boolean or bytes.
             let width = fixed_width
                 .primitive_width()
                 .unwrap_or_else(|| panic!("no all-NULL layout for {fixed_width}"));

@@ -9,6 +9,7 @@ use crate::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::thrift::general::{Encoding, PageType};
 use crate::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::types::columns::{ColumnResolution, TableColumns};
+use crate::types::leaves::leaf_count;
 use crate::types::metadata::{ColumnChunkMeta, FileLeafStatistics, RowGroupMetadata};
 use arrow_array::builder::{BinaryViewBuilder, StringViewBuilder};
 use arrow_array::types::{
@@ -356,7 +357,7 @@ fn absent_leaf_statistics(row_counts: &[i64]) -> FileLeafStatistics {
 
 /// Where a row group's leaf comes from, in the layout
 /// [`resolve_column_layout`] produced.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeafSource {
     /// The file's leaf at this index, in the file's own leaf order.
     File(usize),
@@ -439,17 +440,9 @@ fn resolve_column_layout(
             }
             None => {
                 let data_type = planner::types::physical_arrow_type(&declared.col_type);
-                // A nested column spans several leaves whose reconstruction
-                // reads real values (a variant's metadata blob); there is no
-                // all-NULL shape to synthesize for it.
-                if matches!(data_type, DataType::Struct(_)) {
-                    return Err(Error::UnsupportedType(format!(
-                        "column '{}' is absent from the file and its {} type cannot be read as NULL",
-                        declared.name, declared.col_type
-                    )));
-                }
-                fields.push(Arc::new(Field::new(declared.name.clone(), data_type, true)));
-                leaf_sources.push(LeafSource::Absent);
+                let field = Arc::new(Field::new(declared.name.clone(), data_type, true));
+                leaf_sources.extend(std::iter::repeat_n(LeafSource::Absent, leaf_count(&field)));
+                fields.push(field);
             }
         }
     }
@@ -1591,17 +1584,23 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_nested_column_is_rejected() {
+    fn an_absent_variant_column_spans_absent_leaves() {
         let file = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         let declared = declared_by_field_id(vec![("a", Type::Int32, 1), ("v", Type::Variant, 2)]);
 
-        let error = resolve_column_layout(file, &[Some(1)], &declared).unwrap_err();
+        let layout = resolve_column_layout(file, &[Some(1)], &declared).unwrap();
 
-        assert!(matches!(error, Error::UnsupportedType(_)), "{error}");
+        assert_eq!(field_names(&layout.schema), ["a", "v"]);
+        assert!(layout.schema.field(1).is_nullable());
+        assert_eq!(
+            layout.leaf_sources,
+            [LeafSource::File(0), LeafSource::Absent, LeafSource::Absent]
+        );
     }
 
     /// A file whose columns carry field ids, written in an order that differs
-    /// from the declared one and lacking one declared column.
+    /// from the declared one and lacking a declared scalar and a declared
+    /// variant column.
     fn write_evolved_file(dir: &TempDir) -> Arc<ParquetTable> {
         let with_id = |field: Field, id: i32| {
             field.with_metadata(std::collections::HashMap::from([(
@@ -1631,6 +1630,7 @@ mod tests {
             ("a", Type::Int32, 1),
             ("c", Type::Int64, 3),
             ("b", Type::Int64, 2),
+            ("v", Type::Variant, 4),
         ]);
         let loaded = crate::load_file_row_groups(
             test_dispatcher(),
@@ -1683,6 +1683,53 @@ mod tests {
                 .values(),
             &[10, 20, 30]
         );
+    }
+
+    #[test]
+    fn an_absent_variant_column_scans_as_null_rows() {
+        let dir = TempDir::new().unwrap();
+        let table = write_evolved_file(&dir);
+
+        let batch = scan(&table, vec![3]);
+
+        let variant = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .unwrap();
+        assert_eq!(variant.len(), 3);
+        assert_eq!(variant.null_count(), 3);
+        assert_eq!(variant.column(0).null_count(), 3);
+    }
+
+    #[test]
+    fn an_extract_from_an_absent_variant_column_is_null() {
+        let dir = TempDir::new().unwrap();
+        let table = write_evolved_file(&dir);
+        let projection = dispatch::Projection {
+            column_indices: vec![3, 3],
+            extracts: vec![
+                Some(dispatch::VariantExtract {
+                    path: vec!["x".to_string()],
+                    as_type: Some(DataType::Int64),
+                }),
+                Some(dispatch::VariantExtract {
+                    path: vec!["x".to_string()],
+                    as_type: None,
+                }),
+            ],
+        };
+
+        let batches = crate::table_input(test_dispatcher(), &table, projection, false)
+            .collect()
+            .unwrap();
+        let batch = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.column(0).data_type(), &DataType::Int64);
+        assert_eq!(batch.column(0).null_count(), 3);
+        assert!(matches!(batch.column(1).data_type(), DataType::Struct(_)));
+        assert_eq!(batch.column(1).null_count(), 3);
     }
 
     #[test]
