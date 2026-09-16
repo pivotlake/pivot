@@ -3,9 +3,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{Field, Schema};
-use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec, values_input};
+use dispatch::{DataFlowDispatcher, RECORD_BATCH_SIZE, RecordBatchOperatorSpec, values_input};
 
 use crate::compile::{Error, ExprFn};
 use crate::expression::Expression;
@@ -49,11 +49,27 @@ impl Values {
         )
         .expect("one empty row is a valid batch");
 
-        Ok(values_input(dispatcher, rows)
-            .map_each(move |row: Vec<Arc<ExprFn>>| {
-                let columns: Vec<ArrayRef> = row
-                    .iter()
-                    .map(|builder| builder()(&single_row).into_array(1))
+        // Steal a record batch of rows at a time, not a single row. Every
+        // consumer downstream sizes its work by the batch it is handed, and the
+        // heaviest of them, shredding a variant column, builds a fresh set of
+        // column builders per call. A batch per row makes that per-row too.
+        let chunks: Vec<Vec<Vec<Arc<ExprFn>>>> = rows
+            .chunks(RECORD_BATCH_SIZE)
+            .map(<[Vec<Arc<ExprFn>>]>::to_vec)
+            .collect();
+
+        Ok(values_input(dispatcher, chunks)
+            .map_each(move |chunk: Vec<Vec<Arc<ExprFn>>>| {
+                let column_count = chunk.first().map_or(0, Vec::len);
+                let columns: Vec<ArrayRef> = (0..column_count)
+                    .map(|column| {
+                        let values: Vec<ArrayRef> = chunk
+                            .iter()
+                            .map(|row| row[column]()(&single_row).into_array(1))
+                            .collect();
+                        let values: Vec<&dyn Array> = values.iter().map(AsRef::as_ref).collect();
+                        arrow::compute::concat(&values).expect("one column's rows share a type")
+                    })
                     .collect();
                 // Column names carry no meaning here: the insert matches VALUES
                 // columns to the table positionally, so leave them empty.
