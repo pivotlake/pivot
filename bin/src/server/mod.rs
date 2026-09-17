@@ -38,7 +38,7 @@
 //! let workers = config.server.workers.unwrap_or_else(dispatch::default_worker_count);
 //! let dispatch = Dispatch::spin_up(workers, 32, None);
 //! let metastore = Arc::new(DiskMetastore::open(
-//!     config.metastore,
+//!     config.entries,
 //!     None,
 //!     config.server.refresh_interval.as_duration(),
 //! )?);

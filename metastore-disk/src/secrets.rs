@@ -9,23 +9,22 @@
 //! never a coin toss.
 //!
 //! ```yaml
-//! metastore:
-//!   secrets:
-//!     analytics:
-//!       type: s3
-//!       scope: s3://analytics/          # this bucket, whatever the prefix
-//!       region: us-east-1
-//!       access_key_id: AKIA...
-//!       secret_access_key: "..."
-//!     analytics-archive:
-//!       type: s3
-//!       scope: s3://analytics/archive/  # more specific: wins under archive/
-//!       region: us-east-1
-//!       access_key_id: AKIA...
-//!       secret_access_key: "..."
-//!     google:
-//!       type: gcs                       # no scope: every gs:// location
-//!       credentials_file: /etc/pivot/gcs-key.json
+//! secrets:
+//!   analytics:
+//!     type: s3
+//!     scope: s3://analytics/          # this bucket, whatever the prefix
+//!     region: us-east-1
+//!     access_key_id: AKIA...
+//!     secret_access_key: "..."
+//!   analytics-archive:
+//!     type: s3
+//!     scope: s3://analytics/archive/  # more specific: wins under archive/
+//!     region: us-east-1
+//!     access_key_id: AKIA...
+//!     secret_access_key: "..."
+//!   google:
+//!     type: gcs                       # no scope: every gs:// location
+//!     credentials_file: /etc/pivot/gcs-key.json
 //! ```
 
 use std::collections::HashMap;
@@ -44,7 +43,7 @@ use crate::{Error, Result};
 /// scope, since the datastore over the catalog names it.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type", deny_unknown_fields)]
-pub(crate) enum SecretConfig {
+pub enum SecretConfig {
     #[serde(rename = "s3")]
     S3 {
         /// The `s3://bucket/prefix` this secret covers. Omitted, it covers

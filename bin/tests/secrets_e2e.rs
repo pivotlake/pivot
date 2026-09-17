@@ -33,7 +33,7 @@ use tokio_postgres::Client;
 
 /// Start a server whose entire configuration is `config_yaml`, on a dedicated
 /// thread, and return the port once it is listening. The catalog is opened the
-/// way the binary opens it: the config file's `metastore` section, through
+/// way the binary opens it: the config file's entries, through
 /// [`DiskMetastore`], which resolves each datastore's secret.
 fn start_server_from_config(config_yaml: &str) -> u16 {
     let port = pick_free_port();
@@ -56,7 +56,7 @@ fn start_server_from_config(config_yaml: &str) -> u16 {
             let config = Config::open(&config_path).unwrap();
             let metastore = Arc::new(
                 DiskMetastore::open(
-                    config.metastore,
+                    config.entries,
                     None,
                     config.server.refresh_interval.as_duration(),
                 )
@@ -81,21 +81,20 @@ fn start_server_from_config(config_yaml: &str) -> u16 {
     port
 }
 
-/// The `metastore.datastores` section for a backend's root: the one datastore,
-/// carrying no credentials. Maintenance is off, so the only traffic the bucket
-/// sees is the test's own.
+/// The `datastores` map for a backend's root: the one datastore, carrying no
+/// credentials. Maintenance is off, so the only traffic the bucket sees is the
+/// test's own.
 fn datastores_section(root: &str) -> String {
     format!(
         "server:
   refresh_interval: 100ms
-metastore:
-  datastores:
-    warm:
-      kind: pivot
-      location: {root}
-      default: true
-      compact: false
-      vacuum: false
+datastores:
+  warm:
+    kind: pivot
+    location: {root}
+    default: true
+    compact: false
+    vacuum: false
 "
     )
 }
@@ -164,21 +163,21 @@ fn an_s3_datastore_is_served_with_the_secret_scoped_to_it() {
     // below covers every other `s3://` location with an endpoint nothing
     // answers on, so reaching MinIO at all means the scoped secret won.
     let config = format!(
-        "{}  secrets:
-    decoy:
-      type: s3
-      scope: s3://
-      region: {region}
-      access_key_id: wrong-key
-      secret_access_key: wrong-secret
-      endpoint: http://127.0.0.1:1
-    minio:
-      type: s3
-      scope: {root}
-      region: {region}
-      access_key_id: {access_key_id}
-      secret_access_key: {secret_access_key}
-      endpoint: {endpoint}
+        "{}secrets:
+  decoy:
+    type: s3
+    scope: s3://
+    region: {region}
+    access_key_id: wrong-key
+    secret_access_key: wrong-secret
+    endpoint: http://127.0.0.1:1
+  minio:
+    type: s3
+    scope: {root}
+    region: {region}
+    access_key_id: {access_key_id}
+    secret_access_key: {secret_access_key}
+    endpoint: {endpoint}
 ",
         datastores_section(&backend.root),
         root = backend.root,
@@ -212,11 +211,11 @@ fn a_gcs_datastore_is_served_with_the_secret_scoped_to_it() {
     let key_path = key_file.path().join("gcs-key.json");
     std::fs::write(&key_path, r#"{"type":"authorized_user"}"#).unwrap();
     let config = format!(
-        "{}  secrets:
-    google:
-      type: gcs
-      scope: {root}
-      credentials_file: {key_path}
+        "{}secrets:
+  google:
+    type: gcs
+    scope: {root}
+    credentials_file: {key_path}
 ",
         datastores_section(&backend.root),
         root = backend.root,

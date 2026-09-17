@@ -55,9 +55,7 @@ Installation creates the dedicated `pivot` system user, enables the service at
 boot, and starts it immediately. The service runs this foreground command:
 
 ```sh
-pivot server \
-  --config /etc/pivot/config.yaml \
-  --metastore-file /var/lib/pivot/metastore.yaml
+pivot server --config /etc/pivot/config.yaml
 ```
 
 The package stores its default configuration template at
@@ -67,11 +65,13 @@ live configuration belongs to the administrator and upgrades never replace or
 modify it, so there is no conffile prompt. Removing or purging the package also
 leaves the live configuration in place.
 
-The metastore file is mutable server state: the package creates it only when
-absent, and the server owns subsequent rewrites. Removing or purging the
-package stops the service but deliberately preserves `/var/lib/pivot` and the
-service account. Database data and metastore entries are never deleted as a
-package-script side effect.
+The seeded config defines the default datastore and the trusted `pivot` user,
+and names `/var/lib/pivot/metastore.yaml` as the file the server writes to.
+That metastore file is mutable server state: the package creates it empty when
+absent, and the server owns subsequent rewrites, so users created with
+`CREATE USER` land there. Removing or purging the package stops the service but
+deliberately preserves `/var/lib/pivot` and the service account. Database data
+and metastore entries are never deleted as a package-script side effect.
 
 Build a native package into `dist/`:
 

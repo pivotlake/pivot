@@ -162,18 +162,17 @@ pub fn start(
         "\
 server:
   bind: 127.0.0.1:{port}
-{workers_line}metastore:
-  datastores:
-    default:
-      kind: pivot
-      location: {data_dir}
-      default: true
-      compact: false
-      vacuum: false
-  users:
-    pivot:
-      auth:
-        method: trust
+{workers_line}datastores:
+  default:
+    kind: pivot
+    location: {data_dir}
+    default: true
+    compact: false
+    vacuum: false
+users:
+  pivot:
+    auth:
+      method: trust
 ",
         data_dir = data_dir.display(),
     );

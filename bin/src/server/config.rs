@@ -1,11 +1,13 @@
 //! The config file: one YAML file describing a whole instance.
 //!
-//! The file has two sections, each owned by the code that acts on it. `server`
-//! is [`ServerConfig`] below: the endpoint, the memory and worker budgets, the
-//! disk cache. `metastore` is [`MetastoreConfig`]: the datastores to serve, the
-//! secrets they are opened with, and the users that may connect. Both are read
-//! in a single pass, so a mistake in either one is reported with its place in
-//! the file and stops startup.
+//! `server` is [`ServerConfig`] below: the endpoint, the memory and worker
+//! budgets, the disk cache. `datastores`, `secrets` and `users` are the
+//! operator's entries, a [`MetastoreConfig`] written at the top level of the
+//! file: read at startup and never rewritten by the server. `metastore` is
+//! [`MetastoreStore`]: the store the server writes to, a file of the same three
+//! maps that this process owns, where `CREATE USER` lands. All of it is read in
+//! a single pass, so a mistake anywhere is reported with its place in the file
+//! and stops startup.
 //!
 //! ```yaml
 //! server:
@@ -20,27 +22,36 @@
 //!     cert: /etc/pivot/server.crt
 //!     key: /etc/pivot/server.key
 //!
+//! datastores:
+//!   hot:
+//!     kind: pivot
+//!     location: /var/lib/pivot/datastores/hot
+//!     default: true
+//!
+//! users:
+//!   pivot:
+//!     auth:
+//!       method: trust
+//!
 //! metastore:
-//!   datastores:
-//!     hot:
-//!       kind: pivot
-//!       location: /var/lib/pivot
-//!       default: true
+//!   kind: file
+//!   path: /var/lib/pivot/metastore.yaml
 //! ```
 //!
 //! Every field of `server` has a default, so the section may be omitted whole.
-//! Unknown keys are rejected rather than ignored: a misspelled setting would
-//! otherwise leave the server running on a default nobody asked for.
-//!
-//! The `metastore` section is not the only place datastores, secrets and users
-//! may be written: the binary's `--metastore-file` names a second file of the
-//! same shape, which the metastore merges into this section.
+//! So may `metastore`: the server then serves the file's own entries and has
+//! nowhere to write, which `CREATE USER` reports. Unknown keys are rejected
+//! rather than ignored: a misspelled setting would otherwise leave the server
+//! running on a default nobody asked for.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
-use metastore_disk::{ByteSize, Interval, MetastoreConfig};
+use metastore_disk::{
+    ByteSize, DatastoreConfig, Interval, MetastoreConfig, SecretConfig, UserConfig,
+};
 use serde::Deserialize;
 
 /// The address the PostgreSQL endpoint binds to when `bind` is not set. Loopback
@@ -58,15 +69,57 @@ const DEFAULT_DISK_CACHE_MAX_OBJECTS: usize = 65536;
 /// Unknown top-level keys are rejected: a section under a misspelled name would
 /// otherwise leave the whole instance on defaults without a word about it.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RawConfig")]
 pub struct Config {
     /// The instance itself. Every field has a default, so the section may be
     /// left out entirely.
-    #[serde(default)]
     pub server: ServerConfig,
-    /// The data to serve. Required: a server with no datastores has nothing to
-    /// answer a query with.
-    pub metastore: MetastoreConfig,
+    /// The operator's `datastores`, `secrets` and `users`, written at the top
+    /// level of the file. Never rewritten by the server.
+    pub entries: MetastoreConfig,
+    /// The store the server writes to. Omitted, the server serves `entries`
+    /// alone and refuses to create users.
+    pub metastore: Option<MetastoreStore>,
+}
+
+/// The file as written: the three entry maps sit at the top level beside the
+/// sections, and are gathered into [`Config::entries`] once parsed. Spelling
+/// them out here, rather than flattening a [`MetastoreConfig`] in, is what
+/// lets a misspelled top-level key be rejected.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    #[serde(default)]
+    server: ServerConfig,
+    #[serde(default)]
+    datastores: HashMap<String, DatastoreConfig>,
+    #[serde(default)]
+    secrets: HashMap<String, SecretConfig>,
+    #[serde(default)]
+    users: HashMap<String, UserConfig>,
+    metastore: Option<MetastoreStore>,
+}
+
+impl From<RawConfig> for Config {
+    fn from(raw: RawConfig) -> Self {
+        Self {
+            server: raw.server,
+            entries: MetastoreConfig::new(raw.datastores, raw.secrets, raw.users),
+            metastore: raw.metastore,
+        }
+    }
+}
+
+/// The `metastore` section: where the server keeps what it is told at runtime.
+/// `kind` selects the store, as it selects a datastore's implementation.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum MetastoreStore {
+    /// A YAML file of the same `datastores`, `secrets` and `users` maps as the
+    /// config, owned and rewritten by this server process. It must exist: a
+    /// path that is not there means users are missing, not that none were
+    /// created yet.
+    File { path: PathBuf },
 }
 
 impl Config {
@@ -190,7 +243,7 @@ pub enum Error {
         source: std::io::Error,
     },
     #[error(
-        "parsing config file `{path}`: {source}\nthe file holds a `server` section (optional) and a `metastore` section (required)"
+        "parsing config file `{path}`: {source}\nthe file holds a `server` section, the `datastores`, `secrets` and `users` maps, and a `metastore` section naming the file the server writes to"
     )]
     Parse {
         path: String,
@@ -206,13 +259,13 @@ mod tests {
     use catalog::metastore::Metastore;
     use metastore_disk::DiskMetastore;
 
-    const METASTORE_SECTION: &str = "metastore:\n  datastores:\n    hot:\n      kind: pivot\n      \
-                                     location: /tmp/hot\n      default: true\n";
+    const DATASTORES_SECTION: &str =
+        "datastores:\n  hot:\n    kind: pivot\n    location: /tmp/hot\n    default: true\n";
 
     /// A file whose `server` section holds `settings`, on top of a minimal
-    /// `metastore` section.
+    /// `datastores` map.
     fn from_yaml_with(settings: &str) -> Result<Config> {
-        Config::from_yaml(&format!("server:\n{settings}{METASTORE_SECTION}"), "test")
+        Config::from_yaml(&format!("server:\n{settings}{DATASTORES_SECTION}"), "test")
     }
 
     #[test]
@@ -231,7 +284,7 @@ mod tests {
         )
         .unwrap();
         let metastore = DiskMetastore::open(
-            config.metastore,
+            config.entries,
             None,
             config.server.refresh_interval.as_duration(),
         )
@@ -252,7 +305,7 @@ mod tests {
 
     #[test]
     fn an_omitted_server_section_leaves_the_instance_on_defaults() {
-        let config = Config::from_yaml(METASTORE_SECTION, "test").unwrap();
+        let config = Config::from_yaml(DATASTORES_SECTION, "test").unwrap();
 
         assert_eq!(config.server, ServerConfig::default());
         assert_eq!(config.server.bind, "127.0.0.1:5432".parse().unwrap());
@@ -263,20 +316,57 @@ mod tests {
     }
 
     #[test]
-    fn a_file_without_a_metastore_section_is_rejected() {
-        let error = Config::from_yaml("server:\n  workers: 8\n", "test")
-            .err()
-            .expect("a server with no data to serve should be rejected");
+    fn a_metastore_section_names_the_file_the_server_writes() {
+        let yaml = format!(
+            "{DATASTORES_SECTION}metastore:\n  kind: file\n  path: /var/lib/pivot/metastore.yaml\n"
+        );
+
+        let config = Config::from_yaml(&yaml, "test").unwrap();
+
+        assert_eq!(
+            config.metastore,
+            Some(MetastoreStore::File {
+                path: PathBuf::from("/var/lib/pivot/metastore.yaml")
+            })
+        );
+    }
+
+    #[test]
+    fn an_omitted_metastore_section_leaves_the_server_nothing_to_write() {
+        let config = Config::from_yaml(DATASTORES_SECTION, "test").unwrap();
+
+        assert_eq!(config.metastore, None);
+    }
+
+    #[test]
+    fn a_metastore_section_of_an_unknown_kind_is_rejected() {
+        let yaml =
+            format!("{DATASTORES_SECTION}metastore:\n  kind: postgres\n  url: postgres://x\n");
+
+        let error = Config::from_yaml(&yaml, "test").err().unwrap();
 
         assert!(
-            error.to_string().contains("missing field `metastore`"),
+            error.to_string().contains("unknown variant `postgres`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn entries_written_under_the_metastore_section_are_rejected() {
+        let yaml = "metastore:\n  datastores:\n    hot:\n      kind: pivot\n      \
+                    location: /tmp/hot\n      default: true\n";
+
+        let error = Config::from_yaml(yaml, "test").err().unwrap();
+
+        assert!(
+            error.to_string().contains("missing field `kind`"),
             "{error}"
         );
     }
 
     #[test]
     fn a_misspelled_section_is_rejected_rather_than_dropped() {
-        let yaml = format!("sever:\n  workers: 8\n{METASTORE_SECTION}");
+        let yaml = format!("sever:\n  workers: 8\n{DATASTORES_SECTION}");
 
         let error = Config::from_yaml(&yaml, "test").err().unwrap();
 

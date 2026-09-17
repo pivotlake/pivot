@@ -39,14 +39,18 @@ fn server_command_runs_until_terminated() {
 
     let directory = tempfile::tempdir().unwrap();
     let datastore = directory.path().join("datastore");
-    let config = directory.path().join("config.yaml");
+    let metastore = directory.path().join("metastore.yaml");
+    fs::write(&metastore, "users: {}\n").unwrap();
+    let config = directory.path().join("pivot.yaml");
     fs::write(
         &config,
         format!(
             "server:\n  bind: {address}\n  memory: 64m\n  workers: 1\n\
-             metastore:\n  datastores:\n    default:\n      kind: pivot\n      location: {}\n      \
-             default: true\n  users:\n    pivot:\n      auth:\n        method: trust\n",
-            datastore.display()
+             datastores:\n  default:\n    kind: pivot\n    location: {}\n    default: true\n\
+             users:\n  pivot:\n    auth:\n      method: trust\n\
+             metastore:\n  kind: file\n  path: {}\n",
+            datastore.display(),
+            metastore.display()
         ),
     )
     .unwrap();

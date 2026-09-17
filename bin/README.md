@@ -93,15 +93,15 @@ pivot server --config <FILE>
 ```
 
 One YAML file configures the whole instance. See
-[`config.example.yaml`](config.example.yaml) for a commented file to copy. The
-optional `--metastore-file` flag merges a second datastore and user file into
-that configuration.
+[`config.example.yaml`](config.example.yaml) for a commented file to copy.
 
 #### The config file
 
-The file has two sections. `server` is the instance: where it listens and what
-it may use. Every setting there has a default, so the section may be left out
-entirely. `metastore` is the data to serve, and is required.
+`server` is the instance: where it listens and what it may use. Every setting
+there has a default, so the section may be left out entirely. `datastores`,
+`secrets` and `users` are what it serves; they are the operator's, and the
+server never rewrites the file. `metastore` names the file the server does
+write to, where `CREATE USER` lands.
 
 ```yaml
 server:
@@ -117,17 +117,34 @@ server:
     cert: /etc/pivot/server.crt
     key: /etc/pivot/server.key
 
+datastores: ...
+secrets: ...
+users: ...
+
 metastore:
-  datastores: ...
-  secrets: ...
-  users: ...
+  kind: file
+  path: /var/lib/pivot/metastore.yaml
 ```
+
+#### The metastore file
+
+The file `metastore` names holds the same `datastores`, `secrets` and `users`
+maps as the config, without a `server` or `metastore` section. The server owns
+it: `CREATE USER` rewrites it, so the file must be writable by the server and
+readable by nobody else, since a secret may land in it. It must exist when the
+server starts; a path that is not there is an error, not an empty store. A name
+defined in both files stops startup rather than one definition silently
+winning, and `CREATE USER` refuses a name the config defines, since the config
+is never rewritten.
+
+Leave the `metastore` section out to run on the config's entries alone. The
+server then has nowhere to write, and `CREATE USER` says so.
 
 #### Datastores
 
 The disk provider lives in the separate `metastore-disk` crate, which owns the
-`metastore` section. At least one datastore is always required, including when
-serving one local directory. Exactly one datastore must set `default = true`; it
+`datastores`, `secrets` and `users` maps. At least one datastore is always
+required, including when serving one local directory. Exactly one datastore must set `default = true`; it
 becomes the current database (the target of unqualified table names). Every
 datastore is attached as a database of its own name, so a query reads any other
 one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
@@ -145,23 +162,22 @@ default and should run in only one process per datastore (set `compact: false`
 on the others):
 
 ```yaml
-metastore:
-  datastores:
-    hot:
-      kind: pivot
-      location: /var/lib/pivot/hot    # local path -> local store
-      default: true                   # the current database
-    warm:
-      kind: pivot
-      location: s3://analytics/warm/  # S3 store
-      compact: true                   # this datastore compacts itself
-      compact_bytes: 128m
-      compact_merge_bytes: 192m
-      compact_min_files: 100
-      compact_parallelism: 3
-    cold:
-      kind: pivot
-      location: gs://analytics/cold/  # Google Cloud Storage store
+datastores:
+  hot:
+    kind: pivot
+    location: /var/lib/pivot/datastores/hot   # local path -> local store
+    default: true                             # the current database
+  warm:
+    kind: pivot
+    location: s3://analytics/warm/            # S3 store
+    compact: true                             # this datastore compacts itself
+    compact_bytes: 128m
+    compact_merge_bytes: 192m
+    compact_min_files: 100
+    compact_parallelism: 3
+  cold:
+    kind: pivot
+    location: gs://analytics/cold/            # Google Cloud Storage store
 ```
 
 Start the server with:
@@ -188,24 +204,23 @@ once however many datastores sit in it. `type` names the backend, `s3` or `gcs`,
 and carries exactly that backend's fields:
 
 ```yaml
-metastore:
-  secrets:
-    analytics:
-      type: s3
-      scope: s3://analytics/          # this bucket, whatever the prefix
-      region: us-east-1
-      access_key_id: AKIA...
-      secret_access_key: "..."
-      # endpoint: http://localhost:9000   # MinIO / S3-compatible
-    analytics-archive:
-      type: s3
-      scope: s3://analytics/archive/  # more specific: wins under archive/
-      region: us-east-1
-      access_key_id: AKIA...
-      secret_access_key: "..."
-    google:
-      type: gcs                       # no scope: every gs:// location
-      credentials_file: /etc/pivot/gcs-key.json
+secrets:
+  analytics:
+    type: s3
+    scope: s3://analytics/          # this bucket, whatever the prefix
+    region: us-east-1
+    access_key_id: AKIA...
+    secret_access_key: "..."
+    # endpoint: http://localhost:9000   # MinIO / S3-compatible
+  analytics-archive:
+    type: s3
+    scope: s3://analytics/archive/  # more specific: wins under archive/
+    region: us-east-1
+    access_key_id: AKIA...
+    secret_access_key: "..."
+  google:
+    type: gcs                       # no scope: every gs:// location
+    credentials_file: /etc/pivot/gcs-key.json
 ```
 
 A scope is matched whole path segments at a time, so `s3://analytics/warm`
@@ -232,16 +247,15 @@ Each entry under `users` names a user that may connect. Its nested `auth`
 contains exactly one authentication method and that method's fields:
 
 ```yaml
-metastore:
-  users:
-    pivot:
-      auth:
-        method: trust
+users:
+  pivot:
+    auth:
+      method: trust
 
-    analytics:
-      auth:
-        method: scram-sha-256
-        verifier: "pivot-scram-sha-256$4096:8fZ1u...$Wm9tYm..."
+  analytics:
+    auth:
+      method: scram-sha-256
+      verifier: "pivot-scram-sha-256$4096:8fZ1u...$Wm9tYm..."
 ```
 
 The SCRAM verifier is precomputed in PivotDB's
@@ -250,7 +264,7 @@ performs no identity proof: anyone who supplies `pivot` as the user name is
 accepted. Variant-specific fields are enforced, so trust cannot contain a
 verifier and SCRAM cannot omit one.
 
-A user named `pivot` is always served, whatever else the `users` section
+A user named `pivot` is always served, whatever else the `users` map
 defines, so a server is always reachable. It is trusted unless `pivot` is
 defined explicitly, which takes over its authentication method entirely: give it
 a `scram-sha-256` verifier to require a password of it.

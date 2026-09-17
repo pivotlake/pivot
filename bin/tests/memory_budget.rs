@@ -8,11 +8,7 @@ use std::process::Command;
 fn refuses_to_boot_when_the_buffer_pool_does_not_fit_in_free_memory() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("pivot.yaml");
-    std::fs::write(
-        &config,
-        "server:\n  memory: 1000000g\nmetastore:\n  datastores: {}\n",
-    )
-    .unwrap();
+    std::fs::write(&config, "server:\n  memory: 1000000g\n").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
         .arg("server")

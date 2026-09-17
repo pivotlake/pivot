@@ -13,6 +13,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use bin::server::Config;
+use bin::server::config::MetastoreStore;
 use catalog::metastore::Metastore;
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{CatalogFixture, connect_client, select_rows, start_server};
@@ -95,9 +96,10 @@ async fn queries_bind_tables_by_datastore_name() {
     std::fs::write(
         &config_path,
         format!(
-            "server:\n  refresh_interval: 100ms\nmetastore:\n  datastores:\n    default:\n      \
-             kind: pivot\n      location: \"{}\"\n      default: true\n",
+            "server:\n  refresh_interval: 100ms\ndatastores:\n  default:\n    kind: pivot\n    \
+             location: \"{}\"\n    default: true\nmetastore:\n  kind: file\n  path: \"{}\"\n",
             default_dir.path().display(),
+            metastore_path.display(),
         ),
     )
     .unwrap();
@@ -112,10 +114,13 @@ async fn queries_bind_tables_by_datastore_name() {
 
     let port = start_server(64, move |dispatch| {
         let config = Config::open(&config_path).unwrap();
+        let Some(MetastoreStore::File { path }) = config.metastore else {
+            panic!("the config names its metastore file");
+        };
         let metastore = Arc::new(
             DiskMetastore::open(
-                config.metastore,
-                Some(&metastore_path),
+                config.entries,
+                Some(&path),
                 config.server.refresh_interval.as_duration(),
             )
             .unwrap(),
