@@ -5,8 +5,13 @@ sidebar:
   order: 6
 ---
 
-The server reads one YAML file. Unknown fields are rejected, including unknown
-fields nested inside a section.
+The server reads one YAML file, the one `--config` names. Unknown fields are
+rejected, including unknown fields nested inside a section.
+
+The file has a `server` section for the instance, top-level `datastores`,
+`secrets` and `users` maps for what it serves, and a `metastore` section naming
+the file the server writes to. The three maps are the operator's and the server
+never rewrites them; `CREATE USER` lands in the metastore file.
 
 Sizes accept whole bytes or base-1024 `k`, `m`, `g`, and `t` suffixes, such as
 `512m` or `32g`. Durations require a `ms`, `s`, `m`, or `h` suffix, such as
@@ -31,9 +36,10 @@ Every server setting is optional.
 Adding `server.tls` makes TLS available but does not require clients to use it.
 Both `cert` and `key` are required.
 
-### `metastore.datastores`
+### `datastores`
 
-Exactly one datastore must set `default: true`.
+Exactly one datastore, in the config or the metastore file, must set
+`default: true`.
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -47,7 +53,7 @@ Exactly one datastore must set `default: true`.
 | `compact_parallelism` | `1` | Maximum number of disjoint compaction merges rewritten concurrently. Values below one run one merge at a time. Each merge in flight holds its decoded input rows in memory. |
 | `vacuum` | `true` | Deletes expired unreferenced files and old log entries. Enable it in only one process per shared datastore. |
 
-### `metastore.secrets`
+### `secrets`
 
 Secret names are user-defined. `scope` is an optional URI prefix; the most
 specific secret covering a datastore location is selected.
@@ -59,7 +65,7 @@ specific secret covering a datastore location is selected.
 
 Two secrets cannot claim the same scope.
 
-### `metastore.users`
+### `users`
 
 | Authentication method | Configuration |
 | --- | --- |
@@ -68,6 +74,20 @@ Two secrets cannot claim the same scope.
 
 The built-in `pivot` user uses trust authentication unless it is configured
 explicitly.
+
+### `metastore`
+
+The file the server writes to. Optional: without it the server serves the
+config's own entries and refuses `CREATE USER`.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `metastore.kind` | Required | `file` is the only supported value. |
+| `metastore.path` | Required | A YAML file of the same `datastores`, `secrets` and `users` maps as the config, without a `server` or `metastore` section. It must exist, and only the server should be able to read it. |
+
+The config's entries and the file's are served together. A name defined in
+both is a startup error, and `CREATE USER` refuses a name the config defines,
+because the server never rewrites the config.
 
 ### Environment variables
 

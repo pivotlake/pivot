@@ -13,22 +13,18 @@ use metastore_disk::{DiskMetastore, MetastoreConfig};
 use tracing::{error, info};
 
 use crate::memory::{compute_default_pool_bytes, read_memory_pct};
-use crate::server::config::DiskCacheConfig;
+use crate::server::config::{DiskCacheConfig, MetastoreStore};
 use crate::server::{Config, Error, Server, raise_open_file_limit};
 
 /// Options accepted by `pivot server`.
 #[derive(Args, Debug)]
 pub struct ServerOptions {
-    /// Config file (YAML) describing this instance. Its `server` section sets
-    /// the endpoint, memory and worker budgets, and disk cache. Its `metastore`
-    /// section defines the datastores and users served by this process.
+    /// Config file (YAML) describing this instance: its `server` section sets
+    /// the endpoint, memory and worker budgets, and disk cache; `datastores`,
+    /// `secrets` and `users` are what it serves; `metastore` names the file
+    /// the server writes users it is told to create into.
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
-
-    /// A second YAML file holding datastores and users, without a surrounding
-    /// `metastore` key. Its entries are merged with the main config.
-    #[arg(long, value_name = "FILE")]
-    metastore_file: Option<PathBuf>,
 }
 
 /// Targets whose `INFO` output is noise for an operator reading the server log.
@@ -121,17 +117,16 @@ fn build_disk_cache(config: Option<DiskCacheConfig>) -> Option<Arc<dispatch::io:
 }
 
 fn build_metastore(
-    config: MetastoreConfig,
+    entries: MetastoreConfig,
     path: &Path,
-    metastore_file: Option<&Path>,
+    store: Option<MetastoreStore>,
     refresh_interval: Duration,
 ) -> Result<Arc<DiskMetastore>, Error> {
-    let metastore =
-        DiskMetastore::open(config, metastore_file, refresh_interval).map_err(|source| {
-            Error::Metastore {
-                path: path.to_path_buf(),
-                source: Box::new(source),
-            }
+    let metastore_file = store.map(|MetastoreStore::File { path }| path);
+    let metastore = DiskMetastore::open(entries, metastore_file.as_deref(), refresh_interval)
+        .map_err(|source| Error::Metastore {
+            path: path.to_path_buf(),
+            source: Box::new(source),
         })?;
     Ok(Arc::new(metastore))
 }
@@ -198,9 +193,9 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
 
     runtime.block_on(async move {
         let metastore = build_metastore(
-            config.metastore,
+            config.entries,
             &options.config,
-            options.metastore_file.as_deref(),
+            config.metastore,
             server_config.refresh_interval.as_duration(),
         )?;
         let catalog = build_catalog(&options.config, &metastore, dispatch.dispatcher())?;

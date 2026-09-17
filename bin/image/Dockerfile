@@ -29,9 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 ARG TARGETARCH
 COPY --chmod=755 ${TARGETARCH}/pivot /usr/local/bin/pivot
 
-# The image runs out of the box. The config carries only the instance
-# settings; the datastores and users live in the metastore file, which the
-# entrypoint generates on the first boot of a fresh /var/lib/pivot and the
+# The image runs out of the box. The config carries the instance settings and
+# names the metastore file; the datastores and users live in that file, which
+# the entrypoint generates on the first boot of a fresh /var/lib/pivot and the
 # server then owns and rewrites, so CREATE USER works. The generated default
 # datastore comes from PIVOT_DATASTORE: a local directory when unset, or an
 # object store with, for example,
@@ -70,4 +70,4 @@ ENV RUST_LOG=info
 # The pgwire endpoint.
 EXPOSE 5432
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["pivot", "server", "--config", "/etc/pivot/pivot.yaml", "--metastore-file", "/var/lib/pivot/metastore.yaml"]
+CMD ["pivot", "server", "--config", "/etc/pivot/pivot.yaml"]

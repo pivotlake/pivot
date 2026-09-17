@@ -1,18 +1,19 @@
 //! A disk-backed [`catalog::metastore::Metastore`] provider.
 //!
-//! This crate owns the `metastore` section of PivotDB's config file: the
-//! datastores to serve, the secrets they are opened with, and the users that
-//! may connect. The server reads the file, keeps its own `server` section, and
-//! hands this section over as a [`MetastoreConfig`]. The scalars both sections
-//! are written with, [`ByteSize`] and [`Interval`], are defined here too.
+//! This crate owns the `datastores`, `secrets` and `users` maps of PivotDB's
+//! config file: the datastores to serve, the secrets they are opened with, and
+//! the users that may connect. The server reads the file, keeps its own
+//! `server` section, and hands these maps over as a [`MetastoreConfig`]. The
+//! scalars the file is written with, [`ByteSize`] and [`Interval`], are
+//! defined here too.
 //!
-//! A section of the same shape may also live in a file of its own, which the
-//! server names with `--metastore-file` and this crate reads and merges into
-//! the config file's section ([`DiskMetastore::open`]). The two are peers: a
-//! datastore, a secret or a user may be written in either, and the rules below
-//! apply to the merged whole. A name written in both files stops startup rather
-//! than one silently winning, since the two entries are free to disagree about
-//! location or credentials.
+//! The same three maps may also live in a file of their own, the metastore
+//! file, which the config's `metastore` section names and this crate reads and
+//! merges into the config's entries ([`DiskMetastore::open`]). The two are
+//! peers: a datastore, a secret or a user may be written in either, and the
+//! rules below apply to the merged whole. A name written in both files stops
+//! startup rather than one silently winning, since the two entries are free to
+//! disagree about location or credentials.
 //!
 //! Each file's definitions are held as a section of their own, because the two
 //! files are not interchangeable once the server is running: the config file
@@ -47,39 +48,38 @@
 //! catalog names it.
 //!
 //! ```yaml
-//! metastore:
-//!   datastores:
-//!     hot:
-//!       kind: pivot
-//!       location: /var/lib/pivot     # local path -> local store
-//!       default: true                # the current database
-//!     warm:
-//!       kind: pivot
-//!       location: s3://my-bucket/pivot/
-//!       # compact: true              # optional
-//!     cold:
-//!       kind: pivot
-//!       location: gs://my-bucket/pivot/
-//!     lake:
-//!       kind: iceberg
-//!       uri: https://catalog.example.com/api
-//!       warehouse: s3://my-bucket/warehouse/
-//!       secret: lake-catalog          # omit for a catalog needing no auth
-//!   secrets:
-//!     lake-catalog:
-//!       type: iceberg
-//!       credential: client-id:client-secret
-//!     my-bucket:
-//!       type: s3
-//!       scope: s3://my-bucket/       # omit to cover every s3:// location
-//!       region: us-east-1
-//!       access_key_id: AKIA...
-//!       secret_access_key: "..."
-//!       # endpoint: http://localhost:9000   # MinIO / S3-compatible
-//!     google:
-//!       type: gcs
-//!       scope: gs://my-bucket/
-//!       credentials_file: /etc/pivot/gcs-key.json
+//! datastores:
+//!   hot:
+//!     kind: pivot
+//!     location: /var/lib/pivot/datastores/hot   # local path -> local store
+//!     default: true                             # the current database
+//!   warm:
+//!     kind: pivot
+//!     location: s3://my-bucket/pivot/
+//!     # compact: true                           # optional
+//!   cold:
+//!     kind: pivot
+//!     location: gs://my-bucket/pivot/
+//!   lake:
+//!     kind: iceberg
+//!     uri: https://catalog.example.com/api
+//!     warehouse: s3://my-bucket/warehouse/
+//!     secret: lake-catalog          # omit for a catalog needing no auth
+//! secrets:
+//!   lake-catalog:
+//!     type: iceberg
+//!     credential: client-id:client-secret
+//!   my-bucket:
+//!     type: s3
+//!     scope: s3://my-bucket/       # omit to cover every s3:// location
+//!     region: us-east-1
+//!     access_key_id: AKIA...
+//!     secret_access_key: "..."
+//!     # endpoint: http://localhost:9000   # MinIO / S3-compatible
+//!   google:
+//!     type: gcs
+//!     scope: gs://my-bucket/
+//!     credentials_file: /etc/pivot/gcs-key.json
 //! ```
 //!
 //! An `s3://` datastore without a covering secret uses anonymous, unsigned
@@ -95,23 +95,21 @@
 //! user may explicitly be trusted without a password:
 //!
 //! ```yaml
-//! metastore:
-//!   users:
-//!     reader:
-//!       auth:
-//!         method: trust
+//! users:
+//!   reader:
+//!     auth:
+//!       method: trust
 //! ```
 //!
 //! Or it may authenticate with a SCRAM-SHA-256 verifier derived from its
 //! password:
 //!
 //! ```yaml
-//! metastore:
-//!   users:
-//!     analytics:
-//!       auth:
-//!         method: scram-sha-256
-//!         verifier: "pivot-scram-sha-256$4096:cGVwcGVy...$Zm9vYmFy..."
+//! users:
+//!   analytics:
+//!     auth:
+//!       method: scram-sha-256
+//!       verifier: "pivot-scram-sha-256$4096:cGVwcGVy...$Zm9vYmFy..."
 //! ```
 //!
 //! A user named `pivot` is always served, so a server is reachable whatever else
@@ -150,23 +148,24 @@ use serde::{Deserialize, Serialize};
 mod secrets;
 mod units;
 
-use secrets::{SecretConfig, Secrets};
+pub use secrets::SecretConfig;
+use secrets::Secrets;
 pub use units::{ByteSize, Interval};
 
-/// A metastore backed by the config file's `metastore` section, and by the
-/// standalone file merged into it.
+/// A metastore backed by the config file's entries, and by the standalone
+/// metastore file merged into them.
 ///
 /// The configuration is structurally validated by [`open`](Self::open). Object
 /// stores and their Pivot datastores are opened when
 /// [`Metastore::open_datastores`] is called.
 #[derive(Debug)]
 pub struct DiskMetastore {
-    /// The server config file's `metastore` section: the operator's, never
-    /// rewritten, so it needs no lock.
+    /// The server config file's entries: the operator's, never rewritten, so
+    /// they need no lock.
     server_config: MetastoreConfig,
     /// What the metastore file holds: the server's own to rewrite.
     metastore_config: RwLock<MetastoreConfig>,
-    /// The file named by `--metastore-file`.
+    /// The file the config's `metastore` section names.
     metastore_file: Option<PathBuf>,
     /// The secrets of both configs (config file + metastore file) as one set.
     secrets: Arc<Secrets>,
@@ -205,9 +204,8 @@ impl ExternalStoreFactory for SecretExternalStoreFactory {
 }
 
 impl DiskMetastore {
-    /// Build the metastore from the config file's `metastore` section, merged
-    /// with the datastores and users in `metastore_file` when the server was
-    /// given one.
+    /// Build the metastore from the config file's entries, merged with the
+    /// datastores and users in `metastore_file` when the config names one.
     ///
     /// A `metastore_file` that cannot be read stops startup: a metastore file
     /// that was asked for and is not there means datastores or users are
@@ -251,7 +249,8 @@ impl DiskMetastore {
     /// with the user added, then serve the result from memory. A password
     /// becomes a stored SCRAM verifier over a fresh random salt; no password
     /// means [`UserAuth::Trust`]. Requires a metastore file: the server
-    /// config file is the operator's, and the server never rewrites it.
+    /// config file is the operator's, and the server never rewrites it, which
+    /// is also why a name the config defines is refused by that name.
     ///
     /// The metastore file is this server's own, and nothing else writes it,
     /// so the config in memory is authoritative and the rewrite simply
@@ -260,7 +259,12 @@ impl DiskMetastore {
         let Some(path) = &self.metastore_file else {
             return Err(Error::NoMetastoreFile);
         };
-        if username == DEFAULT_USER_NAME || self.server_config.users.contains_key(username) {
+        if self.server_config.users.contains_key(username) {
+            return Err(Error::UserInConfig {
+                name: username.to_string(),
+            });
+        }
+        if username == DEFAULT_USER_NAME {
             return Err(Error::UserExists {
                 name: username.to_string(),
             });
@@ -444,17 +448,17 @@ pub enum Error {
         source: serde_yaml_ng::Error,
     },
     #[error(
-        "datastores defined both in the config file's `metastore` section and in the metastore file: {}",
+        "datastores defined both in the config file and in the metastore file: {}",
         .names.join(", ")
     )]
     ConflictingDatastores { names: Vec<String> },
     #[error(
-        "users defined both in the config file's `metastore` section and in the metastore file: {}",
+        "users defined both in the config file and in the metastore file: {}",
         .names.join(", ")
     )]
     ConflictingUsers { names: Vec<String> },
     #[error(
-        "secrets defined both in the config file's `metastore` section and in the metastore file: {}",
+        "secrets defined both in the config file and in the metastore file: {}",
         .names.join(", ")
     )]
     ConflictingSecrets { names: Vec<String> },
@@ -478,7 +482,11 @@ pub enum Error {
     UnknownIcebergSecret { datastore: String, secret: String },
     #[error("user `{name}` already exists")]
     UserExists { name: String },
-    #[error("creating a user requires a metastore file; start the server with --metastore-file")]
+    #[error("user `{name}` is defined in the config file, which the server never rewrites")]
+    UserInConfig { name: String },
+    #[error(
+        "creating a user requires a metastore file; add a `metastore` section naming one to the config file"
+    )]
     NoMetastoreFile,
     #[error(
         "no default datastore is configured; mark exactly one entry under `datastores` with `default: true`"
@@ -497,7 +505,7 @@ pub enum Error {
 }
 
 /// The datastores and users of a metastore, as written: the config file's
-/// `metastore` section, and the standalone metastore file, share this shape.
+/// top-level entries, and the standalone metastore file, share this shape.
 ///
 /// Unknown keys are rejected: a misspelled `users` section would otherwise be
 /// dropped in silence and unexpectedly select the built-in trusted `pivot` user.
@@ -513,6 +521,21 @@ pub struct MetastoreConfig {
     users: HashMap<String, UserConfig>,
     #[serde(default, serialize_with = "sorted_by_name")]
     secrets: HashMap<String, SecretConfig>,
+}
+
+impl MetastoreConfig {
+    /// Assemble the three maps a config file spells at its top level.
+    pub fn new(
+        datastores: HashMap<String, DatastoreConfig>,
+        secrets: HashMap<String, SecretConfig>,
+        users: HashMap<String, UserConfig>,
+    ) -> Self {
+        Self {
+            datastores,
+            users,
+            secrets,
+        }
+    }
 }
 
 /// Serialize a map's entries in name order.
@@ -547,12 +570,12 @@ fn parse_config(text: &str) -> Result<MetastoreConfig> {
 /// One user and the authentication method nested inside it. Keeping the user as
 /// a struct leaves room for later user-level fields such as roles.
 ///
-/// The verifier is decoded by deserialisation itself (via [`RawUserConfig`]),
+/// The verifier is decoded by deserialisation itself (via `RawUserConfig`),
 /// so a parsed config holds ready [`UserAuth`]s and a malformed verifier fails
 /// the file's parse rather than a login; serialisation re-encodes it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(try_from = "RawUserConfig", into = "RawUserConfig")]
-struct UserConfig {
+pub struct UserConfig {
     auth: UserAuth,
 }
 
@@ -604,10 +627,10 @@ enum UserAuthConfig {
 
 /// One datastore's configuration, by `kind`: the datastore implementation,
 /// which decides what else the entry says. Adding an implementation is a new
-/// variant plus its arm in [`build_datastores`](DiskMetastore::build_datastores).
+/// variant plus its arm in `DiskMetastore::build_datastores`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum DatastoreConfig {
+pub enum DatastoreConfig {
     Pivot(PivotDatastoreConfig),
     Iceberg(IcebergDatastoreConfig),
 }
@@ -629,7 +652,7 @@ impl DatastoreConfig {
 /// secret scoped to each location.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct IcebergDatastoreConfig {
+pub struct IcebergDatastoreConfig {
     /// The catalog's base URI, such as `https://catalog.example.com/api`.
     uri: String,
     /// The warehouse to serve, when the catalog serves several.
@@ -678,7 +701,7 @@ impl IcebergDatastoreConfig {
 /// the datastore itself.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PivotDatastoreConfig {
+pub struct PivotDatastoreConfig {
     location: String,
     /// Marks this datastore as the default: the current database, the target of
     /// unqualified table names and DDL. Exactly one datastore must set it.
@@ -801,8 +824,8 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
-    /// Open a `metastore` section on its own, at whatever refresh cadence the
-    /// tests that do not exercise it would rather not spell out.
+    /// Open a config file's entries on their own, at whatever refresh cadence
+    /// the tests that do not exercise it would rather not spell out.
     fn from_yaml(text: &str) -> Result<DiskMetastore> {
         DiskMetastore::open(parse_config(text)?, None, DEFAULT_REFRESH_INTERVAL)
     }
@@ -874,7 +897,7 @@ mod tests {
         .unwrap()
     }
 
-    /// A minimal config-file `metastore` section: one default datastore.
+    /// Minimal config-file entries: one default datastore.
     const HOT_SECTION: &str =
         "datastores:\n  hot:\n    kind: pivot\n    location: /tmp/hot\n    default: true\n";
 
@@ -1732,7 +1755,7 @@ secrets:
         assert_eq!(cold.location_uri(), "gs://bucket/prefix");
     }
 
-    /// A `metastore` section, and a metastore file, opened as one metastore.
+    /// A config file's entries, and a metastore file, opened as one metastore.
     fn open_merged(section: &str, disk: &str) -> Result<DiskMetastore> {
         let file = metastore_file(disk);
         DiskMetastore::open(
@@ -2040,11 +2063,16 @@ datastores:
         let disk = "users:\n  writer:\n    auth:\n      method: trust\n";
         let (store, _file) = open_with_file(&section, disk);
 
-        for existing in ["reader", "writer", DEFAULT_USER_NAME] {
+        for existing in ["writer", DEFAULT_USER_NAME] {
             let error = store.create_user(existing, None).unwrap_err();
 
             assert!(matches!(error, Error::UserExists { .. }), "{error}");
         }
+        let error = store.create_user("reader", None).unwrap_err();
+        assert!(
+            matches!(&error, Error::UserInConfig { name } if name == "reader"),
+            "{error}"
+        );
     }
 
     #[test]

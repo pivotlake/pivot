@@ -28,13 +28,13 @@ set -eu
 # `docker run pivotlake/pivot --config /my/pivot.yaml` keeps working; no
 # arguments at all fall back to the image's default command.
 if [ $# -eq 0 ]; then
-  set -- pivot server \
-    --config /etc/pivot/pivot.yaml \
-    --metastore-file /var/lib/pivot/metastore.yaml
+  set -- pivot server --config /etc/pivot/pivot.yaml
 elif [ "${1#-}" != "$1" ]; then
   set -- pivot server "$@"
 fi
 
+# The config names the metastore file at this path; both are fixed by the
+# image, so the entrypoint knows them without reading the config.
 METASTORE_FILE=/var/lib/pivot/metastore.yaml
 CONFIG_FILE=/etc/pivot/pivot.yaml
 DISK_CACHE_DIR=/var/cache/pivot

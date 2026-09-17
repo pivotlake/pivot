@@ -112,8 +112,8 @@ mod tests {
         assert!(Args::try_parse_from(["pivot", "server"]).is_err());
         assert!(Args::try_parse_from(["pivot", "server", "install"]).is_err());
 
-        let args = Args::try_parse_from(["pivot", "server", "--config", "/etc/pivot/config.yaml"])
-            .unwrap();
+        let args =
+            Args::try_parse_from(["pivot", "server", "--config", "/etc/pivot/pivot.yaml"]).unwrap();
         assert!(matches!(args.command, PivotCommand::Server(_)));
     }
 }

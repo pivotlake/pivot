@@ -51,7 +51,7 @@ esac
 grep -Fx 'License: MIT or Apache-2.0' \
     "$temporary_directory/root/usr/share/doc/pivot/copyright" >/dev/null ||
     fail 'copyright does not declare the dual license'
-grep -Fx 'ExecStart=/usr/bin/pivot server --config /etc/pivot/config.yaml --metastore-file /var/lib/pivot/metastore.yaml' \
+grep -Fx 'ExecStart=/usr/bin/pivot server --config /etc/pivot/config.yaml' \
     "$temporary_directory/root/lib/systemd/system/pivot.service" >/dev/null ||
     fail 'systemd does not invoke pivot server'
 [ ! -e "$temporary_directory/control/conffiles" ] ||
@@ -59,5 +59,8 @@ grep -Fx 'ExecStart=/usr/bin/pivot server --config /etc/pivot/config.yaml --meta
 grep -F '/var/lib/pivot/datastores/default' \
     "$temporary_directory/root/usr/share/pivot/config.yaml" >/dev/null ||
     fail 'default datastore path is incorrect'
+grep -Fx '  path: /var/lib/pivot/metastore.yaml' \
+    "$temporary_directory/root/usr/share/pivot/config.yaml" >/dev/null ||
+    fail 'config does not name the metastore file'
 
 printf 'Debian package tests passed: %s\n' "$package"

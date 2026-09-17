@@ -1,13 +1,23 @@
+# Pivot server configuration. See config.example.yaml in the repository for
+# every setting.
+#
+# The datastores and users below are the operator's: the server reads them at
+# startup and never rewrites this file. Users created with CREATE USER are
+# written to the metastore file named at the bottom, which the server owns.
 server:
   bind: 127.0.0.1:5432
 
+datastores:
+  default:
+    kind: pivot
+    location: /var/lib/pivot/datastores/default
+    default: true
+
+users:
+  pivot:
+    auth:
+      method: trust
+
 metastore:
-  datastores:
-    default:
-      kind: pivot
-      location: /var/lib/pivot/datastores/default
-      default: true
-  users:
-    pivot:
-      auth:
-        method: trust
+  kind: file
+  path: /var/lib/pivot/metastore.yaml
