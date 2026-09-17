@@ -6,8 +6,9 @@ server:
   # set this to reach the server from beyond loopback.
   bind: 127.0.0.1:5432
 
-  # Buffer-pool budget (suffixes k/m/g/t, base-1024). Defaults to a percentage of
-  # the machine's total memory.
+  # Buffer-pool budget (suffixes k/m/g/t, base-1024). Defaults to 80% of the
+  # machine's total memory (PIVOT_MEMORY_PCT) minus a 4 GiB reserve for
+  # allocations outside the pool.
   # memory: 32g
 
   # Dispatch worker threads. Defaults to the machine's core count.

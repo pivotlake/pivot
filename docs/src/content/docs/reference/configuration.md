@@ -19,7 +19,7 @@ Every server setting is optional.
 | Key | Default | Description |
 | --- | --- | --- |
 | `server.bind` | `127.0.0.1:5432` | Address for the Postgres wire endpoint. |
-| `server.memory` | 80% of total memory | Buffer-pool budget. Overrides `PIVOT_MEMORY_PCT`. |
+| `server.memory` | 80% of total memory minus 4 GiB | Buffer-pool budget. Overrides `PIVOT_MEMORY_PCT`. The 4 GiB is held back for allocations outside the pool. |
 | `server.workers` | Machine core count | Dispatch worker threads. |
 | `server.refresh_interval` | `30s` | How often in-memory catalogs refresh commits made by other processes. |
 | `server.disk_cache.dir` | Required when enabled | Persistent local directory for cached remote reads. |
@@ -73,7 +73,7 @@ explicitly.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `PIVOT_MEMORY_PCT` | `80` | Percentage of total memory used when `server.memory` is omitted. |
+| `PIVOT_MEMORY_PCT` | `80` | Percentage of total memory the buffer pool takes, minus 4 GiB, when `server.memory` or `pivot open --memory` is omitted. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Unset | GCS credentials file used by the ambient credentials chain when no matching GCS secret exists. |
 
 See `server/config.example.yaml` in the repository for a complete annotated

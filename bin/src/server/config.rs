@@ -104,7 +104,8 @@ pub struct ServerConfig {
     /// TCP socket the PostgreSQL endpoint binds to.
     pub bind: SocketAddr,
     /// Memory budget for the buffer pool, such as `32g`. Defaults to a
-    /// percentage of the machine's total memory.
+    /// percentage of the machine's total memory minus a reserve for allocations
+    /// outside the pool, see [`crate::memory::compute_default_pool_bytes`].
     pub memory: Option<ByteSize>,
     /// Number of dispatch worker threads. Defaults to the machine's core count.
     pub workers: Option<usize>,

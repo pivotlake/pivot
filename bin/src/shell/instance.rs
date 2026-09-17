@@ -11,15 +11,18 @@ use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use object_storage::{AmbientExternalStoreFactory, ObjectStore, open_store};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
+use crate::memory::{compute_default_pool_bytes, read_memory_pct};
+
 const MIB: u64 = 1024 * 1024;
 
 /// Optional resource limits for an embedded shell instance.
 ///
 /// Omitted fields keep the production CLI defaults: all available dispatch
-/// workers and half of the machine's physical memory.
+/// workers and the same share of physical memory `pivot server` takes, see
+/// [`compute_default_pool_bytes`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShellLimits {
-    /// Buffer-pool budget in bytes. `None` uses half of physical memory.
+    /// Buffer-pool budget in bytes. `None` uses the default pool budget.
     pub memory_bytes: Option<u64>,
     /// Dispatch worker count. `None` uses every available core.
     pub workers: Option<usize>,
@@ -127,8 +130,8 @@ pub struct ShellInstance {
 }
 
 impl ShellInstance {
-    /// Open the production CLI instance on all available workers with half of
-    /// physical memory assigned to dispatch. `location` is a local directory,
+    /// Open the production CLI instance on all available workers with the
+    /// default pool budget assigned to dispatch. `location` is a local directory,
     /// or an object-store URI (`s3://bucket/prefix`, `gs://bucket/prefix`) whose
     /// credentials come from the environment.
     pub fn open(location: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -148,9 +151,10 @@ impl ShellInstance {
             return Err(ResourceLimitError::NoWorkers.into());
         }
 
-        let memory_bytes = limits
-            .memory_bytes
-            .unwrap_or_else(|| memory().total_memory() / 2);
+        let memory_bytes = match limits.memory_bytes {
+            Some(bytes) => bytes,
+            None => compute_default_pool_bytes(memory().total_memory(), read_memory_pct())?,
+        };
         if memory_bytes < BUFFER_SIZE as u64 {
             return Err(ResourceLimitError::MemoryTooSmall {
                 requested_bytes: memory_bytes,

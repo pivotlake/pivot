@@ -68,6 +68,8 @@ pub enum Error {
     DispatchWorkerFailed(String),
     #[error("dispatch worker died unexpectedly")]
     DispatchWorkerDied,
+    #[error(transparent)]
+    MachineTooSmall(#[from] crate::memory::MachineTooSmall),
     #[error(
         "the buffer pool needs {} GiB but the machine only has {} GiB available right now; \
          every pool slot is faulted in at startup, so booting would be killed by the OOM \
@@ -83,7 +85,7 @@ pub enum Error {
 }
 
 /// Bytes in a gibibyte, the unit memory budgets are reported in.
-const GIB: usize = 1024 * 1024 * 1024;
+const GIB: usize = crate::memory::GIB as usize;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 

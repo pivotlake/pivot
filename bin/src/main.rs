@@ -35,7 +35,8 @@ enum PivotCommand {
         datastore_location: String,
 
         /// Buffer-pool memory budget (suffixes k/m/g/t, base-1024).
-        /// Defaults to half of the machine's physical memory.
+        /// Defaults to 80% of the machine's physical memory (PIVOT_MEMORY_PCT)
+        /// minus a 4 GiB reserve for allocations outside the pool.
         #[arg(long, value_name = "SIZE")]
         memory: Option<ByteSize>,
 
