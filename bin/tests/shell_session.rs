@@ -197,3 +197,25 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
     assert_eq!((ids.value(0), names.value(0)), (1, "alice"));
     assert_eq!((ids.value(1), names.value(1)), (2, "bob"));
 }
+
+#[test]
+fn default_pool_budget_is_the_share_less_the_overhead_reserve() {
+    use bin::memory::{GIB, OVERHEAD_RESERVE_BYTES, compute_default_pool_bytes};
+
+    let pool_bytes = compute_default_pool_bytes(100 * GIB, 80).unwrap();
+
+    assert_eq!(pool_bytes, 80 * GIB - OVERHEAD_RESERVE_BYTES);
+}
+
+#[test]
+fn default_pool_budget_rejects_a_machine_the_reserve_swallows() {
+    use bin::memory::{GIB, compute_default_pool_bytes};
+
+    let error = compute_default_pool_bytes(4 * GIB, 80).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("too little for the default buffer-pool budget")
+    );
+}

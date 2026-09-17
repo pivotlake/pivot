@@ -2,6 +2,8 @@
 //!
 //! - [`execution`]: statement transactions, planning, the plan cache, dispatch,
 //!   cancellation, and command classification, independent of any transport.
+//! - [`memory`]: the default buffer-pool budget both commands size their
+//!   dispatch from.
 //! - [`server`]: the PostgreSQL-wire and HTTP adapters around the executor, and
 //!   the configured foreground process behind `pivot server`.
 //! - [`shell`]: the embedded single-datastore instance and the interactive
@@ -11,5 +13,6 @@
 //! or a [`shell::ShellInstance`] in-process; `src/main.rs` is the only binary.
 
 pub mod execution;
+pub mod memory;
 pub mod server;
 pub mod shell;

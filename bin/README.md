@@ -106,7 +106,7 @@ entirely. `metastore` is the data to serve, and is required.
 ```yaml
 server:
   bind: 0.0.0.0:5432        # default 127.0.0.1:5432
-  memory: 32g               # default: 80% of total RAM (see PIVOT_MEMORY_PCT)
+  memory: 32g               # default: 80% of total RAM minus 4 GiB (see PIVOT_MEMORY_PCT)
   workers: 16               # default: number of cores
   refresh_interval: 30s     # default 30s
   disk_cache:               # cache S3 reads on local disk; omitted means no cache

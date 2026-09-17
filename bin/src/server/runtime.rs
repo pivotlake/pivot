@@ -8,11 +8,11 @@ use std::time::Duration;
 use catalog::PivotCatalog;
 use catalog::metastore::Metastore;
 use clap::Args;
-use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use tracing::{error, info};
 
+use crate::memory::{compute_default_pool_bytes, read_memory_pct};
 use crate::server::config::DiskCacheConfig;
 use crate::server::{Config, Error, Server, raise_open_file_limit};
 
@@ -175,10 +175,7 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
     let disk_cache = build_disk_cache(server_config.disk_cache);
     let pool_bytes = match server_config.memory {
         Some(size) => size.as_bytes() as usize,
-        None => {
-            let memory_pct: usize = get_env_var_with_default("PIVOT_MEMORY_PCT", 80);
-            get_total_memory() * memory_pct / 100
-        }
+        None => compute_default_pool_bytes(get_total_memory() as u64, read_memory_pct())? as usize,
     };
     // The pool is a share of *total* memory, but every one of its slots is
     // faulted in while the workers start, so what it has to fit into is what the
