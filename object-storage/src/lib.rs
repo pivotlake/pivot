@@ -51,8 +51,8 @@ pub enum StoreError {
     #[error("missing credential/config: {0}")]
     Config(String),
     /// A conditional replace lost to a concurrent writer: the object changed
-    /// between the read and the swap. [`update_by_version_swap`] retries on it;
-    /// it surfaces only when the retries are exhausted.
+    /// between the read and the swap. The conditional-update path retries on
+    /// it, so it surfaces only once those retries are exhausted.
     #[error("object `{key}` was changed by another writer")]
     VersionConflict { key: String },
 }
