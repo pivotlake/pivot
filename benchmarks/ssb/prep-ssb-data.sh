@@ -2,10 +2,10 @@
 # prep-ssb-data.sh — sync the SSB parquet dataset from S3 to a local
 # directory (one subdirectory per table), the layout `setup.sql` expects.
 #
-# The canonical datasets are hosted at s3://pivot-benchmarks/ssb/:
-#   s3://pivot-benchmarks/ssb/sf1/           SF1,   ~0.4 GB (smoke tests)
-#   s3://pivot-benchmarks/ssb/sf100/         SF100, ~30 GB, ssb-dbgen row order
-#   s3://pivot-benchmarks/ssb/sf100-sorted/  SF100, ~18 GB, each table sorted
+# The canonical datasets are hosted at $PIVOT_BENCH_S3/ssb/:
+#   $PIVOT_BENCH_S3/ssb/sf1/           SF1,   ~0.4 GB (smoke tests)
+#   $PIVOT_BENCH_S3/ssb/sf100/         SF100, ~30 GB, ssb-dbgen row order
+#   $PIVOT_BENCH_S3/ssb/sf100-sorted/  SF100, ~18 GB, each table sorted
 #                                            by its ClickHouse ORDER BY key
 #
 # The sorted dataset is the interesting one for scan pruning: lineorder is
@@ -46,5 +46,6 @@ done
 root="${root:-$HOME/ssb-$dataset}"
 
 mkdir -p "$root"
-aws s3 sync "s3://pivot-benchmarks/ssb/$dataset/" "$root/"
+bucket="${PIVOT_BENCH_S3:?set PIVOT_BENCH_S3 to the S3 prefix holding the datasets, e.g. s3://my-bucket}"
+aws s3 sync "$bucket/ssb/$dataset/" "$root/"
 echo "ready: --suite ssb --source $root"

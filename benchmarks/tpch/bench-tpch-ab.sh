@@ -193,7 +193,7 @@ sync_pid=$!
 native_db="$(dirname "$data_root")/tpch-native.duckdb"
 native_pid=""
 if [[ "$run_duckdb" == "1" && ! -f "$native_db" ]]; then
-    ( aws s3 cp "s3://pivot-benchmarks/tpch/native/tpch-native-duckdb.tar.zst" - --only-show-errors \
+    ( aws s3 cp "$data_bucket/native/tpch-native-duckdb.tar.zst" - --only-show-errors \
         | tar -I "zstd -T0" -xf - -C "$(dirname "$data_root")" \
         && echo ">>> native duckdb database restored" ) &
     native_pid=$!

@@ -3,7 +3,8 @@
 Google Artifact Registry stores the versioned Debian packages and generates and
 signs the repository metadata served at `https://packages.pivotlake.io/deb`.
 
-Two public APT repositories in `pivot-packages/us` are the release lines:
+Two public APT repositories, in the project and location named by
+`PIVOT_APT_PROJECT` and `PIVOT_APT_LOCATION`, are the release lines:
 
 ```text
 stable   final releases
@@ -46,7 +47,7 @@ release-candidate timestamps remain strictly increasing.
 GitHub repository variables:
 
 ```text
-PIVOT_APT_PROJECT=pivot-packages
+PIVOT_APT_PROJECT=<artifact-registry-project>
 PIVOT_APT_LOCATION=us
 PIVOT_APT_URL=https://packages.pivotlake.io/deb
 ```
@@ -62,13 +63,13 @@ state. The previous GCS objects are retained temporarily as rollback data.
 ## HTTPS endpoint
 
 Artifact Registry's native repository root is
-`https://us-apt.pkg.dev/projects/pivot-packages`. A global external HTTPS load
+`https://<location>-apt.pkg.dev/projects/<project>`. A global external HTTPS load
 balancer exposes the conventional public layout:
 
 ```text
 packages.pivotlake.io/deb/dists/stable/...
                     ↓
-us-apt.pkg.dev/projects/pivot-packages/dists/stable/...
+<location>-apt.pkg.dev/projects/<project>/dists/stable/...
 ```
 
 The same load balancer rewrites the public-key URL to Artifact Registry's

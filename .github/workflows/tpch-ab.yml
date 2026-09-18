@@ -34,12 +34,12 @@ name: TPC-H A/B
 #   TPCH_AB_REGION        (eu-central-1)
 #   TPCH_AB_INSTANCE_TYPE (c8gd.4xlarge) - instance-store NVMe required; keep
 #                         one type so timings stay comparable across runs
-#   TPCH_AB_KEY_NAME      (ec2-key-pair)  - EC2 key pair matching PERF_SSH_KEY
+#   TPCH_AB_KEY_NAME      - EC2 key pair matching PERF_SSH_KEY
 #   TPCH_AB_SUBNET_ID / TPCH_AB_SECURITY_GROUP  (account defaults) - the
 #                         security group must allow ssh from the runner
-#   TPCH_AB_DATA_BUCKET_NORM (s3://pivot-benchmarks/tpch) - the normalized dataset, one
+#   TPCH_AB_DATA_BUCKET_NORM - the normalized dataset, one
 #                         directory per table under each scale prefix
-#   TPCH_AB_CACHE_PREFIX  (s3://pivot-tpch-flat/tpch-ab-cache) - empty string
+#   TPCH_AB_CACHE_PREFIX  - unset or empty string
 #                         disables warm caches entirely; shared with the flat
 #                         job, since the cached artifacts are whole-workspace
 #                         cargo target dirs and identical either way
@@ -129,6 +129,7 @@ jobs:
           set -euo pipefail
           [ -n "$AMI_ID" ] || { echo "::error::TPCH_AB_AMI_ID is unset; bake one with benchmarks/tpch/bake-tpch-ab-ami.sh"; exit 1; }
           [ -n "$INSTANCE_PROFILE" ] || { echo "::error::TPCH_AB_INSTANCE_PROFILE is unset"; exit 1; }
+          [ -n "$KEY_NAME" ] || { echo "::error::TPCH_AB_KEY_NAME is unset; set it to an EC2 key pair whose private half is in PERF_SSH_KEY"; exit 1; }
 
           # The tag stays under the tpch-ab-* prefix the CI user may
           # terminate; a tag outside it would leak the box.

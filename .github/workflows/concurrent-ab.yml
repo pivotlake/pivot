@@ -19,7 +19,7 @@ name: Concurrency A/B
 #
 # Shares the TPC-H A/B infrastructure: the same baked AMI (TPCH_AB_AMI_ID),
 # secrets, instance profile and cache prefix. The dataset lives beside the
-# TPC-H scales as s3://pivot-benchmarks/clickbench-quarter/ (the first quarter of
+# TPC-H scales as <CONCURRENT_AB_DATA_BUCKET>/clickbench-quarter/ (the first quarter of
 # ClickBench hits.parquet, 24,999,374 rows).
 
 on:
@@ -108,6 +108,7 @@ jobs:
           set -euo pipefail
           [ -n "$AMI_ID" ] || { echo "::error::TPCH_AB_AMI_ID is unset; bake one with benchmarks/tpch/bake-tpch-ab-ami.sh"; exit 1; }
           [ -n "$INSTANCE_PROFILE" ] || { echo "::error::TPCH_AB_INSTANCE_PROFILE is unset"; exit 1; }
+          [ -n "$KEY_NAME" ] || { echo "::error::TPCH_AB_KEY_NAME is unset; set it to an EC2 key pair whose private half is in PERF_SSH_KEY"; exit 1; }
 
           # The tag stays under the tpch-ab-* prefix the CI user may
           # terminate; a tag outside it would leak the box.

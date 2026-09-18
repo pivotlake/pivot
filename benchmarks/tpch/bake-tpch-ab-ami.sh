@@ -16,8 +16,8 @@
 # baked image keeps a token-free remote URL and no credential files.
 #
 # Usage:
-#   GITHUB_TOKEN=ghp_xxx ./bake-tpch-ab-ami.sh --key-name ec2-key-pair \
-#     [--ssh-key ~/ec2-key-pair.pem] \
+#   GITHUB_TOKEN=<token> ./bake-tpch-ab-ami.sh --key-name <ec2-key-pair> \
+#     [--ssh-key ~/<ec2-key-pair>.pem] \
 #     [--region eu-central-1] [--security-group sg-xxx] [--subnet subnet-xxx] \
 #     [--repo Epsio-Labs/pivotdb] [--rust-toolchain stable] [--duckdb 1.5.4]
 

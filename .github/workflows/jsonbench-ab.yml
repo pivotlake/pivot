@@ -30,12 +30,12 @@ name: JSONBench A/B
 #   JSONBENCH_AB_INSTANCE_TYPE (TPCH_AB_INSTANCE_TYPE | c8gd.4xlarge) -
 #       instance-store NVMe required; keep one type so timings stay comparable
 #       across runs.
-#   JSONBENCH_AB_KEY_NAME      (TPCH_AB_KEY_NAME | ec2-key-pair)
+#   JSONBENCH_AB_KEY_NAME      (falls back to TPCH_AB_KEY_NAME)
 #   JSONBENCH_AB_SUBNET_ID / JSONBENCH_AB_SECURITY_GROUP  (TPCH_AB_* | account
 #       defaults) - the security group must allow ssh from the runner.
 #   JSONBENCH_AB_INSTANCE_PROFILE (TPCH_AB_INSTANCE_PROFILE | none) - only
 #       needed for the warm S3 build cache; the public dataset needs no creds.
-#   JSONBENCH_AB_CACHE_PREFIX  (s3://pivot-tpch-flat/jsonbench-ab-cache) - empty
+#   JSONBENCH_AB_CACHE_PREFIX  - unset or empty
 #       string disables warm caches (every run builds cold). The instance
 #       profile must be able to read/write this prefix.
 
@@ -131,6 +131,7 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "$AMI_ID" ] || { echo "::error::no AMI id; set TPCH_AB_AMI_ID (or JSONBENCH_AB_AMI_ID). Bake one with benchmarks/tpch/bake-tpch-ab-ami.sh"; exit 1; }
+          [ -n "$KEY_NAME" ] || { echo "::error::no EC2 key pair; set TPCH_AB_KEY_NAME (or JSONBENCH_AB_KEY_NAME) to a key pair whose private half is in PERF_SSH_KEY"; exit 1; }
 
           args=(--image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1
                 --key-name "$KEY_NAME"

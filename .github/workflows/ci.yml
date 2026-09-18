@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       use_gcp_runner:
-        description: "Run the check matrix on the self-hosted GCP runner (ci-runner-x86). On by default; uncheck to fall back to GitHub-hosted runners."
+        description: "Run the check matrix on the self-hosted GCP runner. On by default; uncheck to fall back to GitHub-hosted runners."
         type: boolean
         default: true
 
@@ -18,8 +18,9 @@ env:
   CARGO_TERM_COLOR: always
   RUSTDOCFLAGS: "-D warnings"
 
-# The self-hosted runners live on the suspended `ci-runner-x86` GCP VM
-# (pivot-ci / me-west1-c) and advertise the `gcp-builder` label. They are
+# The self-hosted runners live on a suspended GCP VM
+# (named by the GCP_PROJECT / GCP_RUNNER_X86 / GCP_RUNNER_ZONE repository
+# variables) and advertise the `gcp-builder` label. They are
 # the default: every push and PR resumes the VM and routes the matrix there, and
 # the box's own hourly suspend-if-unused cron suspends it again once no ci/deploy
 # run is active. A manual workflow_dispatch can opt out (use_gcp_runner=false) to
@@ -38,6 +39,9 @@ jobs:
       - uses: ./.github/actions/resume-gcp-runner
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project: ${{ vars.GCP_PROJECT }}
+          instance: ${{ vars.GCP_RUNNER_X86 }}
+          zone: ${{ vars.GCP_RUNNER_ZONE }}
 
   # Derive the check×crate matrix from ci.sh so the crate/check lists live in
   # exactly one place (shared with local `./ci.sh` runs). Also resolve which
@@ -115,7 +119,7 @@ jobs:
             fi
           done
 
-      # ci-runner-x86 is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
+      # The x86 runner VM is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
       # (GCC bug 95189). Build the C/C++ deps with clang there, like the
       # deploy and pages workflows do; GitHub-hosted runners have a newer,
       # unaffected gcc, so leave them on the default.
@@ -149,7 +153,7 @@ jobs:
             exit 1
           fi
 
-  # NOTE: we deliberately do NOT suspend the VM here. ci-runner-x86 runs an hourly
+  # NOTE: we deliberately do NOT suspend the VM here. It runs an hourly
   # `suspend-if-unused` cron that suspends it only when no ci/deploy run is active
-  # (across pivotdb + epsio). An unconditional stop job here would suspend the box
+  # (across every repo sharing the box). An unconditional stop job here would suspend it
   # out from under a *concurrent* ci/deploy run still using it.

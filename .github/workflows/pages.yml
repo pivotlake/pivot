@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       use_gcp_runner:
-        description: "Build the docs on the self-hosted GCP runner (ci-runner-x86). On by default; uncheck to use a GitHub-hosted runner."
+        description: "Build the docs on the self-hosted GCP runner. On by default; uncheck to use a GitHub-hosted runner."
         type: boolean
         default: true
 
@@ -22,7 +22,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# Like ci.yml, the docs build defaults to the self-hosted `ci-runner-x86` GCP VM
+# Like ci.yml, the docs build defaults to the self-hosted x86 GCP runner VM
 # (gcp-builder label). Pushes to main resume the VM and build there; a manual
 # dispatch can opt out with use_gcp_runner=false. The box's hourly
 # suspend-if-unused cron suspends it again once no run is active.
@@ -37,6 +37,9 @@ jobs:
       - uses: ./.github/actions/resume-gcp-runner
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project: ${{ vars.GCP_PROJECT }}
+          instance: ${{ vars.GCP_RUNNER_X86 }}
+          zone: ${{ vars.GCP_RUNNER_ZONE }}
 
   deploy:
     needs: [start-ci]
@@ -62,7 +65,7 @@ jobs:
       - name: Build documentation
         working-directory: dispatch
         run: |
-          # ci-runner-x86 is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
+          # The x86 runner VM is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
           # (GCC bug 95189). Build the C/C++ deps with clang there; GitHub-hosted
           # runners have a newer, unaffected gcc, so leave them on the default.
           if [ "${{ runner.environment }}" = "self-hosted" ]; then

@@ -43,8 +43,8 @@ on:
 # Required secrets:
 #   GCP_SA_KEY  — JSON key for a service account with objectAdmin on the bucket.
 #                 For use_gcp_runner it also needs to bring the runner VMs online:
-#                 instance-scoped compute.instanceAdmin.v1 on ci-runner-x86 and
-#                 ci-runner-aarch64, plus iam.serviceAccountUser on ci-runner-aarch64's
+#                 instance-scoped compute.instanceAdmin.v1 on both runner VMs,
+#                 plus iam.serviceAccountUser on the ARM VM's
 #                 attached service account (starting a stopped VM requires it).
 # Required repository variables (unless overridden via the `bucket` input):
 #   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
@@ -65,7 +65,8 @@ on:
 #   PIVOT_DOWNLOAD_URL     (variable) how that bucket is reached over HTTPS,
 #                                     e.g. https://storage.googleapis.com/pivot-releases
 # publish_apt additionally uses:
-#   PIVOT_APT_PROJECT       (variable) Artifact Registry project, e.g. pivot-packages
+#   PIVOT_APT_PROJECT       (variable) Artifact Registry project hosting the
+#                           apt repositories
 #   PIVOT_APT_LOCATION      (variable) Artifact Registry location, e.g. us
 #   PIVOT_APT_URL           (variable) public proxy URL, e.g.
 #                                     https://packages.pivotlake.io/deb
@@ -156,8 +157,8 @@ jobs:
             echo "apt_distribution=$apt_distribution"
           } >> "$GITHUB_OUTPUT"
 
-  # Bring the self-hosted GCP VMs online when opted in: ci-runner-x86 (x86_64
-  # binary build) and ci-runner-aarch64 (aarch64 binary build). Each box only
+  # Bring the self-hosted GCP VMs online when opted in: the x86_64
+  # builder and the aarch64 builder. Each box only
   # wakes when something that runs on it is selected. The Docker image job
   # runs on a hosted runner, so it never needs a box.
   start-ci:
@@ -169,6 +170,9 @@ jobs:
       - uses: ./.github/actions/resume-gcp-runner
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project: ${{ vars.GCP_PROJECT }}
+          instance: ${{ vars.GCP_RUNNER_X86 }}
+          zone: ${{ vars.GCP_RUNNER_ZONE }}
 
   start-ci-arm:
     name: Start GCP ARM runner
@@ -179,8 +183,9 @@ jobs:
       - uses: ./.github/actions/resume-gcp-runner
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-          instance: ci-runner-aarch64
-          zone: europe-west3-b
+          project: ${{ vars.GCP_PROJECT }}
+          instance: ${{ vars.GCP_RUNNER_ARM }}
+          zone: ${{ vars.GCP_RUNNER_ARM_ZONE }}
 
   deploy:
     needs: [matrix, version, start-ci, start-ci-arm]
@@ -254,7 +259,7 @@ jobs:
       # package can never drift from the released server. It runs in the
       # packaging image's AlmaLinux 8 environment (glibc 2.28, a current GCC
       # from gcc-toolset), which keeps both artifacts usable on Debian 10+,
-      # Ubuntu 20.04+ and RHEL 8+ and sidesteps ci-runner-x86's gcc 9.4, which
+      # Ubuntu 20.04+ and RHEL 8+ and sidesteps the x86 runner's gcc 9.4, which
       # aws-lc-sys rejects (GCC bug 95189).
       # The profile-use build reads pgo-profiles/ from the context and fails
       # without it, so a release can never silently ship un-PGOed.
@@ -491,7 +496,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=
-          [ -n "$APT_PROJECT" ] || missing="$missing\n  PIVOT_APT_PROJECT (variable): e.g. pivot-packages"
+          [ -n "$APT_PROJECT" ] || missing="$missing\n  PIVOT_APT_PROJECT (variable): the Artifact Registry project"
           [ -n "$APT_LOCATION" ] || missing="$missing\n  PIVOT_APT_LOCATION (variable): e.g. us"
           [ -n "$APT_URL" ] || missing="$missing\n  PIVOT_APT_URL (variable): e.g. https://packages.pivotlake.io/deb"
           if [ -n "$missing" ]; then
@@ -639,6 +644,6 @@ jobs:
           git push --force origin "$tag"
 
   # NOTE: no stop job here. Each self-hosted box runs an hourly if-unused cron
-  # (suspend on ci-runner-x86, stop on ci-runner-aarch64) that only takes it down when
+  # (suspend on the x86 VM, stop on the ARM VM) that only takes it down when
   # no ci/deploy run is active, so it can't be killed out from under a
   # concurrent run — which an unconditional stop job here would do.

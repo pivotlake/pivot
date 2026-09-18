@@ -37,6 +37,9 @@ jobs:
       - uses: ./.github/actions/resume-gcp-runner
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project: ${{ vars.GCP_PROJECT }}
+          instance: ${{ vars.GCP_RUNNER_X86 }}
+          zone: ${{ vars.GCP_RUNNER_ZONE }}
 
   deploy-web:
     name: Deploy the site
@@ -135,6 +138,6 @@ jobs:
             echo "$SITE_URL/docs/ serves the documentation."
           fi
 
-  # NOTE: no stop job. ci-runner-x86 runs an hourly suspend-if-unused cron that
+  # NOTE: no stop job. The runner VM runs an hourly suspend-if-unused cron that
   # only takes the box down when no run is active, so it cannot be suspended out
   # from under a concurrent one.

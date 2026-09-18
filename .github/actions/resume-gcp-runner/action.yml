@@ -12,28 +12,49 @@ inputs:
       compute.instanceAdmin.v1 on the target VM. Starting a stopped VM also
       requires iam.serviceAccountUser on the VM's attached service account.
     required: true
+  project:
+    description: >-
+      GCP project holding the runner VM. Callers pass `vars.GCP_PROJECT`;
+      there is no default, so a fork without that variable fails with a
+      message instead of reaching somebody else's project.
+    required: true
   instance:
     description: Name of the runner VM to bring online.
-    required: false
-    default: ci-runner-x86
+    required: true
   zone:
     description: Zone of the runner VM.
-    required: false
-    default: me-west1-c
+    required: true
 
 runs:
   using: composite
   steps:
+    # `required: true` on an action input is advisory, so the values a wrong
+    # or missing repository variable would leave empty are checked here.
+    - name: Check the runner is addressed
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project }}
+        INSTANCE: ${{ inputs.instance }}
+        ZONE: ${{ inputs.zone }}
+      run: |
+        set -euo pipefail
+        for var in PROJECT INSTANCE ZONE; do
+          if [ -z "${!var}" ]; then
+            echo "::error::resume-gcp-runner: $var is empty; set the matching repository variable (GCP_PROJECT, GCP_RUNNER_X86 / GCP_RUNNER_ARM, GCP_RUNNER_ZONE)"
+            exit 1
+          fi
+        done
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v2
       with:
         credentials_json: ${{ inputs.credentials_json }}
     - uses: google-github-actions/setup-gcloud@v2
       with:
-        project_id: pivot-ci
+        project_id: ${{ inputs.project }}
     - name: Bring ${{ inputs.instance }} online
       shell: bash
       env:
+        PROJECT: ${{ inputs.project }}
         INSTANCE: ${{ inputs.instance }}
         ZONE: ${{ inputs.zone }}
       run: |
@@ -42,18 +63,18 @@ runs:
         # as we come up), so poll until it reaches a state we can act on.
         for _ in $(seq 1 20); do
           status=$(gcloud compute instances describe "$INSTANCE" \
-            --project=pivot-ci --zone="$ZONE" --format='value(status)')
+            --project="$PROJECT" --zone="$ZONE" --format='value(status)')
           echo "Instance status: $status"
           case "$status" in
             RUNNING)
               exit 0 ;;
             SUSPENDED)
               gcloud compute instances resume "$INSTANCE" \
-                --project=pivot-ci --zone="$ZONE"
+                --project="$PROJECT" --zone="$ZONE"
               exit 0 ;;
             TERMINATED)
               gcloud compute instances start "$INSTANCE" \
-                --project=pivot-ci --zone="$ZONE"
+                --project="$PROJECT" --zone="$ZONE"
               exit 0 ;;
             *)
               sleep 15 ;;

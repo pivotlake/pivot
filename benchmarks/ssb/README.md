@@ -9,13 +9,13 @@ in four "flights" of increasing dimensionality.
 ## Data
 
 The datasets are pre-generated (ssb-dbgen → DuckDB → parquet, see the
-provenance notes in prep-ssb-data.sh) and hosted at `s3://pivot-benchmarks/ssb/`:
+provenance notes in prep-ssb-data.sh) and hosted at `$PIVOT_BENCH_S3/ssb/`:
 
 | Dataset | Path | Size |
 |---|---|---|
-| SF1 (smoke tests) | `s3://pivot-benchmarks/ssb/sf1/` | ~0.4 GB |
-| SF100, dbgen row order | `s3://pivot-benchmarks/ssb/sf100/` | ~30 GB |
-| SF100, ClickHouse sort keys | `s3://pivot-benchmarks/ssb/sf100-sorted/` | ~18 GB |
+| SF1 (smoke tests) | `$PIVOT_BENCH_S3/ssb/sf1/` | ~0.4 GB |
+| SF100, dbgen row order | `$PIVOT_BENCH_S3/ssb/sf100/` | ~30 GB |
+| SF100, ClickHouse sort keys | `$PIVOT_BENCH_S3/ssb/sf100-sorted/` | ~18 GB |
 
 ```sh
 ./prep-ssb-data.sh                     # sorted → ~/ssb-sf100-sorted
