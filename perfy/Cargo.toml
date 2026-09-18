@@ -5,7 +5,7 @@ members = ["crates/ibs-annotate", "crates/perfy-server"]
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
-authors = ["Maor Kern"]
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 ibs-annotate = { path = "crates/ibs-annotate" }

@@ -2,7 +2,7 @@
 name = "ibs-annotate"
 edition.workspace = true
 version.workspace = true
-authors.workspace = true
+license.workspace = true
 description = "Rust port of ibs_annotate: AMD IBS perf.data parsing and annotation"
 
 [dependencies]
