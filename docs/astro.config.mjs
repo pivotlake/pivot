@@ -66,6 +66,19 @@ export default defineConfig({
             href: "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap",
           },
         },
+        // Privacy-friendly analytics by Plausible.
+        {
+          tag: "script",
+          attrs: {
+            async: true,
+            src: "https://plausible.io/js/pa-mzBvHvq0jpw3-SL6-9gRy.js",
+          },
+        },
+        {
+          tag: "script",
+          content:
+            "window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};plausible.init()",
+        },
       ],
       // Every entry is a directory under src/content/docs/. Pages order
       // themselves by the `sidebar.order` field in their frontmatter.
