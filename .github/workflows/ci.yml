@@ -31,8 +31,12 @@ jobs:
   # to kick the VM awake here — no SSH/readiness wait required.
   start-ci:
     name: Start GCP runner
-    # Resume on every push/PR; on manual dispatch, only when not opted out.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_gcp_runner }}
+    # Resume on every push to this repository and every pull request opened
+    # against it; on manual dispatch, only when not opted out. Never inside a
+    # fork: the VM and the credential that wakes it are this repository's.
+    if: >-
+      ${{ github.repository == 'pivotlake/pivot'
+          && (github.event_name != 'workflow_dispatch' || inputs.use_gcp_runner) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,9 +62,13 @@ jobs:
         run: echo "cells=$(./ci.sh --matrix)" >> "$GITHUB_OUTPUT"
       - id: runner
         run: |
-          # Default to the self-hosted box; only a dispatch opt-out routes back to
-          # GitHub-hosted runners.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.use_gcp_runner }}" != "true" ]; then
+          # The self-hosted box belongs to this repository: a push to it and a
+          # pull request opened against it, from a branch or a fork, both run
+          # there, and a dispatch can opt out. A workflow running inside a fork
+          # goes to a GitHub-hosted runner, as the box is not its to use.
+          if [ "${{ github.repository }}" != "pivotlake/pivot" ]; then
+            echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.use_gcp_runner }}" != "true" ]; then
             echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
           else
             echo "label=gcp-builder" >> "$GITHUB_OUTPUT"
