@@ -1,10 +1,35 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: Pivot
-Source: https://github.com/Epsio-Labs/pivotdb
+Source: https://github.com/pivotlake/pivot
+Comment: The binary links third-party components statically. Those present in
+ the source tree have their own paragraphs below. The Rust dependencies are
+ fetched at build time rather than shipped as sources, so they have none; they
+ and everything else are inventoried in /usr/share/doc/pivot/NOTICE, which this
+ package installs.
 
 Files: *
 Copyright: 2026 Pivot Lake
 License: MIT or Apache-2.0
+
+Files: duckdb-planner/third_party/nlohmann/*
+Copyright: 2013-2023 Niels Lohmann
+License: MIT
+
+Files: duckdb-planner/duckdb-sources/*
+Copyright: 2018-2026 Stichting DuckDB Foundation
+License: MIT
+Comment: Linked statically, with its parquet, core_functions and icu
+ extensions. DuckDB vendors its own third-party components, which are
+ therefore also present in the binary, among them brotli, fast_float,
+ fastpforlib, fmt, fsst, httplib, hyperloglog, jaro_winkler, lz4, mbedtls,
+ miniz, pcg, pdqsort, re2, skiplist, snappy, snowball, tdigest, thrift,
+ utf8proc, yyjson and zstd. The icu extension embeds International
+ Components for Unicode, under the Unicode License.
+
+Files: arrow-rs/*
+Copyright: 2016-2026 The Apache Software Foundation
+License: Apache-2.0
+Comment: The upstream NOTICE.txt applies and ships with the source.
 
 License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy

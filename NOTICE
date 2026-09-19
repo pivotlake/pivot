@@ -1,0 +1,98 @@
+Pivot
+Copyright 2026 Pivot Lake
+
+Pivot is distributed under the terms of either the MIT license or the
+Apache License, Version 2.0, at your option. See LICENSE-MIT and
+LICENSE-APACHE.
+
+The `pivot` binary links the components below statically, so a distributed
+binary carries their code. Their licenses are listed here as required, and
+their full texts ship with their own sources.
+
+
+Bundled in this repository
+--------------------------
+
+JSON for Modern C++ (nlohmann/json) 3.11.3
+  Copyright (c) 2013-2022 Niels Lohmann
+  MIT license. See duckdb-planner/third_party/nlohmann/LICENSE.MIT, copied
+  unmodified from upstream tag v3.11.3 along with the header itself.
+  Vendored at duckdb-planner/third_party/nlohmann/json.hpp; see the
+  PROVENANCE.md beside it.
+
+
+Linked from submodules
+----------------------
+
+DuckDB
+  Copyright (c) 2018-2026 Stichting DuckDB Foundation
+  MIT license. Source: duckdb-planner/duckdb-sources (a fork of
+  https://github.com/duckdb/duckdb), linked as duckdb_static together with
+  its parquet, core_functions and icu extensions.
+
+  DuckDB vendors its own third-party components, which are therefore also
+  present in the binary, among them brotli, fast_float, fastpforlib, fmt,
+  fsst, httplib, hyperloglog, jaro_winkler, lz4, mbedtls, miniz, pcg,
+  pdqsort, re2, skiplist, snappy, snowball, tdigest, thrift, utf8proc,
+  yyjson and zstd. Their licenses are in
+  duckdb-planner/duckdb-sources/third_party.
+
+  The icu extension embeds International Components for Unicode, which is
+  distributed under the Unicode License.
+
+Apache Arrow (arrow-rs)
+  Copyright 2016-2026 The Apache Software Foundation
+  Apache License 2.0. Source: arrow-rs (a fork of
+  https://github.com/apache/arrow-rs). Its own NOTICE.txt applies and is
+  reproduced with its source; it credits, among others, the chronoutil crate
+  (MIT, Copyright (c) 2020-2022 Oliver Margetts) and the compact-thrift
+  project (Apache 2.0, Copyright Jörn Horstmann).
+
+
+Linked Rust dependencies
+------------------------
+
+The great majority of the Rust dependency tree is licensed MIT or Apache-2.0
+at the user's option. The entries below carry terms that differ from those or
+that require separate attribution.
+
+jemalloc, via tikv-jemallocator
+  Copyright (c) 2002-present Jason Evans and others
+  2-clause BSD license.
+
+ring
+  Apache License 2.0 and ISC. Derived in part from BoringSSL and OpenSSL;
+  the applicable notices ship with the crate's source.
+
+aws-lc-rs and aws-lc-sys
+  ISC, Apache-2.0 and further terms declared by the crates. Derived from
+  AWS-LC, itself derived from BoringSSL and OpenSSL.
+
+rustls, rustls-webpki, rustls-native-certs, rustls-pemfile, hyper-rustls,
+libloading, untrusted
+  ISC, or Apache-2.0 / ISC / MIT at the user's option.
+
+webpki-roots and webpki-root-certs
+  Mozilla's CA certificate trust list, CDLA-Permissive-2.0.
+
+x509-certificate
+  Mozilla Public License 2.0.
+
+The ICU4X crates (icu_collections, icu_locale_core, icu_normalizer,
+icu_properties, icu_provider, litemap, tinystr, writeable, yoke, zerofrom
+and related)
+  Unicode License v3. Copyright (c) The Unicode Consortium.
+
+encoding_rs
+  Apache-2.0 or MIT, and BSD-3-Clause.
+
+brotli, brotli-decompressor, alloc-no-stdlib, alloc-stdlib, bcder, snap,
+subtle, autocxx-bindgen, arrayref
+  BSD-2-Clause or BSD-3-Clause, some dual licensed with MIT.
+
+Snappy, via a fork of the snap crate
+  Copyright (c) 2016 Andrew Gallant
+  BSD-3-Clause.
+
+For the complete, machine-generated inventory of every dependency and its
+license, run `cargo license` or `cargo about generate` over the workspace.

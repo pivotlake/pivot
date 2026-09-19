@@ -98,6 +98,10 @@ install -m 0644 "$repository_root/packaging/debian/pivot.service" \
     "$package_root/lib/systemd/system/pivot.service"
 install -m 0644 "$repository_root/packaging/debian/copyright" \
     "$package_root/usr/share/doc/pivot/copyright"
+# The binary links third-party code statically, so the attribution travels
+# with the package rather than only with the repository.
+install -m 0644 "$repository_root/NOTICE" \
+    "$package_root/usr/share/doc/pivot/NOTICE"
 install -m 0755 "$repository_root/packaging/debian/postinst" "$package_root/DEBIAN/postinst"
 install -m 0755 "$repository_root/packaging/debian/prerm" "$package_root/DEBIAN/prerm"
 install -m 0755 "$repository_root/packaging/debian/postrm" "$package_root/DEBIAN/postrm"
