@@ -12,6 +12,8 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, Thread};
+#[cfg(not(any(debug_assertions, feature = "unbounded-park")))]
+use std::time::Duration;
 
 thread_local! {
     /// This worker's node-local waker. Non-worker threads instead use an owned
@@ -38,6 +40,32 @@ struct ParkSlot {
     /// How to interrupt this worker's ring wait, registered once at worker
     /// startup.
     ring_wake: OnceLock<crate::io::RingWakeHandle>,
+}
+
+/// How long a release build lets a worker sleep without a notification before
+/// it wakes up and runs a pass anyway.
+#[cfg(not(any(debug_assertions, feature = "unbounded-park")))]
+pub const PARK_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Block the calling worker until a notifier unparks it.
+///
+/// Every wake-up is supposed to come from a notifier, and a worker that never
+/// hears one is a bug: some send forgot to notify. Debug builds, and any build
+/// with the `unbounded-park` feature, keep the park unbounded so such a bug
+/// shows up as a hang instead of hiding. A plain release build caps the sleep
+/// at [`PARK_TIMEOUT`]: the same bug then costs one short stall per missed
+/// wake rather than a query stuck for good. The caller already tolerates early
+/// returns, so a timed-out park is handled the same way as a spurious unpark.
+#[cfg(not(any(debug_assertions, feature = "unbounded-park")))]
+fn park() {
+    thread::park_timeout(PARK_TIMEOUT);
+}
+
+/// Block the calling worker until a notifier unparks it. See the release
+/// variant for why this build never times out.
+#[cfg(any(debug_assertions, feature = "unbounded-park"))]
+fn park() {
+    thread::park();
 }
 
 /// Wake-up coordination for the workers in one NUMA node.
@@ -257,6 +285,10 @@ impl WorkerWaker {
     /// A concurrent notification therefore either changes the count observed
     /// here or claims the slot and unparks the thread. A leftover unpark token
     /// can only make a later park return early.
+    ///
+    /// In a plain release build the park itself returns after `PARK_TIMEOUT`
+    /// even without a notification; debug builds and builds with the
+    /// `unbounded-park` feature park until notified.
     pub fn wait_if_unchanged(&self, last_seen: u64, local_idx: usize) -> u64 {
         let slot = &self.slots[local_idx];
         slot.parked.store(true, Ordering::SeqCst);
@@ -269,7 +301,7 @@ impl WorkerWaker {
             }
             return self.wake_count.load(Ordering::SeqCst);
         }
-        thread::park();
+        park();
         if slot.parked.swap(false, Ordering::SeqCst) {
             self.parked_workers.fetch_sub(1, Ordering::SeqCst);
         }
@@ -499,6 +531,22 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+        assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
+    }
+
+    /// Only a release build without `unbounded-park` bounds the park, so this
+    /// runs under `cargo test --release`.
+    #[cfg(not(any(debug_assertions, feature = "unbounded-park")))]
+    #[test]
+    fn release_park_returns_without_a_notification() {
+        let waker = Arc::new(WorkerWaker::new(1));
+        let parked = park_worker(&waker, 0);
+        await_parked(&waker, 1);
+
+        let started = std::time::Instant::now();
+        parked.join().unwrap();
+
+        assert!(started.elapsed() < PARK_TIMEOUT * 10);
         assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
     }
 

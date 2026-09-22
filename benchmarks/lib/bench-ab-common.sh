@@ -225,7 +225,7 @@ build_gen() {
     mkdir -p "$pgo_dir"
     (cd "$dir/benchmarks" && \
         PGO_DIR="$pgo_dir" PGO_GEN_TARGET_DIR=target-pgogen \
-        just pgo-gen-build build --release -p bin --bin pivot && \
+        just pgo-gen-build build --release -p bin --bin pivot --features unbounded-park && \
         CARGO_TARGET_DIR=target-client \
         cargo build --release -p benchmarks --bin pivot-bench)
 }
@@ -257,7 +257,7 @@ build_use() {
     local dir="$1" side="$2"
     (cd "$dir/benchmarks" && \
         PGO_USE_TARGET_DIR=target-pgouse \
-        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release -p bin --bin pivot)
+        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release -p bin --bin pivot --features unbounded-park)
     verify_pgo_applied "$dir" \
         "$dir/benchmarks/target-pgouse/$host_target/release/pivot" \
         "$work_dir/$side-$run_id.profdata" "$side"
@@ -282,7 +282,8 @@ verify_pgo_applied() {
 build_release() {
     local dir="$1"
     (cd "$dir/benchmarks" && \
-        cargo build --release -p bin --bin pivot -p benchmarks --bin pivot-bench)
+        cargo build --release -p bin --bin pivot -p benchmarks --bin pivot-bench \
+            --features bin/unbounded-park)
 }
 
 # Drop the OS page cache (and sync first) so the next read is cold. Needs

@@ -58,6 +58,11 @@ test-util = []
 # loop. Off by default: no per-dataflow state, zero hot-loop overhead. Pulls
 # nix's `process` feature for `gettid`.
 perf = ["nix/process"]
+# Parks an idle worker until it is notified, even in a release build. A plain
+# release build caps the park at `waker::PARK_TIMEOUT` so a missed wake-up costs
+# a short stall instead of a hang; debug builds always park unbounded. Passed by
+# the benchmark builds so a missed wake-up is caught as a hang there too.
+unbounded-park = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

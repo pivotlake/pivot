@@ -77,7 +77,7 @@ build_side() {
         rm -rf "$pgo"
         mkdir -p "$pgo"
         PGO_DIR="$pgo" PGO_GEN_TARGET_DIR=target-pgogen \
-            just pgo-gen-build build --release -p bin --bin pivot
+            just pgo-gen-build build --release -p bin --bin pivot --features unbounded-park
         # The client is a plain build in its own target dir: it takes no
         # profile flags, and sharing a flagged dir would rebuild it for
         # nothing on every flavor switch.
@@ -97,7 +97,7 @@ build_side() {
             --source "$pgo_subset" --iterations 2 --skip-check >/dev/null
         "$llvm_profdata" merge -o "$pgo/merged.profdata" "$pgo"/*.profraw
         PGO_USE_TARGET_DIR=target-pgouse \
-            just pgo-use-with "$pgo/merged.profdata" build --release -p bin --bin pivot
+            just pgo-use-with "$pgo/merged.profdata" build --release -p bin --bin pivot --features unbounded-park
     ) >&2; then
         # Without this the subshell's failure is swallowed by the printf below,
         # and the run only trips at the final existence check, which then names

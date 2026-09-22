@@ -165,7 +165,7 @@ if [[ $regen_profile -eq 1 ]]; then
     begin "building instrumented pivot server"
     ( cd "$crate_dir" \
         && PGO_DIR="$baseline/pgo" PGO_GEN_TARGET_DIR="$working/target-pgogen" \
-           just pgo-gen-build build --profile "$cargo_profile" -p bin --bin pivot )
+           just pgo-gen-build build --profile "$cargo_profile" -p bin --bin pivot --features unbounded-park )
     elapsed "instrumented build"
 
     begin "building the client (plain release, no profile flags)"
@@ -221,7 +221,7 @@ fi
 begin "building profile-use pivot server (--profile $cargo_profile)"
 ( cd "$crate_dir" \
     && PGO_USE_TARGET_DIR="$working/target-pgouse" \
-       just pgo-use-with "$active" build --profile "$cargo_profile" -p bin --bin pivot )
+       just pgo-use-with "$active" build --profile "$cargo_profile" -p bin --bin pivot --features unbounded-park )
 elapsed "profile-use build"
 
 # Tripwire: fail loudly if the profile did not actually apply to the build.

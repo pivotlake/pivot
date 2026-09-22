@@ -59,6 +59,11 @@ nix = { version = "0.31.2", features = ["resource"] }
 # is compiled out and `SET perf = 1` is an accepted no-op, so there is no
 # overhead in a normal build.
 perf = ["dep:libc", "dispatch/perf"]
+# Parks an idle worker until it is notified, even in a release build, instead
+# of the plain release build's `dispatch::waker::PARK_TIMEOUT` cap. Passed by
+# the benchmark builds so a missed wake-up is caught as a hang there, the way
+# it is in a debug build, rather than recovered after a short stall.
+unbounded-park = ["dispatch/unbounded-park"]
 
 [dev-dependencies]
 tokio-postgres = { workspace = true }
