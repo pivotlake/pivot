@@ -132,9 +132,8 @@ fn scratch_dir(source: &Path) -> std::io::Result<tempfile::TempDir> {
 
 /// Start `server_bin` on a free port over an empty scratch datastore,
 /// returning once its listener accepts connections. The catalog starts empty;
-/// the runner sends `CREATE TABLE` over the wire to populate it. Memory
-/// sizing is inherited through the environment: the server reads the same
-/// `PIVOT_MEMORY_PCT` this process was started with.
+/// the runner sends `CREATE TABLE` over the wire to populate it, on the
+/// server's default memory budget.
 ///
 /// `source` is the benchmark's data directory; the scratch datastore is placed
 /// beside it (see [`scratch_dir`]).

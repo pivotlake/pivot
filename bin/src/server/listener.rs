@@ -62,6 +62,10 @@ pub enum Error {
     InvalidCatalog(#[from] catalog::Error),
     #[error(transparent)]
     Tls(#[from] crate::server::tls::Error),
+    #[error(transparent)]
+    DiskCache(#[from] crate::server::config::DiskCacheError),
+    #[error(transparent)]
+    LogFilter(#[from] crate::logging::FilterError),
     #[error("worker watcher panic: {0}")]
     WorkerWatcherPanic(JoinError),
     #[error("dispatch worker failed: {0}")]
@@ -74,7 +78,7 @@ pub enum Error {
         "the buffer pool needs {} GiB but the machine only has {} GiB available right now; \
          every pool slot is faulted in at startup, so booting would be killed by the OOM \
          killer part way through. Free memory on the machine, or lower the budget with the \
-         `server.memory` config key (or the PIVOT_MEMORY_PCT environment variable)",
+         `memory` config key",
         .requested_bytes / GIB,
         .available_bytes / GIB,
     )]

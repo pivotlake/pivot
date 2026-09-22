@@ -1,32 +1,33 @@
-# One file configures a whole instance. `server` is the instance itself, and
-# every setting in it has a default, so the section can be left out entirely.
-# `datastores`, `secrets` and `users` are what the instance serves; they belong
-# to the operator and the server never rewrites them. `metastore` names the
-# file the server writes to, where CREATE USER lands.
+# One file configures a whole instance. Its top level is the instance itself:
+# the resources it runs on. Every one of them has a default. `server` is the
+# endpoint; `datastores`, `secrets` and `users` are
+# what the instance serves, belong to the operator, and are never rewritten;
+# `metastore` names the file the server writes to, where CREATE USER lands.
+
+# Buffer-pool budget: a size (suffixes k/m/g/t, base-1024), or a share of the
+# machine's total memory minus a 4 GiB reserve for allocations outside the
+# pool. Defaults to 80%.
+# memory: 32g
+
+# Dispatch worker threads. Defaults to the machine's core count.
+# workers: 16
+
+# How often each datastore brings itself up to date with its store: the
+# tables it has, and each table's committed files. For shared remote stores,
+# this bounds how stale a query's view of another process's commits can be;
+# this process's own commits are visible immediately. Defaults to 30s.
+datastore_refresh_interval: 30s
+
+# What the server logs, to stdout: a level for everything, such as info (the
+# default) or debug.
+# log: info
+
+# The PostgreSQL endpoint. Every setting has a default, so the section can be
+# left out entirely.
 server:
-  # TCP socket the PostgreSQL endpoint binds to. Defaults to 127.0.0.1:5432, so
-  # set this to reach the server from beyond loopback.
+  # TCP socket the endpoint binds to. Defaults to 127.0.0.1:5432, so set this
+  # to reach the server from beyond loopback.
   bind: 127.0.0.1:5432
-
-  # Buffer-pool budget (suffixes k/m/g/t, base-1024). Defaults to 80% of the
-  # machine's total memory (PIVOT_MEMORY_PCT) minus a 4 GiB reserve for
-  # allocations outside the pool.
-  # memory: 32g
-
-  # Dispatch worker threads. Defaults to the machine's core count.
-  # workers: 16
-
-  # How often the background refresh brings the in-memory table set up to date
-  # with the store. For shared remote stores, this bounds how stale a query's
-  # view of data committed by other processes can be. Defaults to 30s.
-  refresh_interval: 30s
-
-  # Cache remote (S3 / GCS) reads on local disk. The whole section is optional; `dir`
-  # is required once it is present, and the contents survive a restart.
-  # disk_cache:
-  #   dir: /var/cache/pivot
-  #   size: 64g            # default
-  #   max_objects: 65536   # one open file descriptor per cached object
 
   # Certificate to present to a client that asks to encrypt its connection
   # (`psql "sslmode=require"`). Omitted means those requests are turned down and

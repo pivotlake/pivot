@@ -5,9 +5,7 @@
 # The datastores and users are not defined here: they live in the metastore
 # file named at the bottom, which the entrypoint generates on first boot (from
 # PIVOT_DATASTORE and the AWS_* variables) and the server then owns and
-# rewrites, so statements like CREATE USER can persist alongside them. With
-# PIVOT_DISK_CACHE_SIZE set, the entrypoint writes a disk_cache section into
-# the server section below.
+# rewrites, so statements like CREATE USER can persist alongside them.
 server:
   # Beyond loopback, so published container ports reach the server. Loopback
   # inside a container is reachable from nowhere.

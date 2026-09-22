@@ -35,12 +35,12 @@
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //! let config = Config::open("pivot.yaml")?;
-//! let workers = config.server.workers.unwrap_or_else(dispatch::default_worker_count);
+//! let workers = config.workers.unwrap_or_else(dispatch::default_worker_count);
 //! let dispatch = Dispatch::spin_up(workers, 32, None);
 //! let metastore = Arc::new(DiskMetastore::open(
 //!     config.entries,
 //!     None,
-//!     config.server.refresh_interval.as_duration(),
+//!     config.datastore_refresh_interval.as_duration(),
 //! )?);
 //! let catalog = Arc::new(PivotCatalog::new(
 //!     metastore.open_datastores(dispatch.dispatcher())?,

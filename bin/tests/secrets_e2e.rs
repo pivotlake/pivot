@@ -58,7 +58,7 @@ fn start_server_from_config(config_yaml: &str) -> u16 {
                 DiskMetastore::open(
                     config.entries,
                     None,
-                    config.server.refresh_interval.as_duration(),
+                    config.datastore_refresh_interval.as_duration(),
                 )
                 .unwrap(),
             );
@@ -86,8 +86,7 @@ fn start_server_from_config(config_yaml: &str) -> u16 {
 /// test's own.
 fn datastores_section(root: &str) -> String {
     format!(
-        "server:
-  refresh_interval: 100ms
+        "datastore_refresh_interval: 100ms
 datastores:
   warm:
     kind: pivot

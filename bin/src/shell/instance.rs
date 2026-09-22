@@ -12,7 +12,7 @@ use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use object_storage::{AmbientExternalStoreFactory, ObjectStore, open_store};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
-use crate::memory::{compute_default_pool_bytes, read_memory_pct};
+use crate::memory::MemoryBudget;
 use crate::shell::ShellTarget;
 
 const MIB: u64 = 1024 * 1024;
@@ -21,11 +21,11 @@ const MIB: u64 = 1024 * 1024;
 ///
 /// Omitted fields keep the production CLI defaults: all available dispatch
 /// workers and the same share of physical memory `pivot server` takes, see
-/// [`compute_default_pool_bytes`].
+/// [`MemoryBudget::default`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShellLimits {
-    /// Buffer-pool budget in bytes. `None` uses the default pool budget.
-    pub memory_bytes: Option<u64>,
+    /// Buffer-pool budget. `None` uses the default pool budget.
+    pub memory: Option<MemoryBudget>,
     /// Dispatch worker count. `None` uses every available core.
     pub workers: Option<usize>,
 }
@@ -155,10 +155,10 @@ impl ShellInstance {
             return Err(ResourceLimitError::NoWorkers.into());
         }
 
-        let memory_bytes = match limits.memory_bytes {
-            Some(bytes) => bytes,
-            None => compute_default_pool_bytes(memory().total_memory(), read_memory_pct())?,
-        };
+        let memory_bytes = limits
+            .memory
+            .unwrap_or_default()
+            .resolve(memory().total_memory())?;
         if memory_bytes < BUFFER_SIZE as u64 {
             return Err(ResourceLimitError::MemoryTooSmall {
                 requested_bytes: memory_bytes,

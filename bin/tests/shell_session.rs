@@ -1,15 +1,21 @@
 use arrow_array::{Array, Int64Array, StringViewArray};
 use bin::execution::{Command, ExecuteOptions, StatementOutput};
+use bin::memory::MemoryBudget;
 use bin::shell::{ShellInstance, ShellLimits, ShellTarget};
 use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
 use dispatch::BUFFER_SIZE;
+use metastore_disk::ByteSize;
+
+fn bytes(count: u64) -> Option<MemoryBudget> {
+    Some(MemoryBudget::Bytes(ByteSize::from_bytes(count)))
+}
 
 #[test]
 fn shell_limits_require_at_least_one_worker() {
     let result = ShellInstance::open_with_limits(
         &ShellTarget::pivot("unused"),
         ShellLimits {
-            memory_bytes: Some(BUFFER_SIZE as u64),
+            memory: bytes(BUFFER_SIZE as u64),
             workers: Some(0),
         },
     );
@@ -30,7 +36,7 @@ fn shell_limits_require_at_least_one_memory_slot() {
     let result = ShellInstance::open_with_limits(
         &ShellTarget::pivot("unused"),
         ShellLimits {
-            memory_bytes: Some(BUFFER_SIZE as u64 - 1),
+            memory: bytes(BUFFER_SIZE as u64 - 1),
             workers: Some(1),
         },
     );
@@ -47,7 +53,7 @@ fn shell_limits_reject_a_pool_larger_than_available_memory() {
     let result = ShellInstance::open_with_limits(
         &ShellTarget::pivot("unused"),
         ShellLimits {
-            memory_bytes: Some(u64::MAX),
+            memory: bytes(u64::MAX),
             workers: Some(1),
         },
     );
@@ -75,7 +81,7 @@ fn a_table_can_be_created_in_a_relative_datastore_path() {
             ShellInstance::open_with_limits(
                 &ShellTarget::pivot(location),
                 ShellLimits {
-                    memory_bytes: Some((BUFFER_SIZE * 32) as u64),
+                    memory: bytes((BUFFER_SIZE * 32) as u64),
                     workers: Some(1),
                 },
             )
@@ -214,22 +220,22 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
 
 #[test]
 fn default_pool_budget_is_the_share_less_the_overhead_reserve() {
-    use bin::memory::{GIB, OVERHEAD_RESERVE_BYTES, compute_default_pool_bytes};
+    use bin::memory::{GIB, OVERHEAD_RESERVE_BYTES};
 
-    let pool_bytes = compute_default_pool_bytes(100 * GIB, 80).unwrap();
+    let pool_bytes = MemoryBudget::default().resolve(100 * GIB).unwrap();
 
     assert_eq!(pool_bytes, 80 * GIB - OVERHEAD_RESERVE_BYTES);
 }
 
 #[test]
 fn default_pool_budget_rejects_a_machine_the_reserve_swallows() {
-    use bin::memory::{GIB, compute_default_pool_bytes};
+    use bin::memory::GIB;
 
-    let error = compute_default_pool_bytes(4 * GIB, 80).unwrap_err();
+    let error = MemoryBudget::default().resolve(4 * GIB).unwrap_err();
 
     assert!(
         error
             .to_string()
-            .contains("too little for the default buffer-pool budget")
+            .contains("too little for a buffer-pool budget")
     );
 }

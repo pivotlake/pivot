@@ -17,16 +17,18 @@ cargo install --path bin
 pivot open ./pivot-data
 ```
 
-The CLI uses every available dispatch worker and assigns 50% of physical
-memory to the dispatch buffer pool. Override either resource independently:
+The CLI uses every available dispatch worker and assigns 80% of physical
+memory, minus a 4 GiB reserve for allocations outside the pool, to the dispatch
+buffer pool. Override either resource independently:
 
 ```sh
 pivot open ./pivot-data --memory 8g --workers 4
 ```
 
-`--memory` accepts base-1024 `k`, `m`, `g`, and `t` suffixes. Pivot checks the
-budget against memory currently available before faulting in the pool, and
-exits with an error instead of risking an OOM kill when it does not fit.
+`--memory` accepts base-1024 `k`, `m`, `g`, and `t` suffixes, or a share of
+physical memory such as `50%`. Pivot checks the budget against memory currently
+available before faulting in the pool, and exits with an error instead of
+risking an OOM kill when it does not fit.
 
 ## Datastore directory
 
@@ -97,22 +99,25 @@ One YAML file configures the whole instance. See
 
 #### The config file
 
-`server` is the instance: where it listens and what it may use. Every setting
-there has a default, so the section may be left out entirely. `datastores`,
-`secrets` and `users` are what it serves; they are the operator's, and the
-server never rewrites the file. `metastore` names the file the server does
-write to, where `CREATE USER` lands.
+The top level is the instance: the resources it runs on. Every setting there
+has a default. `server` is the endpoint, which only
+serving has; it too may be left out entirely. `datastores`, `secrets` and
+`users` are what the instance serves; they are the operator's, and the server
+never rewrites the file. `metastore` names the file the server does write to,
+where `CREATE USER` lands.
 
 ```yaml
+memory: 32g                 # default 80%: that share of total RAM minus 4 GiB
+workers: 16                 # default: number of cores
+datastore_refresh_interval: 30s  # default 30s
+log: info                   # default; or debug, or per-target directives
+disk_cache:                 # cache S3 reads on local disk; omitted means no cache
+  dir: /var/cache/pivot     # required once the section is present
+  size: 64g                 # default 64g
+  max_objects: 65536        # default; one open file descriptor per cached object
+
 server:
   bind: 0.0.0.0:5432        # default 127.0.0.1:5432
-  memory: 32g               # default: 80% of total RAM minus 4 GiB (see PIVOT_MEMORY_PCT)
-  workers: 16               # default: number of cores
-  refresh_interval: 30s     # default 30s
-  disk_cache:               # cache S3 reads on local disk; omitted means no cache
-    dir: /var/cache/pivot   # required once the section is present
-    size: 64g               # default 64g
-    max_objects: 65536      # default; one open file descriptor per cached object
   tls:                      # offer SSL to clients that ask; omitted means no SSL
     cert: /etc/pivot/server.crt
     key: /etc/pivot/server.key
@@ -190,10 +195,9 @@ A local datastore directory may be open in only one Pivot process at a time.
 Pivot holds `.pivot.lock` in that directory until shutdown and reports the
 owning PID if another process tries to open it.
 
-The `server` section's `refresh_interval` sets how often the background refresh
-brings the in-memory table set up to date with the store: new Delta versions,
-new files' footers, and, for shared remote stores, tables committed by other
-processes. It bounds how stale a query's view of externally committed data can
+`datastore_refresh_interval` sets how often each datastore brings itself up
+to date with the store: new Delta versions, new files' footers, and, for shared
+remote stores, tables committed by other processes. It bounds how stale a query's view of externally committed data can
 be; this process's own INSERT and compaction publish their commits immediately.
 
 #### Secrets
@@ -269,11 +273,23 @@ defines, so a server is always reachable. It is trusted unless `pivot` is
 defined explicitly, which takes over its authentication method entirely: give it
 a `scram-sha-256` verifier to require a password of it.
 
-Logging is controlled by `RUST_LOG` (defaults to `info`):
+Logging is controlled by the config's `log`. A level applies to everything;
+`tracing` filter directives narrow it per target:
 
-```sh
-RUST_LOG=bin::server=debug,dispatch=info pivot server --config pivot.yaml
+```yaml
+log: debug
 ```
+
+```yaml
+log: info,dispatch=debug
+```
+
+The server writes its log to stdout, where journald and `docker logs` read it.
+
+Every documented setting is in the file; see
+[`config.example.yaml`](config.example.yaml). The switches Pivot's own
+experiments and profiling runs flip stay environment variables the engine
+reads itself, and are not part of the configuration.
 
 ### Connecting
 

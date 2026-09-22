@@ -56,17 +56,10 @@ COPY --chmod=755 ${TARGETARCH}/pivot /usr/local/bin/pivot
 # /var/lib/pivot that brings its own metastore.yaml is served as-is, and one
 # without gets a file generated into it. Mount a file over
 # /etc/pivot/pivot.yaml to reconfigure the instance settings.
-#
-# PIVOT_DISK_CACHE_SIZE (for example 64g) caches remote object-store reads
-# on local disk under /var/cache/pivot, sized to the variable. Unlike the
-# generation-time variables it applies on every boot, by writing the
-# `disk_cache` section of /etc/pivot/pivot.yaml; a mounted config should
-# carry its own disk_cache section instead of setting this.
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY --chmod=644 pivot.yaml /etc/pivot/pivot.yaml
 RUN mkdir -p /var/lib/pivot/datastores/default
 
-ENV RUST_LOG=info
 # The pgwire endpoint.
 EXPOSE 5432
 ENTRYPOINT ["docker-entrypoint.sh"]

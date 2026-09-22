@@ -15,13 +15,6 @@
 # own to rewrite (CREATE USER lands there), and a mounted /var/lib/pivot that
 # already brings one is served as-is. To point an initialised volume
 # somewhere else, edit its metastore.yaml directly.
-#
-# PIVOT_DISK_CACHE_SIZE (for example 64g) turns on the on-disk cache for
-# remote (object store) reads by writing a `disk_cache` section, sized to the
-# variable and caching under /var/cache/pivot, into the server section of
-# /etc/pivot/pivot.yaml. The write happens on every server boot but is
-# idempotent, and a config that already carries its own disk_cache section is
-# refused rather than rewritten: set the size there instead.
 set -eu
 
 # Flags alone select the server command with exactly those flags, so
@@ -33,43 +26,9 @@ elif [ "${1#-}" != "$1" ]; then
   set -- pivot server "$@"
 fi
 
-# The config names the metastore file at this path; both are fixed by the
-# image, so the entrypoint knows them without reading the config.
+# The config names the metastore file at this path, fixed by the image, so
+# the entrypoint knows it without reading the config.
 METASTORE_FILE=/var/lib/pivot/metastore.yaml
-CONFIG_FILE=/etc/pivot/pivot.yaml
-DISK_CACHE_DIR=/var/cache/pivot
-
-configure_disk_cache() {
-  if grep -q '^  disk_cache:' "$CONFIG_FILE"; then
-    # A previous boot of this container already wrote the section (the
-    # container's environment cannot have changed since). Anything else is a
-    # config bringing its own disk_cache, which the environment must not
-    # rewrite behind the operator's back.
-    if grep -qF "    dir: $DISK_CACHE_DIR" "$CONFIG_FILE" &&
-      grep -qF "    size: \"$PIVOT_DISK_CACHE_SIZE\"" "$CONFIG_FILE"; then
-      return 0
-    fi
-    echo "PIVOT_DISK_CACHE_SIZE is set, but $CONFIG_FILE already configures server.disk_cache; set the size there instead" >&2
-    exit 1
-  fi
-  if ! grep -q '^server:' "$CONFIG_FILE"; then
-    echo "PIVOT_DISK_CACHE_SIZE is set, but $CONFIG_FILE has no top-level server section to hold the disk cache" >&2
-    exit 1
-  fi
-  echo "enabling the $PIVOT_DISK_CACHE_SIZE disk cache at $DISK_CACHE_DIR in $CONFIG_FILE" >&2
-  awk -v dir="$DISK_CACHE_DIR" -v size="$PIVOT_DISK_CACHE_SIZE" '
-    { print }
-    /^server:/ {
-      print "  disk_cache:"
-      print "    dir: " dir
-      print "    size: \"" size "\""
-    }
-  ' "$CONFIG_FILE" >"$CONFIG_FILE.tmp"
-  # Replacing the file (rather than editing it in place) means a config
-  # bind-mounted over this path fails loudly here, instead of the entrypoint
-  # quietly rewriting a file on the operator's host.
-  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-}
 
 generate_metastore_file() {
   location="${PIVOT_DATASTORE:-/var/lib/pivot/datastores/default}"
@@ -108,9 +67,6 @@ generate_metastore_file() {
 if [ "$1" = "pivot" ] && [ "${2:-}" = "server" ]; then
   if [ ! -f "$METASTORE_FILE" ]; then
     generate_metastore_file
-  fi
-  if [ -n "${PIVOT_DISK_CACHE_SIZE:-}" ]; then
-    configure_disk_cache
   fi
 fi
 

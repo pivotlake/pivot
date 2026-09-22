@@ -1,23 +1,26 @@
 //! The config file: one YAML file describing a whole instance.
 //!
-//! `server` is [`ServerConfig`] below: the endpoint, the memory and worker
-//! budgets, the disk cache. `datastores`, `secrets` and `users` are the
-//! operator's entries, a [`MetastoreConfig`] written at the top level of the
-//! file: read at startup and never rewritten by the server. `metastore` is
-//! [`MetastoreStore`]: the store the server writes to, a file of the same three
-//! maps that this process owns, where `CREATE USER` lands. All of it is read in
-//! a single pass, so a mistake anywhere is reported with its place in the file
-//! and stops startup.
+//! The top level is the instance: its memory and worker budgets, refresh
+//! cadence, disk cache and log. `server` is [`ServerConfig`] below: the
+//! endpoint.
+//! `datastores`, `secrets` and `users` are the operator's entries, a
+//! [`MetastoreConfig`] written at the top level of the file: read at startup
+//! and never rewritten by the server. `metastore` is [`MetastoreStore`]: the
+//! store the server writes to, a file of the same three maps that this process
+//! owns, where `CREATE USER` lands. All of it is read in a single pass, so a
+//! mistake anywhere is reported with its place in the file and stops startup.
 //!
 //! ```yaml
+//! memory: 32g
+//! workers: 16
+//! datastore_refresh_interval: 30s
+//! log: info
+//! disk_cache:
+//!   dir: /var/cache/pivot
+//!   size: 64g
+//!
 //! server:
 //!   bind: 0.0.0.0:5432
-//!   memory: 32g
-//!   workers: 16
-//!   refresh_interval: 30s
-//!   disk_cache:
-//!     dir: /var/cache/pivot
-//!     size: 64g
 //!   tls:
 //!     cert: /etc/pivot/server.crt
 //!     key: /etc/pivot/server.key
@@ -38,21 +41,26 @@
 //!   path: /var/lib/pivot/metastore.yaml
 //! ```
 //!
-//! Every field of `server` has a default, so the section may be omitted whole.
-//! So may `metastore`: the server then serves the file's own entries and has
-//! nowhere to write, which `CREATE USER` reports. Unknown keys are rejected
-//! rather than ignored: a misspelled setting would otherwise leave the server
-//! running on a default nobody asked for.
+//! Every instance setting and every field of `server` has a default, so any of
+//! them, or the whole `server` section, may be left out. So may `metastore`:
+//! the server then serves the file's own entries and has nowhere to write,
+//! which `CREATE USER` reports. Unknown keys are rejected rather than ignored:
+//! a misspelled setting would otherwise leave the instance running on a
+//! default nobody asked for.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
+use dispatch::io::DiskCache;
 use metastore_disk::{
     ByteSize, DatastoreConfig, Interval, MetastoreConfig, SecretConfig, UserConfig,
 };
 use serde::Deserialize;
+
+use crate::memory::MemoryBudget;
 
 /// The address the PostgreSQL endpoint binds to when `bind` is not set. Loopback
 /// so an unconfigured server is not exposed to the network.
@@ -68,11 +76,33 @@ const DEFAULT_DISK_CACHE_MAX_OBJECTS: usize = 65536;
 ///
 /// Unknown top-level keys are rejected: a section under a misspelled name would
 /// otherwise leave the whole instance on defaults without a word about it.
+///
+/// The fields that are `Option` here are the ones whose default is a property
+/// of the machine (its core count) rather than a constant, so the binary
+/// resolves them at startup instead of baking them in here.
 #[derive(Deserialize)]
 #[serde(from = "RawConfig")]
 pub struct Config {
-    /// The instance itself. Every field has a default, so the section may be
-    /// left out entirely.
+    /// Memory budget for the buffer pool: a size such as `32g`, or a share of
+    /// the machine's total memory such as `80%` (the default) minus a reserve
+    /// for allocations outside the pool, see [`MemoryBudget`].
+    pub memory: MemoryBudget,
+    /// Number of dispatch worker threads. Defaults to the machine's core count.
+    pub workers: Option<usize>,
+    /// How often every datastore brings itself up to date with its store:
+    /// the tables it has, and each table's committed files. For shared remote
+    /// stores, this bounds how stale a query's view of another process's
+    /// commits can be; this process's own commits are visible immediately.
+    pub datastore_refresh_interval: Interval,
+    /// On-disk cache for remote (object store) reads. Omit to disable it; local
+    /// files are never cached, they are read from the filesystem directly.
+    pub disk_cache: Option<DiskCacheConfig>,
+    /// What the process logs, as `tracing` filter directives: a level such as
+    /// `info` or `debug` for everything, or per-target levels such as
+    /// `info,dispatch=debug`. The server writes the log to stdout.
+    pub log: String,
+    /// The endpoint. Every field has a default, so the section may be left out
+    /// entirely.
     pub server: ServerConfig,
     /// The operator's `datastores`, `secrets` and `users`, written at the top
     /// level of the file. Never rewritten by the server.
@@ -82,13 +112,22 @@ pub struct Config {
     pub metastore: Option<MetastoreStore>,
 }
 
-/// The file as written: the three entry maps sit at the top level beside the
-/// sections, and are gathered into [`Config::entries`] once parsed. Spelling
-/// them out here, rather than flattening a [`MetastoreConfig`] in, is what
-/// lets a misspelled top-level key be rejected.
+/// The file as written: the instance settings and the three entry maps sit at
+/// the top level beside the sections, and the maps are gathered into
+/// [`Config::entries`] once parsed. Spelling them out here, rather than
+/// flattening a [`MetastoreConfig`] in, is what lets a misspelled top-level
+/// key be rejected.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    #[serde(default)]
+    memory: MemoryBudget,
+    workers: Option<usize>,
+    #[serde(default = "default_datastore_refresh_interval")]
+    datastore_refresh_interval: Interval,
+    disk_cache: Option<DiskCacheConfig>,
+    #[serde(default = "default_log_filter")]
+    log: String,
     #[serde(default)]
     server: ServerConfig,
     #[serde(default)]
@@ -100,9 +139,22 @@ struct RawConfig {
     metastore: Option<MetastoreStore>,
 }
 
+fn default_datastore_refresh_interval() -> Interval {
+    Interval::from_duration(DEFAULT_REFRESH_INTERVAL)
+}
+
+fn default_log_filter() -> String {
+    crate::logging::DEFAULT_FILTER.to_string()
+}
+
 impl From<RawConfig> for Config {
     fn from(raw: RawConfig) -> Self {
         Self {
+            memory: raw.memory,
+            workers: raw.workers,
+            datastore_refresh_interval: raw.datastore_refresh_interval,
+            disk_cache: raw.disk_cache,
+            log: raw.log,
             server: raw.server,
             entries: MetastoreConfig::new(raw.datastores, raw.secrets, raw.users),
             metastore: raw.metastore,
@@ -145,31 +197,13 @@ impl Config {
     }
 }
 
-/// The `server` section: everything about the instance that is independent of
-/// the data it serves.
-///
-/// The fields that stay `Option` here are the ones whose default is a property
-/// of the machine (its core count, its total memory) rather than a constant, so
-/// the binary resolves them at startup instead of baking them in here.
+/// The `server` section: what only serving the instance has, the PostgreSQL
+/// endpoint.
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     /// TCP socket the PostgreSQL endpoint binds to.
     pub bind: SocketAddr,
-    /// Memory budget for the buffer pool, such as `32g`. Defaults to a
-    /// percentage of the machine's total memory minus a reserve for allocations
-    /// outside the pool, see [`crate::memory::compute_default_pool_bytes`].
-    pub memory: Option<ByteSize>,
-    /// Number of dispatch worker threads. Defaults to the machine's core count.
-    pub workers: Option<usize>,
-    /// How often every datastore brings its in-memory table set up to date with
-    /// the store. For shared remote stores, this bounds how stale a query's view
-    /// of externally committed data can be; this process's own commits are
-    /// visible immediately.
-    pub refresh_interval: Interval,
-    /// On-disk cache for remote (object store) reads. Omit to disable it; local
-    /// files are never cached, they are read from the filesystem directly.
-    pub disk_cache: Option<DiskCacheConfig>,
     /// Certificate the PostgreSQL endpoint presents to a client that asks to
     /// encrypt its connection. Omit to answer every such request with a refusal,
     /// leaving the endpoint plaintext-only.
@@ -180,10 +214,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: DEFAULT_BIND,
-            memory: None,
-            workers: None,
-            refresh_interval: Interval::from_duration(DEFAULT_REFRESH_INTERVAL),
-            disk_cache: None,
             tls: None,
         }
     }
@@ -208,8 +238,8 @@ pub struct TlsConfig {
     pub key: PathBuf,
 }
 
-/// The `server.disk_cache` section. `dir` is required: the section exists to
-/// enable the cache, and a cache with no directory to live in cannot be one.
+/// The `disk_cache` section. `dir` is required: the section exists to enable
+/// the cache, and a cache with no directory to live in cannot be one.
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DiskCacheConfig {
@@ -233,6 +263,27 @@ fn default_disk_cache_max_objects() -> usize {
     DEFAULT_DISK_CACHE_MAX_OBJECTS
 }
 
+impl DiskCacheConfig {
+    /// Open the cache the section describes, creating its directory.
+    pub fn open(&self) -> Result<Arc<DiskCache>, DiskCacheError> {
+        DiskCache::open(self.dir.clone(), self.size.as_bytes(), self.max_objects)
+            .map(Arc::new)
+            .map_err(|source| DiskCacheError {
+                dir: self.dir.clone(),
+                source,
+            })
+    }
+}
+
+/// The disk cache's directory could not be created or read.
+#[derive(Debug, thiserror::Error)]
+#[error("opening the disk cache at `{}`: {source}", .dir.display())]
+pub struct DiskCacheError {
+    dir: PathBuf,
+    #[source]
+    source: std::io::Error,
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
@@ -243,7 +294,7 @@ pub enum Error {
         source: std::io::Error,
     },
     #[error(
-        "parsing config file `{path}`: {source}\nthe file holds a `server` section, the `datastores`, `secrets` and `users` maps, and a `metastore` section naming the file the server writes to"
+        "parsing config file `{path}`: {source}\nthe file holds the instance's settings, a `server` section, the `datastores`, `secrets` and `users` maps, and a `metastore` section naming the file the server writes to"
     )]
     Parse {
         path: String,
@@ -262,10 +313,16 @@ mod tests {
     const DATASTORES_SECTION: &str =
         "datastores:\n  hot:\n    kind: pivot\n    location: /tmp/hot\n    default: true\n";
 
-    /// A file whose `server` section holds `settings`, on top of a minimal
+    /// A file whose top level holds `settings`, on top of a minimal
     /// `datastores` map.
     fn from_yaml_with(settings: &str) -> Result<Config> {
-        Config::from_yaml(&format!("server:\n{settings}{DATASTORES_SECTION}"), "test")
+        Config::from_yaml(&format!("{settings}{DATASTORES_SECTION}"), "test")
+    }
+
+    /// A file whose `server` section holds `settings`, on top of a minimal
+    /// `datastores` map.
+    fn from_yaml_with_server(settings: &str) -> Result<Config> {
+        from_yaml_with(&format!("server:\n{settings}"))
     }
 
     #[test]
@@ -280,38 +337,79 @@ mod tests {
     #[test]
     fn one_file_configures_both_the_instance_and_its_data() {
         let config = from_yaml_with(
-            "  bind: 0.0.0.0:5433\n  memory: 32g\n  workers: 8\n  refresh_interval: 5s\n",
+            "memory: 32g\nworkers: 8\ndatastore_refresh_interval: 5s\nserver:\n  bind: 0.0.0.0:5433\n",
         )
         .unwrap();
         let metastore = DiskMetastore::open(
             config.entries,
             None,
-            config.server.refresh_interval.as_duration(),
+            config.datastore_refresh_interval.as_duration(),
         )
         .unwrap();
 
         assert_eq!(config.server.bind, "0.0.0.0:5433".parse().unwrap());
         assert_eq!(
-            config.server.memory.unwrap().as_bytes(),
-            32 * 1024 * 1024 * 1024
+            config.memory,
+            MemoryBudget::Bytes(ByteSize::from_bytes(32 * 1024 * 1024 * 1024))
         );
-        assert_eq!(config.server.workers, Some(8));
+        assert_eq!(config.workers, Some(8));
         assert_eq!(
-            config.server.refresh_interval.as_duration(),
+            config.datastore_refresh_interval.as_duration(),
             Duration::from_secs(5)
         );
         assert_eq!(metastore.default_datastore_name(), "hot");
     }
 
     #[test]
-    fn an_omitted_server_section_leaves_the_instance_on_defaults() {
+    fn an_omitted_setting_leaves_the_instance_on_its_default() {
         let config = Config::from_yaml(DATASTORES_SECTION, "test").unwrap();
 
         assert_eq!(config.server, ServerConfig::default());
         assert_eq!(config.server.bind, "127.0.0.1:5432".parse().unwrap());
+        assert_eq!(config.memory, MemoryBudget::Percent(80));
+        assert_eq!(config.workers, None);
         assert_eq!(
-            config.server.refresh_interval.as_duration(),
+            config.datastore_refresh_interval.as_duration(),
             DEFAULT_REFRESH_INTERVAL
+        );
+        assert_eq!(config.disk_cache, None);
+    }
+
+    #[test]
+    fn memory_is_a_share_of_the_machine_by_percentage() {
+        let config = from_yaml_with("memory: 50%\n").unwrap();
+
+        assert_eq!(config.memory, MemoryBudget::Percent(50));
+    }
+
+    #[test]
+    fn the_log_filter_defaults_to_info() {
+        let by_default = Config::from_yaml(DATASTORES_SECTION, "test").unwrap();
+        let level = from_yaml_with("log: debug\n").unwrap();
+        let per_target = from_yaml_with("log: info,dispatch=debug\n").unwrap();
+
+        assert_eq!(by_default.log, "info");
+        assert_eq!(level.log, "debug");
+        assert_eq!(per_target.log, "info,dispatch=debug");
+    }
+
+    #[test]
+    fn a_misspelled_setting_is_rejected_rather_than_ignored() {
+        let error = from_yaml_with("wrokers: 8\n").err().unwrap();
+
+        assert!(
+            error.to_string().contains("unknown field `wrokers`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_instance_setting_under_the_server_section_is_rejected() {
+        let error = from_yaml_with_server("  memory: 32g\n").err().unwrap();
+
+        assert!(
+            error.to_string().contains("unknown field `memory`"),
+            "{error}"
         );
     }
 
@@ -366,7 +464,7 @@ mod tests {
 
     #[test]
     fn a_misspelled_section_is_rejected_rather_than_dropped() {
-        let yaml = format!("sever:\n  workers: 8\n{DATASTORES_SECTION}");
+        let yaml = format!("sever:\n  bind: 0.0.0.0:5433\n{DATASTORES_SECTION}");
 
         let error = Config::from_yaml(&yaml, "test").err().unwrap();
 
@@ -378,7 +476,9 @@ mod tests {
 
     #[test]
     fn a_misspelled_server_setting_is_rejected_rather_than_ignored() {
-        let error = from_yaml_with("  bnid: 0.0.0.0:5433\n").err().unwrap();
+        let error = from_yaml_with_server("  bnid: 0.0.0.0:5433\n")
+            .err()
+            .unwrap();
 
         assert!(
             error.to_string().contains("unknown field `bnid`"),
@@ -388,9 +488,9 @@ mod tests {
 
     #[test]
     fn a_disk_cache_takes_its_budgets_from_defaults() {
-        let config = from_yaml_with("  disk_cache:\n    dir: /var/cache/pivot\n").unwrap();
+        let config = from_yaml_with("disk_cache:\n  dir: /var/cache/pivot\n").unwrap();
 
-        let cache = config.server.disk_cache.unwrap();
+        let cache = config.disk_cache.unwrap();
         assert_eq!(cache.dir, PathBuf::from("/var/cache/pivot"));
         assert_eq!(cache.size, DEFAULT_DISK_CACHE_SIZE);
         assert_eq!(cache.max_objects, DEFAULT_DISK_CACHE_MAX_OBJECTS);
@@ -398,7 +498,7 @@ mod tests {
 
     #[test]
     fn a_tls_section_names_the_certificate_to_present() {
-        let config = from_yaml_with(
+        let config = from_yaml_with_server(
             "  tls:\n    cert: /etc/pivot/server.crt\n    key: /etc/pivot/server.key\n",
         )
         .unwrap();
@@ -410,7 +510,7 @@ mod tests {
 
     #[test]
     fn a_certificate_without_its_key_is_rejected() {
-        let error = from_yaml_with("  tls:\n    cert: /etc/pivot/server.crt\n")
+        let error = from_yaml_with_server("  tls:\n    cert: /etc/pivot/server.crt\n")
             .err()
             .expect("a certificate the server cannot prove it holds should be rejected");
 
@@ -419,9 +519,7 @@ mod tests {
 
     #[test]
     fn a_disk_cache_without_a_directory_is_rejected() {
-        let error = from_yaml_with("  disk_cache:\n    size: 8g\n")
-            .err()
-            .unwrap();
+        let error = from_yaml_with("disk_cache:\n  size: 8g\n").err().unwrap();
 
         assert!(error.to_string().contains("missing field `dir`"), "{error}");
     }

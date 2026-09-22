@@ -12,36 +12,19 @@ use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use tracing::{error, info};
 
-use crate::memory::{compute_default_pool_bytes, read_memory_pct};
-use crate::server::config::{DiskCacheConfig, MetastoreStore};
+use crate::server::config::MetastoreStore;
 use crate::server::{Config, Error, Server, raise_open_file_limit};
 
 /// Options accepted by `pivot server`.
 #[derive(Args, Debug)]
 pub struct ServerOptions {
-    /// Config file (YAML) describing this instance: its `server` section sets
-    /// the endpoint, memory and worker budgets, and disk cache; `datastores`,
-    /// `secrets` and `users` are what it serves; `metastore` names the file
-    /// the server writes users it is told to create into.
+    /// Config file (YAML) describing this instance: its memory and worker
+    /// budgets, disk cache and log; a `server` section for the endpoint;
+    /// `datastores`, `secrets` and `users` for what it serves; and
+    /// `metastore` naming the file the server writes users it is told to
+    /// create into.
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
-}
-
-/// Targets whose `INFO` output is noise for an operator reading the server log.
-const QUIET_TARGETS: &str = "delta_kernel=warn,delta_kernel_default_engine=warn";
-
-fn init_tracing() {
-    let requested = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    let filter = tracing_subscriber::EnvFilter::try_new(format!("{QUIET_TARGETS},{requested}"))
-        .unwrap_or_else(|error| {
-            eprintln!("ignoring unparsable RUST_LOG ({requested:?}): {error}");
-            tracing_subscriber::EnvFilter::new(format!("{QUIET_TARGETS},info"))
-        });
-    let ansi = std::io::stdout().is_terminal();
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(ansi)
-        .init();
 }
 
 /// Wait for an interactive interrupt or the termination signal sent by a
@@ -93,29 +76,6 @@ fn read_memory() -> sysinfo::System {
     )
 }
 
-fn build_disk_cache(config: Option<DiskCacheConfig>) -> Option<Arc<dispatch::io::DiskCache>> {
-    let DiskCacheConfig {
-        dir,
-        size,
-        max_objects,
-    } = config?;
-    match dispatch::io::DiskCache::open(dir.clone(), size.as_bytes(), max_objects) {
-        Ok(cache) => {
-            info!(
-                dir = %dir.display(),
-                bytes = size.as_bytes(),
-                max_objects,
-                "disk cache enabled"
-            );
-            Some(Arc::new(cache))
-        }
-        Err(error) => {
-            error!(dir = %dir.display(), "failed to open disk cache, continuing without it: {error}");
-            None
-        }
-    }
-}
-
 fn build_metastore(
     entries: MetastoreConfig,
     path: &Path,
@@ -151,8 +111,13 @@ fn build_catalog(
 
 /// Run a configured server in the foreground until SIGINT or SIGTERM.
 pub fn run(options: ServerOptions) -> Result<(), Error> {
-    init_tracing();
     let config = Config::open(&options.config).map_err(Box::new)?;
+    // The server's log is its stdout: journald and `docker logs` read it there.
+    crate::logging::install(
+        &config.log,
+        std::io::stdout,
+        std::io::stdout().is_terminal(),
+    )?;
     let server_config = config.server;
 
     let tls = server_config
@@ -163,15 +128,24 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
 
     raise_open_file_limit();
 
-    let workers = server_config
+    let workers = config
         .workers
         .unwrap_or_else(dispatch::default_worker_count);
     info!(workers, "initialising dispatch");
-    let disk_cache = build_disk_cache(server_config.disk_cache);
-    let pool_bytes = match server_config.memory {
-        Some(size) => size.as_bytes() as usize,
-        None => compute_default_pool_bytes(get_total_memory() as u64, read_memory_pct())? as usize,
-    };
+    let disk_cache = config
+        .disk_cache
+        .as_ref()
+        .map(|cache| {
+            info!(
+                dir = %cache.dir.display(),
+                bytes = cache.size.as_bytes(),
+                max_objects = cache.max_objects,
+                "disk cache enabled"
+            );
+            cache.open()
+        })
+        .transpose()?;
+    let pool_bytes = config.memory.resolve(get_total_memory() as u64)? as usize;
     // The pool is a share of *total* memory, but every one of its slots is
     // faulted in while the workers start, so what it has to fit into is what the
     // machine has free. Asking for more than that is not a slower server: it is
@@ -196,7 +170,7 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
             config.entries,
             &options.config,
             config.metastore,
-            server_config.refresh_interval.as_duration(),
+            config.datastore_refresh_interval.as_duration(),
         )?;
         let catalog = build_catalog(&options.config, &metastore, dispatch.dispatcher())?;
         let mut server = Server::new(server_config.bind, dispatch, catalog, metastore);

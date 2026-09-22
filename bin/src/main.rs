@@ -3,9 +3,9 @@
 use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
+use bin::memory::MemoryBudget;
 use bin::shell::ShellTarget;
 use clap::{Parser, Subcommand, ValueEnum};
-use metastore_disk::ByteSize;
 
 #[derive(Parser, Debug)]
 #[command(name = "pivot", about = "Pivot command-line tools", version)]
@@ -64,11 +64,11 @@ enum PivotCommand {
         #[arg(long, value_name = "WAREHOUSE")]
         warehouse: Option<String>,
 
-        /// Buffer-pool memory budget (suffixes k/m/g/t, base-1024).
-        /// Defaults to 80% of the machine's physical memory (PIVOT_MEMORY_PCT)
+        /// Buffer-pool memory budget: a size (suffixes k/m/g/t, base-1024), or
+        /// a share of the machine's physical memory such as 80%, the default,
         /// minus a 4 GiB reserve for allocations outside the pool.
         #[arg(long, value_name = "SIZE")]
-        memory: Option<ByteSize>,
+        memory: Option<MemoryBudget>,
 
         /// Number of dispatch worker threads. Defaults to all available cores.
         #[arg(long, value_name = "COUNT")]
@@ -89,7 +89,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => bin::shell::run_with_limits(
             build_shell_target(kind, datastore_location, warehouse)?,
             bin::shell::ShellLimits {
-                memory_bytes: memory.map(ByteSize::as_bytes),
+                memory,
                 workers: workers.map(NonZeroUsize::get),
             },
         ),
