@@ -3,28 +3,30 @@ title: "Datastores & storage credentials"
 description: Connect local and object storage and configure table maintenance.
 ---
 
-A datastore exposes a collection of schemas and tables. Define datastores
-under `metastore.datastores` in the server's YAML configuration.
+A datastore exposes a collection of schemas and tables. Define datastores in
+the top-level `datastores` map of the server's YAML configuration, or in the
+[metastore file](/docs/reference/configuration/#metastore) the server writes
+to.
 
 ## Example
 
 ```yaml
-metastore:
-  datastores:
-    local:
-      kind: pivot
-      location: ./pivot-data
-      default: true
-    lake:
-      kind: pivot
-      location: s3://example-bucket/pivot/
-  secrets:
-    lake-storage:
-      type: s3
-      scope: s3://example-bucket/
-      region: us-east-1
-      access_key_id: replace-me
-      secret_access_key: replace-me
+datastores:
+  local:
+    kind: pivot
+    location: ./pivot-data
+    default: true
+  lake:
+    kind: pivot
+    location: s3://example-bucket/pivot/
+
+secrets:
+  lake-storage:
+    type: s3
+    scope: s3://example-bucket/
+    region: us-east-1
+    access_key_id: replace-me
+    secret_access_key: replace-me
 ```
 
 Replace the bucket and credential values with your own. Tables in `lake` can
@@ -32,7 +34,8 @@ be addressed as `lake.schema.table`.
 
 ## Datastores
 
-Exactly one datastore must set `default: true`.
+Exactly one datastore, in the configuration or the metastore file, must set
+`default: true`.
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -43,7 +46,7 @@ Exactly one datastore must set `default: true`.
 | `compact_bytes` | `64m` | Compaction output target; files strictly below half this size are small-file candidates, and an individual row group may exceed it. |
 | `compact_merge_bytes` | 1.3 times `compact_bytes` | Accumulated small-file bytes that immediately trigger a merge. |
 | `compact_min_files` | `100` | File count at which the small-file balance fallback may merge. |
-| `compact_parallelism` | `3` | Maximum number of disjoint compaction merges rewritten concurrently. Values below one run one merge at a time. Each merge in flight holds its decoded input rows in memory. |
+| `compact_parallelism` | `1` | Maximum number of disjoint compaction merges rewritten concurrently. Values below one run one merge at a time. |
 | `vacuum` | `true` | Deletes expired unreferenced files and old log entries. Enable it in only one process per shared datastore. |
 
 ## Maintenance
@@ -68,27 +71,28 @@ specific secret covering a datastore location is selected.
 
 | Secret type | Keys |
 | --- | --- |
-| `s3` | `type: s3`, optional `scope`, required `region`, `access_key_id`, and `secret_access_key`, plus optional `endpoint` for S3-compatible storage. |
+| `s3` | `type: s3`, optional `scope` and `region`, required `access_key_id` and `secret_access_key`, plus optional `endpoint` for S3-compatible storage. Without a matching secret, S3 uses anonymous, unsigned requests. A missing region is discovered with an unsigned `HeadBucket` request; specify it for compatible endpoints that do not return `x-amz-bucket-region`. |
 | `gcs` | `type: gcs`, optional `scope`, and required `credentials_file`. Without a matching secret, GCS uses ambient Application Default Credentials. |
 
 Two secrets cannot claim the same scope.
 
 ### S3 and compatible storage
 
-An S3 location requires a matching S3 secret. Set `endpoint` for an
-S3-compatible service, such as MinIO. A secret can cover multiple datastores.
+An S3 location without a matching secret is read with anonymous, unsigned
+requests, which suits public buckets. Add an S3 secret to sign requests, and
+set `endpoint` for an S3-compatible service, such as MinIO. A secret can cover
+multiple datastores.
 
 ### Google Cloud Storage
 
-For an explicit credentials file, add a GCS secret under `metastore.secrets`:
+For an explicit credentials file, add a GCS secret under `secrets`:
 
 ```yaml
-metastore:
-  secrets:
-    google:
-      type: gcs
-      scope: gs://example-bucket/
-      credentials_file: /etc/pivot/gcs-key.json
+secrets:
+  google:
+    type: gcs
+    scope: gs://example-bucket/
+    credentials_file: /etc/pivot/gcs-key.json
 ```
 
 Without a matching GCS secret, Pivot uses ambient Application Default

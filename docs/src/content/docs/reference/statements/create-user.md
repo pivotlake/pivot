@@ -5,7 +5,10 @@ sidebar:
   order: 6
 ---
 
-`CREATE USER` adds a login user to the server.
+`CREATE USER` adds a login user to the server. The user is written to the
+[metastore file](/docs/reference/configuration/#metastore), so the statement
+is refused when the configuration names no metastore, and it refuses a name
+the configuration already defines.
 
 ## Example
 
@@ -32,10 +35,6 @@ without checking a password.
 ```sql
 CREATE USER local_analyst;
 ```
-
-For users declared in YAML, configure the authentication method under
-`metastore.users`. Password authentication there uses a precomputed SCRAM
-verifier, not the password itself.
 
 ## Related
 

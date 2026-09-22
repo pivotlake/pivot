@@ -14,18 +14,6 @@ Writes issued between `BEGIN` and `ROLLBACK` are already committed and remain
 in place. Do not rely on these commands for multi-statement atomicity.
 :::
 
-## Example
-
-```sql
-CREATE TABLE transaction_demo (id BIGINT);
-BEGIN;
-INSERT INTO transaction_demo VALUES (1);
-ROLLBACK;
-SELECT count(*) FROM transaction_demo;
-```
-
-The count is `1`. The insert committed when that statement completed.
-
 ## Accepted syntax
 
 ```sql

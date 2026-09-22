@@ -88,9 +88,6 @@ creation.
 Temporary tables, constraints, `CREATE OR REPLACE TABLE`, and
 `CREATE TABLE ... AS SELECT` are not supported.
 
-To populate a new table from a query, create it with an explicit schema, then
-use [INSERT ... SELECT](/docs/reference/statements/insert/#insert-from-a-query).
-
 ## Related
 
 - [Data types](/docs/reference/data-types/)

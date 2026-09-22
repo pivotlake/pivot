@@ -324,40 +324,51 @@ A single morsel of data is typically processed through the entire pipeline of op
 
 <!-- Morsel execution diagram placeholder. -->
 
-On ClickBench, Pivot fetches fewer bytes from beyond the private L1/L2 caches than the other tested engines:
+On ClickBench, hardware-counter estimates indicate that **about 99% of Pivot's
+memory accesses are served by L1 or L2**, with most hitting L1. Keeping data
+hot across successive operations helps the CPU reuse it from these caches.
 
 <figure class="arch-figure">
-<svg viewBox="0 0 920 312" role="img" aria-labelledby="memory-access-title memory-access-desc">
-<title id="memory-access-title">ClickBench L2 refill traffic by engine</title>
-<desc id="memory-access-desc">Horizontal bars on a shared zero-based scale compare bytes fetched from beyond the private L1/L2 caches over 43 ClickBench queries on AWS c8g.4xlarge. Arm PMU l2d_cache_refill counts are multiplied by 64 bytes per cache line. Pivot main 253313c1 with PGO: 1.64 billion refills, approximately 105 GB. DuckDB 1.5.3 native with one warm process: 2.27 billion refills, approximately 145 GB. ClickHouse 26.6.1 MergeTree: 4.57 billion refills, approximately 292 GB. Counts cover only the engine process during hot tries: the mean of tries 2 and 3 per query, summed across all 43 queries. Refills include hardware prefetches and instruction fetches, and may come from the shared system cache or DRAM. DRAM-only traffic could not be measured on this VM. Writebacks are not included. Lower is better.</desc>
-<rect x="40" y="24" width="840" height="264" rx="3" class="arch-panel" />
-<text x="64" y="54" class="arch-title">L2 refill traffic</text>
-<text x="856" y="54" text-anchor="end" class="arch-muted">lower is better</text>
-<text x="64" y="76" class="arch-muted">GB fetched from beyond L2 · 64 bytes per refill</text>
-<line x1="360" y1="100" x2="360" y2="250" class="arch-rule" />
-<line x1="500" y1="100" x2="500" y2="250" class="arch-rule" stroke-dasharray="3 5" />
-<line x1="640" y1="100" x2="640" y2="250" class="arch-rule" stroke-dasharray="3 5" />
-<line x1="780" y1="100" x2="780" y2="250" class="arch-rule" stroke-dasharray="3 5" />
-<text x="64" y="120" class="arch-label">Pivot</text>
-<text x="64" y="138" class="arch-tiny">main 253313c1 · PGO</text>
-<rect x="360" y="114" width="146.94" height="20" rx="1" class="arch-bar-strong" />
-<text x="518.94" y="129" class="arch-label">≈105 GB</text>
-<text x="64" y="176" class="arch-label">DuckDB 1.5.3 native</text>
-<text x="64" y="194" class="arch-tiny">one warm process</text>
-<rect x="360" y="170" width="203.39" height="20" rx="1" class="arch-bar" />
-<text x="575.39" y="185" class="arch-label">≈145 GB</text>
-<text x="64" y="232" class="arch-label">ClickHouse 26.6.1</text>
-<text x="64" y="250" class="arch-tiny">MergeTree</text>
-<rect x="360" y="226" width="409.47" height="20" rx="1" class="arch-bar" />
-<text x="781.47" y="241" class="arch-label">≈292 GB</text>
-<text x="360" y="270" text-anchor="middle" class="arch-tiny">0</text>
-<text x="500" y="270" text-anchor="middle" class="arch-tiny">100</text>
-<text x="640" y="270" text-anchor="middle" class="arch-tiny">200</text>
-<text x="780" y="270" text-anchor="middle" class="arch-tiny">300</text>
+<svg viewBox="0 0 920 280" role="img" aria-labelledby="memory-access-title memory-access-desc">
+<title id="memory-access-title">Pivot's estimated cache access breakdown on ClickBench</title>
+<desc id="memory-access-desc">A stacked bar shows the reported counter-based estimates as percentages of all loads and stores: 97.9 percent hit L1, approximately 1.09 percent are served by L2 after an L1 miss, and 1.01 percent go beyond L2. The shares sum to 100 percent, with 98.99 percent attributed to L1 or L2. L2's share is calculated as 98.99 minus 97.9, using rounded reported rates. These are estimates from hardware-counter ratios, not an exact classification of individual loads and stores. Beyond L2 can mean the shared system cache or DRAM; DRAM-only accesses were not measurable on this VM.</desc>
+<rect x="40" y="24" width="840" height="232" rx="3" class="arch-panel" />
+<text x="64" y="54" class="arch-title">Pivot cache access breakdown</text>
+<text x="856" y="54" text-anchor="end" class="arch-muted">≈99% served by L1 or L2</text>
+<text x="64" y="76" class="arch-muted">Estimated share of all loads and stores</text>
+<!-- One common denominator: 97.9% + 1.09% + 1.01% = 100%. -->
+<rect x="64" y="100" width="775.368" height="24" class="arch-bar-strong" />
+<rect x="839.368" y="100" width="8.6328" height="24" class="arch-bar" />
+<rect x="848.0008" y="100" width="7.9992" height="24" class="arch-inner" />
+<text x="64" y="144" class="arch-tiny">0%</text>
+<text x="856" y="144" text-anchor="end" class="arch-tiny">100%</text>
+<rect x="64" y="164" width="12" height="12" class="arch-bar-strong" />
+<text x="84" y="175" class="arch-label">L1 cache</text>
+<text x="64" y="209" class="arch-title" style="font-size: 28px;">97.9%</text>
+<text x="64" y="233" class="arch-muted">Hit in L1</text>
+<rect x="338" y="164" width="12" height="12" class="arch-bar" />
+<text x="358" y="175" class="arch-label">L2 cache</text>
+<text x="338" y="209" class="arch-title" style="font-size: 28px;">1.09%</text>
+<text x="338" y="233" class="arch-muted">Hit after an L1 miss</text>
+<rect x="610" y="164" width="12" height="12" class="arch-inner" />
+<text x="630" y="175" class="arch-label">Beyond L2 (“cold”)</text>
+<text x="610" y="209" class="arch-title" style="font-size: 28px;">1.01%</text>
+<text x="610" y="233" class="arch-muted">Shared cache or DRAM</text>
 </svg>
-<figcaption>ClickBench, 43 queries, AWS c8g.4xlarge. Arm PMU <code>l2d_cache_refill</code> × 64 bytes, shown in decimal GB. Engine process only: mean of hot tries 2 and 3 per query, summed across all 43 queries.</figcaption>
+<figcaption>ClickBench, 43 queries, AWS c8g.4xlarge. Pivot main 253313c1, PGO; approximately 162 billion loads and stores. Engine process only: mean of hot tries 2 and 3 per query, summed across all 43 queries. Percentages are approximate shares derived from Arm PMU counters.</figcaption>
 </figure>
 
+L2 serves about 52% of L1 misses, which corresponds to approximately 1.09%
+of all accesses. Combined with the 97.9% L1 estimate, this gives 98.99%
+attributed to the two private caches.
 
-#### Utilizing modern NVMEs
+These ratios are estimates: the
+[PMU counters](https://github.com/ARM-software/data/blob/master/pmu/neoverse-v2.json)
+count different kinds of events, including memory operations and cache-refill
+transactions. They do not measure the exact cache hit rate of each load or
+store. “Cold” here means beyond L2; those requests may still hit the shared
+system cache, and this VM did not expose a usable DRAM-only counter.
+
+
+#### Utilizing memory throughput
 ...

@@ -64,21 +64,82 @@ date expressions, and other filters.
 
 ## Joins
 
-Pivot supports inner and left equi-joins, semi and anti joins, and inner range
-joins. An equi-join matches keys using equality; a range join uses inequalities.
+Use `JOIN` in the `FROM` clause to combine rows from two tables. The `ON`
+clause specifies which rows match.
 
-Join table metadata to its column definitions:
+### Inner joins
+
+An `INNER JOIN` returns a row for each matching pair. `JOIN` without a type
+means `INNER JOIN`.
+
+List customers and their orders:
 
 ```sql
-SELECT t.name AS table_name, c.name AS column_name, c.type
-FROM system.tables AS t
-JOIN system.columns AS c ON t.id = c.table_id
-ORDER BY t.name, c.position;
+SELECT c.name, o.id AS order_id
+FROM customers AS c
+JOIN orders AS o ON c.id = o.customer_id;
 ```
 
-An inner join returns matching pairs. A left join also keeps unmatched left
-rows. A semi join keeps left rows that have a match, while an anti join keeps
-left rows that have no match.
+### Left joins
+
+A `LEFT JOIN` also includes rows from the left table that have no match.
+For those rows, columns from the right table are `NULL`.
+
+List all customers, including those without orders:
+
+```sql
+SELECT c.name, o.id AS order_id
+FROM customers AS c
+LEFT JOIN orders AS o ON c.id = o.customer_id;
+```
+
+### Semi joins
+
+A `SEMI JOIN` keeps rows from the left table that have at least one match.
+It returns only columns from the left table, without repeating a left row
+for multiple matches.
+
+List customers who have placed an order:
+
+```sql
+SELECT c.id, c.name
+FROM customers AS c
+SEMI JOIN orders AS o ON c.id = o.customer_id;
+```
+
+### Anti joins
+
+An `ANTI JOIN` keeps rows from the left table that have no match. It returns
+only columns from the left table.
+
+List customers who have never placed an order:
+
+```sql
+SELECT c.id, c.name
+FROM customers AS c
+ANTI JOIN orders AS o ON c.id = o.customer_id;
+```
+
+### Join conditions
+
+Inner, left, semi, and anti joins support equality conditions such as
+`c.id = o.customer_id`. Use `AND` to match on multiple keys or add filters
+to matching pairs, for example `ON c.id = o.customer_id AND o.total > 100`.
+
+An inner join can also match rows using an inequality instead of equality.
+This is called a *range join*. For example, given a `discount_tiers` table
+with `name` and `min_total` columns, find every discount tier each order
+qualifies for:
+
+```sql
+SELECT o.id AS order_id, d.name AS discount_tier
+FROM orders AS o
+JOIN discount_tiers AS d ON o.total >= d.min_total;
+```
+
+Range joins require exactly one `<`, `<=`, `>`, or `>=` comparison between
+numeric, date, or timestamp expressions. Additional join conditions and
+left, semi, or anti range joins are not supported.
 
 ## Grouping and aggregates
 
@@ -123,7 +184,6 @@ SELECT * FROM user_tables WHERE total_rows > 0;
 
 PostgreSQL wire compatibility does not imply support for every PostgreSQL
 query form. The clauses and join forms above describe the supported surface.
-A statement can parse successfully and still require an unsupported plan.
 
 ## Related
 

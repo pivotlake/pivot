@@ -30,9 +30,6 @@ Pass a query after `EXPLAIN` to inspect how Pivot plans to scan, filter, join,
 or aggregate its inputs. The referenced tables must be available to the
 planner.
 
-To include execution statistics while running a query, use
-[`SET pivot_stats`](/docs/reference/statements/set-reset/).
-
 ## Limitations
 
 `EXPLAIN ANALYZE` is not supported. `EXPLAIN` describes a plan; it does not

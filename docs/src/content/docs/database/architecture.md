@@ -426,7 +426,8 @@ Any user or datastore created on one instance is immediately visible to all othe
 
 ## Deployment Architecture
 
-Pivot can run as a standalone SQL shell on top of a [datastore](#datastore) or as a server accepting client connections. Both modes use the same Catalog, Planner, and Dispatch pool, running together in a single process. Cluster deployments with a shared PostgreSQL metastore are planned.
+Pivot can run as a standalone SQL shell on top of a [datastore](#datastore) or as a server accepting client connections. Both modes use the same Catalog, Planner, and Dispatch pool, running together in a single process. Cluster deployments with a shared 
+PostgreSQL metastore are planned.
 
 ### Standalone
 
@@ -465,7 +466,7 @@ queries to the server's query engine; concurrent connections share that
 instance's compute resources.
 
 Create a YAML configuration using the
-[server configuration example](/docs/reference/configuration/#example), then
+[server configuration example](/docs/reference/configuration/#example-configuration), then
 start the server:
 
 ```sh
@@ -479,9 +480,10 @@ psql -h 127.0.0.1 -p 5432 -U pivot
 ```
 
 The `server` configuration controls the listening address, memory budget,
-worker count, and other instance settings. The `metastore` configuration
-defines the datastores, storage credentials, and users available through
-that server. A server can expose multiple datastores and execute queries
+worker count, and other instance settings. The `datastores`, `secrets`, and
+`users` maps define what is available through that server, and the
+`metastore` file holds the entries the server adds itself, such as users
+created with `CREATE USER`. A server can expose multiple datastores and execute queries
 across them.
 
 Separate servers can access the same remote datastores while using their own

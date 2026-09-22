@@ -5,8 +5,10 @@ sidebar:
   order: 7
 ---
 
-`DROP TABLE` removes a table from the catalog. It does not immediately delete
-the table's data files.
+`DROP TABLE` removes a table from the catalog immediately. With `vacuum: true`,
+a running server deletes its stored files on the next hourly
+[vacuum sweep](/docs/reference/server/datastores/#maintenance) after retention
+expires (four hours by default). The standalone shell does not run vacuum.
 
 ## Example
 
@@ -37,8 +39,11 @@ DROP TABLE analytics.events;
 
 ## Limitations
 
-`CASCADE` is not supported. Removing the catalog entry is distinct from
-reclaiming storage; see [datastore maintenance](/docs/reference/server/datastores/#maintenance).
+`CASCADE` is not supported.
+
+Parquet files adopted from outside the table's storage directory with
+[`with_pre_existing_parquets`](/docs/reference/statements/create-table/#adopt-existing-parquet-files)
+are not deleted.
 
 ## Related
 

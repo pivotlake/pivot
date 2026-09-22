@@ -24,12 +24,11 @@ COMPACT [datastore.][schema.]table [FINAL];
 
 ## Compaction behavior
 
-A round keeps merging until no candidate remains. Small files are merged into
-full-size files. Groups of six files with overlapping sort-key ranges are
-re-sorted into narrower, non-overlapping files.
+Regular `COMPACT` merges small files and re-sorts overlapping files until no
+further merges qualify under the normal compaction rules. These rules use
+file sizes, file counts, and the amount of overlap to decide when to merge.
 
 The datastore's compaction settings control output targets and concurrency.
-Each merge in flight holds its decoded input rows in memory.
 
 ## FINAL
 
@@ -37,8 +36,9 @@ Each merge in flight holds its decoded input rows in memory.
 COMPACT events FINAL;
 ```
 
-`FINAL` bypasses the normal size, file-count, balance, and overlap guards. It
-continues rewriting until no two files' sort-key ranges overlap.
+`FINAL` runs a more aggressive compaction. It relaxes the normal merge
+thresholds, merging remaining small files and re-sorting eligible files until
+no two have overlapping sort-key ranges within a partition.
 
 ## Related
 

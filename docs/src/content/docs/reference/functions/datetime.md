@@ -29,7 +29,8 @@ of the statement.
 SELECT now() AS statement_time;
 ```
 
-The result depends on when the statement starts.
+`now()` returns the time the statement started, not the time the function is
+evaluated.
 
 ## date_trunc
 

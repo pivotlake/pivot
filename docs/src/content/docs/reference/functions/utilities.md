@@ -1,6 +1,6 @@
 ---
 title: "Utility functions"
-description: Format byte counts and evict the in-memory compressed cache.
+description: Format byte counts and clear Pivot's data caches.
 sidebar:
   order: 7
 ---
@@ -10,7 +10,7 @@ Utility functions help inspect storage and control the running engine.
 | Function | Result |
 | --- | --- |
 | [format_bytes](#format_bytes) | A byte count formatted as text. |
-| [drop_cache](#drop_cache) | Number of compressed-cache regions evicted. |
+| [drop_cache](#drop_cache) | Number of cache entries evicted. |
 
 ## format_bytes
 
@@ -41,12 +41,12 @@ ORDER BY bytes DESC;
 drop_cache()
 ```
 
-Takes no arguments. Evicts the in-memory compressed cache and returns a
-`BIGINT` count of regions dropped. Calling it changes the running engine's cache
-state.
+Takes no arguments. Clears Pivot's compressed and decompressed memory caches,
+plus its disk cache when configured. Returns a `BIGINT` count of entries
+evicted across these caches.
 
 ```sql
-SELECT drop_cache() AS regions_dropped;
+SELECT drop_cache() AS entries_dropped;
 ```
 
 The result depends on the cache contents at the time of the call.
@@ -54,4 +54,3 @@ The result depends on the cache contents at the time of the call.
 ## Related
 
 - [System tables](/docs/reference/system-tables/)
-- [Server cache configuration](/docs/reference/configuration/#disk-cache)

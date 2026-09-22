@@ -5,8 +5,10 @@ sidebar:
   order: 5
 ---
 
-`VARIANT` stores semi-structured values. Read fields with dot notation or `->`,
-then cast a field when a query needs a scalar SQL value.
+`VARIANT` stores semi-structured values. Read fields with dot notation or `->`.
+Field access returns a `VARIANT`, which Pivot renders as JSON text in query
+results. Cast the field to a SQL type for comparisons, arithmetic, or
+aggregation, or to return a typed value such as `INT`.
 
 | Form | Purpose |
 | --- | --- |
@@ -52,17 +54,20 @@ SELECT doc->'user'->'age' AS age FROM documents;
 ## Scalar casts
 
 ```sql
-CAST(document->'field' AS data_type)
+(document.field)::data_type
 ```
 
-Converts the selected field to a scalar type for filtering, arithmetic, or
-aggregation.
+Field access returns a `VARIANT`, even when the field contains a number or
+string. You must cast it to a SQL type such as `INT` or `VARCHAR` before
+comparing it with a value of that type.
+
+For example, cast the age to `INT` to filter for adults:
 
 ```sql
-SELECT CAST(doc->'user'->'name' AS VARCHAR) AS name
+SELECT (doc.user.age)::INT AS age
 FROM documents
-WHERE CAST(doc->'user'->'age' AS BIGINT) >= 18;
--- name: Ada
+WHERE (doc.user.age)::INT >= 18;
+-- age: 30
 ```
 
 The field value must be compatible with the requested type. A missing field

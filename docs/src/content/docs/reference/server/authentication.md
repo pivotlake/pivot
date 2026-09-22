@@ -3,8 +3,10 @@ title: "Users & authentication"
 description: Configure trusted users and SCRAM password authentication.
 ---
 
-Users are declared under `metastore.users` or added with
-[CREATE USER](/docs/reference/statements/create-user/).
+Users are declared in the top-level `users` map of the server's YAML
+configuration or added with
+[CREATE USER](/docs/reference/statements/create-user/), which stores them in
+the [metastore file](/docs/reference/configuration/#metastore).
 
 ## Example
 
@@ -35,11 +37,10 @@ explicitly.
 Trust accepts the supplied login name without checking a password.
 
 ```yaml
-metastore:
-  users:
-    local_analyst:
-      auth:
-        method: trust
+users:
+  local_analyst:
+    auth:
+      method: trust
 ```
 
 This is a fragment to add to a configuration that also declares its
@@ -57,8 +58,8 @@ omit one.
 
 ## Built-in user
 
-The `pivot` user is always available. Configure it explicitly under
-`metastore.users` to replace its default trust authentication with SCRAM.
+The `pivot` user is always available. Configure it explicitly under `users`
+to replace its default trust authentication with SCRAM.
 
 ## TLS
 
