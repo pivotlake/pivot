@@ -24,7 +24,7 @@ name: Perf A/B
 #       input is used) on the perf box.
 #   PERF_SSH_KEY
 #       Private key authorised for the box's login user.
-# The ClickBench harness fork (Epsio-Labs/ClickBench) is public, so it is
+# The ClickBench harness fork (pivotlake/ClickBench_testing) is public, so it is
 # checked out with the default token — no extra secret needed.
 # Required repository variables:
 #   PERF_AWS_INSTANCE_ID  — the EC2 instance id of the perf box. If empty, a
@@ -63,7 +63,7 @@ on:
         required: false
         default: "5"
       clickbench_ref:
-        description: "Ref of the ClickBench fork (Epsio-Labs/ClickBench) providing the pivot-parquet harness."
+        description: "Ref of the ClickBench fork (pivotlake/ClickBench_testing) providing the pivot-parquet harness."
         required: false
         default: "pivotdb-ab-server-bin"
       run_duckdb:
@@ -112,7 +112,7 @@ jobs:
       - name: Check out ClickBench harness
         uses: actions/checkout@v4
         with:
-          repository: Epsio-Labs/ClickBench
+          repository: pivotlake/ClickBench_testing
           ref: ${{ inputs.clickbench_ref }}
           path: clickbench-src
 
