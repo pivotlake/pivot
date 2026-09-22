@@ -49,6 +49,20 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
     Pivot opens an interactive SQL prompt. The data remains in S3 after you
     exit with `\q`.
+
+    The shell also opens the tables of an Iceberg REST catalog, read-only,
+    with the catalog's namespaces as schemas. Name the catalog by its base
+    URI and pass its credentials in the environment, a bearer token or an
+    OAuth2 client credential:
+
+    ```sh
+    export PIVOT_ICEBERG_CREDENTIAL=client-id:client-secret
+
+    pivot open --kind iceberg https://catalog.example.com/api --warehouse analytics
+    ```
+
+    The tables' files are read with the credentials the catalog vends, or
+    with the same AWS variables as above when it vends none.
   </TabItem>
 
   <TabItem label="Linux service">

@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use arrow_array::Int64Array;
 use bin::execution::{Command, ExecuteOptions, StatementOutput};
-use bin::shell::ShellInstance;
+use bin::shell::{ShellInstance, ShellTarget};
 use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
 
 fn find_table_dir(root: &Path, table: &str) -> PathBuf {
@@ -24,7 +24,7 @@ fn age_file(path: &Path) {
 async fn vacuum_in_shell_reclaims_expired_files_and_dropped_tables() {
     let directory = tempfile::tempdir().unwrap();
     let instance = ShellInstance::open_with_resources(
-        directory.path().to_str().unwrap(),
+        &ShellTarget::pivot(directory.path().to_str().unwrap()),
         1,
         32,
         DEFAULT_REFRESH_INTERVAL,
@@ -111,7 +111,7 @@ async fn vacuum_in_shell_reclaims_expired_files_and_dropped_tables() {
 async fn vacuum_reports_unsupported_forms_and_cleanup_errors() {
     let directory = tempfile::tempdir().unwrap();
     let instance = ShellInstance::open_with_resources(
-        directory.path().to_str().unwrap(),
+        &ShellTarget::pivot(directory.path().to_str().unwrap()),
         1,
         32,
         DEFAULT_REFRESH_INTERVAL,

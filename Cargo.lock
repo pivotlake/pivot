@@ -830,9 +830,13 @@ dependencies = [
  "catalog",
  "clap",
  "core_affinity",
+ "datastore-iceberg",
  "datastore-pivot",
  "dispatch",
  "futures",
+ "iceberg",
+ "iceberg-catalog-rest",
+ "iceberg-storage-opendal",
  "libc",
  "lru",
  "metastore-disk",
@@ -852,6 +856,7 @@ dependencies = [
  "sha2",
  "sysinfo",
  "tempfile",
+ "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
@@ -859,6 +864,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.2.2",
+ "ureq",
+ "url",
 ]
 
 [[package]]

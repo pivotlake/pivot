@@ -143,7 +143,13 @@ fn split_location(location: &str) -> Result<(String, ObjectPath)> {
     };
     let scheme = StoreScheme::of(location).map_err(|error| unsupported(error.to_string()))?;
     if scheme == StoreScheme::Local {
-        let path = local_path(location);
+        // `file:/path`, with one slash, is how the Java catalogs spell a local
+        // file: the minimal form of a file URI, which names the same path as
+        // `file:///path`.
+        let path = match location.strip_prefix("file:/") {
+            Some(rest) if !rest.starts_with('/') => &location["file:".len()..],
+            _ => local_path(location),
+        };
         if !path.starts_with('/') {
             return Err(unsupported(
                 "a local location must be an absolute path".to_string(),
@@ -198,6 +204,21 @@ mod tests {
 
         assert_eq!(root, "/");
         assert_eq!(key.as_str(), "tmp/warehouse/f.parquet");
+    }
+
+    #[test]
+    fn a_single_slash_file_location_names_the_same_path() {
+        let (root, key) = split_location("file:/tmp/warehouse/f.parquet").unwrap();
+
+        assert_eq!(root, "/");
+        assert_eq!(key.as_str(), "tmp/warehouse/f.parquet");
+    }
+
+    #[test]
+    fn a_relative_local_location_is_refused() {
+        let error = split_location("warehouse/f.parquet").unwrap_err();
+
+        assert!(error.to_string().contains("absolute path"), "{error}");
     }
 
     #[test]

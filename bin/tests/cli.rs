@@ -20,6 +20,53 @@ fn open_help_lists_resource_limits() {
 }
 
 #[test]
+fn open_help_lists_the_datastore_kinds_and_the_catalog_credentials() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["open", "--help"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("--kind <KIND>"), "{stdout}");
+    assert!(stdout.contains("--warehouse <NAME>"), "{stdout}");
+    assert!(stdout.contains("--property <KEY=VALUE>"), "{stdout}");
+    assert!(stdout.contains("PIVOT_ICEBERG_TOKEN"), "{stdout}");
+    assert!(stdout.contains("PIVOT_ICEBERG_CREDENTIAL"), "{stdout}");
+}
+
+#[test]
+fn open_rejects_a_catalog_uri_without_the_iceberg_kind() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["open", "https://catalog.example.com/api"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "pivot opened a web address as a datastore"
+    );
+    assert!(stderr.contains("--kind iceberg"), "{stderr}");
+}
+
+#[test]
+fn open_rejects_an_iceberg_flag_on_a_pivot_datastore() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["open", "/tmp/pivot", "--warehouse", "lake"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "pivot accepted --warehouse for a Pivot datastore"
+    );
+    assert!(stderr.contains("--warehouse"), "{stderr}");
+    assert!(stderr.contains("--kind iceberg"), "{stderr}");
+}
+
+#[test]
 fn open_rejects_zero_workers() {
     let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
         .args(["open", "/tmp/pivot", "--workers", "0"])

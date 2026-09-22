@@ -95,6 +95,10 @@ because the server never rewrites the config.
 | --- | --- | --- |
 | `PIVOT_MEMORY_PCT` | `80` | Percentage of total memory the buffer pool takes, minus 4 GiB, when `server.memory` or `pivot open --memory` is omitted. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Unset | GCS credentials file used by the ambient credentials chain when no matching GCS secret exists. |
+| `PIVOT_ICEBERG_TOKEN` | Unset | Bearer token `pivot open --kind iceberg` sends on every request to the Iceberg REST catalog. |
+| `PIVOT_ICEBERG_CREDENTIAL` | Unset | OAuth2 client credential (`client_id:client_secret`) `pivot open --kind iceberg` exchanges for a token at the catalog's token endpoint. Exclusive with `PIVOT_ICEBERG_TOKEN`. |
+| `PIVOT_ICEBERG_OAUTH2_SERVER_URI` | Unset | Token endpoint the credential is exchanged at, when it is not the catalog's own. |
+| `PIVOT_ICEBERG_SCOPE` | Unset | OAuth2 scope requested with the credential. |
 
 See `server/config.example.yaml` in the repository for a complete annotated
 configuration.

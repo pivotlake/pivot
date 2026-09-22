@@ -6,12 +6,14 @@ use std::time::Duration;
 
 use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use datastore_iceberg::IcebergDatastore;
 use datastore_pivot::{DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, PivotDatastore};
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use object_storage::{AmbientExternalStoreFactory, ObjectStore, open_store};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 use crate::memory::{compute_default_pool_bytes, read_memory_pct};
+use crate::shell::ShellTarget;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -102,8 +104,9 @@ struct ShellState {
     executor: crate::execution::Executor,
     catalog: Arc<PivotCatalog>,
     dispatch: DispatchOwner,
-    /// Keeps the datastore lock held until every dispatch worker has joined.
-    datastore: Arc<PivotDatastore>,
+    /// Keeps the datastore (and a Pivot datastore's lock) held until every
+    /// dispatch worker has joined.
+    datastore: Arc<dyn Datastore>,
 }
 
 impl ShellState {
@@ -123,25 +126,26 @@ impl ShellState {
     }
 }
 
-/// An embedded Pivot executor over one persistent Pivot datastore.
+/// An embedded Pivot executor over one datastore: a persistent Pivot
+/// datastore, or the read-only tables of an Iceberg REST catalog.
 pub struct ShellInstance {
     state: Option<ShellState>,
-    location: String,
+    target: ShellTarget,
 }
 
 impl ShellInstance {
     /// Open the production CLI instance on all available workers with the
-    /// default pool budget assigned to dispatch. `location` is a local directory,
-    /// or an object-store URI (`s3://bucket/prefix`, `gs://bucket/prefix`) whose
-    /// credentials come from the environment.
-    pub fn open(location: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::open_with_limits(location, ShellLimits::default())
+    /// default pool budget assigned to dispatch. A Pivot target's object store
+    /// and an Iceberg target's data files are opened with the credentials the
+    /// environment carries.
+    pub fn open(target: &ShellTarget) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::open_with_limits(target, ShellLimits::default())
     }
 
     /// Open with optional production resource limits. Values omitted from
     /// `limits` use the same defaults as [`open`](Self::open).
     pub fn open_with_limits(
-        location: &str,
+        target: &ShellTarget,
         limits: ShellLimits,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let workers = limits
@@ -173,40 +177,48 @@ impl ShellInstance {
 
         let buffers = usize::try_from(memory_bytes / BUFFER_SIZE as u64)
             .map_err(|_| ResourceLimitError::MemoryTooLarge)?;
-        Self::open_with_resources(location, workers, buffers, DEFAULT_REFRESH_INTERVAL)
+        Self::open_with_resources(target, workers, buffers, DEFAULT_REFRESH_INTERVAL)
     }
 
     /// Open with an explicit dispatch shape and refresh cadence. This is useful
     /// for embedding and for small black-box test instances.
     ///
-    /// The instance reloads its tables from the store every `refresh_interval`,
-    /// the same background sweep the server runs, so data another process
-    /// commits to a shared store becomes visible to later queries. Background
-    /// compaction and vacuum stay off: those belong to one owning process per
-    /// datastore, and a shell over a shared store is not it. The sweep spawns
-    /// onto the ambient tokio runtime, so call this from within one.
+    /// The instance reloads its tables from the store, or asks the catalog
+    /// again, every `refresh_interval`, the same background sweep the server
+    /// runs, so data another process commits becomes visible to later queries.
+    /// Background compaction and vacuum stay off: those belong to one owning
+    /// process per datastore, and a shell over a shared store is not it. The
+    /// sweep spawns onto the ambient tokio runtime, so call this from within
+    /// one.
     pub fn open_with_resources(
-        location: &str,
+        target: &ShellTarget,
         workers: usize,
         buffers: usize,
         refresh_interval: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
-        let store: Arc<dyn ObjectStore> = open_store(location)?.into();
-        let maintenance = MaintenanceConfig {
-            refresh_interval,
-            compaction: None,
-            vacuum: None,
+        let datastore: Arc<dyn Datastore> = match target {
+            ShellTarget::Pivot { location } => {
+                let store: Arc<dyn ObjectStore> = open_store(location)?.into();
+                let maintenance = MaintenanceConfig {
+                    refresh_interval,
+                    compaction: None,
+                    vacuum: None,
+                };
+                PivotDatastore::from_store(store, dispatch.dispatcher(), Some(maintenance))?
+            }
+            ShellTarget::Iceberg(config) => IcebergDatastore::open(
+                DEFAULT_DATASTORE_NAME,
+                config,
+                Arc::new(AmbientExternalStoreFactory),
+                dispatch.dispatcher(),
+                refresh_interval,
+            )?,
         };
-        let datastore =
-            PivotDatastore::from_store(store, dispatch.dispatcher(), Some(maintenance))?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
         let catalog = Arc::new(
             PivotCatalog::new(
-                HashMap::from([(
-                    DEFAULT_DATASTORE_NAME.to_string(),
-                    datastore.clone() as Arc<dyn Datastore>,
-                )]),
+                HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore.clone())]),
                 DEFAULT_DATASTORE_NAME.to_string(),
                 metastore,
             )?
@@ -225,7 +237,7 @@ impl ShellInstance {
                 dispatch,
                 datastore,
             }),
-            location: location.to_string(),
+            target: target.clone(),
         })
     }
 
@@ -237,10 +249,15 @@ impl ShellInstance {
             .executor
     }
 
+    /// What this instance was opened on.
+    pub fn target(&self) -> &ShellTarget {
+        &self.target
+    }
+
     /// The location this instance was opened on, as it was spelled: a local
-    /// directory or an object-store URI.
+    /// directory, an object-store URI, or a catalog's URI.
     pub fn location(&self) -> &str {
-        &self.location
+        self.target.location()
     }
 
     fn shutdown(&mut self) {

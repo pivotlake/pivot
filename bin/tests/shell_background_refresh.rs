@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use arrow_array::Int64Array;
 use bin::execution::{ExecuteOptions, Executor, StatementOutput};
-use bin::shell::ShellInstance;
+use bin::shell::{ShellInstance, ShellTarget};
 
 #[test]
 fn a_commit_from_outside_the_shell_becomes_visible_to_later_queries() {
@@ -19,7 +19,7 @@ fn a_commit_from_outside_the_shell_becomes_visible_to_later_queries() {
     let instance = runtime
         .block_on(async {
             ShellInstance::open_with_resources(
-                directory.path().to_str().unwrap(),
+                &ShellTarget::pivot(directory.path().to_str().unwrap()),
                 1,
                 32,
                 Duration::from_millis(100),
