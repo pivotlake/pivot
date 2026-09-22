@@ -57,6 +57,7 @@
 
 mod binding;
 mod columns;
+pub mod env;
 mod rest_catalog;
 mod store;
 mod table;

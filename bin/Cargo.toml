@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 catalog = { workspace = true }
+datastore-iceberg = { workspace = true }
 datastore-pivot = { workspace = true }
 dispatch = { workspace = true }
 metastore-disk = { workspace = true }
@@ -78,3 +79,8 @@ libc = { workspace = true }
 # the bucket-backed end-to-end tests; the bin build keeps the plain catalog dep.
 datastore-pivot = { workspace = true, features = ["test-support"] }
 object-storage = { workspace = true, features = ["test-support"] }
+# The Iceberg shell test stands up a REST catalog (apache/iceberg-rest-fixture)
+# in Docker, backed by that MinIO, and defines its table over plain HTTP.
+testcontainers = { version = "0.24", features = ["blocking"] }
+ureq = { workspace = true, features = ["json"] }
+url = { workspace = true }

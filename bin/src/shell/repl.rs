@@ -8,7 +8,7 @@ use rustyline::error::ReadlineError;
 use crate::shell::parser::split_complete;
 use crate::shell::progress::show_opening_progress;
 use crate::shell::render::{TextBatch, render_table};
-use crate::shell::{ShellInstance, ShellLimits};
+use crate::shell::{ShellInstance, ShellLimits, ShellTarget};
 
 const HELP: &str = "\
 Shell commands:
@@ -24,15 +24,14 @@ Session settings:
 ";
 
 pub(crate) async fn run_shell(
-    datastore_location: String,
+    target: ShellTarget,
     limits: ShellLimits,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() {
         return Err("an interactive terminal is required".into());
     }
 
-    let instance =
-        show_opening_progress(|| ShellInstance::open_with_limits(&datastore_location, limits))?;
+    let instance = show_opening_progress(|| ShellInstance::open_with_limits(&target, limits))?;
     let editor = DefaultEditor::new()?;
 
     println!("pivot shell ({})", env!("CARGO_PKG_VERSION"));
@@ -337,7 +336,7 @@ mod tests {
         let instance = runtime
             .block_on(async {
                 crate::shell::ShellInstance::open_with_resources(
-                    directory.path().to_str().unwrap(),
+                    &crate::shell::ShellTarget::pivot(directory.path().to_str().unwrap()),
                     1,
                     32,
                     datastore_pivot::DEFAULT_REFRESH_INTERVAL,

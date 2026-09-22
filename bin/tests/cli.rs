@@ -20,6 +20,66 @@ fn open_help_lists_resource_limits() {
 }
 
 #[test]
+fn open_help_lists_the_datastore_kinds_and_iceberg_credentials() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["open", "--help"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("--kind <KIND>"), "{stdout}");
+    assert!(stdout.contains("[default: pivot]"), "{stdout}");
+    assert!(stdout.contains("--warehouse <WAREHOUSE>"), "{stdout}");
+    for variable in [
+        datastore_iceberg::env::TOKEN_VAR,
+        datastore_iceberg::env::CREDENTIAL_VAR,
+        datastore_iceberg::env::OAUTH2_SERVER_URI_VAR,
+        datastore_iceberg::env::OAUTH2_SCOPE_VAR,
+    ] {
+        assert!(
+            stdout.contains(variable),
+            "{variable} missing from:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn open_rejects_a_warehouse_for_a_pivot_datastore() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["open", "/tmp/pivot", "--warehouse", "s3://lake"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "pivot accepted --warehouse for a pivot datastore"
+    );
+    assert!(
+        stderr.contains("--warehouse applies only to --kind iceberg"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn open_rejects_conflicting_iceberg_credentials() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["open", "--kind", "iceberg", "http://127.0.0.1:1"])
+        .env(datastore_iceberg::env::TOKEN_VAR, "t0k3n")
+        .env(datastore_iceberg::env::CREDENTIAL_VAR, "id:secret")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "pivot accepted a token and a credential together"
+    );
+    assert!(stderr.contains("set exactly one of"), "{stderr}");
+}
+
+#[test]
 fn open_rejects_zero_workers() {
     let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
         .args(["open", "/tmp/pivot", "--workers", "0"])

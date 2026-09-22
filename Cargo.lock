@@ -830,6 +830,7 @@ dependencies = [
  "catalog",
  "clap",
  "core_affinity",
+ "datastore-iceberg",
  "datastore-pivot",
  "dispatch",
  "futures",
@@ -852,6 +853,7 @@ dependencies = [
  "sha2",
  "sysinfo",
  "tempfile",
+ "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
@@ -859,6 +861,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.2.2",
+ "ureq",
+ "url",
 ]
 
 [[package]]

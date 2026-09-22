@@ -3,7 +3,8 @@
 use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use bin::shell::ShellTarget;
+use clap::{Parser, Subcommand, ValueEnum};
 use metastore_disk::ByteSize;
 
 #[derive(Parser, Debug)]
@@ -13,13 +14,33 @@ struct Args {
     command: PivotCommand,
 }
 
+/// Which datastore implementation `pivot open` opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DatastoreKind {
+    /// A Pivot datastore in a local directory or at an object-store URI.
+    Pivot,
+    /// The read-only tables of an Iceberg REST catalog at an http(s) URI.
+    Iceberg,
+}
+
 #[derive(Subcommand, Debug)]
 enum PivotCommand {
     /// Open a datastore in the Pivot SQL shell.
     ///
-    /// The datastore is named either by a local directory, which is created if
-    /// it does not exist, or by an object-store URI: s3://bucket/prefix (s3://
-    /// also spelled s3a://), gs://bucket/prefix, or file:///path.
+    /// A Pivot datastore (the default kind) is named either by a local
+    /// directory, which is created if it does not exist, or by an object-store
+    /// URI: s3://bucket/prefix (s3:// also spelled s3a://), gs://bucket/prefix,
+    /// or file:///path.
+    ///
+    /// An Iceberg datastore (--kind iceberg) is named by its REST catalog's
+    /// http(s) base URI and serves the catalog's tables read-only; each
+    /// namespace is a schema. The catalog is
+    /// authenticated to with PIVOT_ICEBERG_TOKEN (a bearer token) or
+    /// PIVOT_ICEBERG_CREDENTIAL (an OAuth2 client_id:client_secret, refined by
+    /// the optional PIVOT_ICEBERG_OAUTH2_SERVER_URI and
+    /// PIVOT_ICEBERG_OAUTH2_SCOPE), or with nothing when neither is set. The
+    /// tables' files are read from wherever the catalog says they are, with the
+    /// credentials the catalog vends or those of the environment below.
     ///
     /// Object-store credentials are read from the environment. S3 takes
     /// AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY when both are set, or uses
@@ -30,9 +51,18 @@ enum PivotCommand {
     /// GOOGLE_APPLICATION_CREDENTIALS, then the gcloud login file, then the
     /// instance metadata server.
     Open {
-        /// Local directory or object-store URI holding the datastore.
+        /// Local directory or object-store URI holding the datastore, or the
+        /// Iceberg REST catalog's URI with --kind iceberg.
         #[arg(value_name = "DATASTORE_LOCATION")]
         datastore_location: String,
+
+        /// Which datastore implementation the location names.
+        #[arg(long, value_enum, default_value_t = DatastoreKind::Pivot)]
+        kind: DatastoreKind,
+
+        /// The warehouse to serve, for an Iceberg catalog that serves several.
+        #[arg(long, value_name = "WAREHOUSE")]
+        warehouse: Option<String>,
 
         /// Buffer-pool memory budget (suffixes k/m/g/t, base-1024).
         /// Defaults to 80% of the machine's physical memory (PIVOT_MEMORY_PCT)
@@ -52,16 +82,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
         PivotCommand::Open {
             datastore_location,
+            kind,
+            warehouse,
             memory,
             workers,
         } => bin::shell::run_with_limits(
-            datastore_location,
+            build_shell_target(kind, datastore_location, warehouse)?,
             bin::shell::ShellLimits {
                 memory_bytes: memory.map(ByteSize::as_bytes),
                 workers: workers.map(NonZeroUsize::get),
             },
         ),
         PivotCommand::Server(options) => bin::server::run(options).map_err(Into::into),
+    }
+}
+
+/// What `pivot open` opens, from its arguments. A Pivot datastore has no
+/// warehouse to name.
+fn build_shell_target(
+    kind: DatastoreKind,
+    datastore_location: String,
+    warehouse: Option<String>,
+) -> Result<ShellTarget, Box<dyn std::error::Error>> {
+    match kind {
+        DatastoreKind::Pivot => {
+            if warehouse.is_some() {
+                return Err("--warehouse applies only to --kind iceberg".into());
+            }
+            Ok(ShellTarget::pivot(datastore_location))
+        }
+        DatastoreKind::Iceberg => Ok(ShellTarget::iceberg(datastore_location, warehouse)?),
     }
 }
 
@@ -79,17 +129,24 @@ fn main() -> ExitCode {
 mod tests {
     use clap::Parser;
 
-    use super::{Args, PivotCommand};
+    use super::{Args, DatastoreKind, PivotCommand};
 
-    fn open_location(argument: &str) -> String {
-        let args = Args::try_parse_from(["pivot", "open", argument]).unwrap();
+    fn parse_open(arguments: &[&str]) -> (String, DatastoreKind, Option<String>) {
+        let args = Args::try_parse_from([&["pivot", "open"], arguments].concat()).unwrap();
         let PivotCommand::Open {
-            datastore_location, ..
+            datastore_location,
+            kind,
+            warehouse,
+            ..
         } = args.command
         else {
             panic!("open did not parse as the open command");
         };
-        datastore_location
+        (datastore_location, kind, warehouse)
+    }
+
+    fn open_location(argument: &str) -> String {
+        parse_open(&[argument]).0
     }
 
     #[test]
@@ -105,6 +162,36 @@ mod tests {
     fn open_takes_an_object_store_uri_verbatim() {
         assert_eq!(open_location("s3://bucket/prefix"), "s3://bucket/prefix");
         assert_eq!(open_location("gs://bucket/prefix"), "gs://bucket/prefix");
+    }
+
+    #[test]
+    fn open_defaults_to_the_pivot_kind() {
+        let (_, kind, warehouse) = parse_open(&["/var/lib/pivot"]);
+
+        assert_eq!(kind, DatastoreKind::Pivot);
+        assert!(warehouse.is_none());
+    }
+
+    #[test]
+    fn open_takes_an_iceberg_catalog_and_its_warehouse() {
+        let (location, kind, warehouse) = parse_open(&[
+            "--kind",
+            "iceberg",
+            "https://catalog.example.com/api",
+            "--warehouse",
+            "s3://lake/warehouse",
+        ]);
+
+        assert_eq!(location, "https://catalog.example.com/api");
+        assert_eq!(kind, DatastoreKind::Iceberg);
+        assert_eq!(warehouse.as_deref(), Some("s3://lake/warehouse"));
+    }
+
+    #[test]
+    fn open_rejects_an_unknown_kind() {
+        assert!(
+            Args::try_parse_from(["pivot", "open", "--kind", "delta", "/var/lib/pivot"]).is_err()
+        );
     }
 
     #[test]

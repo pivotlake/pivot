@@ -6,12 +6,14 @@ use std::time::Duration;
 
 use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use datastore_iceberg::IcebergDatastore;
 use datastore_pivot::{DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, PivotDatastore};
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use object_storage::{AmbientExternalStoreFactory, ObjectStore, open_store};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 use crate::memory::{compute_default_pool_bytes, read_memory_pct};
+use crate::shell::ShellTarget;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -102,8 +104,9 @@ struct ShellState {
     executor: crate::execution::Executor,
     catalog: Arc<PivotCatalog>,
     dispatch: DispatchOwner,
-    /// Keeps the datastore lock held until every dispatch worker has joined.
-    datastore: Arc<PivotDatastore>,
+    /// Dropped after the workers have joined: a Pivot datastore's lock stays
+    /// held until then.
+    datastore: Arc<dyn Datastore>,
 }
 
 impl ShellState {
@@ -123,25 +126,26 @@ impl ShellState {
     }
 }
 
-/// An embedded Pivot executor over one persistent Pivot datastore.
+/// An embedded Pivot executor over one datastore.
 pub struct ShellInstance {
     state: Option<ShellState>,
     location: String,
 }
 
 impl ShellInstance {
-    /// Open the production CLI instance on all available workers with the
-    /// default pool budget assigned to dispatch. `location` is a local directory,
-    /// or an object-store URI (`s3://bucket/prefix`, `gs://bucket/prefix`) whose
-    /// credentials come from the environment.
+    /// Open the production CLI instance over a Pivot datastore on all
+    /// available workers with the default pool budget assigned to dispatch.
+    /// `location` is a local directory, or an object-store URI
+    /// (`s3://bucket/prefix`, `gs://bucket/prefix`) whose credentials come
+    /// from the environment.
     pub fn open(location: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::open_with_limits(location, ShellLimits::default())
+        Self::open_with_limits(&ShellTarget::pivot(location), ShellLimits::default())
     }
 
-    /// Open with optional production resource limits. Values omitted from
-    /// `limits` use the same defaults as [`open`](Self::open).
+    /// Open `target` with optional production resource limits. Values omitted
+    /// from `limits` use the same defaults as [`open`](Self::open).
     pub fn open_with_limits(
-        location: &str,
+        target: &ShellTarget,
         limits: ShellLimits,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let workers = limits
@@ -173,40 +177,31 @@ impl ShellInstance {
 
         let buffers = usize::try_from(memory_bytes / BUFFER_SIZE as u64)
             .map_err(|_| ResourceLimitError::MemoryTooLarge)?;
-        Self::open_with_resources(location, workers, buffers, DEFAULT_REFRESH_INTERVAL)
+        Self::open_with_resources(target, workers, buffers, DEFAULT_REFRESH_INTERVAL)
     }
 
-    /// Open with an explicit dispatch shape and refresh cadence. This is useful
-    /// for embedding and for small black-box test instances.
+    /// Open `target` with an explicit dispatch shape and refresh cadence. This
+    /// is useful for embedding and for small black-box test instances.
     ///
-    /// The instance reloads its tables from the store every `refresh_interval`,
-    /// the same background sweep the server runs, so data another process
-    /// commits to a shared store becomes visible to later queries. Background
-    /// compaction and vacuum stay off: those belong to one owning process per
-    /// datastore, and a shell over a shared store is not it. The sweep spawns
-    /// onto the ambient tokio runtime, so call this from within one.
+    /// The instance reloads its tables every `refresh_interval`, the same
+    /// background sweep the server runs, so data another process commits to a
+    /// shared store, or a table committed to the catalog, becomes visible to
+    /// later queries. Background compaction and vacuum stay off: those belong
+    /// to one owning process per datastore, and a shell over a shared store is
+    /// not it. The sweep spawns onto the ambient tokio runtime, so call this
+    /// from within one.
     pub fn open_with_resources(
-        location: &str,
+        target: &ShellTarget,
         workers: usize,
         buffers: usize,
         refresh_interval: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
-        let store: Arc<dyn ObjectStore> = open_store(location)?.into();
-        let maintenance = MaintenanceConfig {
-            refresh_interval,
-            compaction: None,
-            vacuum: None,
-        };
-        let datastore =
-            PivotDatastore::from_store(store, dispatch.dispatcher(), Some(maintenance))?;
+        let datastore = open_datastore(target, dispatch.dispatcher(), refresh_interval)?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
         let catalog = Arc::new(
             PivotCatalog::new(
-                HashMap::from([(
-                    DEFAULT_DATASTORE_NAME.to_string(),
-                    datastore.clone() as Arc<dyn Datastore>,
-                )]),
+                HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore.clone())]),
                 DEFAULT_DATASTORE_NAME.to_string(),
                 metastore,
             )?
@@ -225,7 +220,7 @@ impl ShellInstance {
                 dispatch,
                 datastore,
             }),
-            location: location.to_string(),
+            location: target.location().to_string(),
         })
     }
 
@@ -238,7 +233,7 @@ impl ShellInstance {
     }
 
     /// The location this instance was opened on, as it was spelled: a local
-    /// directory or an object-store URI.
+    /// directory, an object-store URI, or an Iceberg catalog's URI.
     pub fn location(&self) -> &str {
         &self.location
     }
@@ -253,6 +248,41 @@ impl ShellInstance {
 impl Drop for ShellInstance {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Open the datastore `target` names, refreshing it every `refresh_interval`
+/// once the catalog starts it. A Pivot datastore is opened without
+/// maintenance (see [`ShellInstance::open_with_resources`]); an Iceberg
+/// datastore reads its tables' files through the process's own credential
+/// policy, the same one the `AWS_*` and `GOOGLE_*` variables set for a Pivot
+/// datastore in a bucket.
+fn open_datastore(
+    target: &ShellTarget,
+    dispatcher: &DataFlowDispatcher,
+    refresh_interval: Duration,
+) -> Result<Arc<dyn Datastore>, Box<dyn std::error::Error>> {
+    match target {
+        ShellTarget::Pivot { location } => {
+            let store: Arc<dyn ObjectStore> = open_store(location)?.into();
+            let maintenance = MaintenanceConfig {
+                refresh_interval,
+                compaction: None,
+                vacuum: None,
+            };
+            Ok(PivotDatastore::from_store(
+                store,
+                dispatcher,
+                Some(maintenance),
+            )?)
+        }
+        ShellTarget::Iceberg(config) => Ok(IcebergDatastore::open(
+            DEFAULT_DATASTORE_NAME,
+            config,
+            Arc::new(AmbientExternalStoreFactory),
+            dispatcher,
+            refresh_interval,
+        )?),
     }
 }
 

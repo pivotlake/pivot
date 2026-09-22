@@ -1,13 +1,13 @@
 use arrow_array::{Array, Int64Array, StringViewArray};
 use bin::execution::{Command, ExecuteOptions, StatementOutput};
-use bin::shell::{ShellInstance, ShellLimits};
+use bin::shell::{ShellInstance, ShellLimits, ShellTarget};
 use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
 use dispatch::BUFFER_SIZE;
 
 #[test]
 fn shell_limits_require_at_least_one_worker() {
     let result = ShellInstance::open_with_limits(
-        "unused",
+        &ShellTarget::pivot("unused"),
         ShellLimits {
             memory_bytes: Some(BUFFER_SIZE as u64),
             workers: Some(0),
@@ -28,7 +28,7 @@ fn shell_limits_require_at_least_one_worker() {
 #[test]
 fn shell_limits_require_at_least_one_memory_slot() {
     let result = ShellInstance::open_with_limits(
-        "unused",
+        &ShellTarget::pivot("unused"),
         ShellLimits {
             memory_bytes: Some(BUFFER_SIZE as u64 - 1),
             workers: Some(1),
@@ -45,7 +45,7 @@ fn shell_limits_require_at_least_one_memory_slot() {
 #[test]
 fn shell_limits_reject_a_pool_larger_than_available_memory() {
     let result = ShellInstance::open_with_limits(
-        "unused",
+        &ShellTarget::pivot("unused"),
         ShellLimits {
             memory_bytes: Some(u64::MAX),
             workers: Some(1),
@@ -73,7 +73,7 @@ fn a_table_can_be_created_in_a_relative_datastore_path() {
     let instance = runtime
         .block_on(async {
             ShellInstance::open_with_limits(
-                location,
+                &ShellTarget::pivot(location),
                 ShellLimits {
                     memory_bytes: Some((BUFFER_SIZE * 32) as u64),
                     workers: Some(1),
@@ -105,7 +105,12 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
     let location = path.to_str().unwrap();
     let instance = runtime
         .block_on(async {
-            ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
+            ShellInstance::open_with_resources(
+                &ShellTarget::pivot(location),
+                1,
+                32,
+                DEFAULT_REFRESH_INTERVAL,
+            )
         })
         .unwrap();
     let executor = instance.executor();
@@ -159,8 +164,12 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
     assert_eq!((ids.value(0), names.value(0)), (1, "alice"));
     assert_eq!((ids.value(1), names.value(1)), (2, "bob"));
 
-    let error = match ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
-    {
+    let error = match ShellInstance::open_with_resources(
+        &ShellTarget::pivot(location),
+        1,
+        32,
+        DEFAULT_REFRESH_INTERVAL,
+    ) {
         Ok(_) => panic!("a second instance opened the locked datastore"),
         Err(error) => error,
     };
@@ -174,7 +183,12 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
 
     let reopened = runtime
         .block_on(async {
-            ShellInstance::open_with_resources(location, 1, 32, DEFAULT_REFRESH_INTERVAL)
+            ShellInstance::open_with_resources(
+                &ShellTarget::pivot(location),
+                1,
+                32,
+                DEFAULT_REFRESH_INTERVAL,
+            )
         })
         .unwrap();
     let select = runtime.block_on(reopened.executor().execute(
