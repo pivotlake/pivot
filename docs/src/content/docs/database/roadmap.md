@@ -15,7 +15,6 @@ If you are using Pivot, considering using it, or simply have thoughts about wher
 ## Planned enhancements:
 ### Format support
 - **Deletion support** - Pivot currently focuses on append-only workloads. Adding support for deletes will allow Pivot to work with datasets that are updated or modified over time.
-- **Iceberg support** - Add Iceberg as a new datastore to support Iceberg users.
 - **Unity catalog support** - Integrate with Unity Catalog as a new datastore.
 
 ### Execution enhancements
