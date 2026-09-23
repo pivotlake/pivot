@@ -93,14 +93,22 @@ secrets:
 
 # `pivot` is served whatever this map says, so a server is always reachable. It
 # is trusted unless defined here, as it is below: trust proves no identity
-# (anyone using the name is accepted), so give it a `scram-sha-256` verifier
-# instead to require a password of it.
+# (anyone using the name is accepted), so give it a `password` instead to
+# require one of it.
 users:
   pivot:
     auth:
       method: trust
 
-  # A SCRAM-SHA-256 method contains its precomputed verifier, not the password.
+  # A password is written as is; the server derives a SCRAM-SHA-256 verifier
+  # from it at startup and never sends or stores the password itself.
+  # pivot:
+  #   auth:
+  #     method: password
+  #     password: Password1337
+
+  # A SCRAM-SHA-256 method contains the precomputed verifier instead, which is
+  # how the server stores a user CREATE USER made.
   # analytics:
   #   auth:
   #     method: scram-sha-256

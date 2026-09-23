@@ -70,7 +70,8 @@ Two secrets cannot claim the same scope.
 | Authentication method | Configuration |
 | --- | --- |
 | Trust | `auth: { method: trust }`. No password is checked. |
-| SCRAM-SHA-256 | `auth: { method: scram-sha-256, verifier: "pivot-scram-sha-256$..." }`. Store the precomputed verifier, not the password. |
+| Password | `auth: { method: password, password: Password1337 }`. The server derives a SCRAM-SHA-256 verifier from the password when it reads the file; the password itself is never sent or stored. |
+| SCRAM-SHA-256 | `auth: { method: scram-sha-256, verifier: "pivot-scram-sha-256$..." }`. The precomputed verifier, as `CREATE USER` writes it. |
 
 The built-in `pivot` user uses trust authentication unless it is configured
 explicitly.

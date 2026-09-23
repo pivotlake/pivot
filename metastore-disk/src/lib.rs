@@ -101,8 +101,19 @@
 //!       method: trust
 //! ```
 //!
-//! Or it may authenticate with a SCRAM-SHA-256 verifier derived from its
-//! password:
+//! Or it may authenticate with a password. The password is written as is, and
+//! the server derives a SCRAM-SHA-256 verifier from it when it reads the file:
+//!
+//! ```yaml
+//! users:
+//!   pivot:
+//!     auth:
+//!       method: password
+//!       password: Password1337
+//! ```
+//!
+//! Or it may carry the SCRAM-SHA-256 verifier itself, which is how the server
+//! stores a user it created:
 //!
 //! ```yaml
 //! users:
@@ -112,15 +123,19 @@
 //!       verifier: "pivot-scram-sha-256$4096:cGVwcGVy...$Zm9vYmFy..."
 //! ```
 //!
+//! Both methods authenticate the same way over the wire: the client proves it
+//! knows the password without sending it. Only what the file holds differs.
+//!
 //! A user named `pivot` is always served, so a server is reachable whatever else
 //! its users are. It is trusted unless a file defines `pivot` itself, which
-//! takes over its authentication method entirely: give it a
+//! takes over its authentication method entirely: give it a `password` or a
 //! `scram-sha-256` verifier to require a password of it.
 //!
 //! An S3 secret's keys are inline, so a file holding one should be readable only
 //! by the PivotDB process (a GCS secret's key stays in the file
-//! `credentials_file` points at). A verifier is not a password (the password
-//! cannot be recovered from it), but it is still worth the same care.
+//! `credentials_file` points at). A `password` is exactly as sensitive as it
+//! sounds, and a verifier, while not a password (the password cannot be
+//! recovered from it), is still worth the same care.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -408,13 +423,17 @@ impl Metastore for DiskMetastore {
 fn derive_user_auth(password: Option<&str>) -> UserAuth {
     match password {
         None => UserAuth::Trust,
-        Some(password) => {
-            let salt = rand::random::<[u8; SCRAM_SALT_LEN]>().to_vec();
-            UserAuth::ScramSha256(ScramVerifier {
-                salted_password: gen_salted_password(password, &salt, SCRAM_ITERATIONS),
-                salt,
-            })
-        }
+        Some(password) => UserAuth::ScramSha256(derive_scram_verifier(password)),
+    }
+}
+
+/// The SCRAM verifier for `password` over a fresh random salt: what a login's
+/// proof is checked against, and what gets stored in place of the password.
+fn derive_scram_verifier(password: &str) -> ScramVerifier {
+    let salt = rand::random::<[u8; SCRAM_SALT_LEN]>().to_vec();
+    ScramVerifier {
+        salted_password: gen_salted_password(password, &salt, SCRAM_ITERATIONS),
+        salt,
     }
 }
 
@@ -572,7 +591,10 @@ fn parse_config(text: &str) -> Result<MetastoreConfig> {
 ///
 /// The verifier is decoded by deserialisation itself (via `RawUserConfig`),
 /// so a parsed config holds ready [`UserAuth`]s and a malformed verifier fails
-/// the file's parse rather than a login; serialisation re-encodes it.
+/// the file's parse rather than a login; serialisation re-encodes it. A
+/// `password` is likewise turned into its verifier on parse, so the password
+/// is held nowhere past that point, and a rewritten file holds the verifier
+/// where the password was.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(try_from = "RawUserConfig", into = "RawUserConfig")]
 pub struct UserConfig {
@@ -592,6 +614,9 @@ impl TryFrom<RawUserConfig> for UserConfig {
     fn try_from(raw: RawUserConfig) -> std::result::Result<Self, String> {
         let auth = match raw.auth {
             UserAuthConfig::Trust {} => UserAuth::Trust,
+            UserAuthConfig::Password { password } => {
+                UserAuth::ScramSha256(derive_scram_verifier(&password))
+            }
             UserAuthConfig::ScramSha256 { verifier } => {
                 UserAuth::ScramSha256(parse_scram_verifier(&verifier)?)
             }
@@ -614,13 +639,19 @@ impl From<UserConfig> for RawUserConfig {
 }
 
 /// YAML representation of a user's one authentication method. Variant-specific
-/// fields live inside the variant, so `trust` cannot carry a verifier and SCRAM
-/// cannot omit one.
+/// fields live inside the variant, so `trust` cannot carry a verifier, SCRAM
+/// cannot omit one, and `password` takes the password alone.
+///
+/// `password` is a way of writing a SCRAM user, not a method of its own: it is
+/// read into the same [`UserAuth::ScramSha256`] and never written back, so a
+/// file the server rewrites holds the verifier instead.
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "method", deny_unknown_fields)]
 enum UserAuthConfig {
     #[serde(rename = "trust")]
     Trust {},
+    #[serde(rename = "password")]
+    Password { password: String },
     #[serde(rename = "scram-sha-256")]
     ScramSha256 { verifier: String },
 }
@@ -2257,5 +2288,78 @@ users:
 
         assert!(matches!(&error, Error::Parse { .. }), "{error}");
         assert!(error.to_string().contains("verifier"), "{error}");
+    }
+
+    #[test]
+    fn a_password_user_is_served_as_a_scram_verifier_of_that_password() {
+        let users = r#"
+users:
+  pivot:
+    auth:
+      method: password
+      password: Password1337
+"#;
+
+        let store = from_yaml_with(users).unwrap();
+
+        let Some(UserAuth::ScramSha256(verifier)) = store.user_auth("pivot") else {
+            panic!("a password user is a SCRAM user");
+        };
+        assert_eq!(verifier.salt.len(), SCRAM_SALT_LEN);
+        assert_eq!(
+            verifier.salted_password,
+            gen_salted_password("Password1337", &verifier.salt, SCRAM_ITERATIONS)
+        );
+    }
+
+    #[test]
+    fn a_rewritten_metastore_file_holds_a_password_users_verifier_not_its_password() {
+        let disk = "users:\n  pivot:\n    auth:\n      method: password\n      \
+                    password: Password1337\n";
+        let (store, file) = open_with_file(HOT_SECTION, disk);
+
+        store.create_user("walt", None).unwrap();
+
+        let rewritten = std::fs::read_to_string(file.path()).unwrap();
+        assert!(!rewritten.contains("Password1337"), "{rewritten}");
+        assert!(rewritten.contains("method: scram-sha-256"), "{rewritten}");
+        let Some(UserAuth::ScramSha256(verifier)) = reopen(HOT_SECTION, &file).user_auth("pivot")
+        else {
+            panic!("the rewritten user is still a SCRAM user");
+        };
+        assert_eq!(
+            verifier.salted_password,
+            gen_salted_password("Password1337", &verifier.salt, SCRAM_ITERATIONS)
+        );
+    }
+
+    #[test]
+    fn the_password_method_requires_a_password() {
+        let users = r#"
+users:
+  pivot:
+    auth:
+      method: password
+"#;
+
+        let error = from_yaml_with(users).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn the_password_method_rejects_a_verifier_alongside_the_password() {
+        let users = r#"
+users:
+  pivot:
+    auth:
+      method: password
+      password: Password1337
+      verifier: irrelevant
+"#;
+
+        let error = from_yaml_with(users).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
     }
 }

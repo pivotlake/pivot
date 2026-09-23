@@ -254,6 +254,11 @@ contains exactly one authentication method and that method's fields:
 users:
   pivot:
     auth:
+      method: password
+      password: Password1337
+
+  reader:
+    auth:
       method: trust
 
   analytics:
@@ -262,16 +267,22 @@ users:
       verifier: "pivot-scram-sha-256$4096:8fZ1u...$Wm9tYm..."
 ```
 
-The SCRAM verifier is precomputed in PivotDB's
-`pivot-scram-sha-256$4096:<base64 salt>$<base64 salted password>` format. Trust
-performs no identity proof: anyone who supplies `pivot` as the user name is
-accepted. Variant-specific fields are enforced, so trust cannot contain a
-verifier and SCRAM cannot omit one.
+A `password` is written as is. The server derives a SCRAM-SHA-256 verifier
+from it when it reads the file, so the password is never sent over the wire
+and never stored: a metastore file the server rewrites holds the verifier
+in its place. The `scram-sha-256` method takes that precomputed verifier
+directly, in PivotDB's
+`pivot-scram-sha-256$4096:<base64 salt>$<base64 salted password>` format;
+it is how `CREATE USER` stores a user. Both methods authenticate a client the
+same way. Trust performs no identity proof: anyone who supplies `reader` as
+the user name is accepted. Variant-specific fields are enforced, so trust
+cannot contain a verifier, SCRAM cannot omit one, and `password` takes the
+password alone.
 
 A user named `pivot` is always served, whatever else the `users` map
 defines, so a server is always reachable. It is trusted unless `pivot` is
 defined explicitly, which takes over its authentication method entirely: give it
-a `scram-sha-256` verifier to require a password of it.
+a `password` or a `scram-sha-256` verifier to require a password of it.
 
 Logging is controlled by the config's `log`. A level applies to everything;
 `tracing` filter directives narrow it per target:
