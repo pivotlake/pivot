@@ -132,14 +132,16 @@ fn scratch_dir(source: &Path) -> std::io::Result<tempfile::TempDir> {
 
 /// Start `server_bin` on a free port over an empty scratch datastore,
 /// returning once its listener accepts connections. The catalog starts empty;
-/// the runner sends `CREATE TABLE` over the wire to populate it, on the
-/// server's default memory budget.
+/// the runner sends `CREATE TABLE` over the wire to populate it.
 ///
-/// `source` is the benchmark's data directory; the scratch datastore is placed
-/// beside it (see [`scratch_dir`]).
+/// `memory` is the buffer-pool budget in the config file's `memory` syntax
+/// (`30%`, `16g`); `None` leaves the server on its default share of the
+/// machine. `source` is the benchmark's data directory; the scratch datastore
+/// is placed beside it (see [`scratch_dir`]).
 pub fn start(
     server_bin: &Path,
     workers: Option<usize>,
+    memory: Option<&str>,
     source: &Path,
 ) -> std::io::Result<ServerHandle> {
     let port = pick_free_port()?;
@@ -148,7 +150,11 @@ pub fn start(
     fs::create_dir(&data_dir)?;
 
     let workers_line = match workers {
-        Some(count) => format!("  workers: {count}\n"),
+        Some(count) => format!("workers: {count}\n"),
+        None => String::new(),
+    };
+    let memory_line = match memory {
+        Some(budget) => format!("memory: {budget}\n"),
         None => String::new(),
     };
     // Background maintenance is off: the benchmark datastore adopts
@@ -161,7 +167,7 @@ pub fn start(
         "\
 server:
   bind: 127.0.0.1:{port}
-{workers_line}datastores:
+{workers_line}{memory_line}datastores:
   default:
     kind: pivot
     location: {data_dir}

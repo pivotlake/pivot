@@ -56,6 +56,12 @@ tpch_sf1="$data_dir/tpch-sf1"
 mkdir -p "$out_dir"
 rm -f "$out_dir"/*.profraw
 
+# The training datasets fit in a few GiB, so the server gets a small share of
+# the machine rather than its default one. The default claims most of the
+# host's RAM and refuses to boot when that much is not free, which on a shared
+# build host depends on whatever else happens to be running.
+memory_budget="30%"
+
 # PIVOT_SPIN_LIMIT=0 parks idle workers immediately instead of spinning, so
 # the profile records the wait-heavy control-flow mix that cold runs on full
 # datasets execute, deterministically rather than as a timing-dependent draw
@@ -66,7 +72,7 @@ train_suite() {
     LLVM_PROFILE_FILE="$out_dir/%m-%p.profraw" PIVOT_SPIN_LIMIT=0 \
         "$bench_bin" \
         --suite "$suite" --suite-dir "$repository_root/benchmarks/$suite" \
-        --server-bin "$server_bin" \
+        --server-bin "$server_bin" --memory "$memory_budget" \
         --source "$source" --iterations "$iterations" --skip-check >/dev/null
 }
 

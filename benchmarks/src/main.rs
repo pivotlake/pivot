@@ -73,6 +73,12 @@ struct Cli {
     #[arg(long, env = "WORKER_COUNT")]
     workers: Option<usize>,
 
+    /// Buffer-pool budget for the launched server, in the config file's
+    /// `memory` syntax (`30%`, `16g`). Defaults to the server's own default
+    /// share of the machine.
+    #[arg(long)]
+    memory: Option<String>,
+
     /// Comma-separated query IDs to run (e.g. `q07,q20`). Bare numbers like
     /// `7,20` are accepted and canonicalised to `qNN`. Defaults to all
     /// queries the suite ships.
@@ -214,9 +220,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .server_bin
         .clone()
         .expect("clap enforces --server-bin unless --show");
-    // No worker count here means none in the generated config, and the server
-    // applies its own default (the machine's core count).
-    let server = server_handle::start(&server_bin, cli.workers, &source)?;
+    // No worker count or memory budget here means none in the generated
+    // config, and the server applies its own defaults (the machine's core
+    // count, its default share of the machine's memory).
+    let server = server_handle::start(&server_bin, cli.workers, cli.memory.as_deref(), &source)?;
 
     let query_filter = if cli.query.is_empty() {
         None
