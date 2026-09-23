@@ -174,14 +174,9 @@ macro_rules! bucket_tests {
 bucket_tests!(create_table_and_count);
 bucket_tests!(count_with_filter);
 
-/// KNOWN BUG (`#[ignore]`d until fixed): `SELECT COUNT(*)` with no predicate
-/// returns 0 instead of the row count. DuckDB scans `COUNT(*)` with a
-/// "no column needed" sentinel; `planner::compile`'s `Input::compile` drops it
-/// to an empty scan projection, and the parquet scan emits 0 rows for an empty
-/// projection. Any predicate (or counting a real column) forces a populated
-/// scan and counts correctly. Backend-independent, so this runs on local only.
+/// An unfiltered `COUNT(*)` scans no column at all. Backend-independent, so
+/// this runs on local only.
 #[test]
-#[ignore = "COUNT(*) with no predicate returns 0 — empty scan projection yields 0 rows"]
 fn count_star_no_predicate() {
     let (_dir, b) = test_support::local();
     block_on(async {

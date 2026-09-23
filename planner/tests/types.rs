@@ -40,7 +40,6 @@ fn boolean_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
-#[ignore = "currently not supported in dispatch"]
 fn int8_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
     testing_planner.add_table(
         "int8s",
