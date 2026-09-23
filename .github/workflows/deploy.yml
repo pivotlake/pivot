@@ -36,7 +36,7 @@ on:
         type: boolean
         default: true
       override:
-        description: "Delete and republish an existing version (installed APT clients will not upgrade)"
+        description: "Republish an existing version: overwrite its downloads, delete and re-upload its APT packages (installed APT clients will not upgrade), move its git tag"
         type: boolean
         default: false
 
@@ -375,9 +375,9 @@ jobs:
           pattern: pivot-binary-*
           path: binaries
 
-      # A published version is immutable: people have it installed, and its
-      # objects are served with a year-long cache lifetime, so rewriting one is
-      # not reliably visible to anyone who already fetched it.
+      # A published version is not rewritten by accident: people have it
+      # installed, and the same version string would then name two different
+      # binaries.
       - name: Refuse to republish an existing version
         run: |
           set -euo pipefail
@@ -416,12 +416,15 @@ jobs:
       - name: Publish the release to the bucket
         run: |
           set -euo pipefail
-          # A version directory never changes, so it can be cached forever. The
-          # objects are handed out as-is: a bucket that served them with
+          # Nothing may cache a release object: the storage edge and any proxy
+          # honour this header, and an override must reach every downloader
+          # at once rather than whenever a cached copy happens to expire. The
+          # installer fetches each file once, so caching would buy it nothing.
+          # The objects are handed out as-is: a bucket that served them with
           # Content-Encoding: gzip would decompress them in transit and the
           # installer's checksum would not match.
           gcloud storage cp --recursive \
-            --cache-control="public, max-age=31536000, immutable" \
+            --cache-control="no-cache" \
             "release/v$VERSION" "$BUCKET/"
 
           # A candidate stops here. Its objects exist and are installable by
@@ -435,8 +438,7 @@ jobs:
 
           # latest_version.txt goes last, on its own: until it moves, the new
           # release sits complete but unadvertised, and every installer still
-          # resolves the previous one. It must never be cached, or the release
-          # stays invisible for as long as the cache holds.
+          # resolves the previous one.
           printf '%s\n' "$VERSION" > latest_version.txt
           gcloud storage cp --cache-control="no-cache" \
             latest_version.txt "$BUCKET/latest_version.txt"
