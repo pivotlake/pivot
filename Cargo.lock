@@ -3523,7 +3523,7 @@ dependencies = [
 [[package]]
 name = "lz4_flex"
 version = "0.13.1"
-source = "git+https://github.com/Epsio-Labs/lz4_flex.git?rev=a5cc41c918bbe0a2266db4cb7a1d16a406844d18#a5cc41c918bbe0a2266db4cb7a1d16a406844d18"
+source = "git+https://github.com/pivotlake/lz4_flex.git?rev=a5cc41c918bbe0a2266db4cb7a1d16a406844d18#a5cc41c918bbe0a2266db4cb7a1d16a406844d18"
 
 [[package]]
 name = "matchers"
@@ -4128,14 +4128,14 @@ dependencies = [
  "criterion",
  "crossbeam-deque",
  "dispatch",
- "lz4_flex 0.13.1 (git+https://github.com/Epsio-Labs/lz4_flex.git?rev=a5cc41c918bbe0a2266db4cb7a1d16a406844d18)",
+ "lz4_flex 0.13.1 (git+https://github.com/pivotlake/lz4_flex.git?rev=a5cc41c918bbe0a2266db4cb7a1d16a406844d18)",
  "object-storage",
  "parquet",
  "parquet-variant",
  "parquet-variant-compute",
  "parquet-variant-json",
  "planner",
- "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5)",
+ "snap 1.1.1 (git+https://github.com/pivotlake/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5)",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -5684,7 +5684,7 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 [[package]]
 name = "snap"
 version = "1.1.1"
-source = "git+https://github.com/Epsio-Labs/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5#c1754fc37fe43db77c3b5428d57689cd5f2182a5"
+source = "git+https://github.com/pivotlake/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5#c1754fc37fe43db77c3b5428d57689cd5f2182a5"
 
 [[package]]
 name = "socket2"

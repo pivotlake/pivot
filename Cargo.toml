@@ -75,10 +75,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.11"
-snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "c1754fc37fe43db77c3b5428d57689cd5f2182a5" }
+snap = { git = "https://github.com/pivotlake/rust-snappy.git", rev = "c1754fc37fe43db77c3b5428d57689cd5f2182a5" }
 # Fork: adds `block::decompress_scattered` (vectored pages over cache
 # buffers / ring slots). Default features off = the fast decode path.
-lz4_flex = { git = "https://github.com/Epsio-Labs/lz4_flex.git", rev = "a5cc41c918bbe0a2266db4cb7a1d16a406844d18", default-features = false, features = ["std"] }
+lz4_flex = { git = "https://github.com/pivotlake/lz4_flex.git", rev = "a5cc41c918bbe0a2266db4cb7a1d16a406844d18", default-features = false, features = ["std"] }
 # Same version the vendored parquet crate binds, so one libzstd is built.
 zstd = { version = "0.13", default-features = false }
 sysinfo = "0.38.0"
