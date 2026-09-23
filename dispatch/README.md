@@ -2,7 +2,7 @@
 
 A high-throughput, low-latency parallel dataflow execution engine. One worker per core, local-first with work-stealing.
 
-See `src/lib.rs` or our [docs](https://epsio-labs.github.io/pivotdb/dispatch/index.html) for full documentation.
+See `src/lib.rs` or our [docs](https://pivotlake.github.io/pivot/dispatch/index.html) for full documentation.
 
 ## Running
 

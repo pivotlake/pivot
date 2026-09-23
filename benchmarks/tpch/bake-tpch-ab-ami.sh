@@ -12,14 +12,14 @@
 # toolchain or the base image should move, then update the TPCH_AB_AMI_ID
 # repository variable with the printed AMI id.
 #
-# The GitHub token is used only during the bake to clone the private repo; the
+# The GitHub token is used only during the bake to clone the repo; the
 # baked image keeps a token-free remote URL and no credential files.
 #
 # Usage:
 #   GITHUB_TOKEN=<token> ./bake-tpch-ab-ami.sh --key-name <ec2-key-pair> \
 #     [--ssh-key ~/<ec2-key-pair>.pem] \
 #     [--region eu-central-1] [--security-group sg-xxx] [--subnet subnet-xxx] \
-#     [--repo Epsio-Labs/pivotdb] [--rust-toolchain stable] [--duckdb 1.5.4]
+#     [--repo pivotlake/pivot] [--rust-toolchain stable] [--duckdb 1.5.4]
 
 set -euo pipefail
 
@@ -29,7 +29,7 @@ key_name=""
 ssh_key=""
 subnet=""
 security_group=""
-repo="Epsio-Labs/pivotdb"
+repo="pivotlake/pivot"
 rust_toolchain="stable"
 duckdb_version="1.5.4"
 

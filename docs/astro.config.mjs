@@ -4,8 +4,8 @@ import starlight from "@astrojs/starlight";
 import { codeThemeDark, codeThemeLight } from "./src/styles/code-theme.mjs";
 
 export default defineConfig({
-  // Used for canonical URLs and the sitemap. Change once the domain is fixed.
-  site: "https://pivotdb.dev",
+  // Used for canonical URLs and the sitemap.
+  site: "https://pivotlake.io",
   base: "/docs",
   integrations: [
     starlight({
