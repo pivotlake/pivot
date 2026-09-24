@@ -17,7 +17,6 @@ use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::PartitionBuffers;
 use crate::operations::unary::group::hashtables::{
     AggregationValue, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable, PersistedKey, Prober,
-    StridedScatterRows,
 };
 use crate::operations::unary::group::keys::StoredKey;
 use crate::operations::unary::group::output::topk_pruning::TopKCutoff;
@@ -413,7 +412,7 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
         // counts are powers of two, so the ranges divide evenly.
         let scatter_bucket_count = buffers
             .first()
-            .map_or(num_partitions, |buffer| buffer.0.len());
+            .map_or(num_partitions, |buffer| buffer.bucket_count());
         debug_assert!(
             scatter_bucket_count.is_multiple_of(num_partitions),
             "merge partitions ({num_partitions}) must evenly divide scatter buckets ({scatter_bucket_count})"
@@ -422,11 +421,12 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
         let first_bucket = partition * buckets_per_partition;
         let end_bucket = first_bucket + buckets_per_partition;
         // All scatter buckets for this signature share one row layout.
-        let scatter_layout = StridedScatterRows::<S::Persisted, V>::layout::<N>(context);
+        let scatter_layout = PartitionBuffers::<S::Persisted, V>::layout::<N>(context);
         for worker_buffers in buffers {
             for bucket in first_bucket..end_bucket {
                 if merge_prefetch {
-                    worker_buffers.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
+                    worker_buffers.for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
+                        bucket,
                         scatter_layout,
                         |hash, key, stored, ahead| {
                             if !cutoff.is_none_or(|cutoff| cutoff.admits(hash)) {
@@ -442,7 +442,7 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
                         },
                     );
                 } else {
-                    worker_buffers.0[bucket].for_each(scatter_layout, |hash, key, stored| {
+                    worker_buffers.for_each(bucket, scatter_layout, |hash, key, stored| {
                         if !cutoff.is_none_or(|cutoff| cutoff.admits(hash)) {
                             return;
                         }

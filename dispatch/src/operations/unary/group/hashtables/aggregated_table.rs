@@ -22,8 +22,7 @@ use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, PersistedKey,
-    StridedScatterRows,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, PartitionBuffers,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::topk_pruning::{
@@ -75,12 +74,6 @@ impl RadixConfig {
     }
 }
 
-/// One worker's scatter buffer for each radix partition.
-pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized>(
-    pub Vec<StridedScatterRows<KP, V>>,
-);
-unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for PartitionBuffers<KP, V> {}
-
 /// Tables, optional scatter buffers, and sizing data produced by one worker.
 pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// The NUMA node whose worker flushed this output; the merge groups
@@ -125,7 +118,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Tables built before a radix transition.
     tables: Vec<MultiSlabTable<K::Persisted, V>>,
     /// Per-partition buffers allocated on the first radix transition.
-    buffers: Option<Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>>,
+    buffers: Option<PartitionBuffers<<K as KeyExtractor>::Persisted, V>>,
     /// Distinct-count sketch used to size merge targets.
     hll: Hll,
     /// Index into the aggregation slots of the `ORDER BY <agg> DESC LIMIT k`
@@ -450,11 +443,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     /// Allocates the per-partition scatter buffers if not already present.
     fn create_scatter_buffers(&mut self) {
         if self.buffers.is_none() {
-            self.buffers = Some(
-                (0..self.radix_config.partitions)
-                    .map(|_| StridedScatterRows::new())
-                    .collect(),
-            );
+            self.buffers = Some(PartitionBuffers::new(self.radix_config.partitions));
         }
     }
 
@@ -526,7 +515,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let table = tables.last_mut().unwrap();
         let buffers = buffers.as_mut().unwrap();
         let scatter_layout =
-            StridedScatterRows::<<K as KeyExtractor>::Persisted, V>::layout::<0>(shared_context);
+            PartitionBuffers::<<K as KeyExtractor>::Persisted, V>::layout::<0>(shared_context);
         for entry in table.iter(0) {
             let hash = entry.hash;
             hll.add(hash);
@@ -535,9 +524,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             }
             let partition = (hash >> shift) as usize;
             // Entries are already deduplicated within this table.
-            buffers[partition].push_with(scatter_layout, allocator, hash, *entry.key, |stored| {
-                stored.copy_from(entry.stored)
-            });
+            buffers.push_with(
+                partition,
+                scatter_layout,
+                allocator,
+                hash,
+                *entry.key,
+                |stored| stored.copy_from(entry.stored),
+            );
         }
         table.clear();
     }
@@ -579,9 +573,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         // include the drained partials scattered before the fallback, which
         // only loosens the bounds further.
         let raw_scatter_rows = match (&self.buffers, topk_bin_totals.is_some(), self.scatter_raw) {
-            (Some(buffers), true, true) => {
-                Some(buffers.iter().map(|bucket| bucket.len() as u64).collect())
-            }
+            (Some(buffers), true, true) => Some(
+                (0..buffers.bucket_count())
+                    .map(|bucket| buffers.bucket_len(bucket) as u64)
+                    .collect(),
+            ),
             _ => None,
         };
         self.key_arena.flush();
@@ -589,7 +585,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let output = AggregatedTableOutput {
             node: crate::worker::current_node(),
             tables: self.tables,
-            buffers: self.buffers.map(PartitionBuffers),
+            buffers: self.buffers,
             hll: self.hll,
             has_bin_totals: topk_bin_totals.is_some(),
             raw_scatter_rows,
@@ -768,7 +764,7 @@ fn probe_rows_body<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized
 
 /// State passed through arity dispatch for one scatter range.
 struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
-    buffers: &'a mut Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>,
+    buffers: &'a mut PartitionBuffers<<K as KeyExtractor>::Persisted, V>,
     key_arena: &'a mut WorkerArena,
     worker_context: &'a mut V::WorkerContext,
     allocator: &'a mut SlabAllocator,
@@ -802,7 +798,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
         } = self;
         // Every partition shares one row-layout snapshot.
         let scatter_layout =
-            StridedScatterRows::<<K as KeyExtractor>::Persisted, V>::layout::<N>(shared_context);
+            PartitionBuffers::<<K as KeyExtractor>::Persisted, V>::layout::<N>(shared_context);
         // Indexing rather than iterating: `i` is the absolute row, used to
         // read the hash, the key, and the value columns in parallel.
         #[allow(clippy::needless_range_loop)]
@@ -812,7 +808,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
             let partition = (hash >> shift) as usize;
             let key = K::live_key(key_reader, i, key_arena).persist();
             // Seed directly into the destination row.
-            buffers[partition].push_with(scatter_layout, allocator, hash, key, |stored| {
+            buffers.push_with(partition, scatter_layout, allocator, hash, key, |stored| {
                 stored.seed(value_reader, i, worker_context)
             });
         }
@@ -862,10 +858,11 @@ mod tests {
     }
 
     fn scatter_row_count(output: &AggregatedTableOutput<IntExtractor, CountValue>) -> usize {
-        let layout = StridedScatterRows::<i32, CountValue>::layout::<0>(&());
+        let layout = PartitionBuffers::<i32, CountValue>::layout::<0>(&());
+        let buffers = output.buffers.as_ref().expect("worker switched");
         let mut rows = 0;
-        for bucket in &output.buffers.as_ref().expect("worker switched").0 {
-            bucket.for_each(layout, |_, _, _| rows += 1);
+        for bucket in 0..buffers.bucket_count() {
+            buffers.for_each(bucket, layout, |_, _, _| rows += 1);
         }
         rows
     }

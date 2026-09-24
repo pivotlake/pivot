@@ -15,10 +15,10 @@ mod table_reader;
 pub(crate) use table_reader::TableReader;
 
 mod scatter;
-pub use scatter::StridedScatterRows;
+pub use scatter::PartitionBuffers;
 
 mod aggregated_table;
-pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, PartitionBuffers, RadixConfig};
+pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, RadixConfig};
 
 /// Initial number of slots for a new per-worker hash table.
 pub const DEFAULT_CAPACITY: usize = 128;
