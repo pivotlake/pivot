@@ -27,7 +27,7 @@ use planning::{PlanCache, plan_query};
 
 pub use copy::CopyIngest;
 pub use types::{
-    Command, Error, ExecuteOptions, Execution, ExecutionStats, Result, ResultColumn,
+    Command, CompilePhases, Error, ExecuteOptions, Execution, ExecutionStats, Result, ResultColumn,
     STATS_VARIABLE, StatementOutput, is_truthy,
 };
 
@@ -228,24 +228,35 @@ impl Executor {
 
         let started = Instant::now();
         let compile_transaction = transaction;
-        let handle = tokio::task::spawn_blocking(move || -> Result<StatementHandle<T>> {
-            let spec = plan.compile(&dispatcher, compile_transaction.as_ref())?;
-            Ok(match (statement_kind, options.collect_stats) {
-                (StatementKind::Insert, true) => {
-                    let output = spec.map(|| affected_rows_from_record_batch);
-                    StatementHandle::Insert(output.execute_with_stats())
-                }
-                (StatementKind::Insert, false) => {
-                    let output = spec.map(|| affected_rows_from_record_batch);
-                    StatementHandle::Insert(output.execute())
-                }
-                (_, true) => StatementHandle::Batches(spec.execute_with_stats_as::<T>()),
-                (_, false) => StatementHandle::Batches(spec.execute_as::<T>()),
+        let (handle, picked_up, built, dispatched) =
+            tokio::task::spawn_blocking(move || -> Result<_> {
+                let picked_up = Instant::now();
+                let spec = plan.compile(&dispatcher, compile_transaction.as_ref())?;
+                let built = Instant::now();
+                let handle = match (statement_kind, options.collect_stats) {
+                    (StatementKind::Insert, true) => {
+                        let output = spec.map(|| affected_rows_from_record_batch);
+                        StatementHandle::Insert(output.execute_with_stats())
+                    }
+                    (StatementKind::Insert, false) => {
+                        let output = spec.map(|| affected_rows_from_record_batch);
+                        StatementHandle::Insert(output.execute())
+                    }
+                    (_, true) => StatementHandle::Batches(spec.execute_with_stats_as::<T>()),
+                    (_, false) => StatementHandle::Batches(spec.execute_as::<T>()),
+                };
+                Ok((handle, picked_up, built, Instant::now()))
             })
-        })
-        .await
-        .map_err(Error::PlannerPanic)??;
-        let compile_time = started.elapsed();
+            .await
+            .map_err(Error::PlannerPanic)??;
+        let resumed = Instant::now();
+        let compile_time = resumed - started;
+        let compile_phases = CompilePhases {
+            handoff_in: picked_up - started,
+            build_spec: built - picked_up,
+            dispatch: dispatched - built,
+            handoff_out: resumed - dispatched,
+        };
 
         let (results, flow, execute_time) = collect_handle(handle).await?;
         let output = match (statement_kind, results) {
@@ -276,6 +287,7 @@ impl Executor {
             stats: ExecutionStats {
                 plan: plan_time,
                 compile: compile_time,
+                compile_phases,
                 execute: execute_time,
                 flow,
             },

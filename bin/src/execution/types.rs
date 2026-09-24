@@ -115,8 +115,21 @@ pub enum StatementOutput<T> {
 pub struct ExecutionStats {
     pub plan: Duration,
     pub compile: Duration,
+    /// How `compile` splits: the wait for the blocking thread to pick the
+    /// job up, building the operator spec, handing it to the workers, and the
+    /// wait for the runtime to resume once the job is done.
+    pub compile_phases: CompilePhases,
     pub execute: Duration,
     pub flow: DataFlowStats,
+}
+
+/// The pieces of the compile phase, each a wall-clock duration.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompilePhases {
+    pub handoff_in: Duration,
+    pub build_spec: Duration,
+    pub dispatch: Duration,
+    pub handoff_out: Duration,
 }
 
 impl ExecutionStats {
@@ -125,12 +138,17 @@ impl ExecutionStats {
         let ms = |duration: Duration| duration.as_secs_f64() * 1e3;
         let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
         format!(
-            "stats: plan={:.1}ms compile={:.1}ms exec={:.1}ms | \
+            "stats: plan={:.1}ms compile={:.1}ms \
+             (in={:.2}ms build={:.2}ms dispatch={:.2}ms out={:.2}ms) exec={:.1}ms | \
              disk={} ops/{:.1}MiB/read={:.1}ms/write={:.1}ms  \
              http={} ops/{:.1}MiB/get={:.1}ms/upload={:.1}ms  \
              http-disk-cache={} ops/{:.1}MiB/{:.1}ms  cpu={:.1}ms",
             ms(self.plan),
             ms(self.compile),
+            ms(self.compile_phases.handoff_in),
+            ms(self.compile_phases.build_spec),
+            ms(self.compile_phases.dispatch),
+            ms(self.compile_phases.handoff_out),
             ms(self.execute),
             self.flow.disk_requests,
             mib(self.flow.disk_bytes),

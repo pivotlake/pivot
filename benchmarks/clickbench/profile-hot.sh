@@ -9,7 +9,12 @@
 # Usage:
 #   profile-hot.sh --tree ~/perf-ab/after --clickbench-dir ~/perf-ab/ClickBench \
 #       --source ~/hits --pgo-subset ~/hits-pgo-subset --out /tmp/profile \
-#       [--query 0,1,2] [--callgraph-query 1,13] [--runs 7]
+#       [--query 0,1,2] [--callgraph-query 1,13] [--runs 7] [--workers-list 0,190]
+#
+# --workers-list repeats the whole measurement once per worker count, each
+# under its own <out>/w<N>/ directory; 0 means the server's own default. A
+# non-zero count starts the server directly with a config naming it, since the
+# adapter's ./start writes a config without one.
 #
 # The build mirrors build-ab-servers.sh (instrumented build, training run on
 # the PGO subset, profile-use build), so the profiled binary is the same kind
@@ -25,6 +30,7 @@ out_dir="/tmp/profile"
 queries=""
 callgraph_queries=""
 runs=7
+workers_list="0"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -36,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --query)            queries="$2"; shift 2 ;;
         --callgraph-query)  callgraph_queries="$2"; shift 2 ;;
         --runs)             runs="$2"; shift 2 ;;
+        --workers-list)     workers_list="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -88,12 +95,37 @@ server="$tree/benchmarks/target-pgouse/$host_target/release/pivot"
 adapter="$clickbench_dir/pivot-parquet"
 [[ -x "$adapter/benchmark.sh" ]] || { echo "error: no ClickBench pivot-parquet adapter at $adapter" >&2; exit 2; }
 
+IFS=',' read -ra workers_counts <<<"$workers_list"
+top_out_dir="$out_dir"
+for workers in "${workers_counts[@]}"; do
+out_dir="$top_out_dir/w$workers"
+mkdir -p "$out_dir"
+echo ">>> workers=$workers" >&2
 export PIVOT_SERVER_BIN="$server" PIVOT_SOURCE="$source_path" \
        PIVOT_PORT=7797 PIVOT_CATALOG=/tmp/profile-catalog
 cd "$adapter"
 rm -rf "$PIVOT_CATALOG" "$source_path/_delta_log"
 ./stop >/dev/null 2>&1 || true
-./start
+if [[ "$workers" == "0" ]]; then
+    ./start
+else
+    config="/tmp/pivot-config-$PIVOT_PORT.yaml"
+    cat > "$config" <<EOF
+workers: $workers
+server:
+  bind: 127.0.0.1:$PIVOT_PORT
+datastores:
+  default:
+    kind: pivot
+    location: $PIVOT_CATALOG
+    default: true
+users:
+  postgres:
+    auth:
+      method: trust
+EOF
+    nohup "$server" server --config "$config" > "/tmp/pivot-server-$PIVOT_PORT.log" 2>&1 &
+fi
 for _ in $(seq 1 300); do ./check >/dev/null 2>&1 && break; sleep 1; done
 ./check >/dev/null 2>&1 || {
     echo "error: the server did not come up; its log:" >&2
@@ -103,7 +135,10 @@ for _ in $(seq 1 300); do ./check >/dev/null 2>&1 && break; sleep 1; done
     exit 1
 }
 ./load >/dev/null
-server_pid="$(ps -C pivot -o pid= | head -1 | tr -d ' ')"
+# The pid that listens on the benchmark port: a server another run left
+# behind must not be the one profiled.
+server_pid="$(ss -ltnpH "sport = :$PIVOT_PORT" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+[[ -n "$server_pid" ]] || { echo "error: no process listens on port $PIVOT_PORT" >&2; exit 1; }
 {
     echo "server: $server"
     echo "pid: $server_pid"
@@ -150,7 +185,7 @@ for n in "${query_list[@]}"; do
     } >> "$out_dir/stats.txt"
 
     # Flat profile of the server while the query repeats.
-    sudo -n perf record -q -p "$server_pid" -F 1999 -o "/tmp/perf-q$n.data" -- sleep 600 >/dev/null 2>&1 &
+    sudo -n perf record -q -p "$server_pid" -F 1999 -o "/tmp/perf-q$n.data" -- sleep 600 >>"$out_dir/perf-record.log" 2>&1 &
     sleep 0.3
     for _ in $(seq 1 "$runs"); do run_query "$sql" >/dev/null; done
     sudo -n pkill -INT -x perf || true
@@ -163,7 +198,7 @@ for n in "${query_list[@]}"; do
     for cg in "${callgraph_list[@]}"; do
         [[ "$cg" == "$n" ]] || continue
         sudo -n perf record -q -p "$server_pid" -F 299 --call-graph dwarf,16384 \
-            -o "/tmp/perf-cg-q$n.data" -- sleep 600 >/dev/null 2>&1 &
+            -o "/tmp/perf-cg-q$n.data" -- sleep 600 >>"$out_dir/perf-record.log" 2>&1 &
         sleep 0.3
         for _ in $(seq 1 "$runs"); do run_query "$sql" >/dev/null; done
         sudo -n pkill -INT -x perf || true
@@ -177,5 +212,10 @@ for n in "${query_list[@]}"; do
     done
 done
 
+./stop >/dev/null 2>&1 || true
+pkill -x pivot 2>/dev/null || true
+for _ in $(seq 1 120); do ps -C pivot >/dev/null 2>&1 || break; sleep 1; done
+done
+out_dir="$top_out_dir"
 ./stop >/dev/null 2>&1 || true
 echo ">>> done: $out_dir" >&2

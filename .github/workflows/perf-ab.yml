@@ -94,6 +94,10 @@ on:
         description: "Profile mode only: queries (0-based, comma-separated) to also profile with DWARF call graphs."
         required: false
         default: ""
+      profile_workers:
+        description: "Profile mode only: comma-separated worker counts to measure with (0 = the server's default)."
+        required: false
+        default: "0"
 
 jobs:
   perf-ab:
@@ -469,6 +473,7 @@ jobs:
         env:
           QUERY: ${{ inputs.query }}
           CALLGRAPH_QUERY: ${{ inputs.callgraph_query }}
+          PROFILE_WORKERS: ${{ inputs.profile_workers }}
           RUNS: ${{ inputs.iterations }}
         run: |
           set -euo pipefail
@@ -489,7 +494,7 @@ jobs:
               --tree ~/perf-ab/after \
               --clickbench-dir ~/perf-ab/ClickBench \
               --source '$HITS_PATH' --pgo-subset '$PGO_SUBSET_PATH' \
-              --out /tmp/profile --runs '$RUNS' $query_arg $cg_arg
+              --out /tmp/profile --runs '$RUNS' --workers-list '${PROFILE_WORKERS:-0}' $query_arg $cg_arg
           ' >/tmp/profile.log 2>&1 </dev/null &
           EOF
           scp -F "$HOME/.ssh/config" /tmp/launch.sh perf:/tmp/launch.sh
@@ -528,9 +533,12 @@ jobs:
           {
             echo "## pivotdb hot-run profile"
             echo '```'
-            cat profile-out/profile/machine.txt 2>/dev/null || true
-            echo
-            cat profile-out/profile/stats.txt 2>/dev/null || echo "(no stats captured)"
+            for d in profile-out/profile/w*; do
+              echo "=== $d"
+              cat "$d/machine.txt" 2>/dev/null || true
+              echo
+              cat "$d/stats.txt" 2>/dev/null || echo "(no stats captured)"
+            done
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           [ "${code:-1}" = "0" ]
