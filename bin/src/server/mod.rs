@@ -35,7 +35,9 @@
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //! let config = Config::open("pivot.yaml")?;
-//! let workers = config.workers.unwrap_or_else(dispatch::default_worker_count);
+//! let workers = config
+//!     .workers
+//!     .map_or_else(dispatch::default_worker_count, std::num::NonZeroUsize::get);
 //! let dispatch = Dispatch::spin_up(workers, 32, None);
 //! let metastore = Arc::new(DiskMetastore::open(
 //!     config.entries,

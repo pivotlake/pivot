@@ -1,6 +1,7 @@
 //! Construction and foreground execution of a configured Pivot server.
 
 use std::io::IsTerminal;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,7 +131,7 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
 
     let workers = config
         .workers
-        .unwrap_or_else(dispatch::default_worker_count);
+        .map_or_else(dispatch::default_worker_count, NonZeroUsize::get);
     info!(workers, "initialising dispatch");
     let disk_cache = config
         .disk_cache

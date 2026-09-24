@@ -50,6 +50,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -87,8 +88,9 @@ pub struct Config {
     /// the machine's total memory such as `80%` (the default) minus a reserve
     /// for allocations outside the pool, see [`MemoryBudget`].
     pub memory: MemoryBudget,
-    /// Number of dispatch worker threads. Defaults to the machine's core count.
-    pub workers: Option<usize>,
+    /// Number of dispatch worker threads, at least one. Defaults to the
+    /// machine's core count.
+    pub workers: Option<NonZeroUsize>,
     /// How often every datastore brings itself up to date with its store:
     /// the tables it has, and each table's committed files. For shared remote
     /// stores, this bounds how stale a query's view of another process's
@@ -122,7 +124,7 @@ pub struct Config {
 struct RawConfig {
     #[serde(default)]
     memory: MemoryBudget,
-    workers: Option<usize>,
+    workers: Option<NonZeroUsize>,
     #[serde(default = "default_datastore_refresh_interval")]
     datastore_refresh_interval: Interval,
     disk_cache: Option<DiskCacheConfig>,
@@ -352,12 +354,19 @@ mod tests {
             config.memory,
             MemoryBudget::Bytes(ByteSize::from_bytes(32 * 1024 * 1024 * 1024))
         );
-        assert_eq!(config.workers, Some(8));
+        assert_eq!(config.workers, NonZeroUsize::new(8));
         assert_eq!(
             config.datastore_refresh_interval.as_duration(),
             Duration::from_secs(5)
         );
         assert_eq!(metastore.default_datastore_name(), "hot");
+    }
+
+    #[test]
+    fn zero_workers_is_rejected() {
+        let result = from_yaml_with("workers: 0\n");
+
+        assert!(result.is_err());
     }
 
     #[test]
