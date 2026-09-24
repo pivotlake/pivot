@@ -4,11 +4,15 @@
 //! pushes into the local deque; the consumer (downstream operator) pops from it.  When a
 //! worker's local deque is empty it steals from a *same-NUMA-node* peer's deque, which
 //! balances load across the node's workers without any central coordination. Stealing
-//! never crosses nodes: the messages are typically backed by ring memory the producer's
-//! node owns, so a cross-node steal would drag every downstream access of that item to
-//! remote memory. Cross-node balance comes from the work's *source* instead (a shared
-//! injector of row groups / items), where claiming an item moves only metadata and all
-//! the memory it touches is then allocated locally.
+//! stays inside the node while the node has work: the messages are typically backed by
+//! ring memory the producer's node owns, so a cross-node steal drags every downstream
+//! access of that item to remote memory. Cross-node balance comes from the work's
+//! *source* instead (a shared injector of row groups / items), where claiming an item
+//! moves only metadata and all the memory it touches is then allocated locally. Only
+//! once every same-node peer is out of work does a thief look at the other nodes: at
+//! the tail of a phase one node routinely finishes ahead of the other, and a node's
+//! worth of cores idling until the last owner drains its deque costs far more than
+//! the remote reads.
 //!
 //! Messages flowing through these channels (e.g. `RecordBatch`) will continue processing on
 //! a different worker thread than the one that produced it. This means the message must not be
@@ -101,17 +105,26 @@ impl<I> Receiver<I> for StealableReceiver<I> {
         self.worker.pop()
     }
 
-    /// Try to steal a message from a same-node peer worker's deque.
-    /// Iterates through the node's stealers, retrying on contention.
+    /// Try to steal a message from a peer worker's deque: the same-node peers
+    /// first, and the other nodes' only when none of them holds anything.
+    fn steal(&self) -> Option<I> {
+        self.steal_from(self.siblings.clone())
+            .or_else(|| self.steal_from(0..self.siblings.start))
+            .or_else(|| self.steal_from(self.siblings.end..self.stealers.len()))
+    }
+}
+
+impl<I> StealableReceiver<I> {
+    /// Iterates through the given workers' stealers, retrying on contention.
     ///
     /// The `is_empty` pre-check keeps the (very common) all-empty scan cheap:
     /// it is a couple of plain loads, while `steal()` pins a crossbeam epoch
     /// and CASes even when it finds nothing. Idle workers re-run this scan on
     /// every wakeup, so without the pre-check the pool burns a large share of
     /// its cycles in epoch bookkeeping just discovering there is no work.
-    fn steal(&self) -> Option<I> {
+    fn steal_from(&self, peers: std::ops::Range<usize>) -> Option<I> {
         use crossbeam_deque::Steal;
-        for peer in self.siblings.clone() {
+        for peer in peers {
             if peer == self.worker_idx {
                 continue;
             }
@@ -235,12 +248,15 @@ mod tests {
     }
 
     #[test]
-    fn other_node_worker_cannot_steal() {
+    fn other_node_worker_steals_only_once_its_own_node_is_empty() {
         let mut endpoints = two_node_endpoints::<i64>();
-
         endpoints[0].0.send(7).unwrap();
+        endpoints[3].0.send(8).unwrap();
 
-        assert_eq!(endpoints[2].1.steal(), None);
-        assert_eq!(endpoints[3].1.steal(), None);
+        let from_own_node = endpoints[2].1.steal();
+        let from_other_node = endpoints[2].1.steal();
+
+        assert_eq!(from_own_node, Some(8));
+        assert_eq!(from_other_node, Some(7));
     }
 }
