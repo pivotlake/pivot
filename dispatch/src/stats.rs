@@ -56,6 +56,9 @@ pub struct DataFlowStats {
     pub wake_latency_max: Duration,
     /// The longest any worker spent building its operator graph.
     pub graph_build_max: Duration,
+    /// The most CPU time any single worker spent in this dataflow's operators:
+    /// against `cpu / workers` it shows how unevenly the work was spread.
+    pub cpu_max: Duration,
 }
 
 impl DataFlowStats {
@@ -75,6 +78,9 @@ impl DataFlowStats {
         self.cpu += other.cpu;
         self.wake_latency_max = self.wake_latency_max.max(other.wake_latency_max);
         self.graph_build_max = self.graph_build_max.max(other.graph_build_max);
+        // A worker's own tally carries its CPU in `cpu`; a folded total carries
+        // the largest contribution seen so far in `cpu_max`.
+        self.cpu_max = self.cpu_max.max(other.cpu_max).max(other.cpu);
     }
 
     /// Log the IO tally at WARN when any operation happened, for a path that has no
