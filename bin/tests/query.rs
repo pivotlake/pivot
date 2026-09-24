@@ -401,7 +401,7 @@ async fn system_table_files_reports_column_bounds(#[future] conn: Conn) {
 async fn system_datastores_lists_every_served_datastore(#[future] conn: Conn) {
     let rows = select_rows(
         &conn,
-        "SELECT name, id, type, data_path <> '' FROM system.datastores ORDER BY name",
+        "SELECT name, type, data_path <> '' FROM system.datastores ORDER BY name",
     )
     .await;
 
@@ -410,12 +410,10 @@ async fn system_datastores_lists_every_served_datastore(#[future] conn: Conn) {
         vec![
             vec![
                 Some("default".into()),
-                Some("default".into()),
                 Some("pivot".into()),
                 Some("t".into()),
             ],
             vec![
-                Some("system".into()),
                 Some("system".into()),
                 Some("system".into()),
                 Some("f".into()),
@@ -512,7 +510,6 @@ async fn system_columns_describes_the_system_relations_by_their_id(#[future] con
         rows,
         vec![
             vec![Some(id.into()), Some("name".into()), Some("VARCHAR".into())],
-            vec![Some(id.into()), Some("id".into()), Some("VARCHAR".into())],
             vec![Some(id.into()), Some("type".into()), Some("VARCHAR".into())],
             vec![
                 Some(id.into()),
@@ -573,7 +570,7 @@ async fn system_datastore_is_read_only(#[future] conn: Conn) {
     let insert = conn
         .simple_query(
             "INSERT INTO system.datastores \
-             VALUES ('not_allowed', 'not_allowed', 'delta', '/tmp')",
+             VALUES ('not_allowed', 'delta', '/tmp')",
         )
         .await
         .unwrap_err();

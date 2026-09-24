@@ -22,7 +22,6 @@ running server. Its tables are queried with two-part names such as
 | Column | Type | Description |
 | --- | --- | --- |
 | `name` | `VARCHAR` | Datastore name used in qualified SQL names. |
-| `id` | `VARCHAR` | Datastore identity. Currently the same value as `name`. |
 | `type` | `VARCHAR` | `pivot` for stored datastores or `system` for the virtual datastore. |
 | `data_path` | `VARCHAR` | Local path or object-store URI. Empty for `system`. |
 

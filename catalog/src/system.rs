@@ -121,7 +121,6 @@ const RELATIONS: [SystemRelation; 5] = [
         id: "da7aba5e-5e75-4a11-ab1e-5e1ec7edda7a",
         columns: &[
             ("name", Type::Utf8),
-            ("id", Type::Utf8),
             ("type", Type::Utf8),
             ("data_path", Type::Utf8),
         ],
@@ -354,8 +353,7 @@ impl DatastoreTransaction for SystemTransaction {
 }
 
 /// Build the `system.datastores` relation. A datastore is named once per
-/// server, so its name is its identity; the column is carried anyway, since
-/// that is what the other relations join on.
+/// server, so its name is its identity and what the other relations join on.
 fn build_datastores(
     reference: TableReference,
     columns: Vec<Column>,
@@ -366,7 +364,6 @@ fn build_datastores(
         reference,
         columns,
         vec![
-            string_array(datastores.iter().map(|entry| entry.name.clone())),
             string_array(datastores.iter().map(|entry| entry.name.clone())),
             string_array(datastores.iter().map(|entry| entry.kind.clone())),
             string_array(datastores.iter().map(|entry| entry.data_path.clone())),
