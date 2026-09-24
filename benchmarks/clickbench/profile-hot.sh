@@ -95,7 +95,13 @@ rm -rf "$PIVOT_CATALOG" "$source_path/_delta_log"
 ./stop >/dev/null 2>&1 || true
 ./start
 for _ in $(seq 1 300); do ./check >/dev/null 2>&1 && break; sleep 1; done
-./check >/dev/null 2>&1 || { echo "error: the server did not come up" >&2; exit 1; }
+./check >/dev/null 2>&1 || {
+    echo "error: the server did not come up; its log:" >&2
+    tail -n 40 "/tmp/pivot-server-$PIVOT_PORT.log" >&2 || true
+    echo "the config it was started with:" >&2
+    cat "/tmp/pivot-config-$PIVOT_PORT.yaml" >&2 || true
+    exit 1
+}
 ./load >/dev/null
 server_pid="$(ps -C pivot -o pid= | head -1 | tr -d ' ')"
 {
