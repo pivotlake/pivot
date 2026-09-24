@@ -84,7 +84,7 @@ export default defineConfig({
             "window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};plausible.init()",
         },
       ],
-      // Reference groups are explicit so SQL and server topics stay separate.
+      // Reference groups keep SQL separate from CLI and server topics.
       // Commands and function categories order themselves with sidebar.order.
       sidebar: [
         { label: "Introduction", slug: "index" },
@@ -110,8 +110,9 @@ export default defineConfig({
           ],
         },
         {
-          label: "Server reference",
+          label: "CLI & server reference",
           items: [
+            { label: "CLI", slug: "reference/cli" },
             { slug: "reference/configuration" },
             { slug: "reference/server/datastores" },
             { slug: "reference/server/authentication" },

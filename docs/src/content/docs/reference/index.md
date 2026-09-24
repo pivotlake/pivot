@@ -32,14 +32,19 @@ stored in tables from types available only in expressions and results.
 
 [Browse data types →](/docs/reference/data-types/)
 
-## Server reference
+## System tables
 
-For deployment settings and metadata, see:
+Read catalog, file, and memory metadata through the read-only tables of the
+`system` schema.
 
-- [Server configuration](/docs/reference/configuration/)
-- [Datastores and storage credentials](/docs/reference/server/datastores/)
-- [Users and authentication](/docs/reference/server/authentication/)
-- [System tables](/docs/reference/system-tables/)
+[Browse system tables →](/docs/reference/system-tables/)
+
+## Beyond SQL
+
+- [CLI reference](/docs/reference/cli/) — `pivot open`, `pivot server`, and shell commands.
+- [Configuration file](/docs/reference/configuration/) — every key of the server's YAML file, with
+  sub-pages for [datastores and storage credentials](/docs/reference/server/datastores/) and
+  [users and authentication](/docs/reference/server/authentication/).
 
 ## Compatibility
 

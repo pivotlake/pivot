@@ -41,9 +41,8 @@ ORDER BY bytes DESC;
 drop_cache()
 ```
 
-Takes no arguments. Clears Pivot's compressed and decompressed memory caches,
-plus its disk cache when configured. Returns a `BIGINT` count of entries
-evicted across these caches.
+Takes no arguments. Clears Pivot's caches, including compressed and
+decompressed data. Returns a `BIGINT` count of entries evicted.
 
 ```sql
 SELECT drop_cache() AS entries_dropped;

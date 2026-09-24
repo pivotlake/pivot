@@ -9,7 +9,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 <Tabs>
   <TabItem label="Local shell">
-    **Best for:** querying an S3 datastore directly without running a server or
+    **Best for:** querying an object store based datastore directly without running a server or
     installing `psql`.
 
     Install the Pivot CLI on Linux:
@@ -30,7 +30,8 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
     ```
 
     Pivot opens an interactive SQL prompt. The data remains in S3 after you
-    exit with `\q`.
+    exit with `\q`. See the [CLI reference](/docs/reference/cli/) for options,
+    storage credentials, and shell commands.
   </TabItem>
 
   <TabItem label="Docker">

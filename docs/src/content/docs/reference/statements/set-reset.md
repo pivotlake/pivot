@@ -39,4 +39,4 @@ PostgreSQL configuration parameter available through `SET`.
 ## Related
 
 - [EXPLAIN](/docs/reference/statements/explain/)
-- [Server configuration](/docs/reference/configuration/)
+- [Configuration file](/docs/reference/configuration/)

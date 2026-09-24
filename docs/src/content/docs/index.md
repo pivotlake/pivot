@@ -8,7 +8,7 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 578" role="img" aria-labelledby="arch-title arch-desc">
 <title id="arch-title">Pivot architecture</title>
-<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake format. A Pivot cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as Snowflake, read and write the same files directly without going through the cluster.</desc>
+<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake and Iceberg formats. A Pivot cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as Snowflake, read and write the same files directly without going through the cluster.</desc>
 <defs>
 <marker id="arch-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
@@ -16,7 +16,7 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 </defs>
 <rect x="40" y="24" width="840" height="156" rx="3" class="arch-panel" />
 <text x="64" y="54" class="arch-title">Object storage</text>
-<text x="856" y="54" text-anchor="end" class="arch-muted">S3 · GCS · Azure Blob</text>
+<text x="856" y="54" text-anchor="end" class="arch-muted">S3 · GCS</text>
 <text x="64" y="74" class="arch-muted">pivotlake</text>
 <rect x="64" y="88" width="250" height="76" rx="3" class="arch-inner" />
 <rect x="65" y="89" width="248" height="24" class="arch-strip" />
@@ -36,7 +36,7 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 <rect x="607" y="89" width="248" height="24" class="arch-strip" />
 <line x1="607" y1="113" x2="855" y2="113" class="arch-rule" />
 <text x="618" y="106" class="arch-label">sessions</text>
-<text x="844" y="106" text-anchor="end" class="arch-tiny">Delta Lake format</text>
+<text x="844" y="106" text-anchor="end" class="arch-tiny">Iceberg format</text>
 <text x="618" y="132" class="arch-tiny">part-00000-3f7a….parquet</text>
 <text x="618" y="150" class="arch-tiny">part-00001-9c21….parquet</text>
 <line x1="182" y1="250" x2="182" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
@@ -155,5 +155,5 @@ evaluation, experiments and local analysis today.
 - [Roadmap](/docs/database/roadmap/) shows what is available, in progress, and planned.
 - [SQL reference](/docs/reference/) documents commands, functions, operators,
   and data types with examples.
-- [Server reference](/docs/reference/configuration/) covers configuration,
-  datastores, authentication, and system tables.
+- [CLI & server reference](/docs/reference/cli/) covers CLI commands,
+  configuration, datastores, authentication, and system tables.
