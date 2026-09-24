@@ -126,7 +126,8 @@ users:
     auth:
       method: trust
 EOF
-    nohup "$server" server --config "$config" > "/tmp/pivot-server-$PIVOT_PORT.log" 2>&1 &
+    # Detached, so no `wait` in this script can block on the server.
+    setsid nohup "$server" server --config "$config" > "/tmp/pivot-server-$PIVOT_PORT.log" 2>&1 < /dev/null &
 fi
 for _ in $(seq 1 300); do ./check >/dev/null 2>&1 && break; sleep 1; done
 ./check >/dev/null 2>&1 || {
@@ -188,10 +189,11 @@ for n in "${query_list[@]}"; do
 
     # Flat profile of the server while the query repeats.
     sudo -n perf record -q -p "$server_pid" -F 1999 -o "/tmp/perf-q$n.data" -- sleep 600 >>"$out_dir/perf-record.log" 2>&1 &
+    perf_job=$!
     sleep 0.3
     for _ in $(seq 1 "$runs"); do run_query "$sql" >/dev/null; done
     sudo -n pkill -INT -x perf || true
-    wait || true
+    wait "$perf_job" || true
     sudo -n chown "$(id -u)" "/tmp/perf-q$n.data" || true
     perf report -i "/tmp/perf-q$n.data" --no-children --sort symbol --stdio -g none 2>/dev/null \
         | grep -v '^#' | grep -v '^$' | head -80 > "$out_dir/perf-q$n.txt" || true
@@ -201,10 +203,11 @@ for n in "${query_list[@]}"; do
         [[ "$cg" == "$n" ]] || continue
         sudo -n perf record -q -p "$server_pid" -F 299 --call-graph dwarf,16384 \
             -o "/tmp/perf-cg-q$n.data" -- sleep 600 >>"$out_dir/perf-record.log" 2>&1 &
+        perf_job=$!
         sleep 0.3
         for _ in $(seq 1 "$runs"); do run_query "$sql" >/dev/null; done
         sudo -n pkill -INT -x perf || true
-        wait || true
+        wait "$perf_job" || true
         sudo -n chown "$(id -u)" "/tmp/perf-cg-q$n.data" || true
         perf report -i "/tmp/perf-cg-q$n.data" --children --sort symbol --stdio -g none 2>/dev/null \
             | grep -v '^#' | grep -v '^$' | head -150 > "$out_dir/perf-cg-children-q$n.txt" || true
