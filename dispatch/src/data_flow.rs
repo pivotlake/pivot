@@ -469,7 +469,7 @@ impl DataFlow {
         let started = self.stats.enabled().then(Instant::now);
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| f(self)));
         if let Some(started) = started {
-            self.stats.record_cpu(started.elapsed());
+            self.stats.record_step(started, started.elapsed());
         }
         match outcome {
             Ok(Ok(v)) => v,

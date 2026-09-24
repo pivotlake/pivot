@@ -520,13 +520,16 @@ impl Worker {
         while let Ok(builder) = self.data_flow_queue.try_recv() {
             debug!("Received data flow...");
             let received = Instant::now();
-            let wake_latency = received - builder.dispatched_at();
+            let dispatched_at = builder.dispatched_at();
+            let wake_latency = received - dispatched_at;
             match builder.build() {
                 Ok(mut data_flow) => {
                     if data_flow.stats().enabled() {
-                        data_flow
-                            .stats()
-                            .record_startup(wake_latency, received.elapsed());
+                        data_flow.stats().record_startup(
+                            dispatched_at,
+                            wake_latency,
+                            received.elapsed(),
+                        );
                     }
                     LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
                     self.data_flows.insert(data_flow.id(), data_flow);

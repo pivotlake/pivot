@@ -59,6 +59,13 @@ pub struct DataFlowStats {
     /// The most CPU time any single worker spent in this dataflow's operators:
     /// against `cpu / workers` it shows how unevenly the work was spread.
     pub cpu_max: Duration,
+    /// When, after dispatch, the earliest and the latest worker ran their first
+    /// operator step: the spread is the pool's start-up skew.
+    pub first_step_min: Duration,
+    pub first_step_max: Duration,
+    /// When, after dispatch, the last worker finished its last operator step;
+    /// what the query's wall time holds beyond it is collection.
+    pub last_step_max: Duration,
 }
 
 impl DataFlowStats {
@@ -81,6 +88,14 @@ impl DataFlowStats {
         // A worker's own tally carries its CPU in `cpu`; a folded total carries
         // the largest contribution seen so far in `cpu_max`.
         self.cpu_max = self.cpu_max.max(other.cpu_max).max(other.cpu);
+        // A zero first step means "never stepped"; it must not win the minimum.
+        if other.first_step_min > Duration::ZERO
+            && (self.first_step_min == Duration::ZERO || other.first_step_min < self.first_step_min)
+        {
+            self.first_step_min = other.first_step_min;
+        }
+        self.first_step_max = self.first_step_max.max(other.first_step_max);
+        self.last_step_max = self.last_step_max.max(other.last_step_max);
     }
 
     /// Log the IO tally at WARN when any operation happened, for a path that has no
@@ -115,6 +130,9 @@ impl DataFlowStats {
 pub struct StatsCollector {
     /// `Some` only when stats are on.
     stats: Option<DataFlowStats>,
+    /// When the coordinator dispatched the dataflow; the step timestamps are
+    /// relative to it. Set by the worker once it has the builder.
+    dispatched_at: Option<Instant>,
     /// Where [`report`](Self::report) ships the tally for the handle to fold.
     tx: mpsc::Sender<DataFlowStats>,
 }
@@ -123,6 +141,7 @@ impl StatsCollector {
     pub(crate) fn new(tx: mpsc::Sender<DataFlowStats>, enabled: bool) -> Self {
         Self {
             stats: enabled.then(DataFlowStats::default),
+            dispatched_at: None,
             tx,
         }
     }
@@ -219,10 +238,32 @@ impl StatsCollector {
 
     /// Record how long this worker took to pick the dataflow up after it was
     /// dispatched, and how long it then spent building its operator graph.
-    pub fn record_startup(&mut self, wake_latency: Duration, graph_build: Duration) {
+    pub fn record_startup(
+        &mut self,
+        dispatched_at: Instant,
+        wake_latency: Duration,
+        graph_build: Duration,
+    ) {
+        self.dispatched_at = Some(dispatched_at);
         if let Some(stats) = &mut self.stats {
             stats.wake_latency_max = wake_latency;
             stats.graph_build_max = graph_build;
+        }
+    }
+
+    /// Record one operator step: its CPU, and its place on the timeline.
+    pub fn record_step(&mut self, started: Instant, elapsed: Duration) {
+        let Some(stats) = &mut self.stats else {
+            return;
+        };
+        stats.cpu += elapsed;
+        if let Some(dispatched_at) = self.dispatched_at {
+            let began = started.saturating_duration_since(dispatched_at);
+            if stats.first_step_min == Duration::ZERO {
+                stats.first_step_min = began.max(Duration::from_nanos(1));
+                stats.first_step_max = stats.first_step_min;
+            }
+            stats.last_step_max = began + elapsed;
         }
     }
 
