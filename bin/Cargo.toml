@@ -26,7 +26,7 @@ arrow-schema = { workspace = true }
 lru = { workspace = true }
 # COPY frames arrive as refcounted protocol bytes and decode without copying.
 bytes = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros", "sync", "signal", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros", "sync", "signal", "time", "fs", "io-util"] }
 serde = { workspace = true }
 serde_yaml_ng = { workspace = true }
 pgwire = { workspace = true }

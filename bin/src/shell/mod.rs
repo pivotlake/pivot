@@ -1,5 +1,6 @@
 //! Embedded single-datastore support and the interactive `pivot open` shell.
 
+mod copy;
 mod instance;
 mod parser;
 mod progress;
