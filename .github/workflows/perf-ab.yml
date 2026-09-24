@@ -524,7 +524,8 @@ jobs:
                 sleep 20 ;;
             esac
           done
-          ssh perf 'tar -C /tmp -czf /tmp/profile.tgz profile profile.log'
+          ssh perf 'tail -n 40 /tmp/profile.log' || true
+          ssh perf 'cd /tmp && tar -czf /tmp/profile.tgz $(ls -d profile profile.log 2>/dev/null)'
           scp -F "$HOME/.ssh/config" perf:/tmp/profile.tgz profile.tgz
           mkdir -p profile-out && tar -C profile-out -xzf profile.tgz
           exit_line=$(grep -o 'PROFILE COMPLETE exit=[0-9]*' profile-out/profile.log | tail -1)

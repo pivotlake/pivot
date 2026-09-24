@@ -21,6 +21,8 @@
 # of binary the A/B workflow times.
 
 set -euo pipefail
+trap 'echo "error: profile-hot.sh failed at line $LINENO" >&2' ERR
+echo "invoked as: $0 $*" >&2
 
 tree=""
 clickbench_dir=""
