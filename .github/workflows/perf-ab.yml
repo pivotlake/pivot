@@ -86,6 +86,14 @@ on:
           - m6i.4xlarge
           - m7i.4xlarge
         default: c8g.4xlarge
+      profile:
+        description: "Profile mode: instead of an A/B, build one PGO server from the after commit and record per-query engine stats, hot timings and perf profiles (see benchmarks/clickbench/profile-hot.sh)."
+        type: boolean
+        default: false
+      callgraph_query:
+        description: "Profile mode only: queries (0-based, comma-separated) to also profile with DWARF call graphs."
+        required: false
+        default: ""
 
 jobs:
   perf-ab:
@@ -311,8 +319,10 @@ jobs:
 
           scp -F "$HOME/.ssh/config" /tmp/bench-ab.sh perf:/tmp/bench-ab.sh
           scp -F "$HOME/.ssh/config" /tmp/build-ab-servers.sh perf:/tmp/build-ab-servers.sh
+          scp -F "$HOME/.ssh/config" benchmarks/clickbench/profile-hot.sh perf:/tmp/profile-hot.sh
 
       - name: Run A/B benchmark (detached, polled)
+        if: ${{ !inputs.profile }}
         env:
           QUERY: ${{ inputs.query }}
           ITERATIONS: ${{ inputs.iterations }}
@@ -454,6 +464,77 @@ jobs:
           fi
           echo "No hot regression past the threshold."
 
+      - name: Run the profile (detached, polled)
+        if: ${{ inputs.profile }}
+        env:
+          QUERY: ${{ inputs.query }}
+          CALLGRAPH_QUERY: ${{ inputs.callgraph_query }}
+          RUNS: ${{ inputs.iterations }}
+        run: |
+          set -euo pipefail
+          ssh perf 'command -v perf >/dev/null \
+            || sudo DEBIAN_FRONTEND=noninteractive apt-get install -qy linux-tools-common linux-tools-aws \
+            || sudo DEBIAN_FRONTEND=noninteractive apt-get install -qy linux-tools-common "linux-tools-$(uname -r)"'
+          ssh perf 'perf --version'
+          query_arg=""
+          [ -n "$QUERY" ] && query_arg="--query $QUERY"
+          cg_arg=""
+          [ -n "$CALLGRAPH_QUERY" ] && cg_arg="--callgraph-query $CALLGRAPH_QUERY"
+          cat > /tmp/launch.sh <<EOF
+          rm -rf /tmp/profile /tmp/profile.log /tmp/profile.pid
+          setsid bash -c '
+            echo \$\$ >/tmp/profile.pid
+            trap '"'"'echo "=== PROFILE COMPLETE exit=\$? ==="'"'"' EXIT
+            bash /tmp/profile-hot.sh \
+              --tree ~/perf-ab/after \
+              --clickbench-dir ~/perf-ab/ClickBench \
+              --source '$HITS_PATH' --pgo-subset '$PGO_SUBSET_PATH' \
+              --out /tmp/profile --runs '$RUNS' $query_arg $cg_arg
+          ' >/tmp/profile.log 2>&1 </dev/null &
+          EOF
+          scp -F "$HOME/.ssh/config" /tmp/launch.sh perf:/tmp/launch.sh
+          ssh perf 'bash /tmp/launch.sh'
+          echo "launched the profile run on the box"
+          sleep 10
+          prev=""
+          while true; do
+            state=$(ssh perf '
+              if kill -0 "$(cat /tmp/profile.pid 2>/dev/null)" 2>/dev/null; then
+                echo alive
+              elif grep -q "PROFILE COMPLETE" /tmp/profile.log 2>/dev/null; then
+                echo done
+              else
+                echo dead
+              fi')
+            case "$state" in
+              done) break ;;
+              dead)
+                echo "::error::the profile process vanished without a sentinel."
+                ssh perf 'tail -n 60 /tmp/profile.log' || true
+                exit 1 ;;
+              *)
+                cur=$(ssh perf 'tail -n 3 /tmp/profile.log' 2>/dev/null || true)
+                if [ "$cur" != "$prev" ]; then printf '%s\n' "$cur"; fi
+                prev=$cur
+                sleep 20 ;;
+            esac
+          done
+          ssh perf 'tar -C /tmp -czf /tmp/profile.tgz profile profile.log'
+          scp -F "$HOME/.ssh/config" perf:/tmp/profile.tgz profile.tgz
+          mkdir -p profile-out && tar -C profile-out -xzf profile.tgz
+          exit_line=$(grep -o 'PROFILE COMPLETE exit=[0-9]*' profile-out/profile.log | tail -1)
+          code="${exit_line##*=}"
+          echo "profile exit code: ${code:-unknown}"
+          {
+            echo "## pivotdb hot-run profile"
+            echo '```'
+            cat profile-out/profile/machine.txt 2>/dev/null || true
+            echo
+            cat profile-out/profile/stats.txt 2>/dev/null || echo "(no stats captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${code:-1}" = "0" ]
+
       # Downloadable copy of the report + full box log, so results survive
       # beyond the job summary and are available even when the run failed.
       - name: Upload A/B report
@@ -466,6 +547,7 @@ jobs:
             ab-full.log
             ab-before.out
             ab-after.out
+            profile-out
           if-no-files-found: ignore
 
       - name: Stop the perf box
