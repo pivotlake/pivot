@@ -22,15 +22,20 @@ use crate::operations::channels::{ChannelFactory, Receiver, Sender};
 use crate::waker::worker_waker;
 use crossbeam_deque::{Stealer, Worker};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Factory for building one worker's stealable channel endpoint.
 ///
-/// Holds the local [`Worker`] deque plus a *shared* slice of every worker's
-/// [`Stealer`] and this worker's place in it.
+/// The deque itself is created by [`build`](ChannelFactory::build), on the
+/// worker that owns it, and its [`Stealer`] published into the slot the
+/// factory holds in the *shared* stealer table. Creating the deques on the
+/// workers, rather than on the thread that plans the query, keeps that
+/// thread's work per stage independent of the worker count: a pool of
+/// hundreds of workers would otherwise spend most of a query's compile time
+/// allocating deques one after another.
 pub struct StealableChannelFactory<T: Send> {
-    worker: Worker<T>,
-    stealers: Arc<[Stealer<T>]>,
+    new_worker: fn() -> Worker<T>,
+    stealers: Arc<[OnceLock<Stealer<T>>]>,
     worker_idx: usize,
     topology: Topology,
 }
@@ -40,7 +45,10 @@ impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
     type Receiver = StealableReceiver<T>;
 
     fn build(self) -> (Rc<Worker<T>>, StealableReceiver<T>) {
-        let worker = Rc::new(self.worker);
+        let worker = Rc::new((self.new_worker)());
+        self.stealers[self.worker_idx]
+            .set(worker.stealer())
+            .unwrap_or_else(|_| panic!("stealable channel endpoint built twice"));
         (
             worker.clone(),
             StealableReceiver {
@@ -72,8 +80,10 @@ impl<O> Sender<O> for Rc<Worker<O>> {
 /// cross-worker load balancing within the node.
 pub struct StealableReceiver<I> {
     worker: Rc<Worker<I>>,
-    /// Every worker's stealer, shared by all receivers of the stage.
-    stealers: Arc<[Stealer<I>]>,
+    /// Every worker's stealer, shared by all receivers of the stage. A slot is
+    /// empty until its worker has built its endpoint; a deque that does not
+    /// exist yet holds nothing to steal.
+    stealers: Arc<[OnceLock<Stealer<I>>]>,
     /// The slice of `stealers` this worker may steal from (its node's workers).
     siblings: std::ops::Range<usize>,
     /// This worker's own index in `stealers`, skipped when stealing.
@@ -105,7 +115,9 @@ impl<I> Receiver<I> for StealableReceiver<I> {
             if peer == self.worker_idx {
                 continue;
             }
-            let stealer = &self.stealers[peer];
+            let Some(stealer) = self.stealers[peer].get() else {
+                continue;
+            };
             if stealer.is_empty() {
                 continue;
             }
@@ -143,20 +155,16 @@ fn stealable_with<T: Send>(
     topology: Topology,
     new_worker: fn() -> Worker<T>,
 ) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
-    let workers: Vec<_> = (0..topology.total_workers())
-        .map(|_| new_worker())
+    let stealers: Arc<[OnceLock<Stealer<T>>]> = (0..topology.total_workers())
+        .map(|_| OnceLock::new())
         .collect();
-    let stealers: Arc<[Stealer<T>]> = workers.iter().map(Worker::stealer).collect();
 
-    workers
-        .into_iter()
-        .enumerate()
-        .map(move |(worker_idx, worker)| StealableChannelFactory {
-            worker,
-            stealers: stealers.clone(),
-            worker_idx,
-            topology,
-        })
+    (0..topology.total_workers()).map(move |worker_idx| StealableChannelFactory {
+        new_worker,
+        stealers: stealers.clone(),
+        worker_idx,
+        topology,
+    })
 }
 
 #[cfg(test)]
@@ -204,6 +212,26 @@ mod tests {
         let own = endpoints[0].1.try_recv();
 
         assert_eq!(own, Some(1));
+    }
+
+    #[test]
+    fn a_sibling_that_has_not_built_its_endpoint_is_skipped() {
+        crate::waker::install_test_worker_waker();
+        let mut factories = stealable::<i64>(Topology {
+            workers_per_node: 2,
+            node_count: 1,
+        })
+        .into_iter();
+        let (mut sender, receiver) = factories.next().unwrap().build();
+        let unbuilt_sibling = factories.next().unwrap();
+        sender.send(7).unwrap();
+
+        let stolen_before = receiver.steal();
+        let (_, sibling_receiver) = unbuilt_sibling.build();
+        let stolen_after = sibling_receiver.steal();
+
+        assert_eq!(stolen_before, None);
+        assert_eq!(stolen_after, Some(7));
     }
 
     #[test]
