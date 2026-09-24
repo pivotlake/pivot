@@ -158,6 +158,7 @@ jobs:
         run: |
           cp benchmarks/clickbench/bench-ab.sh /tmp/bench-ab.sh
           cp benchmarks/clickbench/build-ab-servers.sh /tmp/build-ab-servers.sh
+          cp benchmarks/clickbench/profile-hot.sh /tmp/profile-hot.sh
 
       - name: Start the perf box
         env:
@@ -327,7 +328,7 @@ jobs:
 
           scp -F "$HOME/.ssh/config" /tmp/bench-ab.sh perf:/tmp/bench-ab.sh
           scp -F "$HOME/.ssh/config" /tmp/build-ab-servers.sh perf:/tmp/build-ab-servers.sh
-          scp -F "$HOME/.ssh/config" benchmarks/clickbench/profile-hot.sh perf:/tmp/profile-hot.sh
+          scp -F "$HOME/.ssh/config" /tmp/profile-hot.sh perf:/tmp/profile-hot.sh
 
       - name: Run A/B benchmark (detached, polled)
         if: ${{ !inputs.profile }}
