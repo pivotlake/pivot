@@ -18,8 +18,8 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
     curl https://pivotlake.io | sh
     ```
 
-    Export your AWS credentials and region, then open the datastore from its
-    S3 location:
+    Then open a datastore from its location in Amazon S3 or Google Cloud
+    Storage. For S3, export your AWS credentials and region first:
 
     ```sh
     export AWS_ACCESS_KEY_ID=your-access-key-id
@@ -29,15 +29,26 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
     pivot open s3://my-bucket/pivot-data
     ```
 
-    Pivot opens an interactive SQL prompt. The data remains in S3 after you
-    exit with `\q`. See the [CLI reference](/docs/reference/cli/) for options,
-    storage credentials, and shell commands.
+    For Google Cloud Storage, log in with Application Default Credentials
+    first:
+
+    ```sh
+    gcloud auth application-default login
+
+    pivot open gs://my-bucket/pivot-data
+    ```
+
+    Pivot opens an interactive SQL prompt. The data remains in your bucket
+    after you exit with `\q`. See the [CLI reference](/docs/reference/cli/) for
+    options, [storage credentials](/docs/reference/cli/#object-store-credentials),
+    and shell commands.
   </TabItem>
 
   <TabItem label="Docker">
     **Best for:** launching a server with minimal setup.
 
-    Start the server with the S3 location, AWS credentials, and region:
+    Start the server with the datastore's location in Amazon S3 or Google
+    Cloud Storage. For S3, pass your AWS credentials and region:
 
     ```sh
     docker run --rm --name pivot \
@@ -49,16 +60,28 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
       pivotlake/pivot:latest
     ```
 
-    The image generates a metastore for the S3 location on startup, while the
-    datastore itself remains in S3 after the container exits. In a second
-    terminal, connect with any Postgres client:
+    For MinIO or another S3-compatible service, also add
+    `-e AWS_ENDPOINT_URL=http://minio:9000`.
+
+    For Google Cloud Storage, mount a service-account key file and point
+    `GOOGLE_APPLICATION_CREDENTIALS` at it:
+
+    ```sh
+    docker run --rm --name pivot \
+      -p 5432:5432 \
+      -e PIVOT_DATASTORE=gs://my-bucket/pivot-data \
+      -e GOOGLE_APPLICATION_CREDENTIALS=/etc/pivot/gcs-key.json \
+      -v "$PWD/gcs-key.json:/etc/pivot/gcs-key.json:ro" \
+      pivotlake/pivot:latest
+    ```
+
+    The image generates a metastore for the location on startup, while the
+    datastore itself remains in your bucket after the container exits. In a
+    second terminal, connect with any Postgres client:
 
     ```sh
     psql -h 127.0.0.1 -p 5432 -U pivot
     ```
-
-    For MinIO or another S3-compatible service, add
-    `-e AWS_ENDPOINT_URL=http://minio:9000`.
   </TabItem>
 
   <TabItem label="Linux server">
@@ -93,6 +116,10 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
     ```sh
     psql -h 127.0.0.1 -p 5432 -U pivot
     ```
+
+    The package serves a local datastore. To store data in S3 or Google Cloud
+    Storage instead, edit `/etc/pivot/config.yaml` as described in
+    [Datastores & storage credentials](/docs/reference/server/datastores/).
   </TabItem>
 </Tabs>
 

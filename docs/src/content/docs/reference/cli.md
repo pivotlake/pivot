@@ -185,6 +185,26 @@ Shell commands start with a backslash and take no `;`.
 | `\h`, `\help` | Show the list of shell commands. |
 | `\timing` | Toggle printing the elapsed time after each statement. |
 | `\timing on \| off` | Turn statement timing on or off. `true`/`false` and `1`/`0` are also accepted. |
+| `\copy table [(columns)] FROM 'file' WITH (FORMAT arrow)` | Load a local Arrow IPC file into a table. See [Loading a file](#loading-a-file). |
+
+### Loading a file
+
+`\copy` loads a file from the machine running the shell into a table. It
+takes the same table, column list, and options as
+[`COPY ... FROM STDIN`](/docs/reference/statements/copy/), with a file name in
+place of `STDIN`:
+
+```text
+pivot=> \copy events (id, region) FROM 'events.arrow' WITH (FORMAT arrow)
+COPY 1000
+```
+
+The file must be an Arrow IPC stream. The file name can be bare or
+single-quoted; quote it if it contains spaces. The shell prints the number of
+rows loaded. The load is all-or-nothing: if the file is incomplete or you
+press Ctrl-C, no rows are added.
+
+### Execution stats
 
 To print each statement's execution stats, set `pivot_stats`. See
 [`SET` and `RESET`](/docs/reference/statements/set-reset/).
@@ -278,8 +298,8 @@ variable that is set but empty is an error.
 
 ## Known limitations
 
-- The shell does not support `COPY ... FROM STDIN`. Load data through
-  `pivot server` with a PostgreSQL client instead.
+- A plain `COPY ... FROM STDIN` is refused in the shell. Use
+  [`\copy`](#loading-a-file) to load a local file instead.
 - The shell serves exactly one datastore. To query several datastores
   together, configure them in a `pivot server`.
 - The shell runs only interactively. It does not execute SQL from a file or

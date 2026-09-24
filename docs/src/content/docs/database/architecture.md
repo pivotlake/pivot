@@ -427,83 +427,42 @@ Any user or datastore created on one instance is immediately visible to all othe
 ## Deployment Architecture
 
 Pivot can run as a standalone SQL shell on top of a [datastore](#datastore) or as a server accepting client connections. Both modes use the same Catalog, Planner, and Dispatch pool, running together in a single process. Cluster deployments with a shared 
-PostgreSQL metastore are planned.
+PostgreSQL metastore are planned to be released soon.
 
 ### Standalone
 
 `pivot open` starts an interactive SQL shell with its own query engine. It
-opens one datastore and uses an ephemeral metastore for the session. Queries
-execute on the machine running the shell, including when the data is stored
-remotely.
-
-Open a local datastore with:
-
-```sh
-pivot open ./pivot-data
-```
-
-Or open a datastore in object storage, with credentials supplied through the
-environment:
+opens one datastore, local or in object storage, and uses an ephemeral
+metastore for the session. Queries execute on the machine running the shell,
+even when the data is stored remotely, and tables remain in the datastore
+after the shell exits.
 
 ```sh
 pivot open s3://my-bucket/pivot-data
 ```
 
-Tables and data remain in the datastore after the shell exits. The
-`--memory` and `--workers` options control the shell's memory budget and
-Dispatch worker count. See the [Quickstart](/docs/quickstart/) for installation
-and credential setup.
-
-A local datastore directory can be opened by only one Pivot process at a
-time. Use a remote datastore when multiple instances need to access the same
-data.
+A local datastore can be opened by only one process at a time, so use a
+remote datastore when several instances need the same data. See the
+[CLI reference](/docs/reference/cli/) for options, credentials, and shell
+commands.
 
 ### Server
 
 `pivot server` runs a persistent SQL endpoint that accepts connections from
 applications, BI tools, and PostgreSQL clients. Each connection submits its
 queries to the server's query engine; concurrent connections share that
-instance's compute resources.
-
-Create a YAML configuration using the
-[example configuration](/docs/reference/configuration/#example-configuration), then
-start the server:
+instance's compute resources. A server can expose multiple datastores and
+execute queries across them.
 
 ```sh
 pivot server --config pivot.yaml
 ```
 
-With the example configuration, connect from another terminal using:
+The server runs in the foreground; connect from another terminal with any
+PostgreSQL client. The [configuration file](/docs/reference/configuration/) sets the instance's
+resources, its endpoint, the datastores it serves, and its users.
 
-```sh
-psql -h 127.0.0.1 -p 5432 -U pivot
-```
-
-Top-level configuration keys control the memory budget, worker count, and
-other instance settings. The `server` section configures the listening
-address and TLS. The `datastores`, `secrets`, and `users` maps define what is
-available through that server. The `metastore` file can supply additional
-entries from the same three maps and stores users created with `CREATE USER`.
-A server can expose multiple datastores and execute queries across them.
-
-Separate servers can access the same remote datastores while using their own
-configuration. Commits made by another instance become visible through
-background refresh, controlled by `datastore_refresh_interval`. Enable
-compaction and vacuum in one process per shared datastore, as described in
+Separate servers can share the same remote datastores, each with its own
+configuration, and see each other's commits through background refresh. Run
+compaction and vacuum in only one of them per datastore, as described in
 [datastore maintenance](/docs/reference/server/datastores/#maintenance).
-
-### Cluster (upcoming)
-
-The planned cluster deployment places multiple Pivot server instances behind
-a common SQL endpoint. A load balancer routes each client connection to an
-instance, which plans and executes that connection's queries using its own
-compute resources.
-
-Instances will share remote datastores and a PostgreSQL-backed metastore for
-datastore definitions, credentials, and users. Adding instances will provide
-more capacity for concurrent workloads while keeping the data in shared
-storage. See [Sharing a metastore across deployments](#sharing-a-metastore-across-deployments)
-for the proposed architecture.
-
-Distributing a single query across multiple instances through MPP execution
-is a separate, longer-term [roadmap item](/docs/database/roadmap/#execution-enhancements).

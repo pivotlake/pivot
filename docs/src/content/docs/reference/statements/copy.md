@@ -36,6 +36,15 @@ list are filled with `NULL`.
 `FORMAT arrow` is required for the supported form. Arrow IPC is the only
 supported copy format.
 
+## Loading a local file in the shell
+
+In [`pivot open`](/docs/reference/cli/#loading-a-file), `\copy` runs the same
+`COPY` with rows read from a local file:
+
+```text
+\copy events (id, region) FROM 'events.arrow' WITH (FORMAT arrow)
+```
+
 ## Limitations
 
 CSV and plain-text copy input are not supported. This form receives data from

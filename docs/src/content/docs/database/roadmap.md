@@ -10,7 +10,7 @@ This section is intended to provide visibility into where Pivot is heading and t
 
 Pivot was created to improve the ecosystem around open data formats and make it possible to build and operate an open data architecture without compromising on performance. The direction outlined here reflects that goal, but it is not set in stone.
 
-If you are using Pivot, considering using it, or simply have thoughts about where the project should go, we would love to hear them. If you disagree with any of the priorities outlined here or think something important is missing, please open a GitHub issue at |fillme| or start a discussion in the community Slack.
+If you are using Pivot, considering using it, or simply have thoughts about where the project should go, we would love to hear them. If you disagree with any of the priorities outlined here or think something important is missing, please [open a GitHub issue](https://github.com/pivotlake/pivot/issues) or start a discussion in the [community Slack](https://join.slack.com/t/pivotlake/shared_invite/zt-4aedix6mq-SohsZTdeiMMLVgq_sC9Vog).
 
 ## Planned enhancements:
 ### Format support
