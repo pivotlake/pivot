@@ -159,7 +159,7 @@ run_query() {
 }
 run_query_with_stats() {
     psql -h 127.0.0.1 -p "$PIVOT_PORT" -U postgres -d postgres -c "SET pivot_stats = true" -c "$1" 2>&1 \
-        | grep -o "plan=.*cpu=[0-9.]*ms" | sed 's/ | disk=.*http-disk-cache=[^ ]* *//'
+        | grep -o "plan=.*" | sed 's/ | disk=.*http-disk-cache=[^ ]* *//'
 }
 
 total="$(wc -l < queries.sql)"
