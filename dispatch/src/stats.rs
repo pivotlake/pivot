@@ -51,6 +51,11 @@ pub struct DataFlowStats {
     /// CPU time spent in this dataflow's operators (decode, group-by, …), summed
     /// across workers. Excludes time parked waiting on IO.
     pub cpu: Duration,
+    /// The longest any worker took to pick the dataflow up after it was
+    /// dispatched: how long the wake-up of the pool takes end to end.
+    pub wake_latency_max: Duration,
+    /// The longest any worker spent building its operator graph.
+    pub graph_build_max: Duration,
 }
 
 impl DataFlowStats {
@@ -68,6 +73,8 @@ impl DataFlowStats {
         self.disk_read_time += other.disk_read_time;
         self.disk_write_time += other.disk_write_time;
         self.cpu += other.cpu;
+        self.wake_latency_max = self.wake_latency_max.max(other.wake_latency_max);
+        self.graph_build_max = self.graph_build_max.max(other.graph_build_max);
     }
 
     /// Log the IO tally at WARN when any operation happened, for a path that has no
@@ -201,6 +208,15 @@ impl StatsCollector {
     pub fn record_cpu(&mut self, elapsed: Duration) {
         if let Some(stats) = &mut self.stats {
             stats.cpu += elapsed;
+        }
+    }
+
+    /// Record how long this worker took to pick the dataflow up after it was
+    /// dispatched, and how long it then spent building its operator graph.
+    pub fn record_startup(&mut self, wake_latency: Duration, graph_build: Duration) {
+        if let Some(stats) = &mut self.stats {
+            stats.wake_latency_max = wake_latency;
+            stats.graph_build_max = graph_build;
         }
     }
 

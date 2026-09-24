@@ -169,9 +169,16 @@ pub struct DataFlowBuilder {
     profiled: bool,
     /// Builds the per-worker operator graph.
     build: Box<dyn FnOnce(&mut BuildContext) -> OperatorGraphBuilder + Send>,
+    /// When the coordinator created this builder, for the startup stats.
+    dispatched_at: std::time::Instant,
 }
 
 impl DataFlowBuilder {
+    /// When the coordinator created this builder.
+    pub fn dispatched_at(&self) -> std::time::Instant {
+        self.dispatched_at
+    }
+
     pub fn new(
         build: Box<dyn FnOnce(&mut BuildContext) -> OperatorGraphBuilder + Send>,
         cancelled: Arc<AtomicBool>,
@@ -187,6 +194,7 @@ impl DataFlowBuilder {
             #[cfg(feature = "perf")]
             profiled: false,
             build,
+            dispatched_at: std::time::Instant::now(),
         }
     }
 

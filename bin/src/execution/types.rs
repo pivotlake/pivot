@@ -142,7 +142,8 @@ impl ExecutionStats {
              (in={:.2}ms build={:.2}ms dispatch={:.2}ms out={:.2}ms) exec={:.1}ms | \
              disk={} ops/{:.1}MiB/read={:.1}ms/write={:.1}ms  \
              http={} ops/{:.1}MiB/get={:.1}ms/upload={:.1}ms  \
-             http-disk-cache={} ops/{:.1}MiB/{:.1}ms  cpu={:.1}ms",
+             http-disk-cache={} ops/{:.1}MiB/{:.1}ms  cpu={:.1}ms  \
+             wake_max={:.2}ms build_max={:.2}ms",
             ms(self.plan),
             ms(self.compile),
             ms(self.compile_phases.handoff_in),
@@ -162,6 +163,8 @@ impl ExecutionStats {
             mib(self.flow.disk_cache_bytes),
             ms(self.flow.disk_cache_time),
             ms(self.flow.cpu),
+            ms(self.flow.wake_latency_max),
+            ms(self.flow.graph_build_max),
         )
     }
 }

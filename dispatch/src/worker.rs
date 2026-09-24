@@ -33,6 +33,7 @@ use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Live per-worker dataflows across the pool.
 ///
@@ -518,8 +519,15 @@ impl Worker {
         // or park waiting for this worker's operator to ever exist).
         while let Ok(builder) = self.data_flow_queue.try_recv() {
             debug!("Received data flow...");
+            let received = Instant::now();
+            let wake_latency = received - builder.dispatched_at();
             match builder.build() {
-                Ok(data_flow) => {
+                Ok(mut data_flow) => {
+                    if data_flow.stats().enabled() {
+                        data_flow
+                            .stats()
+                            .record_startup(wake_latency, received.elapsed());
+                    }
                     LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
                     self.data_flows.insert(data_flow.id(), data_flow);
                 }
