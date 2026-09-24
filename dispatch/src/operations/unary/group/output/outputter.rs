@@ -31,6 +31,13 @@ use std::sync::{Arc, OnceLock};
 /// nothing extra over one.
 const MIN_MERGE_PARTITIONS: usize = 2;
 
+/// How many merge jobs the phase aims to hand each worker. One job per worker
+/// leaves the pool idle for the length of a whole job at the end of the
+/// phase, since the jobs never finish in step; with several smaller jobs per
+/// worker the last round is short and every core keeps stealing until the
+/// queue drains.
+const MERGE_JOBS_PER_WORKER: usize = 4;
+
 /// Minimum merged distinct estimate for top-k partition pruning. Turning
 /// the per-worker hash-bin totals into partition bounds costs a sum over
 /// `workers x HASH_BINS` counters; below this many groups the whole merge
@@ -196,10 +203,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             let input_slots: usize = tables_by_node.iter().flatten().map(|t| t.capacity()).sum();
             let maximum_allowed_jobs = input_slots / MINIMUM_SCANNED_ENTRIES_PER_JOB;
             let partitions = (input_slots / TARGET_SCANNED_ENTRIES_PER_JOB)
-                // Never fewer jobs than workers, so no core idles, but a job still has
-                // to scan at least MINIMUM_SCANNED_ENTRIES_PER_JOB slots to be worth its
-                // setup, so small inputs stay below that floor.
-                .max(worker_count)
+                // Several jobs per worker, so no core idles through the last
+                // round, but a job still has to scan at least
+                // MINIMUM_SCANNED_ENTRIES_PER_JOB slots to be worth its setup,
+                // so small inputs stay below that floor.
+                .max(worker_count * MERGE_JOBS_PER_WORKER)
                 .min(maximum_allowed_jobs)
                 .max(MIN_MERGE_PARTITIONS)
                 .next_power_of_two();
@@ -231,10 +239,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             // thousands of near-empty jobs at moderate cardinality, so size the job
             // count to the now-exact distinct estimate instead: enough jobs that each
             // target holds ~target_groups_per_partition groups. Then bound it - at
-            // least worker_count so every core has work, and never more than the
-            // bucket count, since the merge can't be finer than the scatter (each job
-            // folds a contiguous range of buckets, reaching one-bucket-per-job only
-            // at very high cardinality).
+            // least several jobs per worker so the last round of the phase keeps
+            // the pool busy, and never more than the bucket count, since the merge
+            // can't be finer than the scatter (each job folds a contiguous range of
+            // buckets, reaching one-bucket-per-job only at very high cardinality).
             let scatter_buckets = buffers_by_node
                 .iter()
                 .flatten()
@@ -243,7 +251,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 .0
                 .len();
             let merge_partitions = (estimate / target_groups_per_partition)
-                .clamp(worker_count, scatter_buckets)
+                .max(worker_count * MERGE_JOBS_PER_WORKER)
+                .min(scatter_buckets)
                 .max(MIN_MERGE_PARTITIONS)
                 .next_power_of_two();
             // Start each target big enough to hold its share at MAX_LOAD_FACTOR (the
