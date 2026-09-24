@@ -19,6 +19,8 @@
 # --env-list repeats it once per server environment: entries separated by
 # '|', each a space-separated list of KEY=VALUE pairs exported around the
 # server's start, or '-' for none. Each entry gets its own <out>/e<N>-w<M>/.
+# --env-list-file reads the same list from a file, for callers whose command
+# line cannot carry the separator.
 #
 # The build mirrors build-ab-servers.sh (instrumented build, training run on
 # the PGO subset, profile-use build), so the profiled binary is the same kind
@@ -52,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --runs)             runs="$2"; shift 2 ;;
         --workers-list)     workers_list="$2"; shift 2 ;;
         --env-list)         env_list="$2"; shift 2 ;;
+        --env-list-file)    env_list="$(cat "$2")"; shift 2 ;;
         --no-perf)          record_perf=0; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac

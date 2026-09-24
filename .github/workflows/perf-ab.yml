@@ -497,6 +497,10 @@ jobs:
           cg_arg=""
           [ -n "$CALLGRAPH_QUERY" ] && cg_arg="--callgraph-query $CALLGRAPH_QUERY"
           [ "$PROFILE_PERF" = "true" ] || cg_arg="$cg_arg --no-perf"
+          # The env list carries '|' and '=' that the launch command's quoting
+          # cannot, so it travels as a file.
+          printf '%s\n' "${PROFILE_ENV_LIST:--}" > /tmp/profile-env-list.txt
+          scp -F "$HOME/.ssh/config" /tmp/profile-env-list.txt perf:/tmp/profile-env-list.txt
           cat > /tmp/launch.sh <<EOF
           rm -rf /tmp/profile /tmp/profile.log /tmp/profile.pid
           setsid bash -c '
@@ -507,7 +511,7 @@ jobs:
               --clickbench-dir ~/perf-ab/ClickBench \
               --source '$HITS_PATH' --pgo-subset '$PGO_SUBSET_PATH' \
               --out /tmp/profile --runs '$RUNS' --workers-list '${PROFILE_WORKERS:-0}' \
-              --env-list '${PROFILE_ENV_LIST:--}' $query_arg $cg_arg
+              --env-list-file /tmp/profile-env-list.txt $query_arg $cg_arg
           ' >/tmp/profile.log 2>&1 </dev/null &
           EOF
           scp -F "$HOME/.ssh/config" /tmp/launch.sh perf:/tmp/launch.sh
