@@ -16,6 +16,10 @@
 # non-zero count starts the server directly with a config naming it, since the
 # adapter's ./start writes a config without one.
 #
+# --env-list repeats it once per server environment: entries separated by
+# '|', each a space-separated list of KEY=VALUE pairs exported around the
+# server's start, or '-' for none. Each entry gets its own <out>/e<N>-w<M>/.
+#
 # The build mirrors build-ab-servers.sh (instrumented build, training run on
 # the PGO subset, profile-use build), so the profiled binary is the same kind
 # of binary the A/B workflow times.
@@ -33,6 +37,7 @@ queries=""
 callgraph_queries=""
 runs=7
 workers_list="0"
+env_list="-"
 record_perf=1
 
 while [[ $# -gt 0 ]]; do
@@ -46,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --callgraph-query)  callgraph_queries="$2"; shift 2 ;;
         --runs)             runs="$2"; shift 2 ;;
         --workers-list)     workers_list="$2"; shift 2 ;;
+        --env-list)         env_list="$2"; shift 2 ;;
         --no-perf)          record_perf=0; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -100,11 +106,19 @@ adapter="$clickbench_dir/pivot-parquet"
 [[ -x "$adapter/benchmark.sh" ]] || { echo "error: no ClickBench pivot-parquet adapter at $adapter" >&2; exit 2; }
 
 IFS=',' read -ra workers_counts <<<"$workers_list"
+IFS='|' read -ra env_entries <<<"$env_list"
 top_out_dir="$out_dir"
+env_index=0
+for env_entry in "${env_entries[@]}"; do
 for workers in "${workers_counts[@]}"; do
-out_dir="$top_out_dir/w$workers"
+(
+out_dir="$top_out_dir/e$env_index-w$workers"
 mkdir -p "$out_dir"
-echo ">>> workers=$workers" >&2
+echo ">>> env='$env_entry' workers=$workers" >&2
+echo "$env_entry" > "$out_dir/env.txt"
+if [[ "$env_entry" != "-" ]]; then
+    for pair in $env_entry; do export "${pair?}"; done
+fi
 export PIVOT_SERVER_BIN="$server" PIVOT_SOURCE="$source_path" \
        PIVOT_PORT=7797 PIVOT_CATALOG=/tmp/profile-catalog
 cd "$adapter"
@@ -223,6 +237,9 @@ done
 ./stop >/dev/null 2>&1 || true
 pkill -x pivot 2>/dev/null || true
 for _ in $(seq 1 120); do ps -C pivot >/dev/null 2>&1 || break; sleep 1; done
+)
+done
+env_index=$((env_index + 1))
 done
 out_dir="$top_out_dir"
 ./stop >/dev/null 2>&1 || true

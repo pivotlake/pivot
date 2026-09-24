@@ -54,7 +54,10 @@ pub fn pending_claim_bound(table: &crate::ParquetTable) -> usize {
     if any_remote {
         MAX_PENDING_REMOTE_ROW_GROUPS
     } else {
-        MAX_PENDING_LOCAL_ROW_GROUPS
+        dispatch::env::get_env_var_with_default(
+            "PIVOT_MAX_PENDING_LOCAL_ROW_GROUPS",
+            MAX_PENDING_LOCAL_ROW_GROUPS,
+        )
     }
 }
 

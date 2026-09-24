@@ -102,6 +102,10 @@ on:
         description: "Profile mode only: also record perf profiles of the server (needs perf on the box)."
         type: boolean
         default: true
+      profile_env_list:
+        description: "Profile mode only: server environments to measure under, '|'-separated entries of space-separated KEY=VALUE pairs ('-' = none)."
+        required: false
+        default: "-"
 
 jobs:
   perf-ab:
@@ -480,6 +484,7 @@ jobs:
           CALLGRAPH_QUERY: ${{ inputs.callgraph_query }}
           PROFILE_WORKERS: ${{ inputs.profile_workers }}
           PROFILE_PERF: ${{ inputs.profile_perf }}
+          PROFILE_ENV_LIST: ${{ inputs.profile_env_list }}
           RUNS: ${{ inputs.iterations }}
         run: |
           set -euo pipefail
@@ -501,7 +506,8 @@ jobs:
               --tree ~/perf-ab/after \
               --clickbench-dir ~/perf-ab/ClickBench \
               --source '$HITS_PATH' --pgo-subset '$PGO_SUBSET_PATH' \
-              --out /tmp/profile --runs '$RUNS' --workers-list '${PROFILE_WORKERS:-0}' $query_arg $cg_arg
+              --out /tmp/profile --runs '$RUNS' --workers-list '${PROFILE_WORKERS:-0}' \
+              --env-list '${PROFILE_ENV_LIST:--}' $query_arg $cg_arg
           ' >/tmp/profile.log 2>&1 </dev/null &
           EOF
           scp -F "$HOME/.ssh/config" /tmp/launch.sh perf:/tmp/launch.sh
@@ -541,7 +547,7 @@ jobs:
           {
             echo "## pivotdb hot-run profile"
             echo '```'
-            for d in profile-out/profile/w*; do
+            for d in profile-out/profile/e*; do
               echo "=== $d"
               cat "$d/machine.txt" 2>/dev/null || true
               echo
