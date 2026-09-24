@@ -265,6 +265,19 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
     }
 }
 
+/// A sender that remembers whether anything went through it.
+struct SendTracker<'a, O> {
+    inner: &'a mut dyn Sender<O>,
+    sent: bool,
+}
+
+impl<O> Sender<O> for SendTracker<'_, O> {
+    fn send(&mut self, item: O) -> super::channels::Result<()> {
+        self.sent = true;
+        self.inner.send(item)
+    }
+}
+
 impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         // A transform that is not taking input may still have work of its own
@@ -346,10 +359,20 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
                 return Ok(FinishStatus::Pending);
             }
 
-            if self.unary.finish(&mut *self.sender)? {
-                // `finish` may have emitted final batches downstream, so wake
-                // any parked peers to pick that work up.
-                worker_waker().notify();
+            let mut sender = SendTracker {
+                inner: &mut *self.sender,
+                sent: false,
+            };
+            if self.unary.finish(&mut sender)? {
+                // A `finish` that emitted final batches downstream wakes any
+                // parked peers to pick that work up. Most finishes emit
+                // nothing, and a broadcast is a write to the line every idle
+                // worker in the node is polling, so one per worker per stage
+                // would cost every stage a long serial chain of cache-line
+                // transfers on a large pool.
+                if sender.sent {
+                    worker_waker().notify();
+                }
                 return Ok(FinishStatus::Done);
             }
             // A pipeline breaker still draining its outputter. The worker re-
