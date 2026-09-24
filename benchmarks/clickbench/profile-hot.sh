@@ -33,6 +33,7 @@ queries=""
 callgraph_queries=""
 runs=7
 workers_list="0"
+record_perf=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --callgraph-query)  callgraph_queries="$2"; shift 2 ;;
         --runs)             runs="$2"; shift 2 ;;
         --workers-list)     workers_list="$2"; shift 2 ;;
+        --no-perf)          record_perf=0; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -172,7 +174,7 @@ IFS=',' read -ra callgraph_list <<<"${callgraph_queries:-}"
 : > "$out_dir/stats.txt"
 for n in "${query_list[@]}"; do
     sql="$(query_sql "$n")"
-    echo ">>> Q$n" >&2
+    echo ">>> Q$n (workers=$workers)" >&2
     # Warm up so the decompressed cache and plan cache are populated.
     for _ in 1 2 3; do run_query "$sql" >/dev/null; done
     timings=""
@@ -187,6 +189,7 @@ for n in "${query_list[@]}"; do
         echo
     } >> "$out_dir/stats.txt"
 
+    (( record_perf )) || continue
     # Flat profile of the server while the query repeats.
     sudo -n perf record -q -p "$server_pid" -F 1999 -o "/tmp/perf-q$n.data" -- sleep 600 >>"$out_dir/perf-record.log" 2>&1 &
     perf_job=$!

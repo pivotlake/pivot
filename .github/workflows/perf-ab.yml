@@ -98,6 +98,10 @@ on:
         description: "Profile mode only: comma-separated worker counts to measure with (0 = the server's default)."
         required: false
         default: "0"
+      profile_perf:
+        description: "Profile mode only: also record perf profiles of the server (needs perf on the box)."
+        type: boolean
+        default: true
 
 jobs:
   perf-ab:
@@ -474,6 +478,7 @@ jobs:
           QUERY: ${{ inputs.query }}
           CALLGRAPH_QUERY: ${{ inputs.callgraph_query }}
           PROFILE_WORKERS: ${{ inputs.profile_workers }}
+          PROFILE_PERF: ${{ inputs.profile_perf }}
           RUNS: ${{ inputs.iterations }}
         run: |
           set -euo pipefail
@@ -485,6 +490,7 @@ jobs:
           [ -n "$QUERY" ] && query_arg="--query $QUERY"
           cg_arg=""
           [ -n "$CALLGRAPH_QUERY" ] && cg_arg="--callgraph-query $CALLGRAPH_QUERY"
+          [ "$PROFILE_PERF" = "true" ] || cg_arg="$cg_arg --no-perf"
           cat > /tmp/launch.sh <<EOF
           rm -rf /tmp/profile /tmp/profile.log /tmp/profile.pid
           setsid bash -c '
