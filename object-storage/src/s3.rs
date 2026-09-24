@@ -268,6 +268,31 @@ impl S3Store {
     fn apply(req: ureq::Request, headers: &[(String, String)]) -> ureq::Request {
         headers.iter().fold(req, |r, (k, v)| r.set(k, v))
     }
+
+    /// The error for a redirect `ureq` handed back as a success it did not
+    /// follow. S3 answers a request addressed to another region's endpoint with
+    /// a 301 `PermanentRedirect` that has no `Location` and names the bucket's
+    /// region in `x-amz-bucket-region`; taken as a success, its error document
+    /// would parse as an empty listing or be read back as an object's bytes.
+    fn explain_redirect(&self, verb: &str, response: &ureq::Response) -> StoreError {
+        let Some(actual) = response.header("x-amz-bucket-region") else {
+            return StoreError::Http(format!(
+                "{verb}: S3 redirected the request (HTTP {}) without naming the bucket's region",
+                response.status()
+            ));
+        };
+        let (bucket, _) = parse_s3_uri(&self.uri).expect("the store was opened from this URI");
+        StoreError::WrongRegion {
+            bucket: bucket.to_string(),
+            configured: self.region.clone(),
+            actual: actual.to_string(),
+        }
+    }
+}
+
+/// Whether `ureq` returned a redirect it did not follow as a success.
+fn is_redirect(response: &ureq::Response) -> bool {
+    (300..400).contains(&response.status())
 }
 
 impl ObjectStore for S3Store {
@@ -313,6 +338,7 @@ impl ObjectStore for S3Store {
         let signed = self.sign("PUT", &url, &[], data)?;
         let req = Self::apply(self.agent.put(&url), &signed);
         match req.send_bytes(data) {
+            Ok(response) if is_redirect(&response) => Err(self.explain_redirect("PUT", &response)),
             Ok(_) => Ok(()),
             Err(e) => Err(StoreError::Http(format!("PUT {object}: {e}"))),
         }
@@ -336,6 +362,9 @@ impl ObjectStore for S3Store {
         let signed = self.sign("DELETE", &url, &[], &[])?;
         let req = Self::apply(self.agent.delete(&url), &signed);
         match req.call() {
+            Ok(response) if is_redirect(&response) => {
+                Err(self.explain_redirect("DELETE", &response))
+            }
             // DELETE is idempotent; a missing key is the goal state.
             Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
             Err(e) => Err(StoreError::Http(format!("DELETE {object}: {e}"))),
@@ -370,6 +399,9 @@ impl ObjectStore for S3Store {
             let signed = self.sign("GET", &url, &[], &[])?;
             let req = Self::apply(self.agent.get(&url), &signed);
             let body = match req.call() {
+                Ok(response) if is_redirect(&response) => {
+                    return Err(self.explain_redirect("LIST", &response));
+                }
                 Ok(response) => response
                     .into_string()
                     .map_err(|error| StoreError::Http(format!("LIST body: {error}")))?,
@@ -448,6 +480,7 @@ impl S3Store {
         let signed = self.sign("GET", &url, &[], &[])?;
         let req = Self::apply(self.agent.get(&url), &signed);
         match req.call() {
+            Ok(response) if is_redirect(&response) => Err(self.explain_redirect("GET", &response)),
             Ok(resp) => {
                 let etag = resp.header("etag").map(str::to_string);
                 let mut buf = Vec::new();
@@ -497,6 +530,7 @@ impl S3Store {
         let signed = self.sign("PUT", &url, &[(header, value)], data)?;
         let req = Self::apply(self.agent.put(&url), &signed).set(header, value);
         match req.send_bytes(data) {
+            Ok(response) if is_redirect(&response) => Err(self.explain_redirect("PUT", &response)),
             Ok(_) => Ok(()),
             Err(ureq::Error::Status(412 | 409, _)) => Err(StoreError::VersionConflict {
                 key: key.to_string(),
@@ -665,24 +699,58 @@ mod tests {
 
     /// Serve one response to the region-discovery HEAD request.
     fn region_server(region: Option<&str>) -> (String, JoinHandle<String>) {
+        let region_header = region
+            .map(|region| format!("x-amz-bucket-region: {region}\r\n"))
+            .unwrap_or_default();
+        serve_once(format!(
+            "HTTP/1.1 403 Forbidden\r\n{region_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+    }
+
+    /// Answer the first request with `response`, handing back the request text.
+    fn serve_once(response: String) -> (String, JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let region = region.map(str::to_string);
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 1024];
             let read = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..read]).into_owned();
-            let region_header = region
-                .map(|region| format!("x-amz-bucket-region: {region}\r\n"))
-                .unwrap_or_default();
-            let response = format!(
-                "HTTP/1.1 403 Forbidden\r\n{region_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
-            );
             stream.write_all(response.as_bytes()).unwrap();
             request
         });
         (endpoint, handle)
+    }
+
+    #[test]
+    fn a_listing_redirected_to_the_buckets_region_names_both_regions() {
+        let (endpoint, request) = serve_once(
+            "HTTP/1.1 301 Moved Permanently\r\nx-amz-bucket-region: us-east-1\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        );
+        let store =
+            S3Store::anonymous_with_options("s3://moved-bucket/root", "eu-west-1", Some(endpoint))
+                .unwrap();
+
+        let error = store
+            .list_with_name_prefix(&ObjectPath::default(), "part")
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                StoreError::WrongRegion { bucket, configured, actual }
+                    if bucket == "moved-bucket" && configured == "eu-west-1" && actual == "us-east-1"
+            ),
+            "{error}"
+        );
+        assert!(
+            request
+                .join()
+                .unwrap()
+                .starts_with("GET /moved-bucket/?list-type=2")
+        );
     }
 
     #[test]

@@ -50,6 +50,14 @@ pub enum StoreError {
     UnsupportedUri(String),
     #[error("missing credential/config: {0}")]
     Config(String),
+    /// The bucket is served from another region than the one the store was
+    /// configured with, so S3 redirected the request instead of serving it.
+    #[error("S3 bucket `{bucket}` is in region `{actual}`, not the configured `{configured}`")]
+    WrongRegion {
+        bucket: String,
+        configured: String,
+        actual: String,
+    },
     /// A conditional replace lost to a concurrent writer: the object changed
     /// between the read and the swap. The conditional-update path retries on
     /// it, so it surfaces only once those retries are exhausted.
