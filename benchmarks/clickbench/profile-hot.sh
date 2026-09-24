@@ -27,6 +27,10 @@
 # of binary the A/B workflow times.
 
 set -euo pipefail
+# A cargo build fans out one rustc per core, and on a box with hundreds of
+# cores the default soft open-file limit is exceeded; the hard limit is
+# usually far higher, so take all of it.
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 trap 'echo "error: profile-hot.sh failed at line $LINENO" >&2' ERR
 echo "invoked as: $0 $*" >&2
 
