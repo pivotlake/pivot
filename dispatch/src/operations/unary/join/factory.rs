@@ -1,3 +1,4 @@
+use crate::operations::unary::SiblingBarrier;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
@@ -395,7 +396,7 @@ pub struct JoinRecordBatchOperatorFactory<PF> {
     pub build_graph: Box<dyn OperatorFactory<()>>,
     pub probe_factory: PF,
     pub probe_channel_factory: StealableChannelFactory<RecordBatch>,
-    pub probe_siblings_left: Arc<AtomicUsize>,
+    pub probe_siblings_left: Arc<SiblingBarrier>,
     pub build_ready: Arc<AtomicBool>,
 }
 

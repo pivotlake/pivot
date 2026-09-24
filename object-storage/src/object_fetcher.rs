@@ -10,11 +10,10 @@ use crate::{DataFile, FileRef};
 use dispatch::io::{FileRange, OperatorIO, ReadRequestId, ReadResponse};
 use dispatch::memory::memory_ctx;
 use dispatch::{
-    DataFlowDispatcher, OperatorSpec, RootUnaryOperatorFactory, Sender, Unary, UnaryFactory,
+    DataFlowDispatcher, OperatorSpec, RootUnaryOperatorFactory, Sender, SiblingBarrier, Unary,
+    UnaryFactory,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 /// One object read in full: its store identity and every byte of it.
 pub struct LoadedObject {
@@ -41,7 +40,7 @@ pub fn load_objects(
     }
     let injector = FileInjectorFactory::new(files);
     let workers = dispatcher.worker_count();
-    let siblings = Arc::new(AtomicUsize::new(workers));
+    let siblings = SiblingBarrier::new(workers);
     let factories: Vec<_> = (0..workers)
         .map(|_| {
             RootUnaryOperatorFactory::new(ObjectFetcherFactory, injector.clone(), siblings.clone())

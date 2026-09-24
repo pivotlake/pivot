@@ -14,8 +14,8 @@ use crate::reading::empty_projection_scan::empty_projection_scan;
 use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
-    RecordBatchOperatorSpec, RootUnaryOperatorFactory, UnaryOperatorFactory, return_to_worker_mpsc,
-    stealable, stealable_fifo, to_single_worker_mpsc,
+    RecordBatchOperatorSpec, RootUnaryOperatorFactory, SiblingBarrier, UnaryOperatorFactory,
+    return_to_worker_mpsc, stealable, stealable_fifo, to_single_worker_mpsc,
 };
 
 use crate::{
@@ -169,7 +169,7 @@ pub fn table_input_with_filter_and_eq_predicates(
         outstanding_row_groups.clone(),
         dispatcher.topology().node_count,
     );
-    let siblings = Arc::new(AtomicUsize::new(n));
+    let siblings = SiblingBarrier::new(n);
     let pending_row_groups = pending_row_group_counters(n);
     // One fetcher handles disk and HTTP row groups, bounding each medium's
     // in-flight count separately, plus its worker's undecoded-claims count.
@@ -207,8 +207,8 @@ pub fn materialize(
 ) -> RecordBatchOperatorSpec {
     let (dispatcher, mut heads) = spec.into_parts();
     let n = dispatcher.worker_count();
-    let siblings_materializer = Arc::new(AtomicUsize::new(n));
-    let siblings_fetcher = Arc::new(AtomicUsize::new(n));
+    let siblings_materializer = SiblingBarrier::new(n);
+    let siblings_fetcher = SiblingBarrier::new(n);
 
     let pending_row_groups = pending_row_group_counters(n);
     let claim_bound = pending_claim_bound(&table);

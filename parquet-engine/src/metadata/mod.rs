@@ -34,7 +34,6 @@ use fetcher::FileRowGroupsFetcher;
 use object_storage::file_injector::FileInjectorFactory;
 use object_storage::{DataFile, DataFileLocation, FileRef};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use writer::FileRowGroupsSinkFactory;
 
 /// A file's footer metadata: its store identity ([`FileRef`]) and the row groups
@@ -92,7 +91,7 @@ fn fetch_file_row_group_factories(
     RootUnaryOperatorFactory<DataFile, FileRowGroups, MetadataFetcherFactory, FileInjectorFactory>,
 > {
     let injector = FileInjectorFactory::new(files);
-    let siblings = Arc::new(AtomicUsize::new(workers));
+    let siblings = dispatch::SiblingBarrier::new(workers);
     (0..workers)
         .map(|_| {
             RootUnaryOperatorFactory::new(

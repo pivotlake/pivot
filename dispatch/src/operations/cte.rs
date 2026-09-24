@@ -18,12 +18,12 @@
 use crate::api::{BuildContext, OperatorFactory, OperatorGraphBuilder};
 use crate::operations::channels::{ChannelFactory, Sender, StealableChannelFactory};
 use crate::operations::in_memory::Forward;
+use crate::operations::unary::SiblingBarrier;
 use crate::operations::unary::UnaryOperator;
 use arrow_array::RecordBatch;
 use crossbeam_deque::Worker;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 /// The tail of a CTE's definition chain: sends every batch to every scan site.
 ///
@@ -58,7 +58,7 @@ impl Sender<RecordBatch> for CteFanOut {
 pub struct CteScanFactory {
     pub channel_factory: StealableChannelFactory<RecordBatch>,
     pub cte_index: usize,
-    pub siblings_left: Arc<AtomicUsize>,
+    pub siblings_left: Arc<SiblingBarrier>,
 }
 
 impl OperatorFactory<RecordBatch> for CteScanFactory {

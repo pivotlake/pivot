@@ -150,7 +150,11 @@ impl StatsCollector {
     #[cfg(any(test, feature = "test-util"))]
     pub fn disabled() -> Self {
         let (tx, _rx) = mpsc::channel();
-        Self { stats: None, tx }
+        Self {
+            stats: None,
+            dispatched_at: None,
+            tx,
+        }
     }
 
     /// Whether collection is on, so a caller can skip a clock read it would only

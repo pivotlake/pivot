@@ -43,9 +43,9 @@
 //! See [`OperatorFactory`] and [`operator_spec`](super::operator_spec) for
 //! details on why this split exists.
 
+use crate::operations::unary::SiblingBarrier;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 use arrow_array::ArrowNativeTypeOp;
 use arrow_array::RecordBatch;
@@ -250,7 +250,7 @@ impl RecordBatchOperatorSpec {
     /// what supplies the rows: on its own a site produces nothing and never
     /// finishes.
     pub fn cte_scan(dispatcher: &DataFlowDispatcher, cte_index: usize) -> Self {
-        let siblings_left = Arc::new(AtomicUsize::new(dispatcher.worker_count()));
+        let siblings_left = SiblingBarrier::new(dispatcher.worker_count());
         let factories = stealable::<RecordBatch>(dispatcher.topology())
             .into_iter()
             .map(|channel_factory| {
@@ -320,7 +320,7 @@ impl RecordBatchOperatorSpec {
         self,
         unary_factories: impl IntoIterator<Item = UF>,
     ) -> Self {
-        let siblings_left = Arc::new(AtomicUsize::new(self.worker_count()));
+        let siblings_left = SiblingBarrier::new(self.worker_count());
         let factories = if self.stream_ordered {
             let target = self.dispatcher.next_worker();
             to_single_worker_mpsc::<RecordBatch>(self.worker_count(), target)
@@ -473,7 +473,7 @@ impl RecordBatchOperatorSpec {
         FB: Fn() -> F,
     {
         let worker_count = self.worker_count();
-        let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let siblings_left = SiblingBarrier::new(worker_count);
         let factories: Vec<_> = stealable::<RecordBatch>(self.dispatcher.topology())
             .into_iter()
             .zip((0..worker_count).map(|_| MapFactory(builder())))
@@ -500,7 +500,7 @@ impl RecordBatchOperatorSpec {
         FB: Fn() -> F,
     {
         let worker_count = self.worker_count();
-        let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let siblings_left = SiblingBarrier::new(worker_count);
         let target = self.dispatcher.next_worker();
         let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(worker_count, target)
             .into_iter()
@@ -614,8 +614,8 @@ impl RecordBatchOperatorSpec {
         let collector_worker = self.dispatcher.next_worker();
         let (sorters, collectors) =
             create_normalizing_order_by_factories(order_by, topology, collector_worker);
-        let input_siblings = Arc::new(AtomicUsize::new(worker_count));
-        let collector_siblings = Arc::new(AtomicUsize::new(worker_count));
+        let input_siblings = SiblingBarrier::new(worker_count);
+        let collector_siblings = SiblingBarrier::new(worker_count);
         let group_channels = to_single_worker_mpsc(worker_count, collector_worker);
 
         let factories = if self.stream_ordered {
@@ -1009,7 +1009,7 @@ impl RecordBatchOperatorSpec {
 
         let topology = self.dispatcher.topology();
         let (_, build_heads) = build.into_parts();
-        let probe_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let probe_siblings_left = SiblingBarrier::new(worker_count);
         let probe_channels = stealable::<RecordBatch>(topology);
 
         let factories = if normalize_build {
@@ -1023,8 +1023,8 @@ impl RecordBatchOperatorSpec {
                     DISCARD_MATCHED_ROWS,
                     EMIT_MARK_COLUMN,
                 >(spec, worker_count, collector_worker);
-            let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
-            let collector_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+            let build_siblings_left = SiblingBarrier::new(worker_count);
+            let collector_siblings_left = SiblingBarrier::new(worker_count);
             let build_channels = stealable::<RecordBatch>(topology);
             let group_channels = to_single_worker_mpsc(worker_count, collector_worker);
 
@@ -1084,7 +1084,7 @@ impl RecordBatchOperatorSpec {
                 DISCARD_MATCHED_ROWS,
                 EMIT_MARK_COLUMN,
             >(spec, worker_count);
-            let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+            let build_siblings_left = SiblingBarrier::new(worker_count);
             let build_channels = stealable::<RecordBatch>(topology);
 
             self.factories
@@ -1255,8 +1255,8 @@ impl RecordBatchOperatorSpec {
             create_range_join_factories::<T>(spec, worker_count, target);
 
         let (_, build_heads) = build.into_parts();
-        let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
-        let probe_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let build_siblings_left = SiblingBarrier::new(worker_count);
+        let probe_siblings_left = SiblingBarrier::new(worker_count);
         let build_channels = to_single_worker_mpsc::<RecordBatch>(worker_count, target);
         let probe_channels = stealable::<RecordBatch>(self.dispatcher.topology());
         let factories = self

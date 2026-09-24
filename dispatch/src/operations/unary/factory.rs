@@ -15,9 +15,9 @@ use crate::api::OperatorGraphBuilder;
 use crate::api::{BuildContext, OperatorFactory};
 use crate::operations::channels::ChannelFactory;
 use crate::operations::channels::{RootChannelFactory, Sender};
+use crate::operations::unary::SiblingBarrier;
 use crate::operations::unary::{Unary, UnaryOperator};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 /// Creates a [`Unary`] transform instance. Consumed once per worker during the build step.
 pub trait UnaryFactory<I, O>: Send + 'static {
@@ -46,7 +46,7 @@ pub struct UnaryOperatorFactory<
     OP: OperatorFactory<I>,
 > {
     head: OP,
-    siblings_left: Arc<AtomicUsize>,
+    siblings_left: Arc<SiblingBarrier>,
     unary_factory: UF,
     channel_factory: C,
     _phantom: std::marker::PhantomData<fn(I) -> O>,
@@ -59,7 +59,7 @@ impl<I, O, UF: UnaryFactory<I, O>, C: ChannelFactory<I>, OP: OperatorFactory<I>>
         head: OP,
         unary_factory: UF,
         channel_factory: C,
-        siblings_left: Arc<AtomicUsize>,
+        siblings_left: Arc<SiblingBarrier>,
     ) -> Self {
         Self {
             head,
@@ -96,14 +96,14 @@ impl<I: 'static, O: 'static, UF: UnaryFactory<I, O>, C: ChannelFactory<I>, OP: O
 /// externally (e.g. a shared [`Injector`](crossbeam_deque::Injector) queue that
 /// distributes row group requests across workers).
 pub struct RootUnaryOperatorFactory<I, O, UF: UnaryFactory<I, O>, C: RootChannelFactory<I>> {
-    siblings_left: Arc<AtomicUsize>,
+    siblings_left: Arc<SiblingBarrier>,
     unary_factory: UF,
     channel_factory: C,
     _phantom: std::marker::PhantomData<fn(I) -> O>,
 }
 
 impl<I, O, UF: UnaryFactory<I, O>, C: RootChannelFactory<I>> RootUnaryOperatorFactory<I, O, UF, C> {
-    pub fn new(unary_factory: UF, channel_factory: C, siblings_left: Arc<AtomicUsize>) -> Self {
+    pub fn new(unary_factory: UF, channel_factory: C, siblings_left: Arc<SiblingBarrier>) -> Self {
         Self {
             siblings_left,
             unary_factory,

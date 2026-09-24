@@ -105,6 +105,7 @@ pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use numa::{Topology, default_worker_count, dominant_node};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
+pub use operations::unary::SiblingBarrier;
 pub use operations::unary::filter::{RowDelivery, RowSelection, collect_selected_indices};
 pub use operations::{
     JoinBuildFilter, JoinKind, JoinResidualFn, JoinResidualSpec, JoinSpec, KeyBitset,

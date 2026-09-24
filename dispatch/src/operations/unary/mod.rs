@@ -61,7 +61,7 @@ use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO, ReadResponse};
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 use thiserror::Error;
 
 use super::channels::{Receiver, Sender};
@@ -69,7 +69,9 @@ use super::{FinishStatus, Operator};
 use crate::waker::{waker_set, worker_waker};
 
 mod pipeline_breaker;
+mod sibling_barrier;
 pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
+pub use sibling_barrier::SiblingBarrier;
 
 mod aggregate;
 pub use aggregate::AggregateFactory;
@@ -241,7 +243,7 @@ pub struct UnaryOperator<I, O, U: Unary<I, O>, R: Receiver<I>> {
     receiver: R,
     sender: Box<dyn Sender<O>>,
     notified_finished: bool,
-    siblings_left: Arc<AtomicUsize>,
+    siblings_left: Arc<SiblingBarrier>,
     _phantom: PhantomData<(I, O)>,
 }
 
@@ -250,7 +252,7 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
         unary: U,
         receiver: R,
         sender: Box<dyn Sender<O>>,
-        siblings_left: Arc<AtomicUsize>,
+        siblings_left: Arc<SiblingBarrier>,
     ) -> Self {
         Self {
             unary,
@@ -318,14 +320,11 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
             return Ok(FinishStatus::Pending);
         }
 
-        // Acquire/Release on the counter so the last-out worker's `finish` sees
-        // every peer's pre-decrement writes (e.g. a shared row-count total each
-        // worker's async completions add to), not just channel-delivered data.
         let ready = if self.notified_finished {
-            self.siblings_left.load(Ordering::Acquire) == 0
+            self.siblings_left.is_complete()
         } else {
             self.notified_finished = true;
-            let was_last = self.siblings_left.fetch_sub(1, Ordering::AcqRel) == 1;
+            let was_last = self.siblings_left.arrive();
             if was_last {
                 // Sibling counter just hit 0: every worker's `try_finish` for this
                 // operator can now run. Wake peers parked on any node's waker so
@@ -343,7 +342,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
             // suffices because the channel ops themselves provide Acquire/Release.
             if !done_consuming() {
                 self.notified_finished = false;
-                self.siblings_left.fetch_add(1, Ordering::Relaxed);
+                self.siblings_left.retract();
                 return Ok(FinishStatus::Pending);
             }
 
@@ -418,7 +417,7 @@ mod tests {
             HeldJob { steps: 0 },
             receiver,
             Box::new(CollectSender::<()>::new()),
-            Arc::new(AtomicUsize::new(1)),
+            SiblingBarrier::new(1),
         );
         let mut test_io = TestOperatorIO::default();
 

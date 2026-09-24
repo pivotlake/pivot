@@ -2,6 +2,7 @@ use crate::api::BuildContext;
 use crate::operations::channels::{
     ChannelFactory, RootChannelFactory, Sender, StealableChannelFactory, mpsc_channel, stealable,
 };
+use crate::operations::unary::SiblingBarrier;
 use crate::operations::{
     ChannelInputSender, ChannelSourceFactory, DefaultUnaryFactory, Forward, InjectorSourceFactory,
     MapFactory, RootUnaryOperatorFactory, UnaryFactory, UnaryOperatorFactory,
@@ -10,7 +11,7 @@ use crate::{DataFlowBuilder, DataFlowDispatcher, DataFlowHandle, OperatorGraphBu
 use arrow_array::RecordBatch;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicBool;
 
 /// Generic, strongly-typed spec for building multi-stage pipelines.
 ///
@@ -130,7 +131,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         UF: UnaryFactory<O, O2>,
         C: ChannelFactory<O>,
     {
-        let siblings_left = Arc::new(AtomicUsize::new(self.factories.len()));
+        let siblings_left = SiblingBarrier::new(self.factories.len());
         let factories: Vec<_> = channels
             .into_iter()
             .zip(unaries)
@@ -195,7 +196,7 @@ fn source_input<T: Send + 'static, S: RootChannelFactory<T> + Clone>(
     source: S,
 ) -> OperatorSpec<T, RootUnaryOperatorFactory<T, T, DefaultUnaryFactory<Forward<T>>, S>> {
     let worker_count = dispatcher.worker_count();
-    let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+    let siblings_left = SiblingBarrier::new(worker_count);
     let factories: Vec<_> = (0..worker_count)
         .map(|_| {
             RootUnaryOperatorFactory::new(
