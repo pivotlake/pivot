@@ -158,7 +158,7 @@ const MIN_BALANCE_RATIO: f64 = 5.0;
 
 /// Default cadence for re-checking the tables' logs. Candidates only change
 /// when a flush commits a new version, so seconds-scale is plenty.
-pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
+pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(30);
 
 /// Default number of merges a datastore runs at once. A merge holds its whole
 /// input decoded on the memory ring until its output is encoded, and the
