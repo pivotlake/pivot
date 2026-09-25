@@ -55,11 +55,30 @@ impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
 
 impl<O> Sender<O> for Rc<Worker<O>> {
     fn send(&mut self, item: O) -> channels::Result<()> {
+        // The sending worker takes its own newest item next unless it is
+        // still busy producing, so only an item queued behind another needs
+        // a thief: wake a single same-node peer then. A wake is a write to
+        // a line every idle worker in the node watches, and on a large pool
+        // that costs more than the work most items represent.
+        let backlog = !self.is_empty();
         self.push(item);
-        // One new item needs one thief: wake a single parked same-node peer.
-        // Waking more would just herd workers into finding nothing (the send
-        // path must stay cheap; see WorkerWaker).
-        worker_waker().notify_one();
+        if backlog {
+            worker_waker().notify_one();
+        }
+        Ok(())
+    }
+
+    fn send_all(&mut self, items: &mut dyn Iterator<Item = O>) -> channels::Result<()> {
+        let mut pushed = 0;
+        for item in items {
+            self.push(item);
+            pushed += 1;
+        }
+        // One wake for the burst, unparking as many peers as there are items
+        // for them: every idle peer learns of the burst at once.
+        if pushed > 1 {
+            worker_waker().notify_up_to(pushed - 1);
+        }
         Ok(())
     }
 }
@@ -204,6 +223,34 @@ mod tests {
         let own = endpoints[0].1.try_recv();
 
         assert_eq!(own, Some(1));
+    }
+
+    #[test]
+    fn a_burst_of_sends_wakes_the_node_once() {
+        let mut endpoints = two_node_endpoints::<i64>();
+        let wakes_before = crate::waker::worker_waker().wake_count();
+
+        endpoints[0].0.send_all(&mut (1..=5).into_iter()).unwrap();
+
+        assert_eq!(crate::waker::worker_waker().wake_count(), wakes_before + 1);
+        let mut received = Vec::new();
+        while let Some(item) = endpoints[1].1.steal() {
+            received.push(item);
+        }
+        assert_eq!(received, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_lone_item_is_left_to_its_sender() {
+        let mut endpoints = two_node_endpoints::<i64>();
+        let wakes_before = crate::waker::worker_waker().wake_count();
+
+        endpoints[0].0.send(7).unwrap();
+        let wakes_after_first = crate::waker::worker_waker().wake_count();
+        endpoints[0].0.send(8).unwrap();
+
+        assert_eq!(wakes_after_first, wakes_before);
+        assert_eq!(crate::waker::worker_waker().wake_count(), wakes_before + 1);
     }
 
     #[test]

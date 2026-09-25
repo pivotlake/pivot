@@ -145,15 +145,10 @@ impl RangeCutter {
             .get_mut(&row_group_index)
             .expect("ranges are emitted for an open row group");
         let ready = open.pages.ready_ranges();
-        for index in open.emitted..ready {
-            dispatch::barrier_trace::mark("cut:range");
-            let started = std::time::Instant::now();
-            let range = open.pages.cut_range(index);
-            dispatch::barrier_trace::add_time(0, started);
-            let started = std::time::Instant::now();
-            sender.send(range)?;
-            dispatch::barrier_trace::add_time(1, started);
-        }
+        let started = std::time::Instant::now();
+        let pages = &mut open.pages;
+        sender.send_all(&mut (open.emitted..ready).map(|index| pages.cut_range(index)))?;
+        dispatch::barrier_trace::add_time(1, started);
         open.emitted = ready;
         if open.emitted == open.pages.range_count() {
             self.close(row_group_index);
