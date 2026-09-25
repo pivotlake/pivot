@@ -102,15 +102,16 @@ impl DataFlowStats {
 pub struct StatsCollector {
     /// `Some` only when stats are on.
     stats: Option<DataFlowStats>,
-    /// Where [`report`](Self::report) ships the tally for the handle to fold.
-    tx: mpsc::Sender<DataFlowStats>,
+    /// Where [`report`](Self::report) ships the tally for the handle to fold;
+    /// `None` once reported, which closes this worker's end of the channel.
+    tx: Option<mpsc::Sender<DataFlowStats>>,
 }
 
 impl StatsCollector {
     pub(crate) fn new(tx: mpsc::Sender<DataFlowStats>, enabled: bool) -> Self {
         Self {
             stats: enabled.then(DataFlowStats::default),
-            tx,
+            tx: Some(tx),
         }
     }
 
@@ -118,7 +119,10 @@ impl StatsCollector {
     #[cfg(any(test, feature = "test-util"))]
     pub fn disabled() -> Self {
         let (tx, _rx) = mpsc::channel();
-        Self { stats: None, tx }
+        Self {
+            stats: None,
+            tx: Some(tx),
+        }
     }
 
     /// Whether collection is on, so a caller can skip a clock read it would only
@@ -204,10 +208,17 @@ impl StatsCollector {
         }
     }
 
-    /// Ship this worker's tally for the handle to fold (a no-op when off).
-    pub fn report(&self) {
+    /// Ship this worker's tally for the handle to fold (nothing is sent when
+    /// stats are off) and close this worker's end of the channel, which is
+    /// what tells the handle this worker is done: the dataflow's own drop,
+    /// which may free large operator state, then no longer holds up the
+    /// query's result. Reporting twice is a no-op.
+    pub fn report(&mut self) {
+        let Some(tx) = self.tx.take() else {
+            return;
+        };
         if let Some(stats) = self.stats {
-            let _ = self.tx.send(stats);
+            let _ = tx.send(stats);
         }
     }
 }
