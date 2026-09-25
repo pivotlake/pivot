@@ -66,7 +66,7 @@ use thiserror::Error;
 
 use super::channels::{Receiver, Sender};
 use super::{FinishStatus, Operator};
-use crate::waker::waker_set;
+use crate::waker::{waker_set, worker_waker};
 
 mod pipeline_breaker;
 pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
@@ -280,6 +280,24 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
 /// [`Unary::runs_before_downstream`]) takes on one turn at most.
 const MAX_ITEMS_PER_DRAIN: usize = 64;
 
+/// A sender that remembers whether anything went through it.
+struct SendTracker<'a, O> {
+    inner: &'a mut dyn Sender<O>,
+    sent: bool,
+}
+
+impl<O> Sender<O> for SendTracker<'_, O> {
+    fn send(&mut self, item: O) -> super::channels::Result<()> {
+        self.sent = true;
+        self.inner.send(item)
+    }
+
+    fn send_all(&mut self, items: &mut dyn Iterator<Item = O>) -> super::channels::Result<()> {
+        self.sent = true;
+        self.inner.send_all(items)
+    }
+}
+
 impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         // A transform that is not taking input may still have work of its own
@@ -382,15 +400,24 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
                 return Ok(FinishStatus::Pending);
             }
 
-            if self.unary.finish(&mut *self.sender)? {
+            let mut sender = SendTracker {
+                inner: &mut *self.sender,
+                sent: false,
+            };
+            if self.unary.finish(&mut sender)? {
                 crate::barrier_trace::record(
                     std::any::type_name::<U>(),
                     crate::barrier_trace::Event::Finished,
                 );
-                // Anything `finish` emitted woke its takers through the
-                // channel's own send, and the barrier that opens once every
-                // sibling retires wakes the rest; a wake per retiring worker
-                // would only add a pool-wide atomic per stage.
+                // A `finish` that emitted something wakes the node so a peer
+                // takes it: this worker's finish pass counts as no work of
+                // its own, so it may park with the item still in its queue.
+                // Most finishes emit nothing, and the barrier that opens once
+                // every sibling retires wakes the rest; a wake per retiring
+                // worker would only add a pool-wide atomic per stage.
+                if sender.sent {
+                    worker_waker().notify();
+                }
                 return Ok(FinishStatus::Done);
             }
             // A pipeline breaker still draining its outputter. The worker re-
