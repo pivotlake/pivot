@@ -2,6 +2,7 @@
 
 use crate::memory::{SlabAllocator, SlabBuffer};
 use crate::operations::unary::group::output::topk_pruning::{HASH_BINS, hash_bin};
+use std::ops::Range;
 
 /// Per-worker (and, after merging, global) sums of the ordering aggregate's
 /// partials by top hash bits.
@@ -15,10 +16,12 @@ pub struct HashBinTotals {
     sums: SlabBuffer<u64>,
 }
 
-// The slab's pages are address-stable pool memory and the totals are accessed
-// by one owner at a time (a worker, then whichever worker steals it from
-// `SharedBinTotals`, then the gather's final arrival).
+// The slab's pages are address-stable pool memory. A worker's totals are
+// written by that worker alone; once published through `SharedBinTotals`
+// they are only read, and the pool-wide sum is written in disjoint ranges
+// (`merge_range`).
 unsafe impl Send for HashBinTotals {}
+unsafe impl Sync for HashBinTotals {}
 
 impl HashBinTotals {
     pub(crate) fn new(allocator: &mut SlabAllocator) -> Self {
@@ -32,6 +35,11 @@ impl HashBinTotals {
         unsafe { std::slice::from_raw_parts(self.sums.ptr_at_index(0), HASH_BINS) }
     }
 
+    fn as_mut_slice(&mut self) -> &mut [u64] {
+        // In-bounds: the buffer was created with HASH_BINS bins.
+        unsafe { std::slice::from_raw_parts_mut(self.sums.ptr_at_index(0), HASH_BINS) }
+    }
+
     /// Folds one partial value of the ordering aggregate into its bin.
     ///
     /// Saturating: a saturated bin only loosens the bound, which stays valid.
@@ -43,14 +51,40 @@ impl HashBinTotals {
 
     /// Sums another worker's bin totals into this one.
     pub(crate) fn merge(&mut self, other: &HashBinTotals) {
-        let base = self.sums.ptr_at_index(0);
-        for (bin, other_sum) in other.as_slice().iter().enumerate() {
-            // One base pointer for the whole pass; `SlabBuffer` indexing would
-            // reload it per bin.
-            unsafe {
-                let sum = base.add(bin);
-                *sum = (*sum).saturating_add(*other_sum);
+        for (sum, other_sum) in self.as_mut_slice().iter_mut().zip(other.as_slice()) {
+            *sum = sum.saturating_add(*other_sum);
+        }
+    }
+
+    /// Sums the bins in `range` of every array in `others` into this one's,
+    /// through a shared reference so several workers can sum disjoint
+    /// ranges of the same array at once.
+    ///
+    /// # Safety
+    ///
+    /// No other access to this array's bins in `range` may overlap the call.
+    pub(crate) unsafe fn merge_range(&self, range: Range<usize>, others: &[HashBinTotals]) {
+        debug_assert!(range.end <= HASH_BINS);
+        // In-bounds: the range lies within the HASH_BINS bins.
+        let sums = unsafe {
+            std::slice::from_raw_parts_mut(self.sums.ptr_at_index(range.start), range.len())
+        };
+        for other in others {
+            for (sum, other_sum) in sums.iter_mut().zip(&other.as_slice()[range.clone()]) {
+                *sum = sum.saturating_add(*other_sum);
             }
+        }
+    }
+
+    /// Adds `weight` to every bin: the groups of the workers that built no
+    /// totals could sit in any bin, so each bin's bound grows by all of
+    /// their weight.
+    pub(crate) fn widen_every_bin(&mut self, weight: u64) {
+        if weight == 0 {
+            return;
+        }
+        for sum in self.as_mut_slice() {
+            *sum = sum.saturating_add(weight);
         }
     }
 
@@ -68,9 +102,14 @@ impl HashBinTotals {
         let buckets = bucket_rows.len();
         if buckets <= HASH_BINS {
             let bins_per_bucket = HASH_BINS / buckets;
-            for bin in 0..HASH_BINS {
-                let rows = bucket_rows[bin / bins_per_bucket];
-                self.sums[bin] = self.sums[bin].saturating_add(rows);
+            for (bins, rows) in self
+                .as_mut_slice()
+                .chunks_exact_mut(bins_per_bucket)
+                .zip(bucket_rows)
+            {
+                for sum in bins {
+                    *sum = sum.saturating_add(*rows);
+                }
             }
         } else {
             let buckets_per_bin = buckets / HASH_BINS;
@@ -124,6 +163,19 @@ mod tests {
         a.merge(&b);
 
         assert_eq!(a.sums[9], 42);
+    }
+
+    #[test]
+    fn widening_adds_the_weight_to_every_bin() {
+        let (_allocator, mut totals) = test_bin_totals();
+        totals.add(7u64 << (u64::BITS - HASH_BIN_BITS), 3);
+
+        totals.widen_every_bin(5);
+
+        let bins = totals.into_bin_totals();
+        assert_eq!(bins[7], 8);
+        assert_eq!(bins[0], 5);
+        assert_eq!(bins[HASH_BINS - 1], 5);
     }
 
     #[test]
