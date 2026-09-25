@@ -94,6 +94,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
             return Ok(());
         }
         let id = io.read(request.open_file().clone(), request.file_ranges())?;
+        dispatch::barrier_trace::mark("fetch:submit");
         self.in_flight.insert(id, request);
         Ok(())
     }
@@ -120,6 +121,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
             .in_flight
             .remove(&response.id())
             .expect("response for an unknown row-group request");
+        dispatch::barrier_trace::mark("fetch:done");
         sender.send(request.into_row_group_buffer(Some(response)))?;
         Ok(())
     }

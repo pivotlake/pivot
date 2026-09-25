@@ -146,6 +146,7 @@ impl RangeCutter {
             .expect("ranges are emitted for an open row group");
         let ready = open.pages.ready_ranges();
         for index in open.emitted..ready {
+            dispatch::barrier_trace::mark("cut:range");
             sender.send(open.pages.cut_range(index))?;
         }
         open.emitted = ready;
@@ -163,6 +164,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
         output: &mut dyn Sender<DecodeRange>,
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
+        dispatch::barrier_trace::mark("cut:page");
         let metadata = page.query_row_group_metadata.clone();
         let row_group_index = metadata.row_group_index;
         if self.closed.contains(&row_group_index) {
@@ -195,9 +197,11 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
                 // read through; a dictionary excluding the pushed-down
                 // constant prunes the row group before any range is cut.
                 let leaf = &open.leaf_decoders[column];
+                dispatch::barrier_trace::mark("cut:dict");
                 let built = self
                     .allocator
                     .with(|allocator| leaf.build_dictionary(header, data, allocator));
+                dispatch::barrier_trace::mark("cut:dict-done");
                 match built {
                     BuiltDictionary::Pruned => {
                         // Seen by every page of this row group still in

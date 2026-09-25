@@ -164,6 +164,7 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         assert!(self.active.is_none(), "a decoder takes one range at a time");
+        dispatch::barrier_trace::mark("decode:range");
         let row_group_index = range.metadata().row_group_index;
         let mut decoder = match self
             .idle

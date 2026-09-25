@@ -12,6 +12,12 @@ pub enum Event {
     Open,
     Finished,
     Dropped,
+    Mark,
+}
+
+/// Record a point event on the current worker.
+pub fn mark(label: &'static str) {
+    record(label, Event::Mark);
 }
 
 struct Record {
@@ -147,6 +153,35 @@ pub fn dump() {
             late.join(" "),
             open - last_open
         ));
+        // The straggler's point events since the previous stage opened.
+        if let Some(&(arrival, straggler)) = arrivals.last() {
+            let mut counts: Vec<(&'static str, usize, f64, f64)> = Vec::new();
+            for r in records.iter().filter(|r| {
+                r.worker == straggler
+                    && matches!(r.event, Event::Mark)
+                    && us(r.at) >= last_open
+                    && us(r.at) <= arrival
+            }) {
+                let t = us(r.at);
+                match counts.iter_mut().find(|c| c.0 == r.stage) {
+                    Some(c) => {
+                        c.1 += 1;
+                        c.3 = t;
+                    }
+                    None => counts.push((r.stage, 1, t, t)),
+                }
+            }
+            if !counts.is_empty() {
+                let items: Vec<String> = counts
+                    .iter()
+                    .map(|(label, n, first, last)| format!("{label} x{n} [{first:.0}..{last:.0}]"))
+                    .collect();
+                out.push_str(&format!(
+                    "    straggler w{straggler}: {}\n",
+                    items.join(", ")
+                ));
+            }
+        }
         last_open = open;
     }
     eprint!("{out}");

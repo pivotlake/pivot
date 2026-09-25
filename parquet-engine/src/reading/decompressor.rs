@@ -264,6 +264,7 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
         output: &mut dyn Sender<DecompressedPage>,
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
+        dispatch::barrier_trace::mark("decomp:page");
         // A data page whose row group was pruned downstream (dictionary pushdown
         // set the shared flag) is never read: the decoder has already dropped the
         // row group and ignores its late-arriving pages (via `closed_row_groups`).
