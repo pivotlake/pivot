@@ -248,7 +248,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 .flatten()
                 .next()
                 .expect("a worker switched, so some node has scatter buffers")
-                .0
+                .buckets()
                 .len();
             let merge_partitions = (estimate / target_groups_per_partition)
                 .max(worker_count * MERGE_JOBS_PER_WORKER)
@@ -281,7 +281,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             let scatter_rows: usize = buffers_by_node
                 .iter()
                 .flatten()
-                .map(|b| b.0.iter().map(|bucket| bucket.len()).sum::<usize>())
+                .map(|b| b.buckets().iter().map(|bucket| bucket.len()).sum::<usize>())
                 .sum();
             total_in_place + scatter_rows > 2 * estimate
         };
