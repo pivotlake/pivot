@@ -484,18 +484,25 @@ impl Worker {
         // keeps polling through a short grace so a query that follows closely
         // starts on a spinning pool, then parks. A spin budget of zero (the
         // profiling runs) parks at once in both cases.
+        // The wake count is watched through the node's spin relay (see
+        // [`crate::waker::SpinTicket`]), so a notifier's write does not have
+        // to reach every idle core's cache. The ticket ends before the park
+        // below, which consults the real count.
+        let waker = Arc::clone(&self.waker);
         if !self.data_flows.is_empty() {
+            let mut spin = waker.begin_spin();
             for _ in 0..in_flight_spin_limit() {
-                if self.take_wake() {
+                if self.adopt_wake(spin.wake_count()) {
                     return;
                 }
                 std::hint::spin_loop();
             }
         } else if in_flight_spin_limit() > 0 {
+            let mut spin = waker.begin_spin();
             let idle_since = *self.idle_since.get_or_insert_with(Instant::now);
             while idle_since.elapsed() < IDLE_GRACE {
                 for _ in 0..IDLE_GRACE_POLLS_PER_CLOCK_READ {
-                    if self.take_wake() {
+                    if self.adopt_wake(spin.wake_count()) {
                         return;
                     }
                     std::hint::spin_loop();
@@ -511,15 +518,16 @@ impl Worker {
             .finish_delegated_wake(&mut self.last_seen_broadcast);
     }
 
-    /// Whether a notification landed since the last snapshot; if so, adopt
-    /// the new count so the next park compares against it. A spinning worker
-    /// also adopts the current delegated-broadcast epoch: fanning a broadcast
-    /// out is the job of the parked worker it wakes, and a spinner that later
-    /// parks must not repeat it on a stale memo.
-    fn take_wake(&mut self) -> bool {
-        let now = self.waker.wake_count();
-        if now != self.last_seen_wake_count {
-            self.last_seen_wake_count = now;
+    /// Whether `observed`, a wake count seen while spinning, differs from the
+    /// last snapshot; if so, adopt it so the next park compares against it.
+    /// A relayed value may trail the real count, which only makes a later
+    /// park return at once for one extra pass. A spinning worker also adopts
+    /// the current delegated-broadcast epoch: fanning a broadcast out is the
+    /// job of the parked worker it wakes, and a spinner that later parks must
+    /// not repeat it on a stale memo.
+    fn adopt_wake(&mut self, observed: u64) -> bool {
+        if observed != self.last_seen_wake_count {
+            self.last_seen_wake_count = observed;
             self.last_seen_broadcast = self.waker.broadcast_epoch();
             return true;
         }
