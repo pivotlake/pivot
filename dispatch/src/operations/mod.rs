@@ -136,6 +136,12 @@ pub trait Operator {
         Ok(WorkStatus::Pending)
     }
 
+    /// Whether the worker should give this operator its turn before any
+    /// operator downstream of it; see `Unary::runs_before_downstream`.
+    fn runs_before_downstream(&self) -> bool {
+        false
+    }
+
     /// A flag this operator raises to ask the `DataFlow` to abandon everything
     /// *upstream* of it, used by `LIMIT` to stop the scan once it has buffered
     /// enough rows, without disturbing operators downstream of it (e.g. a

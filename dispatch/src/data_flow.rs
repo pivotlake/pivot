@@ -581,6 +581,22 @@ impl DataFlow {
     pub fn run_ready_cpu_work(&mut self, requester: &mut IORequester) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_read_id);
+            // An operator that asks to run before its downstream gets the
+            // first sweep, upstream first, so its work is not held back by a
+            // downstream job the worker is in the middle of.
+            let ran_ahead = d.graph.traverse_forwards(|node_id, operator| {
+                if !operator.runs_before_downstream() {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                io.set_operator_idx(node_id);
+                match operator.run_cpu_work(&mut io)? {
+                    WorkStatus::Pending => Ok(ControlFlow::Continue(())),
+                    WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                }
+            })?;
+            if matches!(ran_ahead, ControlFlow::Break(_)) {
+                return Ok(WorkStatus::Ran);
+            }
             d.graph
                 .traverse_backwards(|node_id, operator| {
                     io.set_operator_idx(node_id);
@@ -723,6 +739,33 @@ mod tests {
         }
     }
 
+    /// Like [`CountingOperator`], but asks for its turn before its downstream.
+    struct EagerCountingOperator(Arc<AtomicUsize>);
+    impl Operator for EagerCountingOperator {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(WorkStatus::Ran)
+        }
+        fn runs_before_downstream(&self) -> bool {
+            true
+        }
+        fn process_fs_write_response(
+            &mut self,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
+            Ok(FinishStatus::Pending)
+        }
+    }
+
     /// Build a linear chain `0 -> 1 -> ... -> n-1` of [`LiveOperator`]s, where
     /// node 0 is the source and node n-1 is the leaf.
     fn live_chain(n: usize) -> OperatorGraph {
@@ -800,6 +843,34 @@ mod tests {
         ));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         assert!(flow.graph.operators[0].gates.is_empty());
+    }
+
+    #[test]
+    fn an_operator_that_runs_before_its_downstream_gets_the_turn_first() {
+        let upstream_runs = Arc::new(AtomicUsize::new(0));
+        let downstream_runs = Arc::new(AtomicUsize::new(0));
+        let (err_tx, _err_rx) = mpsc::channel();
+        let (stats_tx, _stats_rx) = mpsc::channel();
+        let mut flow = DataFlow::new(
+            0,
+            Arc::new(AtomicBool::new(false)),
+            err_tx,
+            vec![
+                Box::new(EagerCountingOperator(upstream_runs.clone())),
+                Box::new(CountingOperator(downstream_runs.clone())),
+            ],
+            vec![(0, 1)],
+            HashMap::default(),
+            stats_tx,
+            false,
+        );
+        let mut requester = IORequester::default();
+
+        let status = flow.run_ready_cpu_work(&mut requester);
+
+        assert!(matches!(status, WorkStatus::Ran));
+        assert_eq!(upstream_runs.load(Ordering::Relaxed), 1);
+        assert_eq!(downstream_runs.load(Ordering::Relaxed), 0);
     }
 
     #[test]

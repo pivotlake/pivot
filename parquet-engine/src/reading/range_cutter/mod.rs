@@ -241,12 +241,12 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
     }
 
     /// The cutter's work per page is bookkeeping, and every range it emits
-    /// is a job idle peers can take, so it takes all the pages that have
-    /// arrived on each turn. Paced one page per turn, a worker that owns a
-    /// row group while also decoding lets the row group's ranges out one at
-    /// a time between its own decodes, and at the end of a scan the pool
-    /// idles behind the few workers still holding row groups.
-    fn drains_input_each_turn(&self) -> bool {
+    /// is a job idle peers can take, so it runs ahead of its worker's own
+    /// decoding and takes all the pages that have arrived. Otherwise a
+    /// worker that owns a row group while decoding a range lets the row
+    /// group's pages wait behind that range, and at the end of a scan the
+    /// pool idles behind the few workers still holding row groups.
+    fn runs_before_downstream(&self) -> bool {
         true
     }
 }

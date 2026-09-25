@@ -210,15 +210,16 @@ pub trait Unary<I, O> {
         false
     }
 
-    /// Whether the operator should take every queued item on a turn instead
-    /// of one. A worker runs one unit of work per turn, downstream stages
-    /// first, so a stage's input is otherwise consumed one item per turn
-    /// between the worker's heavier work. That is the right pacing for a
-    /// stage that does real work per item; it starves a stage whose per-item
-    /// work is bookkeeping that unblocks *other* workers, such as one that
-    /// turns arriving pages into stealable decode jobs: its jobs trickle out
-    /// behind its own worker's decoding while the rest of the pool idles.
-    fn drains_input_each_turn(&self) -> bool {
+    /// Whether the operator's input should be taken ahead of the worker's
+    /// downstream work, and all of it at once. A worker runs one unit of
+    /// work per turn, downstream stages first, so a stage's input is
+    /// otherwise consumed one item per turn between the worker's heavier
+    /// work. That is the right pacing for a stage that does real work per
+    /// item; it starves a stage whose per-item work is bookkeeping that
+    /// unblocks *other* workers, such as one that turns arriving pages into
+    /// stealable decode jobs: its jobs trickle out behind its own worker's
+    /// decoding while the rest of the pool idles.
+    fn runs_before_downstream(&self) -> bool {
         false
     }
 
@@ -275,8 +276,8 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
     }
 }
 
-/// Items a draining transform (see [`Unary::drains_input_each_turn`]) takes
-/// on one turn at most.
+/// Items a transform that runs before its downstream (see
+/// [`Unary::runs_before_downstream`]) takes on one turn at most.
 const MAX_ITEMS_PER_DRAIN: usize = 64;
 
 impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
@@ -293,7 +294,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
         };
 
         self.unary.consume(item, &mut *self.sender, io)?;
-        if self.unary.drains_input_each_turn() {
+        if self.unary.runs_before_downstream() {
             // Bounded, so a flood of input still yields the worker between
             // drains.
             for _ in 1..MAX_ITEMS_PER_DRAIN {
@@ -401,6 +402,10 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
         Ok(FinishStatus::Pending)
     }
 
+    fn runs_before_downstream(&self) -> bool {
+        self.unary.runs_before_downstream()
+    }
+
     fn try_steal_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         if !self.unary.ready_for_more_work() {
             return Ok(WorkStatus::Pending);
@@ -458,7 +463,7 @@ mod tests {
             Ok(())
         }
 
-        fn drains_input_each_turn(&self) -> bool {
+        fn runs_before_downstream(&self) -> bool {
             true
         }
     }
