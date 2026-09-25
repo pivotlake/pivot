@@ -396,6 +396,9 @@ impl Worker {
         for id in to_remove {
             debug!("Finished data flow {:?}", id);
             if let Some(mut flow) = self.data_flows.remove(&id) {
+                // Report first: it closes this worker's stats channel, which
+                // lets the query's collector return while the drop below,
+                // which frees every retired operator's state, still runs.
                 flow.stats().report();
                 drop(flow);
                 self.release_live_dataflow();
