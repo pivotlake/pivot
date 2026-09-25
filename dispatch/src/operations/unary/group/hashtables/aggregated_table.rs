@@ -32,7 +32,9 @@ use crate::operations::unary::group::output::topk_pruning::{
 use crate::operations::unary::group::values::{AggregationSlot, ArityBody, WorkerContext};
 use ahash::RandomState;
 use arrow_array::RecordBatch;
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Table capacity at which eligible keys switch to radix scatter.
 const SWITCH_THRESHOLD: usize = 32768;
@@ -76,10 +78,72 @@ impl RadixConfig {
 }
 
 /// One worker's scatter buffer for each radix partition.
-pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized>(
-    pub Vec<StridedScatterRows<KP, V>>,
-);
+///
+/// The merge reads the buckets through a shared reference from every worker
+/// and each partition job releases the rows of its own partition as it
+/// finishes ([`release_partition`](Self::release_partition)), so the pool's
+/// scatter memory is returned in parallel and as the merge goes. Once every
+/// bucket is released the buckets own nothing, and dropping the buffers skips
+/// walking them: with thousands of buckets per worker that walk alone would
+/// cost the one worker dropping the last reference milliseconds.
+pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
+    buckets: Vec<StridedScatterRows<KP, V>>,
+    released_buckets: AtomicUsize,
+}
 unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for PartitionBuffers<KP, V> {}
+
+impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
+    /// Wraps a worker's buckets, none of them released yet.
+    pub fn new(buckets: Vec<StridedScatterRows<KP, V>>) -> Self {
+        Self {
+            buckets,
+            released_buckets: AtomicUsize::new(0),
+        }
+    }
+
+    /// The buckets, in radix partition order.
+    pub fn buckets(&self) -> &[StridedScatterRows<KP, V>] {
+        &self.buckets
+    }
+
+    /// The buckets a merge running at `num_partitions` folds into partition
+    /// `partition`. A merge partition owns several consecutive buckets when
+    /// the merge runs coarser than the scatter; both counts are powers of two,
+    /// so the buckets divide evenly.
+    pub fn bucket_range(&self, partition: usize, num_partitions: usize) -> Range<usize> {
+        let bucket_count = self.buckets.len();
+        debug_assert!(
+            bucket_count.is_multiple_of(num_partitions),
+            "merge partitions ({num_partitions}) must evenly divide scatter buckets ({bucket_count})"
+        );
+        let buckets_per_partition = bucket_count / num_partitions;
+        let first_bucket = partition * buckets_per_partition;
+        first_bucket..first_bucket + buckets_per_partition
+    }
+
+    /// Frees the rows of the buckets partition `partition` folds. Each
+    /// partition is released exactly once, by the job that merged it.
+    pub fn release_partition(&self, partition: usize, num_partitions: usize) {
+        let range = self.bucket_range(partition, num_partitions);
+        for bucket in &self.buckets[range.clone()] {
+            bucket.release();
+        }
+        self.released_buckets
+            .fetch_add(range.len(), Ordering::Relaxed);
+    }
+}
+
+impl<KP: PersistedKey, V: AggregationValue + ?Sized> Drop for PartitionBuffers<KP, V> {
+    fn drop(&mut self) {
+        if *self.released_buckets.get_mut() == self.buckets.len() {
+            // SAFETY: a released bucket owns nothing (its chunk list was taken
+            // and it holds only counts and a raw pointer into the freed
+            // memory), so skipping the buckets' drop leaks nothing; only the
+            // vector's own allocation is left to free.
+            unsafe { self.buckets.set_len(0) }
+        }
+    }
+}
 
 /// Tables, optional scatter buffers, and sizing data produced by one worker.
 pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> {
@@ -589,7 +653,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let output = AggregatedTableOutput {
             node: crate::worker::current_node(),
             tables: self.tables,
-            buffers: self.buffers.map(PartitionBuffers),
+            buffers: self.buffers.map(PartitionBuffers::new),
             hll: self.hll,
             has_bin_totals: topk_bin_totals.is_some(),
             raw_scatter_rows,
@@ -864,7 +928,7 @@ mod tests {
     fn scatter_row_count(output: &AggregatedTableOutput<IntExtractor, CountValue>) -> usize {
         let layout = StridedScatterRows::<i32, CountValue>::layout::<0>(&());
         let mut rows = 0;
-        for bucket in &output.buffers.as_ref().expect("worker switched").0 {
+        for bucket in output.buffers.as_ref().expect("worker switched").buckets() {
             bucket.for_each(layout, |_, _, _| rows += 1);
         }
         rows
@@ -893,6 +957,40 @@ mod tests {
             scatter_row_count(&output) > 4500,
             "duplicates should be scattered raw after the fallback"
         );
+    }
+
+    #[test]
+    fn a_released_partition_visits_no_rows_while_the_others_keep_theirs() {
+        init_test_free_pool(64);
+        let mut table = AggregatedTable::<IntExtractor, CountValue>::new(
+            ahash::RandomState::new(),
+            SharedArena::new(64),
+            (),
+            (),
+            SMALL_RADIX,
+            None,
+        );
+        let values: Vec<i32> = (0..4000).collect();
+        consume_all(&mut table, &values);
+        let (output, _totals) = table.flush();
+        let buffers = output.buffers.as_ref().expect("worker switched");
+        let merge_partitions = SMALL_RADIX.partitions / 2;
+        let rows_before = scatter_row_count(&output);
+        let layout = StridedScatterRows::<i32, CountValue>::layout::<0>(&());
+        let count_rows = |partition: usize| {
+            let mut rows = 0;
+            for bucket in &buffers.buckets()[buffers.bucket_range(partition, merge_partitions)] {
+                bucket.for_each(layout, |_, _, _| rows += 1);
+            }
+            rows
+        };
+        let released_rows = count_rows(0);
+
+        buffers.release_partition(0, merge_partitions);
+
+        assert!(released_rows > 0);
+        assert_eq!(count_rows(0), 0);
+        assert_eq!(scatter_row_count(&output), rows_before - released_rows);
     }
 
     #[test]

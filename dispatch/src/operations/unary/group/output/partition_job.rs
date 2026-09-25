@@ -163,6 +163,28 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
+        let outcome = self.merge_and_emit(acc, sender, allocator);
+        self.release_scatter_rows();
+        outcome
+    }
+
+    /// Frees this partition's scatter rows in every source buffer. Run after
+    /// the merge whether or not it read them (a pruned job never does), so
+    /// the pool's scatter memory is returned by the jobs in parallel rather
+    /// than by whichever worker drops the last reference to the shared state.
+    fn release_scatter_rows(&self) {
+        let (buffers, _) = &self.shared.sources[self.node];
+        for worker_buffers in buffers {
+            worker_buffers.release_partition(self.index, self.shared.num_partitions);
+        }
+    }
+
+    fn merge_and_emit(
+        &self,
+        acc: &mut Option<OutputAccumulator<K, V>>,
+        sender: &mut dyn Sender<RecordBatch>,
+        allocator: &mut SlabAllocator,
+    ) -> Result<()> {
         let shared = &*self.shared;
         // Any `limit` groups satisfy a plain (unordered) pushed LIMIT, so once
         // that many are emitted the remaining partitions are unnecessary.

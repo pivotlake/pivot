@@ -14,6 +14,7 @@ use super::hash_table::{PersistedKey, entry_layout};
 use crate::memory::{Slab, SlabAllocator};
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
+use std::sync::{Mutex, PoisonError};
 
 /// Copyable layout for strided scatter rows.
 ///
@@ -45,19 +46,26 @@ impl<V: AggregationValue + ?Sized> Copy for ScatterLayout<V> {}
 /// value's stride comes from the query. The buffer stores only allocation
 /// state and the current chunk's fill; the caller supplies [`ScatterLayout`].
 pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
-    chunks: Vec<Slab>,
+    /// The lock exists so the merge can free the rows through the shared
+    /// reference it reads them by (see [`release`](Self::release)); it is
+    /// never contended, since each bucket is read and then released by the
+    /// one merge job that owns its partition, and the scatter loop reaches
+    /// the chunks through `&mut self` without locking.
+    chunks: Mutex<Vec<Slab>>,
     /// Base address of the chunk being filled.
     ///
     /// The push loop hops between thousands of partition buffers in random
     /// order, so their headers are a cache-resident working set and every
     /// field the push touches costs a stalled access. The push therefore
-    /// reads only this base and `last_rows` (adjacent fields), addresses the
+    /// reads only this base and the two row counts after it, addresses the
     /// row as `base + last_rows * stride`, and writes back only the
-    /// incremented `last_rows`; fullness is a compare against the caller's
-    /// register-resident layout, not a stored end pointer.
+    /// incremented `last_rows`.
     current_chunk_base: *mut u8,
     /// Rows in the chunk being filled.
     last_rows: usize,
+    /// Rows the chunk being filled holds when full; zero before the first
+    /// chunk exists, so the first push allocates it.
+    current_chunk_rows: usize,
     /// Rows in all full chunks; maintained only when a chunk fills.
     completed_rows: usize,
     // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
@@ -85,19 +93,25 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
     #[cold]
     /// The layout is copied by value to keep the caller's copy local.
     fn grow(&mut self, layout: ScatterLayout<V>, allocator: &mut SlabAllocator) {
-        let rows = Self::chunk_capacity(layout, self.chunks.len());
+        let chunks = self
+            .chunks
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        let rows = Self::chunk_capacity(layout, chunks.len());
         let chunk = allocator.get_aligned_slab(rows * layout.stride, layout.align, false);
         self.current_chunk_base = chunk.ptr;
+        self.current_chunk_rows = rows;
         self.completed_rows += self.last_rows;
         self.last_rows = 0;
-        self.chunks.push(chunk);
+        chunks.push(chunk);
     }
 
     /// Visits each chunk with its base address and populated row count.
     #[inline(always)]
     fn for_each_chunk(&self, layout: ScatterLayout<V>, mut f: impl FnMut(*mut u8, usize)) {
-        let chunk_count = self.chunks.len();
-        for (index, chunk) in self.chunks.iter().enumerate() {
+        let chunks = self.chunks.lock().unwrap_or_else(PoisonError::into_inner);
+        let chunk_count = chunks.len();
+        for (index, chunk) in chunks.iter().enumerate() {
             let rows = if index + 1 == chunk_count {
                 self.last_rows
             } else {
@@ -112,12 +126,29 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
     /// Creates an empty, lazily allocated buffer.
     pub fn new() -> Self {
         Self {
-            chunks: Vec::new(),
+            chunks: Mutex::new(Vec::new()),
             current_chunk_base: std::ptr::null_mut(),
             last_rows: 0,
+            current_chunk_rows: 0,
             completed_rows: 0,
             _phantom: PhantomData,
         }
+    }
+
+    /// Frees the rows' memory. The row count is unchanged, since it describes
+    /// what was scattered, but a later visit sees no rows.
+    ///
+    /// A merge job calls this on every bucket of its partition once it has
+    /// folded them, so the buffers of the whole pool are freed by the jobs in
+    /// parallel and as they go, instead of all at once by whichever worker
+    /// drops the last reference to them.
+    pub fn release(&self) {
+        // Takes the list rather than clearing it, so its heap block goes too:
+        // with hundreds of thousands of buckets, freeing those blocks is
+        // most of what dropping the emptied buffers would still cost.
+        drop(std::mem::take(
+            &mut *self.chunks.lock().unwrap_or_else(PoisonError::into_inner),
+        ));
     }
 
     /// Computes the row layout shared by every partition buffer.
@@ -161,11 +192,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
         key: KP,
         seed: impl FnOnce(&mut V),
     ) {
-        // The capacity compare uses the caller's layout, kept in registers,
-        // so an over-full check costs no buffer-header access.
-        if self.chunks.is_empty()
-            || self.last_rows == Self::chunk_capacity(layout, self.chunks.len() - 1)
-        {
+        if self.last_rows == self.current_chunk_rows {
             self.grow(layout, allocator);
         }
         // Field offsets come from the caller's shared layout snapshot.
@@ -231,5 +258,41 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::init_test_free_pool;
+    use crate::operations::unary::group::values::{Compiled, CountSlot};
+
+    type CountValue = Compiled<(CountSlot,), u8>;
+
+    fn count_visited_rows(
+        rows: &StridedScatterRows<i32, CountValue>,
+        layout: ScatterLayout<CountValue>,
+    ) -> usize {
+        let mut visited = 0;
+        rows.for_each(layout, |_, _, _| visited += 1);
+        visited
+    }
+
+    #[test]
+    fn released_rows_keep_their_count_but_visit_nothing() {
+        init_test_free_pool(8);
+        let mut allocator = SlabAllocator::new(false);
+        let layout = StridedScatterRows::<i32, CountValue>::layout::<0>(&());
+        let mut rows = StridedScatterRows::<i32, CountValue>::new();
+        for key in 0..(layout.full_chunk_rows as i32 * 2) {
+            rows.push_with(layout, &mut allocator, key as u64, key, |_| {});
+        }
+        let pushed = rows.len();
+        assert_eq!(count_visited_rows(&rows, layout), pushed);
+
+        rows.release();
+
+        assert_eq!(rows.len(), pushed);
+        assert_eq!(count_visited_rows(&rows, layout), 0);
     }
 }

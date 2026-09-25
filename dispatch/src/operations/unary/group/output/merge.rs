@@ -409,24 +409,13 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
         const TARGET_PREFETCH_MIN_SLOTS: usize = 16384;
         let merge_prefetch =
             <S::Persisted as PersistedKey>::HAS_BLOB || capacity > TARGET_PREFETCH_MIN_SLOTS;
-        // A merge partition may own several consecutive scatter buckets. Both
-        // counts are powers of two, so the ranges divide evenly.
-        let scatter_bucket_count = buffers
-            .first()
-            .map_or(num_partitions, |buffer| buffer.0.len());
-        debug_assert!(
-            scatter_bucket_count.is_multiple_of(num_partitions),
-            "merge partitions ({num_partitions}) must evenly divide scatter buckets ({scatter_bucket_count})"
-        );
-        let buckets_per_partition = (scatter_bucket_count / num_partitions).max(1);
-        let first_bucket = partition * buckets_per_partition;
-        let end_bucket = first_bucket + buckets_per_partition;
         // All scatter buckets for this signature share one row layout.
         let scatter_layout = StridedScatterRows::<S::Persisted, V>::layout::<N>(context);
         for worker_buffers in buffers {
-            for bucket in first_bucket..end_bucket {
+            let bucket_range = worker_buffers.bucket_range(partition, num_partitions);
+            for bucket in &worker_buffers.buckets()[bucket_range] {
                 if merge_prefetch {
-                    worker_buffers.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
+                    bucket.for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
                         scatter_layout,
                         |hash, key, stored, ahead| {
                             if !cutoff.is_none_or(|cutoff| cutoff.admits(hash)) {
@@ -442,7 +431,7 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
                         },
                     );
                 } else {
-                    worker_buffers.0[bucket].for_each(scatter_layout, |hash, key, stored| {
+                    bucket.for_each(scatter_layout, |hash, key, stored| {
                         if !cutoff.is_none_or(|cutoff| cutoff.admits(hash)) {
                             return;
                         }
