@@ -86,6 +86,10 @@ impl<O, N: Nullary<O>> NullaryOperator<O, N> {
 }
 
 impl<O, N: Nullary<O>> Operator for NullaryOperator<O, N> {
+    fn release_output(&mut self) {
+        self.sender = Box::new(crate::operations::channels::ClosedSender);
+    }
+
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         Ok(self.nullary.run(&mut *self.sender, io)?)
     }

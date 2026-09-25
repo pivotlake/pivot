@@ -86,6 +86,19 @@ pub trait Sender<O> {
     fn send(&mut self, item: O) -> Result<()>;
 }
 
+/// The sender a retired operator is left with: its real one is dropped the
+/// moment the operator finishes, so whoever holds the other end of that
+/// channel sees the stage end even though the operator's state lives on
+/// until its dataflow is torn down. A retired operator sends nothing, so a
+/// send through this is a bug and fails like a send to a dropped receiver.
+pub struct ClosedSender;
+
+impl<O> Sender<O> for ClosedSender {
+    fn send(&mut self, _item: O) -> Result<()> {
+        Err(Error::MpscSendError)
+    }
+}
+
 /// Reading end of a channel between operators.
 pub trait Receiver<I> {
     /// Returns `true` if no messages are currently available.
