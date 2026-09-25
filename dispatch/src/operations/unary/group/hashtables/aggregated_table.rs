@@ -88,6 +88,11 @@ impl RadixConfig {
 /// cost the one worker dropping the last reference milliseconds.
 pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
     buckets: Vec<StridedScatterRows<KP, V>>,
+    /// Rows over all buckets, counted once by the worker that scattered
+    /// them: the merge's planner sums it over every worker, and walking each
+    /// worker's thousands of bucket headers there instead would be a serial
+    /// pass over the whole pool's buffers.
+    rows: usize,
     released_buckets: AtomicUsize,
 }
 unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for PartitionBuffers<KP, V> {}
@@ -96,6 +101,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
     /// Wraps a worker's buckets, none of them released yet.
     pub fn new(buckets: Vec<StridedScatterRows<KP, V>>) -> Self {
         Self {
+            rows: buckets.iter().map(|bucket| bucket.len()).sum(),
             buckets,
             released_buckets: AtomicUsize::new(0),
         }
@@ -104,6 +110,11 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
     /// The buckets, in radix partition order.
     pub fn buckets(&self) -> &[StridedScatterRows<KP, V>] {
         &self.buckets
+    }
+
+    /// Rows scattered over all buckets.
+    pub fn rows(&self) -> usize {
+        self.rows
     }
 
     /// The buckets a merge running at `num_partitions` folds into partition
@@ -161,16 +172,12 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     /// by [`AggregatedTable::flush`] and added into the pool-wide totals
     /// before the gather).
     pub has_bin_totals: bool,
-    /// With bin totals and a raw-scatter fallback: this worker's raw row
-    /// count per scatter bucket. Raw rows are not in the totals, and at
-    /// worst one group absorbed a whole bucket of them, so the merge adds a
-    /// bucket's count to the bound of every bin the bucket covers.
-    ///
-    /// This is most definitely a hack and a patch. It keeps the bounds valid
-    /// without touching the per-row scatter path, at the price of loosening
-    /// them by a whole bucket's rows. It will not be relevant once raw rows
-    /// are summed into the totals properly.
-    pub raw_scatter_rows: Option<Vec<u64>>,
+    /// The summed ordering-aggregate weight of this worker's groups when it
+    /// built no bin totals (too few groups to be worth the array). The merge
+    /// widens every bin by it, which keeps the pool's bounds valid at a cost
+    /// proportional to what such a small worker holds; without it one small
+    /// worker would turn pruning off for the whole pool.
+    pub unbinned_weight: u64,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
     /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
     pub zero_hash_seen: bool,
@@ -620,13 +627,21 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         }
         // Fold the entries still sitting in the in-place tables into the
         // top-k bin totals (drained entries were folded as they scattered). A
-        // worker this small skips the totals (and thereby turns pruning off)
-        // rather than pay the allocation on a query too small to prune.
+        // worker this small skips the array rather than pay its allocation
+        // on a query too small to prune, and reports its groups' summed
+        // weight instead, so the merge's bounds stay valid.
         let table_entries: usize = self.tables.iter().map(|t| t.len()).sum();
         let allocator = &mut self.allocator;
         let taken_totals = self.topk_bin_totals.take();
-        let topk_bin_totals = self.topk_aggregation_slot.and_then(|slot| {
+        let mut unbinned_weight = 0u64;
+        let mut topk_bin_totals = self.topk_aggregation_slot.and_then(|slot| {
             if taken_totals.is_none() && table_entries < MIN_BINNED_ENTRIES {
+                for table in &self.tables {
+                    for entry in table.iter(0) {
+                        unbinned_weight = unbinned_weight
+                            .saturating_add(entry.stored.sort_key(slot).saturating_weight());
+                    }
+                }
                 return None;
             }
             let mut totals = taken_totals.unwrap_or_else(|| HashBinTotals::new(allocator));
@@ -637,17 +652,21 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             }
             Some(totals)
         });
-        // Raw-scattered rows never reached the totals. Report each bucket's
-        // row count so the merge can widen its bounds by them (a hack, see
-        // `AggregatedTableOutput::raw_scatter_rows`). The bucket counts also
-        // include the drained partials scattered before the fallback, which
-        // only loosens the bounds further.
-        let raw_scatter_rows = match (&self.buffers, topk_bin_totals.is_some(), self.scatter_raw) {
-            (Some(buffers), true, true) => {
-                Some(buffers.iter().map(|bucket| bucket.len() as u64).collect())
-            }
-            _ => None,
-        };
+        // Raw-scattered rows never reached the totals. At worst one group
+        // absorbed a whole bucket of them, so widen every bin a bucket covers
+        // by the bucket's row count (a hack that keeps the bounds valid
+        // without touching the per-row scatter path, at the price of
+        // loosening them by a bucket's rows; it goes once raw rows are summed
+        // into the totals properly). The bucket counts also include the
+        // drained partials scattered before the fallback, which only loosens
+        // the bounds further. Done here, by every worker on its own totals,
+        // so the merge's planner never touches the per-worker counts.
+        if let (Some(buffers), Some(totals), true) =
+            (&self.buffers, topk_bin_totals.as_mut(), self.scatter_raw)
+        {
+            let bucket_rows: Vec<u64> = buffers.iter().map(|bucket| bucket.len() as u64).collect();
+            totals.add_raw_bucket_rows(&bucket_rows);
+        }
         self.key_arena.flush();
         self.worker_context.flush();
         let output = AggregatedTableOutput {
@@ -656,7 +675,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             buffers: self.buffers.map(PartitionBuffers::new),
             hll: self.hll,
             has_bin_totals: topk_bin_totals.is_some(),
-            raw_scatter_rows,
+            unbinned_weight,
             zero_hash_seen: self.zero_hash_seen,
         };
         (output, topk_bin_totals)
@@ -1057,17 +1076,37 @@ mod tests {
 
         // Unique keys make every post-switch fill 100% distinct: the worker
         // must fall back to raw scatter, keep the totals of what it drained
-        // before, and report the raw row count per bucket for the merge to
-        // widen its bounds with.
+        // before, and widen every bin of a bucket by the bucket's raw rows.
         let values: Vec<i32> = (0..6000).collect();
         consume_all(&mut table, &values);
         let (output, totals) = table.flush();
 
         assert!(output.buffers.is_some(), "fallback allocates buffers");
         assert!(scatter_row_count(&output) > 1000, "tail rows scatter raw");
-        assert!(totals.is_some(), "drained fills keep the bin totals");
         assert!(output.has_bin_totals);
-        let bucket_rows: u64 = output.raw_scatter_rows.as_ref().unwrap().iter().sum();
-        assert_eq!(bucket_rows as usize, scatter_row_count(&output));
+        let layout = StridedScatterRows::<i32, CountValue>::layout::<0>(&());
+        let fullest_bucket = output
+            .buffers
+            .as_ref()
+            .unwrap()
+            .buckets()
+            .iter()
+            .map(|bucket| {
+                let mut rows = 0;
+                bucket.for_each(layout, |_, _, _| rows += 1);
+                rows as u64
+            })
+            .max()
+            .unwrap();
+        let widest_bin = totals
+            .expect("drained fills keep the bin totals")
+            .into_bin_totals()
+            .into_iter()
+            .max()
+            .unwrap();
+        assert!(
+            widest_bin >= fullest_bucket,
+            "{widest_bin} < {fullest_bucket}"
+        );
     }
 }

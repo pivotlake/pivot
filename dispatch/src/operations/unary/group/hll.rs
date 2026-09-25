@@ -21,9 +21,15 @@ const ALPHA: f64 = 0.7213 / (1.0 + 1.079 / M as f64);
 /// estimator is biased low, so HyperLogLog falls back to linear counting.
 const LINEAR_COUNTING_CUTOFF: f64 = 2.5;
 
+/// The registers live inline rather than behind a `Box`: a worker's sketch
+/// then travels with its output into the merge planner's contiguous gather
+/// slots, where the planner's fold over every worker's sketch streams through
+/// memory. Boxed, each sketch was 4 KB of some other worker's heap, and the
+/// fold across a large pool became a chain of scattered remote misses on the
+/// one worker planning the merge, milliseconds on every grouped query.
 #[derive(Clone)]
 pub struct Hll {
-    registers: Box<[u8; M]>,
+    registers: [u8; M],
 }
 
 impl Default for Hll {
@@ -35,7 +41,7 @@ impl Default for Hll {
 impl Hll {
     pub fn new() -> Self {
         Self {
-            registers: vec![0u8; M].into_boxed_slice().try_into().unwrap(),
+            registers: [0u8; M],
         }
     }
 

@@ -154,26 +154,19 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // switched worker also holds over-counts, which only over-sizes the
         // merge targets (safe); under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
-        // Bounds are only valid if every worker holding groups folded its
-        // bin totals; a worker that skipped (too small, see the flush) makes them
-        // undercount and disables pruning.
+        // Bounds are only valid if every worker's groups are accounted for:
+        // in its bin totals, or, for a worker too small to build them (see
+        // the flush), in the weight the merge widens every bin by. A switched
+        // worker without totals has groups in neither, so no bounds.
         let mut every_group_binned = true;
-        // Pool-wide raw-scattered row count per scatter bucket, from the
-        // workers that fell back to raw scatter; widens the bounds below.
-        let mut raw_bucket_rows: Option<Vec<u64>> = None;
+        let mut unbinned_weight = 0u64;
         for out in outputs {
             let table_entries: usize = out.tables.iter().map(|t| t.len()).sum();
             if out.buffers.is_none() {
                 non_switched_groups += table_entries;
             }
-            every_group_binned &=
-                out.has_bin_totals || (table_entries == 0 && out.buffers.is_none());
-            if let Some(rows) = &out.raw_scatter_rows {
-                let sum = raw_bucket_rows.get_or_insert_with(|| vec![0; rows.len()]);
-                for (bucket, count) in sum.iter_mut().zip(rows) {
-                    *bucket += count;
-                }
-            }
+            every_group_binned &= out.has_bin_totals || out.buffers.is_none();
+            unbinned_weight = unbinned_weight.saturating_add(out.unbinned_weight);
             tables_by_node[out.node].extend(out.tables);
             if let Some(b) = out.buffers {
                 buffers_by_node[out.node].push(b);
@@ -265,15 +258,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // so merge every node's sources directly and pay the remote reads
         // once. An all-in-place merge is always direct: its tables are
         // per-worker aggregated already and their estimate equals their
-        // total, so the test is never met. Counting the scattered rows walks
-        // every switched worker's every bucket, so only pay for it when a
-        // second node exists at all.
+        // total, so the test is never met.
         let hierarchical = node_count > 1 && {
-            let scatter_rows: usize = buffers_by_node
-                .iter()
-                .flatten()
-                .map(|b| b.buckets().iter().map(|bucket| bucket.len()).sum::<usize>())
-                .sum();
+            let scatter_rows: usize = buffers_by_node.iter().flatten().map(|b| b.rows()).sum();
             total_in_place + scatter_rows > 2 * estimate
         };
         // Wrap the arena's ring buffers once for the whole output phase (consume
@@ -292,10 +279,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         let topk_bounds = (every_group_binned
             && (cfg!(test) || estimate >= MIN_TOPK_PRUNE_ESTIMATE))
             .then(|| {
-                self.shared_bin_totals.take_sum().map(|mut totals| {
-                    if let Some(bucket_rows) = &raw_bucket_rows {
-                        totals.add_raw_bucket_rows(bucket_rows);
-                    }
+                let allocator = self
+                    .output_allocator
+                    .get_or_insert_with(|| SlabAllocator::new(false));
+                self.shared_bin_totals.sum(allocator).map(|mut totals| {
+                    totals.widen_every_bin(unbinned_weight);
                     TopKBounds::build(totals)
                 })
             })
@@ -428,6 +416,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
                     .map_err(unary::Error::from)?;
             }
             Steal::Empty => {
+                // No job yet: the planner may be waiting on the bin-total
+                // sum, which this worker can advance.
+                if self.shared_bin_totals.help() {
+                    return Ok(false);
+                }
                 if self.partition_jobs_injected.load(Ordering::Acquire) {
                     // Queue drained: emit this worker's last partial batch.
                     if let (Some(acc), Some(allocator)) = (
