@@ -136,6 +136,13 @@ pub const RECORD_BATCH_SIZE: usize = 8192;
 pub struct RecordBatchOperatorSpec {
     dispatcher: DataFlowDispatcher,
     factories: VecDeque<Box<dyn OperatorFactory<RecordBatch>>>,
+    /// Per-batch transforms added by [`project`](Self::project) since the last
+    /// stage, one list per worker. They are held back rather than chained at
+    /// once so that consecutive projections run as a single stage: every stage
+    /// costs a pool-wide barrier when it finishes, which for a projection is
+    /// far more than the work itself. Empty when there are none; the next
+    /// stage of any other kind chains them first.
+    pending_projections: Vec<Vec<BatchTransform>>,
     /// Whether batches form one ordered stream. Downstream stages must then
     /// consume through FIFO rather than work-stealing queues, which may reorder
     /// batches even when every batch is internally sorted.
@@ -157,14 +164,21 @@ impl OutputBatch for RecordBatch {
     }
 }
 
+/// A per-batch transform held back by [`RecordBatchOperatorSpec::project`].
+type BatchTransform = Box<dyn FnMut(RecordBatch) -> RecordBatch + Send>;
+
+/// The per-batch function of a map stage: the projections held back before it
+/// followed by the map itself.
+type BatchMap<T> = Box<dyn FnMut(RecordBatch) -> T + Send>;
+
 /// Return type of [`RecordBatchOperatorSpec::map`]: a generic
 /// [`OperatorSpec<T, _>`] wrapping the RB→T map stage.
-type MapOperatorSpec<T, F> = OperatorSpec<
+type MapOperatorSpec<T> = OperatorSpec<
     T,
     UnaryOperatorFactory<
         RecordBatch,
         T,
-        MapFactory<F>,
+        MapFactory<BatchMap<T>>,
         StealableChannelFactory<RecordBatch>,
         Box<dyn OperatorFactory<RecordBatch>>,
     >,
@@ -172,16 +186,23 @@ type MapOperatorSpec<T, F> = OperatorSpec<
 
 /// FIFO counterpart to [`MapOperatorSpec`], used when mapping a stream whose
 /// batch order is already significant.
-type OrderedMapOperatorSpec<T, F> = OperatorSpec<
+type OrderedMapOperatorSpec<T> = OperatorSpec<
     T,
     UnaryOperatorFactory<
         RecordBatch,
         T,
-        MapFactory<F>,
+        MapFactory<BatchMap<T>>,
         SingleWorkerMpscFactory<RecordBatch>,
         Box<dyn OperatorFactory<RecordBatch>>,
     >,
 >;
+
+/// Run `transforms` in order over `batch`.
+fn apply_transforms(transforms: &mut [BatchTransform], batch: RecordBatch) -> RecordBatch {
+    transforms
+        .iter_mut()
+        .fold(batch, |batch, transform| transform(batch))
+}
 
 impl RecordBatchOperatorSpec {
     /// Convert a generic [`OperatorSpec`] into a type-erased `RecordBatchOperatorSpec`.
@@ -198,6 +219,7 @@ impl RecordBatchOperatorSpec {
                 .into_iter()
                 .map(|f| Box::new(f) as Box<dyn OperatorFactory<RecordBatch>>)
                 .collect(),
+            pending_projections: Vec::new(),
             stream_ordered: false,
         }
     }
@@ -205,11 +227,12 @@ impl RecordBatchOperatorSpec {
     /// Decompose into the dispatcher and per-worker factories, so out-of-crate
     /// code (e.g. late materialization in `catalog`) can chain further stages.
     pub fn into_parts(
-        self,
+        mut self,
     ) -> (
         DataFlowDispatcher,
         VecDeque<Box<dyn OperatorFactory<RecordBatch>>>,
     ) {
+        self.chain_pending_projections();
         (self.dispatcher, self.factories)
     }
 
@@ -264,6 +287,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: dispatcher.clone(),
             factories,
+            pending_projections: Vec::new(),
             stream_ordered: false,
         }
     }
@@ -276,11 +300,12 @@ impl RecordBatchOperatorSpec {
     /// concurrently with them: a site consumes batches as they are produced
     /// rather than waiting for the whole result.
     pub fn with_cte(
-        self,
+        mut self,
         definition: RecordBatchOperatorSpec,
         cte_index: usize,
         sites: usize,
     ) -> Self {
+        self.chain_pending_projections();
         let (_, definition_heads) = definition.into_parts();
         assert_eq!(
             self.factories.len(),
@@ -303,6 +328,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: self.dispatcher,
             factories,
+            pending_projections: Vec::new(),
             stream_ordered: self.stream_ordered,
         }
     }
@@ -317,6 +343,34 @@ impl RecordBatchOperatorSpec {
     /// Takes an iterator of [`UnaryFactory`] instances (one per worker) and wraps
     /// each existing factory with a [`UnaryOperatorFactory`].
     fn unary<UF: UnaryFactory<RecordBatch, RecordBatch>>(
+        mut self,
+        unary_factories: impl IntoIterator<Item = UF>,
+    ) -> Self {
+        self.chain_pending_projections();
+        self.chain_stage(unary_factories)
+    }
+
+    /// Chain the projections held back so far as one stage, if there are any.
+    fn chain_pending_projections(&mut self) {
+        let pending = std::mem::take(&mut self.pending_projections);
+        if pending.is_empty() {
+            return;
+        }
+        let dispatcher = self.dispatcher.clone();
+        let placeholder = Self {
+            dispatcher,
+            factories: VecDeque::new(),
+            pending_projections: Vec::new(),
+            stream_ordered: self.stream_ordered,
+        };
+        let spec = std::mem::replace(self, placeholder);
+        *self = spec.chain_stage(pending.into_iter().map(|mut transforms| {
+            MapFactory(move |batch: RecordBatch| apply_transforms(&mut transforms, batch))
+        }));
+    }
+
+    /// Append a unary stage directly, behind whatever the last stage is.
+    fn chain_stage<UF: UnaryFactory<RecordBatch, RecordBatch>>(
         self,
         unary_factories: impl IntoIterator<Item = UF>,
     ) -> Self {
@@ -354,6 +408,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: self.dispatcher,
             factories,
+            pending_projections: Vec::new(),
             stream_ordered: self.stream_ordered,
         }
     }
@@ -466,7 +521,7 @@ impl RecordBatchOperatorSpec {
     /// })
     /// # ;
     /// ```
-    pub fn map<T, F, FB>(self, builder: FB) -> MapOperatorSpec<T, F>
+    pub fn map<T, F, FB>(mut self, builder: FB) -> MapOperatorSpec<T>
     where
         T: Send + 'static,
         F: FnMut(RecordBatch) -> T + Send + 'static,
@@ -474,9 +529,10 @@ impl RecordBatchOperatorSpec {
     {
         let worker_count = self.worker_count();
         let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let maps = self.batch_maps(builder);
         let factories: Vec<_> = stealable::<RecordBatch>(self.dispatcher.topology())
             .into_iter()
-            .zip((0..worker_count).map(|_| MapFactory(builder())))
+            .zip(maps)
             .zip(self.factories)
             .map(|((channel_factory, unary_factory), head)| {
                 UnaryOperatorFactory::new(
@@ -493,7 +549,7 @@ impl RecordBatchOperatorSpec {
     /// Apply a type-changing map without changing an already-established
     /// batch order. The ordered producer emits from one worker, and the FIFO
     /// channel delivers those batches to one consumer in the same sequence.
-    fn map_ordered<T, F, FB>(self, builder: FB) -> OrderedMapOperatorSpec<T, F>
+    fn map_ordered<T, F, FB>(mut self, builder: FB) -> OrderedMapOperatorSpec<T>
     where
         T: Send + 'static,
         F: FnMut(RecordBatch) -> T + Send + 'static,
@@ -502,9 +558,10 @@ impl RecordBatchOperatorSpec {
         let worker_count = self.worker_count();
         let siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let target = self.dispatcher.next_worker();
+        let maps = self.batch_maps(builder);
         let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(worker_count, target)
             .into_iter()
-            .zip((0..worker_count).map(|_| MapFactory(builder())))
+            .zip(maps)
             .zip(self.factories)
             .map(|((channel_factory, unary_factory), head)| {
                 UnaryOperatorFactory::new(
@@ -525,13 +582,44 @@ impl RecordBatchOperatorSpec {
     /// Unordered streams use the same work-stealing delivery as [`map`](Self::map).
     /// After `ORDER BY`, the stage instead reads the batches through one FIFO
     /// consumer so their global row order is preserved.
-    pub fn project<F, FB>(self, builder: FB) -> Self
+    pub fn project<F, FB>(mut self, builder: FB) -> Self
     where
         F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
         FB: Fn() -> F,
     {
+        if self.pending_projections.is_empty() {
+            let worker_count = self.worker_count();
+            self.pending_projections = (0..worker_count).map(|_| Vec::new()).collect();
+        }
+        for transforms in &mut self.pending_projections {
+            transforms.push(Box::new(builder()));
+        }
+        self
+    }
+
+    /// One map function per worker: the projections held back so far, then
+    /// the map `builder` produces for that worker.
+    fn batch_maps<T, F, FB>(&mut self, builder: FB) -> Vec<MapFactory<BatchMap<T>>>
+    where
+        T: Send + 'static,
+        F: FnMut(RecordBatch) -> T + Send + 'static,
+        FB: Fn() -> F,
+    {
         let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| MapFactory(builder())))
+        let mut pending = std::mem::take(&mut self.pending_projections);
+        if pending.is_empty() {
+            pending = (0..worker_count).map(|_| Vec::new()).collect();
+        }
+        pending
+            .into_iter()
+            .map(|mut transforms| {
+                let mut map = builder();
+                let batch_map: BatchMap<T> = Box::new(move |batch: RecordBatch| {
+                    map(apply_transforms(&mut transforms, batch))
+                });
+                MapFactory(batch_map)
+            })
+            .collect()
     }
 
     /// Global aggregates (no GROUP BY): one or more `SUM`/`COUNT` slots over
@@ -608,7 +696,8 @@ impl RecordBatchOperatorSpec {
 
     /// Full ORDER BY with the optional variant-layout normalization breaker
     /// inserted between the worker-local sorters and the ordinary run merger.
-    pub fn order_by_normalizing(self, order_by: Vec<OrderBy>) -> Self {
+    pub fn order_by_normalizing(mut self, order_by: Vec<OrderBy>) -> Self {
+        self.chain_pending_projections();
         let topology = self.dispatcher.topology();
         let worker_count = self.worker_count();
         let collector_worker = self.dispatcher.next_worker();
@@ -674,6 +763,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: self.dispatcher,
             factories,
+            pending_projections: Vec::new(),
             stream_ordered: true,
         }
     }
@@ -989,11 +1079,12 @@ impl RecordBatchOperatorSpec {
         const DISCARD_MATCHED_ROWS: bool,
         const EMIT_MARK_COLUMN: bool,
     >(
-        self,
+        mut self,
         build: RecordBatchOperatorSpec,
         spec: JoinSpec,
         normalize_build: bool,
     ) -> Self {
+        self.chain_pending_projections();
         let worker_count = self.worker_count();
         assert_eq!(
             worker_count,
@@ -1122,6 +1213,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: self.dispatcher,
             factories,
+            pending_projections: Vec::new(),
             stream_ordered: false,
         }
     }
@@ -1218,7 +1310,7 @@ impl RecordBatchOperatorSpec {
     }
 
     fn range_join_typed<T: arrow_array::types::ArrowPrimitiveType>(
-        self,
+        mut self,
         build: RecordBatchOperatorSpec,
         spec: RangeJoinSpec,
         normalize_build: bool,
@@ -1226,6 +1318,7 @@ impl RecordBatchOperatorSpec {
     where
         T::Native: ArrowNativeTypeOp + Send,
     {
+        self.chain_pending_projections();
         let worker_count = self.worker_count();
         assert_eq!(
             worker_count,
@@ -1296,6 +1389,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: self.dispatcher,
             factories,
+            pending_projections: Vec::new(),
             stream_ordered: false,
         }
     }
@@ -1329,7 +1423,8 @@ impl RecordBatchOperatorSpec {
     ///     .unwrap();
     /// ```
     /// Dispatch the pipeline and return its ring-backed Arrow output.
-    pub fn execute(self) -> DataFlowHandle<RecordBatch> {
+    pub fn execute(mut self) -> DataFlowHandle<RecordBatch> {
+        self.chain_pending_projections();
         let factories: Vec<_> = self.factories.into_iter().collect();
         OperatorSpec::new(self.dispatcher, factories).execute()
     }
@@ -1345,7 +1440,8 @@ impl RecordBatchOperatorSpec {
     }
 
     /// Like [`execute`](Self::execute), with worker statistics enabled.
-    pub fn execute_with_stats(self) -> DataFlowHandle<RecordBatch> {
+    pub fn execute_with_stats(mut self) -> DataFlowHandle<RecordBatch> {
+        self.chain_pending_projections();
         let factories: Vec<_> = self.factories.into_iter().collect();
         OperatorSpec::new(self.dispatcher, factories).execute_with_stats()
     }

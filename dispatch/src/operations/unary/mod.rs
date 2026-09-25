@@ -66,7 +66,7 @@ use thiserror::Error;
 
 use super::channels::{Receiver, Sender};
 use super::{FinishStatus, Operator};
-use crate::waker::{waker_set, worker_waker};
+use crate::waker::waker_set;
 
 mod pipeline_breaker;
 pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
@@ -348,9 +348,10 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
             }
 
             if self.unary.finish(&mut *self.sender)? {
-                // `finish` may have emitted final batches downstream, so wake
-                // any parked peers to pick that work up.
-                worker_waker().notify();
+                // Anything `finish` emitted woke its takers through the
+                // channel's own send, and the barrier that opens once every
+                // sibling retires wakes the rest; a wake per retiring worker
+                // would only add a pool-wide atomic per stage.
                 return Ok(FinishStatus::Done);
             }
             // A pipeline breaker still draining its outputter. The worker re-

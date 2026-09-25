@@ -165,6 +165,30 @@ fn project_selects_single_column() {
 }
 
 #[test]
+fn consecutive_projections_apply_in_order() {
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(&["a", "b"], &[10, 20]);
+
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
+        .project(|| {
+            let ints_first = vec![1, 0];
+            move |batch: RecordBatch| batch.project(&ints_first).unwrap()
+        })
+        .project(|| {
+            let only_ints = vec![0];
+            move |batch: RecordBatch| batch.project(&only_ints).unwrap()
+        })
+        .collect()
+        .unwrap();
+
+    assert_eq!(results[0].num_columns(), 1);
+    let mut vals = collect_i64s(&results, 0);
+    vals.sort();
+    assert_eq!(vals, vec![10, 20]);
+}
+
+#[test]
 fn order_by_ascending_with_limit() {
     let dispatch = dispatch(1);
     let batch = strings_and_ints(&["e", "a", "d", "b", "c"], &[50, 10, 40, 20, 30]);
