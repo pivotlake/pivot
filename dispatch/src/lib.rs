@@ -65,6 +65,7 @@ use tracing::info;
 // lives in `catalog`, not here) can build on it: memory/IO/array-builder
 // primitives and worker identity.
 pub mod arrays;
+pub mod barrier_trace;
 pub mod cpu_features;
 pub mod env;
 pub mod gather_barrier;

@@ -3,12 +3,11 @@
 //!
 //! A pipeline breaker (see [`pipeline_breaker`](super::pipeline_breaker)): each
 //! worker keeps a local [`Slot`] accumulator per requested aggregate while
-//! consuming batches, then on finalization sends its slots down a shared mpsc
-//! channel. One worker holds the receiver, drains every sibling's slots, merges
-//! them, and emits the single-row result with one output column per aggregate.
-//! The cross-worker merge therefore needs no shared lock - it mirrors
-//! [`OrderByLimit`](super::order_by_limit), which combines worker partials the
-//! same way.
+//! consuming batches, then on finalization hands its slots to a shared
+//! [`GatherBarrier`]. The last worker to arrive merges every sibling's slots
+//! and emits the single-row result with one output column per aggregate. The
+//! cross-worker merge therefore needs no shared lock and no channel, and the
+//! pool is woken once, by the barrier, rather than once per finishing worker.
 //!
 //! A [`Slot`] owns one aggregate's whole lifecycle - fold batches in, merge a
 //! sibling worker's accumulator, render the output column - so each op's logic
@@ -22,6 +21,7 @@
 //! `AVG(x)` to `sum(x) / count(x)`, so an average arrives as a `Sum` slot and a
 //! `Count` slot.
 
+use crate::GatherBarrier;
 use crate::cpu_features::multitarget_kernel;
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
@@ -30,7 +30,6 @@ use crate::operations::unary::group::{
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
-use crate::waker::waker_set;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Decimal64Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
@@ -41,7 +40,6 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
-use std::sync::mpsc;
 
 /// A numeric aggregate op (`SUM`/`MIN`/`MAX`) shared by the integer and float
 /// slots, dispatched once per batch (never per row) into its monomorphic op.
@@ -474,31 +472,28 @@ fn reduce_str_extreme<const MAX: bool>(a: &StringViewArray) -> Option<String> {
     }
 }
 
-/// Factory for the aggregate operator. All workers share one mpsc channel; the
+/// Factory for the aggregate operator. All workers share one gather barrier; the
 /// first factory gets the receiver, the rest get `None`, so per-worker slots
 /// flow to a single collector (the same wiring as [`OrderByLimitFactory`]).
 ///
 /// [`OrderByLimitFactory`]: super::order_by_limit
 pub struct AggregateFactory<A: IntCell> {
     specs: Arc<Vec<AggregationSlot>>,
-    sender: mpsc::Sender<Vec<Slot<A>>>,
-    receiver: Option<mpsc::Receiver<Vec<Slot<A>>>>,
+    gather: Arc<GatherBarrier<Vec<Slot<A>>>>,
 }
 
 impl<A: IntCell> AggregateFactory<A> {
-    /// Create one factory per worker, all sharing the same slots channel.
+    /// Create one factory per worker, all sharing the same gather barrier.
     pub fn create_for_workers(
         specs: Vec<AggregationSlot>,
         worker_count: usize,
     ) -> impl IntoIterator<Item = AggregateFactory<A>> {
         let specs = Arc::new(specs);
-        let (tx, rx) = mpsc::channel();
-        let mut rx_opt = Some(rx);
+        let gather = Arc::new(GatherBarrier::new(worker_count));
 
         (0..worker_count).map(move |_| AggregateFactory {
             specs: specs.clone(),
-            sender: tx.clone(),
-            receiver: rx_opt.take(),
+            gather: gather.clone(),
         })
     }
 }
@@ -508,36 +503,26 @@ impl<A: IntCell + F64Cell + WideCell> UnaryFactory<RecordBatch, RecordBatch>
 {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Aggregate<A>>;
 
-    fn build_unary(mut self) -> Self::Unary {
-        PipelineBreaker::Consuming(Aggregate::new(
-            self.specs,
-            self.sender,
-            self.receiver.take(),
-        ))
+    fn build_unary(self) -> Self::Unary {
+        PipelineBreaker::Consuming(Aggregate::new(self.specs, self.gather))
     }
 }
 
-/// Per-worker aggregate consumer. Accumulates local slots, then sends them down
-/// the shared channel on finalization.
+/// Per-worker aggregate consumer. Accumulates local slots, then hands them to
+/// the shared gather barrier on finalization.
 pub struct Aggregate<A: IntCell> {
     specs: Arc<Vec<AggregationSlot>>,
     local: Vec<Slot<A>>,
-    sender: mpsc::Sender<Vec<Slot<A>>>,
-    receiver: Option<mpsc::Receiver<Vec<Slot<A>>>>,
+    gather: Arc<GatherBarrier<Vec<Slot<A>>>>,
 }
 
 impl<A: IntCell + F64Cell + WideCell> Aggregate<A> {
-    fn new(
-        specs: Arc<Vec<AggregationSlot>>,
-        sender: mpsc::Sender<Vec<Slot<A>>>,
-        receiver: Option<mpsc::Receiver<Vec<Slot<A>>>>,
-    ) -> Self {
+    fn new(specs: Arc<Vec<AggregationSlot>>, gather: Arc<GatherBarrier<Vec<Slot<A>>>>) -> Self {
         let local = specs.iter().map(Slot::build).collect();
         Aggregate {
             specs,
             local,
-            sender,
-            receiver,
+            gather,
         }
     }
 }
@@ -557,61 +542,42 @@ impl<A: IntCell + F64Cell + WideCell> Consumer<RecordBatch, RecordBatch> for Agg
     }
 
     fn into_outputter(self) -> unary::Result<Option<Self::Outputter>> {
-        // Every worker sends its slots (even untouched, so the merge always sees
-        // a contribution per worker) and wakes the collector. Notifying
-        // unconditionally after the send avoids the lost-wakeup that bites when
-        // a finishing worker drops its sender while the collector is parked.
-        // The collector may be parked on another node, so wake every node.
-        self.sender
-            .send(self.local)
-            .expect("aggregate collector dropped");
-        waker_set().notify_all();
-
-        let totals = self.specs.iter().map(Slot::build).collect();
-        Ok(self.receiver.map(|rx| AggregateOutputter {
-            rx,
-            specs: self.specs,
-            totals,
-        }))
+        // Every worker arrives with its slots (even untouched, so the merge
+        // always sees a contribution per worker); the last to arrive merges
+        // them all and becomes the one worker that emits the result.
+        let specs = self.specs;
+        let totals = self.gather.arrive(self.local, |partials| {
+            let mut totals: Vec<Slot<A>> = specs.iter().map(Slot::build).collect();
+            for worker_slots in partials {
+                for (total, slot) in totals.iter_mut().zip(worker_slots) {
+                    total.merge(slot);
+                }
+            }
+            totals
+        });
+        Ok(totals.map(|totals| AggregateOutputter { specs, totals }))
     }
 }
 
-/// Output phase (one worker only): drains every sibling's slots from the
-/// channel, merges them, then emits the single-row result.
+/// Output phase (one worker only): emits the merged single-row result.
 pub struct AggregateOutputter<A: IntCell> {
-    rx: mpsc::Receiver<Vec<Slot<A>>>,
     specs: Arc<Vec<AggregationSlot>>,
     totals: Vec<Slot<A>>,
 }
 
 impl<A: IntCell + F64Cell + WideCell> Outputter<RecordBatch> for AggregateOutputter<A> {
     fn output(&mut self, output: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
-        loop {
-            match self.rx.try_recv() {
-                Ok(worker_slots) => {
-                    for (total, slot) in self.totals.iter_mut().zip(worker_slots) {
-                        total.merge(slot);
-                    }
-                }
-                // Some siblings haven't finished yet; resume when re-driven.
-                Err(mpsc::TryRecvError::Empty) => return Ok(false),
-                // All senders dropped → every worker's slots are merged in.
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let (fields, columns): (Vec<Field>, Vec<ArrayRef>) =
-                        std::mem::take(&mut self.totals)
-                            .into_iter()
-                            .zip(self.specs.iter())
-                            .map(|(slot, spec)| {
-                                let (field, column) = slot.into_column();
-                                cast_value_column(field, column, &spec.output_type)
-                            })
-                            .unzip();
-                    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-                    output.send(batch)?;
-                    return Ok(true);
-                }
-            }
-        }
+        let (fields, columns): (Vec<Field>, Vec<ArrayRef>) = std::mem::take(&mut self.totals)
+            .into_iter()
+            .zip(self.specs.iter())
+            .map(|(slot, spec)| {
+                let (field, column) = slot.into_column();
+                cast_value_column(field, column, &spec.output_type)
+            })
+            .unzip();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+        output.send(batch)?;
+        Ok(true)
     }
 }
 
@@ -643,17 +609,16 @@ mod tests {
         .unwrap()
     }
 
-    /// Build `n` channel-wired aggregate consumers sharing one slots channel
-    /// (the first holds the receiver), mirroring the factory's wiring.
+    /// Build `n` aggregate consumers sharing one gather barrier, mirroring the
+    /// factory's wiring.
     fn build<A: IntCell + F64Cell + WideCell>(
         n: usize,
         specs: Vec<AggregationSlot>,
     ) -> Vec<Aggregate<A>> {
         let specs = Arc::new(specs);
-        let (tx, rx) = mpsc::channel();
-        let mut rx_opt = Some(rx);
+        let gather = Arc::new(GatherBarrier::new(n));
         (0..n)
-            .map(move |_| Aggregate::new(specs.clone(), tx.clone(), rx_opt.take()))
+            .map(move |_| Aggregate::new(specs.clone(), gather.clone()))
             .collect()
     }
 

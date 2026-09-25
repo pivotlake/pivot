@@ -66,7 +66,7 @@ use thiserror::Error;
 
 use super::channels::{Receiver, Sender};
 use super::{FinishStatus, Operator};
-use crate::waker::{waker_set, worker_waker};
+use crate::waker::waker_set;
 
 mod pipeline_breaker;
 pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
@@ -325,8 +325,16 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
             self.siblings_left.load(Ordering::Acquire) == 0
         } else {
             self.notified_finished = true;
+            crate::barrier_trace::record(
+                std::any::type_name::<U>(),
+                crate::barrier_trace::Event::Arrive,
+            );
             let was_last = self.siblings_left.fetch_sub(1, Ordering::AcqRel) == 1;
             if was_last {
+                crate::barrier_trace::record(
+                    std::any::type_name::<U>(),
+                    crate::barrier_trace::Event::Open,
+                );
                 // Sibling counter just hit 0: every worker's `try_finish` for this
                 // operator can now run. Wake peers parked on any node's waker so
                 // they advance to their `finish` instead of sleeping out the park.
@@ -348,9 +356,14 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
             }
 
             if self.unary.finish(&mut *self.sender)? {
-                // `finish` may have emitted final batches downstream, so wake
-                // any parked peers to pick that work up.
-                worker_waker().notify();
+                crate::barrier_trace::record(
+                    std::any::type_name::<U>(),
+                    crate::barrier_trace::Event::Finished,
+                );
+                // Anything `finish` emitted woke its takers through the
+                // channel's own send, and the barrier that opens once every
+                // sibling retires wakes the rest; a wake per retiring worker
+                // would only add a pool-wide atomic per stage.
                 return Ok(FinishStatus::Done);
             }
             // A pipeline breaker still draining its outputter. The worker re-

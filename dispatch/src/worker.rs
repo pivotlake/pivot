@@ -373,6 +373,7 @@ impl Worker {
             if let Some(mut flow) = self.data_flows.remove(&id) {
                 flow.stats().report();
                 drop(flow);
+                crate::barrier_trace::record("drop", crate::barrier_trace::Event::Dropped);
                 self.release_live_dataflow();
             }
         }
@@ -406,6 +407,7 @@ impl Worker {
     /// [`Self::clear_dirty_buffer_or_park`].
     fn release_live_dataflow(&self) {
         if LIVE_DATAFLOWS.fetch_sub(1, Ordering::Relaxed) == 1 {
+            crate::barrier_trace::dump();
             self.waker.notify();
         }
     }
@@ -518,6 +520,7 @@ impl Worker {
         // or park waiting for this worker's operator to ever exist).
         while let Ok(builder) = self.data_flow_queue.try_recv() {
             debug!("Received data flow...");
+            crate::barrier_trace::record("build", crate::barrier_trace::Event::Built);
             match builder.build() {
                 Ok(data_flow) => {
                     LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
