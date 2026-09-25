@@ -15,11 +15,13 @@ use crate::thrift::headers::PageHeader;
 use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use crate::types::page::{CompressedPage, DataPage, DecompressedPage, DecompressedPageType};
 use bytes::Bytes;
-use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
+use dispatch::UnaryFactory;
 use dispatch::memory::{BlockKey, memory_ctx};
 use snap::raw::Decoder;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use zstd::zstd_safe::{DCtx, InBuffer, OutBuffer, ResetDirective, get_error_name};
 
@@ -45,7 +47,29 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Factory for creating [`Decompressor`] instances, one per worker thread.
-pub type DecompressorFactory = DefaultUnaryFactory<Decompressor>;
+pub struct DecompressorFactory {
+    /// The worker's claimed-but-not-yet-cut row-group count, shared with its
+    /// fetcher and range cutter; see [`Decompressor::steals_input`].
+    pending_row_groups: Arc<AtomicUsize>,
+}
+
+impl DecompressorFactory {
+    pub fn new(pending_row_groups: Arc<AtomicUsize>) -> Self {
+        Self { pending_row_groups }
+    }
+}
+
+impl UnaryFactory<CompressedPage, DecompressedPage> for DecompressorFactory {
+    type Unary = Decompressor;
+
+    fn build_unary(self) -> Decompressor {
+        Decompressor {
+            snappy_decoder: Decoder::new(),
+            zstd_decoder: DCtx::create(),
+            own_row_groups_pending: self.pending_row_groups,
+        }
+    }
+}
 
 /// Decompressor that converts [`CompressedPage`]s into [`DecompressedPage`]s,
 /// dispatching on each page's codec.
@@ -55,6 +79,10 @@ pub type DecompressorFactory = DefaultUnaryFactory<Decompressor>;
 pub struct Decompressor {
     snappy_decoder: Decoder,
     zstd_decoder: DCtx<'static>,
+    /// Row groups this worker has claimed and not yet cut into decode
+    /// ranges: while there are any, it has pages of its own coming and
+    /// leaves other owners' pages to them.
+    own_row_groups_pending: Arc<AtomicUsize>,
 }
 
 impl Default for Decompressor {
@@ -62,6 +90,7 @@ impl Default for Decompressor {
         Self {
             snappy_decoder: Decoder::new(),
             zstd_decoder: DCtx::create(),
+            own_row_groups_pending: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -258,6 +287,13 @@ fn serialize_header(header: &PageHeader) -> Vec<Bytes> {
 }
 
 impl Unary<CompressedPage, DecompressedPage> for Decompressor {
+    /// A page is decoded fastest on the core that decompressed it, so a
+    /// worker with row groups of its own still coming leaves other owners'
+    /// pages to them and steals only once it is otherwise idle.
+    fn steals_input(&self) -> bool {
+        self.own_row_groups_pending.load(Ordering::Relaxed) == 0
+    }
+
     fn consume(
         &mut self,
         page: CompressedPage,

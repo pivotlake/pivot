@@ -210,6 +210,17 @@ pub trait Unary<I, O> {
         false
     }
 
+    /// Whether the operator should take a peer's input right now. `true` by
+    /// default: an idle worker steals whatever it can. An operator whose
+    /// output feeds work that runs best where its input was produced (a
+    /// decompressed page is decoded fastest by the core holding it) can
+    /// decline while its own worker has such input of its own to get
+    /// through, and steal only once it is otherwise idle, so the pool still
+    /// drains a straggler's queue at the end.
+    fn steals_input(&self) -> bool {
+        true
+    }
+
     /// Whether this operator has async work still outstanding that its
     /// [`finish`](Self::finish) depends on — e.g. writes/uploads submitted to the
     /// ring whose completions haven't landed yet. The default is `false`.
@@ -363,7 +374,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
     }
 
     fn try_steal_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
-        if !self.unary.ready_for_more_work() {
+        if !self.unary.ready_for_more_work() || !self.unary.steals_input() {
             return Ok(WorkStatus::Pending);
         }
         match self.receiver.steal() {
@@ -406,6 +417,38 @@ mod tests {
             self.steps += 1;
             Ok(WorkStatus::Ran)
         }
+    }
+
+    /// A transform that declines to steal.
+    struct OwnInputOnly;
+
+    impl Unary<(), ()> for OwnInputOnly {
+        fn consume(&mut self, _: (), _: &mut dyn Sender<()>, _: &mut OperatorIO) -> Result<()> {
+            Ok(())
+        }
+
+        fn steals_input(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_transform_that_declines_to_steal_leaves_the_peers_queues_alone() {
+        let (mut peer_input, peer_receiver) = mpsc_channel::<()>();
+        peer_input.send(()).unwrap();
+        let (_own_input, own_receiver) = mpsc_channel::<()>();
+        let mut operator = UnaryOperator::new(
+            OwnInputOnly,
+            own_receiver,
+            Box::new(CollectSender::<()>::new()),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        let mut test_io = TestOperatorIO::default();
+
+        let status = operator.try_steal_work(&mut test_io.io()).unwrap();
+
+        assert!(matches!(status, WorkStatus::Pending));
+        assert!(!peer_receiver.is_empty());
     }
 
     /// A transform that is not ready for input still gets its turn through

@@ -51,7 +51,10 @@ where
         )
         .chain(
             stealable::<CompressedPage>(topology).into_iter().collect(),
-            (0..n).map(|_| DecompressorFactory::new()).collect(),
+            pending_row_groups
+                .iter()
+                .map(|pending| DecompressorFactory::new(pending.clone()))
+                .collect(),
         )
         .chain(
             return_to_worker_mpsc::<DecompressedPage>(n)
