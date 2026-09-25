@@ -20,6 +20,30 @@ pub fn mark(label: &'static str) {
     record(label, Event::Mark);
 }
 
+/// Pool-wide accumulated nanoseconds and counts for a few timed sections.
+pub static TIMED_NS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub static TIMED_COUNT: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub const TIMED_LABELS: [&str; 4] = ["cut_range", "range send", "cut consume", "decode consume"];
+
+/// Add one timed section's duration to the pool-wide tally.
+pub fn add_time(slot: usize, started: Instant) {
+    if !enabled() {
+        return;
+    }
+    TIMED_NS[slot].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    TIMED_COUNT[slot].fetch_add(1, Ordering::Relaxed);
+}
+
 struct Record {
     at: Instant,
     worker: usize,
@@ -183,6 +207,17 @@ pub fn dump() {
             }
         }
         last_open = open;
+    }
+    for (slot, label) in TIMED_LABELS.iter().enumerate() {
+        let ns = TIMED_NS[slot].swap(0, Ordering::Relaxed);
+        let count = TIMED_COUNT[slot].swap(0, Ordering::Relaxed);
+        if count > 0 {
+            out.push_str(&format!(
+                "timed {label}: n={count} total {:.0}us mean {:.2}us\n",
+                ns as f64 / 1e3,
+                ns as f64 / 1e3 / count as f64
+            ));
+        }
     }
     eprint!("{out}");
 }

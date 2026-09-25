@@ -147,7 +147,12 @@ impl RangeCutter {
         let ready = open.pages.ready_ranges();
         for index in open.emitted..ready {
             dispatch::barrier_trace::mark("cut:range");
-            sender.send(open.pages.cut_range(index))?;
+            let started = std::time::Instant::now();
+            let range = open.pages.cut_range(index);
+            dispatch::barrier_trace::add_time(0, started);
+            let started = std::time::Instant::now();
+            sender.send(range)?;
+            dispatch::barrier_trace::add_time(1, started);
         }
         open.emitted = ready;
         if open.emitted == open.pages.range_count() {
@@ -165,6 +170,19 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         dispatch::barrier_trace::mark("cut:page");
+        let consume_started = std::time::Instant::now();
+        let outcome = self.consume_page(page, output);
+        dispatch::barrier_trace::add_time(2, consume_started);
+        outcome
+    }
+}
+
+impl RangeCutter {
+    fn consume_page(
+        &mut self,
+        page: DecompressedPage,
+        output: &mut dyn Sender<DecodeRange>,
+    ) -> dispatch::UnaryResult<()> {
         let metadata = page.query_row_group_metadata.clone();
         let row_group_index = metadata.row_group_index;
         if self.closed.contains(&row_group_index) {
@@ -239,7 +257,9 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
         }
         self.emit_ready_ranges(row_group_index, output)
     }
+}
 
+impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
     fn finish(&mut self, _output: &mut dyn Sender<DecodeRange>) -> dispatch::UnaryResult<bool> {
         Ok(self.open.is_empty())
     }

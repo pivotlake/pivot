@@ -165,6 +165,7 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
     ) -> dispatch::UnaryResult<()> {
         assert!(self.active.is_none(), "a decoder takes one range at a time");
         dispatch::barrier_trace::mark("decode:range");
+        let consume_started = std::time::Instant::now();
         let row_group_index = range.metadata().row_group_index;
         let mut decoder = match self
             .idle
@@ -178,6 +179,7 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
         decoder.attach(range).map_err(crate::op_err)?;
         self.active = Some(decoder);
         self.produce_batch(output)?;
+        dispatch::barrier_trace::add_time(3, consume_started);
         Ok(())
     }
 
