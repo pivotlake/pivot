@@ -101,6 +101,14 @@ unicode-width = "0.2"
 [profile.dev]
 debug = "line-tables-only"
 
+# One codegen unit per crate and whole-program link-time optimization: the
+# scan, decode and hash paths cross crate boundaries (parquet-engine, dispatch,
+# arrow) on every value, and only a fat LTO link lets the compiler inline and
+# specialize across them. Slower to link; the build is not on any hot path.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 # Optimized like release but with debuginfo, so `perf` can resolve inlined
 # frames and line numbers. Build for profiling with
 # `cargo build --profile profiling`; plain `--release` stays lean.
