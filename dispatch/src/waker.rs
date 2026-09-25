@@ -102,6 +102,71 @@ pub struct WorkerWaker {
     /// Bumped on every delegated broadcast. The first worker woken observes the
     /// change and wakes its remaining parked siblings.
     broadcast_epoch: AtomicU64,
+    /// Spinning workers' view of `wake_count`, see [`SpinTicket`].
+    relayed_wake_count: Padded<AtomicU64>,
+    /// Whether some spinning worker currently relays `wake_count`.
+    relay_claimed: Padded<AtomicBool>,
+}
+
+/// Keeps its content on a cache line of its own, so polling it shares no
+/// line with anything a notifier writes.
+#[repr(align(128))]
+struct Padded<T>(T);
+
+/// How many polls a spinner makes between checks for a vacant relay.
+const RELAY_CLAIM_INTERVAL: u32 = 256;
+
+/// A spinning worker's way of watching the wake count.
+///
+/// Every idle worker polls the wake count, so each one holds its cache line
+/// in its own cache, and a notifier's increment has to invalidate every one
+/// of those copies before it completes: on a node with many idle cores a
+/// plain send costs microseconds precisely while the pool is mostly idle and
+/// the send's latency matters most. So one spinner per node, the holder,
+/// polls the real count and copies each change into a relay line that only
+/// it writes, while every other spinner polls the relay. The holder gives the
+/// role up when it stops spinning, and a spinner that then finds it vacant
+/// takes it over at its next check, so a change is never relayed later than
+/// one check interval. The relay only serves spinning: parking still checks
+/// the real count, so no wake is lost through it.
+pub struct SpinTicket<'a> {
+    waker: &'a WorkerWaker,
+    holds_relay: bool,
+    polls_since_claim_check: u32,
+}
+
+impl SpinTicket<'_> {
+    /// The wake count as this spinner sees it: exact for the holder, the
+    /// holder's last relayed value for everyone else.
+    pub fn wake_count(&mut self) -> u64 {
+        if self.holds_relay {
+            let now = self.waker.wake_count.load(Ordering::SeqCst);
+            if self.waker.relayed_wake_count.0.load(Ordering::Relaxed) != now {
+                self.waker
+                    .relayed_wake_count
+                    .0
+                    .store(now, Ordering::Release);
+            }
+            return now;
+        }
+        self.polls_since_claim_check += 1;
+        if self.polls_since_claim_check >= RELAY_CLAIM_INTERVAL {
+            self.polls_since_claim_check = 0;
+            if self.waker.try_claim_relay() {
+                self.holds_relay = true;
+                return self.wake_count();
+            }
+        }
+        self.waker.relayed_wake_count.0.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SpinTicket<'_> {
+    fn drop(&mut self) {
+        if self.holds_relay {
+            self.waker.relay_claimed.0.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl WorkerWaker {
@@ -122,7 +187,31 @@ impl WorkerWaker {
                 .collect(),
             next_wake: AtomicUsize::new(0),
             broadcast_epoch: AtomicU64::new(0),
+            relayed_wake_count: Padded(AtomicU64::new(0)),
+            relay_claimed: Padded(AtomicBool::new(false)),
         }
+    }
+
+    /// Start watching the wake count as a spinner, taking the relay if it is
+    /// vacant. See [`SpinTicket`].
+    pub fn begin_spin(&self) -> SpinTicket<'_> {
+        let holds_relay = self.try_claim_relay();
+        SpinTicket {
+            waker: self,
+            holds_relay,
+            polls_since_claim_check: 0,
+        }
+    }
+
+    /// Claim the relay if it is vacant. The plain load first keeps the many
+    /// spinners that find it taken from contending for the line.
+    fn try_claim_relay(&self) -> bool {
+        !self.relay_claimed.0.load(Ordering::Relaxed)
+            && self
+                .relay_claimed
+                .0
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
     }
 
     /// Register the calling thread as worker `local_idx` in this node. Must be
