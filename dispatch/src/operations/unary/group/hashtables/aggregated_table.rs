@@ -492,8 +492,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     #[inline(always)]
     fn grow_or_radix(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
-        // Hash-only keys have no persisted key to scatter.
-        if K::DEDUP_BY_HASH || next_size <= self.radix_config.switch_threshold {
+        if next_size <= self.radix_config.switch_threshold {
             self.tables.push(BaseHashTable::new(
                 &mut self.allocator,
                 next_size,
@@ -550,6 +549,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             hll,
             hashes,
             shared_context,
+            zero_hash_seen,
             ..
         } = self;
         V::dispatch_arity(
@@ -561,6 +561,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 allocator,
                 hll,
                 hashes,
+                zero_hash_seen,
                 shift,
                 start,
                 end,
@@ -857,6 +858,9 @@ struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
     allocator: &'a mut SlabAllocator,
     hll: &'a mut Hll,
     hashes: &'a [u64; RECORD_BATCH_SIZE],
+    /// Set when a hash-only key's out-of-band zero hash is seen; see the
+    /// probe loop.
+    zero_hash_seen: &'a mut bool,
     shift: u32,
     start: usize,
     end: usize,
@@ -876,6 +880,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
             allocator,
             hll,
             hashes,
+            zero_hash_seen,
             shift,
             start,
             end,
@@ -891,6 +896,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
         #[allow(clippy::needless_range_loop)]
         for i in start..end {
             let hash = hashes[i];
+            // Exact hash-only distinct counting handles hash zero out of band,
+            // as the probe loop does: zero is the merge tables' empty sentinel.
+            if K::DEDUP_BY_HASH && hash == 0 {
+                *zero_hash_seen = true;
+                continue;
+            }
             hll.add(hash);
             let partition = (hash >> shift) as usize;
             let key = K::live_key(key_reader, i, key_arena).persist();

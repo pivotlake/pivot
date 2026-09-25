@@ -447,6 +447,26 @@ mod tests {
         output_limit: Option<GroupLimit>,
         radix: RadixConfig,
     ) -> CollectSender {
+        run_group_counting::<K, V>(
+            worker_batches,
+            key_cols,
+            value_slots,
+            output_limit,
+            radix,
+            false,
+        )
+    }
+
+    /// The general harness with the count-only output mode chosen: a global
+    /// `COUNT(DISTINCT)` emits per-partition counts instead of keys.
+    fn run_group_counting<K: KeyExtractor<Config: Default>, V: AggregationValue + ?Sized>(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        output_limit: Option<GroupLimit>,
+        radix: RadixConfig,
+        count_only: bool,
+    ) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
         let key_arena = SharedArena::new(64);
@@ -469,7 +489,7 @@ mod tests {
                     value_slots.clone(),
                     K::Config::default(),
                     output_limit,
-                    false,
+                    count_only,
                     gather.clone(),
                     partition_jobs_injected.clone(),
                     radix,
@@ -480,6 +500,30 @@ mod tests {
             .collect();
 
         run_consumers(groups, worker_batches)
+    }
+
+    /// A global `COUNT(DISTINCT)` over more values than the in-place table
+    /// holds before switching to radix scatter, with the value whose hash is
+    /// the tables' empty sentinel among them, counts every value exactly once.
+    #[test]
+    fn hash_only_distinct_count_stays_exact_across_the_radix_switch() {
+        let values: Vec<i32> = (0..40_000).collect();
+        let batches = vec![
+            vec![batch_with_column(&values)],
+            vec![batch_with_column(&values[..25_000])],
+        ];
+
+        let sender = run_group_counting::<HashOnlyIntKeyExtractor<Int32Type>, Distinct>(
+            batches,
+            vec![0],
+            Vec::new(),
+            None,
+            RadixConfig::DEFAULT,
+            true,
+        );
+
+        let counted: i64 = sender.i64_column(0).into_iter().sum();
+        assert_eq!(counted, 40_000);
     }
 
     #[test]
