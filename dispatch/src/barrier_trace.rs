@@ -40,8 +40,11 @@ pub fn add_time(slot: usize, started: Instant) {
     if !enabled() {
         return;
     }
-    TIMED_NS[slot].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    TIMED_COUNT[slot].fetch_add(1, Ordering::Relaxed);
+    let elapsed = started.elapsed().as_nanos() as u64;
+    LOCAL_TIMED.with_borrow_mut(|local| {
+        local[slot].0 += elapsed;
+        local[slot].1 += 1;
+    });
 }
 
 struct Record {
@@ -75,7 +78,31 @@ pub fn record(stage: &'static str, event: Event) {
         stage,
         event,
     });
-    ARMED.store(true, Ordering::Relaxed);
+    // Written once per query, not per event: a store per event would bounce
+    // the line between every worker's core.
+    if !ARMED.load(Ordering::Relaxed) {
+        ARMED.store(true, Ordering::Relaxed);
+    }
+    if matches!(event, Event::Dropped) {
+        flush_local_times();
+    }
+}
+
+thread_local! {
+    static LOCAL_TIMED: std::cell::RefCell<[(u64, u64); 4]> = const { std::cell::RefCell::new([(0, 0); 4]) };
+}
+
+fn flush_local_times() {
+    LOCAL_TIMED.with_borrow_mut(|local| {
+        for (slot, (ns, count)) in local.iter_mut().enumerate() {
+            if *count > 0 {
+                TIMED_NS[slot].fetch_add(*ns, Ordering::Relaxed);
+                TIMED_COUNT[slot].fetch_add(*count, Ordering::Relaxed);
+                *ns = 0;
+                *count = 0;
+            }
+        }
+    });
 }
 
 fn short(stage: &str) -> String {
