@@ -264,6 +264,10 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
 }
 
 impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
+    fn release_output(&mut self) {
+        self.sender = Box::new(crate::operations::channels::ClosedSender);
+    }
+
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         // A transform that is not taking input may still have work of its own
         // to advance, e.g. a job it steps through one batch per turn.

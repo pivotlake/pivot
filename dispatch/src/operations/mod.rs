@@ -136,6 +136,13 @@ pub trait Operator {
         Ok(WorkStatus::Pending)
     }
 
+    /// Drop the downstream sender once the operator has finished, so a stage
+    /// watching the other end of that channel learns this one is over right
+    /// away, while the operator's own state (hash tables, buffered rows) is
+    /// kept for its dataflow to tear down later, off the query's critical
+    /// path. An operator that holds no sender has nothing to release.
+    fn release_output(&mut self) {}
+
     /// A flag this operator raises to ask the `DataFlow` to abandon everything
     /// *upstream* of it, used by `LIMIT` to stop the scan once it has buffered
     /// enough rows, without disturbing operators downstream of it (e.g. a

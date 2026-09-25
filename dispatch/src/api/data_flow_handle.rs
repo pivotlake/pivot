@@ -67,9 +67,11 @@ impl<T> DataFlowHandle<T> {
     ///
     /// The output channel closing does not mean the tallies have landed: a
     /// worker releases the output sender the moment its last operator finishes,
-    /// and ships its tally just afterwards, when the worker drops the dataflow.
-    /// So the fold waits on the stats channel itself, which closes only once
-    /// every worker has dropped its dataflow, and therefore reported.
+    /// and ships its tally just afterwards, once its dataflow has finished as
+    /// a whole. So the fold waits on the stats channel itself, which closes
+    /// only once every worker has reported. A worker reports before it tears
+    /// its dataflow down, so a large free at the end of a query is not waited
+    /// for here.
     pub fn collect_with_stats(mut self) -> crate::data_flow::Result<(Vec<T>, DataFlowStats)> {
         let mut items = Vec::new();
         let mut error = None;
