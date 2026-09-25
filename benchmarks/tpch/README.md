@@ -23,6 +23,12 @@ Layout: one directory per table (`<root>/lineitem/lineitem.N.parquet`, ...).
 Types are tpchgen's parquet output: BIGINT keys, DECIMAL(15,2) money columns,
 real DATEs.
 
+The comparison engines run the same query files: `run-duckdb.sh` and
+`run-datafusion.sh` over these parquet directories (DuckDB also over its native
+database), `run-clickhouse.sh` over a native ClickHouse data directory (see
+`fetch-native-dbs.sh`). All three print the same `=== qNN ===` / `Run Time`
+lines, so one parser reads any of them.
+
 ## Queries
 
 Official TPC-H query texts (default substitution parameters), added one by one

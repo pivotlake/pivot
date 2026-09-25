@@ -55,8 +55,8 @@ benchmarks/
 │   ├── baseline.json             # default location for saved timings
 │   ├── benchmark.sh bench-modes.sh bench-ab.sh   # ClickBench drivers
 │   ├── prep-modes-data.sh prep-clickhouse-native.sh
-│   ├── run-duckdb.sh run-clickhouse.sh
-│   └── duckdb-official/ clickhouse-official/      # vendored native schemas
+│   ├── run-duckdb.sh run-clickhouse.sh run-datafusion.sh
+│   └── duckdb-official/ clickhouse-official/ datafusion-official/  # vendored schemas + queries
 ├── clickbench-insert/
 │   └── setup.sql                 # the hits schema per table: source + a target per batch size
 ├── ssb/
@@ -66,7 +66,8 @@ benchmarks/
 ├── tpch/
 │   ├── setup.sql                 # the 8 normalized TPC-H tables
 │   ├── qNN.sql  qNN.tsv          # official TPC-H query texts
-│   └── prep-tpch-data.sh         # sync the parquet dataset from S3
+│   ├── prep-tpch-data.sh         # sync the parquet dataset from S3
+│   └── run-duckdb.sh run-clickhouse.sh run-datafusion.sh   # comparison engines
 └── tpch-flat/
     ├── setup.sql                 # the denormalized flat table
     ├── qNN.sql  qNN.tsv
