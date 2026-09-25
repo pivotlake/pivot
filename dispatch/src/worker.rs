@@ -50,6 +50,20 @@ static LIVE_DATAFLOWS: AtomicUsize = AtomicUsize::new(0);
 /// through to a park. Large queries keep workers busy and rarely reach this path.
 const IN_FLIGHT_SPIN_LIMIT: u32 = 120_000;
 
+/// How long a worker keeps polling for a new dataflow after the pool goes
+/// idle before it parks. A parked pool starts the next query with a chain of
+/// futex wake-ups fanned out serially inside each node, and every woken core
+/// climbs out of its idle state; a query that arrives within this grace finds
+/// the workers already spinning and starts in nanoseconds instead. Long
+/// enough to bridge the gap between the statements of an interactive or
+/// benchmarking client, short enough that a genuinely idle server stops
+/// burning its cores almost at once.
+const IDLE_GRACE: Duration = Duration::from_millis(100);
+
+/// How many wake-count polls a worker makes between clock reads while it sits
+/// out [`IDLE_GRACE`].
+const IDLE_GRACE_POLLS_PER_CLOCK_READ: u32 = 256;
+
 /// The spin budget, overridable through `PIVOT_SPIN_LIMIT` (`0` parks
 /// immediately). Instrumented (PGO) profiling runs set `0`. Profiling runs
 /// on a small dataset where waits are short, so the spin usually catches the
@@ -70,6 +84,7 @@ fn in_flight_spin_limit() -> u32 {
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use std::{result, thread};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
@@ -162,6 +177,10 @@ pub struct Worker {
     /// Last delegated-broadcast epoch this worker has fanned out (see
     /// [`WorkerWaker::finish_delegated_wake`]).
     last_seen_broadcast: u64,
+    /// When this worker first found itself with no dataflow at all, bounding
+    /// the spin it grants a next query before it parks (see [`IDLE_GRACE`]).
+    /// Cleared by a park and by the arrival of a dataflow.
+    idle_since: Option<Instant>,
 }
 
 impl Worker {
@@ -229,6 +248,7 @@ impl Worker {
                     last_seen_ring_wake_count,
                     node_local_idx,
                     last_seen_broadcast,
+                    idle_since: None,
                 };
                 // Notifiers must be able to interrupt this worker's blocking
                 // IO wait, not just its thread park; register the ring's wake
@@ -452,29 +472,55 @@ impl Worker {
             return;
         }
 
-        // Spin-before-park, but only while a dataflow is in flight. Parking on
-        // the condvar costs a wakeup (tens of µs + OS scheduling) on the next
-        // `notify`; for a small multi-stage query that per-stage wakeup latency
-        // dominates, so a worker idle at a stage barrier polls the lock-free
-        // wake count and resumes in nanoseconds when the next notify lands (the
-        // core is idle at the barrier anyway). With no dataflow running we're
-        // genuinely idle between queries — park immediately rather than burn CPU.
+        // Spin-before-park. Parking on the condvar costs a wakeup (tens of µs
+        // + OS scheduling) on the next `notify`; for a small multi-stage query
+        // that per-stage wakeup latency dominates, so a worker idle at a stage
+        // barrier polls the lock-free wake count and resumes in nanoseconds
+        // when the next notify lands (the core is idle at the barrier anyway).
+        // With no dataflow running the worker is idle between queries: it
+        // keeps polling through a short grace so a query that follows closely
+        // starts on a spinning pool, then parks. A spin budget of zero (the
+        // profiling runs) parks at once in both cases.
         if !self.data_flows.is_empty() {
             for _ in 0..in_flight_spin_limit() {
-                let now = self.waker.wake_count();
-                if now != self.last_seen_wake_count {
-                    self.last_seen_wake_count = now;
+                if self.take_wake() {
                     return;
                 }
                 std::hint::spin_loop();
+            }
+        } else if in_flight_spin_limit() > 0 {
+            let idle_since = *self.idle_since.get_or_insert_with(Instant::now);
+            while idle_since.elapsed() < IDLE_GRACE {
+                for _ in 0..IDLE_GRACE_POLLS_PER_CLOCK_READ {
+                    if self.take_wake() {
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
             }
         }
 
         self.last_seen_wake_count = self
             .waker
             .wait_if_unchanged(self.last_seen_wake_count, self.node_local_idx);
+        self.idle_since = None;
         self.waker
             .finish_delegated_wake(&mut self.last_seen_broadcast);
+    }
+
+    /// Whether a notification landed since the last snapshot; if so, adopt
+    /// the new count so the next park compares against it. A spinning worker
+    /// also adopts the current delegated-broadcast epoch: fanning a broadcast
+    /// out is the job of the parked worker it wakes, and a spinner that later
+    /// parks must not repeat it on a stale memo.
+    fn take_wake(&mut self) -> bool {
+        let now = self.waker.wake_count();
+        if now != self.last_seen_wake_count {
+            self.last_seen_wake_count = now;
+            self.last_seen_broadcast = self.waker.broadcast_epoch();
+            return true;
+        }
+        false
     }
 
     fn clear_cancelled_dataflows(&mut self) {
@@ -522,6 +568,7 @@ impl Worker {
                 Ok(data_flow) => {
                     LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
                     self.data_flows.insert(data_flow.id(), data_flow);
+                    self.idle_since = None;
                 }
                 Err(e) => {
                     warn!("Failed to build dataflow {:?}", e)
