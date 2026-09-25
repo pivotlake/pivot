@@ -21,7 +21,7 @@ pub struct ServerOptions {
     /// Config file (YAML) describing this instance: its memory and worker
     /// budgets, disk cache and log; a `server` section for the endpoint;
     /// `datastores`, `secrets` and `users` for what it serves; and
-    /// `metastore` naming the file the server writes users it is told to
+    /// `metastore` names the file the server writes users it is told to
     /// create into.
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
