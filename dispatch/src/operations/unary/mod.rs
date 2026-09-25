@@ -210,6 +210,18 @@ pub trait Unary<I, O> {
         false
     }
 
+    /// Whether the operator should take every queued item on a turn instead
+    /// of one. A worker runs one unit of work per turn, downstream stages
+    /// first, so a stage's input is otherwise consumed one item per turn
+    /// between the worker's heavier work. That is the right pacing for a
+    /// stage that does real work per item; it starves a stage whose per-item
+    /// work is bookkeeping that unblocks *other* workers, such as one that
+    /// turns arriving pages into stealable decode jobs: its jobs trickle out
+    /// behind its own worker's decoding while the rest of the pool idles.
+    fn drains_input_each_turn(&self) -> bool {
+        false
+    }
+
     /// Whether this operator has async work still outstanding that its
     /// [`finish`](Self::finish) depends on — e.g. writes/uploads submitted to the
     /// ring whose completions haven't landed yet. The default is `false`.
@@ -263,6 +275,10 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
     }
 }
 
+/// Items a draining transform (see [`Unary::drains_input_each_turn`]) takes
+/// on one turn at most.
+const MAX_ITEMS_PER_DRAIN: usize = 64;
+
 impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         // A transform that is not taking input may still have work of its own
@@ -277,6 +293,16 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
         };
 
         self.unary.consume(item, &mut *self.sender, io)?;
+        if self.unary.drains_input_each_turn() {
+            // Bounded, so a flood of input still yields the worker between
+            // drains.
+            for _ in 1..MAX_ITEMS_PER_DRAIN {
+                match self.receiver.try_recv() {
+                    Some(item) => self.unary.consume(item, &mut *self.sender, io)?,
+                    None => break,
+                }
+            }
+        }
 
         Ok(WorkStatus::Ran)
     }
@@ -419,6 +445,43 @@ mod tests {
             self.steps += 1;
             Ok(WorkStatus::Ran)
         }
+    }
+
+    /// A transform that takes its whole input on a turn.
+    struct Draining {
+        consumed: usize,
+    }
+
+    impl Unary<(), ()> for Draining {
+        fn consume(&mut self, _: (), _: &mut dyn Sender<()>, _: &mut OperatorIO) -> Result<()> {
+            self.consumed += 1;
+            Ok(())
+        }
+
+        fn drains_input_each_turn(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_draining_transform_takes_every_queued_item_on_one_turn() {
+        let (mut input, receiver) = mpsc_channel::<()>();
+        for _ in 0..5 {
+            input.send(()).unwrap();
+        }
+        let mut operator = UnaryOperator::new(
+            Draining { consumed: 0 },
+            receiver,
+            Box::new(CollectSender::<()>::new()),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        let mut test_io = TestOperatorIO::default();
+
+        let status = operator.run_cpu_work(&mut test_io.io()).unwrap();
+
+        assert!(matches!(status, WorkStatus::Ran));
+        assert_eq!(operator.unary.consumed, 5);
+        assert!(operator.receiver.is_empty());
     }
 
     /// A transform that is not ready for input still gets its turn through

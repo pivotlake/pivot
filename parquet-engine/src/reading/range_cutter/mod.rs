@@ -239,6 +239,16 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
     fn finish(&mut self, _output: &mut dyn Sender<DecodeRange>) -> dispatch::UnaryResult<bool> {
         Ok(self.open.is_empty())
     }
+
+    /// The cutter's work per page is bookkeeping, and every range it emits
+    /// is a job idle peers can take, so it takes all the pages that have
+    /// arrived on each turn. Paced one page per turn, a worker that owns a
+    /// row group while also decoding lets the row group's ranges out one at
+    /// a time between its own decodes, and at the end of a scan the pool
+    /// idles behind the few workers still holding row groups.
+    fn drains_input_each_turn(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
