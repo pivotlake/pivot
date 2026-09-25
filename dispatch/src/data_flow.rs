@@ -40,10 +40,12 @@ use tracing::{debug, error, info, warn};
 struct OperatorNode {
     id: Identifier,
     /// The node's operator, or `None` once it has finished (or been abandoned).
-    /// Dropping it at that moment frees what it held right away: the batches
-    /// buffered in its channels, its hash tables, and the downstream sender it
-    /// owns. Releasing that sender is also how a stage's completion becomes
-    /// observable to whoever holds the other end.
+    /// A finished operator releases its downstream sender at that moment,
+    /// which is how a stage's completion becomes observable to whoever holds
+    /// the other end, and moves to the graph's retired list: what else it
+    /// held (hash tables, buffered rows) is freed only when the dataflow is
+    /// torn down, after the worker has reported it, so a large free never
+    /// holds up the query's result. An abandoned operator is dropped outright.
     ///
     /// Retiring the node in place, rather than restructuring the graph, keeps
     /// every edge index stable: traversals skip a retired node and move on, and
@@ -128,6 +130,9 @@ struct OperatorGraph {
     edges: Vec<Vec<usize>>,
     /// Publisher indices for each node.
     back_edges: Vec<Vec<usize>>,
+    /// Finished operators, senders already released, kept until the graph
+    /// drops so their state is freed after the dataflow has been reported.
+    retired: Vec<Box<dyn Operator>>,
 }
 
 impl OperatorGraph {
@@ -169,6 +174,7 @@ impl OperatorGraph {
             leafs,
             edges,
             back_edges,
+            retired: Vec::new(),
         }
     }
 
@@ -235,10 +241,19 @@ impl OperatorGraph {
             }
             if let Some(operator) = node.operator.as_deref_mut() {
                 match operator.try_finish()? {
-                    // Retiring the node drops the operator, and with it the
-                    // sender it holds, so a stage that watches the other end
-                    // of that channel learns the stage is over.
-                    FinishStatus::Done => node.operator = None,
+                    // Retiring the node releases the operator's sender, so a
+                    // stage that watches the other end of that channel learns
+                    // the stage is over; the operator itself is kept for the
+                    // graph's drop, since freeing a large table here would
+                    // stall this worker's remaining stages behind it.
+                    FinishStatus::Done => {
+                        let mut operator = node
+                            .operator
+                            .take()
+                            .expect("a node that just finished still holds its operator");
+                        operator.release_output();
+                        self.retired.push(operator);
+                    }
                     FinishStatus::Working => working = true,
                     FinishStatus::Pending => {}
                 }
@@ -497,8 +512,9 @@ impl DataFlow {
     /// [`Pending`](FinishStatus::Pending) when stalled on input/siblings (the
     /// worker may park).
     ///
-    /// An operator that reports [`FinishStatus::Done`] is dropped there and then,
-    /// so subsequent passes step over its node.
+    /// An operator that reports [`FinishStatus::Done`] retires there and then,
+    /// releasing its sender, so subsequent passes step over its node; its
+    /// state is freed with the dataflow.
     pub fn maybe_finish(&mut self) -> FinishStatus {
         self.try_run_or(FinishStatus::Pending, |d| d.graph.try_finish())
     }
@@ -648,10 +664,12 @@ mod tests {
         }
     }
 
-    /// Reports a fixed [`FinishStatus`], and optionally raises a flag when it is
-    /// dropped so a test can watch for the node letting go of it.
+    /// Reports a fixed [`FinishStatus`], and optionally raises flags when its
+    /// output is released and when it is dropped, so a test can watch for the
+    /// node retiring it and for the graph letting go of it.
     struct FinishOperator {
         status: FinishStatus,
+        released: Option<Arc<AtomicBool>>,
         dropped: Option<Arc<AtomicBool>>,
     }
 
@@ -659,13 +677,19 @@ mod tests {
         fn new(status: FinishStatus) -> Self {
             Self {
                 status,
+                released: None,
                 dropped: None,
             }
         }
 
-        fn signalling_drop(status: FinishStatus, dropped: Arc<AtomicBool>) -> Self {
+        fn signalling(
+            status: FinishStatus,
+            released: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+        ) -> Self {
             Self {
                 status,
+                released: Some(released),
                 dropped: Some(dropped),
             }
         }
@@ -697,6 +721,11 @@ mod tests {
         }
         fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
             Ok(self.status)
+        }
+        fn release_output(&mut self) {
+            if let Some(released) = &self.released {
+                released.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -741,16 +770,23 @@ mod tests {
     }
 
     #[test]
-    fn a_node_lets_go_of_its_operator_once_it_finishes() {
+    fn a_finished_node_releases_its_output_and_keeps_its_operator_for_the_graph_drop() {
+        let released = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
-        let operators: Vec<Box<dyn Operator>> = vec![Box::new(FinishOperator::signalling_drop(
+        let operators: Vec<Box<dyn Operator>> = vec![Box::new(FinishOperator::signalling(
             FinishStatus::Done,
+            released.clone(),
             dropped.clone(),
         ))];
         let mut graph = OperatorGraph::from_edges(operators, Vec::new(), HashMap::default());
 
         assert_eq!(graph.try_finish().unwrap(), FinishStatus::Done);
+        let released_at_finish = released.load(Ordering::Acquire);
+        let dropped_at_finish = dropped.load(Ordering::Acquire);
+        drop(graph);
 
+        assert!(released_at_finish);
+        assert!(!dropped_at_finish);
         assert!(dropped.load(Ordering::Acquire));
     }
 
