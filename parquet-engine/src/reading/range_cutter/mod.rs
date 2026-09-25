@@ -175,6 +175,20 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
         dispatch::barrier_trace::add_time(2, consume_started);
         outcome
     }
+
+    fn finish(&mut self, _output: &mut dyn Sender<DecodeRange>) -> dispatch::UnaryResult<bool> {
+        Ok(self.open.is_empty())
+    }
+
+    /// The cutter's work per page is bookkeeping, and every range it emits
+    /// is a job idle peers can take, so it runs ahead of its worker's own
+    /// decoding and takes all the pages that have arrived. Otherwise a
+    /// worker that owns a row group while decoding a range lets the row
+    /// group's pages wait behind that range, and at the end of a scan the
+    /// pool idles behind the few workers still holding row groups.
+    fn runs_before_downstream(&self) -> bool {
+        true
+    }
 }
 
 impl RangeCutter {
@@ -256,22 +270,6 @@ impl RangeCutter {
             }
         }
         self.emit_ready_ranges(row_group_index, output)
-    }
-}
-
-impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
-    fn finish(&mut self, _output: &mut dyn Sender<DecodeRange>) -> dispatch::UnaryResult<bool> {
-        Ok(self.open.is_empty())
-    }
-
-    /// The cutter's work per page is bookkeeping, and every range it emits
-    /// is a job idle peers can take, so it runs ahead of its worker's own
-    /// decoding and takes all the pages that have arrived. Otherwise a
-    /// worker that owns a row group while decoding a range lets the row
-    /// group's pages wait behind that range, and at the end of a scan the
-    /// pool idles behind the few workers still holding row groups.
-    fn runs_before_downstream(&self) -> bool {
-        true
     }
 }
 
