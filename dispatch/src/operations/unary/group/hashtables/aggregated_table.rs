@@ -721,6 +721,9 @@ fn probe_rows_body<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized
     {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
+        // Far enough behind the L1 prefetch for its entries to have arrived,
+        // far enough ahead for the blob's miss to resolve before the compare.
+        const BLOB_DISTANCE: usize = 8;
         // Reuse one probe layout for every row in the window.
         let mut prober = if N == 0 {
             table.prober()
@@ -743,6 +746,11 @@ fn probe_rows_body<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized
             }
             if row + L1_DISTANCE < length {
                 prober.prefetch(hashes[row + L1_DISTANCE]);
+            }
+            // Keys that point into the arena pay a second dependent miss on a
+            // match, which is the common case once the groups exist.
+            if K::Persisted::HAS_BLOB && row + BLOB_DISTANCE < length {
+                prober.prefetch_blob(hashes[row + BLOB_DISTANCE], key_arena.shared());
             }
             // Probe once, then seed a new group or update the matching group.
             let key = K::live_key(key_reader, row, key_arena);

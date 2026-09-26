@@ -95,7 +95,10 @@ impl PersistedKey for ArenaKey {
     #[inline(always)]
     fn prefetch_blob(&self, arena: &SharedArena) {
         if !self.is_inline() {
+            // The bytes rarely start on a line boundary, so a key longer than
+            // a few dozen bytes straddles two lines; the compare reads both.
             arena.prefetch(self.buffer_index(), self.offset());
+            arena.prefetch(self.buffer_index(), self.offset() + self.len() - 1);
         }
     }
 }

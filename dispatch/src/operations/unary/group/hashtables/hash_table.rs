@@ -486,6 +486,10 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
     }
 }
 
+/// Slots of a home run [`Prober::prefetch`] covers (three cache lines at the
+/// smallest entry width), and so how far [`Prober::prefetch_blob`] walks.
+const PREFETCHED_SLOTS: usize = 4;
+
 /// Mutable table handle that keeps the probe reader local across many probes.
 pub struct Prober<'t, K: PersistedKey, V: AggregationValue + ?Sized> {
     table: &'t mut BaseHashTable<K, V>,
@@ -500,6 +504,31 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
         prefetch_l1_line(ptr);
         prefetch_l1_line(ptr.wrapping_add(64));
         prefetch_l1_line(ptr.wrapping_add(128));
+    }
+
+    /// Prefetches the arena bytes the probe for `hash` will compare against:
+    /// those of the first slot in the hash's home run that holds the hash, up
+    /// to `PREFETCHED_SLOTS` in. This reads the entries, so it runs at a
+    /// shorter lookahead than [`prefetch`](Self::prefetch), which has brought
+    /// them in by then; the blob's own scattered miss is then in flight
+    /// instead of stalling the compare. A slot that changes before the probe
+    /// reaches it only costs a wasted hint.
+    #[inline(always)]
+    pub fn prefetch_blob(&self, hash: u64, arena: &SharedArena) {
+        let reader = self.reader;
+        let mut idx = reader.slot_for(hash);
+        for _ in 0..PREFETCHED_SLOTS {
+            let entry = reader.entry_ptr(idx);
+            let stored_hash = unsafe { *(entry.add(reader.hash_offset) as *const u64) };
+            if stored_hash == hash {
+                unsafe { (*(entry.add(reader.key_offset) as *const K)).prefetch_blob(arena) };
+                return;
+            }
+            if stored_hash == 0 {
+                return;
+            }
+            idx = (idx + 1) & reader.slot_mask;
+        }
     }
 
     /// Prefetches the initial slot into L2 for a longer lookahead.

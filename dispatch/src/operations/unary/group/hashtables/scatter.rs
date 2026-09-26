@@ -201,12 +201,14 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
         });
     }
 
-    /// Visits rows and exposes a future row for software prefetching.
+    /// Visits rows and exposes two future rows for software prefetching: the
+    /// row `AHEAD` on, and the hash of the row half as far on, for a second
+    /// prefetch stage that reads what the first one fetched.
     #[inline(always)]
     pub fn for_each_prefetched<const AHEAD: usize>(
         &self,
         layout: ScatterLayout<V>,
-        mut f: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>),
+        mut f: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>, Option<u64>),
     ) {
         self.for_each_chunk(layout, |base, rows| {
             let mut row = base;
@@ -221,15 +223,48 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
                             &*(ahead_row.add(layout.key_offset) as *const KP),
                         )
                     });
+                    let near_hash = (i + AHEAD / 2 < rows).then(|| {
+                        *(row.add(AHEAD / 2 * layout.stride + layout.hash_offset) as *const u64)
+                    });
                     f(
                         hash,
                         key,
                         V::from_entry(row.add(layout.value_offset), layout.metadata),
                         ahead,
+                        near_hash,
                     );
                     row = row.add(layout.stride);
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::init_test_free_pool;
+    use crate::operations::unary::group::values::{Compiled, CountSlot};
+
+    type CountValue = Compiled<(CountSlot,), u8>;
+
+    #[test]
+    fn the_prefetched_visit_sees_the_rows_a_full_and_a_half_lookahead_on() {
+        init_test_free_pool(8);
+        let mut allocator = SlabAllocator::new(false);
+        let layout = StridedScatterRows::<i32, CountValue>::layout::<0>(&());
+        let mut rows = StridedScatterRows::<i32, CountValue>::new();
+        for key in 0..10 {
+            rows.push_with(layout, &mut allocator, 100 + key as u64, key, |_| {});
+        }
+        let mut seen = Vec::new();
+
+        rows.for_each_prefetched::<4>(layout, |hash, _, _, ahead, near_hash| {
+            seen.push((hash, ahead.map(|(hash, _)| hash), near_hash));
+        });
+
+        assert_eq!(seen[0], (100, Some(104), Some(102)));
+        assert_eq!(seen[7], (107, None, Some(109)));
+        assert_eq!(seen[9], (109, None, None));
     }
 }

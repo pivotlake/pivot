@@ -428,13 +428,21 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
                 if merge_prefetch {
                     worker_buffers.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
                         scatter_layout,
-                        |hash, key, stored, ahead| {
+                        |hash, key, stored, ahead, near_hash| {
                             if !cutoff.is_none_or(|cutoff| cutoff.admits(hash)) {
                                 return;
                             }
                             if let Some((ahead_hash, ahead_key)) = ahead {
                                 ahead_key.prefetch_blob(key_arena);
                                 target.prefetch(ahead_hash);
+                            }
+                            // The target entry prefetched half a lookahead ago
+                            // has arrived: fetch the blob its key compare will
+                            // read as well.
+                            if <S::Persisted as PersistedKey>::HAS_BLOB
+                                && let Some(near_hash) = near_hash
+                            {
+                                target.prefetch_blob(near_hash, key_arena);
                             }
                             target.grow_if_full(&mut allocator, &mut capacity);
                             let live_key = S::resolve_persisted(key_arena, *key);
