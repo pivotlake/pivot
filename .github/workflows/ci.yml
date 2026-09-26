@@ -21,21 +21,26 @@ env:
 # The self-hosted runners live on a suspended GCP VM
 # (named by the GCP_PROJECT / GCP_RUNNER_X86 / GCP_RUNNER_ZONE repository
 # variables) and advertise the `gcp-builder` label. They are
-# the default: every push and PR resumes the VM and routes the matrix there, and
-# the box's own hourly suspend-if-unused cron suspends it again once no ci/deploy
-# run is active. A manual workflow_dispatch can opt out (use_gcp_runner=false) to
-# fall back to GitHub-hosted `ubuntu-latest` and skip the GCP jobs entirely.
+# the default for pushes and for pull requests from branches of this
+# repository: those resume the VM and route the matrix there, and the box's own
+# hourly suspend-if-unused cron suspends it again once no ci/deploy run is
+# active. Pull requests from forks run untrusted code, so they never touch the
+# VM and run on GitHub-hosted `ubuntu-latest`. A manual workflow_dispatch can
+# opt out (use_gcp_runner=false) to fall back to GitHub-hosted runners too.
 jobs:
   # Resume the GCP VM so its runners come online before the matrix dispatches.
   # Jobs targeting `gcp-builder` queue until a runner connects, so we only need
   # to kick the VM awake here — no SSH/readiness wait required.
   start-ci:
     name: Start GCP runner
-    # Resume on every push to this repository and every pull request opened
-    # against it; on manual dispatch, only when not opted out. Never inside a
-    # fork: the VM and the credential that wakes it are this repository's.
+    # Resume on every push to this repository and every pull request from one
+    # of its branches; on manual dispatch, only when not opted out. Never inside
+    # a fork or for a fork's pull request: the VM and the credential that wakes
+    # it are this repository's.
     if: >-
       ${{ github.repository == 'pivotlake/pivot'
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
           && (github.event_name != 'workflow_dispatch' || inputs.use_gcp_runner) }}
     runs-on: ubuntu-latest
     steps:
@@ -61,12 +66,16 @@ jobs:
       - id: gen
         run: echo "cells=$(./ci.sh --matrix)" >> "$GITHUB_OUTPUT"
       - id: runner
+        env:
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
-          # The self-hosted box belongs to this repository: a push to it and a
-          # pull request opened against it, from a branch or a fork, both run
-          # there, and a dispatch can opt out. A workflow running inside a fork
-          # goes to a GitHub-hosted runner, as the box is not its to use.
+          # The self-hosted box runs only this repository's own code: a push to
+          # it and a pull request from one of its branches run there, and a
+          # dispatch can opt out. A pull request from a fork, and any workflow
+          # running inside a fork, goes to a GitHub-hosted runner.
           if [ "${{ github.repository }}" != "pivotlake/pivot" ]; then
+            echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "pull_request" ] && [ "$PR_HEAD_REPO" != "${{ github.repository }}" ]; then
             echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.use_gcp_runner }}" != "true" ]; then
             echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
@@ -80,7 +89,8 @@ jobs:
   check:
     needs: [matrix, start-ci]
     # Run once the matrix is computed and the VM is up — but `start-ci` is
-    # skipped on push/PR, so accept its skipped result too.
+    # skipped for fork pull requests and opted-out dispatches, so accept its
+    # skipped result too.
     if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
     name: ${{ matrix.check }} (${{ matrix.crate }})
     runs-on: ${{ needs.matrix.outputs.runner }}
