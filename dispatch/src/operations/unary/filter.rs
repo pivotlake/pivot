@@ -24,6 +24,7 @@ use crate::operations::unary;
 use crate::operations::unary::{Unary, UnaryFactory};
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_buffer::BooleanBuffer;
+use std::sync::Arc;
 
 /// The row positions a filter mask keeps: true bits, with a null mask entry
 /// dropping the row (Arrow's filter semantics).
@@ -88,9 +89,13 @@ pub enum RowDelivery {
     Immediate,
 }
 
-/// Factory that wraps a filter closure. `F` is the per-worker closure created by the
-/// builder passed to [`RecordBatchOperatorSpec::filter`](crate::api::RecordBatchOperatorSpec::filter).
-pub struct FilterFactory<F>(pub F, pub RowDelivery);
+/// Factory that wraps a filter closure builder. `F` is the per-worker
+/// closure the builder passed to
+/// [`RecordBatchOperatorSpec::filter`](crate::api::RecordBatchOperatorSpec::filter)
+/// creates; it is created in [`build_unary`](UnaryFactory::build_unary), on
+/// the worker, so compiling a predicate for every worker runs in parallel
+/// rather than once per worker on the thread compiling the query.
+pub struct FilterFactory<F>(pub Arc<dyn Fn() -> F + Send + Sync>, pub RowDelivery);
 
 impl<F> UnaryFactory<RecordBatch, RecordBatch> for FilterFactory<F>
 where
@@ -100,7 +105,7 @@ where
 
     fn build_unary(self) -> Self::Unary {
         Filter {
-            func: self.0,
+            func: (self.0)(),
             delivery: self.1,
             allocator: SlabAllocator::new(false),
             accumulator: None,

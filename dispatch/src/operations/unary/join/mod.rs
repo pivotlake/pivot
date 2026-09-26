@@ -886,11 +886,13 @@ mod tests {
         // would be forwarded untouched, and only partial selections coalesce
         // through the accumulator.
         let drop_first = FilterFactory(
-            |b: &RecordBatch, _: &mut _, indices: &mut Vec<u32>| {
-                indices.clear();
-                indices.extend(1..b.num_rows() as u32);
-                RowSelection::Indices
-            },
+            Arc::new(|| {
+                |b: &RecordBatch, _: &mut _, indices: &mut Vec<u32>| {
+                    indices.clear();
+                    indices.extend(1..b.num_rows() as u32);
+                    RowSelection::Indices
+                }
+            }),
             RowDelivery::Coalesced,
         )
         .build_unary();

@@ -11,42 +11,71 @@
 use crate::Identifier;
 use crate::operations::channels;
 use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel_to};
-use crate::operations::channels::{ChannelFactory, Sender};
-use std::sync::Arc;
+use crate::operations::channels::{ChannelFactory, Receiver, Sender};
 
-/// Factory for one worker's end of the funnel: the shared sender slice (every
-/// build routes to `target`) and this worker's receiver.
+/// Factory for one worker's end of the funnel: a sender to the one channel
+/// the target reads, and this worker's receiver, which is that channel's for
+/// the target and an empty stand-in for everyone else. Only the target's
+/// channel exists: one per worker would cost a query one allocation per
+/// worker per funnel for channels that never carry a message.
 pub struct SingleWorkerMpscFactory<T> {
-    senders: Arc<[MpscSender<T>]>,
-    target: Identifier,
-    receiver: MpscReceiver<T>,
+    sender: MpscSender<T>,
+    receiver: SingleWorkerReceiver<T>,
 }
 
 impl<T: 'static + Send> ChannelFactory<T> for SingleWorkerMpscFactory<T> {
     type Sender = SingleWorkerSender<T>;
-    type Receiver = MpscReceiver<T>;
+    type Receiver = SingleWorkerReceiver<T>;
 
     fn build(self) -> (Self::Sender, Self::Receiver) {
         (
             SingleWorkerSender {
-                senders: self.senders,
-                target: self.target,
+                sender: self.sender,
             },
             self.receiver,
         )
     }
 }
 
-/// A sender that puts every message on the `target` worker's mpsc channel.
+/// A sender that puts every message on the target worker's mpsc channel.
 pub struct SingleWorkerSender<O> {
-    senders: Arc<[MpscSender<O>]>,
-    target: Identifier,
+    sender: MpscSender<O>,
 }
 
 impl<O> Sender<O> for SingleWorkerSender<O> {
     fn send(&mut self, item: O) -> channels::Result<()> {
-        self.senders[self.target].send_ref(item)?;
+        self.sender.send_ref(item)?;
         Ok(())
+    }
+}
+
+/// The target worker's receiver, or the empty stand-in every other worker
+/// reads: it never holds a message, so their stage finishes at once.
+pub enum SingleWorkerReceiver<T> {
+    Target(MpscReceiver<T>),
+    Empty,
+}
+
+impl<T> Receiver<T> for SingleWorkerReceiver<T> {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Target(receiver) => receiver.is_empty(),
+            Self::Empty => true,
+        }
+    }
+
+    fn try_recv(&self) -> Option<T> {
+        match self {
+            Self::Target(receiver) => receiver.try_recv(),
+            Self::Empty => None,
+        }
+    }
+
+    fn steal(&self) -> Option<T> {
+        match self {
+            Self::Target(receiver) => receiver.steal(),
+            Self::Empty => None,
+        }
     }
 }
 
@@ -55,16 +84,20 @@ pub fn to_single_worker_mpsc<T: 'static + Send>(
     count: usize,
     target: Identifier,
 ) -> impl IntoIterator<Item = SingleWorkerMpscFactory<T>> {
-    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
-        .map(|worker| mpsc_channel_to::<T>(worker))
-        .unzip();
-    let senders: Arc<[MpscSender<T>]> = senders.into();
+    assert!(target < count, "the funnel's target must name a worker");
+    let (sender, receiver) = mpsc_channel_to::<T>(target);
+    let mut receiver = Some(receiver);
 
-    receivers
-        .into_iter()
-        .map(move |rx| SingleWorkerMpscFactory {
-            senders: senders.clone(),
-            target,
-            receiver: rx,
-        })
+    (0..count).map(move |worker| SingleWorkerMpscFactory {
+        sender: sender.clone(),
+        receiver: if worker == target {
+            SingleWorkerReceiver::Target(
+                receiver
+                    .take()
+                    .expect("the target's receiver is taken once"),
+            )
+        } else {
+            SingleWorkerReceiver::Empty
+        },
+    })
 }

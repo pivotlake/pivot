@@ -158,13 +158,16 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     ) -> OperatorSpec<O2, UnaryOperatorFactory<O, O2, MapFactory<F>, StealableChannelFactory<O>, OF>>
     where
         O2: Send + 'static,
-        F: FnMut(O) -> O2 + Clone + Send + 'static,
+        F: FnMut(O) -> O2 + Clone + Send + Sync + 'static,
     {
         let worker_count = self.factories.len();
         let channels: Vec<_> = stealable::<O>(self.dispatcher.topology())
             .into_iter()
             .collect();
-        let unaries: Vec<_> = (0..worker_count).map(|_| MapFactory(f.clone())).collect();
+        let builder: Arc<dyn Fn() -> F + Send + Sync> = Arc::new(move || f.clone());
+        let unaries: Vec<_> = (0..worker_count)
+            .map(|_| MapFactory(builder.clone()))
+            .collect();
         self.chain(channels, unaries)
     }
 }
