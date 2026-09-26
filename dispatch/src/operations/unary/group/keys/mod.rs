@@ -55,8 +55,8 @@ pub trait KeyExtractor: Send + 'static {
     /// the (bijective) hash, so a hash of 0 — which the table reserves as its
     /// empty-slot sentinel — cannot be remapped without aliasing a real key.
     /// [`AggregatedTable`](super::hashtables::AggregatedTable) instead counts the
-    /// single 0-hash key out of band (it never reaches the table). Such a key has
-    /// no bytes to scatter, so it never takes the radix path.
+    /// single 0-hash key out of band (it never reaches the table). Every other
+    /// key takes the radix path like any key does, scattered as its hash alone.
     const DEDUP_BY_HASH: bool = false;
 
     /// Runtime configuration threaded from the operator spec to the per-batch

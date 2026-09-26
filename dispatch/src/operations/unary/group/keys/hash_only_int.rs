@@ -55,8 +55,10 @@ where
     T::Native: IntBits,
 {
     // Dedup is purely by the bijective hash (the key is `()`), so the table
-    // counts the single 0-hash key out of band instead of remapping it. Stays
-    // in-place (no radix) — the out-of-band count lives on the in-place table.
+    // counts the single 0-hash key out of band instead of remapping it. Past
+    // the radix threshold a worker scatters its entries by hash like any
+    // other key, each row being the hash alone; the out-of-band count stays
+    // with the worker.
     const DEDUP_BY_HASH: bool = true;
 
     type Config = ();

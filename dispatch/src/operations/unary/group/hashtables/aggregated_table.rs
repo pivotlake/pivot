@@ -421,8 +421,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     #[inline(always)]
     fn grow_or_radix(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
-        // Hash-only keys have no persisted key to scatter.
-        if K::DEDUP_BY_HASH || next_size <= self.radix_config.switch_threshold {
+        if next_size <= self.radix_config.switch_threshold {
             self.tables.push(BaseHashTable::new(
                 &mut self.allocator,
                 next_size,
