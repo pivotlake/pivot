@@ -3,6 +3,7 @@ name = "benchmarks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 # Deliberately links nothing from the engine. pivot-bench launches an external
 # `pivot server` and talks to it over pgwire, so the binary being measured (and

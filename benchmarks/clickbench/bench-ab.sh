@@ -23,6 +23,7 @@
 #     [--before-label <sha>] [--after-label <sha>] \
 #     [--query 7,20]     # ClickBench query numbers (0-based), empty = all
 #     [--server-env 'PIVOT_X=1 PIVOT_Y=true']   # env applied to both sides
+#     [--sleep-between-queries 0.5]  # seconds of pause between a query's tries
 
 set -uo pipefail
 
@@ -46,6 +47,7 @@ after_label="after"
 queries=""
 duckdb_data=""
 server_env=""
+sleep_between_queries=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -72,6 +74,11 @@ while [[ $# -gt 0 ]]; do
         # space-separated KEY=VALUE pairs. Applied to both sides identically so
         # the comparison stays a like-for-like A/B (e.g. PIVOT_* runtime knobs).
         --server-env)     server_env="$2"; shift 2 ;;
+        # Seconds the harness pauses between consecutive tries of a query
+        # (fractions allowed). The server reclaims its buffers after a query
+        # finishes; without a pause that work runs inside the next try's
+        # timing and shows up as hot-time noise. Applied to every side alike.
+        --sleep-between-queries) sleep_between_queries="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -103,6 +110,13 @@ clickbench_dir="$(expand_tilde "$clickbench_dir")"
 source_path="$(expand_tilde "$source_path")"
 pgo_subset="$(expand_tilde "$pgo_subset")"
 [[ -n "$duckdb_data" ]] && duckdb_data="$(expand_tilde "$duckdb_data")"
+
+# `sleep` takes a non-negative decimal; anything else would abort the run
+# only once it reaches the first query, after the long build, so check now.
+if [[ ! "$sleep_between_queries" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "error: --sleep-between-queries expects seconds (e.g. 0.5), got '$sleep_between_queries'" >&2
+    exit 2
+fi
 
 # cargo / just / llvm-profdata live under the login home but not on the
 # non-interactive ssh PATH, so add them explicitly.
@@ -161,7 +175,8 @@ run_harness() {
     (
         cd "$adapter"
         export PIVOT_SERVER_BIN="$bin" PIVOT_SOURCE="$source_path" \
-               PIVOT_PORT="$port" PIVOT_CATALOG="$catalog" BENCH_TRIES="$iterations"
+               PIVOT_PORT="$port" PIVOT_CATALOG="$catalog" BENCH_TRIES="$iterations" \
+               BENCH_SLEEP_BETWEEN_QUERIES="$sleep_between_queries"
         [[ -n "$queries_file" ]] && export BENCH_QUERIES_FILE="$queries_file"
         ./benchmark.sh
     ) >"$out" 2>&1 || true   # a nonzero exit (e.g. the QPS watchdog) is fine; we read the timings
@@ -217,7 +232,7 @@ run_duckdb_harness() {
         # duckdb is not on the non-interactive PATH; expose the CLI so the
         # adapter's ./install sees it and skips a network install.
         export PATH="$PATH:$HOME/.duckdb/cli/latest:$HOME/.duckdb/cli/1.5.3"
-        export BENCH_TRIES="$iterations"
+        export BENCH_TRIES="$iterations" BENCH_SLEEP_BETWEEN_QUERIES="$sleep_between_queries"
         [[ -n "$duck_qfile" ]] && export BENCH_QUERIES_FILE="$duck_qfile"
         ./benchmark.sh
     ) >"$out" 2>&1 || true
@@ -251,7 +266,7 @@ before_tsv="/tmp/ab-before.tsv"; after_tsv="/tmp/ab-after.tsv"
 duck_out="/tmp/ab-duck.out";     duck_tsv="/tmp/ab-duck.tsv"
 
 echo "=== A/B via ClickBench pivot-parquet: '$before_label' (before) vs '$after_label' (after) ===" >"$report"
-echo "source=$source_path tries=$iterations regression_pct=$regression_pct queries=${queries:-all}" >>"$report"
+echo "source=$source_path tries=$iterations sleep_between_queries=${sleep_between_queries}s regression_pct=$regression_pct queries=${queries:-all}" >>"$report"
 [[ -n "$server_env" ]] && echo "server_env=$server_env" >>"$report"
 echo >>"$report"
 

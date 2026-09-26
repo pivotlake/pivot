@@ -3,6 +3,7 @@ name = "object-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "PivotDB object-store backends and ring-readable data-file locations."
 
 [dependencies]

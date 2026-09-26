@@ -62,6 +62,10 @@ on:
         description: "Hot-time regression threshold (percent) that fails the run."
         required: false
         default: "5"
+      sleep_between_queries:
+        description: "Seconds to pause between a query's tries (e.g. 0.5) so the server finishes reclaiming buffers before the next try. 0 = no pause."
+        required: false
+        default: "0"
       clickbench_ref:
         description: "Ref of the ClickBench fork (pivotlake/ClickBench_testing) providing the pivot-parquet harness."
         required: false
@@ -317,6 +321,7 @@ jobs:
           QUERY: ${{ inputs.query }}
           ITERATIONS: ${{ inputs.iterations }}
           REGRESSION_PCT: ${{ inputs.regression_pct }}
+          SLEEP_BETWEEN_QUERIES: ${{ inputs.sleep_between_queries }}
           RUN_DUCKDB: ${{ inputs.run_duckdb }}
           DUCKDB_DATA: ${{ vars.PERF_DUCKDB_DATA }}
           SERVER_ENV: ${{ inputs.server_env }}
@@ -365,6 +370,7 @@ jobs:
               --clickbench-dir ~/perf-ab/ClickBench \
               --source '$HITS_PATH' --pgo-subset '$PGO_SUBSET_PATH' \
               --iterations '$ITERATIONS' --regression-pct '$REGRESSION_PCT' \
+              --sleep-between-queries '$SLEEP_BETWEEN_QUERIES' \
               --report /tmp/ab-report.txt \
               --before-label '${BEFORE_SHA:0:12}' --after-label '${AFTER_SHA:0:12}' \
               $query_arg $duckdb_arg $env_arg

@@ -27,8 +27,9 @@ use delta_kernel::engine_data::TypedGetData as _;
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::expressions::Scalar as DeltaScalar;
 use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::StaticCredentialProvider;
 use delta_kernel::object_store::aws::AmazonS3Builder;
-use delta_kernel::object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
+use delta_kernel::object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::scan::state::ScanFile;
@@ -1005,9 +1006,16 @@ fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObject
         } => {
             let mut builder = GoogleCloudStorageBuilder::from_env().with_url(uri);
             if let Some(endpoint) = emulator_endpoint {
+                // Uploads fetch a token even with SkipSignature set, so an
+                // emulator gets an empty static one; otherwise the builder falls
+                // back to the cloud metadata server, which exists only on GCP.
+                let no_credential = StaticCredentialProvider::new(GcpCredential {
+                    bearer: String::new(),
+                });
                 builder = builder
                     .with_config(GoogleConfigKey::BaseUrl, endpoint)
-                    .with_config(GoogleConfigKey::SkipSignature, "true");
+                    .with_config(GoogleConfigKey::SkipSignature, "true")
+                    .with_credentials(Arc::new(no_credential));
             } else if let Some(path) = credentials_file {
                 builder = builder.with_service_account_path(path);
             }

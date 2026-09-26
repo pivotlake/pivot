@@ -6,6 +6,8 @@ members = ["crates/ibs-annotate", "crates/perfy-server"]
 edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
+# None of these crates is published to crates.io.
+publish = false
 
 [workspace.dependencies]
 ibs-annotate = { path = "crates/ibs-annotate" }

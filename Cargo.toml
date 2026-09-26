@@ -21,6 +21,8 @@ exclude = ["arrow-rs", "perfy"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+# None of these crates is published to crates.io.
+publish = false
 
 [workspace.dependencies]
 # Sibling crates.
