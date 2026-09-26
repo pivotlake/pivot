@@ -473,6 +473,14 @@ impl Worker {
         {
             b.zero_out();
 
+            // The cleanup starts on every worker the instant a query's last
+            // dataflow is dropped, which is also when the query's collector
+            // and the connection carrying its result wake up: unpinned
+            // threads that land on cores every one of which is busy zeroing.
+            // Yielding after each buffer lets them in within one buffer's
+            // memset instead of a scheduler slice.
+            thread::yield_now();
+
             // Bound work per pass: zero one buffer, then hand
             // control back to the main loop so a newly-arrived
             // dataflow / new stealable work isn't starved behind
