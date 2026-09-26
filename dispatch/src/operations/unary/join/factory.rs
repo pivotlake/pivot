@@ -13,8 +13,8 @@ use crate::memory::MultiSlabBuffer;
 use crate::operations::UnaryFactory;
 use crate::operations::channels::{ChannelFactory, Sender, StealableChannelFactory};
 use crate::operations::unary::join::build::{
-    BuildWorkerOutput, JoinBuildConsumer, JoinBuilder, NUM_PARTITIONS, PendingKeyBitsets,
-    WorkerFilterArrays,
+    BuildWorkerOutput, JoinBuildConsumer, JoinBuilder, PendingKeyBitsets, WorkerFilterArrays,
+    partitions_for,
 };
 use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
@@ -37,6 +37,7 @@ pub struct JoinBuildFactory<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O>
     /// sits between them, since a normalizer ships the group itself to the
     /// collector worker.
     filter_arrays: WorkerFilterArrays,
+    partitions: usize,
     _key: PhantomData<fn() -> K>,
 }
 
@@ -209,8 +210,9 @@ pub fn create_for_workers<
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
     let build_ready = Arc::new(AtomicBool::new(false));
+    let partitions = partitions_for(worker_count);
     // One partition scatter job each, plus one key bitset pass per worker.
-    let remaining_jobs = Arc::new(AtomicUsize::new(NUM_PARTITIONS + worker_count));
+    let remaining_jobs = Arc::new(AtomicUsize::new(partitions + worker_count));
     let gather = Arc::new(GatherBarrier::new(worker_count));
     let pending_key_bitsets: PendingKeyBitsets = Arc::new(OnceLock::new());
 
@@ -227,6 +229,7 @@ pub fn create_for_workers<
                 build_ready.clone(),
                 remaining_jobs.clone(),
                 gather.clone(),
+                partitions,
                 spec.build_output_indices.clone(),
                 spec.build_filters.clone(),
                 filter_arrays.clone(),
@@ -242,6 +245,7 @@ pub fn create_for_workers<
                 hash_state: hash_state.clone(),
                 outputter,
                 filter_arrays,
+                partitions,
                 _key: PhantomData,
             }
         })
@@ -301,6 +305,7 @@ pub(crate) fn create_normalizing_for_workers<
             hash_state,
             outputter,
             filter_arrays,
+            partitions,
             _key,
         } = build;
         normalized_builds.push(JoinBuildFactory {
@@ -309,6 +314,7 @@ pub(crate) fn create_normalizing_for_workers<
             hash_state,
             outputter: normalizer,
             filter_arrays,
+            partitions,
             _key,
         });
         collectors.push(CollectorFactory::new(outputter, worker == collector_worker));
@@ -332,6 +338,7 @@ where
             self.hash_state,
             self.outputter,
             self.filter_arrays,
+            self.partitions,
         ))
     }
 }

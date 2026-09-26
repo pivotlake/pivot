@@ -25,7 +25,6 @@ static TAG_TABLE: [u16; 2048] = build_tag_table();
 /// word alone and otherwise reads its arena range straight out of it.
 pub struct JoinDirectory {
     entries: UnsafeCell<MultiSlabBuffer<u64>>,
-    capacity: usize,
     pub(crate) shift: u32,
 }
 
@@ -36,7 +35,6 @@ impl JoinDirectory {
     pub fn new(entries: MultiSlabBuffer<u64>, capacity: usize) -> Self {
         Self {
             entries: UnsafeCell::new(entries),
-            capacity,
             shift: if capacity > 0 {
                 debug_assert!(capacity.is_power_of_two());
                 64 - capacity.trailing_zeros()
@@ -61,10 +59,6 @@ impl JoinDirectory {
     #[inline(always)]
     pub fn slot_for(&self, hash: u64) -> usize {
         (hash >> self.shift) as usize
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
     }
 
     /// Raw pointer to the entry at `slot`, so probe code can compute the exact

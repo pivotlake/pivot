@@ -20,8 +20,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
 
-pub(crate) const NUM_PARTITIONS: usize = 64;
-const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
+/// How many hash partitions a build is scattered in, one scatter job each:
+/// at least two per worker (rounded up to a power of two, since a tuple's
+/// partition is the top bits of its hash), so no worker sits idle through
+/// the scatter's tail while a lone last job finishes, and never fewer than
+/// 64. Every worker keeps one tuple list per partition while it consumes,
+/// so finer than two per worker costs more in those lists on small builds
+/// than the shorter tail returns.
+pub(crate) fn partitions_for(worker_count: usize) -> usize {
+    (2 * worker_count).next_power_of_two().max(64)
+}
 
 /// One build-side row, radix-partitioned by `hash`: the full-width key (for
 /// exact match rejection of hash collisions in the probe) and the row's id
@@ -76,6 +84,9 @@ pub struct JoinBuildConsumer<
     filter_columns: Vec<usize>,
     hash_state: RandomState,
     values: PartitionBuffers<K::Stored>,
+    /// A tuple's partition is its hash shifted down by this: the top
+    /// `log2(partitions)` bits.
+    partition_shift: u32,
     /// This worker's build rows, stored as the batches they arrived in. No
     /// bytes are copied and nothing leaves engine memory: the batches stay
     /// the arrays the upstream operator produced.
@@ -118,12 +129,15 @@ impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O>
         hash_state: RandomState,
         outputter: O,
         filter_arrays: WorkerFilterArrays,
+        partitions: usize,
     ) -> Self {
         Self {
             key_columns,
             filter_columns,
             hash_state,
-            values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
+            values: (0..partitions).map(|_| SlabVec::new()).collect(),
+            // `partitions` is a power of two, so its trailing zeros are its log2.
+            partition_shift: 64 - partitions.trailing_zeros(),
             build_row_batches: Vec::new(),
             slab_allocator: SlabAllocator::new(false),
             outputter,
@@ -197,7 +211,7 @@ where
                 }
                 let key = K::read_stored(&reader, i);
                 let hash = K::hash_row(&reader, i, &self.hash_state);
-                let partition = (hash >> PARTITION_SHIFT) as usize;
+                let partition = (hash >> self.partition_shift) as usize;
                 self.values[partition].push(
                     &mut self.slab_allocator,
                     BuildTuple {
@@ -259,6 +273,8 @@ pub struct JoinBuilder<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> {
     build_ready: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
     gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
+    /// Hash partitions of the build, one scatter job each; see [`partitions_for`].
+    partitions: usize,
     build_output_indices: Vec<usize>,
     /// Key filters to publish for sibling probe scans once every build row
     /// is present (the final gather arrival) — publishing any earlier would
@@ -288,8 +304,10 @@ pub struct PartitionScatterJob<K: Copy + Send> {
     tuples: Vec<(u64, SlabVec<BuildTuple<K>>)>,
     table: JoinTable<K>,
     arena_offset: usize,
-
+    /// This partition's directory slot range: `slots_per_partition` slots
+    /// from `slot_start`.
     slot_start: usize,
+    slots_per_partition: usize,
     remaining_jobs: Arc<AtomicUsize>,
 }
 
@@ -317,8 +335,7 @@ impl<K: Copy + Send> PartitionScatterJob<K> {
         // Pass 2: convert counts to absolute write cursors. Linear sweep
         // over this partition's directory slot range replaces each count
         // with a running arena pointer while preserving the tag bits.
-        let slots_per_partition = directory.capacity() / NUM_PARTITIONS;
-        let slot_end = self.slot_start + slots_per_partition;
+        let slot_end = self.slot_start + self.slots_per_partition;
         let mut cur = self.arena_offset as u64;
 
         for i in self.slot_start..slot_end {
@@ -384,6 +401,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
         build_ready: Arc<AtomicBool>,
         remaining_jobs: Arc<AtomicUsize>,
         gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
+        partitions: usize,
         build_output_indices: Vec<usize>,
         build_filters: Vec<JoinBuildFilter>,
         filter_arrays: WorkerFilterArrays,
@@ -396,6 +414,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
             build_ready,
             remaining_jobs,
             gather,
+            partitions,
             build_output_indices,
             build_filters,
             filter_arrays,
@@ -416,7 +435,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
         // The filters read the stored build rows, so they run before those
         // rows are taken for the merge.
         self.publish_filter_bounds(&worker_outputs);
-        let partition_sizes: Vec<usize> = (0..NUM_PARTITIONS)
+        let partition_sizes: Vec<usize> = (0..self.partitions)
             .map(|partition| {
                 worker_outputs
                     .iter()
@@ -532,7 +551,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
     fn allocate_directory_and_arenas(&mut self, total_tuples: usize, row_id_space: usize) -> usize {
         let directory_capacity = ((total_tuples as f64 * 1.125) as usize)
             .next_power_of_two()
-            .max(NUM_PARTITIONS);
+            .max(self.partitions);
         let directory = unsafe { &mut *self.table.directory.get() };
         let mut directory_alloc = SlabAllocator::new(false);
         *directory = JoinDirectory::new(
@@ -562,7 +581,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
         partition_sizes: &[usize],
         directory_capacity: usize,
     ) {
-        let slots_per_partition = directory_capacity / NUM_PARTITIONS;
+        let slots_per_partition = directory_capacity / self.partitions;
         let mut arena_offset = 0;
         for (partition, &size) in partition_sizes.iter().enumerate() {
             let tuples: Vec<(u64, SlabVec<BuildTuple<K>>)> = worker_outputs
@@ -577,6 +596,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
                 table: self.table.clone(),
                 arena_offset,
                 slot_start: partition * slots_per_partition,
+                slots_per_partition,
                 remaining_jobs: self.remaining_jobs.clone(),
             });
             arena_offset += size;
