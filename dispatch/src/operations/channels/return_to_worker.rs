@@ -12,15 +12,18 @@ use crate::Identifier;
 use crate::operations::channels;
 use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel_to};
 use crate::operations::channels::{ChannelFactory, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Factory for building a return-to-worker channel.
 ///
-/// Holds a *shared* slice of all workers' mpsc senders (so the built
-/// [`WorkerAwareSender`] can route to any worker) and this worker's receiver.
+/// This worker's channel is created by [`build`](ChannelFactory::build), on
+/// the worker thread, and its sender published into the *shared* slot array
+/// every built [`WorkerAwareSender`] routes through. A message can only be
+/// addressed to a worker that has already built the stage, since the worker
+/// id it carries comes from that worker's own operators.
 pub struct ReturnToWorkerMpscFactory<T> {
-    senders: Arc<[MpscSender<T>]>,
-    receiver: MpscReceiver<T>,
+    senders: Arc<[OnceLock<MpscSender<T>>]>,
+    worker: usize,
 }
 
 impl<T: 'static + Send + WorkerIdOutput> ChannelFactory<T> for ReturnToWorkerMpscFactory<T> {
@@ -28,7 +31,11 @@ impl<T: 'static + Send + WorkerIdOutput> ChannelFactory<T> for ReturnToWorkerMps
     type Receiver = MpscReceiver<T>;
 
     fn build(self) -> (Self::Sender, Self::Receiver) {
-        (WorkerAwareSender::new(self.senders), self.receiver)
+        let (sender, receiver) = mpsc_channel_to::<T>(self.worker);
+        if self.senders[self.worker].set(sender).is_err() {
+            panic!("a worker's return channel was published twice");
+        }
+        (WorkerAwareSender::new(self.senders), receiver)
     }
 }
 
@@ -40,11 +47,11 @@ pub trait WorkerIdOutput: 'static {
 /// A sender that routes each message to a specific worker's mpsc channel
 /// based on [`WorkerIdOutput::worker_id`].
 pub struct WorkerAwareSender<O> {
-    senders: Arc<[MpscSender<O>]>,
+    senders: Arc<[OnceLock<MpscSender<O>>]>,
 }
 
 impl<O> WorkerAwareSender<O> {
-    pub fn new(senders: Arc<[MpscSender<O>]>) -> Self {
+    pub fn new(senders: Arc<[OnceLock<MpscSender<O>>]>) -> Self {
         Self { senders }
     }
 }
@@ -52,7 +59,10 @@ impl<O> WorkerAwareSender<O> {
 impl<O: WorkerIdOutput> Sender<O> for WorkerAwareSender<O> {
     fn send(&mut self, item: O) -> channels::Result<()> {
         let worker_idx = item.worker_id();
-        self.senders[worker_idx].send_ref(item)?;
+        self.senders[worker_idx]
+            .get()
+            .expect("a message returns only to a worker that has built the stage")
+            .send_ref(item)?;
         Ok(())
     }
 }
@@ -64,15 +74,10 @@ impl<O: WorkerIdOutput> Sender<O> for WorkerAwareSender<O> {
 pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(
     count: usize,
 ) -> impl IntoIterator<Item = ReturnToWorkerMpscFactory<T>> {
-    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
-        .map(|worker| mpsc_channel_to::<T>(worker))
-        .unzip();
-    let senders: Arc<[MpscSender<T>]> = senders.into();
+    let senders: Arc<[OnceLock<MpscSender<T>>]> = (0..count).map(|_| OnceLock::new()).collect();
 
-    receivers
-        .into_iter()
-        .map(move |rx| ReturnToWorkerMpscFactory {
-            senders: senders.clone(),
-            receiver: rx,
-        })
+    (0..count).map(move |worker| ReturnToWorkerMpscFactory {
+        senders: senders.clone(),
+        worker,
+    })
 }
