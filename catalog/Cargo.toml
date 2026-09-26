@@ -3,6 +3,7 @@ name = "catalog"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "PivotDB's catalog: the Datastore and Metastore interfaces, the read-only `system` datastore, and the cross-datastore catalog that presents every configured datastore to the planner."
 
 [dependencies]

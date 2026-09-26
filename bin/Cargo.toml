@@ -3,6 +3,7 @@ name = "bin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "The `pivot` executable: the statement executor, the PostgreSQL-wire server (`pivot server`), and the interactive shell (`pivot open`)."
 
 [[bin]]

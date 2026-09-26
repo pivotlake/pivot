@@ -3,6 +3,7 @@ name = "planner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 # `chrono-tz` so a cast to TIMESTAMP WITH TIME ZONE accepts a named zone such

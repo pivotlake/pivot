@@ -3,6 +3,7 @@ name = "datastore-iceberg"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "A read-only Iceberg datastore: tables of a REST catalog, read through Pivot's Parquet engine and object caches."
 
 [dependencies]

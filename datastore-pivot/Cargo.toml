@@ -3,6 +3,7 @@ name = "datastore-pivot"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Pivot's datastore backend: a durable Pivot table index, per-table Delta snapshots, and live row-group state, implementing catalog's Datastore traits over Parquet data files."
 
 [dependencies]

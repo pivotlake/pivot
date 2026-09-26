@@ -3,6 +3,7 @@ name = "perfy-server"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "perfy backend: parses perf.data and serves the analysis API"
 
 [[bin]]
