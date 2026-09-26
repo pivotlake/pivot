@@ -239,6 +239,49 @@ run_duckdb_harness() {
     find "$dd" -maxdepth 1 -type l -name 'hits_*.parquet' -delete 2>/dev/null || true
 }
 
+# Profile a handful of queries on the AFTER build, on this box, so the log
+# says where its time goes and not only how much: `perf stat` counters and a
+# `perf record` symbol breakdown per query, printed to stdout (the workflow
+# keeps the full log). Best effort throughout: a box without perf, or without
+# a counter, skips that part rather than failing the run.
+profile_after() {
+    local bin="$1" port="$2" catalog="$3"
+    local adapter="$clickbench_dir/pivot-parquet"
+    if ! command -v perf >/dev/null 2>&1; then
+        sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 \
+            || sudo apt-get install -y linux-tools-common linux-tools-aws >/dev/null 2>&1 || true
+    fi
+    command -v perf >/dev/null 2>&1 || { echo ">>> profile: perf is not available on this box; skipping"; return 0; }
+    echo ">>> profiling AFTER on this box ($(uname -m), $(nproc) cpus)"
+    (
+        cd "$adapter"
+        export PIVOT_SERVER_BIN="$bin" PIVOT_SOURCE="$source_path" PIVOT_PORT="$port" PIVOT_CATALOG="$catalog"
+        ./start >/dev/null 2>&1
+        for _ in $(seq 1 300); do ./check >/dev/null 2>&1 && break; sleep 1; done
+        ./load >/dev/null 2>&1 || true
+        local pid
+        pid="$(ps -C pivot,pivotdb-server -o pid=,args= | grep -- "-$port\." | awk '{print $1}' | head -1)"
+        [[ -n "$pid" ]] || { echo "profile: no server pid found"; exit 0; }
+        local qfile
+        qfile="$(mktemp)"
+        for n in 1 19 37 42 13 32 22 4; do
+            sed -n "$((n + 1))p" queries.sql >"$qfile"
+            ./query <"$qfile" >/dev/null 2>&1 || true
+            echo "--- profile Q$n: $(cut -c1-110 "$qfile")"
+            echo "    timing: $(./query <"$qfile" 2>&1 >/dev/null | tail -1)s"
+            sudo perf stat -e task-clock,context-switches,page-faults,cycles,instructions,branches,branch-misses \
+                -p "$pid" -- ./query <"$qfile" 2>&1 >/dev/null | grep -E '[0-9]' | grep -vE '^Time:|^[0-9.]+$' | sed 's/^/    /' || true
+            sudo perf stat -e stall_frontend,stall_backend,l1d_cache_refill,l2d_cache_refill,l3d_cache_refill,mem_access \
+                -p "$pid" -- ./query <"$qfile" 2>&1 >/dev/null | grep -E '[0-9]' | grep -vE '^Time:|^[0-9.]+$' | sed 's/^/    /' || true
+            sudo perf record -F 2000 -p "$pid" -o /tmp/ab-prof.data -- ./query <"$qfile" >/dev/null 2>&1 || true
+            sudo perf report -i /tmp/ab-prof.data --no-children --sort sym --stdio -g none --percent-limit 1.5 2>/dev/null \
+                | grep -E '^\s+[0-9.]+%' | head -30 | cut -c1-220 || true
+        done
+        rm -f "$qfile" /tmp/ab-prof.data
+        ./stop >/dev/null 2>&1 || true
+    ) || true
+}
+
 # Turn a harness log into "idx cold hot" rows: idx is the 0-based position of the
 # query, cold is the first try, hot is the min of the remaining tries ("null" if
 # any needed value is missing). The harness prints one "[t1,t2,t3]," line per
@@ -277,6 +320,7 @@ parse_timings "$before_out" >"$before_tsv"
 echo ">>> timing AFTER through ClickBench harness"
 run_harness "$after_bin" "$after_out" 7798 /tmp/ab-cat-after
 parse_timings "$after_out" >"$after_tsv"
+profile_after "$after_bin" 7798 /tmp/ab-cat-after
 
 # Join by query index and render the cold/hot diff. Gate on hot: a query whose
 # hot time is >= regression_pct slower after than before fails the run. Labels
