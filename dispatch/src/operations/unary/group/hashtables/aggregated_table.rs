@@ -17,7 +17,7 @@
 //! ```
 
 use crate::RECORD_BATCH_SIZE;
-use crate::memory::SlabAllocator;
+use crate::memory::{SlabAllocator, SlabBuffer};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
@@ -112,6 +112,33 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     pub zero_hash_seen: bool,
 }
 
+/// One batch window's per-row hashes, carved from the worker's slab memory.
+///
+/// The ring's pages are already faulted in. A heap allocation of this size
+/// is a large one to the allocator, which zeroes a recycled extent by
+/// dropping its pages: every query then paid, on every worker, an `madvise`
+/// with its TLB shootdown across the pool plus the page faults and kernel
+/// zeroing of the first touch, before a single row was grouped.
+struct HashScratch(SlabBuffer<u64>);
+
+impl HashScratch {
+    fn new(allocator: &mut SlabAllocator) -> Self {
+        Self(allocator.create_slab_buffer(RECORD_BATCH_SIZE, false))
+    }
+
+    // SAFETY (both views): the slab holds exactly `RECORD_BATCH_SIZE` `u64`s at
+    // `u64` alignment, is never shared, and the ring's memory is initialised.
+    #[inline(always)]
+    fn as_array(&self) -> &[u64; RECORD_BATCH_SIZE] {
+        unsafe { &*(self.0.ptr_at_index(0) as *const [u64; RECORD_BATCH_SIZE]) }
+    }
+
+    #[inline(always)]
+    fn as_array_mut(&mut self) -> &mut [u64; RECORD_BATCH_SIZE] {
+        unsafe { &mut *(self.0.ptr_at_index(0) as *mut [u64; RECORD_BATCH_SIZE]) }
+    }
+}
+
 /// Per-worker aggregation state.
 pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     hash_state: RandomState,
@@ -153,7 +180,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Radix threshold and partition count.
     radix_config: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
-    hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    hashes: HashScratch,
     /// Per-worker reusable key-extraction scratch (e.g. the row extractor's
     /// encode buffers). Lent to the reader each batch and reused, never
     /// reallocated. `()` for extractors that read columns directly.
@@ -176,6 +203,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = BaseHashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
+        let hashes = HashScratch::new(&mut allocator);
         Self {
             hash_state,
             shared_context,
@@ -191,10 +219,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             scatter_raw: false,
             rows_since_clear: 0,
             radix_config,
-            hashes: vec![0u64; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
+            hashes,
             scratch: K::Scratch::default(),
             zero_hash_seen: false,
         }
@@ -344,7 +369,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             K::prepare_and_hash(
                 &mut key_reader,
                 &self.hash_state,
-                &mut self.hashes[..length],
+                &mut self.hashes.as_array_mut()[..length],
             );
 
             // A worker whose fills stopped deduplicating bypasses the table;
@@ -391,7 +416,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                         table: tables.last_mut().unwrap(),
                         key_arena,
                         worker_context,
-                        hashes,
+                        hashes: hashes.as_array(),
                         zero_hash_seen,
                         next_row: &mut i,
                         length,
@@ -488,7 +513,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 worker_context,
                 allocator,
                 hll,
-                hashes,
+                hashes: hashes.as_array(),
                 shift,
                 start,
                 end,
