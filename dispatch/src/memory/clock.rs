@@ -10,9 +10,11 @@
 //! over without touching its counter - so a tier's blocks age only while that
 //! tier is being evicted from. Which hand moves is the evictor's choice
 //! ([`evict`](super::context::MemoryContext) compares the compressed tier's
-//! share of all cached slots against a target percentage), making the
-//! compressed/decompressed balance an explicit knob instead of an emergent
-//! property of per-tier lifetimes.
+//! share of its region's cached slots against a target percentage), making
+//! the compressed/decompressed balance an explicit knob instead of an
+//! emergent property of per-tier lifetimes. The share is judged per region
+//! because the hands are: a tier over target ring-wide but held entirely in
+//! another node's region has nothing this region's hand could take.
 //!
 //! Slot state (`owner`, `refs`) is global: any worker's hit may `touch` any
 //! slot. The sweep, however, is per NUMA node: each node has its own pair of
@@ -102,13 +104,14 @@ pub struct Clock {
     /// The decompressed tier's counterpart of `compressed_hands`.
     decompressed_hands: Box<[AtomicUsize]>,
     slots_per_region: usize,
-    /// Slots currently bound [`Owner::Compressed`] / [`Owner::Decompressed`],
-    /// maintained by [`bind`](Self::bind)/[`release`](Self::release) - the two
-    /// functions every ownership transition goes through. Global across
-    /// regions: the compressed/decompressed balance is a property of the whole
-    /// ring, not of any one node's share of it.
-    compressed_count: AtomicUsize,
-    decompressed_count: AtomicUsize,
+    /// Slots currently bound [`Owner::Compressed`] / [`Owner::Decompressed`]
+    /// in each region, maintained by [`bind`](Self::bind) and
+    /// [`release`](Self::release), the two functions every ownership transition
+    /// goes through. Per region because the hands are: a region's evictor can
+    /// only take from the tiers as they stand in its own region, so that is the
+    /// balance it must judge.
+    compressed_counts: Box<[AtomicUsize]>,
+    decompressed_counts: Box<[AtomicUsize]>,
 }
 
 impl Clock {
@@ -131,16 +134,20 @@ impl Clock {
             compressed_hands: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
             decompressed_hands: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
             slots_per_region,
-            compressed_count: AtomicUsize::new(0),
-            decompressed_count: AtomicUsize::new(0),
+            compressed_counts: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
+            decompressed_counts: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
         }
     }
 
-    fn count_of(&self, owner: Owner) -> &AtomicUsize {
+    fn counts_of(&self, owner: Owner) -> &[AtomicUsize] {
         match owner {
-            Owner::Compressed => &self.compressed_count,
-            Owner::Decompressed => &self.decompressed_count,
+            Owner::Compressed => &self.compressed_counts,
+            Owner::Decompressed => &self.decompressed_counts,
         }
+    }
+
+    fn region_of(&self, slot: usize) -> usize {
+        slot / self.slots_per_region
     }
 
     /// Give a free slot to `owner` with a single life and an ordinary bump: a
@@ -149,7 +156,7 @@ impl Clock {
         self.slots[slot].refs.store(1, Relaxed);
         self.slots[slot].bump.store(1, Relaxed);
         self.slots[slot].owner.store(owner as u8, Relaxed);
-        self.count_of(owner).fetch_add(1, Relaxed);
+        self.counts_of(owner)[self.region_of(slot)].fetch_add(1, Relaxed);
     }
 
     /// Mark a slot used again: gain its bump's worth of lives, up to
@@ -181,7 +188,7 @@ impl Clock {
     /// Return a slot to the free pool: no owner, never a victim.
     pub fn release(&self, slot: usize) {
         if let Some(owner) = self.owner(slot) {
-            self.count_of(owner).fetch_sub(1, Relaxed);
+            self.counts_of(owner)[self.region_of(slot)].fetch_sub(1, Relaxed);
         }
         self.slots[slot].owner.store(FREE, Relaxed);
     }
@@ -190,9 +197,17 @@ impl Clock {
         Owner::decode(self.slots[slot].owner.load(Relaxed))
     }
 
-    /// Slots currently bound to `tier`.
+    /// Slots currently bound to `tier`, over the whole ring.
     pub fn owned(&self, tier: Owner) -> usize {
-        self.count_of(tier).load(Relaxed)
+        self.counts_of(tier)
+            .iter()
+            .map(|count| count.load(Relaxed))
+            .sum()
+    }
+
+    /// Slots currently bound to `tier` in `region`.
+    pub fn owned_in_region(&self, tier: Owner, region: usize) -> usize {
+        self.counts_of(tier)[region].load(Relaxed)
     }
 
     /// The most sweeps of its hand any slot can survive (the refs ceiling).
@@ -201,15 +216,17 @@ impl Clock {
         *MAX_LIVES
     }
 
-    /// The tier eviction should take from next: compressed while its share of
-    /// all cached slots exceeds the target percentage, decompressed otherwise
-    /// (strictly greater, so at the boundary the decompressed tier gives way -
-    /// no oscillation). The zero cases fall out of the arithmetic: an empty
-    /// compressed tier is never above target, and an empty decompressed tier
-    /// puts compressed at 100%.
-    pub fn preferred_victim_tier(&self) -> Owner {
-        let compressed = self.owned(Owner::Compressed);
-        let decompressed = self.owned(Owner::Decompressed);
+    /// The tier eviction in `region` should take from next: compressed while
+    /// its share of the region's cached slots exceeds the target percentage,
+    /// decompressed otherwise (strictly greater, so at the boundary the
+    /// decompressed tier gives way - no oscillation). The zero cases fall out
+    /// of the arithmetic: an empty compressed tier is never above target, and
+    /// an empty decompressed tier puts compressed at 100%. Judged per region
+    /// because that is all the region's hands can act on: a tier over target
+    /// ring-wide but absent here has nothing to give here.
+    pub fn preferred_victim_tier(&self, region: usize) -> Owner {
+        let compressed = self.owned_in_region(Owner::Compressed, region);
+        let decompressed = self.owned_in_region(Owner::Decompressed, region);
         if compressed * 100 > *COMPRESSED_SHARE_PCT * (compressed + decompressed) {
             Owner::Compressed
         } else {
@@ -298,6 +315,27 @@ mod tests {
         }
 
         assert_eq!(clock.refs(0), 1, "aged by the other tier's hand");
+    }
+
+    #[test]
+    fn the_victim_tier_is_judged_by_the_regions_own_share() {
+        let clock = Clock::with_regions(2, 4);
+        for slot in 0..3 {
+            clock.bind(slot, Owner::Compressed); // region 0: 3 compressed, 1 decompressed
+        }
+        clock.bind(3, Owner::Decompressed);
+        clock.bind(4, Owner::Compressed); // region 1: 1 compressed, 3 decompressed
+        for slot in 5..8 {
+            clock.bind(slot, Owner::Decompressed);
+        }
+
+        assert_eq!(
+            clock.owned(Owner::Compressed),
+            4,
+            "ring-wide the tiers are level"
+        );
+        assert_eq!(clock.preferred_victim_tier(0), Owner::Compressed);
+        assert_eq!(clock.preferred_victim_tier(1), Owner::Decompressed);
     }
 
     #[test]
@@ -392,7 +430,7 @@ mod tests {
             clock.bind(slot, Owner::Decompressed);
         }
 
-        assert_eq!(clock.preferred_victim_tier(), Owner::Decompressed);
+        assert_eq!(clock.preferred_victim_tier(0), Owner::Decompressed);
     }
 
     #[test]
@@ -407,7 +445,7 @@ mod tests {
             clock.bind(slot, Owner::Decompressed);
         }
 
-        assert_eq!(clock.preferred_victim_tier(), Owner::Compressed);
+        assert_eq!(clock.preferred_victim_tier(0), Owner::Compressed);
     }
 
     #[test]
@@ -415,11 +453,11 @@ mod tests {
         let clock = Clock::new(2);
 
         clock.bind(0, Owner::Decompressed);
-        assert_eq!(clock.preferred_victim_tier(), Owner::Decompressed);
+        assert_eq!(clock.preferred_victim_tier(0), Owner::Decompressed);
 
         clock.release(0);
         clock.bind(1, Owner::Compressed);
-        assert_eq!(clock.preferred_victim_tier(), Owner::Compressed);
+        assert_eq!(clock.preferred_victim_tier(0), Owner::Compressed);
     }
 
     #[test]

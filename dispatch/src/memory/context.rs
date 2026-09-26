@@ -349,7 +349,7 @@ impl MemoryContext {
                 );
             }
 
-            let mut tier = self.clock.preferred_victim_tier();
+            let mut tier = self.clock.preferred_victim_tier(self.node);
             if (ticks_without_success / drain) % 2 == 1 {
                 tier = match tier {
                     Owner::Compressed => Owner::Decompressed,
