@@ -1,5 +1,6 @@
 # The one Rust every build uses: developer machines, CI and the release image.
-# llvm-tools carries llvm-profdata for the PGO recipes.
+# llvm-tools carries llvm-profdata for the PGO recipes; rustfmt and clippy are
+# what ci.sh checks with.
 [toolchain]
 channel = "1.98.0"
-components = ["llvm-tools"]
+components = ["llvm-tools", "rustfmt", "clippy"]
