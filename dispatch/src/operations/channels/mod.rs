@@ -84,6 +84,15 @@ pub trait RootChannelFactory<T>: Send {
 /// Writing end of a channel between operators.
 pub trait Sender<O> {
     fn send(&mut self, item: O) -> Result<()>;
+
+    /// Send a burst of items. A channel that wakes consumers per item can
+    /// wake them once for the whole burst instead.
+    fn send_all(&mut self, items: &mut dyn Iterator<Item = O>) -> Result<()> {
+        for item in items {
+            self.send(item)?;
+        }
+        Ok(())
+    }
 }
 
 /// Reading end of a channel between operators.

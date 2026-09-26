@@ -183,17 +183,28 @@ impl WorkerWaker {
     /// then. Returns whether a parked worker was woken so callers can try
     /// another node when they need to grow the pool-wide working set.
     pub fn notify_one(&self) -> bool {
+        self.notify_up_to(1)
+    }
+
+    /// Record one data-availability notification and wake up to `count`
+    /// thread-parked workers, for a burst of `count` new stealable items.
+    /// Returns whether any parked worker was woken.
+    pub fn notify_up_to(&self, count: usize) -> bool {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
         if self.parked_workers.load(Ordering::SeqCst) == 0 {
             return false;
         }
         let start = self.next_wake.fetch_add(1, Ordering::Relaxed);
+        let mut woken = 0;
         for i in 0..self.slots.len() {
             if self.wake_thread_parked_slot(&self.slots[(start + i) % self.slots.len()]) {
-                return true;
+                woken += 1;
+                if woken == count {
+                    break;
+                }
             }
         }
-        false
+        woken > 0
     }
 
     /// Record a notification and wake worker `local_idx` if it is parked,
