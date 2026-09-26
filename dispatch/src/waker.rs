@@ -6,6 +6,7 @@
 //! to reach every node. Worker threads access both through thread-local handles
 //! installed during startup.
 
+use crate::worker::WORKER_IDX;
 #[cfg(any(test, feature = "test-util"))]
 use crate::worker::{NUM_WORKERS, set_current_node};
 use std::cell::{Cell, RefCell};
@@ -102,7 +103,13 @@ pub struct WorkerWaker {
     /// Bumped on every delegated broadcast. The first worker woken observes the
     /// change and wakes its remaining parked siblings.
     broadcast_epoch: AtomicU64,
-    /// Spinning workers' view of `wake_count`, see [`SpinTicket`].
+    /// One counter per worker, bumped by that worker's own data sends
+    /// ([`notify_one`](Self::notify_one)). A send from every core of a node
+    /// used to bump `wake_count`, and the read-modify-writes of 96 producers
+    /// on one line serialised, costing a busy scan a fifth of its time. Each
+    /// worker owns its line instead; whoever needs the total sums them.
+    sent: Box<[Padded<AtomicU64>]>,
+    /// Spinning workers' view of the total count, see [`SpinTicket`].
     relayed_wake_count: Padded<AtomicU64>,
     /// Whether some spinning worker currently relays `wake_count`.
     relay_claimed: Padded<AtomicBool>,
@@ -140,7 +147,7 @@ impl SpinTicket<'_> {
     /// holder's last relayed value for everyone else.
     pub fn wake_count(&mut self) -> u64 {
         if self.holds_relay {
-            let now = self.waker.wake_count.load(Ordering::SeqCst);
+            let now = self.waker.wake_count();
             if self.waker.relayed_wake_count.0.load(Ordering::Relaxed) != now {
                 self.waker
                     .relayed_wake_count
@@ -187,6 +194,9 @@ impl WorkerWaker {
                 .collect(),
             next_wake: AtomicUsize::new(0),
             broadcast_epoch: AtomicU64::new(0),
+            sent: (0..worker_count)
+                .map(|_| Padded(AtomicU64::new(0)))
+                .collect(),
             relayed_wake_count: Padded(AtomicU64::new(0)),
             relay_claimed: Padded(AtomicBool::new(false)),
         }
@@ -272,7 +282,17 @@ impl WorkerWaker {
     /// then. Returns whether a parked worker was woken so callers can try
     /// another node when they need to grow the pool-wide working set.
     pub fn notify_one(&self) -> bool {
-        self.wake_count.fetch_add(1, Ordering::SeqCst);
+        // A worker records the send on its own counter; a thread outside the
+        // pool has no counter and bumps the shared count. A worker on another
+        // node lands on some counter of this node, which is only ever summed.
+        let worker = WORKER_IDX.get();
+        if worker == usize::MAX {
+            self.wake_count.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.sent[worker % self.slots.len()]
+                .0
+                .fetch_add(1, Ordering::SeqCst);
+        }
         if self.parked_workers.load(Ordering::SeqCst) == 0 {
             return false;
         }
@@ -360,17 +380,22 @@ impl WorkerWaker {
         }
     }
 
-    /// Current wake count. Workers snapshot it around work passes and poll it
+    /// Current wake count: the shared count plus every worker's send count.
+    /// Workers snapshot it around work passes and the relay holder polls it
     /// while spinning before a park.
     pub fn wake_count(&self) -> u64 {
-        self.wake_count.load(Ordering::SeqCst)
+        self.sent
+            .iter()
+            .map(|count| count.0.load(Ordering::SeqCst))
+            .sum::<u64>()
+            .wrapping_add(self.wake_count.load(Ordering::SeqCst))
     }
 
     /// Park worker `local_idx` if the wake count still equals `last_seen`.
     /// Returns the current count for use on the next park attempt.
     ///
-    /// No wake is lost: notifiers increment `wake_count` before scanning slots,
-    /// while this method publishes the parked slot before rechecking the count.
+    /// No wake is lost: notifiers increment a count before scanning slots,
+    /// while this method publishes the parked slot before rechecking the sum.
     /// A concurrent notification therefore either changes the count observed
     /// here or claims the slot and unparks the thread. A leftover unpark token
     /// can only make a later park return early.
@@ -382,19 +407,19 @@ impl WorkerWaker {
         let slot = &self.slots[local_idx];
         slot.parked.store(true, Ordering::SeqCst);
         self.parked_workers.fetch_add(1, Ordering::SeqCst);
-        if self.wake_count.load(Ordering::SeqCst) != last_seen {
+        if self.wake_count() != last_seen {
             // Withdraw the slot unless a notifier already claimed it and
             // decremented `parked_workers`.
             if slot.parked.swap(false, Ordering::SeqCst) {
                 self.parked_workers.fetch_sub(1, Ordering::SeqCst);
             }
-            return self.wake_count.load(Ordering::SeqCst);
+            return self.wake_count();
         }
         park();
         if slot.parked.swap(false, Ordering::SeqCst) {
             self.parked_workers.fetch_sub(1, Ordering::SeqCst);
         }
-        self.wake_count.load(Ordering::SeqCst)
+        self.wake_count()
     }
 
     /// Current ring wake count. Workers snapshot it around their ring waits the
