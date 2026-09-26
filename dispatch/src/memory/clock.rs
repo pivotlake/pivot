@@ -76,6 +76,17 @@ pub enum Owner {
 
 const FREE: u8 = 0;
 
+/// What one step of a tier's hand did (see [`Clock::sweep`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sweep {
+    /// The slot is free or belongs to the other tier: stepped over.
+    Skipped,
+    /// The slot belongs to the tier and spent one of its lives.
+    Aged,
+    /// The slot belongs to the tier and had no life left: the victim.
+    Candidate(usize),
+}
+
 impl Owner {
     fn decode(byte: u8) -> Option<Owner> {
         match byte {
@@ -234,6 +245,17 @@ impl Clock {
         }
     }
 
+    /// How many steps `tier`'s hand in `region` has taken in total - test-only
+    /// visibility for bounding an eviction's sweep.
+    #[cfg(test)]
+    pub fn hand_position(&self, tier: Owner, region: usize) -> usize {
+        let hands = match tier {
+            Owner::Compressed => &self.compressed_hands,
+            Owner::Decompressed => &self.decompressed_hands,
+        };
+        hands[region].load(Relaxed)
+    }
+
     /// The slot's current remaining lives - test-only visibility for asserting
     /// reinforcement and aging behavior.
     #[cfg(test)]
@@ -254,6 +276,17 @@ impl Clock {
     /// untouched) or still had a life to spend. Only sweeps `region`'s slots,
     /// so the caller can never be handed another node's memory.
     pub fn advance(&self, tier: Owner, region: usize) -> Option<usize> {
+        match self.sweep(tier, region) {
+            Sweep::Candidate(slot) => Some(slot),
+            Sweep::Skipped | Sweep::Aged => None,
+        }
+    }
+
+    /// [`advance`](Self::advance), telling apart a step that aged one of the
+    /// tier's slots from one that stepped over another tier's or a free slot:
+    /// the evictor reads the difference as whether the tier can still produce
+    /// a victim by sweeping on.
+    pub fn sweep(&self, tier: Owner, region: usize) -> Sweep {
         let hands = match tier {
             Owner::Compressed => &self.compressed_hands,
             Owner::Decompressed => &self.decompressed_hands,
@@ -261,14 +294,18 @@ impl Clock {
         let offset = hands[region].fetch_add(1, Relaxed) % self.slots_per_region;
         let slot = region * self.slots_per_region + offset;
         if self.owner(slot) != Some(tier) {
-            return None;
+            return Sweep::Skipped;
         }
         // Decrement while positive; an already-zero counter is the victim.
         let had_second_chance = self.slots[slot]
             .refs
             .fetch_update(Relaxed, Relaxed, |refs| (refs > 0).then(|| refs - 1))
             .is_ok();
-        (!had_second_chance).then_some(slot)
+        if had_second_chance {
+            Sweep::Aged
+        } else {
+            Sweep::Candidate(slot)
+        }
     }
 }
 

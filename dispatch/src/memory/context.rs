@@ -1,4 +1,4 @@
-use crate::memory::clock::{Clock, Owner};
+use crate::memory::clock::{Clock, Owner, Sweep};
 use crate::memory::compressed_cache::CompressedCache;
 use crate::memory::decompressed_cache::DecompressedCache;
 use crate::memory::fill_cursor::FillCursor;
@@ -329,12 +329,21 @@ impl MemoryContext {
         // A full drain is the most revolutions a hand needs to reach any
         // victim in its tier: one per life a slot can hold, plus the revolution
         // that finds it at zero. A hand that swept that much without reclaiming
-        // anything has nothing to give (every candidate is pinned), so the
-        // other tier gets a full drain of its own, regardless of share, and
-        // the two keep alternating in whole drains. Anything shorter for the
-        // other hand cannot reach a slot that still holds lives.
+        // anything has nothing to give, so the other tier gets a full drain of
+        // its own, regardless of share, and the two keep alternating in whole
+        // drains. Anything shorter for the other hand cannot reach a slot that
+        // still holds lives.
+        //
+        // A revolution that aged nothing cannot produce a victim by going on:
+        // the tier has no lives left to drain in this region, so its zero-life
+        // slots (all held by readers or writers, since the revolution ended
+        // without a victim) or its absence from the region will look the same
+        // next time round. Such a revolution hands over at once instead of
+        // repeating itself for the rest of the drain.
         let drain = (max_lives + 1) * ring_len;
         let mut ticks_without_success: u64 = 0;
+        let mut aged_this_revolution: u64 = 0;
+        let mut sweeping_other_tier = false;
         loop {
             iterations += 1;
             if panic_at.is_none() && iterations == warn_at {
@@ -350,23 +359,35 @@ impl MemoryContext {
             }
 
             let mut tier = self.clock.preferred_victim_tier(self.node);
-            if (ticks_without_success / drain) % 2 == 1 {
+            if sweeping_other_tier {
                 tier = match tier {
                     Owner::Compressed => Owner::Decompressed,
                     Owner::Decompressed => Owner::Compressed,
                 };
             }
 
-            let reclaimed = self
-                .clock
-                .advance(tier, self.node)
-                .and_then(|slot| match tier {
+            let step = self.clock.sweep(tier, self.node);
+            let reclaimed = match step {
+                Sweep::Candidate(slot) => match tier {
                     Owner::Compressed => self.compressed_cache.reclaim(slot),
                     Owner::Decompressed => self.decompressed_cache.reclaim(slot),
-                });
-            match reclaimed {
-                Some(write_buffer) => return write_buffer,
-                None => ticks_without_success += 1,
+                },
+                Sweep::Skipped | Sweep::Aged => None,
+            };
+            if let Some(write_buffer) = reclaimed {
+                return write_buffer;
+            }
+            ticks_without_success += 1;
+            if step == Sweep::Aged {
+                aged_this_revolution += 1;
+            }
+            if ticks_without_success.is_multiple_of(ring_len) {
+                let drained = ticks_without_success.is_multiple_of(drain);
+                let nothing_left_to_drain = aged_this_revolution == 0;
+                if drained || nothing_left_to_drain {
+                    sweeping_other_tier = !sweeping_other_tier;
+                }
+                aged_this_revolution = 0;
             }
         }
     }

@@ -1578,6 +1578,95 @@ mod tests {
         assert_eq!(memory_ctx().clock().owned(Owner::Decompressed), 9);
     }
 
+    /// The preferred tier still has a page with lives to spend beside a pinned
+    /// zero-life one: the hand keeps sweeping it, so the ageing page gives way
+    /// once drained and the other tier is left alone.
+    #[test]
+    fn a_tier_still_ageing_keeps_the_sweep_despite_a_pinned_candidate() {
+        init_test_free_pool(8);
+        cache().open_entry(FD());
+        let lookups = cache().get(&FD(), 0, BUFFER_SIZE);
+        let missing = lookups[0].missing().unwrap();
+        let pinned_slot = missing.extent.slot_idx as usize;
+        missing.commit();
+        release_fill_cursor();
+        let _reader = memory_ctx().ring().try_read(pinned_slot).unwrap();
+        insert_stale_compressed_slot(1); // a second compressed page, holding more lives
+        release_fill_cursor();
+        insert_decompressed(10 * SB, SB); // 2 of 3 compressed: over target, preferred
+        let clock = memory_ctx().clock();
+        assert_eq!(clock.preferred_victim_tier(0), Owner::Compressed);
+
+        drop(memory_ctx().evict());
+
+        assert_eq!(
+            clock.owned(Owner::Compressed),
+            1,
+            "the ageing page gave way"
+        );
+        assert_eq!(
+            clock.owned(Owner::Decompressed),
+            1,
+            "the other tier was left alone"
+        );
+        assert_eq!(
+            clock.owner(pinned_slot),
+            Some(Owner::Compressed),
+            "the pinned page survives"
+        );
+    }
+
+    /// The preferred tier's zero-life slots are held by readers and nothing
+    /// else of it is left to age, so its hand can find nothing there until
+    /// they are done. One such revolution hands the sweep to the other tier,
+    /// whose page then gives way, instead of draining the pinned tier for the
+    /// full lives ceiling first.
+    #[test]
+    fn a_revolution_of_pinned_candidates_hands_the_sweep_to_the_other_tier() {
+        init_test_free_pool(8);
+        let ring_len = memory_ctx().ring().len();
+        cache().open_entry(FD());
+        let mut readers = Vec::new();
+        for offset in [0, BUFFER_SIZE] {
+            let lookups = cache().get(&FD(), offset, BUFFER_SIZE);
+            let missing = lookups[0].missing().unwrap();
+            let slot = missing.extent.slot_idx as usize;
+            missing.commit();
+            release_fill_cursor();
+            readers.push(memory_ctx().ring().try_read(slot).unwrap());
+        }
+        for i in 0..3 {
+            insert_decompressed((10 + i) * SB, SB); // 2 of 5 compressed: over target, preferred
+        }
+        let clock = memory_ctx().clock();
+        assert_eq!(clock.preferred_victim_tier(0), Owner::Compressed);
+        let hand_before = clock.hand_position(Owner::Compressed, 0);
+        // One revolution per life to age the pinned pages to zero, then the one
+        // that finds them pinned and hands over.
+        let lives = (0..ring_len)
+            .filter(|&slot| clock.owner(slot) == Some(Owner::Compressed))
+            .map(|slot| clock.refs(slot) as usize)
+            .max()
+            .unwrap();
+
+        drop(memory_ctx().evict());
+
+        assert_eq!(
+            clock.owned(Owner::Compressed),
+            2,
+            "the pinned pages survive"
+        );
+        assert_eq!(
+            clock.owned(Owner::Decompressed),
+            2,
+            "the other tier gave the victim"
+        );
+        assert!(
+            clock.hand_position(Owner::Compressed, 0) - hand_before <= (lives + 1) * ring_len,
+            "the pinned tier was swept only until its pages were found pinned"
+        );
+    }
+
     #[test]
     fn evict_takes_compressed_while_over_its_target_share() {
         init_test_free_pool(8);
