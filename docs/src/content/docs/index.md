@@ -8,7 +8,7 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 578" role="img" aria-labelledby="arch-title arch-desc">
 <title id="arch-title">Pivot architecture</title>
-<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake format. A Pivot cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as Snowflake, read and write the same files directly without going through the cluster.</desc>
+<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake and Iceberg formats. A Pivot cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as Snowflake, read and write the same files directly without going through the cluster.</desc>
 <defs>
 <marker id="arch-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
@@ -16,7 +16,7 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 </defs>
 <rect x="40" y="24" width="840" height="156" rx="3" class="arch-panel" />
 <text x="64" y="54" class="arch-title">Object storage</text>
-<text x="856" y="54" text-anchor="end" class="arch-muted">S3 · GCS · Azure Blob</text>
+<text x="856" y="54" text-anchor="end" class="arch-muted">S3 · GCS</text>
 <text x="64" y="74" class="arch-muted">pivotlake</text>
 <rect x="64" y="88" width="250" height="76" rx="3" class="arch-inner" />
 <rect x="65" y="89" width="248" height="24" class="arch-strip" />
@@ -36,7 +36,7 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 <rect x="607" y="89" width="248" height="24" class="arch-strip" />
 <line x1="607" y1="113" x2="855" y2="113" class="arch-rule" />
 <text x="618" y="106" class="arch-label">sessions</text>
-<text x="844" y="106" text-anchor="end" class="arch-tiny">Delta Lake format</text>
+<text x="844" y="106" text-anchor="end" class="arch-tiny">Iceberg format</text>
 <text x="618" y="132" class="arch-tiny">part-00000-3f7a….parquet</text>
 <text x="618" y="150" class="arch-tiny">part-00001-9c21….parquet</text>
 <line x1="182" y1="250" x2="182" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
@@ -130,10 +130,10 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 </figure>
 
 #### Key features
-- **Fast** - Written in Rust and built on state-of-the-art columnar execution techniques, including morsel-driven parallelism, SIMD, NUMA-aware execution, and cache-conscious aggregation and joins, in addition to a few novel additions (#Why-is-pivot-fast?).
+- **Fast** - Written in Rust and built on state-of-the-art columnar execution techniques, including [morsel-driven parallelism](https://db.in.tum.de/~leis/papers/morsels.pdf), [SIMD](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data), [NUMA](https://en.wikipedia.org/wiki/Non-uniform_memory_access)-aware execution, and cache-conscious aggregation and joins, in addition to a few novel additions ([Why is Pivot fast?](/docs/database/why-pivot-is-fast/)).
 - **Scalable** - With object storage as its backing store, Pivot can be scaled up, down, or to zero almost instantly.
 - **Portable** -     Pivot can run both as a server serving backends and clients, or as a local engine where users and agents query the source of truth directly—allowing local ad-hoc and agentic analytics to share the same engine and architecture as traditional dashboards and in-app analytics
-- **Open** - Pivot is open source and built on open data formats (Delta Lake, with Iceberg coming soon). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
+- **Open** - Pivot is open source and built on open data formats (Delta Lake and Apache Iceberg). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
 
 ### Project status
 
@@ -144,13 +144,16 @@ evaluation, experiments and local analysis today.
   the on-disk layout change between releases, with no migration path and no
   deprecation period. Expect to recreate a deployment rather than upgrade it.
 - **Gaps in coverage.** Whole areas of SQL are unimplemented. What is
-  supported today is listed under [Reference](/docs/reference/); assume
+  supported today is listed under [SQL reference](/docs/reference/); assume
   anything not listed there is missing.
 
 ### Where to start
 
 - [Quickstart](/docs/quickstart/) runs a server and issues a first query.
 - [Architecture](/docs/database/architecture/) explains how a query becomes
-  work across the dispatch pool.
-- [Reference](/docs/reference/) lists supported SQL, functions, data types,
-  system tables, and configuration.
+  work across the Dispatch pool.
+- [Roadmap](/docs/database/roadmap/) shows what is available, in progress, and planned.
+- [SQL reference](/docs/reference/) documents commands, functions, operators,
+  and data types with examples.
+- [CLI & server reference](/docs/reference/cli/) covers CLI commands,
+  configuration, datastores, authentication, and system tables.

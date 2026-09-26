@@ -5,30 +5,17 @@ description: Run Pivot with Docker, in a local SQL shell, or as a server.
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
+Start Pivot, load some data, and run your first queries.
+
 ### 1. Start Pivot
 
+Pivot runs either as a local SQL shell, or as a server that Postgres clients
+connect to. Choose the option that fits:
+
 <Tabs>
-  <TabItem label="Docker">
-    **Best for:** starting a pivot server quickly.
-
-    ```sh
-    docker run --rm --name pivot \
-      -p 5432:5432 \
-      -v pivot-data:/var/lib/pivot \
-      pivotlake/pivot:latest
-    ```
-
-    The named volume keeps your data between runs. In a second terminal,
-    connect with any Postgres client:
-
-    ```sh
-    psql -h 127.0.0.1 -p 5432 -U pivot
-    ```
-  </TabItem>
-
   <TabItem label="Local shell">
-    **Best for:** querying an S3 datastore directly without running a server or
-    installing `psql`.
+    **Best for:** trying Pivot on your own machine, with no server to run and
+    no client to install.
 
     Install the Pivot CLI on Linux:
 
@@ -36,8 +23,8 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
     curl https://pivotlake.io | sh
     ```
 
-    Export your AWS credentials and region, then open the datastore from its
-    S3 location:
+    Then open a datastore from its location in Amazon S3 or Google Cloud
+    Storage. For S3, export your AWS credentials and region first:
 
     ```sh
     export AWS_ACCESS_KEY_ID=your-access-key-id
@@ -47,12 +34,67 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
     pivot open s3://my-bucket/pivot-data
     ```
 
-    Pivot opens an interactive SQL prompt. The data remains in S3 after you
-    exit with `\q`.
+    For Google Cloud Storage, log in with Application Default Credentials
+    first:
+
+    ```sh
+    gcloud auth application-default login
+
+    pivot open gs://my-bucket/pivot-data
+    ```
+
+    Pivot opens an interactive SQL prompt. The data remains in your bucket
+    after you exit with `\q`. See the [CLI reference](/docs/reference/cli/) for
+    options, [storage credentials](/docs/reference/cli/#object-store-credentials),
+    and shell commands.
   </TabItem>
 
-  <TabItem label="Linux service">
-    **Best for:** a persistent database endpoint for applications, BI tools,
+  <TabItem label="Docker">
+    **Best for:** running a server with minimal setup.
+
+    Start the server with the datastore's location in Amazon S3 or Google
+    Cloud Storage. For S3, pass your AWS credentials and region:
+
+    ```sh
+    # seccomp=unconfined allows io_uring, which Docker's default profile blocks
+    docker run --rm --name pivot \
+      -p 5432:5432 \
+      --security-opt seccomp=unconfined \
+      -e PIVOT_DATASTORE=s3://my-bucket/pivot-data \
+      -e AWS_ACCESS_KEY_ID=your-access-key-id \
+      -e AWS_SECRET_ACCESS_KEY=your-secret-access-key \
+      -e AWS_REGION=us-east-1 \
+      pivotlake/pivot:latest
+    ```
+
+    For MinIO or another S3-compatible service, also add
+    `-e AWS_ENDPOINT_URL=http://minio:9000`.
+
+    For Google Cloud Storage, mount a service-account key file and point
+    `GOOGLE_APPLICATION_CREDENTIALS` at it:
+
+    ```sh
+    # seccomp=unconfined allows io_uring, which Docker's default profile blocks
+    docker run --rm --name pivot \
+      -p 5432:5432 \
+      --security-opt seccomp=unconfined \
+      -e PIVOT_DATASTORE=gs://my-bucket/pivot-data \
+      -e GOOGLE_APPLICATION_CREDENTIALS=/etc/pivot/gcs-key.json \
+      -v "$PWD/gcs-key.json:/etc/pivot/gcs-key.json:ro" \
+      pivotlake/pivot:latest
+    ```
+
+    The image generates a metastore for the location on startup, while the
+    datastore itself remains in your bucket after the container exits. In a
+    second terminal, connect with any Postgres client:
+
+    ```sh
+    psql -h 127.0.0.1 -p 5432 -U pivot
+    ```
+  </TabItem>
+
+  <TabItem label="Linux server">
+    **Best for:** a persistent production database endpoint for applications, BI tools,
     and other Postgres clients.
 
     Install Pivot from the Debian or Ubuntu package repository:
@@ -83,41 +125,115 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
     ```sh
     psql -h 127.0.0.1 -p 5432 -U pivot
     ```
+
+    The package serves a local datastore. To store data in S3 or Google Cloud
+    Storage instead, edit `/etc/pivot/config.yaml` as described in
+    [Datastores & storage credentials](/docs/reference/server/datastores/),
+    then restart the server to apply it:
+
+    ```sh
+    sudo systemctl restart pivot
+    ```
   </TabItem>
 </Tabs>
 
 ### 2. Load data
 
-Run the following SQL in the local shell or connected Postgres client:
+As an example, create a table of NYC taxi trips, then fill it three ways: with
+SQL, from Parquet in object storage, and from raw Arrow IPC data with `\copy`.
 
 ```sql
-CREATE TABLE events (
-  id BIGINT,
-  name TEXT,
-  ts TIMESTAMP
-);
-
-INSERT INTO events VALUES
-  (1, 'signup', now() - interval '2 hours'),
-  (2, 'purchase', now() - interval '1 hour'),
-  (3, 'signup', now());
+CREATE TABLE trips (
+  vendor_id INTEGER,
+  pickup_at TIMESTAMP,
+  dropoff_at TIMESTAMP,
+  passenger_count BIGINT,
+  trip_distance DOUBLE,
+  pickup_location_id INTEGER,
+  dropoff_location_id INTEGER,
+  fare_amount DOUBLE,
+  tip_amount DOUBLE,
+  total_amount DOUBLE
+) WITH (sort_by = 'pickup_at');
 ```
 
-To start from existing Parquet files instead, use
-[`with_pre_existing_parquets`](/docs/reference/table-options/#adopt-existing-parquet-files).
+```sql
+-- Insert rows with SQL
+INSERT INTO trips VALUES
+  (2, '2024-01-01 00:57:55', '2024-01-01 01:17:43', 1, 1.72, 186, 79, 17.7, 0.0, 22.7),
+  (1, '2024-01-01 00:03:00', '2024-01-01 00:09:36', 1, 1.8, 140, 236, 10.0, 3.75, 18.75);
+
+-- Load January 2024 (about 3 million trips) from Parquet in a public bucket
+INSERT INTO trips
+SELECT VendorID, tpep_pickup_datetime, tpep_dropoff_datetime, passenger_count,
+       trip_distance, PULocationID, DOLocationID, fare_amount, tip_amount,
+       total_amount
+FROM read_parquet('s3://pivotlake-examples/nyc-taxi/yellow_tripdata_2024-01.parquet');
+
+-- Ingest raw Arrow IPC data from a local file (works in psql too). Download it first:
+-- curl -O https://pivotlake-examples.s3.amazonaws.com/nyc-taxi/yellow_tripdata_2024-02_sample.arrow
+\copy trips FROM 'yellow_tripdata_2024-02_sample.arrow' WITH (FORMAT arrow)
+```
 
 ### 3. Query
 
+Find January's busiest days and their average tip:
+
 ```sql
-SELECT name, count(*)
-FROM events
-WHERE ts >= now() - interval '1 day'
-GROUP BY name
-ORDER BY 2 DESC
-LIMIT 10;
+SELECT date_trunc('day', pickup_at) AS day,
+       count(*) AS trips,
+       CAST(avg(tip_amount) AS DECIMAL(10, 2)) AS avg_tip
+FROM trips
+WHERE pickup_at >= '2024-01-01' AND pickup_at < '2024-02-01'
+GROUP BY day
+ORDER BY trips DESC
+LIMIT 5;
 ```
 
-You should see two `signup` events and one `purchase` event.
+```text
+         day         | trips  | avg_tip
+---------------------+--------+---------
+ 2024-01-27 00:00:00 | 110515 |    3.10
+ 2024-01-17 00:00:00 | 110365 |    3.35
+ 2024-01-18 00:00:00 | 110358 |    3.36
+ 2024-01-25 00:00:00 | 110318 |    3.48
+ 2024-01-20 00:00:00 | 108768 |    2.92
+(5 rows)
+```
+
+Or see how tipping changes with the number of passengers:
+
+```sql
+SELECT passenger_count,
+       count(*) AS trips,
+       CAST(avg(tip_amount / NULLIF(fare_amount, 0)) * 100 AS DECIMAL(10, 1)) AS tip_percent
+FROM trips
+WHERE passenger_count BETWEEN 1 AND 6
+GROUP BY passenger_count
+ORDER BY passenger_count;
+```
+
+```text
+ passenger_count |  trips  | tip_percent
+-----------------+---------+-------------
+               1 | 2271171 |        23.7
+               2 |  416662 |        20.7
+               3 |   93344 |        21.0
+               4 |   53029 |        18.0
+               5 |   34516 |        21.4
+               6 |   23040 |        21.5
+(6 rows)
+```
+
+### Next steps
+
+- [SQL reference](/docs/reference/sql-statements/): the statements and
+  functions Pivot supports.
+- [CLI reference](/docs/reference/cli/): every `pivot open` option and shell
+  command.
+- [Configuration file](/docs/reference/configuration/) and
+  [Datastores & storage credentials](/docs/reference/server/datastores/): set
+  up a server for your own data.
 
 ### Build from source
 

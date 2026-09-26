@@ -7,14 +7,18 @@ export default defineConfig({
   // Used for canonical URLs and the sitemap.
   site: "https://pivotlake.io",
   base: "/docs",
+  redirects: {
+    "/reference/table-options/": "/docs/reference/statements/create-table/#table-options",
+  },
   integrations: [
     starlight({
       title: "pivotdb",
       description: "Documentation for pivotdb, a columnar analytics engine.",
+      favicon: "/pivot-favicon.png",
       customCss: ["./src/styles/theme.css"],
-      tableOfContents: { minHeadingLevel: 3, maxHeadingLevel: 4 },
-      // Puts the pre-release banner on every page. Starlight has no site-wide
-      // banner setting; the middleware fills in the per-page frontmatter one.
+      tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 4 },
+      // Adds the shared pre-release banner and nests the table of contents
+      // beneath the page title.
       routeMiddleware: "./src/routeData.ts",
       expressiveCode: {
         themes: [codeThemeDark, codeThemeLight],
@@ -80,22 +84,40 @@ export default defineConfig({
             "window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};plausible.init()",
         },
       ],
-      // Every entry is a directory under src/content/docs/. Pages order
-      // themselves by the `sidebar.order` field in their frontmatter.
+      // Reference groups keep SQL separate from CLI and server topics.
+      // Commands and function categories order themselves with sidebar.order.
       sidebar: [
         { label: "Introduction", slug: "index" },
         { label: "Quickstart", slug: "quickstart" },
-        {
-          label: "Use cases",
-          items: [{ autogenerate: { directory: "use-cases" } }],
-        },
         {
           label: "Database",
           items: [{ autogenerate: { directory: "database" } }],
         },
         {
-          label: "Reference",
-          items: [{ autogenerate: { directory: "reference" } }],
+          label: "SQL reference",
+          items: [
+            {
+              label: "Statements",
+              collapsed: true,
+              items: [{ autogenerate: { directory: "reference/statements" } }],
+            },
+            {
+              label: "Functions & operators",
+              collapsed: true,
+              items: [{ autogenerate: { directory: "reference/functions" } }],
+            },
+            { slug: "reference/data-types" },
+          ],
+        },
+        {
+          label: "CLI & server reference",
+          items: [
+            { label: "CLI", slug: "reference/cli" },
+            { slug: "reference/configuration" },
+            { slug: "reference/server/datastores" },
+            { slug: "reference/server/authentication" },
+            { slug: "reference/system-tables" },
+          ],
         },
       ],
       pagination: true,
