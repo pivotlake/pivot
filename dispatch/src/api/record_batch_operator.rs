@@ -406,7 +406,7 @@ impl RecordBatchOperatorSpec {
             ) -> crate::RowSelection
             + Send
             + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         self.filter_with_delivery(builder, crate::RowDelivery::Coalesced)
     }
@@ -427,10 +427,11 @@ impl RecordBatchOperatorSpec {
             ) -> crate::RowSelection
             + Send
             + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| FilterFactory(builder(), delivery)))
+        let builder: Arc<dyn Fn() -> F + Send + Sync> = Arc::new(builder);
+        self.unary((0..worker_count).map(|_| FilterFactory(builder.clone(), delivery)))
     }
 
     /// Apply a per-batch 1→1 transform that can change the output type.
@@ -470,13 +471,14 @@ impl RecordBatchOperatorSpec {
     where
         T: Send + 'static,
         F: FnMut(RecordBatch) -> T + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
         let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let builder: Arc<dyn Fn() -> F + Send + Sync> = Arc::new(builder);
         let factories: Vec<_> = stealable::<RecordBatch>(self.dispatcher.topology())
             .into_iter()
-            .zip((0..worker_count).map(|_| MapFactory(builder())))
+            .zip((0..worker_count).map(|_| MapFactory(builder.clone())))
             .zip(self.factories)
             .map(|((channel_factory, unary_factory), head)| {
                 UnaryOperatorFactory::new(
@@ -497,14 +499,15 @@ impl RecordBatchOperatorSpec {
     where
         T: Send + 'static,
         F: FnMut(RecordBatch) -> T + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
         let siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let target = self.dispatcher.next_worker();
+        let builder: Arc<dyn Fn() -> F + Send + Sync> = Arc::new(builder);
         let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(worker_count, target)
             .into_iter()
-            .zip((0..worker_count).map(|_| MapFactory(builder())))
+            .zip((0..worker_count).map(|_| MapFactory(builder.clone())))
             .zip(self.factories)
             .map(|((channel_factory, unary_factory), head)| {
                 UnaryOperatorFactory::new(
@@ -528,10 +531,11 @@ impl RecordBatchOperatorSpec {
     pub fn project<F, FB>(self, builder: FB) -> Self
     where
         F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| MapFactory(builder())))
+        let builder: Arc<dyn Fn() -> F + Send + Sync> = Arc::new(builder);
+        self.unary((0..worker_count).map(|_| MapFactory(builder.clone())))
     }
 
     /// Global aggregates (no GROUP BY): one or more `SUM`/`COUNT` slots over

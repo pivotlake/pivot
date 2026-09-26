@@ -10,9 +10,13 @@
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::{self, Unary, UnaryFactory};
+use std::sync::Arc;
 
-/// Factory wrapping the per-worker closure.
-pub struct MapFactory<F>(pub F);
+/// Factory wrapping the builder of the per-worker closure, which it calls in
+/// [`build_unary`](UnaryFactory::build_unary), on the worker, so every
+/// worker's closure is created in parallel rather than one after another on
+/// the thread compiling the query.
+pub struct MapFactory<F>(pub Arc<dyn Fn() -> F + Send + Sync>);
 
 impl<I, O, F> UnaryFactory<I, O> for MapFactory<F>
 where
@@ -23,7 +27,7 @@ where
     type Unary = Map<F>;
 
     fn build_unary(self) -> Self::Unary {
-        Map { func: self.0 }
+        Map { func: (self.0)() }
     }
 }
 
