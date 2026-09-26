@@ -13,19 +13,28 @@ use std::sync::Arc;
 /// is pinned until the last slab is dropped. To avoid pinning buffers longer than necessary,
 /// use separate allocators for data with different lifetimes (e.g. one for short-lived scratch
 /// buffers, another for output that lives until Arrow arrays are consumed).
+///
+/// Once every slab carved from the working buffer has been dropped, the next allocation starts
+/// over at the buffer's beginning (see [`rewind_if_unshared`](Self::rewind_if_unshared)), so an
+/// allocator whose slabs die young keeps reusing the same cache-resident bytes.
 pub struct SlabAllocator {
     /// The current buffer we're bumping through.
     working_buffer: Arc<WriteBuffer>,
     /// Byte offset of the next free region in `working_buffer`.
     offset: usize,
+    /// Whether the bytes from `offset` onwards are still zero. Starts as the buffer's own
+    /// `zeroed` flag and is cleared by a rewind, which hands out bytes already written.
+    working_buffer_zeroed: bool,
 }
 
 impl SlabAllocator {
     /// Creates a new allocator with a fresh buffer from the free pool.
     /// If `zeroed` is true, prefers a pre-zeroed buffer.
     pub fn new(zeroed: bool) -> Self {
+        let working_buffer = memory_ctx().get_write_buffer(zeroed);
         Self {
-            working_buffer: Arc::new(memory_ctx().get_write_buffer(zeroed)),
+            working_buffer_zeroed: working_buffer.zeroed,
+            working_buffer: Arc::new(working_buffer),
             offset: 0,
         }
     }
@@ -45,7 +54,7 @@ impl SlabAllocator {
             size,
             _buffer: self.working_buffer.clone(),
         };
-        if zeroed && !self.working_buffer.zeroed {
+        if zeroed && !self.working_buffer_zeroed {
             slab.zero_out();
         }
 
@@ -56,7 +65,34 @@ impl SlabAllocator {
     /// Discards the remaining space in the current buffer and acquires a fresh one.
     fn advance_to_new_buffer(&mut self, zeroed: bool) {
         self.offset = 0;
-        self.working_buffer = Arc::new(memory_ctx().get_write_buffer(zeroed));
+        let working_buffer = memory_ctx().get_write_buffer(zeroed);
+        self.working_buffer_zeroed = working_buffer.zeroed;
+        self.working_buffer = Arc::new(working_buffer);
+    }
+
+    /// Restarts the bump pointer at the beginning of the working buffer when no slab carved
+    /// from it is still alive.
+    ///
+    /// Without this, a steady stream of short-lived allocations (a batch built, consumed and
+    /// dropped before the next one is built) walks through fresh ring memory: every line it
+    /// touches is first read in for ownership and later written back to DRAM on eviction, though
+    /// its contents died long before. Rewinding keeps such a stream on the same few
+    /// cache-resident lines.
+    ///
+    /// A zeroed request against a buffer whose untouched tail is still zero keeps consuming that
+    /// tail instead: rewinding there would trade zeroing already done for an inline memset.
+    #[inline(always)]
+    fn rewind_if_unshared(&mut self, zeroed: bool) {
+        if self.offset == 0 || (zeroed && self.working_buffer_zeroed) {
+            return;
+        }
+        // `get_mut` succeeds only while this allocator holds the sole reference, and its
+        // Acquire orders every access made through a since-dropped slab (possibly on another
+        // thread) before the reuse.
+        if Arc::get_mut(&mut self.working_buffer).is_some() {
+            self.offset = 0;
+            self.working_buffer_zeroed = false;
+        }
     }
 
     /// Allocates a single slab of exactly `size` bytes.
@@ -65,6 +101,7 @@ impl SlabAllocator {
     /// for larger allocations. Advances to a new buffer if the current one doesn't have enough room.
     pub fn get_slab_of_size(&mut self, size: usize, zeroed: bool) -> Slab {
         assert!(size <= BUFFER_SIZE, "Size was {:?}", size);
+        self.rewind_if_unshared(zeroed);
 
         if self.remaining_in_buffer() < size {
             self.advance_to_new_buffer(zeroed);
@@ -78,6 +115,7 @@ impl SlabAllocator {
     /// Returns the slabs in order — the caller is responsible for treating them as a
     /// contiguous logical buffer (see [`MultiSlabBuffer`]).
     pub fn get_slabs_of_size(&mut self, size: usize, zeroed: bool) -> Vec<Slab> {
+        self.rewind_if_unshared(zeroed);
         let mut slabs = vec![];
         let mut remaining = size;
         while remaining > 0 {
@@ -121,6 +159,7 @@ impl SlabAllocator {
         } else {
             size.div_ceil(elems_per_slab) * BUFFER_SIZE
         };
+        self.rewind_if_unshared(zeroed);
         // For MultiSlabBuffer to work properly (with indexing), if the allocation doesn't fit
         // in the remaining space we must start a new buffer so each slab begins at offset 0.
         if self.remaining_in_buffer() < bytes {
@@ -141,6 +180,7 @@ impl SlabAllocator {
         } else {
             count.div_ceil(entries_per_slab) * BUFFER_SIZE
         };
+        self.rewind_if_unshared(true);
         if self.remaining_in_buffer() < bytes {
             self.advance_to_new_buffer(true);
         }
@@ -152,6 +192,7 @@ impl SlabAllocator {
     ///
     /// `size + align` must fit in one backing buffer.
     pub fn get_aligned_slab(&mut self, size: usize, align: usize, zeroed: bool) -> Slab {
+        self.rewind_if_unshared(zeroed);
         if self.remaining_in_buffer() < size + align {
             self.advance_to_new_buffer(zeroed);
         }
@@ -220,5 +261,43 @@ mod tests {
         assert!(slabs.len() >= 2);
         let total: usize = slabs.iter().map(|s| s.size).sum();
         assert_eq!(total, BUFFER_SIZE + 1024);
+    }
+
+    #[test]
+    fn reuses_space_once_every_slab_is_dropped() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(false);
+        let first = alloc.get_slab_of_size(1024, false);
+        let first_ptr = first.ptr;
+        drop(first);
+
+        let second = alloc.get_slab_of_size(1024, false);
+
+        assert_eq!(second.ptr, first_ptr);
+    }
+
+    #[test]
+    fn keeps_space_of_a_live_slab() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(false);
+        let first = alloc.get_slab_of_size(1024, false);
+
+        let second = alloc.get_slab_of_size(1024, false);
+
+        assert_eq!(unsafe { second.ptr.offset_from(first.ptr) }, 1024);
+    }
+
+    #[test]
+    fn zeroes_reused_space_for_a_zeroed_request() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(false);
+        let mut dirty = alloc.get_slab_of_size(1024, false);
+        dirty.as_mut_slice().fill(0xFF);
+        drop(dirty);
+        alloc.get_slab_of_size(16, false);
+
+        let zeroed = alloc.get_slab_of_size(1024, true);
+
+        assert!(zeroed.as_slice().iter().all(|&b| b == 0));
     }
 }

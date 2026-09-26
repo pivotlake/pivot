@@ -7,41 +7,13 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use dispatch::{AggregationKind, AggregationSlot, Projection, RECORD_BATCH_SIZE};
+use dispatch::{AggregationKind, AggregationSlot, Projection};
 use parquet_engine::table_input;
 
+/// A batch dropped before the next one is decoded gives its memory back:
+/// the allocator restarts at the buffer's start once nothing carved from it
+/// is alive.
 #[test]
-fn subsequent_batches_reuse_write_buffer() {
-    let dispatcher = dispatch(1);
-    let n = 10_000; // > RECORD_BATCH_SIZE (8192) to produce multiple batches from one page
-    let names: Vec<&str> = (0..n).map(|_| "x").collect();
-    let values: Vec<i64> = (0..n as i64).collect();
-    let (_dir, table) = parquet_table(&dispatcher, &[strings_and_ints(&names, &values)], true);
-
-    let results = table_input(&dispatcher, &table, Projection::columns([1]), false)
-        .map(|| |d| d.column(0).to_data().buffers()[0].as_ptr() as usize)
-        .collect()
-        .unwrap();
-
-    assert!(
-        results.len() >= 2,
-        "expected at least 2 batches, got {}",
-        results.len()
-    );
-    let ptr0 = results[0];
-    let ptr1 = results[1];
-    assert_eq!(
-        ptr1 - ptr0,
-        RECORD_BATCH_SIZE * 8,
-        "subsequent batches should be contiguous in the same WriteBuffer"
-    );
-}
-
-/// Not yet implemented: SlabAllocator needs to reclaim space when the most
-/// recent allocation is dropped (bump pointer rollback), so that the next
-/// batch can reuse the same region.
-#[test]
-#[ignore]
 fn dropped_batch_memory_is_reused() {
     let dispatcher = dispatch(1);
     let n = 10_000;

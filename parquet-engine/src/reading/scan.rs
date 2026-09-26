@@ -41,8 +41,14 @@ where
 {
     let n = input.dispatcher().worker_count();
     let topology = input.dispatcher().topology();
-    // One allocator per worker, for its range cutter and its decoder alike.
-    let allocators: Vec<Arc<WorkerAllocator>> =
+    // Two allocators per worker: one for the dictionaries its range cutter
+    // builds, which live as long as their row group, and one for the batches
+    // its decoder emits, which usually die before the next one is built. Kept
+    // apart, a dictionary never pins the buffer the batches cycle through, so
+    // the decoder keeps rewriting the same cache-resident bytes.
+    let dictionary_allocators: Vec<Arc<WorkerAllocator>> =
+        (0..n).map(|_| Arc::new(WorkerAllocator::new())).collect();
+    let batch_allocators: Vec<Arc<WorkerAllocator>> =
         (0..n).map(|_| Arc::new(WorkerAllocator::new())).collect();
     let decoded = input
         .chain(
@@ -59,13 +65,13 @@ where
                 .collect(),
             pending_row_groups
                 .into_iter()
-                .zip(&allocators)
+                .zip(dictionary_allocators)
                 .map(|(pending, allocator)| RangeCutterFactory {
                     projection: projection.clone(),
                     eq_predicates: eq_predicates.clone(),
                     pending_row_groups: pending,
                     outstanding_row_groups: outstanding_row_groups.clone(),
-                    allocator: allocator.clone(),
+                    allocator,
                 })
                 .collect(),
         )
@@ -76,7 +82,7 @@ where
             stealable_fifo::<DecodeRange>(topology)
                 .into_iter()
                 .collect(),
-            allocators
+            batch_allocators
                 .into_iter()
                 .map(|allocator| DecoderFactory {
                     batch_size,

@@ -42,10 +42,9 @@ pub struct ScanEqualityPredicate {
     pub value: Scalar<ArrayRef>,
 }
 
-/// One worker's slab allocator, shared by the stages on that worker that
-/// allocate: the range cutter's dictionaries and the decoder's batches come
-/// out of one ring buffer instead of one each. Taken from the ring on first
-/// use, on the worker; the lock is never contended, the stages run one at a
+/// One worker's slab allocator for one scan stage: its range cutter's
+/// dictionaries, or its decoder's batches. Taken from the ring on first use,
+/// on the worker; the lock is never contended, a worker runs one stage at a
 /// time.
 pub struct WorkerAllocator {
     allocator: Mutex<Option<SlabAllocator>>,
@@ -77,7 +76,7 @@ pub struct DecoderFactory {
     /// Whether to append row-group-id and row-index metadata columns to each
     /// output batch (used by the materializer path).
     pub add_row_group_metadata: bool,
-    /// The worker's allocator, shared with its range cutter.
+    /// The worker's allocator for decoded batches.
     pub allocator: Arc<WorkerAllocator>,
 }
 

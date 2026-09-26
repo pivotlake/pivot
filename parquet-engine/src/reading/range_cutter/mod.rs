@@ -43,7 +43,7 @@ pub struct RangeCutterFactory {
     /// range is decoded, on whichever worker; one that is pruned or empty
     /// is released here.
     pub outstanding_row_groups: Arc<AtomicUsize>,
-    /// The worker's allocator, shared with its decoder.
+    /// The worker's allocator for the dictionaries it builds.
     pub allocator: Arc<WorkerAllocator>,
 }
 
@@ -76,8 +76,7 @@ struct OpenRowGroup {
 pub struct RangeCutter {
     projection: Projection,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
-    /// Slab allocator for the dictionaries built here, the worker's own,
-    /// shared with its decoder.
+    /// Slab allocator for the dictionaries built here, the worker's own.
     allocator: Arc<WorkerAllocator>,
     open: HashMap<usize, OpenRowGroup>,
     /// Row groups whose ranges are all emitted or that were pruned; a page
