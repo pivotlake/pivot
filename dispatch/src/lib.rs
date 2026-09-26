@@ -183,7 +183,9 @@ impl Shutdown {
 #[derive(Clone)]
 pub struct DataFlowDispatcher {
     /// One channel per worker, in global worker order (node 0's workers first).
-    senders: Vec<StdSender<DataFlowBuilder>>,
+    /// Behind one `Arc`, so cloning the dispatcher for a query touches one
+    /// refcount rather than one per worker.
+    senders: Arc<[StdSender<DataFlowBuilder>]>,
     /// The worker/node shape, mirrored by every per-worker structure a
     /// dataflow builds (channels, sibling counters).
     topology: numa::Topology,
@@ -428,7 +430,7 @@ impl Dispatch {
 
         Dispatch {
             dataflow_dispatcher: DataFlowDispatcher {
-                senders,
+                senders: senders.into(),
                 topology,
                 waker_set: waker_set.clone(),
                 buffers: layout.total_slots(),
