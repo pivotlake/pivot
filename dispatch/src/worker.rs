@@ -50,6 +50,11 @@ static LIVE_DATAFLOWS: AtomicUsize = AtomicUsize::new(0);
 /// through to a park. Large queries keep workers busy and rarely reach this path.
 const IN_FLIGHT_SPIN_LIMIT: u32 = 120_000;
 
+/// Spin iterations between yields of the core (see `clear_dirty_buffer_or_park`):
+/// a few tens of microseconds, so a thread waiting for the core gets it quickly
+/// while an idle spin pays one cheap syscall per interval.
+const SPIN_YIELD_INTERVAL: u32 = 1024;
+
 /// The spin budget, overridable through `PIVOT_SPIN_LIMIT` (`0` parks
 /// immediately). Instrumented (PGO) profiling runs set `0`. Profiling runs
 /// on a small dataset where waits are short, so the spin usually catches the
@@ -476,7 +481,7 @@ impl Worker {
             return;
         }
         if !self.data_flows.is_empty() {
-            for _ in 0..in_flight_spin_limit() {
+            for spin in 0..in_flight_spin_limit() {
                 if self.waker.spin_claimed(self.node_local_idx) {
                     self.spin_published = false;
                     return;
@@ -485,6 +490,16 @@ impl Worker {
                 if now != self.last_seen_wake_count {
                     self.last_seen_wake_count = now;
                     return;
+                }
+                // Every worker is pinned to its own core, so a thread outside the
+                // pool (the query's coordinator, the result collector, the network
+                // runtime) that wakes on a core a worker is spinning on waits for
+                // the scheduler to preempt the spinner, which can take
+                // milliseconds. The spinner has nothing to do, so it hands the
+                // core over now and then; with nothing else runnable the yield
+                // returns at once.
+                if spin % SPIN_YIELD_INTERVAL == SPIN_YIELD_INTERVAL - 1 {
+                    std::thread::yield_now();
                 }
                 std::hint::spin_loop();
             }
