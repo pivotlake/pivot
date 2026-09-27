@@ -429,6 +429,76 @@ else:
     print("no timings")
 '
         }
+        # Samples every CPU while a query repeats and prints, per 200us of the
+        # query, how many cores ran operator work, how many polled idle in the
+        # worker loop, and the top work symbols.
+        cpu_timeline() {
+            local n="$1" label="$2" sql
+            sql="$(sed -n "$((n + 1))p" queries.sql)"
+            sql="${sql%;}"
+            for _ in 1 2 3; do psql -h 127.0.0.1 -p "$port" -U postgres -d postgres -q -o /dev/null -c "$sql" >/dev/null 2>&1; done
+            sudo perf record -a -F 20000 -o /tmp/ab-cpu.data -- bash -c "for _ in 1 2 3 4 5; do sleep 0.1; psql -h 127.0.0.1 -p $port -U postgres -d postgres -q -o /dev/null -c \"$sql\"; done" >/dev/null 2>&1 || true
+            sudo perf script -i /tmp/ab-cpu.data -F tid,cpu,time,ip,sym 2>/dev/null | c++filt >/tmp/ab-cpu.txt || true
+            echo "--- cpu timeline Q$n ($label): cores per 200us, averaged over the runs"
+            sudo python3 - "$pid" 20000 200 /tmp/ab-cpu.txt <<'PY' || true
+import collections, os, re, sys
+
+pid, freq, bucket_us, path = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+names = {t: open(f'/proc/{pid}/task/{t}/comm').read().strip() for t in os.listdir(f'/proc/{pid}/task')}
+kinds = {t: ('tokio' if n.startswith('tokio') else ('worker' if t != pid and n == names[pid] else 'other')) for t, n in names.items()}
+IDLE = re.compile(r'Worker.*(run|clear_dirty|park)|maybe_finish|run_ready_cpu_work|try_steal|try_recv|deliver_ready_reads|'
+                  r'completions|drain|retain|sched_yield|yield_now|schedule|syscall|el0_svc|futex|pop$|is_empty|spin')
+
+
+def shorten(sym):
+    sym = re.sub(r'\[[0-9a-f]{16}\]', '', sym)
+    sym = re.sub(r'::h[0-9a-f]{16}$', '', sym)
+    while True:
+        stripped = re.sub(r'(\w)<[^<>]*>', r'\1', sym)
+        stripped = re.sub(r'<([^<>]*?)(?: as [^<>]*)?>::', r'\1::', stripped)
+        if stripped == sym:
+            break
+        sym = stripped
+    parts = [p for p in sym.split('::') if p and not p.startswith('{')]
+    return '::'.join(parts[-3:])[:60]
+
+
+samples = []
+for line in open(path):
+    m = re.match(r'\s*(\d+)\s+\[(\d+)\]\s+([\d.]+):\s+([0-9a-f]+)\s+(.*)', line)
+    if m and m.group(1) in names:
+        samples.append((float(m.group(3)), m.group(1), m.group(5).strip()))
+samples.sort()
+windows, current = [], []
+for s in samples:
+    if current and s[0] - current[-1][0] > 0.02:
+        windows.append(current)
+        current = []
+    current.append(s)
+if current:
+    windows.append(current)
+windows = [w for w in windows if any(kinds.get(tid) == 'worker' for _, tid, _ in w)]
+print('    %d query windows' % len(windows))
+per_cpu = freq * bucket_us / 1e6 * max(len(windows), 1)
+work = collections.defaultdict(collections.Counter)
+busy = collections.defaultdict(collections.Counter)
+for w in windows:
+    t0 = w[0][0]
+    for t, tid, sym in w:
+        b = int((t - t0) * 1e6 // bucket_us)
+        kind = kinds.get(tid, 'other')
+        idle = kind == 'worker' and IDLE.search(sym) is not None
+        busy[b]['idle' if idle else kind] += 1
+        if not idle:
+            work[b][shorten(sym)] += 1
+for b in sorted(busy):
+    top = ', '.join('%s %.1f' % (s, c / per_cpu) for s, c in work[b].most_common(3))
+    print('    %5dus work %5.1f idle %5.1f tokio %4.1f | %s' % (
+        b * bucket_us, busy[b]['worker'] / per_cpu, busy[b]['idle'] / per_cpu,
+        (busy[b]['tokio'] + busy[b]['other']) / per_cpu, top))
+PY
+            sudo rm -f /tmp/ab-cpu.data /tmp/ab-cpu.txt
+        }
         for setup in "default:" "default:PIVOT_SPIN_LIMIT=2000000" "96:"; do
             local workers="${setup%%:*}" extra_env="${setup#*:}"
             [[ "$workers" == default ]] && workers=""
@@ -439,7 +509,12 @@ else:
                 sql="$(sed -n "$((n + 1))p" queries.sql)"
                 echo "    Q$n: $(stage_medians "${sql%;}")"
             done
-            if [[ -z "$workers" ]]; then
+            if [[ -z "$extra_env" ]]; then
+                for n in 1 38 40; do
+                    cpu_timeline "$n" "workers=${workers:-default}"
+                done
+            fi
+            if [[ -z "$workers" && -z "$extra_env" ]]; then
                 for n in 0 40; do
                     local sql qlen
                     sql="$(sed -n "$((n + 1))p" queries.sql)"
