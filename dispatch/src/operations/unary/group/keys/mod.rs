@@ -21,11 +21,12 @@
 //!   [`ArenaKey`] for strings, an integer / packed integer for
 //!   numeric keys). Only created when the key is genuinely new.
 
+use crate::env::MAX_INLINE_STRING_VIEW;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::hashtables::{LiveKey, PersistedKey};
+use crate::operations::unary::group::hashtables::{LiveKey, PersistedKey, prefetch_l1_line};
 use ahash::RandomState;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, StringViewArray};
 use arrow_buffer::Buffer;
 use arrow_schema::Field;
 use std::sync::Arc;
@@ -47,6 +48,55 @@ pub use string::{ArenaKey, StringKeyExtractor};
 
 mod row;
 pub use row::{RowKeyExtractor, RowKeySchema};
+
+/// How many rows ahead of the one being hashed a string key's bytes are
+/// prefetched: far enough to cover a memory round trip, near enough that the
+/// lines are still in L1 when their row's turn comes.
+pub(super) const STRING_PREFETCH_DISTANCE: usize = 16;
+
+/// Views into more bytes than this get their bytes prefetched. Below it the
+/// views address at most a few decoded pages, whose bytes are read in order
+/// and stay cached, and the prefetches would only add work to the hashing
+/// loop; above it the views point into buffers no cache holds.
+const VIEW_PREFETCH_MIN_BYTES: usize = 16 << 20;
+
+/// Whether hashing `array`'s strings should prefetch their bytes: true when
+/// the views address more memory than the cache holds, as a merge's output
+/// does (its views point into every worker's arena in no particular order).
+#[inline]
+pub(super) fn views_span_cold_memory(array: &StringViewArray) -> bool {
+    array.data_buffers().iter().map(Buffer::len).sum::<usize>() > VIEW_PREFETCH_MIN_BYTES
+}
+
+/// Prefetches the bytes a string view points at, ahead of hashing that row.
+///
+/// A batch whose views point into many buffers in no particular order (a
+/// merge's output, say) otherwise stalls once per row: the hash reads the
+/// bytes through a fresh cache miss, and the length branches between rows
+/// mispredict often enough that the misses never overlap. Inline views carry
+/// their bytes with them and need nothing.
+#[inline(always)]
+pub(super) fn prefetch_view_bytes(array: &StringViewArray, idx: usize) {
+    let views = array.views();
+    let view = unsafe { *views.get_unchecked(idx) };
+    let len = view as u32 as usize;
+    let out_of_line = len > MAX_INLINE_STRING_VIEW;
+    // Branch-free: an inline view's index bytes are arbitrary, so the index
+    // is clamped and the address selected against the views buffer itself,
+    // already in L1, which makes the inline case a free prefetch.
+    let buffers = array.data_buffers();
+    let buffer_index = ((view >> 64) as u32 as usize).min(buffers.len().saturating_sub(1));
+    let offset = (view >> 96) as u32 as usize;
+    let views_ptr = views.as_ptr() as *const u8;
+    let base = buffers
+        .get(buffer_index)
+        .map_or(views_ptr, |buffer| buffer.as_ptr());
+    let first = std::hint::select_unpredictable(out_of_line, base.wrapping_add(offset), views_ptr);
+    // The hash touches the first and last bytes of every string, and the
+    // middle of long ones streams behind those two lines.
+    prefetch_l1_line(first);
+    prefetch_l1_line(first.wrapping_add(len.saturating_sub(1)));
+}
 
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.

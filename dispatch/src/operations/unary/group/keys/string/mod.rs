@@ -7,7 +7,10 @@ pub use live_key::{ResolvedKey, StringKey};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor, StoredKey};
+use crate::operations::unary::group::keys::{
+    KeyColumnBuilder, KeyExtractor, STRING_PREFETCH_DISTANCE, StoredKey, prefetch_view_bytes,
+    views_span_cold_memory,
+};
 use ahash::RandomState;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
 use arrow_buffer::{Buffer, ScalarBuffer};
@@ -46,7 +49,17 @@ impl KeyExtractor for StringKeyExtractor {
 
     #[inline(always)]
     fn prepare_and_hash(reader: &mut Self::Reader<'_>, state: &RandomState, hashes: &mut [u64]) {
+        let length = hashes.len();
+        let prefetch = views_span_cold_memory(reader);
+        for idx in 0..STRING_PREFETCH_DISTANCE.min(length) {
+            if prefetch {
+                prefetch_view_bytes(reader, idx);
+            }
+        }
         for (i, h) in hashes.iter_mut().enumerate() {
+            if prefetch && i + STRING_PREFETCH_DISTANCE < length {
+                prefetch_view_bytes(reader, i + STRING_PREFETCH_DISTANCE);
+            }
             *h = state.hash_one(unsafe { reader.value_unchecked(i) });
         }
     }

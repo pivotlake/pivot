@@ -3,6 +3,9 @@
 
 use super::schema::RowKeySchema;
 use crate::cpu_features::multitarget_kernel;
+use crate::operations::unary::group::keys::{
+    STRING_PREFETCH_DISTANCE, prefetch_view_bytes, views_span_cold_memory,
+};
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -197,8 +200,26 @@ impl<'b> RowReader<'b> {
             Some(ColumnEncoder::Str(_)) => encoders.len() - 1,
             _ => encoders.len(),
         };
+        let length = hashes.len();
+        let string_columns: Vec<&StringViewArray> = encoders
+            .iter()
+            .filter_map(|enc| match enc {
+                ColumnEncoder::Str(array) if views_span_cold_memory(array) => Some(*array),
+                _ => None,
+            })
+            .collect();
+        for idx in 0..STRING_PREFETCH_DISTANCE.min(length) {
+            for array in &string_columns {
+                prefetch_view_bytes(array, idx);
+            }
+        }
         let mut start = 0usize;
         for (i, slot) in hashes.iter_mut().enumerate() {
+            if i + STRING_PREFETCH_DISTANCE < length {
+                for array in &string_columns {
+                    prefetch_view_bytes(array, i + STRING_PREFETCH_DISTANCE);
+                }
+            }
             for (enc, &nullable) in encoders[..head].iter().zip(&self.nullable) {
                 enc.encode(i, ANY_NULLABLE && nullable, &mut scratch.bytes);
             }

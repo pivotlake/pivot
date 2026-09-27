@@ -172,7 +172,7 @@ pub(super) fn entry_layout<K, V: AggregationValue + ?Sized>(
 
 /// Prefetch the cache line at `ptr` into L1 (x86 `T0` / ARM `pldl1keep`).
 #[inline(always)]
-fn prefetch_l1_line(ptr: *const u8) {
+pub(crate) fn prefetch_l1_line(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);

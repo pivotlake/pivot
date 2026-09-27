@@ -22,7 +22,10 @@ use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::{LiveKey, PersistedKey};
 use crate::operations::unary::group::keys::string::ArenaKey;
-use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor, StoredKey};
+use crate::operations::unary::group::keys::{
+    KeyColumnBuilder, KeyExtractor, STRING_PREFETCH_DISTANCE, StoredKey, prefetch_view_bytes,
+    views_span_cold_memory,
+};
 use ahash::RandomState;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
@@ -192,7 +195,17 @@ where
         // re-hashes). Equal `(int, string)` rows hash identically; `eq_persisted`
         // resolves the rare collision. Hashing the integer then the `&str` mirrors
         // the int and string extractors composed.
+        let length = hashes.len();
+        let prefetch = views_span_cold_memory(reader.strings);
+        for idx in 0..STRING_PREFETCH_DISTANCE.min(length) {
+            if prefetch {
+                prefetch_view_bytes(reader.strings, idx);
+            }
+        }
         for (i, h) in hashes.iter_mut().enumerate() {
+            if prefetch && i + STRING_PREFETCH_DISTANCE < length {
+                prefetch_view_bytes(reader.strings, i + STRING_PREFETCH_DISTANCE);
+            }
             let int = unsafe { reader.ints.value_unchecked(i) };
             let string = unsafe { reader.strings.value_unchecked(i) };
             *h = state.hash_one((int, string));
