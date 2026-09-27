@@ -619,33 +619,38 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     /// top-k bin totals beside the output so the caller can fold them into the
     /// pool's shared accumulators before arriving at the gather barrier.
     pub fn flush(mut self) -> (AggregatedTableOutput<K, V>, Option<HashBinTotals>) {
-        if self.switched_to_radix {
-            // Add pre-transition groups to the scatter-side estimate.
-            for table in &self.tables {
-                for entry in table.iter(0) {
-                    self.hll.add(entry.hash);
-                }
-            }
-        }
-        // Fold the entries still sitting in the in-place tables into the
-        // top-k bin totals (drained entries were folded as they scattered). A
-        // worker this small skips the totals (and thereby turns pruning off)
-        // rather than pay the allocation on a query too small to prune.
+        // A worker that switched adds its pre-transition groups to the scatter-side
+        // estimate. The entries still sitting in the in-place tables are also folded
+        // into the top-k bin totals (drained entries were folded as they scattered).
+        // A worker this small skips the totals (and thereby turns pruning off)
+        // rather than pay the allocation on a query too small to prune. Both folds
+        // share one walk of the tables, so a large table stack is read once.
+        let fold_into_hll = self.switched_to_radix;
         let table_entries: usize = self.tables.iter().map(|t| t.len()).sum();
         let allocator = &mut self.allocator;
         let taken_totals = self.topk_bin_totals.take();
-        let topk_bin_totals = self.topk_aggregation_slot.and_then(|slot| {
+        let mut topk_fold = self.topk_aggregation_slot.and_then(|slot| {
             if taken_totals.is_none() && table_entries < MIN_BINNED_ENTRIES {
                 return None;
             }
-            let mut totals = taken_totals.unwrap_or_else(|| HashBinTotals::new(allocator));
+            Some((
+                slot,
+                taken_totals.unwrap_or_else(|| HashBinTotals::new(allocator)),
+            ))
+        });
+        if fold_into_hll || topk_fold.is_some() {
             for table in &self.tables {
                 for entry in table.iter(0) {
-                    totals.add(entry.hash, entry.stored.sort_key(slot).saturating_weight());
+                    if fold_into_hll {
+                        self.hll.add(entry.hash);
+                    }
+                    if let Some((slot, totals)) = &mut topk_fold {
+                        totals.add(entry.hash, entry.stored.sort_key(*slot).saturating_weight());
+                    }
                 }
             }
-            Some(totals)
-        });
+        }
+        let topk_bin_totals = topk_fold.map(|(_, totals)| totals);
         // Raw-scattered rows never reached the totals. Report each bucket's
         // row count so the merge can widen its bounds by them (a hack, see
         // `AggregatedTableOutput::raw_scatter_rows`). The bucket counts also
