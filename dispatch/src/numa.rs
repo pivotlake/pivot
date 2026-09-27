@@ -89,7 +89,8 @@ pub fn default_worker_count() -> usize {
     };
     let groups = group_cores_by_node(cores);
     let cores: usize = groups.iter().map(Vec::len).sum();
-    cores.saturating_sub(groups.len()).max(1)
+    // EXPERIMENT: half the cores.
+    (cores / 2).max(1)
 }
 
 /// Group the cores this process may run on by NUMA node.
