@@ -323,6 +323,25 @@ impl Run {
     }
 }
 
+/// Reads the ULEB128 value starting at `offset`, returning it and its length
+/// in bytes, or `None` when it does not end inside `bytes`.
+#[inline(always)]
+fn read_varint_at(bytes: &[u8], offset: usize) -> Option<(u32, usize)> {
+    let first = *bytes.get(offset)?;
+    if first & 0x80 == 0 {
+        return Some((first as u32, 1));
+    }
+    let mut value = (first & 0x7f) as u32;
+    for i in 1..5 {
+        let byte = *bytes.get(offset + i)?;
+        value |= ((byte & 0x7f) as u32) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
 /// Minimum number of bytes needed to hold a value of `bit_width` bits.
 const fn byte_width(bit_width: u8) -> u8 {
     bit_width.div_ceil(8)
@@ -370,11 +389,53 @@ impl RleDecoder {
     /// Advances past `size` values without producing output.
     pub fn skip(&mut self, mut size: usize) {
         while size > 0 {
+            if self.run.is_none() {
+                size = self.skip_whole_runs(size);
+                if size == 0 {
+                    break;
+                }
+            }
             let run = self.get_or_set_next_run();
             let (skipped, run) = run.skip(&self.data, self.bit_width, &mut self.position, size);
             self.run = run;
             size -= skipped;
         }
+    }
+
+    /// Steps over every run that ends within the next `size` values, reading
+    /// only run headers, and returns how many values are left to skip.
+    ///
+    /// A decoder repositioning deep into a page steps over thousands of runs,
+    /// so this walks the headers straight off the current buffer. It stops at
+    /// the first run that reaches past `size` or past the buffer, which the
+    /// general path then takes apart.
+    fn skip_whole_runs(&mut self, mut size: usize) -> usize {
+        let Some(buffer) = self.data.get(self.position.buffer_index) else {
+            return size;
+        };
+        let bytes: &[u8] = buffer;
+        let bit_width = self.bit_width as usize;
+        let value_bytes = byte_width(self.bit_width) as usize;
+        let mut offset = self.position.offset;
+        while size > 0 {
+            let Some((header, header_len)) = read_varint_at(bytes, offset) else {
+                break;
+            };
+            let groups = (header >> 1) as usize;
+            let (values, run_bytes) = if header & 1 == 0 {
+                (groups, value_bytes)
+            } else {
+                (groups * 8, groups * bit_width)
+            };
+            let end = offset + header_len + run_bytes;
+            if values > size || end > bytes.len() {
+                break;
+            }
+            offset = end;
+            size -= values;
+        }
+        self.position.offset = offset;
+        size
     }
 
     /// Decodes `size` values, looking up each index in `dict` and pushing
@@ -560,6 +621,43 @@ mod tests {
         assert_eq!(head, vec!["AA", "BB", "CC"]);
         assert_eq!(middle, vec!["CC", "DD"]);
         assert_eq!(tail, vec!["AA", "BB", "CC", "DD"]);
+    }
+
+    /// Skipping any number of values over a stream of mixed RLE and
+    /// bit-packed runs, whole or split across buffers, leaves the decoder
+    /// where decoding through them would.
+    #[test]
+    fn skip_over_many_runs_matches_decoding_through_them() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        // Repeats of: 1 bit-packed group (AA BB CC DD AA BB CC DD), then an
+        // RLE run of 5 x CC.
+        let segment = [0x03, 0xE4, 0xE4, 0x0A, 0x02];
+        let stream: Vec<u8> = segment
+            .iter()
+            .copied()
+            .cycle()
+            .take(segment.len() * 20)
+            .collect();
+        let total = 13 * 20;
+        let mut reference = new_decoder(stream.clone(), 2);
+        let expected = push_all(&mut allocator, &mut reference, &dict, total);
+
+        for split in [stream.len(), 7, 38] {
+            for skip in [0, 7, 8, 13, 100, 101, 251] {
+                let data = make_data_multi_buffer(vec![
+                    stream[..split].to_vec(),
+                    stream[split..].to_vec(),
+                ]);
+                let mut dec = RleDecoder::new(data, ReaderPosition::default(), 2);
+
+                dec.skip(skip);
+                let rest = push_all(&mut allocator, &mut dec, &dict, total - skip);
+
+                assert_eq!(rest, expected[skip..], "split {split} skip {skip}");
+            }
+        }
     }
 
     /// Regression: after handling a buffer-boundary overflow, the decoder must
