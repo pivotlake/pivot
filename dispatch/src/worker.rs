@@ -162,6 +162,10 @@ pub struct Worker {
     /// Last delegated-broadcast epoch this worker has fanned out (see
     /// [`WorkerWaker::finish_delegated_wake`]).
     last_seen_broadcast: u64,
+    /// Whether this worker is published to senders as spinning for work (see
+    /// [`WorkerWaker::begin_spin`]). Set on the idle pass that publishes it
+    /// and cleared once it works again, is claimed by a send, or parks.
+    spin_published: bool,
 }
 
 impl Worker {
@@ -229,6 +233,7 @@ impl Worker {
                     last_seen_ring_wake_count,
                     node_local_idx,
                     last_seen_broadcast,
+                    spin_published: false,
                 };
                 // Notifiers must be able to interrupt this worker's blocking
                 // IO wait, not just its thread park; register the ring's wake
@@ -459,8 +464,23 @@ impl Worker {
         // wake count and resumes in nanoseconds when the next notify lands (the
         // core is idle at the barrier anyway). With no dataflow running we're
         // genuinely idle between queries — park immediately rather than burn CPU.
+        //
+        // Senders claim a published spinner directly (see
+        // `WorkerWaker::begin_spin`), and skip notifying at all while no worker
+        // is published. So the first idle pass only publishes and returns to
+        // look for work once more: a send that raced the previous look either
+        // shows up in the next one or finds this worker published.
+        if !self.spin_published {
+            self.waker.begin_spin(self.node_local_idx);
+            self.spin_published = true;
+            return;
+        }
         if !self.data_flows.is_empty() {
             for _ in 0..in_flight_spin_limit() {
+                if self.waker.spin_claimed(self.node_local_idx) {
+                    self.spin_published = false;
+                    return;
+                }
                 let now = self.waker.wake_count();
                 if now != self.last_seen_wake_count {
                     self.last_seen_wake_count = now;
@@ -470,11 +490,22 @@ impl Worker {
             }
         }
 
+        self.spin_published = false;
         self.last_seen_wake_count = self
             .waker
-            .wait_if_unchanged(self.last_seen_wake_count, self.node_local_idx);
+            .park_after_spin(self.last_seen_wake_count, self.node_local_idx);
         self.waker
             .finish_delegated_wake(&mut self.last_seen_broadcast);
+    }
+
+    /// Stop being published as a spinner, if this worker is. Returns whether a
+    /// send had claimed it first, which means there is work to look for.
+    fn withdraw_spin(&mut self) -> bool {
+        if !self.spin_published {
+            return false;
+        }
+        self.spin_published = false;
+        self.waker.end_spin(self.node_local_idx)
     }
 
     fn clear_cancelled_dataflows(&mut self) {
@@ -560,40 +591,47 @@ impl Worker {
             if !self.did_work_last_iteration {
                 // Don't clear buffers or sleep on IO while there is work to steal.
                 self.try_steal_work();
-                if self.did_work_last_iteration {
-                    continue;
-                }
-
-                // One ring serves both disk and HTTP, so a single wait wakes on
-                // either kind of completion — no dual-ring coordination needed.
-                // The wait doubles as a select over worker notifications: the
-                // slot published around it lets a notifier interrupt the ring
-                // (see `begin_ring_wait`), so a message sent mid-wait resumes
-                // the loop instead of stalling behind the slowest read.
-                if self.io.has_pending() {
-                    debug!("Waiting for IO...");
-                    if self
-                        .waker
-                        .begin_ring_wait(self.node_local_idx, self.last_seen_ring_wake_count)
-                    {
-                        // Withdraw the slot before propagating a wait error.
-                        // If the error tears this worker down while the slot
-                        // still reads as parked, notifiers keep claiming it:
-                        // each claimed wake is swallowed by a dead worker
-                        // instead of reaching a live parked one, and the wake
-                        // itself writes to an eventfd this thread closed on
-                        // its way out.
-                        let wait_result = self.io.wait();
-                        self.waker.end_ring_wait(self.node_local_idx);
-                        wait_result?;
-                    }
-                    self.last_seen_ring_wake_count = self.waker.ring_wake_count();
-                    self.last_seen_wake_count = self.waker.wake_count();
-                    continue;
-                }
-
-                self.clear_dirty_buffer_or_park();
             }
+            if self.did_work_last_iteration {
+                // Working again: stop being a spinner senders may claim.
+                self.withdraw_spin();
+                continue;
+            }
+            // One ring serves both disk and HTTP, so a single wait wakes on
+            // either kind of completion — no dual-ring coordination needed.
+            // The wait doubles as a select over worker notifications: the
+            // slot published around it lets a notifier interrupt the ring
+            // (see `begin_ring_wait`), so a message sent mid-wait resumes
+            // the loop instead of stalling behind the slowest read.
+            if self.io.has_pending() {
+                // A data send does not interrupt a ring wait, so the worker
+                // must not stay published as a spinner while it blocks. A
+                // send that claimed it meanwhile left work to look for.
+                if self.withdraw_spin() {
+                    continue;
+                }
+                debug!("Waiting for IO...");
+                if self
+                    .waker
+                    .begin_ring_wait(self.node_local_idx, self.last_seen_ring_wake_count)
+                {
+                    // Withdraw the slot before propagating a wait error.
+                    // If the error tears this worker down while the slot
+                    // still reads as parked, notifiers keep claiming it:
+                    // each claimed wake is swallowed by a dead worker
+                    // instead of reaching a live parked one, and the wake
+                    // itself writes to an eventfd this thread closed on
+                    // its way out.
+                    let wait_result = self.io.wait();
+                    self.waker.end_ring_wait(self.node_local_idx);
+                    wait_result?;
+                }
+                self.last_seen_ring_wake_count = self.waker.ring_wake_count();
+                self.last_seen_wake_count = self.waker.wake_count();
+                continue;
+            }
+
+            self.clear_dirty_buffer_or_park();
         }
     }
 }

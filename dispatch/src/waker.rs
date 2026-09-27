@@ -9,7 +9,7 @@
 #[cfg(any(test, feature = "test-util"))]
 use crate::worker::{NUM_WORKERS, set_current_node};
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, Thread};
 #[cfg(not(any(debug_assertions, feature = "unbounded-park")))]
@@ -22,6 +22,21 @@ thread_local! {
     /// Owns the set referenced by `WAKER_SET` for the lifetime of this thread.
     static WAKER_SET_OWNER: RefCell<Option<Box<WakerSet>>> = const { RefCell::new(None) };
     static WAKER_SET: Cell<*const WakerSet> = const { Cell::new(std::ptr::null()) };
+    /// Where this thread's next [`WorkerWaker::notify_one`] starts looking for a
+    /// spinning worker, so concurrent senders spread their claims without
+    /// sharing a counter.
+    static NEXT_SPINNER: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A spinning worker's claim token, alone on its cache line: the worker polls
+/// it while it spins, so a line shared with anything else would be pulled away
+/// from it by every unrelated write.
+#[repr(align(128))]
+struct SpinSlot {
+    /// Whether this worker is spinning and has not been claimed. Whoever swaps
+    /// it `true -> false` (the worker withdrawing, or a notifier claiming it)
+    /// ends the spin.
+    spinning: AtomicBool,
 }
 
 /// One worker's parking state within a node-local [`WorkerWaker`].
@@ -79,6 +94,16 @@ fn park() {
 /// A worker snapshots the wake count after each park. On its next attempt to
 /// sleep, [`wait_if_unchanged`](Self::wait_if_unchanged) parks only if no
 /// notification arrived during the intervening work pass.
+///
+/// A worker that runs out of work first spins, published in the node's
+/// spinner mask, and a data send ([`notify_one`](Self::notify_one)) claims
+/// exactly one spinner through its own [`SpinSlot`]. Sends therefore never
+/// write a line every idle worker is polling, and wake one spinner rather than
+/// every one of them. A worker publishes itself before its last look for work
+/// and stays published, as a spinner and then as a parked worker, until it
+/// works again; a send that finds no published worker can then skip the
+/// notification entirely, because every worker is either busy or about to
+/// look for work again.
 pub struct WorkerWaker {
     /// Monotonic wrapping counter bumped on every notification. Workers poll it
     /// while spinning before they park.
@@ -96,6 +121,12 @@ pub struct WorkerWaker {
     /// Number of workers currently blocked in their IO ring wait.
     ring_parked_workers: AtomicUsize,
     slots: Box<[ParkSlot]>,
+    /// One claim token per worker (see [`SpinSlot`]).
+    spin_slots: Box<[SpinSlot]>,
+    /// Which workers are spinning, one bit each. A hint for finding a spinner
+    /// without polling every slot: the slot's token is what a claim takes, and
+    /// a bit may briefly outlive its spin.
+    spinner_mask: Box<[AtomicU64]>,
     /// Rotates [`notify_one`](Self::notify_one)'s scan start so wake-ups spread
     /// over parked workers instead of always choosing the lowest index.
     next_wake: AtomicUsize,
@@ -119,6 +150,14 @@ impl WorkerWaker {
                     ring_parked: AtomicBool::new(false),
                     ring_wake: OnceLock::new(),
                 })
+                .collect(),
+            spin_slots: (0..worker_count)
+                .map(|_| SpinSlot {
+                    spinning: AtomicBool::new(false),
+                })
+                .collect(),
+            spinner_mask: (0..worker_count.div_ceil(64))
+                .map(|_| AtomicU64::new(0))
                 .collect(),
             next_wake: AtomicUsize::new(0),
             broadcast_epoch: AtomicU64::new(0),
@@ -174,19 +213,29 @@ impl WorkerWaker {
         false
     }
 
-    /// Record a data-availability notification and wake one thread-parked
-    /// worker, if any.
+    /// Record a data-availability notification and wake one idle worker: a
+    /// spinning one if any, else a thread-parked one. Nothing is recorded when
+    /// no worker is idle.
     ///
     /// This is used when one new stealable item needs one same-node consumer.
     /// Workers blocked in their IO ring wait are deliberately not interrupted:
     /// their own IO completion wakes them promptly, and they scan for new work
-    /// then. Returns whether a parked worker was woken so callers can try
-    /// another node when they need to grow the pool-wide working set.
+    /// then. Returns whether a worker was woken so callers can try another
+    /// node when they need to grow the pool-wide working set.
     pub fn notify_one(&self) -> bool {
-        self.wake_count.fetch_add(1, Ordering::SeqCst);
+        // Order the caller's publication of its item before reading who is
+        // idle. A worker publishes itself idle before its last look for work,
+        // so either that look finds the item or this read finds the worker.
+        fence(Ordering::SeqCst);
+        if self.claim_spinner() {
+            return true;
+        }
+        // A worker withdraws from spinning only after publishing itself parked,
+        // so a spinner this send missed is counted here.
         if self.parked_workers.load(Ordering::SeqCst) == 0 {
             return false;
         }
+        self.wake_count.fetch_add(1, Ordering::SeqCst);
         let start = self.next_wake.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.slots.len() {
             if self.wake_thread_parked_slot(&self.slots[(start + i) % self.slots.len()]) {
@@ -269,6 +318,96 @@ impl WorkerWaker {
             *last_seen = epoch;
             self.notify();
         }
+    }
+
+    /// Claim one spinning worker, ending its spin so it looks for work again.
+    /// Returns whether one was claimed.
+    fn claim_spinner(&self) -> bool {
+        let words = self.spinner_mask.len();
+        let start = NEXT_SPINNER.get();
+        NEXT_SPINNER.set(start.wrapping_add(1));
+        for offset in 0..words {
+            let word_idx = (start + offset) % words;
+            let word = &self.spinner_mask[word_idx];
+            let mut candidates = word.load(Ordering::SeqCst);
+            while candidates != 0 {
+                // Rotate the pick within the word too, so senders spread out.
+                let rotation = (start % 64) as u32;
+                let bit = candidates
+                    .rotate_right(rotation)
+                    .trailing_zeros()
+                    .wrapping_add(rotation)
+                    % 64;
+                let mask = 1u64 << bit;
+                candidates &= !mask;
+                // Clearing the bit first hides the worker from other senders;
+                // the token decides whether this send or the worker's own
+                // withdrawal ends the spin.
+                if word.fetch_and(!mask, Ordering::SeqCst) & mask == 0 {
+                    continue;
+                }
+                let slot = word_idx * 64 + bit as usize;
+                if self.spin_slots[slot].spinning.swap(false, Ordering::SeqCst) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Publish worker `local_idx` as spinning for work. The worker must look
+    /// for work once more after this before it spins: a send made before the
+    /// publication is not guaranteed to claim it.
+    pub fn begin_spin(&self, local_idx: usize) {
+        self.spin_slots[local_idx]
+            .spinning
+            .store(true, Ordering::SeqCst);
+        self.spinner_mask[local_idx / 64].fetch_or(1 << (local_idx % 64), Ordering::SeqCst);
+    }
+
+    /// Whether a send has claimed worker `local_idx` since it began spinning.
+    #[inline(always)]
+    pub fn spin_claimed(&self, local_idx: usize) -> bool {
+        !self.spin_slots[local_idx].spinning.load(Ordering::Acquire)
+    }
+
+    /// Withdraw worker `local_idx` from spinning. Returns whether a send had
+    /// claimed it first.
+    pub fn end_spin(&self, local_idx: usize) -> bool {
+        if self.spin_slots[local_idx]
+            .spinning
+            .swap(false, Ordering::SeqCst)
+        {
+            self.spinner_mask[local_idx / 64].fetch_and(!(1 << (local_idx % 64)), Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// Park spinning worker `local_idx` if no send claimed it and the wake
+    /// count still equals `last_seen`, withdrawing it from spinning either way.
+    /// Returns the current count for use on the next park attempt.
+    ///
+    /// The worker is published as parked before it withdraws from spinning,
+    /// so a send always finds it as one or the other.
+    pub fn park_after_spin(&self, last_seen: u64, local_idx: usize) -> u64 {
+        let slot = &self.slots[local_idx];
+        slot.parked.store(true, Ordering::SeqCst);
+        self.parked_workers.fetch_add(1, Ordering::SeqCst);
+        let claimed = self.end_spin(local_idx);
+        if claimed || self.wake_count.load(Ordering::SeqCst) != last_seen {
+            // Withdraw the slot unless a notifier already claimed it and
+            // decremented `parked_workers`.
+            if slot.parked.swap(false, Ordering::SeqCst) {
+                self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            }
+            return self.wake_count.load(Ordering::SeqCst);
+        }
+        park();
+        if slot.parked.swap(false, Ordering::SeqCst) {
+            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.wake_count.load(Ordering::SeqCst)
     }
 
     /// Current wake count. Workers snapshot it around work passes and poll it
@@ -587,15 +726,129 @@ mod tests {
     }
 
     #[test]
-    fn a_notify_before_the_park_is_not_lost() {
+    fn a_broadcast_before_the_park_is_not_lost() {
         let waker = Arc::new(WorkerWaker::new(1));
         waker.register(0);
         let last_seen = waker.wake_count();
 
-        waker.notify_one();
+        waker.notify();
 
         assert_eq!(waker.wait_if_unchanged(last_seen, 0), waker.wake_count());
         assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_send_claims_a_spinning_worker() {
+        let waker = WorkerWaker::new(2);
+        waker.begin_spin(1);
+
+        let woke = waker.notify_one();
+
+        assert!(woke);
+        assert!(waker.spin_claimed(1));
+        assert!(waker.end_spin(1), "the worker learns it was claimed");
+    }
+
+    #[test]
+    fn a_send_claims_one_spinner_of_many() {
+        let waker = WorkerWaker::new(3);
+        (0..3).for_each(|worker| waker.begin_spin(worker));
+
+        waker.notify_one();
+
+        let claimed = (0..3).filter(|&worker| waker.spin_claimed(worker)).count();
+        assert_eq!(claimed, 1);
+    }
+
+    #[test]
+    fn a_send_with_no_idle_worker_records_nothing() {
+        let waker = WorkerWaker::new(2);
+        let before = waker.wake_count();
+
+        let woke = waker.notify_one();
+
+        assert!(!woke);
+        assert_eq!(waker.wake_count(), before);
+    }
+
+    #[test]
+    fn a_claimed_spinner_does_not_park() {
+        let waker = Arc::new(WorkerWaker::new(1));
+        waker.register(0);
+        let last_seen = waker.wake_count();
+        waker.begin_spin(0);
+        waker.notify_one();
+
+        let seen = waker.park_after_spin(last_seen, 0);
+
+        assert_eq!(seen, waker.wake_count());
+        assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
+    }
+
+    /// Workers follow the idle protocol (publish, look again, spin, park)
+    /// against a stream of sends; a lost wake leaves an item behind or a
+    /// worker parked forever, which the test catches as a hang.
+    #[test]
+    fn every_sent_item_is_taken_under_the_idle_protocol() {
+        use crossbeam_deque::Injector;
+        const WORKERS: usize = 4;
+        const ITEMS: usize = 20_000;
+        let waker = Arc::new(WorkerWaker::new(WORKERS));
+        let queue = Arc::new(Injector::<usize>::new());
+        let taken = Arc::new(AtomicUsize::new(0));
+        let consumers: Vec<_> = (0..WORKERS)
+            .map(|worker| {
+                let (waker, queue, taken) = (waker.clone(), queue.clone(), taken.clone());
+                thread::spawn(move || {
+                    waker.register(worker);
+                    let mut last_seen = waker.wake_count();
+                    let mut published = false;
+                    while taken.load(Ordering::SeqCst) < ITEMS {
+                        if queue.steal().is_success() {
+                            taken.fetch_add(1, Ordering::SeqCst);
+                            if published {
+                                waker.end_spin(worker);
+                                published = false;
+                            }
+                            continue;
+                        }
+                        if !published {
+                            waker.begin_spin(worker);
+                            published = true;
+                            continue;
+                        }
+                        let mut claimed = false;
+                        for _ in 0..100 {
+                            if waker.spin_claimed(worker) {
+                                claimed = true;
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                        if claimed {
+                            published = false;
+                            continue;
+                        }
+                        published = false;
+                        last_seen = waker.park_after_spin(last_seen, worker);
+                    }
+                    waker.notify();
+                })
+            })
+            .collect();
+
+        for item in 0..ITEMS {
+            queue.push(item);
+            waker.notify_one();
+            if item % 1000 == 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        for consumer in consumers {
+            consumer.join().unwrap();
+        }
+        assert_eq!(taken.load(Ordering::SeqCst), ITEMS);
     }
 
     #[test]
