@@ -39,7 +39,10 @@ struct SpinSlot {
     spinning: AtomicBool,
 }
 
-/// One worker's parking state within a node-local [`WorkerWaker`].
+/// One worker's parking state within a node-local [`WorkerWaker`], alone on
+/// its cache line so a worker publishing or withdrawing its own slot does not
+/// disturb its neighbours'.
+#[repr(align(128))]
 struct ParkSlot {
     /// Whether this worker is currently parked. Whoever swaps it `true -> false`
     /// (the parker on wake-up, or a notifier claiming the slot) decrements
@@ -187,7 +190,13 @@ impl WorkerWaker {
     /// atomic claim makes concurrent notifiers choose different sleepers
     /// whenever possible.
     fn wake_slot(&self, slot: &ParkSlot) -> bool {
-        if slot.ring_parked.swap(false, Ordering::SeqCst) {
+        // Load before claiming: a broadcast visits every slot, and swapping an
+        // unparked one would still take its cache line away from its worker. A
+        // `false` read is as good as a failed claim, since the notifier bumped
+        // the wake count first and a parking worker rechecks it after
+        // publishing its slot.
+        if slot.ring_parked.load(Ordering::SeqCst) && slot.ring_parked.swap(false, Ordering::SeqCst)
+        {
             self.ring_parked_workers.fetch_sub(1, Ordering::SeqCst);
             slot.ring_wake
                 .get()
@@ -203,7 +212,7 @@ impl WorkerWaker {
     /// and interrupting the ring costs an eventfd round-trip per wake, which
     /// data-availability sends fire far too often to afford.
     fn wake_thread_parked_slot(&self, slot: &ParkSlot) -> bool {
-        if slot.parked.swap(false, Ordering::SeqCst) {
+        if slot.parked.load(Ordering::SeqCst) && slot.parked.swap(false, Ordering::SeqCst) {
             self.parked_workers.fetch_sub(1, Ordering::SeqCst);
             if let Some(thread) = slot.thread.get() {
                 thread.unpark();
