@@ -195,11 +195,15 @@ const RADIX_PARTITIONS: usize = 4096;
 ///
 /// Every (worker, bucket) pair is one small stream the merge later walks,
 /// prefetch-warms, and tears down, so those fixed costs grow with
-/// `workers x buckets` while the useful bytes per stream shrink.
-/// [`get_scatter_bucket_count_for_worker`] scales the per-worker bucket count
-/// down as the pool grows to hold the total near this target (chosen so
-/// pools of ~128 workers or fewer keep the full [`RADIX_PARTITIONS`]).
-const TARGET_SCATTER_STREAMS: usize = 1 << 19;
+/// `workers x buckets` while the useful bytes per stream shrink. The scatter
+/// side pays per stream too: each worker keeps one partly written row and one
+/// buffer header hot per bucket, and past a few hundred buckets that frontier
+/// no longer fits in L1. [`get_scatter_bucket_count_for_worker`] scales the
+/// per-worker bucket count down as the pool grows to hold the total near this
+/// target (chosen so pools of ~32 workers or fewer keep the full
+/// [`RADIX_PARTITIONS`]; a 192-worker pool gets 512 buckets, where both sides'
+/// per-stream costs stop throttling the memory bandwidth the merge can use).
+const TARGET_SCATTER_STREAMS: usize = 1 << 17;
 
 /// How many scatter buckets each worker should use when `total_workers`
 /// workers share the pool.
@@ -357,9 +361,11 @@ mod tests {
         // Small pools keep the full per-worker resolution; large pools trade
         // it away to hold the total stream count near the budget.
         assert_eq!(get_scatter_bucket_count_for_worker(8), RADIX_PARTITIONS);
-        assert_eq!(get_scatter_bucket_count_for_worker(96), RADIX_PARTITIONS);
-        assert_eq!(get_scatter_bucket_count_for_worker(190), 2048);
-        assert_eq!(get_scatter_bucket_count_for_worker(400), 1024);
+        assert_eq!(get_scatter_bucket_count_for_worker(32), RADIX_PARTITIONS);
+        assert_eq!(get_scatter_bucket_count_for_worker(96), 1024);
+        assert_eq!(get_scatter_bucket_count_for_worker(190), 512);
+        // Never fewer buckets than workers, whatever the budget says.
+        assert_eq!(get_scatter_bucket_count_for_worker(400), 512);
     }
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
