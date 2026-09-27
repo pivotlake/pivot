@@ -33,7 +33,7 @@ CREATE TABLE measurements (
 | `SMALLINT` | Signed 16-bit integer. | ✓ | ✓ |
 | `INTEGER` | Signed 32-bit integer. `INT` is an alias. | ✓ | ✓ |
 | `BIGINT` | Signed 64-bit integer. | ✓ | ✓ |
-| `HUGEINT` | Signed 128-bit integer, used by integer aggregates. | — | ✓ |
+| `HUGEINT` | Signed 128-bit integer, used by integer aggregates. | - | ✓ |
 | `UTINYINT` | Unsigned 8-bit integer. | ✓ | ✓ |
 | `USMALLINT` | Unsigned 16-bit integer. | ✓ | ✓ |
 | `UINTEGER` | Unsigned 32-bit integer. | ✓ | ✓ |
@@ -58,7 +58,7 @@ See [string and regular expression functions](/docs/reference/functions/strings/
 | --- | --- | :---: | :---: |
 | `DATE` | Calendar date without a time. | ✓ | ✓ |
 | `TIMESTAMP` | Timezone-free timestamp at microsecond resolution. | ✓ | ✓ |
-| `INTERVAL` | Months, days, and sub-day time used in temporal expressions. | — | ✓ |
+| `INTERVAL` | Months, days, and sub-day time used in temporal expressions. | - | ✓ |
 
 `TIMESTAMP WITH TIME ZONE` and its `TIMESTAMPTZ` alias are not supported. Use `TIMESTAMP` and normalize timezone-sensitive input before loading it.
 

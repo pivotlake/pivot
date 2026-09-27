@@ -7,94 +7,9 @@ sidebar:
 
 ## System architecture
 
-Pivot separates query execution, data access, and server metadata into distinct layers. This separation allows the same execution engine to work with different data sources, such as Iceberg and Delta Lake, and across different deployment models, from a local shell to a server cluster. It also allows multiple deployments to share some or all of their underlying data sources, a common metadata layer, or both.
+Pivot separates query execution, data access, and server metadata into distinct layers. This separation allows the same execution engine to operate across different data sources, including Iceberg and Delta Lake, and across deployment models ranging from a local shell to a distributed server cluster. It also allows multiple deployments to share the same data sources, metadata layer, or both.
 
-<figure class="arch-figure">
-<svg viewBox="0 0 920 492" role="img" aria-labelledby="map-title map-desc">
-<title id="map-title">Pivot architecture</title>
-<desc id="map-desc">Inside Pivot, the catalog holds a snapshot per query, the planner binds and prunes against it, and the Dispatch pool runs the scan on worker threads. The metastore supplies configuration and identity to Pivot; the datastore is the transactional data source Pivot scans and commits to, layered as a Pivot manifest, a Delta log, and Parquet files.</desc>
-<defs>
-<marker id="map-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-<path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
-</marker>
-</defs>
-<g transform="translate(0 -156)">
-<rect x="40" y="180" width="840" height="200" rx="3" class="arch-panel" />
-<text x="64" y="210" class="arch-title">Pivot</text>
-<rect x="64" y="224" width="240" height="104" rx="2" class="arch-inner" />
-<rect x="65" y="225" width="238" height="23" class="arch-strip" />
-<line x1="65" y1="248" x2="303" y2="248" class="arch-rule" />
-<text x="76" y="241" class="arch-label">Catalog</text>
-<text x="76" y="270" class="arch-tiny">datastores by name</text>
-<text x="76" y="288" class="arch-tiny">snapshot per query</text>
-<rect x="340" y="224" width="240" height="104" rx="2" class="arch-inner" />
-<rect x="341" y="225" width="238" height="23" class="arch-strip" />
-<line x1="341" y1="248" x2="579" y2="248" class="arch-rule" />
-<text x="352" y="241" class="arch-label">Planner</text>
-<text x="568" y="241" text-anchor="end" class="arch-tiny">per query</text>
-<text x="352" y="270" class="arch-tiny">bind tables from snapshot</text>
-<text x="352" y="288" class="arch-tiny">prune + push down</text>
-<rect x="616" y="224" width="240" height="104" rx="2" class="arch-inner" />
-<rect x="617" y="225" width="238" height="23" class="arch-strip" />
-<line x1="617" y1="248" x2="855" y2="248" class="arch-rule" />
-<text x="628" y="241" class="arch-label">Dispatch pool</text>
-<text x="844" y="241" text-anchor="end" class="arch-tiny">worker threads</text>
-<rect x="628" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="650" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="672" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="694" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="716" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="738" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="760" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="782" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="804" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="826" y="262" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="628" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="650" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="672" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="694" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="716" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="738" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="760" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="782" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="804" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="826" y="284" width="16" height="16" rx="1" class="arch-cell" />
-<text x="628" y="316" class="arch-tiny">parallel scan + compute</text>
-<line x1="242" y1="452" x2="242" y2="384" stroke-dasharray="4 5" class="arch-line" marker-end="url(#map-head)" />
-<text x="256" y="422" class="arch-muted">configuration + identity</text>
-<line x1="678" y1="452" x2="678" y2="384" class="arch-line" marker-start="url(#map-head)" marker-end="url(#map-head)" />
-<text x="692" y="422" class="arch-muted">scan + commit</text>
-<rect x="40" y="452" width="404" height="172" rx="3" class="arch-panel" />
-<text x="64" y="482" class="arch-title">Metastore</text>
-<text x="420" y="482" text-anchor="end" class="arch-muted">control plane</text>
-<text x="64" y="502" class="arch-muted">YAML · PostgreSQL upcoming</text>
-<rect x="64" y="514" width="356" height="26" rx="2" class="arch-inner" />
-<text x="76" y="531" class="arch-tiny">datastores</text>
-<text x="408" y="531" text-anchor="end" class="arch-tiny">locations + default</text>
-<rect x="64" y="546" width="356" height="26" rx="2" class="arch-inner" />
-<text x="76" y="563" class="arch-tiny">users</text>
-<text x="408" y="563" text-anchor="end" class="arch-tiny">trust · scram-sha-256</text>
-<rect x="64" y="578" width="356" height="26" rx="2" class="arch-inner" />
-<text x="76" y="595" class="arch-tiny">credentials</text>
-<text x="408" y="595" text-anchor="end" class="arch-tiny">object storage keys</text>
-<rect x="476" y="452" width="404" height="172" rx="3" class="arch-panel" />
-<text x="500" y="482" class="arch-title">Datastore</text>
-<text x="856" y="482" text-anchor="end" class="arch-muted">data plane</text>
-<text x="500" y="502" class="arch-muted">delta · file:// · s3:// · gs://</text>
-<rect x="500" y="514" width="356" height="26" rx="2" class="arch-inner" />
-<text x="512" y="531" class="arch-tiny">pivot manifest</text>
-<text x="844" y="531" text-anchor="end" class="arch-tiny">schemas + tables</text>
-<rect x="500" y="546" width="356" height="26" rx="2" class="arch-inner" />
-<text x="512" y="563" class="arch-tiny">delta log</text>
-<text x="844" y="563" text-anchor="end" class="arch-tiny">versions + active files</text>
-<rect x="500" y="578" width="356" height="26" rx="2" class="arch-inner" />
-<text x="512" y="595" class="arch-tiny">parquet files</text>
-<text x="844" y="595" text-anchor="end" class="arch-tiny">columns + statistics</text>
-</g>
-</svg>
-</figure>
-
-These responsibilities are divided across five core components:
+These responsibilities are split across five core components:
 - [Dispatch execution pool](#dispatch-execution-pool) - Executes physical plans across a pool of workers responsible for computation and I/O.
 - [Planner](#planner) - Translates SQL queries into optimized physical execution plans.
 - [Catalog](#catalog) - Connects the planner to named datastores and maintains the datastore snapshots used by each query.
@@ -262,9 +177,9 @@ The catalog also exposes a read-only "virtual" [system tables datastore](/docs/r
 A datastore is a collection of schemas and tables exposed to Pivot through a common interface. Each configured datastore implementation handles table discovery, metadata, snapshots, and supported read and write operations for its underlying storage or table format.
 
 Pivot currently supports/exposes the following datastores:
-* Pivot — A collection of Delta Lake tables.
-* Iceberg — Tables stored using the Apache Iceberg table format.
-* System — Internal tables exposing information about the running Pivot instance.
+* Pivot - A collection of Delta Lake tables.
+* Iceberg - Tables stored using the Apache Iceberg table format.
+* System - Internal tables exposing information about the running Pivot instance.
 
 A server can expose multiple datastores, with tables addressed as `datastore.schema.table`.
 
@@ -290,9 +205,9 @@ datastore and executes the join in the same query engine.
 The metastore is a collective of configurations and secrets that declare the metadata a pivot instance needs for it to run.
 
 These include:
-- Datastores — their names, implementations, locations, and settings, including which datastore is the default for unqualified table names.
-- Secrets — credentials for accessing object storage, scoped to the locations they apply to. Multiple datastores can use the same secret.
-- Users — which users are authored to access pivot, and how do they authenticate.
+- Datastores - their names, implementations, locations, and settings, including which datastore is the default for unqualified table names.
+- Secrets - credentials for accessing object storage, scoped to the locations they apply to. Multiple datastores can use the same secret.
+- Users - which users are authored to access pivot, and how do they authenticate.
 
 Thanks to the separation of datastores and metastore, different instances / deployments of pivot might access different /overlapping datastores with different permission models and with different configurations:
 

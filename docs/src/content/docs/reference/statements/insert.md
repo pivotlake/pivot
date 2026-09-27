@@ -63,6 +63,6 @@ inserts; see [transaction behavior](/docs/reference/statements/transactions/).
 
 ## Related
 
-- [CREATE TABLE](/docs/reference/statements/create-table/) — define the target table.
-- [COPY](/docs/reference/statements/copy/) — stream Arrow IPC data from a client.
-- [SELECT](/docs/reference/statements/select/) — construct an input query.
+- [CREATE TABLE](/docs/reference/statements/create-table/) - define the target table.
+- [COPY](/docs/reference/statements/copy/) - stream Arrow IPC data from a client.
+- [SELECT](/docs/reference/statements/select/) - construct an input query.
