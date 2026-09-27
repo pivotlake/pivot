@@ -406,7 +406,8 @@ stages_after() {
             { [[ -n "$1" ]] && echo "workers: $1"
               printf 'server:\n  bind: 127.0.0.1:%s\ndatastores:\n  default:\n    kind: pivot\n    location: %s\n    default: true\n    compact: false\nusers:\n  postgres:\n    auth:\n      method: trust\n' "$port" "$catalog"
             } >"$config"
-            nohup "$bin" server --config "$config" >/tmp/ab-stages.log 2>&1 &
+            # A second argument is extra server environment (KEY=VALUE ...).
+            env $2 nohup "$bin" server --config "$config" >/tmp/ab-stages.log 2>&1 &
             pid=$!
             for _ in $(seq 1 300); do ./check >/dev/null 2>&1 && break; sleep 1; done
             ./load >/dev/null 2>&1 || true
@@ -428,9 +429,11 @@ else:
     print("no timings")
 '
         }
-        for workers in "" 96; do
-            start_with_workers "$workers"
-            echo ">>> stages: workers=${workers:-default}, median of 10 hot runs (ms)"
+        for setup in "default:" "default:PIVOT_SPIN_LIMIT=2000000" "96:"; do
+            local workers="${setup%%:*}" extra_env="${setup#*:}"
+            [[ "$workers" == default ]] && workers=""
+            start_with_workers "$workers" "$extra_env"
+            echo ">>> stages: workers=${workers:-default} ${extra_env}, median of 10 hot runs (ms)"
             for n in 0 1 6 19 2 7 24 38 40 13 22; do
                 local sql
                 sql="$(sed -n "$((n + 1))p" queries.sql)"
@@ -446,7 +449,7 @@ else:
                     sudo perf record -a -e sched:sched_waking,sched:sched_switch,syscalls:sys_exit_recvfrom,syscalls:sys_enter_sendto \
                         -o /tmp/ab-sched.data -- bash -c "sleep 0.3; psql -h 127.0.0.1 -p $port -U postgres -d postgres -q -o /dev/null -c \"$sql\"; sleep 0.05" >/dev/null 2>&1 || true
                     sudo perf script -i /tmp/ab-sched.data -F comm,tid,cpu,time,event,trace 2>/dev/null >/tmp/ab-sched.txt || true
-                    echo "--- sched Q$n (workers=default)"
+                    echo "--- sched Q$n (workers=default ${extra_env})"
                     sudo python3 - "$pid" "$qlen" /tmp/ab-sched.txt <<'PY' || true
 import re, sys, os, collections
 pid, qlen, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
