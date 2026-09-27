@@ -269,19 +269,31 @@ profile_after() {
             ./query <"$qfile" >/dev/null 2>&1 || true
             echo "--- profile Q$n: $(cut -c1-110 "$qfile")"
             echo "    timing: $(./query <"$qfile" 2>&1 >/dev/null | tail -1)s"
+            # perf attaches to every worker thread before it counts or
+            # samples, which on a big box takes longer than a hot query
+            # runs, so perf starts first, the query runs once it is
+            # attached, and an interrupt ends the measurement.
+            measure() {
+                sudo "$@" >/tmp/ab-perf.out 2>&1 &
+                local perf_pid=$!
+                sleep 2
+                ./query <"$qfile" >/dev/null 2>&1 || true
+                sudo kill -INT "$perf_pid" 2>/dev/null || true
+                wait "$perf_pid" 2>/dev/null || true
+            }
             # Generic event names, one group per line: a name the box's PMU
             # lacks then costs only that line, and `cycles` is spelled out
             # because some boxes alias it to an uncore PMU as well.
             for events in task-clock,context-switches,page-faults,cpu-cycles,instructions,branch-misses \
                           stall_frontend,stall_backend l1d_cache_refill,l2d_cache_refill,l3d_cache_refill \
                           ls_dmnd_fills_from_sys.dram_io_near,de_no_dispatch_per_slot.backend_stalls; do
-                sudo perf stat -e "$events" -p "$pid" -- ./query <"$qfile" 2>&1 >/dev/null \
-                    | grep -E '^\s+[0-9,.]+\s+[a-z]' | sed 's/^/    /' || true
+                measure perf stat -e "$events" -p "$pid"
+                grep -E '^\s+[0-9,.]+\s+[a-z]|not (counted|supported)' /tmp/ab-perf.out | sed 's/^/    /' || true
             done
             # Time-based sampling: it needs no PMU event and so profiles the
             # same way on every box.
-            sudo perf record -e cpu-clock -F 4000 -p "$pid" -o /tmp/ab-prof.data -- ./query <"$qfile" 2>&1 >/dev/null \
-                | grep -vE '^\s*$' | tail -2 | sed 's/^/    perf record: /' || true
+            measure perf record -e cpu-clock -F 4000 -p "$pid" -o /tmp/ab-prof.data
+            grep -vE '^\s*$' /tmp/ab-perf.out | tail -1 | sed 's/^/    perf record: /' || true
             sudo perf report -i /tmp/ab-prof.data --no-children --sort sym --stdio -g none --percent-limit 1.5 2>&1 \
                 | grep -E '^\s+[0-9.]+%|[Ee]rror|[Ff]ail' | head -30 | cut -c1-220 || true
         done
