@@ -187,6 +187,6 @@ query form. The clauses and join forms above describe the supported surface.
 
 ## Related
 
-- [EXPLAIN](/docs/reference/statements/explain/) — inspect a query plan.
-- [VALUES](/docs/reference/statements/values/) — construct rows directly.
-- [System tables](/docs/reference/system-tables/) — query server metadata.
+- [EXPLAIN](/docs/reference/statements/explain/) - inspect a query plan.
+- [VALUES](/docs/reference/statements/values/) - construct rows directly.
+- [System tables](/docs/reference/system-tables/) - query server metadata.

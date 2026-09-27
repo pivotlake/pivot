@@ -42,6 +42,6 @@ no two have overlapping sort-key ranges within a partition.
 
 ## Related
 
-- [Datastore maintenance](/docs/reference/server/datastores/#maintenance) — background compaction and its settings.
-- [CREATE TABLE sorting](/docs/reference/statements/create-table/#sorting) — choose sort columns.
-- [System tables](/docs/reference/system-tables/) — inspect file and table metadata.
+- [Datastore maintenance](/docs/reference/server/datastores/#maintenance) - background compaction and its settings.
+- [CREATE TABLE sorting](/docs/reference/statements/create-table/#sorting) - choose sort columns.
+- [System tables](/docs/reference/system-tables/) - inspect file and table metadata.

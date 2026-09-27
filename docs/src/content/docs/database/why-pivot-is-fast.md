@@ -10,7 +10,7 @@ Although database performance comes from many different optimization strategies 
 ### It utilizes the hardware well.
 
 #### Utilizing the CPU cache
-Modern analytical engines are often bound by memory access rather than computation. A simple integer comparison may take roughly 1 CPU cycle (<1 ns), while fetching data from DRAM can take on the order of 70–100 ns — hundreds of CPU cycles.
+Modern analytical engines are often bound by memory access rather than computation. A simple integer comparison may take roughly 1 CPU cycle (<1 ns), while fetching data from DRAM can take on the order of 70–100 ns, or hundreds of CPU cycles.
 
 This makes effective use of the CPU cache hierarchy critical for analytical workloads. Data in the CPU’s L1 cache can typically be accessed in ~1 ns, L2 in ~3–5 ns, and L3 in ~10–20 ns, compared with ~70–100 ns for DRAM. Keeping data close to the CPU can therefore improve a query's performance by one to two orders of magnitude.
 
@@ -306,7 +306,7 @@ LIMIT 10;
 
 Although the query selects many columns, only country and last_activity are needed to determine which 10 rows should be returned. Instead of immediately reading and decoding every selected column, Pivot can first process the columns required for filtering and Top-K selection.
 
-Once the 10 matching rows have been identified, the remaining columns—such as name, email, city, company, job_title, profile_image_url, and bio—can be materialized only for the surviving rows.
+Once the 10 matching rows have been identified, the remaining columns (such as name, email, city, company, job_title, profile_image_url, and bio) can be materialized only for the surviving rows.
 
 For wide tables or highly selective queries, this can significantly reduce the amount of data read, decoded, and processed. For example, on ClickBench Q23 (a query of a similar shape) running on a c8g.4xlarge instance with late materialization on and off:
 
@@ -348,10 +348,10 @@ SELECT * FROM events WHERE country = 'IL';
 
 Pivot can eliminate work at several levels:
 
-- **Dictionary-based pruning** — if the country column is [dictionary-encoded](https://parquet.apache.org/docs/file-format/data-pages/encodings/#DICTIONARY), Pivot can first check whether "IL" exists in the dictionary of that column. If it does not, every data page referencing that dictionary can be skipped without decompressing or decoding it.
-- **Page-level pruning** — even when a row group contains matching rows, many of its pages may contain none of the rows that need to be read. Pivot uses the selected row positions to identify these pages and skips their decompression and decoding entirely.
-- **Selective decoding** — for pages that do need to be read, Pivot passes the surviving row positions down into the Parquet reader. Where the encoding allows, values belonging to unwanted rows can be skipped without being decoded at all.
-- **Bloom-filter pruning (coming soon)** — Pivot will also use Parquet Bloom filters to quickly determine that a row group cannot contain a requested value, allowing it to be skipped entirely.
+- **Dictionary-based pruning** - if the country column is [dictionary-encoded](https://parquet.apache.org/docs/file-format/data-pages/encodings/#DICTIONARY), Pivot can first check whether "IL" exists in the dictionary of that column. If it does not, every data page referencing that dictionary can be skipped without decompressing or decoding it.
+- **Page-level pruning** - even when a row group contains matching rows, many of its pages may contain none of the rows that need to be read. Pivot uses the selected row positions to identify these pages and skips their decompression and decoding entirely.
+- **Selective decoding** - for pages that do need to be read, Pivot passes the surviving row positions down into the Parquet reader. Where the encoding allows, values belonging to unwanted rows can be skipped without being decoded at all.
+- **Bloom-filter pruning (coming soon)** - Pivot will also use Parquet Bloom filters to quickly determine that a row group cannot contain a requested value, allowing it to be skipped entirely.
 
 ### It works well with the OS
 Linux is an amazing operating system. It can run a wide variety of workloads with great performance and stability. However, like many low-level systems, it is difficult to build a “generalist” system or algorithm that performs optimally across very different workloads.
@@ -504,6 +504,6 @@ As a complement to its thread-per-core architecture, Pivot uses io_uring for I/O
 
 Pivot also avoids relying on the operating system’s page cache for caching disk data, as some other databases such as ClickHouse do by default. Instead, it uses direct I/O together with its own dedicated caching system.
 
-Managing the cache directly gives Pivot more control over what memory is used for. Rather than having disk pages cached independently by the operating system, Pivot can make eviction decisions across different types of cached data—for example, choosing between compressed data read from disk and decompressed or otherwise processed data that is more expensive to reconstruct.
+Managing the cache directly gives Pivot more control over what memory is used for. Rather than having disk pages cached independently by the operating system, Pivot can make eviction decisions across different types of cached data, for example choosing between compressed data read from disk and decompressed or otherwise processed data that is more expensive to reconstruct.
 
 Because these decisions are made by the database itself, Pivot can prioritize cached objects based on their actual value to query execution, rather than relying on the more general-purpose caching policies of the operating system.

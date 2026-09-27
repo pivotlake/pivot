@@ -41,8 +41,8 @@ Read catalog, file, and memory metadata through the read-only tables of the
 
 ## Beyond SQL
 
-- [CLI reference](/docs/reference/cli/) — `pivot open`, `pivot server`, and shell commands.
-- [Configuration file](/docs/reference/configuration/) — every key of the server's YAML file, with
+- [CLI reference](/docs/reference/cli/) - `pivot open`, `pivot server`, and shell commands.
+- [Configuration file](/docs/reference/configuration/) - every key of the server's YAML file, with
   sub-pages for [datastores and storage credentials](/docs/reference/server/datastores/) and
   [users and authentication](/docs/reference/server/authentication/).
 

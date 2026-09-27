@@ -177,9 +177,9 @@ The catalog also exposes a read-only "virtual" [system tables datastore](/docs/r
 A datastore is a collection of schemas and tables exposed to Pivot through a common interface. Each configured datastore implementation handles table discovery, metadata, snapshots, and supported read and write operations for its underlying storage or table format.
 
 Pivot currently supports/exposes the following datastores:
-* Pivot — A collection of Delta Lake tables.
-* Iceberg — Tables stored using the Apache Iceberg table format.
-* System — Internal tables exposing information about the running Pivot instance.
+* Pivot - A collection of Delta Lake tables.
+* Iceberg - Tables stored using the Apache Iceberg table format.
+* System - Internal tables exposing information about the running Pivot instance.
 
 A server can expose multiple datastores, with tables addressed as `datastore.schema.table`.
 
@@ -205,9 +205,9 @@ datastore and executes the join in the same query engine.
 The metastore is a collective of configurations and secrets that declare the metadata a pivot instance needs for it to run.
 
 These include:
-- Datastores — their names, implementations, locations, and settings, including which datastore is the default for unqualified table names.
-- Secrets — credentials for accessing object storage, scoped to the locations they apply to. Multiple datastores can use the same secret.
-- Users — which users are authored to access pivot, and how do they authenticate.
+- Datastores - their names, implementations, locations, and settings, including which datastore is the default for unqualified table names.
+- Secrets - credentials for accessing object storage, scoped to the locations they apply to. Multiple datastores can use the same secret.
+- Users - which users are authored to access pivot, and how do they authenticate.
 
 Thanks to the separation of datastores and metastore, different instances / deployments of pivot might access different /overlapping datastores with different permission models and with different configurations:
 
