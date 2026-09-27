@@ -302,6 +302,93 @@ profile_after() {
     ) || true
 }
 
+# How the AFTER build scales with its worker count on this box, and where a
+# hot query's CPUs sit idle: hot times (best of six) per worker count, then a
+# system-wide timeline of one hot query in 200us buckets that splits the
+# samples into worker compute, worker spin, other server threads, and idle.
+# Best effort, printed to stdout like the profile above.
+scaling_after() {
+    local bin="$1" port=7797 catalog=/tmp/ab-cat-scaling
+    local adapter="$clickbench_dir/pivot-parquet"
+    (
+        cd "$adapter"
+        export PIVOT_SOURCE="$source_path" PIVOT_PORT="$port" PIVOT_CATALOG="$catalog"
+        local config=/tmp/ab-scaling.yaml pid qfile
+        qfile="$(mktemp)"
+        start_with_workers() {
+            mkdir -p "$catalog"
+            { [[ -n "$1" ]] && echo "workers: $1"
+              printf 'server:\n  bind: 127.0.0.1:%s\ndatastores:\n  default:\n    kind: pivot\n    location: %s\n    default: true\n    compact: false\nusers:\n  postgres:\n    auth:\n      method: trust\n' "$port" "$catalog"
+            } >"$config"
+            nohup "$bin" server --config "$config" >/tmp/ab-scaling.log 2>&1 &
+            pid=$!
+            for _ in $(seq 1 300); do ./check >/dev/null 2>&1 && break; sleep 1; done
+            ./load >/dev/null 2>&1 || true
+        }
+        stop_server() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+        best_of() {
+            local best=""
+            for _ in 1 2 3 4 5 6; do
+                local t
+                t="$(./query <"$qfile" 2>&1 >/dev/null | tail -1)"
+                [[ -z "$best" ]] || awk -v a="$t" -v b="$best" 'BEGIN{exit !(a<b)}' && best="$t"
+            done
+            echo "$best"
+        }
+        echo ">>> scaling: hot best-of-6 ms per worker count ($(nproc) cpus)"
+        for workers in "" 96 48 24; do
+            start_with_workers "$workers"
+            local line="    workers=${workers:-default}:"
+            for n in 0 1 6 19 40 24 13 32 22; do
+                sed -n "$((n + 1))p" queries.sql >"$qfile"
+                ./query <"$qfile" >/dev/null 2>&1 || true
+                line="$line Q$n=$(awk -v t="$(best_of)" 'BEGIN{printf "%.1f", t*1000}')"
+            done
+            echo "$line"
+            stop_server
+            rm -rf "$catalog"
+        done
+        start_with_workers ""
+        local server_comm
+        server_comm="$(cut -c1-15 /proc/"$pid"/comm)"
+        for n in 1 6 13; do
+            sed -n "$((n + 1))p" queries.sql >"$qfile"
+            ./query <"$qfile" >/dev/null 2>&1 || true
+            ./query <"$qfile" >/dev/null 2>&1 || true
+            sudo perf record -a -e cpu-clock -F 5000 -o /tmp/ab-timeline.data -- \
+                bash -c "sleep 0.3; ./query <'$qfile' >/dev/null 2>&1; sleep 0.3" >/dev/null 2>&1 || true
+            echo "--- timeline Q$n (200us buckets: work/spin/other-server/idle cpus-equivalent, of $(nproc))"
+            sudo perf script -i /tmp/ab-timeline.data -F comm,time,ip,sym 2>/dev/null | awk -v server="$server_comm" -v cpus="$(nproc)" '
+                {
+                    comm = $1; t = $2 + 0; sym = $4
+                    for (i = 5; i <= NF; i++) sym = sym " " $i
+                    bucket = int(t * 5000)
+                    # A tickless idle cpu takes no samples, so idle is what
+                    # the busy classes leave of the cpu count.
+                    if (comm == "swapper") next
+                    else if (comm == server) class = (sym ~ /Worker.*run|spin|park|yield|futex|schedule|pause/) ? "spin" : "work"
+                    else if (comm ~ /^tokio/) class = "other"
+                    else class = "rest"
+                    count[bucket " " class]++
+                    total[bucket]++
+                    if (class == "work" || class == "other") busy[bucket] = 1
+                }
+                END {
+                    first = ""; last = ""
+                    for (b in busy) { if (first == "" || b + 0 < first + 0) first = b; if (last == "" || b + 0 > last + 0) last = b }
+                    if (first == "") exit
+                    for (b = first - 2; b <= last + 2; b++) {
+                        # 5000 Hz over 200us is one sample per busy cpu per bucket
+                        printf "    %+6.1fms work=%3d spin=%3d other=%2d idle=%3d\n", (b - first) * 0.2, count[b " work"], count[b " spin"], count[b " other"], cpus - total[b]
+                    }
+                }' | head -120
+        done
+        stop_server
+        rm -rf "$catalog" "$qfile"
+        sudo rm -f /tmp/ab-timeline.data
+    ) || true
+}
+
 # Turn a harness log into "idx cold hot" rows: idx is the 0-based position of the
 # query, cold is the first try, hot is the min of the remaining tries ("null" if
 # any needed value is missing). The harness prints one "[t1,t2,t3]," line per
@@ -341,6 +428,7 @@ echo ">>> timing AFTER through ClickBench harness"
 run_harness "$after_bin" "$after_out" 7798 /tmp/ab-cat-after
 parse_timings "$after_out" >"$after_tsv"
 profile_after "$after_bin" 7798 /tmp/ab-cat-after
+scaling_after "$after_bin"
 
 # Join by query index and render the cold/hot diff. Gate on hot: a query whose
 # hot time is >= regression_pct slower after than before fails the run. Labels
