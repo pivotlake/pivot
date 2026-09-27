@@ -389,6 +389,111 @@ scaling_after() {
     ) || true
 }
 
+# Where a hot query's time goes on this box, per worker count: the server's own
+# compile/exec split (its pivot_stats notice) against the client's total, and a
+# scheduler trace of a couple of hot queries summarized as the gaps and wake-up
+# fan-out between the query arriving and its reply. Best effort, printed to
+# stdout like the profile above.
+stages_after() {
+    local bin="$1" port=7797 catalog=/tmp/ab-cat-stages
+    local adapter="$clickbench_dir/pivot-parquet"
+    (
+        cd "$adapter"
+        export PIVOT_SOURCE="$source_path" PIVOT_PORT="$port" PIVOT_CATALOG="$catalog"
+        local config=/tmp/ab-stages.yaml pid
+        start_with_workers() {
+            mkdir -p "$catalog"
+            { [[ -n "$1" ]] && echo "workers: $1"
+              printf 'server:\n  bind: 127.0.0.1:%s\ndatastores:\n  default:\n    kind: pivot\n    location: %s\n    default: true\n    compact: false\nusers:\n  postgres:\n    auth:\n      method: trust\n' "$port" "$catalog"
+            } >"$config"
+            nohup "$bin" server --config "$config" >/tmp/ab-stages.log 2>&1 &
+            pid=$!
+            for _ in $(seq 1 300); do ./check >/dev/null 2>&1 && break; sleep 1; done
+            ./load >/dev/null 2>&1 || true
+        }
+        stop_server() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+        stage_medians() {
+            local sql="$1"
+            { echo "SET pivot_stats = 1;"; echo '\timing on'; for _ in $(seq 1 12); do echo "$sql;"; done; } \
+                | psql -h 127.0.0.1 -p "$port" -U postgres -d postgres -o /dev/null 2>&1 \
+                | python3 -c '
+import re, sys, statistics
+text = sys.stdin.read()
+stats = re.findall(r"compile=([0-9.]+)ms exec=([0-9.]+)ms", text)[-10:]
+times = [float(t) for t in re.findall(r"Time: ([0-9.]+)", text)][-10:]
+if stats and times:
+    med = lambda values: statistics.median(values)
+    print("compile %.2f exec %.2f total %.2f" % (med([float(c) for c, _ in stats]), med([float(e) for _, e in stats]), med(times)))
+else:
+    print("no timings")
+'
+        }
+        for workers in "" 96; do
+            start_with_workers "$workers"
+            echo ">>> stages: workers=${workers:-default}, median of 10 hot runs (ms)"
+            for n in 0 1 6 19 2 7 24 38 40 13 22; do
+                local sql
+                sql="$(sed -n "$((n + 1))p" queries.sql)"
+                echo "    Q$n: $(stage_medians "${sql%;}")"
+            done
+            if [[ -z "$workers" ]]; then
+                for n in 0 40; do
+                    local sql qlen
+                    sql="$(sed -n "$((n + 1))p" queries.sql)"
+                    sql="${sql%;}"
+                    qlen=$(( $(printf '%s' "$sql" | wc -c) + 6 ))
+                    for _ in 1 2 3; do psql -h 127.0.0.1 -p "$port" -U postgres -d postgres -q -o /dev/null -c "$sql" >/dev/null 2>&1; done
+                    sudo perf record -a -e sched:sched_waking,sched:sched_switch,syscalls:sys_exit_recvfrom,syscalls:sys_enter_sendto \
+                        -o /tmp/ab-sched.data -- bash -c "sleep 0.3; psql -h 127.0.0.1 -p $port -U postgres -d postgres -q -o /dev/null -c \"$sql\"; sleep 0.05" >/dev/null 2>&1 || true
+                    sudo perf script -i /tmp/ab-sched.data -F comm,tid,cpu,time,event,trace 2>/dev/null >/tmp/ab-sched.txt || true
+                    echo "--- sched Q$n (workers=default)"
+                    sudo python3 - "$pid" "$qlen" /tmp/ab-sched.txt <<'PY' || true
+import re, sys, os, collections
+pid, qlen, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+names = {t: open(f'/proc/{pid}/task/{t}/comm').read().strip() for t in os.listdir(f'/proc/{pid}/task')}
+rows = []
+for l in open(path):
+    m = re.match(r'\s*(.+?)\s+(\d+)\s+\[(\d+)\]\s+([\d.]+):\s+(\S+):\s*(.*)', l)
+    if m:
+        rows.append((float(m.group(4)), m.group(2), m.group(5), m.group(6)))
+recv = [t for t, tid, e, r in rows if 'exit_recvfrom' in e and tid in names and r.split()[-1].startswith('0x') and int(r.split()[-1], 16) == qlen]
+if not recv:
+    print("    no query receive found"); sys.exit()
+t0 = recv[-1]
+sends = [t for t, tid, e, r in rows if 'sendto' in e and tid in names and t > t0]
+tend = max(sends) if sends else t0
+print("    server receive -> last send: %.0f us" % ((tend - t0) * 1e6))
+kinds = {t: ('tokio' if n.startswith('tokio') else ('worker' if t != pid and n == names[pid] else 'other')) for t, n in names.items()}
+buckets = collections.defaultdict(lambda: collections.Counter())
+first_on = {}
+for t, tid, e, r in rows:
+    if not (t0 <= t <= tend):
+        continue
+    d = (t - t0) * 1e6
+    if e == 'sched:sched_waking':
+        tgt = re.search(r'pid=(\d+)', r).group(1)
+        if tgt in names:
+            waker = kinds.get(tid, 'ext')
+            buckets[int(d // 100)][waker + '>' + kinds[tgt]] += 1
+    elif e == 'sched:sched_switch':
+        mm = re.search(r'==> .*:(\d+) \[', r)
+        if mm and mm.group(1) in names and mm.group(1) not in first_on:
+            first_on[mm.group(1)] = d
+for b in sorted(buckets):
+    print("    %5d-%5dus wakes: %s" % (b * 100, (b + 1) * 100, ', '.join('%s x%d' % kv for kv in buckets[b].most_common(4))))
+w = sorted(v for k, v in first_on.items() if kinds.get(k) == 'worker')
+if w:
+    print("    workers first on-cpu: n=%d first %.0fus median %.0fus last %.0fus" % (len(w), w[0], w[len(w) // 2], w[-1]))
+PY
+                done
+            fi
+            stop_server
+            rm -rf "$catalog"
+        done
+        sudo rm -f /tmp/ab-sched.data /tmp/ab-sched.txt
+    ) || true
+}
+
 # Turn a harness log into "idx cold hot" rows: idx is the 0-based position of the
 # query, cold is the first try, hot is the min of the remaining tries ("null" if
 # any needed value is missing). The harness prints one "[t1,t2,t3]," line per
@@ -427,8 +532,7 @@ parse_timings "$before_out" >"$before_tsv"
 echo ">>> timing AFTER through ClickBench harness"
 run_harness "$after_bin" "$after_out" 7798 /tmp/ab-cat-after
 parse_timings "$after_out" >"$after_tsv"
-profile_after "$after_bin" 7798 /tmp/ab-cat-after
-scaling_after "$after_bin"
+stages_after "$after_bin"
 
 # Join by query index and render the cold/hot diff. Gate on hot: a query whose
 # hot time is >= regression_pct slower after than before fails the run. Labels
