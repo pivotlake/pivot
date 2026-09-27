@@ -23,6 +23,39 @@ Layout: one directory per table (`<root>/lineitem/lineitem.N.parquet`, ...).
 Types are tpchgen's parquet output: BIGINT keys, DECIMAL(15,2) money columns,
 real DATEs.
 
+SF1000 (~396 GB) is not hosted; generating it takes about 2.5 minutes on 192
+cores, faster than any sync. It needs tpchgen-cli 2.0.1 on PATH
+(`cargo install tpchgen-cli --version 2.0.1 --locked`):
+
+```sh
+./gen-tpch-data.sh --scale 1000 --root /mnt/nvme/tpch/sf1000
+```
+
+## Other engines
+
+`run-duckdb.sh`, `run-clickhouse.sh` and `run-datafusion.sh` run the same
+query files through DuckDB, ClickHouse and DataFusion for side-by-side
+numbers. All three read the parquet directories pivot reads; DuckDB and
+ClickHouse also read their native formats, which `load-native-dbs.sh` loads
+from a parquet dataset so every engine holds exactly the same rows. All three
+print the same `=== qNN ===` / `Run Time` lines, so one parser reads any of
+them.
+
+```sh
+./run-duckdb.sh --source ~/tpch-sf100
+./run-clickhouse.sh --data parquet --source ~/tpch-sf100
+./run-datafusion.sh --source ~/tpch-sf100
+./load-native-dbs.sh --source ~/tpch-sf100 --root /mnt/nvme   # → tpch-native.duckdb, clickhouse/
+./run-duckdb.sh --data native --source /mnt/nvme/tpch-native.duckdb
+./run-clickhouse.sh --source /mnt/nvme/clickhouse
+```
+
+The TPC-H A/B workflow (`.github/workflows/tpch-ab.yml`) streams the suite
+through any of these as reference columns (`engines: all`, or a list of
+`duckdb-parquet`, `clickhouse-parquet`, `datafusion-parquet`, `duckdb-native`,
+`clickhouse-native`), and measures SF100 or, on a `c8gd.metal-48xl` whose six
+NVMe disks the box stripes into one array, SF1000 (`scale: sf1000`).
+
 ## Queries
 
 Official TPC-H query texts (default substitution parameters), added one by one
@@ -64,6 +97,7 @@ side probing into the outer rows.
 
 q11's HAVING threshold is the spec's `FRACTION = 0.0001 / SF`, written out for
 SF100 as `0.000001`; adjust it (and regenerate the oracle) for another scale.
+The A/B harness rewrites it to `0.0000001` when it measures SF1000.
 q11 also carries one deviation from the official text: `ps_partkey` as a
 second sort key, because at SF100 several part keys sum to the same `value`
 and the byte-exact oracle comparison needs a deterministic row order. q15

@@ -9,9 +9,15 @@ name: TPC-H A/B
 # power runs: per side and pass, one pivot-bench process streams the whole
 # suite, each query once, 500ms apart, caches dropped only before the stream.
 # Cold is the per-query min across passes; a cold regression past the
-# threshold, or an output mismatch between the sides, fails the run. With
-# run_duckdb, DuckDB streams the suite the same way through
-# benchmarks/tpch/run-duckdb.sh as a reference column that never gates.
+# threshold, or an output mismatch between the sides, fails the run. The
+# engines input adds reference columns that never gate, one stream each in
+# the same shape: DuckDB, ClickHouse and DataFusion over the same parquet, and
+# DuckDB and ClickHouse over their native storage, loaded on the box from the
+# measured parquet (benchmarks/tpch/run-{duckdb,clickhouse,datafusion}.sh).
+#
+# scale picks the dataset: sf100 syncs the pivot-written SF100 from S3; sf1000
+# generates SF1000 (~396GB) on the box, which needs ~2TB of instance store:
+# pick instance_type c8gd.metal-48xl (six NVMe disks, striped into one array).
 #
 # Manual trigger only.
 #
@@ -33,7 +39,8 @@ name: TPC-H A/B
 # Optional repository variables (defaults in parentheses):
 #   TPCH_AB_REGION        (eu-central-1)
 #   TPCH_AB_INSTANCE_TYPE (c8gd.4xlarge) - instance-store NVMe required; keep
-#                         one type so timings stay comparable across runs
+#                         one type so timings stay comparable across runs; the
+#                         instance_type input overrides it per run
 #   TPCH_AB_KEY_NAME      - EC2 key pair matching PERF_SSH_KEY
 #   TPCH_AB_SUBNET_ID / TPCH_AB_SECURITY_GROUP  (account defaults) - the
 #                         security group must allow ssh from the runner
@@ -72,10 +79,23 @@ on:
         description: "Cold-time regression threshold (percent) that fails the run."
         required: false
         default: "5"
-      run_duckdb:
-        description: "Also stream the suite through DuckDB (run-duckdb.sh) as a reference column (never gates)."
-        type: boolean
-        default: false
+      scale:
+        description: "sf100 = pivot-written SF100 synced from S3. sf1000 = SF1000 generated on the box (needs instance_type c8gd.metal-48xl)."
+        type: choice
+        options: [sf100, sf1000]
+        default: sf100
+      instance_type:
+        description: "EC2 instance type (instance-store NVMe required). Empty = the TPCH_AB_INSTANCE_TYPE variable, else c8gd.4xlarge."
+        required: false
+        default: ""
+      engines:
+        description: "Reference columns (never gate), comma-separated: duckdb-parquet, clickhouse-parquet, datafusion-parquet, duckdb-native, clickhouse-native; 'all' = every one. Empty = pivot only."
+        required: false
+        default: ""
+      reference_timeout:
+        description: "Per-query cap in seconds for the ClickHouse and DataFusion columns; a capped query shows no time."
+        required: false
+        default: "600"
       bench_env:
         description: "Extra env for both sides' runs, space-separated KEY=VALUE (e.g. PIVOT_COMPRESSED_CACHE_PCT=70)."
         required: false
@@ -85,13 +105,17 @@ jobs:
   tpch-ab:
     name: TPC-H A/B on a fresh box
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # SF1000 adds the dataset generation, native loads of ~6 billion lineitem
+    # rows and far longer streams.
+    timeout-minutes: ${{ inputs.scale == 'sf1000' && 350 || 180 }}
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.PERF_AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.PERF_AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ vars.TPCH_AB_REGION || 'eu-central-1' }}
       DATA_BUCKET: ${{ vars.TPCH_AB_DATA_BUCKET_NORM }}
       CACHE_PREFIX: ${{ vars.TPCH_AB_CACHE_PREFIX }}
+      # Minutes after launch the box halts itself; matches the job timeout.
+      BOX_LIFETIME_MINUTES: ${{ inputs.scale == 'sf1000' && 360 || 180 }}
 
     steps:
       # No submodules: the box resolves sources from its baked clone. The full
@@ -120,7 +144,7 @@ jobs:
       - name: Launch a fresh box
         env:
           AMI_ID: ${{ vars.TPCH_AB_AMI_ID }}
-          INSTANCE_TYPE: ${{ vars.TPCH_AB_INSTANCE_TYPE || 'c8gd.4xlarge' }}
+          INSTANCE_TYPE: ${{ inputs.instance_type || vars.TPCH_AB_INSTANCE_TYPE || 'c8gd.4xlarge' }}
           KEY_NAME: ${{ vars.TPCH_AB_KEY_NAME }}
           INSTANCE_PROFILE: ${{ vars.TPCH_AB_INSTANCE_PROFILE }}
           SUBNET_ID: ${{ vars.TPCH_AB_SUBNET_ID }}
@@ -141,15 +165,16 @@ jobs:
           [ -n "$SUBNET_ID" ] && args+=(--subnet-id "$SUBNET_ID")
           [ -n "$SECURITY_GROUP" ] && args+=(--security-group-ids "$SECURITY_GROUP")
 
-          # Belt-and-braces leak guard: the instance halts itself after 3h and
-          # a halt terminates it (shutdown behavior above), so a runner that
-          # dies mid-job cannot leave the box running forever.
+          # Belt-and-braces leak guard: the instance halts itself once the job
+          # could no longer be running and a halt terminates it (shutdown
+          # behavior above), so a runner that dies mid-job cannot leave the
+          # box running forever.
           id=$(aws ec2 run-instances "${args[@]}" \
-            --user-data '#!/bin/bash
-          shutdown -h +180' \
+            --user-data "#!/bin/bash
+          shutdown -h +$BOX_LIFETIME_MINUTES" \
             --query 'Instances[0].InstanceId' --output text)
           echo "INSTANCE_ID=$id" >> "$GITHUB_ENV"
-          echo "Launched $id"
+          echo "Launched $id ($INSTANCE_TYPE)"
 
           aws ec2 wait instance-running --instance-ids "$id"
           ip=$(aws ec2 describe-instances --instance-ids "$id" \
@@ -180,7 +205,8 @@ jobs:
             ServerAliveInterval 20
             ConnectTimeout 15
           EOF
-          for _ in $(seq 1 60); do
+          # Metal instances take far longer to boot than virtualized ones.
+          for _ in $(seq 1 180); do
             if ssh box true 2>/dev/null; then
               echo "SSH is up."; exit 0
             fi
@@ -196,7 +222,9 @@ jobs:
           QUERY: ${{ inputs.query }}
           PASSES: ${{ inputs.passes }}
           REGRESSION_PCT: ${{ inputs.regression_pct }}
-          RUN_DUCKDB: ${{ inputs.run_duckdb }}
+          SCALE: ${{ inputs.scale }}
+          ENGINES: ${{ inputs.engines }}
+          REFERENCE_TIMEOUT: ${{ inputs.reference_timeout }}
           BENCH_ENV: ${{ inputs.bench_env }}
           # Ephemeral, repo-read token: lets the box fetch the two commits into
           # its baked clone. It expires when the job ends and the box is
@@ -204,18 +232,24 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Ship the harness, its shared library and the DuckDB runner from
+          # Ship the harness, its shared library and its helper scripts from
           # the run's commit (the 'before' commit may predate them). The
-          # harness finds both siblings by relative path, so all three land in
+          # harness finds its siblings by relative path, so they all land in
           # the same /tmp directory.
-          scp -F "$HOME/.ssh/config" benchmarks/tpch/bench-tpch-ab.sh box:/tmp/bench-tpch-ab.sh
-          scp -F "$HOME/.ssh/config" benchmarks/lib/bench-ab-common.sh box:/tmp/bench-ab-common.sh
-          scp -F "$HOME/.ssh/config" benchmarks/tpch/run-duckdb.sh box:/tmp/run-duckdb.sh
+          scp -F "$HOME/.ssh/config" \
+            benchmarks/tpch/bench-tpch-ab.sh \
+            benchmarks/lib/bench-ab-common.sh \
+            benchmarks/tpch/run-duckdb.sh \
+            benchmarks/tpch/run-clickhouse.sh \
+            benchmarks/tpch/run-datafusion.sh \
+            benchmarks/tpch/load-native-dbs.sh \
+            benchmarks/tpch/gen-tpch-data.sh \
+            box:/tmp/
 
           query_arg=""
           [ -n "$QUERY" ] && query_arg="--query '$QUERY'"
-          duckdb_arg=""
-          [ "$RUN_DUCKDB" = "true" ] && duckdb_arg="--duckdb"
+          engines_arg=""
+          [ -n "$ENGINES" ] && engines_arg="--engines '$ENGINES'"
           env_arg=""
           [ -n "$BENCH_ENV" ] && env_arg="--bench-env '$BENCH_ENV'"
 
@@ -227,10 +261,10 @@ jobs:
             --before '$BEFORE_SHA' --after '$AFTER_SHA' \
             --before-label '${BEFORE_SHA:0:12}' --after-label '${AFTER_SHA:0:12}' \
             --data-bucket '$DATA_BUCKET' --cache-prefix '$CACHE_PREFIX' \
-            --mode '$BUILD_MODE' --passes '$PASSES' \
-            --regression-pct '$REGRESSION_PCT' \
+            --mode '$BUILD_MODE' --scale '$SCALE' --passes '$PASSES' \
+            --regression-pct '$REGRESSION_PCT' --reference-timeout '$REFERENCE_TIMEOUT' \
             --report /tmp/ab-report.txt \
-            $query_arg $duckdb_arg $env_arg >/tmp/ab.log 2>&1 </dev/null &
+            $query_arg $engines_arg $env_arg >/tmp/ab.log 2>&1 </dev/null &
           EOF
           scp -F "$HOME/.ssh/config" /tmp/launch.sh box:/tmp/launch.sh
           ssh box 'bash /tmp/launch.sh && rm -f /tmp/launch.sh'
@@ -268,7 +302,7 @@ jobs:
           scp -F "$HOME/.ssh/config" box:/tmp/ab-report.txt ab-report.txt || true
           scp -F "$HOME/.ssh/config" box:/tmp/ab.log ab-full.log || true
           {
-            echo "## pivotdb TPC-H A/B ($BUILD_MODE)"
+            echo "## pivotdb TPC-H A/B ($BUILD_MODE, $SCALE)"
             echo ""
             echo "before \`${BEFORE_SHA:0:12}\` vs after \`${AFTER_SHA:0:12}\`"
             echo ""

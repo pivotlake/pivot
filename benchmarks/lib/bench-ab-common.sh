@@ -45,9 +45,11 @@ ab_common_init() {
 }
 
 # ---------------------------------------------------------------------------
-# Instance-store NVMe: find the unformatted ephemeral disk and mount it at the
-# parent of $data_root. Device names are not stable across instance types, so
-# pick by model string.
+# Instance-store NVMe: find the unformatted ephemeral disks and mount them at
+# the parent of $data_root. Device names are not stable across instance types,
+# so pick by model string. Boxes with several disks (the metal sizes carry six)
+# get them striped into one RAID0 array, so the data reads at the sum of their
+# bandwidth.
 # ---------------------------------------------------------------------------
 mount_nvme() {
     local mnt
@@ -56,13 +58,20 @@ mount_nvme() {
         echo ">>> $mnt already mounted"
         return
     fi
-    local dev
-    dev="$(lsblk -dno NAME,MODEL | awk '/Instance Storage/ {print $1; exit}')"
-    [[ -n "$dev" ]] || { echo "error: no instance-store NVMe device found" >&2; exit 1; }
-    echo ">>> formatting /dev/$dev and mounting at $mnt"
-    sudo mkfs.ext4 -q -E lazy_itable_init=1 "/dev/$dev"
+    local disks dev
+    mapfile -t disks < <(lsblk -dno NAME,MODEL | awk '/Instance Storage/ {print "/dev/" $1}')
+    [[ ${#disks[@]} -gt 0 ]] || { echo "error: no instance-store NVMe device found" >&2; exit 1; }
+    if [[ ${#disks[@]} -eq 1 ]]; then
+        dev="${disks[0]}"
+    else
+        dev="/dev/md0"
+        echo ">>> striping ${#disks[@]} instance-store disks into $dev"
+        sudo mdadm --create "$dev" --run --level=0 --raid-devices="${#disks[@]}" "${disks[@]}"
+    fi
+    echo ">>> formatting $dev and mounting at $mnt"
+    sudo mkfs.ext4 -q -E lazy_itable_init=1 "$dev"
     sudo mkdir -p "$mnt"
-    sudo mount -o noatime "/dev/$dev" "$mnt"
+    sudo mount -o noatime "$dev" "$mnt"
     sudo chown "$(id -u):$(id -g)" "$mnt"
 }
 
