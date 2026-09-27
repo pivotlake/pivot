@@ -75,9 +75,21 @@ impl Topology {
     }
 }
 
-/// The default worker count is every available core.
+/// The default worker count: every available core but one per NUMA node.
+///
+/// Each worker is pinned to its own core and spins there while it waits for
+/// work, so with a worker on every core a thread outside the pool (the query's
+/// coordinator, its result collector, the network runtime) that wakes up has
+/// to wait for the scheduler to preempt a worker, which can take milliseconds,
+/// and each query hands work to those threads several times. One free core per
+/// node keeps them runnable at once, near their node's memory.
 pub fn default_worker_count() -> usize {
-    core_affinity::get_core_ids().map_or(1, |cores| cores.len().max(1))
+    let Some(cores) = core_affinity::get_core_ids() else {
+        return 1;
+    };
+    let groups = group_cores_by_node(cores);
+    let cores: usize = groups.iter().map(Vec::len).sum();
+    cores.saturating_sub(groups.len()).max(1)
 }
 
 /// Group the cores this process may run on by NUMA node.
@@ -237,6 +249,16 @@ mod tests {
 
     fn ids(group: &[CoreId]) -> Vec<usize> {
         group.iter().map(|c| c.id).collect()
+    }
+
+    #[test]
+    fn the_default_leaves_a_core_per_node_without_a_worker() {
+        let available = core_affinity::get_core_ids().unwrap();
+        let nodes = group_cores_by_node(available.clone()).len();
+
+        let workers = default_worker_count();
+
+        assert_eq!(workers, available.len().saturating_sub(nodes).max(1));
     }
 
     #[test]
