@@ -52,6 +52,6 @@ a client; it does not read a named server-side file.
 
 ## Related
 
-- [CREATE TABLE](/docs/reference/statements/create-table/) — create the target table.
-- [INSERT](/docs/reference/statements/insert/) — append SQL values or query results.
-- [Adopt existing Parquet files](/docs/reference/statements/create-table/#adopt-existing-parquet-files) — register files already in storage.
+- [CREATE TABLE](/docs/reference/statements/create-table/) - create the target table.
+- [INSERT](/docs/reference/statements/insert/) - append SQL values or query results.
+- [Adopt existing Parquet files](/docs/reference/statements/create-table/#adopt-existing-parquet-files) - register files already in storage.
