@@ -17,10 +17,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Date32Type, Int32Type, Int64Type, TimestampMicrosecondType};
+use arrow_array::types::{Date32Type, Int32Type, Int64Type, TimestampMicrosecondType, UInt16Type};
 use arrow_array::{
     ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, Scalar, StringViewArray,
-    TimestampMicrosecondArray,
+    TimestampMicrosecondArray, UInt16Array,
 };
 use arrow_json::ArrayWriter;
 use arrow_schema::{DataType, Field, Schema};
@@ -210,6 +210,15 @@ impl BoundTable for TestTable {
                 Some((
                     Scalar::new(Arc::new(Int64Array::from(vec![lo])) as ArrayRef),
                     Scalar::new(Arc::new(Int64Array::from(vec![hi])) as ArrayRef),
+                ))
+            }
+            DataType::UInt16 => {
+                let values = arr.as_primitive::<UInt16Type>().values();
+                let lo = *values.iter().min()?;
+                let hi = *values.iter().max()?;
+                Some((
+                    Scalar::new(Arc::new(UInt16Array::from(vec![lo])) as ArrayRef),
+                    Scalar::new(Arc::new(UInt16Array::from(vec![hi])) as ArrayRef),
                 ))
             }
             DataType::Date32 => {

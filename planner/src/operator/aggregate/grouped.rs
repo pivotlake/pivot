@@ -845,7 +845,7 @@ mod tests {
     use crate::types::Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Date32Type, Float64Type, Int64Type};
-    use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, RecordBatch};
+    use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, RecordBatch, UInt16Array};
     use arrow_schema::DataType;
     use rstest::rstest;
     use std::sync::Arc;
@@ -1691,6 +1691,26 @@ mod tests {
         let col = batches[0].column(0);
         assert_eq!(col.data_type(), &DataType::Date32);
         assert_eq!(col.as_primitive::<Date32Type>().value(0), 10);
+    }
+
+    #[rstest]
+    fn global_min_max_of_a_small_unsigned_column_from_stats(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "days",
+            &[(
+                "d",
+                Type::UInt16,
+                Arc::new(UInt16Array::from(vec![15_900, 15_887, 65_000])) as ArrayRef,
+            )],
+        );
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT MIN(d) AS lo, MAX(d) AS hi FROM days",
+        );
+
+        assert_eq!(rows[0]["lo"].as_i64(), Some(15_887));
+        assert_eq!(rows[0]["hi"].as_i64(), Some(65_000));
     }
 
     #[rstest]

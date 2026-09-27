@@ -97,12 +97,16 @@ impl Aggregate {
             // as Int64 are sound here: their stats cast losslessly to Int64.
             // Float/decimal/boolean/Int128 would silently truncate, overflow, or
             // rescale under that cast, so decline and let the ordinary scan-based
-            // path handle, or reject, them.
+            // path handle, or reject, them. The narrow unsigned types fit a
+            // signed 32-bit physical value, so their stats order and cast the
+            // same whichever way they are stored; wider unsigned ones may not.
             match column.return_type {
                 Type::Int8
                 | Type::Int16
                 | Type::Int32
                 | Type::Int64
+                | Type::UInt8
+                | Type::UInt16
                 | Type::Date
                 | Type::Timestamp
                 | Type::TimestampTz => {}
