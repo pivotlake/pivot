@@ -10,7 +10,9 @@ Start Pivot, load some data, and run your first queries.
 ### 1. Start Pivot
 
 Pivot runs either as a local SQL shell, or as a server that Postgres clients
-connect to. Choose the option that fits:
+connect to. Choose the option that fits, then where your data lives: an
+existing Iceberg catalog, or a Pivot datastore in Amazon S3 or Google Cloud
+Storage.
 
 <Tabs>
   <TabItem label="Local shell">
@@ -23,70 +25,136 @@ connect to. Choose the option that fits:
     curl https://pivotlake.io | sh
     ```
 
-    Then open a datastore from its location in Amazon S3 or Google Cloud
-    Storage. For S3, export your AWS credentials and region first:
+    Then open your data:
 
-    ```sh
-    export AWS_ACCESS_KEY_ID=your-access-key-id
-    export AWS_SECRET_ACCESS_KEY=your-secret-access-key
-    export AWS_REGION=us-east-1
+    <Tabs syncKey="quickstart-datastore">
+      <TabItem label="Iceberg datastore">
+        Give Pivot the catalog's credential, then open the Iceberg REST
+        catalog:
 
-    pivot open s3://my-bucket/pivot-data
-    ```
+        ```sh
+        export PIVOT_ICEBERG_CREDENTIAL=client-id:client-secret
+        # Or, for a catalog that issues bearer tokens:
+        # export PIVOT_ICEBERG_TOKEN=your-token
 
-    For Google Cloud Storage, log in with Application Default Credentials
-    first:
+        pivot open --kind iceberg https://catalog.example.com/api --warehouse mywarehouse
+        ```
 
-    ```sh
-    gcloud auth application-default login
+        Each catalog namespace appears as a schema. Table files are read with
+        the credentials the catalog vends; if it vends none, also export your
+        [object-store credentials](/docs/reference/cli/#object-store-credentials).
+      </TabItem>
 
-    pivot open gs://my-bucket/pivot-data
-    ```
+      <TabItem label="Pivot datastore - S3">
+        Export your AWS credentials and region, then open a datastore from its
+        location in S3:
 
-    Pivot opens an interactive SQL prompt. The data remains in your bucket
-    after you exit with `\q`. See the [CLI reference](/docs/reference/cli/) for
-    options, [storage credentials](/docs/reference/cli/#object-store-credentials),
+        ```sh
+        export AWS_ACCESS_KEY_ID=your-access-key-id
+        export AWS_SECRET_ACCESS_KEY=your-secret-access-key
+        export AWS_REGION=us-east-1
+
+        pivot open s3://my-bucket/pivot-data
+        ```
+      </TabItem>
+
+      <TabItem label="Pivot datastore - GCS">
+        Log in with Application Default Credentials, then open a datastore
+        from its location in Google Cloud Storage:
+
+        ```sh
+        gcloud auth application-default login
+
+        pivot open gs://my-bucket/pivot-data
+        ```
+      </TabItem>
+    </Tabs>
+
+    Pivot opens an interactive SQL prompt, and your data stays where it is
+    after you exit with `\q`. See the [CLI reference](/docs/reference/cli/)
+    for options, [credentials](/docs/reference/cli/#object-store-credentials),
     and shell commands.
   </TabItem>
 
   <TabItem label="Docker">
     **Best for:** running a server with minimal setup.
 
-    Start the server with the datastore's location in Amazon S3 or Google
-    Cloud Storage. For S3, pass your AWS credentials and region:
+    <Tabs syncKey="quickstart-datastore">
+      <TabItem label="Iceberg datastore">
+        Write `pivot-data/metastore.yaml` with an
+        [Iceberg datastore](/docs/reference/server/datastores/#iceberg-datastores)
+        named `lake`:
 
-    ```sh
-    # seccomp=unconfined allows io_uring, which Docker's default profile blocks
-    docker run --rm --name pivot \
-      -p 5432:5432 \
-      --security-opt seccomp=unconfined \
-      -e PIVOT_DATASTORE=s3://my-bucket/pivot-data \
-      -e AWS_ACCESS_KEY_ID=your-access-key-id \
-      -e AWS_SECRET_ACCESS_KEY=your-secret-access-key \
-      -e AWS_REGION=us-east-1 \
-      pivotlake/pivot:latest
-    ```
+        ```yaml
+        datastores:
+          lake:
+            kind: iceberg
+            uri: https://catalog.example.com/api
+            warehouse: mywarehouse
+            secret: lake-catalog
+            default: true
+        secrets:
+          lake-catalog:
+            type: iceberg
+            credential: client-id:client-secret
+        ```
 
-    For MinIO or another S3-compatible service, also add
-    `-e AWS_ENDPOINT_URL=http://minio:9000`.
+        Then mount its directory over `/var/lib/pivot` and start the server:
 
-    For Google Cloud Storage, mount a service-account key file and point
-    `GOOGLE_APPLICATION_CREDENTIALS` at it:
+        ```sh
+        # seccomp=unconfined allows io_uring, which Docker's default profile blocks
+        docker run --rm --name pivot \
+          -p 5432:5432 \
+          --security-opt seccomp=unconfined \
+          -v "$PWD/pivot-data:/var/lib/pivot" \
+          pivotlake/pivot:latest
+        ```
+      </TabItem>
 
-    ```sh
-    # seccomp=unconfined allows io_uring, which Docker's default profile blocks
-    docker run --rm --name pivot \
-      -p 5432:5432 \
-      --security-opt seccomp=unconfined \
-      -e PIVOT_DATASTORE=gs://my-bucket/pivot-data \
-      -e GOOGLE_APPLICATION_CREDENTIALS=/etc/pivot/gcs-key.json \
-      -v "$PWD/gcs-key.json:/etc/pivot/gcs-key.json:ro" \
-      pivotlake/pivot:latest
-    ```
+      <TabItem label="Pivot datastore - S3">
+        Start the server with the datastore's location in S3, and pass your
+        AWS credentials and region:
 
-    The image generates a metastore for the location on startup, while the
-    datastore itself remains in your bucket after the container exits. In a
-    second terminal, connect with any Postgres client:
+        ```sh
+        # seccomp=unconfined allows io_uring, which Docker's default profile blocks
+        docker run --rm --name pivot \
+          -p 5432:5432 \
+          --security-opt seccomp=unconfined \
+          -e PIVOT_DATASTORE=s3://my-bucket/pivot-data \
+          -e AWS_ACCESS_KEY_ID=your-access-key-id \
+          -e AWS_SECRET_ACCESS_KEY=your-secret-access-key \
+          -e AWS_REGION=us-east-1 \
+          pivotlake/pivot:latest
+        ```
+
+        For MinIO or another S3-compatible service, also add
+        `-e AWS_ENDPOINT_URL=http://minio:9000`. The image generates a
+        metastore for the location on startup, and the datastore remains in
+        your bucket after the container exits.
+      </TabItem>
+
+      <TabItem label="Pivot datastore - GCS">
+        Start the server with the datastore's location in Google Cloud
+        Storage, mounting a service-account key file and pointing
+        `GOOGLE_APPLICATION_CREDENTIALS` at it:
+
+        ```sh
+        # seccomp=unconfined allows io_uring, which Docker's default profile blocks
+        docker run --rm --name pivot \
+          -p 5432:5432 \
+          --security-opt seccomp=unconfined \
+          -e PIVOT_DATASTORE=gs://my-bucket/pivot-data \
+          -e GOOGLE_APPLICATION_CREDENTIALS=/etc/pivot/gcs-key.json \
+          -v "$PWD/gcs-key.json:/etc/pivot/gcs-key.json:ro" \
+          pivotlake/pivot:latest
+        ```
+
+        The image generates a metastore for the location on startup, and the
+        datastore remains in your bucket after the container exits.
+      </TabItem>
+    </Tabs>
+
+    In a second terminal, connect with any Postgres client:
 
     ```sh
     psql -h 127.0.0.1 -p 5432 -U pivot
@@ -113,31 +181,88 @@ connect to. Choose the option that fits:
     ```
 
     Use `testing` instead of `stable` in the repository line to receive release
-    candidates. The package starts Pivot immediately and enables it at boot.
-    Check the service:
+    candidates. The package starts Pivot immediately and enables it at boot,
+    serving a local datastore. Check the service:
 
     ```sh
     sudo systemctl status pivot
     ```
 
-    Then connect with any Postgres client:
+    To serve your own data, edit `/etc/pivot/config.yaml` (see
+    [Datastores & storage credentials](/docs/reference/server/datastores/)):
 
-    ```sh
-    psql -h 127.0.0.1 -p 5432 -U pivot
-    ```
+    <Tabs syncKey="quickstart-datastore">
+      <TabItem label="Iceberg datastore">
+        Add an [Iceberg datastore](/docs/reference/server/datastores/#iceberg-datastores)
+        named `lake` next to the `default` one, and its catalog credential:
 
-    The package serves a local datastore. To store data in S3 or Google Cloud
-    Storage instead, edit `/etc/pivot/config.yaml` as described in
-    [Datastores & storage credentials](/docs/reference/server/datastores/),
-    then restart the server to apply it:
+        ```yaml
+        datastores:
+          lake:
+            kind: iceberg
+            uri: https://catalog.example.com/api
+            warehouse: mywarehouse
+            secret: lake-catalog
+        secrets:
+          lake-catalog:
+            type: iceberg
+            credential: client-id:client-secret
+        ```
+      </TabItem>
+
+      <TabItem label="Pivot datastore - S3">
+        Point the `default` datastore at your bucket, and add a secret for it:
+
+        ```yaml
+        datastores:
+          default:
+            kind: pivot
+            location: s3://my-bucket/pivot-data
+            default: true
+        secrets:
+          my-bucket:
+            type: s3
+            scope: s3://my-bucket/
+            region: us-east-1
+            access_key_id: your-access-key-id
+            secret_access_key: your-secret-access-key
+        ```
+      </TabItem>
+
+      <TabItem label="Pivot datastore - GCS">
+        Point the `default` datastore at your bucket, and add a secret with a
+        service-account key file:
+
+        ```yaml
+        datastores:
+          default:
+            kind: pivot
+            location: gs://my-bucket/pivot-data
+            default: true
+        secrets:
+          my-bucket:
+            type: gcs
+            scope: gs://my-bucket/
+            credentials_file: /etc/pivot/gcs-key.json
+        ```
+      </TabItem>
+    </Tabs>
+
+    Restart the server to apply it, then connect with any Postgres client:
 
     ```sh
     sudo systemctl restart pivot
+    psql -h 127.0.0.1 -p 5432 -U pivot
     ```
   </TabItem>
 </Tabs>
 
 ### 2. Load data
+
+:::note[Iceberg datastores are read-only]
+Loading data works only in a Pivot datastore. On an Iceberg datastore, skip to
+[3. Query](#3-query).
+:::
 
 As an example, create a table of NYC taxi trips, then fill it three ways: with
 SQL, from Parquet in object storage, and from raw Arrow IPC data with `\copy`.
