@@ -66,6 +66,7 @@ pub mod config;
 mod copy_session;
 mod limits;
 mod listener;
+mod mapped_files;
 #[cfg(feature = "perf")]
 mod perf;
 mod query_handler;
