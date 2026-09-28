@@ -515,6 +515,16 @@ PY
                 done
             fi
             if [[ -z "$workers" && -z "$extra_env" ]]; then
+                # Who takes the contended 32-bit atomics (a std Mutex lock /
+                # unlock pair) that show up at the start of a small query.
+                local sql
+                sql="$(sed -n 41p queries.sql)"
+                sql="${sql%;}"
+                sudo perf record -a -g -F 10000 -o /tmp/ab-cg.data -- bash -c "for _ in 1 2 3 4 5; do sleep 0.1; psql -h 127.0.0.1 -p $port -U postgres -d postgres -q -o /dev/null -c \"$sql\"; done" >/dev/null 2>&1 || true
+                echo "--- callers of contended 32-bit atomics in Q40 (workers=default)"
+                sudo perf report -i /tmp/ab-cg.data --no-children --stdio --symbols=__aarch64_cas4_acq,__aarch64_swp4_rel -g caller,0.5,callee,function,percent 2>/dev/null \
+                    | c++filt | grep -v '^#' | grep -v '^$' | sed -E 's/\[[0-9a-f]{16}\]//g' | cut -c1-200 | head -160 || true
+                sudo rm -f /tmp/ab-cg.data
                 for n in 0 40; do
                     local sql qlen
                     sql="$(sed -n "$((n + 1))p" queries.sql)"
