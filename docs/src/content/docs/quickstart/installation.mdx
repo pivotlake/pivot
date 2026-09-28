@@ -1,13 +1,11 @@
 ---
-title: Quickstart
+title: Installation & Connection
+sidebar:
+  order: 1
 description: Run Pivot with Docker, in a local SQL shell, or as a server.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
-
-Start Pivot, load some data, and run your first queries.
-
-### 1. Start Pivot
 
 Pivot runs either as a local SQL shell, or as a server that Postgres clients
 connect to. Choose the option that fits:
@@ -32,6 +30,8 @@ connect to. Choose the option that fits:
     export AWS_REGION=us-east-1
 
     pivot open s3://my-bucket/pivot-data
+    # Or, for an existing Iceberg warehouse:
+    pivot open --kind iceberg https://catalog.example.com/api --warehouse mywarehouse
     ```
 
     For Google Cloud Storage, log in with Application Default Credentials
@@ -41,6 +41,8 @@ connect to. Choose the option that fits:
     gcloud auth application-default login
 
     pivot open gs://my-bucket/pivot-data
+    # Or, for an existing Iceberg warehouse:
+    pivot open --kind iceberg https://catalog.example.com/api --warehouse mywarehouse
     ```
 
     Pivot opens an interactive SQL prompt. The data remains in your bucket
@@ -83,6 +85,46 @@ connect to. Choose the option that fits:
       -v "$PWD/gcs-key.json:/etc/pivot/gcs-key.json:ro" \
       pivotlake/pivot:latest
     ```
+
+
+    <details>
+    <summary>Connecting to an Iceberg catalog in Docker</summary>
+
+    Write `pivot-data/metastore.yaml` with an
+    [Iceberg datastore](/docs/reference/server/datastores/#iceberg-datastores):
+
+    ```yaml
+    datastores:
+      local:
+        kind: pivot
+        location: /var/lib/pivot/datastores/local
+        default: true
+      lake:
+        kind: iceberg
+        uri: https://catalog.example.com/api
+        warehouse: mywarehouse
+        secret: lake-catalog
+    secrets:
+      lake-catalog:
+        type: iceberg
+        credential: client-id:client-secret
+    users:
+      pivot:
+        auth:
+          method: trust
+    ```
+
+    Then mount its directory over `/var/lib/pivot`, and query tables as
+    `lake.schema.table`:
+
+    ```sh
+    docker run --rm --name pivot \
+      -p 5432:5432 \
+      --security-opt seccomp=unconfined \
+      -v "$PWD/pivot-data:/var/lib/pivot" \
+      pivotlake/pivot:latest
+    ```
+    </details>
 
     The image generates a metastore for the location on startup, while the
     datastore itself remains in your bucket after the container exits. In a
@@ -137,105 +179,7 @@ connect to. Choose the option that fits:
   </TabItem>
 </Tabs>
 
-### 2. Load data
-
-As an example, create a table of NYC taxi trips, then fill it three ways: with
-SQL, from Parquet in object storage, and from raw Arrow IPC data with `\copy`.
-
-```sql
-CREATE TABLE trips (
-  vendor_id INTEGER,
-  pickup_at TIMESTAMP,
-  dropoff_at TIMESTAMP,
-  passenger_count BIGINT,
-  trip_distance DOUBLE,
-  pickup_location_id INTEGER,
-  dropoff_location_id INTEGER,
-  fare_amount DOUBLE,
-  tip_amount DOUBLE,
-  total_amount DOUBLE
-) WITH (sort_by = 'pickup_at');
-```
-
-```sql
--- Insert rows with SQL
-INSERT INTO trips VALUES
-  (2, '2024-01-01 00:57:55', '2024-01-01 01:17:43', 1, 1.72, 186, 79, 17.7, 0.0, 22.7),
-  (1, '2024-01-01 00:03:00', '2024-01-01 00:09:36', 1, 1.8, 140, 236, 10.0, 3.75, 18.75);
-
--- Load January 2024 (about 3 million trips) from Parquet in a public bucket
-INSERT INTO trips
-SELECT VendorID, tpep_pickup_datetime, tpep_dropoff_datetime, passenger_count,
-       trip_distance, PULocationID, DOLocationID, fare_amount, tip_amount,
-       total_amount
-FROM read_parquet('s3://pivotlake-examples/nyc-taxi/yellow_tripdata_2024-01.parquet');
-
--- Ingest raw Arrow IPC data from a local file (works in psql too). Download it first:
--- curl -O https://pivotlake-examples.s3.amazonaws.com/nyc-taxi/yellow_tripdata_2024-02_sample.arrow
-\copy trips FROM 'yellow_tripdata_2024-02_sample.arrow' WITH (FORMAT arrow)
-```
-
-### 3. Query
-
-Find January's busiest days and their average tip:
-
-```sql
-SELECT date_trunc('day', pickup_at) AS day,
-       count(*) AS trips,
-       CAST(avg(tip_amount) AS DECIMAL(10, 2)) AS avg_tip
-FROM trips
-WHERE pickup_at >= '2024-01-01' AND pickup_at < '2024-02-01'
-GROUP BY day
-ORDER BY trips DESC
-LIMIT 5;
-```
-
-```text
-         day         | trips  | avg_tip
----------------------+--------+---------
- 2024-01-27 00:00:00 | 110515 |    3.10
- 2024-01-17 00:00:00 | 110365 |    3.35
- 2024-01-18 00:00:00 | 110358 |    3.36
- 2024-01-25 00:00:00 | 110318 |    3.48
- 2024-01-20 00:00:00 | 108768 |    2.92
-(5 rows)
-```
-
-Or see how tipping changes with the number of passengers:
-
-```sql
-SELECT passenger_count,
-       count(*) AS trips,
-       CAST(avg(tip_amount / NULLIF(fare_amount, 0)) * 100 AS DECIMAL(10, 1)) AS tip_percent
-FROM trips
-WHERE passenger_count BETWEEN 1 AND 6
-GROUP BY passenger_count
-ORDER BY passenger_count;
-```
-
-```text
- passenger_count |  trips  | tip_percent
------------------+---------+-------------
-               1 | 2271171 |        23.7
-               2 |  416662 |        20.7
-               3 |   93344 |        21.0
-               4 |   53029 |        18.0
-               5 |   34516 |        21.4
-               6 |   23040 |        21.5
-(6 rows)
-```
-
-### Next steps
-
-- [SQL reference](/docs/reference/sql-statements/): the statements and
-  functions Pivot supports.
-- [CLI reference](/docs/reference/cli/): every `pivot open` option and shell
-  command.
-- [Configuration file](/docs/reference/configuration/) and
-  [Datastores & storage credentials](/docs/reference/server/datastores/): set
-  up a server for your own data.
-
-### Build from source
+## Build from source
 
 To build the same executable from the repository:
 

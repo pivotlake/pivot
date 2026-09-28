@@ -22,8 +22,9 @@ counts, sums, averages, and other summaries: `avg`, `count`, `first`, `min`,
 
 ## Table functions
 
-[Table functions](/docs/reference/functions/table-functions/) produce integer
-rows for use in `FROM`: `range` and `generate_series`.
+[Table functions](/docs/reference/functions/table-functions/) produce rows for
+use in `FROM`: `read_parquet` reads Parquet files, and `range` and
+`generate_series` generate integers.
 
 ## Compatibility
 

@@ -9,6 +9,7 @@ export default defineConfig({
   base: "/docs",
   redirects: {
     "/reference/table-options/": "/docs/reference/statements/create-table/#table-options",
+    "/quickstart/": "/docs/quickstart/installation/",
   },
   integrations: [
     starlight({
@@ -88,7 +89,10 @@ export default defineConfig({
       // Commands and function categories order themselves with sidebar.order.
       sidebar: [
         { label: "Introduction", slug: "index" },
-        { label: "Quickstart", slug: "quickstart" },
+        {
+          label: "Quickstart",
+          items: [{ autogenerate: { directory: "quickstart" } }],
+        },
         {
           label: "Database",
           items: [{ autogenerate: { directory: "database" } }],
