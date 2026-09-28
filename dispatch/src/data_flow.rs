@@ -255,11 +255,16 @@ impl OperatorGraph {
             }
             stack.extend(self.edges[idx].iter().copied());
         }
+        // A retired operator's `finish` may have queued its last batches on
+        // this worker, after this pass's work step already ran, for a stage
+        // this walk then found pending. Report the pass as working so the
+        // worker looks again instead of going idle with them queued.
+        let retired_any = !retired.is_empty();
         drop(retired);
 
         Ok(if self.operators.iter().all(OperatorNode::is_finished) {
             FinishStatus::Done
-        } else if working {
+        } else if working || retired_any {
             FinishStatus::Working
         } else {
             FinishStatus::Pending
@@ -769,9 +774,24 @@ mod tests {
         ];
         let mut graph = OperatorGraph::from_edges(operators, Vec::new(), HashMap::default());
 
-        assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
+        assert_ne!(graph.try_finish().unwrap(), FinishStatus::Done);
         assert!(!graph.operators[0].is_finished());
         assert!(graph.operators[1].is_finished());
+    }
+
+    #[test]
+    fn a_finish_pass_that_retires_an_operator_asks_to_run_again() {
+        let operators: Vec<Box<dyn Operator>> = vec![
+            Box::new(FinishOperator::new(FinishStatus::Done)),
+            Box::new(FinishOperator::new(FinishStatus::Pending)),
+        ];
+        let mut graph = OperatorGraph::from_edges(operators, vec![(0, 1)], HashMap::default());
+
+        let first = graph.try_finish().unwrap();
+        let second = graph.try_finish().unwrap();
+
+        assert_eq!(first, FinishStatus::Working);
+        assert_eq!(second, FinishStatus::Pending);
     }
 
     #[test]
