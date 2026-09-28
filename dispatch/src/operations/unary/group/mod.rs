@@ -184,10 +184,14 @@ impl GroupLimit {
     }
 }
 
-/// Number of radix partitions for the scatter + merge of high-cardinality
-/// (switched) workers. Far finer than the in-place merge's job count so each
-/// radix target stays cache-resident at high group counts.
-const RADIX_PARTITIONS: usize = 4096;
+/// Most radix partitions a worker scatters into for the scatter + merge of
+/// high-cardinality (switched) workers. Far finer than the in-place merge's
+/// job count so each radix target stays small at high group counts, but
+/// bounded because every bucket is a stream with its own costs on both sides:
+/// the scatter keeps one partly written row and one buffer header hot per
+/// bucket, a frontier that stops fitting in L1 past a few hundred buckets,
+/// and the merge walks, prefetch-warms and tears down every stream.
+const RADIX_PARTITIONS: usize = 512;
 
 /// How many scatter streams the whole pool should aim to stay under. This is
 /// a target, not a hard cap: the one-bucket-per-worker floor below may exceed
@@ -197,8 +201,8 @@ const RADIX_PARTITIONS: usize = 4096;
 /// prefetch-warms, and tears down, so those fixed costs grow with
 /// `workers x buckets` while the useful bytes per stream shrink.
 /// [`get_scatter_bucket_count_for_worker`] scales the per-worker bucket count
-/// down as the pool grows to hold the total near this target (chosen so
-/// pools of ~128 workers or fewer keep the full [`RADIX_PARTITIONS`]).
+/// down as the pool grows to hold the total near this target (pools of ~1024
+/// workers or fewer keep the full [`RADIX_PARTITIONS`]).
 const TARGET_SCATTER_STREAMS: usize = 1 << 19;
 
 /// How many scatter buckets each worker should use when `total_workers`
@@ -217,8 +221,8 @@ fn get_scatter_bucket_count_for_worker(total_workers: usize) -> usize {
     let budget = (TARGET_SCATTER_STREAMS / total_workers.max(1)).max(1);
     // The largest power of two at or below the budget.
     (1usize << budget.ilog2())
-        .max(total_workers.next_power_of_two())
         .min(RADIX_PARTITIONS)
+        .max(total_workers.next_power_of_two())
 }
 
 /// Per-worker GROUP BY consumer.
@@ -353,13 +357,11 @@ mod tests {
     type SumValue = Compiled<(SumSlot<Int32Type>,)>;
 
     #[test]
-    fn scatter_buckets_shrink_as_the_pool_grows() {
-        // Small pools keep the full per-worker resolution; large pools trade
-        // it away to hold the total stream count near the budget.
+    fn scatter_buckets_stay_at_the_cap_but_cover_every_worker() {
         assert_eq!(get_scatter_bucket_count_for_worker(8), RADIX_PARTITIONS);
-        assert_eq!(get_scatter_bucket_count_for_worker(96), RADIX_PARTITIONS);
-        assert_eq!(get_scatter_bucket_count_for_worker(190), 2048);
-        assert_eq!(get_scatter_bucket_count_for_worker(400), 1024);
+        assert_eq!(get_scatter_bucket_count_for_worker(190), RADIX_PARTITIONS);
+        // Never fewer buckets than workers, even past the cap.
+        assert_eq!(get_scatter_bucket_count_for_worker(600), 1024);
     }
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
