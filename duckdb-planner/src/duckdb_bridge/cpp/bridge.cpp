@@ -141,9 +141,13 @@ static ExtractPlanResult build_duckdb_error(const duckdb::Exception &e) {
 	return make_error("duckdb_planning", message, position);
 }
 
-// Create new context for an in-memory DB
+// Create new context for an in-memory DB. The context only binds and optimizes
+// statements and never executes one, so it runs with a single thread: by
+// default DuckDB starts a worker per core, which makes creating a context
+// cost milliseconds and leaves those workers idle for the context's lifetime.
 DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
     : catalog(std::move(catalog)),
+      config({{"threads", duckdb::Value::BIGINT(1)}}, false),
       db(nullptr, &this->config),
       con(db) {
         auto timezone_result = con.Query("SET TimeZone='UTC'");

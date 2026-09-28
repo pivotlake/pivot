@@ -212,7 +212,7 @@ impl ShellInstance {
         );
         catalog.start();
         let executor =
-            crate::execution::Executor::new(catalog.clone(), dispatch.dispatcher().clone());
+            crate::execution::Executor::new(catalog.clone(), dispatch.dispatcher().clone())?;
         Ok(Self {
             state: Some(ShellState {
                 executor,

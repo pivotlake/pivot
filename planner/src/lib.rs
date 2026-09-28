@@ -204,6 +204,13 @@ pub struct Planner {
     planner_context: duckdb_planner::PlannerContext,
 }
 
+// SAFETY: the DuckDB database and connection behind the planner context keep
+// no state tied to the thread that created them. The context is only reached
+// through a `duckdb_planner::Plan` while one is alive, and `plan` drops its
+// `duckdb_planner::Plan` before returning, so between calls nothing else
+// refers to the context and the planner can move to another thread.
+unsafe impl Send for Planner {}
+
 impl Planner {
     /// Create a `Planner` over several named datastores, each attached to DuckDB
     /// as its own database so a query can name it (`db.schema.t`). `default_name`

@@ -52,7 +52,7 @@ fn shutdown_signal_drains_all_worker_threads() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server = Server::new(bind, dispatch, catalog, pivot_metastore());
+            let server = Server::new(bind, dispatch, catalog, pivot_metastore()).unwrap();
             server
                 .serve(Box::pin(async move {
                     let _ = shutdown_rx.await;

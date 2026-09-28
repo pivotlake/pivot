@@ -180,7 +180,7 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
             config.datastore_refresh_interval.as_duration(),
         )?;
         let catalog = build_catalog(&options.config, &metastore, dispatch.dispatcher())?;
-        let mut server = Server::new(server_config.bind, dispatch, catalog, metastore);
+        let mut server = Server::new(server_config.bind, dispatch, catalog, metastore)?;
         if let Some(acceptor) = tls {
             server = server.with_tls(acceptor);
         }

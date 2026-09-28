@@ -72,6 +72,8 @@ pub enum Error {
     DispatchWorkerFailed(String),
     #[error("dispatch worker died unexpectedly")]
     DispatchWorkerDied,
+    #[error("failed to create the statement executor: {0}")]
+    CreateExecutor(crate::execution::Error),
     #[error(transparent)]
     MachineTooSmall(#[from] crate::memory::MachineTooSmall),
     #[error(
@@ -132,20 +134,19 @@ impl Server {
         dispatch: Dispatch,
         catalog: Arc<PivotCatalog>,
         metastore: Arc<dyn Metastore>,
-    ) -> Self {
-        // Clone the dispatcher out *before* `into_parts` drops it; the query
-        // handler needs it to compile every plan.
-        let dispatcher = dispatch.dispatcher().clone();
+    ) -> Result<Self> {
+        // Build the executor *before* `into_parts` drops the dispatcher; the
+        // query handler needs it to compile every plan.
+        let query_executor = Arc::new(
+            crate::execution::Executor::new(catalog.clone(), dispatch.dispatcher().clone())
+                .map_err(Error::CreateExecutor)?,
+        );
         let (handles, shutdown) = dispatch.into_parts();
         let mut watchers = JoinSet::new();
         for handle in handles {
             watchers.spawn_blocking(move || handle.join());
         }
-        let query_executor = Arc::new(crate::execution::Executor::new(
-            catalog.clone(),
-            dispatcher.clone(),
-        ));
-        Self {
+        Ok(Self {
             bind,
             shutdown,
             worker_watchers: watchers,
@@ -153,7 +154,7 @@ impl Server {
             catalog,
             metastore,
             tls: None,
-        }
+        })
     }
 
     /// Offer `acceptor`'s certificate to connections that ask to encrypt
@@ -322,7 +323,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let dispatch = Dispatch::spin_up(1, 32, None);
         let (_directory, catalog) = catalog(&dispatch);
-        let server = Server::new(bind(), dispatch, catalog, metastore());
+        let server = Server::new(bind(), dispatch, catalog, metastore()).unwrap();
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;
