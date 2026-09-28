@@ -16,6 +16,12 @@ use crate::server::config::MetastoreStore;
 use crate::server::mapped_files::populate_mapped_files;
 use crate::server::{Config, Error, Server, raise_open_file_limit};
 
+/// How long an idle blocking-pool thread lives before it exits. Statements are
+/// planned on these threads, each holding its own query planner that costs
+/// 10-20 ms to build, so they are kept well past tokio's 10 second default
+/// rather than rebuilt after every pause between queries.
+const BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(60 * 60);
+
 /// Options accepted by `pivot server`.
 #[derive(Args, Debug)]
 pub struct ServerOptions {
@@ -169,6 +175,7 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
+        .thread_keep_alive(BLOCKING_THREAD_KEEP_ALIVE)
         .enable_all()
         .build()?;
 

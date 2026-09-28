@@ -72,6 +72,8 @@ pub enum Error {
     DispatchWorkerFailed(String),
     #[error("dispatch worker died unexpectedly")]
     DispatchWorkerDied,
+    #[error("failed to prepare the query planners: {0}")]
+    PreparePlanners(crate::execution::Error),
     #[error(transparent)]
     MachineTooSmall(#[from] crate::memory::MachineTooSmall),
     #[error(
@@ -92,6 +94,11 @@ pub enum Error {
 const GIB: usize = crate::memory::GIB as usize;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Blocking-pool threads given a query planner before the server accepts
+/// connections: enough for a few statements to plan at once. A thread beyond
+/// these builds its own planner the first time it plans a statement.
+const PREPARED_PLANNER_THREADS: usize = 4;
 
 /// A pivotdb server instance.
 ///
@@ -177,6 +184,10 @@ impl Server {
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> Result<()> {
+        self.query_executor
+            .prepare_planners(PREPARED_PLANNER_THREADS)
+            .await
+            .map_err(Error::PreparePlanners)?;
         let listener = TcpListener::bind(self.bind).await?;
         let tls = self.tls.clone();
         info!(addr = %self.bind, ssl = tls.is_some(), "listening for psql connections");

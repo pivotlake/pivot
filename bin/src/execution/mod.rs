@@ -23,7 +23,7 @@ use dataflow::{
     affected_rows_from_record_batch, collect_handle, execute_compact, result_columns,
 };
 use planner::operator::TransactionStatement;
-use planning::{PlanCache, plan_query};
+use planning::{PlanCache, plan_query, prepare_planners};
 
 pub use copy::CopyIngest;
 pub use types::{
@@ -49,6 +49,12 @@ impl Executor {
             dispatcher,
             plan_cache: Arc::new(PlanCache::default()),
         }
+    }
+
+    /// Build planners on `threads` blocking-pool threads now, so statements
+    /// planned on those threads do not pay for creating one.
+    pub async fn prepare_planners(&self, threads: usize) -> Result<()> {
+        prepare_planners(&self.catalog, threads).await
     }
 
     /// Execute a statement and copy its Arrow batches out of dispatch memory.

@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use lru::LruCache;
 
@@ -76,6 +76,34 @@ fn with_planner<R>(
         };
         Ok(function(planner))
     })
+}
+
+/// Build a planner on `threads` distinct blocking-pool threads ahead of time.
+///
+/// A planner's DuckDB context takes 10-20 ms to create and belongs to the
+/// thread that created it, so otherwise the first statement planned on each
+/// blocking thread pays for one. Every task waits for all the others before
+/// returning, which keeps them on separate threads.
+pub(super) async fn prepare_planners(
+    catalog: &Arc<catalog::PivotCatalog>,
+    threads: usize,
+) -> Result<()> {
+    let all_prepared = Arc::new(Barrier::new(threads));
+    let tasks: Vec<_> = (0..threads)
+        .map(|_| {
+            let catalog = catalog.clone();
+            let all_prepared = all_prepared.clone();
+            tokio::task::spawn_blocking(move || {
+                let prepared = with_planner(&catalog, |_| ());
+                all_prepared.wait();
+                prepared
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.map_err(Error::PlannerPanic)??;
+    }
+    Ok(())
 }
 
 pub(super) async fn plan_query(
