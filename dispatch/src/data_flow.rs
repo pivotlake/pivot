@@ -218,6 +218,12 @@ impl OperatorGraph {
     /// downstream of it, not sibling roots.
     fn try_finish(&mut self) -> Result<FinishStatus> {
         let mut working = false;
+        // Retired operators are dropped once the walk is over. Dropping the
+        // last reference to a stage's channels frees every worker's endpoint,
+        // work that grows with the pool; done mid-walk it would hold up this
+        // worker's check-in at the barriers downstream, which every peer
+        // waits on.
+        let mut retired = Vec::new();
 
         let mut stack: Vec<usize> = self.roots.clone();
         while let Some(idx) = stack.pop() {
@@ -238,7 +244,7 @@ impl OperatorGraph {
                     // Retiring the node drops the operator, and with it the
                     // sender it holds, so a stage that watches the other end
                     // of that channel learns the stage is over.
-                    FinishStatus::Done => node.operator = None,
+                    FinishStatus::Done => retired.push(node.operator.take()),
                     FinishStatus::Working => working = true,
                     FinishStatus::Pending => {}
                 }
@@ -249,6 +255,7 @@ impl OperatorGraph {
             }
             stack.extend(self.edges[idx].iter().copied());
         }
+        drop(retired);
 
         Ok(if self.operators.iter().all(OperatorNode::is_finished) {
             FinishStatus::Done
