@@ -507,3 +507,24 @@ Pivot also avoids relying on the operating system’s page cache for caching dis
 Managing the cache directly gives Pivot more control over what memory is used for. Rather than having disk pages cached independently by the operating system, Pivot can make eviction decisions across different types of cached data, for example choosing between compressed data read from disk and decompressed or otherwise processed data that is more expensive to reconstruct.
 
 Because these decisions are made by the database itself, Pivot can prioritize cached objects based on their actual value to query execution, rather than relying on the more general-purpose caching policies of the operating system.
+
+### Locally optimized with LLMs
+
+Pivots initial codebase is built entirely without LLMs, to ensure our initial architecture is at the highest level, exactly according to our intentions.
+
+But LLMs are incredibly powerful at finding "local" optimizations given the right starting conditions,
+and will oftentimes find improvements in places humans wouldn't. By ensuring our initial architecture removes "noise", for example page-faults or context-switching, LLMs can reason more easily about what is going on and find very interesting improvements.
+
+To find local optimizations with LLMs, we give LLMs access to servers such as CherryServers (which allows all `perf` events to the level of seeing memory bandwith) and AWS servers. We give the LLM a series of benchmarks, and ask it to use `perf` and other tools to find single improvements
+that yield above x% in given benchmarks.
+
+If the LLM succeeds (spoiler: it usually does!) we go over the general idea of what allowed the improvement; most times, the idea behind the improvement is sound, while the implementation is not. LLMs are powerful in this regard; they can (much quicker than humans) confirm whether an idea is worth delving into,
+even if their solution is messy.
+
+As a real example in Pivot, Pivot used to spread row groups across workers for decoding, one row group per worker.
+This meant that on large machines, the last row group being decoded held up all the other workers running the query. The LLM realized this was as a bottleneck, and implemented a fix that allowed parallelization in decoding a single row group by 
+using mutexes and some other "unsavory" code. This sped up benchmarks by over 5% on large machines, which led us to understand that our current lack of parallelization in decoding a single row group was indeed a real problem that could also affect workloads out in the wild.
+The implementation however was nothing close to what we wanted, and could create serious issues. We then designed the "sound" way to do this - create another operator with a stealable channel of "decode jobs" - which both fit well within our architecture 
+and actually sped us up even more than the LLMs implementation.
+
+As per our contribution guide, code is *never* merged without a human deeply understanding it; LLMs could simply "cheat" and benchmax, which of course does not help Pivot in the long run.  
