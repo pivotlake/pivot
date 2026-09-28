@@ -510,7 +510,7 @@ PY
                 echo "    Q$n: $(stage_medians "${sql%;}")"
             done
             if [[ -z "$extra_env" ]]; then
-                for n in 1 38 40; do
+                for n in 1 38 40 22; do
                     cpu_timeline "$n" "workers=${workers:-default}"
                 done
             fi
