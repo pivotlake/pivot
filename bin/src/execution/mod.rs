@@ -23,7 +23,7 @@ use dataflow::{
     affected_rows_from_record_batch, collect_handle, execute_compact, result_columns,
 };
 use planner::operator::TransactionStatement;
-use planning::{PlanCache, plan_query};
+use planning::{PlanCache, PlannerThreads, plan_query};
 
 pub use copy::CopyIngest;
 pub use types::{
@@ -37,6 +37,7 @@ pub struct Executor {
     catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
     plan_cache: Arc<PlanCache>,
+    planners: Arc<PlannerThreads>,
 }
 
 impl Executor {
@@ -45,6 +46,7 @@ impl Executor {
         dispatcher: dispatch::DataFlowDispatcher,
     ) -> Self {
         Self {
+            planners: Arc::new(PlannerThreads::new(catalog.clone())),
             catalog,
             dispatcher,
             plan_cache: Arc::new(PlanCache::default()),
@@ -101,7 +103,7 @@ impl Executor {
     pub async fn describe(&self, sql: &str) -> Result<Option<Vec<ResultColumn>>> {
         let transaction = self.catalog.begin_transaction();
         let plan = plan_query(
-            &self.catalog,
+            &self.planners,
             transaction.clone(),
             self.plan_cache.as_ref(),
             sql,
@@ -135,7 +137,7 @@ impl Executor {
     {
         let started = Instant::now();
         let plan = plan_query(
-            &self.catalog,
+            &self.planners,
             transaction.clone(),
             self.plan_cache.as_ref(),
             &sql,

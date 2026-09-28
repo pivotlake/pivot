@@ -6,9 +6,9 @@
 //! [`planner`] turns each SQL string into an executable plan against a
 //! caller-supplied [`PivotCatalog`](catalog::PivotCatalog), and [`dispatch`]
 //! runs the resulting dataflow on its thread-per-core worker pool. Each query
-//! hops to `tokio::task::spawn_blocking` to drive the (non-`Send`) DuckDB
-//! planner; the planner is cached in a thread-local on each blocking-pool
-//! thread and reused across queries. [`run`] provides the configured foreground
+//! that misses the plan cache is planned on a dedicated planner thread, which
+//! owns a (non-`Send`) DuckDB planner and reuses it across queries. [`run`]
+//! provides the configured foreground
 //! process used by `pivot server`.
 //!
 //! The public interface: hand a bind address to [`Server::new`] together with a

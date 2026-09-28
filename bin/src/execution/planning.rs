@@ -1,17 +1,12 @@
 //! Planner lifecycle and revision-aware plan caching.
 
-use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use lru::LruCache;
+use tokio::sync::oneshot;
 
 use super::{Error, Result};
-
-thread_local! {
-    /// One planner and its non-Send DuckDB context per blocking-pool thread.
-    static PLANNER: RefCell<Option<planner::Planner>> = const { RefCell::new(None) };
-}
 
 const PLAN_CACHE_QUERY_CAPACITY: usize = 128;
 
@@ -62,24 +57,124 @@ impl PlanCache {
     }
 }
 
-fn with_planner<R>(
-    catalog: &Arc<catalog::PivotCatalog>,
-    function: impl FnOnce(&mut planner::Planner) -> R,
-) -> Result<R, planner::Error> {
-    PLANNER.with_borrow_mut(|slot| {
-        let planner = match slot {
-            Some(planner) => planner,
-            None => slot.insert(planner::Planner::from_datastore_names(
-                catalog.datastore_names(),
-                catalog.default_datastore_name().to_string(),
-            )?),
+/// One statement for a planner thread to plan, with the channel its plan goes
+/// back on.
+struct PlanRequest {
+    query: String,
+    transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+    reply: oneshot::Sender<Result<planner::Plan, planner::Error>>,
+    /// The receiving thread's own request channel, which the thread hands back
+    /// to the idle list once it has planned this statement.
+    requests: mpsc::Sender<PlanRequest>,
+}
+
+/// Threads that each own one planner for the life of the pool.
+///
+/// A planner holds a non-`Send` DuckDB context that takes over 10 ms to build,
+/// so it has to stay on the thread that built it, and building one inside a
+/// statement costs that statement the full construction time. A request goes
+/// to the thread that went idle most recently, and a new thread (with a new
+/// planner) starts only when every existing one is busy. Planners are thus
+/// built once per level of planning concurrency. A general-purpose pool would
+/// instead hand a statement to whichever of its threads was free, often one
+/// that had never planned before.
+///
+/// The idle list holds the only sender of each waiting thread's channel, so
+/// dropping the pool closes those channels and the threads exit.
+pub(super) struct PlannerThreads {
+    catalog: Arc<catalog::PivotCatalog>,
+    /// Request channels of the threads waiting for work, most recently idle
+    /// last.
+    idle: Arc<Mutex<Vec<mpsc::Sender<PlanRequest>>>>,
+}
+
+impl PlannerThreads {
+    pub(super) fn new(catalog: Arc<catalog::PivotCatalog>) -> Self {
+        Self {
+            catalog,
+            idle: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    async fn plan(
+        &self,
+        query: String,
+        transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+    ) -> Result<planner::Plan> {
+        let (reply, planned) = oneshot::channel();
+        let idle_thread = self.idle.lock().unwrap().pop();
+        match idle_thread {
+            Some(requests) => requests
+                .send(PlanRequest {
+                    query,
+                    transaction,
+                    reply,
+                    requests: requests.clone(),
+                })
+                .expect("an idle planner thread waits on its request channel"),
+            None => self.start_thread(query, transaction, reply),
+        }
+        Ok(planned.await.map_err(|_| Error::PlannerThreadPanicked)??)
+    }
+
+    /// Start a planner thread that builds its planner, plans the first
+    /// statement, and then serves requests until the pool is dropped.
+    fn start_thread(
+        &self,
+        query: String,
+        transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+        reply: oneshot::Sender<Result<planner::Plan, planner::Error>>,
+    ) {
+        let catalog = self.catalog.clone();
+        let idle = Arc::downgrade(&self.idle);
+        let (requests, incoming) = mpsc::channel();
+        let first = PlanRequest {
+            query,
+            transaction,
+            reply,
+            requests,
         };
-        Ok(function(planner))
-    })
+        std::thread::Builder::new()
+            .name("pivot-planner".to_string())
+            .spawn(move || {
+                let mut planner = match planner::Planner::from_datastore_names(
+                    catalog.datastore_names(),
+                    catalog.default_datastore_name().to_string(),
+                ) {
+                    Ok(planner) => planner,
+                    Err(error) => {
+                        let _ = first.reply.send(Err(error));
+                        return;
+                    }
+                };
+                let mut request = first;
+                loop {
+                    let planned = planner.plan(&request.query, request.transaction);
+                    // Rejoin the idle list before replying, so a statement the
+                    // reply unblocks finds this thread's planner free. A pool
+                    // that is gone has no further work for this thread.
+                    let Some(idle) = idle.upgrade() else {
+                        let _ = request.reply.send(planned);
+                        return;
+                    };
+                    idle.lock().unwrap().push(request.requests);
+                    drop(idle);
+                    // The requester may have gone away (a cancelled statement),
+                    // in which case nobody wants the plan.
+                    let _ = request.reply.send(planned);
+                    // Every sender is gone once the pool drops its idle list.
+                    let Ok(next) = incoming.recv() else {
+                        return;
+                    };
+                    request = next;
+                }
+            })
+            .expect("spawning a planner thread");
+    }
 }
 
 pub(super) async fn plan_query(
-    catalog: &Arc<catalog::PivotCatalog>,
+    planners: &PlannerThreads,
     transaction: Arc<dyn planner::catalog::CatalogTransaction>,
     plan_cache: &PlanCache,
     query: &str,
@@ -88,18 +183,9 @@ pub(super) async fn plan_query(
         return Ok(plan);
     }
 
-    let catalog = catalog.clone();
-    let cache_key = query.to_string();
-    let query = cache_key.clone();
-    let plan = tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
-        with_planner(&catalog, |planner| {
-            Ok(Arc::new(planner.plan(&query, transaction)?))
-        })?
-    })
-    .await
-    .map_err(Error::PlannerPanic)??;
+    let plan = Arc::new(planners.plan(query.to_string(), transaction).await?);
     if plan.is_cacheable() {
-        plan_cache.insert(cache_key, plan.clone());
+        plan_cache.insert(query.to_string(), plan.clone());
     }
     Ok(plan)
 }

@@ -169,6 +169,8 @@ pub enum Error {
     WorkerPanic(JoinError),
     #[error("planner thread panicked: {0}")]
     PlannerPanic(JoinError),
+    #[error("planner thread panicked while planning")]
+    PlannerThreadPanicked,
     #[error("invalid INSERT row-count result: {0}")]
     InvalidInsertResult(String),
     #[error("{0}")]
