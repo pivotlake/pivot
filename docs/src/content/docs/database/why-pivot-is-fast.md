@@ -515,7 +515,7 @@ Pivots initial codebase is built entirely without LLMs, to ensure our initial ar
 But LLMs are incredibly powerful at finding "local" optimizations given the right starting conditions,
 and will oftentimes find improvements in places humans wouldn't. By ensuring our initial architecture removes "noise", for example page-faults or context-switching, LLMs can reason more easily about what is going on and find very interesting improvements.
 
-To find local optimizations with LLMs, we give LLMs access to servers such as CherryServers (which allows all `perf` events to the level of seeing memory bandwith) and AWS servers. We give the LLM a series of benchmarks, and ask it to use `perf` and other tools to find single improvements
+To find local optimizations with LLMs, we give LLMs access to servers such as CherryServers (which allows all `perf` events to the level of seeing memory bandwidth) and AWS servers. We give the LLM a series of benchmarks, and ask it to use `perf` and other tools to find single improvements
 that yield above x% in given benchmarks.
 
 If the LLM succeeds (spoiler: it usually does!) we go over the general idea of what allowed the improvement; most times, the idea behind the improvement is sound, while the implementation is not. LLMs are powerful in this regard; they can (much quicker than humans) confirm whether an idea is worth delving into,
