@@ -13,6 +13,7 @@ use metastore_disk::{DiskMetastore, MetastoreConfig};
 use tracing::{error, info};
 
 use crate::server::config::MetastoreStore;
+use crate::server::mapped_files::populate_mapped_files;
 use crate::server::{Config, Error, Server, raise_open_file_limit};
 
 /// Options accepted by `pivot server`.
@@ -158,7 +159,13 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
             available_bytes,
         });
     }
+    // Reading the executable in is disk-bound and the pool prefault is
+    // memory-bound, so the two overlap instead of adding up.
+    let mapped_files = std::thread::spawn(populate_mapped_files);
     let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
+    mapped_files
+        .join()
+        .expect("populating mapped files panicked");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
