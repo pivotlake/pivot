@@ -1,13 +1,13 @@
 use crate::env::MAX_INLINE_STRING_VIEW;
 use crate::memory::{BUFFER_SIZE, WriteBuffer, memory_ctx};
 use crate::operations::unary::group::ArenaKey;
+use crate::worker::WORKER_IDX;
 use arrow_buffer::Buffer;
-use crossbeam_deque::Injector;
 use std::cell::UnsafeCell;
 use std::ptr;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Shared arena holding all string buffers across workers.
 ///
@@ -24,10 +24,17 @@ pub struct SharedArena {
     ptrs: Box<[UnsafeCell<*mut u8>]>,
     next_idx: AtomicU32,
     /// Owns WriteBuffers so ring memory stays alive until the arena is dropped.
-    /// Every worker hands back its last buffer at the same moment, as its
-    /// consume phase ends, so the handoff is a lock-free push.
-    buffers: Injector<WriteBuffer>,
+    /// Workers hand buffers back at the same moments (every merge job returns
+    /// its own), so the list is striped by worker to keep them from contending.
+    buffers: Box<[ReturnedBuffers]>,
 }
+
+/// Stripes of a [`SharedArena`]'s returned buffers.
+const RETURNED_BUFFER_STRIPES: usize = 64;
+
+/// One stripe of returned buffers, on a cache line of its own.
+#[repr(align(128))]
+struct ReturnedBuffers(Mutex<Vec<WriteBuffer>>);
 
 unsafe impl Send for SharedArena {}
 unsafe impl Sync for SharedArena {}
@@ -61,7 +68,9 @@ impl SharedArena {
         Arc::new(Self {
             ptrs,
             next_idx: AtomicU32::new(0),
-            buffers: Injector::new(),
+            buffers: (0..RETURNED_BUFFER_STRIPES)
+                .map(|_| ReturnedBuffers(Mutex::new(Vec::new())))
+                .collect(),
         })
     }
 
@@ -77,7 +86,8 @@ impl SharedArena {
 
     /// Transfer ownership of a completed buffer back to the arena.
     pub fn return_buffer(&self, wb: WriteBuffer) {
-        self.buffers.push(wb);
+        let stripe = WORKER_IDX.get() % RETURNED_BUFFER_STRIPES;
+        self.buffers[stripe].0.lock().unwrap().push(wb);
     }
 
     /// Resolve a non-inline key's buffer slice.
