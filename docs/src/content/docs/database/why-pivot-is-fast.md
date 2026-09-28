@@ -508,7 +508,7 @@ Managing the cache directly gives Pivot more control over what memory is used fo
 
 Because these decisions are made by the database itself, Pivot can prioritize cached objects based on their actual value to query execution, rather than relying on the more general-purpose caching policies of the operating system.
 
-### Locally optimized with LLMs
+### It's locally optimized with LLMs
 
 Pivots initial codebase is built entirely without LLMs, to ensure our initial architecture is at the highest level, exactly according to our intentions.
 
