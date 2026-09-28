@@ -171,7 +171,7 @@ where
             // Build the datastores inside the runtime: a datastore that
             // self-manages maintenance spawns its tasks onto the ambient runtime.
             let (CatalogFixture { catalog, data_dirs }, metastore) = build_catalog(&dispatch);
-            let mut server = Server::new(bind, dispatch, catalog, metastore);
+            let mut server = Server::new(bind, dispatch, catalog, metastore).unwrap();
             if let Some(acceptor) = tls {
                 server = server.with_tls(acceptor);
             }

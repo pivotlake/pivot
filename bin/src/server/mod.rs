@@ -51,7 +51,7 @@
 //!     metastore.external_store_factory(),
 //! ));
 //!
-//! let server = Server::new(config.server.bind, dispatch, catalog, metastore);
+//! let server = Server::new(config.server.bind, dispatch, catalog, metastore)?;
 //! // Returns when ctrl_c fires, or earlier if a dispatch worker dies.
 //! server.serve(Box::pin(async {
 //!     let _ = tokio::signal::ctrl_c().await;

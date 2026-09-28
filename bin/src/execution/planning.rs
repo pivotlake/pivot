@@ -1,17 +1,11 @@
 //! Planner lifecycle and revision-aware plan caching.
 
-use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 
 use super::{Error, Result};
-
-thread_local! {
-    /// One planner and its non-Send DuckDB context per blocking-pool thread.
-    static PLANNER: RefCell<Option<planner::Planner>> = const { RefCell::new(None) };
-}
 
 const PLAN_CACHE_QUERY_CAPACITY: usize = 128;
 
@@ -62,24 +56,61 @@ impl PlanCache {
     }
 }
 
-fn with_planner<R>(
-    catalog: &Arc<catalog::PivotCatalog>,
-    function: impl FnOnce(&mut planner::Planner) -> R,
-) -> Result<R, planner::Error> {
-    PLANNER.with_borrow_mut(|slot| {
-        let planner = match slot {
+/// Query planners shared by every statement, kept between statements because
+/// creating a planner's DuckDB context costs milliseconds.
+///
+/// A statement takes an idle planner, or creates one when none is idle, and
+/// puts it back when it is done planning. Statements plan on blocking-pool
+/// threads, so there are never more planners than blocking threads.
+pub(super) struct PlannerPool {
+    catalog: Arc<catalog::PivotCatalog>,
+    idle_planners: Mutex<Vec<planner::Planner>>,
+}
+
+/// Planners a new pool starts with, so the first few statements planned at
+/// once do not pay for creating one.
+const INITIAL_PLANNERS: usize = 4;
+
+impl PlannerPool {
+    pub(super) fn new(catalog: Arc<catalog::PivotCatalog>) -> Result<Self, planner::Error> {
+        let planners = (0..INITIAL_PLANNERS)
+            .map(|_| {
+                planner::Planner::from_datastore_names(
+                    catalog.datastore_names(),
+                    catalog.default_datastore_name().to_string(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            catalog,
+            idle_planners: Mutex::new(planners),
+        })
+    }
+
+    /// Plan `query` with an idle planner, or a new one when none is idle, and
+    /// put the planner back afterwards. A planner that panics while planning is
+    /// dropped instead of being handed to the next statement.
+    fn plan(
+        &self,
+        query: &str,
+        transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+    ) -> Result<planner::Plan, planner::Error> {
+        let idle_planner = self.idle_planners.lock().unwrap().pop();
+        let mut planner = match idle_planner {
             Some(planner) => planner,
-            None => slot.insert(planner::Planner::from_datastore_names(
-                catalog.datastore_names(),
-                catalog.default_datastore_name().to_string(),
-            )?),
+            None => planner::Planner::from_datastore_names(
+                self.catalog.datastore_names(),
+                self.catalog.default_datastore_name().to_string(),
+            )?,
         };
-        Ok(function(planner))
-    })
+        let plan = planner.plan(query, transaction);
+        self.idle_planners.lock().unwrap().push(planner);
+        plan
+    }
 }
 
 pub(super) async fn plan_query(
-    catalog: &Arc<catalog::PivotCatalog>,
+    planner_pool: &Arc<PlannerPool>,
     transaction: Arc<dyn planner::catalog::CatalogTransaction>,
     plan_cache: &PlanCache,
     query: &str,
@@ -88,13 +119,11 @@ pub(super) async fn plan_query(
         return Ok(plan);
     }
 
-    let catalog = catalog.clone();
+    let planner_pool = planner_pool.clone();
     let cache_key = query.to_string();
     let query = cache_key.clone();
     let plan = tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
-        with_planner(&catalog, |planner| {
-            Ok(Arc::new(planner.plan(&query, transaction)?))
-        })?
+        Ok(Arc::new(planner_pool.plan(&query, transaction)?))
     })
     .await
     .map_err(Error::PlannerPanic)??;

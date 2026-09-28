@@ -72,7 +72,7 @@ fn start_server_from_config(config_yaml: &str) -> u16 {
                         metastore.external_store_factory(),
                     ),
             );
-            let server = Server::new(bind, dispatch, catalog, metastore);
+            let server = Server::new(bind, dispatch, catalog, metastore).unwrap();
             let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
         });
     });

@@ -23,7 +23,7 @@ use dataflow::{
     affected_rows_from_record_batch, collect_handle, execute_compact, result_columns,
 };
 use planner::operator::TransactionStatement;
-use planning::{PlanCache, plan_query};
+use planning::{PlanCache, PlannerPool, plan_query};
 
 pub use copy::CopyIngest;
 pub use types::{
@@ -37,18 +37,20 @@ pub struct Executor {
     catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
     plan_cache: Arc<PlanCache>,
+    planner_pool: Arc<PlannerPool>,
 }
 
 impl Executor {
     pub fn new(
         catalog: Arc<catalog::PivotCatalog>,
         dispatcher: dispatch::DataFlowDispatcher,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
+            planner_pool: Arc::new(PlannerPool::new(catalog.clone())?),
             catalog,
             dispatcher,
             plan_cache: Arc::new(PlanCache::default()),
-        }
+        })
     }
 
     /// Execute a statement and copy its Arrow batches out of dispatch memory.
@@ -101,7 +103,7 @@ impl Executor {
     pub async fn describe(&self, sql: &str) -> Result<Option<Vec<ResultColumn>>> {
         let transaction = self.catalog.begin_transaction();
         let plan = plan_query(
-            &self.catalog,
+            &self.planner_pool,
             transaction.clone(),
             self.plan_cache.as_ref(),
             sql,
@@ -135,7 +137,7 @@ impl Executor {
     {
         let started = Instant::now();
         let plan = plan_query(
-            &self.catalog,
+            &self.planner_pool,
             transaction.clone(),
             self.plan_cache.as_ref(),
             &sql,
