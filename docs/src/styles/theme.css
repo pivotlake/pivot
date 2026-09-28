@@ -207,6 +207,32 @@
   fill: var(--sl-color-gray-2);
 }
 
+/* Asides stay as quiet as the rest of the page: a neutral panel with a thin
+   rule instead of a filled accent block, and a title at body size. Caution
+   and danger keep their own rule colour so they still stand out. */
+.starlight-aside {
+  padding: 0.75rem 1rem;
+  border-inline-start-width: 2px;
+  background-color: var(--sl-color-bg-sidebar);
+  font-size: var(--sl-text-sm);
+}
+
+.starlight-aside--note,
+.starlight-aside--tip {
+  border-color: var(--sl-color-gray-4);
+}
+
+.starlight-aside__title {
+  gap: 0.4rem;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-white);
+}
+
+.starlight-aside__icon {
+  width: 1em;
+  height: 1em;
+}
+
 /* Headings and chrome carry the display face; prose stays monospace. */
 .sl-markdown-content h1,
 .sl-markdown-content h2,
