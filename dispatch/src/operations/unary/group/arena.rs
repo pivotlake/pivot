@@ -2,11 +2,12 @@ use crate::env::MAX_INLINE_STRING_VIEW;
 use crate::memory::{BUFFER_SIZE, WriteBuffer, memory_ctx};
 use crate::operations::unary::group::ArenaKey;
 use arrow_buffer::Buffer;
+use crossbeam_deque::Injector;
 use std::cell::UnsafeCell;
 use std::ptr;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
 /// Shared arena holding all string buffers across workers.
 ///
@@ -23,7 +24,9 @@ pub struct SharedArena {
     ptrs: Box<[UnsafeCell<*mut u8>]>,
     next_idx: AtomicU32,
     /// Owns WriteBuffers so ring memory stays alive until the arena is dropped.
-    buffers: Mutex<Vec<WriteBuffer>>,
+    /// Every worker hands back its last buffer at the same moment, as its
+    /// consume phase ends, so the handoff is a lock-free push.
+    buffers: Injector<WriteBuffer>,
 }
 
 unsafe impl Send for SharedArena {}
@@ -58,7 +61,7 @@ impl SharedArena {
         Arc::new(Self {
             ptrs,
             next_idx: AtomicU32::new(0),
-            buffers: Mutex::new(Vec::new()),
+            buffers: Injector::new(),
         })
     }
 
@@ -74,7 +77,7 @@ impl SharedArena {
 
     /// Transfer ownership of a completed buffer back to the arena.
     pub fn return_buffer(&self, wb: WriteBuffer) {
-        self.buffers.lock().unwrap().push(wb);
+        self.buffers.push(wb);
     }
 
     /// Resolve a non-inline key's buffer slice.
