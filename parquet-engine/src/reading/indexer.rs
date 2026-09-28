@@ -23,6 +23,7 @@
 //! 2. **Dictionary pages** — sent last so they arrive first, ensuring the decoder has the
 //!    dictionary before any RLE-dictionary-encoded data page.
 
+use crate::reading::range_cutter::row_group_pages::{PageSpan, decode_ranges};
 use crate::thrift::general::{CompressionCodec, Encoding, PageType};
 use crate::thrift::headers::{DataPageHeader, PageHeader};
 use crate::thrift::parquet_thrift::{ParquetError, ThriftReadInputProtocol};
@@ -266,6 +267,30 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(crate::op_err)?;
+
+        // Every page of the row group is known here, before any is sent on,
+        // so this is where its decode ranges are cut along them. A selection
+        // of rows decodes as one range instead (see `RowGroupPages`).
+        if matches!(buffer.metadata.selection(), RowSelection::All) {
+            let spans: Vec<Vec<PageSpan>> = pages_per_column
+                .iter()
+                .map(|pages| {
+                    pages
+                        .iter()
+                        .filter(|page| page.header.r#type == PageType::DATA_PAGE)
+                        .map(|page| PageSpan {
+                            first_row: page.first_row,
+                            rows: page.header.data_page_num_values() as u32,
+                            bytes: page.header.uncompressed_page_size.max(0) as u64,
+                        })
+                        .collect()
+                })
+                .collect();
+            let row_count = buffer.metadata.num_rows().max(0) as u32;
+            buffer
+                .metadata
+                .publish_decode_ranges(decode_ranges(row_count, &spans));
+        }
 
         // We want to send the pages out in an order that will be best for decoding. If we were to,
         // for example, send all of column A pages and then only column B pages, we would be unable to

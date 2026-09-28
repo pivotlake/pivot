@@ -245,7 +245,7 @@ mod tests {
     use super::*;
     use crate::reading::decoding::tests::{
         cut, encode_i32s, i32_schema, make_data_page, make_rle_data_page, make_test_table,
-        new_cutter, row_number_pages,
+        new_cutter, publish_decode_ranges, row_number_pages,
     };
     use crate::thrift::headers::PageHeader;
     use crate::types::metadata::{
@@ -317,8 +317,8 @@ mod tests {
 
         let ranges = cut(&table, row_number_pages(&metadata, 40_000, 20_000));
 
-        assert_eq!(range_starts(&ranges), vec![0, 16_384, 32_768]);
-        assert_eq!(ranges[2].rows(), 32_768..40_000);
+        assert_eq!(range_starts(&ranges), vec![0, 20_000]);
+        assert_eq!(ranges[1].rows(), 20_000..40_000);
     }
 
     /// The second page arrives first: no range is ready until the first
@@ -329,6 +329,7 @@ mod tests {
         let table = make_test_table(i32_schema(&["a"]), 40_000);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let mut pages = row_number_pages(&metadata, 40_000, 20_000);
+        publish_decode_ranges(&pages);
         let first_page = pages.remove(0);
         let mut cutter = new_cutter(&table, Vec::new());
 
@@ -336,7 +337,7 @@ mod tests {
         let ranges = feed_unary(&mut cutter, vec![first_page]);
 
         assert!(before.is_empty());
-        assert_eq!(range_starts(&ranges), vec![0, 16_384, 32_768]);
+        assert_eq!(range_starts(&ranges), vec![0, 20_000]);
     }
 
     #[test]
@@ -346,6 +347,7 @@ mod tests {
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page_a = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0, 0);
         let page_b = make_data_page(metadata, 1, encode_i32s(&[40, 50, 60]), 3, 0, 0);
+        publish_decode_ranges([&page_a, &page_b]);
         let mut cutter = new_cutter(&table, Vec::new());
 
         let after_one = feed_unary(&mut cutter, vec![page_a]);
@@ -376,6 +378,7 @@ mod tests {
         let table = make_test_table(i32_schema(&["a"]), 3);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30]), 3, 0, 0);
+        publish_decode_ranges([&page]);
         let pending = Arc::new(AtomicUsize::new(1));
         let outstanding = Arc::new(AtomicUsize::new(1));
         let cutter = RangeCutter::new(
@@ -403,6 +406,7 @@ mod tests {
         let table = i32_dictionary_table(3);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let dict = i32_dict_page(metadata.clone(), &[10, 20]);
+        publish_decode_ranges([&dict]);
         let pending = Arc::new(AtomicUsize::new(1));
         let cutter = RangeCutter::new(
             Projection::all_from_schema(table.schema()),
@@ -429,6 +433,7 @@ mod tests {
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page = make_rle_data_page(metadata.clone(), 0, &[1, 0, 1], 0);
         let dict = i32_dict_page(metadata, &[10, 20]);
+        publish_decode_ranges([&page, &dict]);
         let mut cutter = new_cutter(&table, Vec::new());
 
         let before = feed_unary(&mut cutter, vec![page]);

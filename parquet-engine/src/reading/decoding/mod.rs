@@ -203,6 +203,7 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
 pub(crate) mod tests {
     use super::*;
     use crate::reading::range_cutter::RangeCutter;
+    use crate::reading::range_cutter::row_group_pages::{PageSpan, decode_ranges};
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
     use crate::types::filter_mask::FilterMask;
@@ -430,8 +431,55 @@ pub(crate) mod tests {
         Decoder::new(batch_size, false, Arc::new(WorkerAllocator::new()))
     }
 
+    /// Publishes the decode ranges of the whole row groups `pages` belong
+    /// to, from their data pages, as the indexer does before sending pages
+    /// on. `pages` must hold every page of those row groups.
+    pub(crate) fn publish_decode_ranges<'a>(pages: impl IntoIterator<Item = &'a DecompressedPage>) {
+        let mut row_groups: Vec<(QueryRowGroupMetadata, Vec<Vec<PageSpan>>)> = Vec::new();
+        for page in pages {
+            let metadata = &page.query_row_group_metadata;
+            let position = match row_groups
+                .iter()
+                .position(|(known, _)| known.index() == metadata.index())
+            {
+                Some(position) => position,
+                None => {
+                    row_groups.push((metadata.clone(), Vec::new()));
+                    row_groups.len() - 1
+                }
+            };
+            let columns = &mut row_groups[position].1;
+            if columns.len() <= page.column_idx {
+                columns.resize_with(page.column_idx + 1, Vec::new);
+            }
+            let (rows, bytes) = match &page.data {
+                DecompressedPageType::Data(data) => (
+                    data.header.num_values as u32,
+                    data.data.iter().map(|bytes| bytes.len() as u64).sum(),
+                ),
+                DecompressedPageType::SkippedData { header } => (header.num_values as u32, 0),
+                DecompressedPageType::Dict { .. } => continue,
+            };
+            columns[page.column_idx].push(PageSpan {
+                first_row: page.first_row,
+                rows,
+                bytes,
+            });
+        }
+        for (metadata, mut columns) in row_groups {
+            if !matches!(metadata.selection(), RowSelection::All) {
+                continue;
+            }
+            for spans in &mut columns {
+                spans.sort_by_key(|span| span.first_row);
+            }
+            metadata.publish_decode_ranges(decode_ranges(metadata.num_rows() as u32, &columns));
+        }
+    }
+
     /// Cuts `pages` into ranges.
     pub(crate) fn cut(table: &Arc<ParquetTable>, pages: Vec<DecompressedPage>) -> Vec<DecodeRange> {
+        publish_decode_ranges(&pages);
         run_unary_to_completion(new_cutter(table, Vec::new()), pages)
     }
 
@@ -442,6 +490,7 @@ pub(crate) mod tests {
         batch_size: usize,
         eq_predicates: Vec<ScanEqualityPredicate>,
     ) -> Vec<RecordBatch> {
+        publish_decode_ranges(&pages);
         let ranges = run_unary_to_completion(new_cutter(table, eq_predicates), pages);
         run_unary_to_completion(new_decoder(batch_size), ranges)
     }
@@ -655,9 +704,9 @@ pub(crate) mod tests {
     #[test]
     fn a_range_taken_by_another_worker_decodes_its_rows_from_inside_a_page() {
         init_test_free_pool(4);
-        let table = make_test_table(i32_schema(&["a"]), 40_000);
+        let table = make_test_table(i32_schema(&["a"]), 50_000);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
-        let mut ranges = cut(&table, row_number_pages(&metadata, 40_000, 20_000));
+        let mut ranges = cut(&table, row_number_pages(&metadata, 50_000, 50_000));
         let middle = ranges.remove(1);
 
         let first_worker = run_unary_to_completion(new_decoder(8192), ranges);
@@ -671,7 +720,7 @@ pub(crate) mod tests {
             .iter()
             .flat_map(|b| extract_i32s(b, 0))
             .collect();
-        let expected_first: Vec<i32> = (0..16_384).chain(32_768..40_000).collect();
+        let expected_first: Vec<i32> = (0..16_384).chain(32_768..50_000).collect();
         assert_eq!(first, expected_first);
         assert_eq!(second, (16_384..32_768).collect::<Vec<i32>>());
     }

@@ -21,8 +21,67 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Rows per decode range. A range is the unit another worker can take over,
 /// and a worker taking one over skips into its first page of every column,
 /// so a range must be large enough for that skip to stay a small fraction
-/// of its decode.
+/// of its decode. Ranges end on page boundaries of the row group's widest
+/// column (see [`decode_ranges`]), so they run up to twice this long.
 pub const DECODE_RANGE_ROWS: u32 = 16 * 1024;
+
+/// Where a data page sits in its column chunk, and how many bytes it holds
+/// once decompressed.
+#[derive(Clone, Copy, Debug)]
+pub struct PageSpan {
+    pub first_row: u32,
+    pub rows: u32,
+    pub bytes: u64,
+}
+
+/// Cuts a row group of `row_count` rows into decode ranges, given the data
+/// pages of each of its columns.
+///
+/// A worker taking over a range that starts inside a page has to step over
+/// the page's values before the range's first row, and for a column of
+/// variable-width plain values that means reading them. So the ranges end
+/// on page boundaries of the column holding the most bytes: pages are
+/// joined until a range reaches [`DECODE_RANGE_ROWS`], and a page longer
+/// than two ranges is cut at that length within it. Without a column whose
+/// pages cover the row group row for row, the ranges are cut every
+/// [`DECODE_RANGE_ROWS`].
+pub fn decode_ranges(row_count: u32, columns: &[Vec<PageSpan>]) -> Vec<Range<u32>> {
+    let covers_row_group = |pages: &&Vec<PageSpan>| {
+        let mut next = 0;
+        pages.iter().all(|page| {
+            let starts_here = page.first_row == next;
+            next = page.first_row + page.rows;
+            starts_here
+        }) && next == row_count
+    };
+    let widest = columns
+        .iter()
+        .filter(covers_row_group)
+        .max_by_key(|pages| pages.iter().map(|page| page.bytes).sum::<u64>());
+    let Some(widest) = widest else {
+        return (0..row_count)
+            .step_by(DECODE_RANGE_ROWS as usize)
+            .map(|start| start..(start + DECODE_RANGE_ROWS).min(row_count))
+            .collect();
+    };
+
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for end in widest.iter().map(|page| page.first_row + page.rows) {
+        while end - start >= 2 * DECODE_RANGE_ROWS {
+            ranges.push(start..start + DECODE_RANGE_ROWS);
+            start += DECODE_RANGE_ROWS;
+        }
+        if end - start >= DECODE_RANGE_ROWS {
+            ranges.push(start..end);
+            start = end;
+        }
+    }
+    if start < row_count {
+        ranges.push(start..row_count);
+    }
+    ranges
+}
 
 /// A data page's payload, or only its header when every row of the page was
 /// filtered out.
@@ -170,10 +229,7 @@ impl RowGroupPages {
         let row_group_rows = metadata.num_rows().max(0) as u32;
         let (ranges, rows_needed) = match metadata.selection() {
             RowSelection::All => {
-                let ranges: Vec<Range<u32>> = (0..row_group_rows)
-                    .step_by(DECODE_RANGE_ROWS as usize)
-                    .map(|start| start..(start + DECODE_RANGE_ROWS).min(row_group_rows))
-                    .collect();
+                let ranges = metadata.decode_ranges().to_vec();
                 let rows_needed = ranges.iter().map(|range| range.end).collect();
                 (ranges, rows_needed)
             }
@@ -324,6 +380,7 @@ mod tests {
 
     fn pages_of(table: &Arc<ParquetTable>) -> RowGroupPages {
         let metadata = QueryRowGroupMetadata::new(table, 0, RowSelection::All);
+        metadata.publish_decode_ranges(decode_ranges(metadata.num_rows() as u32, &[]));
         let plan =
             DecodePlan::new(&metadata, &Projection::all_from_schema(table.schema()), &[]).unwrap();
         RowGroupPages::new(metadata, Arc::new(plan), Arc::new(AtomicUsize::new(1)))
@@ -398,6 +455,53 @@ mod tests {
             (held_after_first, held_after_second, pages.held_pages(0)),
             (2, 1, 0)
         );
+    }
+
+    fn span(first_row: u32, rows: u32, bytes: u64) -> PageSpan {
+        PageSpan {
+            first_row,
+            rows,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn ranges_end_on_the_page_boundaries_of_the_widest_column() {
+        let narrow = vec![span(0, 60_000, 1_000)];
+        let wide = vec![
+            span(0, 20_000, 900_000),
+            span(20_000, 20_000, 900_000),
+            span(40_000, 20_000, 900_000),
+        ];
+
+        let ranges = decode_ranges(60_000, &[narrow, wide]);
+
+        assert_eq!(ranges, vec![0..20_000, 20_000..40_000, 40_000..60_000]);
+    }
+
+    #[test]
+    fn short_pages_join_until_a_range_is_long_enough() {
+        let pages = (0..5).map(|i| span(i * 10_000, 10_000, 1)).collect();
+
+        let ranges = decode_ranges(50_000, &[pages]);
+
+        assert_eq!(ranges, vec![0..20_000, 20_000..40_000, 40_000..50_000]);
+    }
+
+    #[test]
+    fn a_page_longer_than_two_ranges_is_cut_within() {
+        let ranges = decode_ranges(50_000, &[vec![span(0, 50_000, 1)]]);
+
+        assert_eq!(ranges, vec![0..16_384, 16_384..32_768, 32_768..50_000]);
+    }
+
+    #[test]
+    fn without_a_column_covering_the_row_group_ranges_have_fixed_length() {
+        let gapped = vec![span(0, 10_000, 1), span(20_000, 20_000, 1)];
+
+        let ranges = decode_ranges(40_000, &[gapped]);
+
+        assert_eq!(ranges, vec![0..16_384, 16_384..32_768, 32_768..40_000]);
     }
 
     #[test]

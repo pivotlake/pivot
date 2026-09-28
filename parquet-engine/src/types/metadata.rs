@@ -13,8 +13,9 @@ use crate::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use dispatch::io::OpenFile;
-use std::sync::Arc;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// One entry per leaf in column-chunk order, shared by every row group in the
 /// file. Each leaf holds one bound array indexed by file-local row-group index.
@@ -236,6 +237,9 @@ pub struct QueryRowGroupMetadata {
     /// the decompressor skips the remaining, not-yet-touched pages instead of
     /// decompressing them only to be discarded.
     pruned: Arc<AtomicBool>,
+    /// The row group's decode ranges, cut along its pages by the indexer
+    /// before it sends any of them on. Shared by every page of the row group.
+    decode_ranges: Arc<OnceLock<Vec<Range<u32>>>>,
 }
 
 impl QueryRowGroupMetadata {
@@ -246,6 +250,7 @@ impl QueryRowGroupMetadata {
             selection,
             row_group_index: index,
             pruned: Arc::new(AtomicBool::new(false)),
+            decode_ranges: Arc::new(OnceLock::new()),
         }
     }
 
@@ -264,6 +269,22 @@ impl QueryRowGroupMetadata {
     /// this metadata — in particular to the decompressor handling later pages.
     pub fn mark_pruned(&self) {
         self.pruned.store(true, Ordering::Relaxed);
+    }
+
+    /// Record the row group's decode ranges. Called once per row group, by
+    /// the indexer, before any of its pages is sent on.
+    pub fn publish_decode_ranges(&self, ranges: Vec<Range<u32>>) {
+        self.decode_ranges
+            .set(ranges)
+            .expect("a row group's decode ranges are published once");
+    }
+
+    /// The row group's decode ranges, which the indexer published before
+    /// sending on the page that brought this metadata.
+    pub fn decode_ranges(&self) -> &[Range<u32>] {
+        self.decode_ranges
+            .get()
+            .expect("the indexer publishes a row group's decode ranges before its pages")
     }
 
     /// Get the corresponding RowGroupMetadata from the table
