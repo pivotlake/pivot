@@ -68,6 +68,7 @@ pub mod arrays;
 pub mod cpu_features;
 pub mod env;
 pub mod gather_barrier;
+pub mod hash_seeds;
 pub mod io;
 pub mod memory;
 pub mod waker;

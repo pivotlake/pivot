@@ -116,6 +116,7 @@ fn build_shell_target(
 }
 
 fn main() -> ExitCode {
+    dispatch::hash_seeds::install_per_thread_hash_seeds();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
