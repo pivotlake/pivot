@@ -36,6 +36,36 @@ unsafe fn gather_entries<D: Dict>(dict: &D, keys: &[u32], dest: &mut [D::Item]) 
     }
 }
 
+/// Longest RLE run whose key joins the batched lookup of
+/// [`RleDecoder::read_whole_runs`]; a longer one is filled directly.
+const SHORT_RLE_RUN: usize = 32;
+
+/// Pushes `dict`'s entry for each of `keys` onto `builder`. Keys from runs
+/// wider than `dict` covers are checked first.
+#[inline(always)]
+fn emit_keys<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+    builder: &mut B,
+    dict: &D,
+    keys: &[u32],
+    keys_in_range: bool,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    if !keys_in_range {
+        let max = keys.iter().copied().max().unwrap_or(0);
+        assert!(
+            (max as usize) < dict.len(),
+            "dictionary key {max} out of range ({} entries)",
+            dict.len()
+        );
+    }
+    let dest = builder.spare_mut(keys.len());
+    // SAFETY: every key is < dict.len() - by the bit-width bound, the RLE
+    // value check, or the max-scan above.
+    unsafe { gather_entries(dict, keys, dest) };
+}
+
 /// A single run in the RLE/bit-packed stream.
 pub enum Run {
     Rle {
@@ -402,6 +432,90 @@ impl RleDecoder {
         }
     }
 
+    /// Decodes every run that ends within the next `size` values and lies
+    /// wholly in the current buffer, parsing headers straight off it.
+    ///
+    /// Low-cardinality columns alternate short RLE and bit-packed runs every
+    /// few values, so per-run overhead dominates their decode. Here the keys
+    /// of consecutive short runs collect in the scratch buffer and are looked
+    /// up in one pass; only a long RLE run is filled directly. Stops at the
+    /// first run that reaches past `size` or past the buffer, which the
+    /// general path then takes apart.
+    fn read_whole_runs<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+        &mut self,
+        builder: &mut B,
+        dict: &D,
+        size: usize,
+    ) {
+        let Some(buffer) = self.data.get(self.position.buffer_index) else {
+            return;
+        };
+        let bytes: &[u8] = buffer;
+        let keys = &mut *self.buffer;
+        let bit_width = self.bit_width as usize;
+        let value_bytes = byte_width(self.bit_width) as usize;
+        // Bit-packed keys are bounded by the bit width; a dictionary at least
+        // that large holds every one of them (see `Run::read_into`).
+        let keys_in_range = (1u64 << bit_width) as usize <= dict.len();
+        let mut pending = 0;
+        let mut offset = self.position.offset;
+        let mut left = size;
+        while left > 0 {
+            let Some((header, header_len)) = read_varint_at(bytes, offset) else {
+                break;
+            };
+            let start = offset + header_len;
+            let groups = (header >> 1) as usize;
+            if header & 1 == 0 {
+                let end = start + value_bytes;
+                if groups > left || end > bytes.len() {
+                    break;
+                }
+                let value = bytes[start..end]
+                    .iter()
+                    .rev()
+                    .fold(0u32, |value, &byte| (value << 8) | byte as u32);
+                if groups <= SHORT_RLE_RUN {
+                    assert!(
+                        (value as usize) < dict.len(),
+                        "dictionary key {value} out of range ({} entries)",
+                        dict.len()
+                    );
+                    if pending + groups > keys.len() {
+                        emit_keys(builder, dict, &keys[..pending], keys_in_range);
+                        pending = 0;
+                    }
+                    keys[pending..pending + groups].fill(value);
+                    pending += groups;
+                } else {
+                    emit_keys(builder, dict, &keys[..pending], keys_in_range);
+                    pending = 0;
+                    builder.push(&dict.entry(value as usize), groups);
+                }
+                offset = end;
+                left -= groups;
+            } else {
+                let values = groups * 8;
+                let end = start + groups * bit_width;
+                if values > left || end > bytes.len() || values > keys.len() {
+                    break;
+                }
+                if pending + values > keys.len() {
+                    emit_keys(builder, dict, &keys[..pending], keys_in_range);
+                    pending = 0;
+                }
+                BitPackDecoder::new(bytes, start, self.bit_width, [0; 7], 0)
+                    .decode(&mut keys[pending..pending + values])
+                    .expect("a run inside the buffer unpacks whole");
+                pending += values;
+                offset = end;
+                left -= values;
+            }
+        }
+        emit_keys(builder, dict, &keys[..pending], keys_in_range);
+        self.position.offset = offset;
+    }
+
     /// Steps over every run that ends within the next `size` values, reading
     /// only run headers, and returns how many values are left to skip.
     ///
@@ -448,6 +562,12 @@ impl RleDecoder {
     ) {
         let target = builder.len() + size;
         while builder.len() < target {
+            if self.run.is_none() {
+                self.read_whole_runs(builder, dict, target - builder.len());
+                if builder.len() == target {
+                    break;
+                }
+            }
             let size = target - builder.len();
             let run = self.get_or_set_next_run();
             self.run = run.read_into(
@@ -656,6 +776,49 @@ mod tests {
                 let rest = push_all(&mut allocator, &mut dec, &dict, total - skip);
 
                 assert_eq!(rest, expected[skip..], "split {split} skip {skip}");
+            }
+        }
+    }
+
+    /// Reading in any chunk sizes over a stream of short RLE, long RLE and
+    /// bit-packed runs, whole or split across buffers, yields every value
+    /// in order.
+    #[test]
+    fn read_over_many_runs_yields_every_value() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        // Repeats of: 1 bit-packed group (AA BB CC DD AA BB CC DD), an RLE
+        // run of 5 x CC, then an RLE run of 40 x BB.
+        let segment = [0x03, 0xE4, 0xE4, 0x0A, 0x02, 0x50, 0x01];
+        let stream: Vec<u8> = segment
+            .iter()
+            .copied()
+            .cycle()
+            .take(segment.len() * 30)
+            .collect();
+        let mut expected = Vec::new();
+        for _ in 0..30 {
+            expected.extend(["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"]);
+            expected.extend(["CC"; 5]);
+            expected.extend(["BB"; 40]);
+        }
+
+        for split in [stream.len(), 7, 40, 101] {
+            for chunk in [1, 7, 53, 1000, expected.len()] {
+                let data = make_data_multi_buffer(vec![
+                    stream[..split].to_vec(),
+                    stream[split..].to_vec(),
+                ]);
+                let mut dec = RleDecoder::new(data, ReaderPosition::default(), 2);
+
+                let mut values = Vec::new();
+                while values.len() < expected.len() {
+                    let size = chunk.min(expected.len() - values.len());
+                    values.extend(push_all(&mut allocator, &mut dec, &dict, size));
+                }
+
+                assert_eq!(values, expected, "split {split} chunk {chunk}");
             }
         }
     }
