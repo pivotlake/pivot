@@ -65,8 +65,12 @@ pub(crate) fn prunable_topk_slot(
     slots: &[AggregationSlot],
 ) -> Option<usize> {
     // Experiment kill switch: disables the whole pruning apparatus so an A/B
-    // can attribute a regression to it or to the surrounding changes.
-    if std::env::var_os("PIVOT_DISABLE_TOPK_PRUNING").is_some() {
+    // can attribute a regression to it or to the surrounding changes. Read
+    // once: every worker builds its group operator at the same moment, and
+    // reading the environment takes a process-wide lock.
+    static PRUNING_DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PIVOT_DISABLE_TOPK_PRUNING").is_some());
+    if *PRUNING_DISABLED {
         return None;
     }
     let (slot, limit) = match output_limit? {
