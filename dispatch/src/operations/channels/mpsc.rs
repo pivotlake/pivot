@@ -114,6 +114,38 @@ impl<O> Receiver<O> for MpscReceiver<O> {
     }
 }
 
+/// One worker's end of a channel that a single worker reads: the reader's
+/// receiver, or nothing for every other worker, whose operator then finds no
+/// input. The other workers get no channel of their own, so a channel read by
+/// one of many workers costs one allocation, not one per worker.
+pub struct SingleReaderReceiver<O>(Option<MpscReceiver<O>>);
+
+impl<O> SingleReaderReceiver<O> {
+    /// The reading worker's end.
+    pub fn reader(receiver: MpscReceiver<O>) -> Self {
+        Self(Some(receiver))
+    }
+
+    /// Any other worker's end, which never receives.
+    pub fn other() -> Self {
+        Self(None)
+    }
+}
+
+impl<O> Receiver<O> for SingleReaderReceiver<O> {
+    fn is_empty(&self) -> bool {
+        self.0.as_ref().is_none_or(|receiver| receiver.is_empty())
+    }
+
+    fn try_recv(&self) -> Option<O> {
+        self.0.as_ref()?.try_recv()
+    }
+
+    fn steal(&self) -> Option<O> {
+        None
+    }
+}
+
 /// An mpsc channel whose receiver is not a worker (e.g. the final output
 /// channel drained by the query's caller): sends bump the count but wake nobody.
 pub fn mpsc_channel<T>() -> (MpscSender<T>, MpscReceiver<T>) {
