@@ -212,6 +212,11 @@ pub struct IcebergDatastore {
     /// Its calls are async and are blocked on from the calling thread
     /// ([`block_on`]).
     catalog: RestCatalog,
+    /// Whether the catalog is authenticated to with an OAuth2 credential. The
+    /// client caches the token it exchanges the credential for and never
+    /// renews it, so each refresh exchanges the credential again before the
+    /// catalog's tokens can expire.
+    exchanges_credential: bool,
     /// The catalog's URI, which stands in for a data path: every file location
     /// a table reports is absolute.
     catalog_uri: String,
@@ -312,6 +317,7 @@ impl IcebergDatastore {
         let catalog = build_rest_catalog(name, config)?;
         let datastore = Self {
             catalog,
+            exchanges_credential: matches!(config.auth, Some(IcebergCatalogAuth::OAuth2 { .. })),
             catalog_uri: config.uri.clone(),
             store_factory,
             dispatcher: dispatcher.clone(),
@@ -324,8 +330,12 @@ impl IcebergDatastore {
     }
 
     /// Ask the catalog for everything it holds and replace the index with the
-    /// answer. A failure leaves the index as it was.
+    /// answer, first exchanging the OAuth2 credential for a fresh token when
+    /// there is one. A failure leaves the index (and the token) as it was.
     pub fn refresh(&self) -> Result<()> {
+        if self.exchanges_credential {
+            block_on(self.catalog.regenerate_token()).map_err(Box::new)?;
+        }
         let fetched = self.fetch_index()?;
         *self.index.write().unwrap() = Arc::new(fetched);
         Ok(())
