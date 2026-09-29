@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use bin::server::Server;
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use common::{pick_free_port, pivot_metastore, wait_until_listening};
-use datastore_pivot::PivotDatastore;
+use datastore_pivotlake::PivotlakeDatastore;
 use dispatch::Dispatch;
 use tokio::sync::oneshot;
 
@@ -32,7 +32,7 @@ fn shutdown_signal_drains_all_worker_threads() {
         let dispatch = Dispatch::spin_up(workers, 32, None);
         let data_dir = tempfile::tempdir().unwrap();
         let datastore: Arc<dyn Datastore> =
-            PivotDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
+            PivotlakeDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
                 .unwrap();
         let catalog = Arc::new(
             PivotCatalog::new(

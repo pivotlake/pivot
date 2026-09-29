@@ -15,7 +15,7 @@
 
 mod common;
 
-use datastore_pivot::test_support as harness;
+use datastore_pivotlake::test_support as harness;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use common::{
     DispatchGuard, collect_i64s, commit_datastore_transaction, current_parquet,
     dispatch_with_buffers, strings_and_ints,
 };
-use datastore_pivot::PivotDatastore;
+use datastore_pivotlake::PivotlakeDatastore;
 use dispatch::Projection;
 use harness::Backend;
 use object_storage::ObjectPath;
@@ -81,13 +81,17 @@ fn pq(values: &[i64]) -> Vec<u8> {
 }
 
 /// Put `files` (name → values) under `events/` and `CREATE TABLE events` over them.
-fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Arc<PivotDatastore> {
+fn create_events(
+    d: &DispatchGuard,
+    b: &Backend,
+    files: &[(&str, &[i64])],
+) -> Arc<PivotlakeDatastore> {
     for (name, values) in files {
         b.store
             .put(&ObjectPath::new(format!("events/{name}")), &pq(values))
             .unwrap();
     }
-    let datastore = PivotDatastore::open(&b.root, d).unwrap();
+    let datastore = PivotlakeDatastore::open(&b.root, d).unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(adopting_request("events", "events"))
@@ -102,7 +106,7 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Ar
 }
 
 /// Scan the table's `value` column, sorted.
-fn scan(d: &DispatchGuard, datastore: &PivotDatastore, name: &str) -> Vec<i64> {
+fn scan(d: &DispatchGuard, datastore: &PivotlakeDatastore, name: &str) -> Vec<i64> {
     let parquet = current_parquet(datastore, name);
     let out = table_input(d, &parquet, Projection::all(2), false)
         .collect()
@@ -112,12 +116,12 @@ fn scan(d: &DispatchGuard, datastore: &PivotDatastore, name: &str) -> Vec<i64> {
     values
 }
 
-fn row_groups(datastore: &PivotDatastore, name: &str) -> usize {
+fn row_groups(datastore: &PivotlakeDatastore, name: &str) -> usize {
     current_parquet(datastore, name).row_groups().len()
 }
 
 /// The table's own storage directory, relative to the store root.
-fn table_location(datastore: &PivotDatastore, name: &str) -> ObjectPath {
+fn table_location(datastore: &PivotlakeDatastore, name: &str) -> ObjectPath {
     ObjectPath::new(
         datastore
             .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
@@ -128,7 +132,7 @@ fn table_location(datastore: &PivotDatastore, name: &str) -> ObjectPath {
 
 /// `DROP TABLE <name>`, the way the server runs it: execute the staging
 /// dataflow, then commit the transaction that unregisters the table.
-fn drop_table(d: &DispatchGuard, datastore: &Arc<PivotDatastore>, name: &str) {
+fn drop_table(d: &DispatchGuard, datastore: &Arc<PivotlakeDatastore>, name: &str) {
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_drop_table(DropTableRequest {
@@ -157,7 +161,7 @@ mod bodies {
         b.store
             .put(&ObjectPath::new("events/p1.parquet"), &pq(&[1, 2, 3]))
             .unwrap();
-        let datastore = PivotDatastore::open(&b.root, &d).unwrap();
+        let datastore = PivotlakeDatastore::open(&b.root, &d).unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -184,7 +188,7 @@ mod bodies {
             .unwrap();
         let absolute = b.store.absolute_key(&ObjectPath::new("outside")).unwrap();
         assert!(absolute.is_absolute(), "the store yields an absolute key");
-        let datastore = PivotDatastore::open(&b.root, &d).unwrap();
+        let datastore = PivotlakeDatastore::open(&b.root, &d).unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -205,7 +209,7 @@ mod bodies {
         let d = dispatch_with_buffers(2, 32);
         drop(create_events(&d, b, &[("p1.parquet", &[1, 2, 3])]));
 
-        let reopened = PivotDatastore::open(&b.root, &d).unwrap();
+        let reopened = PivotlakeDatastore::open(&b.root, &d).unwrap();
 
         assert_eq!(scan(&d, &reopened, "events"), vec![1, 2, 3]);
     }
@@ -244,13 +248,13 @@ mod bodies {
                 &merged_bytes,
             )
             .unwrap();
-        let merged = datastore_pivot::FileRef {
+        let merged = datastore_pivotlake::FileRef {
             path: merged_path,
             size: merged_bytes.len() as u64,
         };
 
         table
-            .replace_data_files(&inputs, &[datastore_pivot::DeltaFileEntry::new(merged)])
+            .replace_data_files(&inputs, &[datastore_pivotlake::DeltaFileEntry::new(merged)])
             .unwrap();
 
         assert_eq!(scan(&d, &datastore, "events"), vec![1, 2, 3, 4]);

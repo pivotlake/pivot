@@ -6,16 +6,16 @@ use datastore_iceberg::{IcebergCatalogAuth, IcebergCatalogConfig};
 /// The datastore a shell instance serves.
 #[derive(Clone, Debug)]
 pub enum ShellTarget {
-    /// A Pivot datastore in a local directory (created if it does not exist)
+    /// A pivotlake datastore in a local directory (created if it does not exist)
     /// or at an object-store URI.
-    Pivot { location: String },
+    Pivotlake { location: String },
     /// The read-only tables of an Iceberg REST catalog.
     Iceberg(IcebergCatalogConfig),
 }
 
 impl ShellTarget {
     pub fn pivot(location: impl Into<String>) -> Self {
-        Self::Pivot {
+        Self::Pivotlake {
             location: location.into(),
         }
     }
@@ -34,11 +34,11 @@ impl ShellTarget {
         }))
     }
 
-    /// Where the datastore is, as it was spelled: a Pivot datastore's
+    /// Where the datastore is, as it was spelled: a pivotlake datastore's
     /// directory or object-store URI, or an Iceberg catalog's URI.
     pub fn location(&self) -> &str {
         match self {
-            Self::Pivot { location } => location,
+            Self::Pivotlake { location } => location,
             Self::Iceberg(config) => &config.uri,
         }
     }

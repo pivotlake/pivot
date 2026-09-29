@@ -1,5 +1,5 @@
 //! End-to-end blackbox tests: spin up the real `Server` (with a real
-//! `dispatch` worker pool and `PivotDatastore`), connect with a real Postgres
+//! `dispatch` worker pool and `PivotlakeDatastore`), connect with a real Postgres
 //! client (`tokio-postgres`), and exercise the full
 //! `CREATE TABLE` → `SELECT` → wire-encoding flow.
 //!
@@ -410,7 +410,7 @@ async fn system_datastores_lists_every_served_datastore(#[future] conn: Conn) {
         vec![
             vec![
                 Some("default".into()),
-                Some("pivot".into()),
+                Some("pivotlake".into()),
                 Some("t".into()),
             ],
             vec![

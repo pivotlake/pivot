@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use arrow_array::Int64Array;
 use bin::execution::{Command, ExecuteOptions, StatementOutput};
 use bin::shell::{ShellInstance, ShellTarget};
-use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
 
 fn find_table_dir(root: &Path, table: &str) -> PathBuf {
     let manifest: serde_json::Value =

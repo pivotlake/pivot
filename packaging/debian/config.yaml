@@ -9,7 +9,7 @@ server:
 
 datastores:
   default:
-    kind: pivot
+    kind: pivotlake
     location: /var/lib/pivot/datastores/default
     default: true
 

@@ -24,7 +24,7 @@ use catalog::metastore::Metastore;
 use common::{
     connect_client, parquet_name_value_rows, pick_free_port, select_rows, wait_until_listening,
 };
-use datastore_pivot::test_support::{self, Backend};
+use datastore_pivotlake::test_support::{self, Backend};
 use dispatch::Dispatch;
 use metastore_disk::DiskMetastore;
 use object_storage::ObjectPath;
@@ -89,7 +89,7 @@ fn datastores_section(root: &str) -> String {
         "datastore_refresh_interval: 100ms
 datastores:
   warm:
-    kind: pivot
+    kind: pivotlake
     location: {root}
     default: true
     compact: false

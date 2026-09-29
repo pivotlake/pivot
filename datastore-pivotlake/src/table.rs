@@ -69,12 +69,12 @@ impl TableFile {
 /// This is a cloneable snapshot value. Copies handed out are read views and may
 /// drift as commits land; [`refresh`](Self::refresh) reconciles one to the latest
 /// version. Writers instead go through
-/// `PivotDatastore::commit_to_table`, following the table's commit-lock
+/// `PivotlakeDatastore::commit_to_table`, following the table's commit-lock
 /// protocol. `store` and `location`
 /// let any copy persist and reload itself.
 #[derive(Clone)]
 pub struct CatalogTable {
-    /// The table's durable identity from the Pivot manifest, minted once at
+    /// The table's durable identity from the pivotlake manifest, minted once at
     /// creation and stable across renames and every commit. The catalog indexes
     /// by this; Delta Kernel independently owns the log's `metaData.id`.
     id: uuid::Uuid,
@@ -490,7 +490,7 @@ impl CatalogTable {
         &self.files
     }
 
-    /// The table's durable identity from the Pivot manifest, stable across
+    /// The table's durable identity from the pivotlake manifest, stable across
     /// renames and commits. The catalog indexes by this.
     pub fn id(&self) -> uuid::Uuid {
         self.id

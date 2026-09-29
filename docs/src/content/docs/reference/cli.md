@@ -9,7 +9,7 @@ in an interactive SQL shell, or runs the PostgreSQL-compatible server.
 ## Usage
 
 ```sh
-pivot open [--kind pivot] [--memory <SIZE>] [--workers <COUNT>] <DIRECTORY | URI>
+pivot open [--kind pivotlake] [--memory <SIZE>] [--workers <COUNT>] <DIRECTORY | URI>
 pivot open --kind iceberg [--warehouse <WAREHOUSE>] [--memory <SIZE>] [--workers <COUNT>] <CATALOG_URI>
 pivot server --config <FILE>
 pivot --help
@@ -31,8 +31,8 @@ Opens a single datastore and starts the [SQL shell](#sql-shell) over it.
 
 | Flag | Description |
 | --- | --- |
-| `<DATASTORE_LOCATION>` | **Required.** Where the datastore is: a local directory or object-store URI for `--kind pivot`, or the REST catalog's `http(s)` base URI for `--kind iceberg`. See [Datastore locations](#datastore-locations). |
-| `--kind <KIND>` | The datastore implementation, `pivot` or `iceberg`.<br />**Default:** `pivot` |
+| `<DATASTORE_LOCATION>` | **Required.** Where the datastore is: a local directory or object-store URI for `--kind pivotlake`, or the REST catalog's `http(s)` base URI for `--kind iceberg`. See [Datastore locations](#datastore-locations). |
+| `--kind <KIND>` | The datastore implementation, `pivotlake` (also accepted as `pivot`) or `iceberg`.<br />**Default:** `pivotlake` |
 | `--warehouse <WAREHOUSE>` | The warehouse to serve, for an Iceberg catalog that serves several. Only valid with `--kind iceberg`. |
 | `--memory <SIZE>` | The buffer-pool budget, as a size such as `8g` or a share of memory such as `50%`. See [Memory budget](#memory-budget).<br />**Default:** `80%` |
 | `--workers <COUNT>` | The number of worker threads that execute queries. Must be at least 1.<br />**Default:** the number of available cores |
@@ -41,10 +41,10 @@ Opens a single datastore and starts the [SQL shell](#sql-shell) over it.
 
 | Location | Kind | Example |
 | --- | --- | --- |
-| Local directory | `pivot` | `./pivot-data`, `/var/lib/pivot` |
-| Local file URI | `pivot` | `file:///var/lib/pivot` |
-| Amazon S3 or S3-compatible storage | `pivot` | `s3://bucket/prefix` (also `s3a://`) |
-| Google Cloud Storage | `pivot` | `gs://bucket/prefix` |
+| Local directory | `pivotlake` | `./pivot-data`, `/var/lib/pivot` |
+| Local file URI | `pivotlake` | `file:///var/lib/pivot` |
+| Amazon S3 or S3-compatible storage | `pivotlake` | `s3://bucket/prefix` (also `s3a://`) |
+| Google Cloud Storage | `pivotlake` | `gs://bucket/prefix` |
 | Iceberg REST catalog | `iceberg` | `https://catalog.example.com/api` |
 
 A local directory is created if it does not exist. Object-store credentials

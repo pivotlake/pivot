@@ -15,13 +15,13 @@
 //!
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
 //! per-file row groups at one log version. The in-memory set is kept current by
-//! **push, not pull**: a periodic [`refresh_from_store`](PivotDatastore::refresh_from_store)
+//! **push, not pull**: a periodic [`refresh_from_store`](PivotlakeDatastore::refresh_from_store)
 //! sweep (the server and the shell each run one on an interval) reloads every
 //! table to its latest committed version and fetches any new files' footers,
 //! and an in-process writer (INSERT, compaction)
-//! [`publish_table`](PivotDatastore::publish_table)s its committed copy
+//! [`publish_table`](PivotlakeDatastore::publish_table)s its committed copy
 //! immediately. Queries never touch the store: a query opens
-//! a transaction ([`Datastore::begin_transaction`]) whose [`PivotSnapshot`]
+//! a transaction ([`Datastore::begin_transaction`]) whose [`PivotlakeSnapshot`]
 //! freezes the table set as of that moment, and every binding, scan, and late
 //! materialize of that query reads the frozen snapshot with zero I/O.
 //!
@@ -263,7 +263,7 @@ impl DatastoreIndex {
     }
 }
 
-/// A Pivot datastore's concurrent table index, keyed by name.
+/// A pivotlake datastore's concurrent table index, keyed by name.
 ///
 /// `CREATE TABLE` compiles to a dataflow that reads every data file's footer
 /// **once** (in parallel over the worker pool) and stages the materialized table
@@ -280,7 +280,7 @@ impl DatastoreIndex {
 /// Cloneable (every field is an `Arc`, a `String`, or the shared dispatcher
 /// handle), so a commit that writes can hand a clone to the blocking pool.
 #[derive(Clone)]
-pub struct PivotDatastore {
+pub struct PivotlakeDatastore {
     /// The in-memory schema and table sets. The lock guards the *index* (add on
     /// `CREATE`, swap-in on a resolve's refresh); each [`CatalogTable`] is itself
     /// a lock-free value that callers clone out and evolve independently. One
@@ -320,15 +320,15 @@ pub struct PivotDatastore {
     compacter: Arc<Mutex<Option<crate::compact::CompacterHandle>>>,
 }
 
-impl std::fmt::Debug for PivotDatastore {
+impl std::fmt::Debug for PivotlakeDatastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PivotDatastore")
+        f.debug_struct("PivotlakeDatastore")
             .field("store", &self.store)
             .finish_non_exhaustive()
     }
 }
 
-impl PivotDatastore {
+impl PivotlakeDatastore {
     /// Open a persisted database rooted at `uri`, a local directory (or
     /// `file://…`), or a remote `s3://…` object store, reloading every
     /// table the manifest records at its latest version: read each table's
@@ -350,7 +350,7 @@ impl PivotDatastore {
         dispatcher: &DataFlowDispatcher,
         maintenance: Option<crate::MaintenanceConfig>,
     ) -> Result<Arc<Self>> {
-        // Only local Pivot datastores take a process lock; remote stores have
+        // Only local pivotlake datastores take a process lock; remote stores have
         // no local root and skip this.
         let local_lock = store
             .local_root()
@@ -492,15 +492,15 @@ impl PivotDatastore {
     }
 
     /// Open a transaction, typed: freeze the current table set into a
-    /// [`PivotSnapshot`] and create the injectors that receive completed INSERT
+    /// [`PivotlakeSnapshot`] and create the injectors that receive completed INSERT
     /// files and table creations. Cheap: clones the map (the row-group metadata
     /// inside is `Arc`-shared), no I/O. The [`Datastore::begin_transaction`]
     /// trait impl delegates here.
-    pub fn begin_transaction(self: Arc<Self>) -> Arc<PivotTransaction> {
-        let snapshot = Arc::new(PivotSnapshot {
+    pub fn begin_transaction(self: Arc<Self>) -> Arc<PivotlakeTransaction> {
+        let snapshot = Arc::new(PivotlakeSnapshot {
             index: self.tables_index.read().unwrap().clone(),
         });
-        Arc::new(PivotTransaction {
+        Arc::new(PivotlakeTransaction {
             snapshot,
             uploaded_files: Arc::new(Injector::new()),
             pending_table_creations: Arc::new(Injector::new()),
@@ -668,7 +668,7 @@ impl PivotDatastore {
     /// Persist one table creation staged by a completed footer-fetch dataflow:
     /// commit Delta version 0, record the table in the database index, and
     /// publish it into the live set so the next transaction binds it. Called
-    /// from [`PivotTransaction::commit`] on the blocking pool, never from a
+    /// from [`PivotlakeTransaction::commit`] on the blocking pool, never from a
     /// dispatch worker.
     ///
     /// The whole step holds the table-set write lock, which serializes
@@ -717,7 +717,7 @@ impl PivotDatastore {
     /// storage after the retention window) and remove it from the live set, so
     /// the next transaction no longer binds it. The table's files stay in
     /// place: a query that bound the table before the drop may still be
-    /// reading them. Called from [`PivotTransaction::commit`] on the blocking
+    /// reading them. Called from [`PivotlakeTransaction::commit`] on the blocking
     /// pool, never from a dispatch worker.
     ///
     /// The whole step holds the index write lock, which serializes in-process
@@ -836,7 +836,7 @@ impl PivotDatastore {
 
     /// Persist one schema creation staged by a transaction: record it in the
     /// database index and publish it into the live set so the next transaction
-    /// resolves it. Called from [`PivotTransaction::commit`] on the blocking
+    /// resolves it. Called from [`PivotlakeTransaction::commit`] on the blocking
     /// pool, never from a dispatch worker.
     ///
     /// The whole step holds the index write lock, which serializes in-process
@@ -923,7 +923,7 @@ impl PivotDatastore {
     }
 }
 
-impl PivotTransaction {
+impl PivotlakeTransaction {
     /// Whether this transaction's frozen snapshot holds `schema`. DuckDB
     /// resolves every name through a schema lookup, so this is answered from the
     /// snapshot alone and takes no lock. A schema this transaction has staged is
@@ -934,7 +934,7 @@ impl PivotTransaction {
 
     /// Resolve a `CREATE TABLE` against this datastore: check the schema exists
     /// and the name is still free, parse the layout options, and locate the
-    /// Parquet files the table adopts. Returns a [`PivotTableCreation`] whose
+    /// Parquet files the table adopts. Returns a [`PivotlakeTableCreation`] whose
     /// `compile` builds the footer-fetch-and-stage dataflow. This part runs on
     /// the coordinator; compiling needs the pool.
     ///
@@ -942,7 +942,7 @@ impl PivotTransaction {
     /// database root, named after its identity. `WITH (with_pre_existing_parquets = '…')`
     /// only points at data to adopt; nothing is written to that directory. A
     /// statement that names none yields an empty table.
-    fn bind_create(&self, request: CreateTableRequest) -> Result<PivotTableCreation> {
+    fn bind_create(&self, request: CreateTableRequest) -> Result<PivotlakeTableCreation> {
         let name = request.schema_qualified_name();
 
         Self::reject_unknown_options(&request)?;
@@ -973,7 +973,7 @@ impl PivotTransaction {
         let sort_by = Self::parse_spec_columns(&request, SORT_BY_OPTION)?;
         let files = self.adopted_data_files(&request)?;
 
-        Ok(PivotTableCreation {
+        Ok(PivotlakeTableCreation {
             pending_table_creations: self.pending_table_creations.clone(),
             files,
             name,
@@ -986,7 +986,7 @@ impl PivotTransaction {
         })
     }
 
-    fn bind_drop(&self, request: DropTableRequest) -> Result<PivotTableDrop> {
+    fn bind_drop(&self, request: DropTableRequest) -> Result<PivotlakeTableDrop> {
         let name = request.schema_qualified_name();
         if !request.if_exists {
             if !self.contains_schema(&name.schema) {
@@ -996,7 +996,7 @@ impl PivotTransaction {
                 return Err(Error::TableNotFound(name.to_string()));
             }
         }
-        Ok(PivotTableDrop {
+        Ok(PivotlakeTableDrop {
             pending_table_drops: self.pending_table_drops.clone(),
             drop: PendingTableDrop {
                 name,
@@ -1015,11 +1015,14 @@ impl PivotTransaction {
     /// schema a success. This checks the transaction's frozen snapshot; the
     /// datastore re-checks under its write lock at commit as the real race
     /// backstop, honouring `IF NOT EXISTS` there too.
-    fn bind_schema_creation(&self, request: CreateSchemaRequest) -> Result<PivotSchemaCreation> {
+    fn bind_schema_creation(
+        &self,
+        request: CreateSchemaRequest,
+    ) -> Result<PivotlakeSchemaCreation> {
         if !request.if_not_exists && self.contains_schema(&request.name) {
             return Err(Error::SchemaExists(request.name));
         }
-        Ok(PivotSchemaCreation {
+        Ok(PivotlakeSchemaCreation {
             pending_schema_creations: self.pending_schema_creations.clone(),
             creation: PendingSchemaCreation {
                 name: request.name,
@@ -1134,10 +1137,10 @@ impl PivotTransaction {
 
 /// Commit the schema creations drained from a transaction. Each one records
 /// itself in the database manifest and publishes into the live schema set.
-/// Blocking store I/O, so [`PivotTransaction::commit`] runs this on the blocking
+/// Blocking store I/O, so [`PivotlakeTransaction::commit`] runs this on the blocking
 /// pool.
 fn commit_schema_creations(
-    datastore: &PivotDatastore,
+    datastore: &PivotlakeDatastore,
     pending_schema_creations: Vec<PendingSchemaCreation>,
 ) -> CatalogResult<()> {
     for pending in pending_schema_creations {
@@ -1148,10 +1151,10 @@ fn commit_schema_creations(
 
 /// Commit the table creations drained from a transaction. Each one initializes
 /// its Delta log, registers itself in the database manifest, and publishes into
-/// the live table set. Blocking store I/O, so [`PivotTransaction::commit`] runs
+/// the live table set. Blocking store I/O, so [`PivotlakeTransaction::commit`] runs
 /// this on the blocking pool.
 fn commit_table_creations(
-    datastore: &PivotDatastore,
+    datastore: &PivotlakeDatastore,
     pending_table_creations: Vec<PendingTableCreation>,
 ) -> CatalogResult<()> {
     for pending in pending_table_creations {
@@ -1162,9 +1165,9 @@ fn commit_table_creations(
 
 /// Commit the table drops drained from a transaction. Each one unregisters
 /// itself from the database manifest and the live table set. Blocking store
-/// I/O, so [`PivotTransaction::commit`] runs this on the blocking pool.
+/// I/O, so [`PivotlakeTransaction::commit`] runs this on the blocking pool.
 fn commit_table_drops(
-    datastore: &PivotDatastore,
+    datastore: &PivotlakeDatastore,
     pending_table_drops: Vec<PendingTableDrop>,
 ) -> CatalogResult<()> {
     for pending in pending_table_drops {
@@ -1175,13 +1178,13 @@ fn commit_table_drops(
 
 /// Commit the files an INSERT drained from its transaction: group them by the
 /// table they were written for and append each group through
-/// [`PivotDatastore::commit_to_table`]. The transaction's frozen snapshot is not
+/// [`PivotlakeDatastore::commit_to_table`]. The transaction's frozen snapshot is not
 /// the commit base -- it is a read view, and a table it froze versions ago would
 /// lose the compare-and-swap against every INSERT that committed since.
-/// Blocking store I/O, so [`PivotTransaction::commit`] runs it on the blocking
+/// Blocking store I/O, so [`PivotlakeTransaction::commit`] runs it on the blocking
 /// pool.
 fn commit_uploaded_files(
-    datastore: &PivotDatastore,
+    datastore: &PivotlakeDatastore,
     drained: Vec<insert_sink::UploadedFile>,
 ) -> CatalogResult<()> {
     let mut files_by_table = HashMap::<Uuid, Vec<TableFile>>::new();
@@ -1224,21 +1227,21 @@ fn drain_injector<T>(injector: &Injector<T>) -> Vec<T> {
 }
 
 #[async_trait]
-impl Datastore for PivotDatastore {
+impl Datastore for PivotlakeDatastore {
     /// Open a transaction: freeze the table set as it stands right now. Every
     /// table the transaction binds resolves from that frozen
-    /// [`PivotSnapshot`] (pure in-memory, no I/O), so one query reads one
+    /// [`PivotlakeSnapshot`] (pure in-memory, no I/O), so one query reads one
     /// consistent version of every table regardless of concurrent refreshes or
     /// commits. [`DatastoreTransaction::commit`] persists staged table creations
     /// and files injected by INSERT; rollback or dropping the transaction
     /// discards those pending sets.
     fn begin_transaction(self: Arc<Self>) -> Arc<dyn DatastoreTransaction> {
-        PivotDatastore::begin_transaction(self)
+        PivotlakeDatastore::begin_transaction(self)
     }
 
     /// The datastore implementation, independent of the object store backing it.
     fn kind(&self) -> &'static str {
-        "pivot"
+        "pivotlake"
     }
 
     /// The URI this database is rooted at; every table location and file path
@@ -1306,21 +1309,21 @@ impl Datastore for PivotDatastore {
 /// materialized (the background refresh keeps the master set fully fetched).
 /// Everything a query does against it (binding, scan-view construction, late
 /// materialize) is pure in-memory.
-pub struct PivotSnapshot {
+pub struct PivotlakeSnapshot {
     /// The datastore's schemas and tables as they stood when the transaction
     /// began, so a query resolves both from one frozen view.
     index: DatastoreIndex,
 }
 
-impl std::fmt::Debug for PivotSnapshot {
+impl std::fmt::Debug for PivotlakeSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PivotSnapshot")
+        f.debug_struct("PivotlakeSnapshot")
             .field("tables", &self.index.table_names().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
 
-impl PivotSnapshot {
+impl PivotlakeSnapshot {
     /// A clone of the table named `name`, or `None` if this snapshot has no such
     /// table. The frozen copy a [`TableBinding`] captures at bind time, so its
     /// compile resolves the table's file set without any transaction handle.
@@ -1336,7 +1339,7 @@ impl PivotSnapshot {
         self.index.contains_schema(schema)
     }
 
-    /// The cache revision of `name` in this frozen snapshot. The Pivot manifest
+    /// The cache revision of `name` in this frozen snapshot. The pivotlake manifest
     /// ID distinguishes table incarnations; the Delta log version distinguishes
     /// every committed snapshot of one incarnation.
     fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision> {
@@ -1347,7 +1350,7 @@ impl PivotSnapshot {
         })
     }
 
-    /// Every table in this frozen index, with its Pivot manifest ID, the
+    /// Every table in this frozen index, with its pivotlake manifest ID, the
     /// columns it declares and the files it holds at this version.
     fn tables(&self) -> Vec<DatastoreTableMetadata> {
         self.index
@@ -1397,11 +1400,11 @@ struct PendingTableCreation {
     loaded: Vec<parquet_engine::FileRowGroups>,
 }
 
-/// The [`DatastoreTransaction`] a [`PivotDatastore`] opens: one query's frozen
-/// [`PivotSnapshot`] plus injectors of uploaded files and completed table
+/// The [`DatastoreTransaction`] a [`PivotlakeDatastore`] opens: one query's frozen
+/// [`PivotlakeSnapshot`] plus injectors of uploaded files and completed table
 /// creations awaiting commit.
-pub struct PivotTransaction {
-    pub(crate) snapshot: Arc<PivotSnapshot>,
+pub struct PivotlakeTransaction {
+    pub(crate) snapshot: Arc<PivotlakeSnapshot>,
     pub(crate) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
     pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
@@ -1409,7 +1412,7 @@ pub struct PivotTransaction {
     /// The datastore this transaction reads and writes back to. CREATE commits
     /// publish through it so DDL is visible to the next transaction without
     /// waiting for a refresh.
-    datastore: Arc<PivotDatastore>,
+    datastore: Arc<PivotlakeDatastore>,
     /// Whether commit has run. A second commit is refused, and the drop
     /// safety net below discards the staged writes of a transaction its owner
     /// never resolved, so no code path can leak them into limbo; deliberate
@@ -1419,15 +1422,15 @@ pub struct PivotTransaction {
     committed: std::sync::atomic::AtomicBool,
 }
 
-impl std::fmt::Debug for PivotTransaction {
+impl std::fmt::Debug for PivotlakeTransaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PivotTransaction")
+        f.debug_struct("PivotlakeTransaction")
             .field("snapshot", &self.snapshot)
             .finish_non_exhaustive()
     }
 }
 
-impl PivotTransaction {
+impl PivotlakeTransaction {
     /// [`DatastoreTransaction::bind_table`], typed: the concrete
     /// [`TableBinding`] instead of the trait object. This is the single
     /// resolution path; the trait impl below only boxes its result (the planner
@@ -1449,7 +1452,7 @@ impl PivotTransaction {
 }
 
 #[async_trait]
-impl DatastoreTransaction for PivotTransaction {
+impl DatastoreTransaction for PivotlakeTransaction {
     fn does_schema_exist(&self, schema: &str) -> CatalogResult<bool> {
         Ok(self.contains_schema(schema))
     }
@@ -1459,7 +1462,7 @@ impl DatastoreTransaction for PivotTransaction {
         datastore: &str,
         name: &SchemaQualifiedTableName,
     ) -> CatalogResult<Option<Box<dyn BoundTable>>> {
-        Ok(PivotTransaction::table(self, datastore, name)
+        Ok(PivotlakeTransaction::table(self, datastore, name)
             .map(|table| Box::new(table) as Box<dyn BoundTable>))
     }
 
@@ -1569,7 +1572,7 @@ impl DatastoreTransaction for PivotTransaction {
 /// so no owner mistake can leave them in limbo. Reaching this is a bug in the
 /// owner, hence the warning; read-only transactions drop silently (planning
 /// and pure reads resolve nothing by design).
-impl Drop for PivotTransaction {
+impl Drop for PivotlakeTransaction {
     fn drop(&mut self) {
         if self.committed.load(std::sync::atomic::Ordering::Acquire) {
             return;
@@ -1589,16 +1592,16 @@ impl Drop for PivotTransaction {
     }
 }
 
-/// A resolved `CREATE SCHEMA` for a [`PivotDatastore`]: the validated creation
+/// A resolved `CREATE SCHEMA` for a [`PivotlakeDatastore`]: the validated creation
 /// plus the transaction-owned staging queue it will land in. Compiling it builds
 /// a dataflow that stages the creation and emits no rows, so the schema appears
 /// on the transaction only once that dataflow runs.
-struct PivotSchemaCreation {
+struct PivotlakeSchemaCreation {
     pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
     creation: PendingSchemaCreation,
 }
 
-impl SchemaCreation for PivotSchemaCreation {
+impl SchemaCreation for PivotlakeSchemaCreation {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
         // One nullary per worker, but only the first carries the creation; the
         // rest no-op. Handing it out here rather than racing for it at run time
@@ -1620,16 +1623,16 @@ impl SchemaCreation for PivotSchemaCreation {
     }
 }
 
-/// A resolved `DROP TABLE` for a [`PivotDatastore`]: the validated drop plus
+/// A resolved `DROP TABLE` for a [`PivotlakeDatastore`]: the validated drop plus
 /// the transaction-owned staging queue it will land in. Compiling it builds a
 /// dataflow that stages the drop and emits no rows, so the drop lands on the
 /// transaction only once that dataflow runs.
-struct PivotTableDrop {
+struct PivotlakeTableDrop {
     pending_table_drops: Arc<Injector<PendingTableDrop>>,
     drop: PendingTableDrop,
 }
 
-impl TableDrop for PivotTableDrop {
+impl TableDrop for PivotlakeTableDrop {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
         // One nullary per worker, but only the first carries the drop; the
         // rest no-op, exactly as the schema-creation sink stages.
@@ -1650,12 +1653,12 @@ impl TableDrop for PivotTableDrop {
     }
 }
 
-/// A resolved `CREATE TABLE` for a [`PivotDatastore`]: the validated request, a
+/// A resolved `CREATE TABLE` for a [`PivotlakeDatastore`]: the validated request, a
 /// transaction-owned staging injector, and the located data files, captured at
-/// resolution by [`PivotTransaction::bind_create`]. Compiling it builds the
+/// resolution by [`PivotlakeTransaction::bind_create`]. Compiling it builds the
 /// dataflow that fetches the files' footers and stages the completed creation
 /// for transaction commit.
-struct PivotTableCreation {
+struct PivotlakeTableCreation {
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
     files: Vec<DataFile>,
     name: SchemaQualifiedTableName,
@@ -1669,7 +1672,7 @@ struct PivotTableCreation {
     if_not_exists: bool,
 }
 
-impl TableCreation for PivotTableCreation {
+impl TableCreation for PivotlakeTableCreation {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
         // The terminal worker only stages the completed creation. Durable writes
         // and live publication happen later in the transaction's blocking commit.

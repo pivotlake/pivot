@@ -26,7 +26,7 @@ The smallest useful file names one datastore. Everything else has a default:
 ```yaml
 datastores:
   local:
-    kind: pivot
+    kind: pivotlake
     location: ./pivot-data
     default: true
 ```
@@ -65,7 +65,7 @@ server:
 # What the server serves
 datastores:
   <name>:
-    kind: pivot
+    kind: pivotlake
     location: /var/lib/pivot/datastores/<name>
     default: true               # on exactly one datastore
     # compact: true

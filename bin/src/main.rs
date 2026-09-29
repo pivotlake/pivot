@@ -17,8 +17,10 @@ struct Args {
 /// Which datastore implementation `pivot open` opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum DatastoreKind {
-    /// A Pivot datastore in a local directory or at an object-store URI.
-    Pivot,
+    /// A pivotlake datastore in a local directory or at an object-store URI.
+    /// Also accepted as `pivot`, the kind's name before it was renamed.
+    #[value(alias = "pivot")]
+    Pivotlake,
     /// The read-only tables of an Iceberg REST catalog at an http(s) URI.
     Iceberg,
 }
@@ -27,7 +29,7 @@ enum DatastoreKind {
 enum PivotCommand {
     /// Open a datastore in the Pivot SQL shell.
     ///
-    /// A Pivot datastore (the default kind) is named either by a local
+    /// A pivotlake datastore (the default kind) is named either by a local
     /// directory, which is created if it does not exist, or by an object-store
     /// URI: s3://bucket/prefix (s3:// also spelled s3a://), gs://bucket/prefix,
     /// or file:///path.
@@ -57,7 +59,7 @@ enum PivotCommand {
         datastore_location: String,
 
         /// Which datastore implementation the location names.
-        #[arg(long, value_enum, default_value_t = DatastoreKind::Pivot)]
+        #[arg(long, value_enum, default_value_t = DatastoreKind::Pivotlake)]
         kind: DatastoreKind,
 
         /// The warehouse to serve, for an Iceberg catalog that serves several.
@@ -97,7 +99,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// What `pivot open` opens, from its arguments. A Pivot datastore has no
+/// What `pivot open` opens, from its arguments. A pivotlake datastore has no
 /// warehouse to name.
 fn build_shell_target(
     kind: DatastoreKind,
@@ -105,7 +107,7 @@ fn build_shell_target(
     warehouse: Option<String>,
 ) -> Result<ShellTarget, Box<dyn std::error::Error>> {
     match kind {
-        DatastoreKind::Pivot => {
+        DatastoreKind::Pivotlake => {
             if warehouse.is_some() {
                 return Err("--warehouse applies only to --kind iceberg".into());
             }
@@ -165,11 +167,18 @@ mod tests {
     }
 
     #[test]
-    fn open_defaults_to_the_pivot_kind() {
+    fn open_defaults_to_the_pivotlake_kind() {
         let (_, kind, warehouse) = parse_open(&["/var/lib/pivot"]);
 
-        assert_eq!(kind, DatastoreKind::Pivot);
+        assert_eq!(kind, DatastoreKind::Pivotlake);
         assert!(warehouse.is_none());
+    }
+
+    #[test]
+    fn open_takes_pivot_as_the_pivotlake_kind() {
+        let (_, kind, _) = parse_open(&["--kind", "pivot", "/var/lib/pivot"]);
+
+        assert_eq!(kind, DatastoreKind::Pivotlake);
     }
 
     #[test]

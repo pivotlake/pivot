@@ -25,7 +25,7 @@
 //! it holds nothing but a datastore handle, reads each table's directory, and
 //! deletes through the table's store -- so a table under an `s3://` root vacuums
 //! through the exact same code as a local one. It is self-managed by the
-//! [`PivotDatastore`] alongside the compacter, and unlike the merge it touches no
+//! [`PivotlakeDatastore`] alongside the compacter, and unlike the merge it touches no
 //! dispatch workers: it only lists the directory and deletes objects.
 
 use std::collections::HashSet;
@@ -37,7 +37,7 @@ use tracing::{info, warn};
 
 use planner::catalog::SchemaQualifiedTableName;
 
-use crate::{CatalogTable, PivotDatastore, Result};
+use crate::{CatalogTable, PivotlakeDatastore, Result};
 use object_storage::ObjectPath;
 
 /// Default cadence for re-scanning the tables for newly-expired files and
@@ -77,11 +77,11 @@ pub(crate) fn now_unix_ms() -> u64 {
 pub struct Vacuumer {
     /// How often to re-scan the tables for files to delete.
     poll_interval: Duration,
-    datastore: Arc<PivotDatastore>,
+    datastore: Arc<PivotlakeDatastore>,
 }
 
 impl Vacuumer {
-    pub fn new(poll_interval: Duration, datastore: Arc<PivotDatastore>) -> Self {
+    pub fn new(poll_interval: Duration, datastore: Arc<PivotlakeDatastore>) -> Self {
         Self {
             poll_interval,
             datastore,

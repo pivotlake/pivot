@@ -21,7 +21,7 @@ use tempfile::TempDir;
 use catalog::datastore::{Datastore, DatastoreTransaction};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::commit_datastore_transaction;
-use datastore_pivot::PivotDatastore;
+use datastore_pivotlake::PivotlakeDatastore;
 use planner::Planner;
 use planner::catalog::{Column, CreateTableRequest};
 use planner::types::Type;
@@ -34,7 +34,7 @@ fn dispatcher() -> DataFlowDispatcher {
         .clone()
 }
 
-fn make_datastore() -> (TempDir, Arc<PivotDatastore>) {
+fn make_datastore() -> (TempDir, Arc<PivotlakeDatastore>) {
     let dir = TempDir::new().unwrap();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -59,7 +59,7 @@ fn make_datastore() -> (TempDir, Arc<PivotDatastore>) {
         .unwrap();
     writer.close().unwrap();
 
-    let datastore = PivotDatastore::open(&dir.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open(&dir.path().to_string_lossy(), &dispatcher()).unwrap();
     let mut options = HashMap::new();
     options.insert(
         "with_pre_existing_parquets".to_string(),
@@ -94,7 +94,7 @@ fn make_datastore() -> (TempDir, Arc<PivotDatastore>) {
     (dir, datastore)
 }
 
-fn run_count(datastore: &Arc<PivotDatastore>) -> usize {
+fn run_count(datastore: &Arc<PivotlakeDatastore>) -> usize {
     let catalog = Arc::new(
         PivotCatalog::new(
             HashMap::from([(

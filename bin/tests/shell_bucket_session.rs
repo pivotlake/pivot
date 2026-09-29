@@ -6,8 +6,8 @@
 use arrow_array::{Array, Int64Array};
 use bin::execution::{ExecuteOptions, StatementOutput};
 use bin::shell::{ShellInstance, ShellTarget};
-use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
-use datastore_pivot::test_support;
+use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivotlake::test_support;
 
 #[test]
 fn a_datastore_is_opened_on_an_s3_uri() {

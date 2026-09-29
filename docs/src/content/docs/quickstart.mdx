@@ -11,7 +11,7 @@ Start Pivot, load some data, and run your first queries.
 
 Pivot runs either as a local SQL shell, or as a server that Postgres clients
 connect to. Choose the option that fits, then where your data lives: an
-existing Iceberg catalog, or a Pivot datastore in Amazon S3 or Google Cloud
+existing Iceberg catalog, or a pivotlake datastore in Amazon S3 or Google Cloud
 Storage.
 
 <Tabs>
@@ -45,7 +45,7 @@ Storage.
         [object-store credentials](/docs/reference/cli/#object-store-credentials).
       </TabItem>
 
-      <TabItem label="Pivot datastore - S3">
+      <TabItem label="pivotlake datastore - S3">
         Export your AWS credentials and region, then open a datastore from its
         location in S3:
 
@@ -58,7 +58,7 @@ Storage.
         ```
       </TabItem>
 
-      <TabItem label="Pivot datastore - GCS">
+      <TabItem label="pivotlake datastore - GCS">
         Log in with Application Default Credentials, then open a datastore
         from its location in Google Cloud Storage:
 
@@ -111,7 +111,7 @@ Storage.
         ```
       </TabItem>
 
-      <TabItem label="Pivot datastore - S3">
+      <TabItem label="pivotlake datastore - S3">
         Start the server with the datastore's location in S3, and pass your
         AWS credentials and region:
 
@@ -133,7 +133,7 @@ Storage.
         your bucket after the container exits.
       </TabItem>
 
-      <TabItem label="Pivot datastore - GCS">
+      <TabItem label="pivotlake datastore - GCS">
         Start the server with the datastore's location in Google Cloud
         Storage, mounting a service-account key file and pointing
         `GOOGLE_APPLICATION_CREDENTIALS` at it:
@@ -210,13 +210,13 @@ Storage.
         ```
       </TabItem>
 
-      <TabItem label="Pivot datastore - S3">
+      <TabItem label="pivotlake datastore - S3">
         Point the `default` datastore at your bucket, and add a secret for it:
 
         ```yaml
         datastores:
           default:
-            kind: pivot
+            kind: pivotlake
             location: s3://my-bucket/pivot-data
             default: true
         secrets:
@@ -229,14 +229,14 @@ Storage.
         ```
       </TabItem>
 
-      <TabItem label="Pivot datastore - GCS">
+      <TabItem label="pivotlake datastore - GCS">
         Point the `default` datastore at your bucket, and add a secret with a
         service-account key file:
 
         ```yaml
         datastores:
           default:
-            kind: pivot
+            kind: pivotlake
             location: gs://my-bucket/pivot-data
             default: true
         secrets:
@@ -260,7 +260,7 @@ Storage.
 ### 2. Load data
 
 :::note[Iceberg datastores are read-only]
-Loading data works only in a Pivot datastore. On an Iceberg datastore, skip to
+Loading data works only in a pivotlake datastore. On an Iceberg datastore, skip to
 [3. Query](#3-query).
 :::
 

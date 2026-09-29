@@ -36,8 +36,8 @@ One row per datastore, including `system` itself.
 | Column | Type | Description |
 | --- | --- | --- |
 | `name` | `VARCHAR` | The datastore's name, as configured. |
-| `type` | `VARCHAR` | `pivot`, `iceberg`, or `system`. |
-| `data_path` | `VARCHAR` | Where the datastore lives: the storage location of a Pivot datastore, the catalog URI of an Iceberg datastore, or an empty string for `system`. |
+| `type` | `VARCHAR` | `pivotlake`, `iceberg`, or `system`. |
+| `data_path` | `VARCHAR` | Where the datastore lives: the storage location of a pivotlake datastore, the catalog URI of an Iceberg datastore, or an empty string for `system`. |
 
 ```sql
 SELECT name, type, data_path FROM system.datastores;
@@ -103,7 +103,7 @@ transaction has written but not yet committed are not listed.
 | Column | Type | Description |
 | --- | --- | --- |
 | `table_id` | `VARCHAR` | The table's `system.tables.id`. |
-| `path` | `VARCHAR` | The file's path. Relative to the datastore's `data_path` for a Pivot datastore; a full URI for an Iceberg datastore. |
+| `path` | `VARCHAR` | The file's path. Relative to the datastore's `data_path` for a pivotlake datastore; a full URI for an Iceberg datastore. |
 | `partition` | `VARCHAR` | The file's partition as comma-separated `column=value` pairs, or an empty string for an unpartitioned table. |
 | `bytes` | `BIGINT` | The file's size in storage. |
 | `bytes_uncompressed` | `BIGINT` | Bytes the file's data holds once decompressed. |

@@ -10,7 +10,7 @@
 //! The datastore holds the catalog's answer for every table: the load-table
 //! response, which is the table's metadata and where it lives. That is fetched
 //! whole when the datastore opens and again every refresh interval in the
-//! background, the way the Pivot datastore refreshes its own tables, so a
+//! background, the way the pivotlake datastore refreshes its own tables, so a
 //! query never waits on the catalog and reads a snapshot at most one interval
 //! old. A table created or committed to between refreshes is seen at the next
 //! one. What is indexed is small (kilobytes per table); a table's manifests and
@@ -296,7 +296,7 @@ impl std::fmt::Debug for IcebergDatastore {
 impl IcebergDatastore {
     /// Open the datastore over the catalog `config` describes, fetching every
     /// table it holds; a catalog that cannot be reached fails the open, as a
-    /// store that cannot be read fails a Pivot datastore's. `name` is what the
+    /// store that cannot be read fails a pivotlake datastore's. `name` is what the
     /// REST client registers the catalog as, which it requires;
     /// `store_factory` opens the object stores the tables' files live in, so
     /// their credentials follow the same policy as every other datastore's;

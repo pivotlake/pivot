@@ -169,7 +169,7 @@ server:
   bind: 127.0.0.1:{port}
 {workers_line}{memory_line}datastores:
   default:
-    kind: pivot
+    kind: pivotlake
     location: {data_dir}
     default: true
     compact: false

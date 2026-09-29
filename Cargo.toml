@@ -5,7 +5,7 @@ members = [
     "bin",
     "catalog",
     "datastore-iceberg",
-    "datastore-pivot",
+    "datastore-pivotlake",
     "dispatch",
     "duckdb-planner",
     "metastore-disk",
@@ -28,7 +28,7 @@ publish = false
 # Sibling crates.
 catalog = { path = "catalog" }
 datastore-iceberg = { path = "datastore-iceberg" }
-datastore-pivot = { path = "datastore-pivot" }
+datastore-pivotlake = { path = "datastore-pivotlake" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore-disk = { path = "metastore-disk" }

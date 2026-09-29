@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use bin::server::config::TlsConfig;
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use common::{CatalogFixture, pivot_metastore, select_rows, start_server_with_tls};
-use datastore_pivot::PivotDatastore;
+use datastore_pivotlake::PivotlakeDatastore;
 use pgwire::tokio::tokio_rustls::rustls::crypto::aws_lc_rs;
 use pgwire::tokio::tokio_rustls::rustls::pki_types::CertificateDer;
 use pgwire::tokio::tokio_rustls::rustls::pki_types::pem::PemObject;
@@ -48,7 +48,7 @@ fn server() -> &'static (u16, Vec<u8>) {
         let port = start_server_with_tls(32, Some(acceptor), |dispatch| {
             let data_dir = TempDir::new().unwrap();
             let datastore: Arc<dyn Datastore> =
-                PivotDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
+                PivotlakeDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
                     .unwrap();
             let catalog = Arc::new(
                 PivotCatalog::new(

@@ -29,7 +29,7 @@ fn open_help_lists_the_datastore_kinds_and_iceberg_credentials() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("--kind <KIND>"), "{stdout}");
-    assert!(stdout.contains("[default: pivot]"), "{stdout}");
+    assert!(stdout.contains("[default: pivotlake]"), "{stdout}");
     assert!(stdout.contains("--warehouse <WAREHOUSE>"), "{stdout}");
     for variable in [
         datastore_iceberg::env::TOKEN_VAR,
@@ -54,7 +54,7 @@ fn open_rejects_a_warehouse_for_a_pivot_datastore() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "pivot accepted --warehouse for a pivot datastore"
+        "pivot accepted --warehouse for a pivotlake datastore"
     );
     assert!(
         stderr.contains("--warehouse applies only to --kind iceberg"),
@@ -106,7 +106,7 @@ fn server_command_runs_until_terminated() {
         &config,
         format!(
             "memory: 64m\nworkers: 1\nserver:\n  bind: {address}\n\
-             datastores:\n  default:\n    kind: pivot\n    location: {}\n    default: true\n\
+             datastores:\n  default:\n    kind: pivotlake\n    location: {}\n    default: true\n\
              users:\n  pivot:\n    auth:\n      method: trust\n\
              metastore:\n  kind: file\n  path: {}\n",
             datastore.display(),

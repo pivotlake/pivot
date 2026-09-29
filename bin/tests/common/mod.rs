@@ -17,7 +17,7 @@ use arrow_schema::{DataType, Field, Schema};
 use bin::server::Server;
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use datastore_pivot::PivotDatastore;
+use datastore_pivotlake::PivotlakeDatastore;
 use dispatch::{DataFlowDispatcher, Dispatch};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -230,7 +230,7 @@ pub fn server_port() -> u16 {
         DATA_DIR.set(data_dir.path().to_path_buf()).unwrap();
         start_server(256, move |dispatch| {
             let datastore: Arc<dyn Datastore> =
-                PivotDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
+                PivotlakeDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
                     .unwrap();
             let catalog = Arc::new(
                 PivotCatalog::new(

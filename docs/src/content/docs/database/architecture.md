@@ -183,7 +183,7 @@ Pivot currently supports/exposes the following datastores:
 
 A server can expose multiple datastores, with tables addressed as `datastore.schema.table`.
 
-For example, a query can join orders in a Pivot datastore named `analytics` with customer
+For example, a query can join orders in a pivotlake datastore named `analytics` with customer
 details in an Iceberg datastore named `lake`:
 
 ```sql
@@ -214,7 +214,7 @@ Thanks to the separation of datastores and metastore, different instances / depl
 <figure class="arch-figure">
 <svg viewBox="0 0 920 496" role="img" aria-labelledby="deployments-title deployments-desc">
 <title id="deployments-title">Two Pivot instances with different metastores share one datastore</title>
-<desc id="deployments-desc">Object storage holds two datastores: analytics, a Pivot datastore, and lake, an Iceberg datastore. A Pivot shell started with pivot open on the analytics location uses an ephemeral metastore and reads and writes only analytics. A Pivot server started with pivot server and a metastore from pivot.yaml reads and writes analytics, reads lake, and serves SQL clients such as the analyst user over the Postgres wire.</desc>
+<desc id="deployments-desc">Object storage holds two datastores: analytics, a pivotlake datastore, and lake, an Iceberg datastore. A Pivot shell started with pivot open on the analytics location uses an ephemeral metastore and reads and writes only analytics. A Pivot server started with pivot server and a metastore from pivot.yaml reads and writes analytics, reads lake, and serves SQL clients such as the analyst user over the Postgres wire.</desc>
 <defs>
 <marker id="deployments-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />

@@ -831,7 +831,7 @@ dependencies = [
  "clap",
  "core_affinity",
  "datastore-iceberg",
- "datastore-pivot",
+ "datastore-pivotlake",
  "dispatch",
  "futures",
  "libc",
@@ -1848,7 +1848,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "datastore-pivot"
+name = "datastore-pivotlake"
 version = "0.1.0"
 dependencies = [
  "arrow",
@@ -1864,7 +1864,7 @@ dependencies = [
  "core_affinity",
  "criterion",
  "crossbeam-deque",
- "datastore-pivot",
+ "datastore-pivotlake",
  "delta_kernel",
  "delta_kernel_default_engine",
  "dispatch",
@@ -3583,7 +3583,7 @@ dependencies = [
  "base64 0.22.1",
  "catalog",
  "datastore-iceberg",
- "datastore-pivot",
+ "datastore-pivotlake",
  "dispatch",
  "object-storage",
  "pgwire",

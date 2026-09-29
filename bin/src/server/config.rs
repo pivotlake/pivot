@@ -27,7 +27,7 @@
 //!
 //! datastores:
 //!   hot:
-//!     kind: pivot
+//!     kind: pivotlake
 //!     location: /var/lib/pivot/datastores/hot
 //!     default: true
 //!
@@ -53,7 +53,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
 use dispatch::io::DiskCache;
 use metastore_disk::{
     ByteSize, DatastoreConfig, Interval, MetastoreConfig, SecretConfig, UserConfig,
@@ -311,7 +311,7 @@ mod tests {
     use metastore_disk::DiskMetastore;
 
     const DATASTORES_SECTION: &str =
-        "datastores:\n  hot:\n    kind: pivot\n    location: /tmp/hot\n    default: true\n";
+        "datastores:\n  hot:\n    kind: pivotlake\n    location: /tmp/hot\n    default: true\n";
 
     /// A file whose top level holds `settings`, on top of a minimal
     /// `datastores` map.
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn entries_written_under_the_metastore_section_are_rejected() {
-        let yaml = "metastore:\n  datastores:\n    hot:\n      kind: pivot\n      \
+        let yaml = "metastore:\n  datastores:\n    hot:\n      kind: pivotlake\n      \
                     location: /tmp/hot\n      default: true\n";
 
         let error = Config::from_yaml(yaml, "test").err().unwrap();

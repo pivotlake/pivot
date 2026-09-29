@@ -443,7 +443,7 @@ fn load_files(
 /// A data file's column bounds as the catalog reports them: a JSON object
 /// keyed by column name, each holding the manifest's `min` and `max` for the
 /// column. Numbers and booleans are JSON scalars, everything else a string,
-/// the shape the pivot datastore reports its file bounds in.
+/// the shape the pivotlake datastore reports its file bounds in.
 fn format_min_max_stats(schema: &SchemaRef, data_file: &iceberg::spec::DataFile) -> String {
     let mut field_ids: Vec<i32> = data_file
         .lower_bounds()

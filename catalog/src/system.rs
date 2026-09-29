@@ -36,7 +36,7 @@ const TABLE_FILES_NAME: &str = "table_files";
 const MEMORY_BLOCKS_NAME: &str = "memory_blocks";
 
 /// The type `system.datastores` reports this datastore itself as. It stores
-/// nothing, so it is neither a Pivot datastore nor any other stored format.
+/// nothing, so it is neither a pivotlake datastore nor any other stored format.
 const SYSTEM_DATASTORE_KIND: &str = "system";
 
 /// A statement this datastore cannot serve. Its relations are assembled per

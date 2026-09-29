@@ -48,7 +48,7 @@ pub struct TableBinding {
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
     /// The transaction's shared queue of finished INSERT files. Shared (`Arc`)
-    /// with the [`PivotTransaction`](super::PivotTransaction) that produced this
+    /// with the [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
     /// binding, so a file this binding's [`compile_insert`](BoundTable::compile_insert)
     /// pushes is drained by that transaction's commit.
     uploaded_files: Arc<Injector<UploadedFile>>,

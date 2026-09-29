@@ -19,8 +19,8 @@ use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use common::{
     connect_client, parquet_name_value_rows, pick_free_port, pivot_metastore, wait_until_listening,
 };
-use datastore_pivot::PivotDatastore;
-use datastore_pivot::test_support::{self, Backend};
+use datastore_pivotlake::PivotlakeDatastore;
+use datastore_pivotlake::test_support::{self, Backend};
 use dispatch::Dispatch;
 use object_storage::ObjectPath;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -37,7 +37,7 @@ fn start_server_on(root: &str) -> u16 {
     thread::spawn(move || {
         let dispatch = Dispatch::spin_up(workers, 32, None);
         let datastore: Arc<dyn Datastore> =
-            PivotDatastore::open(&root, dispatch.dispatcher()).unwrap();
+            PivotlakeDatastore::open(&root, dispatch.dispatcher()).unwrap();
         let catalog = Arc::new(
             PivotCatalog::new(
                 HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),

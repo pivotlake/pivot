@@ -45,7 +45,7 @@ datastores:
   # `kind` selects the datastore implementation (only `pivot` today). The storage backend is
   # inferred from `location`: a local path here, an S3 URI for `warm` below.
   default:
-    kind: pivot
+    kind: pivotlake
     location: /var/lib/pivot/datastores/default
     default: true
 
@@ -53,7 +53,7 @@ datastores:
   # names such as `warm.main.events`. Compaction is on by default; run it in
   # only one process per datastore (set `compact: false` on the others).
   warm:
-    kind: pivot
+    kind: pivotlake
     location: s3://example-bucket/warm/
     compact: true
     compact_bytes: 128m
@@ -63,7 +63,7 @@ datastores:
 
   # A `gs://` location opens a Google Cloud Storage store.
   cold:
-    kind: pivot
+    kind: pivotlake
     location: gs://example-bucket/cold/
 
 # The credentials a remote location is opened with, kept apart from the

@@ -11,7 +11,7 @@ mod target;
 pub use instance::{ShellInstance, ShellLimits};
 pub use target::ShellTarget;
 
-/// Open an interactive SQL shell over one Pivot datastore, named by a local
+/// Open an interactive SQL shell over one pivotlake datastore, named by a local
 /// directory or an object-store URI.
 pub fn run(datastore_location: String) -> Result<(), Box<dyn std::error::Error>> {
     run_with_limits(

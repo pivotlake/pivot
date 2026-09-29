@@ -7,7 +7,7 @@ use std::time::Duration;
 use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_iceberg::IcebergDatastore;
-use datastore_pivot::{DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, PivotDatastore};
+use datastore_pivotlake::{DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, PivotlakeDatastore};
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use object_storage::{AmbientExternalStoreFactory, ObjectStore, open_store};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
@@ -104,7 +104,7 @@ struct ShellState {
     executor: crate::execution::Executor,
     catalog: Arc<PivotCatalog>,
     dispatch: DispatchOwner,
-    /// Dropped after the workers have joined: a Pivot datastore's lock stays
+    /// Dropped after the workers have joined: a pivotlake datastore's lock stays
     /// held until then.
     datastore: Arc<dyn Datastore>,
 }
@@ -133,7 +133,7 @@ pub struct ShellInstance {
 }
 
 impl ShellInstance {
-    /// Open the production CLI instance over a Pivot datastore on all
+    /// Open the production CLI instance over a pivotlake datastore on all
     /// available workers with the default pool budget assigned to dispatch.
     /// `location` is a local directory, or an object-store URI
     /// (`s3://bucket/prefix`, `gs://bucket/prefix`) whose credentials come
@@ -252,10 +252,10 @@ impl Drop for ShellInstance {
 }
 
 /// Open the datastore `target` names, refreshing it every `refresh_interval`
-/// once the catalog starts it. A Pivot datastore is opened without
+/// once the catalog starts it. A pivotlake datastore is opened without
 /// maintenance (see [`ShellInstance::open_with_resources`]); an Iceberg
 /// datastore reads its tables' files through the process's own credential
-/// policy, the same one the `AWS_*` and `GOOGLE_*` variables set for a Pivot
+/// policy, the same one the `AWS_*` and `GOOGLE_*` variables set for a pivotlake
 /// datastore in a bucket.
 fn open_datastore(
     target: &ShellTarget,
@@ -263,14 +263,14 @@ fn open_datastore(
     refresh_interval: Duration,
 ) -> Result<Arc<dyn Datastore>, Box<dyn std::error::Error>> {
     match target {
-        ShellTarget::Pivot { location } => {
+        ShellTarget::Pivotlake { location } => {
             let store: Arc<dyn ObjectStore> = open_store(location)?.into();
             let maintenance = MaintenanceConfig {
                 refresh_interval,
                 compaction: None,
                 vacuum: None,
             };
-            Ok(PivotDatastore::from_store(
+            Ok(PivotlakeDatastore::from_store(
                 store,
                 dispatcher,
                 Some(maintenance),

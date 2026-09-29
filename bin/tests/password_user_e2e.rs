@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use catalog::PivotCatalog;
 use catalog::metastore::Metastore;
 use common::{CatalogFixture, login, login_without_password, start_server_with_metastore};
-use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use tempfile::TempDir;
 
@@ -24,7 +24,7 @@ fn password_user_server_port() -> u16 {
         let yaml = format!(
             r#"datastores:
   default:
-    kind: pivot
+    kind: pivotlake
     location: "{}"
     default: true
 users:

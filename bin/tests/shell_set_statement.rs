@@ -4,7 +4,7 @@
 
 use bin::execution::{ExecuteOptions, StatementOutput};
 use bin::shell::{ShellInstance, ShellTarget};
-use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
 
 #[test]
 fn set_and_reset_hand_back_the_variable_name_and_value() {

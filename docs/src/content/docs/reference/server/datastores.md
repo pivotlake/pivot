@@ -1,6 +1,6 @@
 ---
 title: "Datastores & storage credentials"
-description: Configure Pivot datastores, Iceberg catalogs, storage credentials, and table maintenance.
+description: Configure pivotlake datastores, Iceberg catalogs, storage credentials, and table maintenance.
 ---
 
 A datastore is a named collection of schemas and tables that a server serves.
@@ -14,11 +14,11 @@ are opened with in the `secrets` map.
 ```yaml
 datastores:
   local:
-    kind: pivot
+    kind: pivotlake
     location: /var/lib/pivot/datastores/local
     default: true
   events:
-    kind: pivot
+    kind: pivotlake
     location: s3://example-bucket/pivot/events/
   lake:
     kind: iceberg
@@ -50,7 +50,7 @@ SQL refers to it. `kind` selects the implementation:
 
 | Kind | Description |
 | --- | --- |
-| `pivot` | Pivot's own read-write tables, stored as Delta Lake tables of Parquet files in a local directory or a bucket. |
+| `pivotlake` | Pivot's own read-write tables, stored as Delta Lake tables of Parquet files in a local directory or a bucket. Also accepted as `pivot`. |
 | `iceberg` | The tables of an Iceberg REST catalog, read-only. |
 
 ### Default datastore
@@ -75,12 +75,12 @@ A two-part name such as `sales.orders` can name either a schema in the default
 datastore or a datastore's `main` schema. Use the full three-part name when a
 datastore and a schema share a name.
 
-### Pivot datastores
+### pivotlake datastores
 
 ```yaml
 datastores:
   events:
-    kind: pivot
+    kind: pivotlake
     location: s3://example-bucket/pivot/events/
 ```
 
@@ -140,7 +140,7 @@ The `secrets` map holds two kinds of secret, told apart by `type`:
 
 | Type | Authenticates to | Chosen by |
 | --- | --- | --- |
-| `s3`, `gcs` | A bucket: a Pivot datastore's files, an Iceberg table's files, or a Parquet file read with `read_parquet`. | The secret's [`scope`](#scopes), matched against the location being read. |
+| `s3`, `gcs` | A bucket: a pivotlake datastore's files, an Iceberg table's files, or a Parquet file read with `read_parquet`. | The secret's [`scope`](#scopes), matched against the location being read. |
 | `iceberg` | An Iceberg REST catalog. | The Iceberg datastore's `secret` key. |
 
 An Iceberg datastore can use both kinds: an `iceberg` secret to talk to the
@@ -253,7 +253,7 @@ the user the server runs as.
 
 ## Maintenance
 
-A server keeps each Pivot datastore up to date and tidy with three background
+A server keeps each pivotlake datastore up to date and tidy with three background
 tasks. Iceberg datastores are only refreshed.
 
 | Task | Runs | Setting |

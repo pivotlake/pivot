@@ -12,7 +12,7 @@ use arrow_schema::DataType;
 use bin::execution::{ExecuteOptions, StatementOutput};
 use bin::shell::{ShellInstance, ShellTarget};
 use datastore_iceberg::IcebergCatalogConfig;
-use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
 use object_storage::test_support;
 use testcontainers::core::{ContainerPort, Host, IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;

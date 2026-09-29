@@ -16,7 +16,7 @@ use catalog::{Datastore, PivotCatalog};
 use common::{
     CatalogFixture, login, login_without_password, select_rows, start_server_with_metastore,
 };
-use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
 use dispatch::DataFlowDispatcher;
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use pgwire::api::auth::sasl::scram::gen_salted_password;
@@ -82,7 +82,7 @@ fn authenticating_server() -> &'static AuthServer {
         let yaml = format!(
             r#"datastores:
   default:
-    kind: pivot
+    kind: pivotlake
     location: "{}"
     default: true
 "#,

@@ -2,7 +2,7 @@ use arrow_array::{Array, Int64Array, StringViewArray};
 use bin::execution::{Command, ExecuteOptions, StatementOutput};
 use bin::memory::MemoryBudget;
 use bin::shell::{ShellInstance, ShellLimits, ShellTarget};
-use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
 use dispatch::BUFFER_SIZE;
 use metastore_disk::ByteSize;
 

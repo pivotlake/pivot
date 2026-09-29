@@ -14,7 +14,7 @@ use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction;
 use common::{commit_datastore_transaction, insert_batches, shared_dispatcher};
-use datastore_pivot::PivotDatastore;
+use datastore_pivotlake::PivotlakeDatastore;
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 use planner::types::Type;
 
@@ -30,10 +30,10 @@ fn dispatcher() -> DataFlowDispatcher {
 /// A datastore holding one empty `events (id Int64)` table, created the way the
 /// server runs `CREATE TABLE`. The table sits at Delta version 0, so a later
 /// version number counts the commits made since.
-fn open_datastore_with_empty_table() -> (TempDir, Arc<PivotDatastore>) {
+fn open_datastore_with_empty_table() -> (TempDir, Arc<PivotlakeDatastore>) {
     let database = TempDir::new().unwrap();
     let datastore =
-        PivotDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
+        PivotlakeDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(CreateTableRequest {
@@ -68,21 +68,21 @@ fn insert_row_in(transaction: Arc<dyn DatastoreTransaction>, id: i64) {
 }
 
 /// INSERT one row in a transaction of its own, opened right now.
-fn insert_row(datastore: &Arc<PivotDatastore>, id: i64) {
+fn insert_row(datastore: &Arc<PivotlakeDatastore>, id: i64) {
     insert_row_in(datastore.clone().begin_transaction(), id);
 }
 
 /// The version the datastore's live copy of the table sits at, without
 /// refreshing it: every commit publishes its result, so this is the version of
 /// the last commit made.
-fn published_version(datastore: &PivotDatastore) -> u64 {
+fn published_version(datastore: &PivotlakeDatastore) -> u64 {
     datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema(TABLE))
         .expect("table exists")
         .version()
 }
 
-fn count_committed_rows(datastore: &PivotDatastore) -> i64 {
+fn count_committed_rows(datastore: &PivotlakeDatastore) -> i64 {
     common::current_parquet(datastore, TABLE)
         .row_groups()
         .iter()

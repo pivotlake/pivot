@@ -1,7 +1,7 @@
 # pivot
 
 `pivot open` is an interactive, local Pivot SQL shell. It embeds the planner,
-catalog, Pivot datastore, and dispatch workers in one process. It does not
+catalog, pivotlake datastore, and dispatch workers in one process. It does not
 connect to a Pivot server and does not require `psql`.
 
 ## Running
@@ -32,7 +32,7 @@ risking an OOM kill when it does not fit.
 
 ## Datastore directory
 
-Every `pivot open` invocation requires the path of one local Pivot datastore.
+Every `pivot open` invocation requires the path of one local pivotlake datastore.
 The directory is created when it does not exist. Tables, schemas, and inserted
 data remain in that directory after `\q`, Ctrl+D, and subsequent invocations.
 
@@ -153,7 +153,7 @@ required, including when serving one local directory. Exactly one datastore must
 becomes the current database (the target of unqualified table names). Every
 datastore is attached as a database of its own name, so a query reads any other
 one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
-implementation (`pivot` today); the storage backend is inferred from `location` (a plain
+implementation (`pivotlake` or `iceberg`); the storage backend is inferred from `location` (a plain
 path is local, an `s3://` URI is S3, a `gs://` URI is Google Cloud Storage).
 Compaction is configured per datastore with `compact`. `compact_bytes` targets
 the compaction output size; files strictly below half that size are small-file
@@ -169,11 +169,11 @@ on the others):
 ```yaml
 datastores:
   hot:
-    kind: pivot
+    kind: pivotlake
     location: /var/lib/pivot/datastores/hot   # local path -> local store
     default: true                             # the current database
   warm:
-    kind: pivot
+    kind: pivotlake
     location: s3://analytics/warm/            # S3 store
     compact: true                             # this datastore compacts itself
     compact_bytes: 128m
@@ -181,7 +181,7 @@ datastores:
     compact_min_files: 100
     compact_parallelism: 3
   cold:
-    kind: pivot
+    kind: pivotlake
     location: gs://analytics/cold/            # Google Cloud Storage store
 ```
 
