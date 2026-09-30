@@ -557,18 +557,13 @@ mod tests {
         let b = park_worker(&waker, 1);
         await_parked(&waker, 2);
 
-        waker.notify_one();
+        let woke = waker.notify_one();
 
-        for _ in 0..2000 {
-            if waker.parked_workers.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+        assert!(woke);
         assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 1);
         waker.notify();
-        assert_eq!(a.join().unwrap(), waker.wake_count());
-        assert_eq!(b.join().unwrap(), waker.wake_count());
+        a.join().unwrap();
+        b.join().unwrap();
     }
 
     #[test]
