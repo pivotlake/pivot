@@ -1,20 +1,26 @@
 //! Groups sorted partition batches into file candidates.
 //!
-//! All batches for one write arrive at a single [`FileCollector`]. It keeps a
-//! pending file for each partition key and emits that file after its retained
-//! Arrow data reaches `target_in_memory_bytes_per_file`. The threshold applies
-//! independently to each partition and may be exceeded by the final batch.
-//! Queued messages and files already sent downstream are outside this limit.
+//! Every worker's [`FileCollector`] feeds the same pending runs, so the worker
+//! that sorted a run queues it itself and no run waits on a single collecting
+//! worker. Each partition key has a lock-free queue of runs and a count of the
+//! bytes queued there that no file has claimed. A worker that finds
+//! `target_in_memory_bytes_per_file` unclaimed takes that many bytes with a
+//! compare-and-swap, so exactly one worker cuts each file, then pops the runs
+//! and emits the file. Whole runs are popped, so the final run may take a file
+//! past the target. The last worker to finish emits what each partition has
+//! left. Files already sent downstream are outside this limit.
 //!
 //! Each input message is one sorted run and remembers its source NUMA node.
 //! Ordered files are emitted as one local-merge request per participating node.
 //! Unordered files proceed directly to row-group planning without copying.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use arrow_array::RecordBatch;
 use arrow_row::OwnedRow;
+use crossbeam_deque::{Injector, Steal};
 use dispatch::{
     LocatedBatch, MergeRun, OrderBy, Sender, Topology, Unary, UnaryFactory, UnaryResult,
 };
@@ -24,6 +30,38 @@ use super::partition_sorter::SortedPartitionRun;
 use super::types::{FileMergeContext, FileOrderInput, FilePlan, NodeMergeRequest, ReadyFile};
 use crate::scalar_values_from_row;
 
+/// One partition's sorted runs waiting to be cut into files.
+struct PendingRuns {
+    runs: Injector<SortedPartitionRun>,
+    /// Bytes of `runs` that no file has claimed. A run is counted only after
+    /// it is queued, so bytes a worker claims are there for it to pop.
+    unclaimed_bytes: AtomicI64,
+}
+
+impl PendingRuns {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            runs: Injector::new(),
+            unclaimed_bytes: AtomicI64::new(0),
+        })
+    }
+}
+
+/// What every worker's collector shares for one write.
+struct SharedCollector {
+    /// Every partition seen so far. A worker looks here only the first time it
+    /// meets a partition key, then keeps the handle it found. Most of those
+    /// lookups find a partition another worker registered, so they share the
+    /// read lock; only registering a new partition takes the write lock. An
+    /// unpartitioned table's one partition is registered before the workers
+    /// start, so its write only ever takes the read lock.
+    partitions: RwLock<HashMap<Option<OwnedRow>, Arc<PendingRuns>>>,
+    next_file_id: AtomicU64,
+    next_row_group_id: AtomicU64,
+    /// Workers still to finish. The last one emits each partition's leftovers.
+    remaining_workers: AtomicUsize,
+}
+
 pub(super) struct FileCollectorFactory {
     partition_column_names: Arc<[String]>,
     order_by: Arc<[OrderBy]>,
@@ -31,6 +69,7 @@ pub(super) struct FileCollectorFactory {
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
     topology: Topology,
+    shared: Arc<SharedCollector>,
 }
 
 pub(super) fn factories(
@@ -41,6 +80,21 @@ pub(super) fn factories(
     max_file_size: Option<usize>,
     topology: Topology,
 ) -> Vec<FileCollectorFactory> {
+    let shared = Arc::new(SharedCollector {
+        partitions: RwLock::new(HashMap::new()),
+        next_file_id: AtomicU64::new(0),
+        next_row_group_id: AtomicU64::new(0),
+        remaining_workers: AtomicUsize::new(topology.total_workers()),
+    });
+    // An unpartitioned table has the one partition, `None`: register it now,
+    // so no worker ever takes the write lock.
+    if partition_column_names.is_empty() {
+        shared
+            .partitions
+            .write()
+            .expect("partition registry poisoned")
+            .insert(None, PendingRuns::new());
+    }
     (0..topology.total_workers())
         .map(|_| FileCollectorFactory {
             partition_column_names: partition_column_names.clone(),
@@ -49,6 +103,7 @@ pub(super) fn factories(
             target_in_memory_bytes_per_file,
             max_file_size,
             topology,
+            shared: shared.clone(),
         })
         .collect()
 }
@@ -64,14 +119,13 @@ impl UnaryFactory<SortedPartitionRun, FileOrderInput> for FileCollectorFactory {
             target_in_memory_bytes_per_file: self.target_in_memory_bytes_per_file,
             max_file_size: self.max_file_size,
             topology: self.topology,
-            pending_files_by_partition: HashMap::new(),
-            next_file_id: 0,
-            next_row_group_id: 0,
+            shared: self.shared,
+            known_partitions: HashMap::new(),
         }
     }
 }
 
-/// Sorted runs retained for the next file of one partition.
+/// The sorted runs of one file.
 struct PendingFile {
     runs_by_node: Vec<Vec<Vec<RecordBatch>>>,
     row_count: usize,
@@ -85,6 +139,12 @@ impl PendingFile {
             row_count: 0,
             in_memory_bytes: 0,
         }
+    }
+
+    fn push(&mut self, run: SortedPartitionRun) {
+        self.row_count += run.batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        self.in_memory_bytes += run.in_memory_bytes;
+        self.runs_by_node[run.source_node].push(run.batches);
     }
 
     fn first_batch(&self) -> &RecordBatch {
@@ -104,27 +164,102 @@ pub(super) struct FileCollector {
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
     topology: Topology,
-    pending_files_by_partition: HashMap<Option<OwnedRow>, PendingFile>,
-    next_file_id: u64,
-    next_row_group_id: u64,
+    shared: Arc<SharedCollector>,
+    /// The partitions this worker has already looked up in `shared`.
+    known_partitions: HashMap<Option<OwnedRow>, Arc<PendingRuns>>,
 }
 
 impl FileCollector {
+    /// The shared pending runs of `partition_key`, registering the partition
+    /// the first time any worker meets it.
+    fn pending_runs(&mut self, partition_key: &Option<OwnedRow>) -> Arc<PendingRuns> {
+        if let Some(pending) = self.known_partitions.get(partition_key) {
+            return pending.clone();
+        }
+        let registered = self
+            .shared
+            .partitions
+            .read()
+            .expect("partition registry poisoned")
+            .get(partition_key)
+            .cloned();
+        let pending = match registered {
+            Some(pending) => pending,
+            // Another worker may register the partition between the two
+            // locks, so the write side looks again before inserting.
+            None => self
+                .shared
+                .partitions
+                .write()
+                .expect("partition registry poisoned")
+                .entry(partition_key.clone())
+                .or_insert_with(PendingRuns::new)
+                .clone(),
+        };
+        self.known_partitions
+            .insert(partition_key.clone(), pending.clone());
+        pending
+    }
+
+    /// Claims one file's worth of unclaimed bytes and pops its runs, or returns
+    /// `None` when less than a file is unclaimed. Concurrent claimers each
+    /// take whole runs past their share, so one of them may find the queue a
+    /// few runs short and cut a slightly smaller file.
+    fn try_claim_file(&self, pending: &PendingRuns) -> Option<PendingFile> {
+        // A target no file can reach (compaction) leaves everything to finish.
+        let target = i64::try_from(self.target_in_memory_bytes_per_file).unwrap_or(i64::MAX);
+        let mut unclaimed = pending.unclaimed_bytes.load(Ordering::Acquire);
+        loop {
+            if unclaimed < target {
+                return None;
+            }
+            match pending.unclaimed_bytes.compare_exchange_weak(
+                unclaimed,
+                unclaimed - target,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => unclaimed = current,
+            }
+        }
+        let file = self.pop_runs(pending, target as usize);
+        // The claim took exactly `target`; settle it to what was popped.
+        pending
+            .unclaimed_bytes
+            .fetch_sub(file.in_memory_bytes as i64 - target, Ordering::AcqRel);
+        (file.row_count > 0).then_some(file)
+    }
+
+    /// Pops whole runs until the file holds `target_bytes` or none are queued.
+    fn pop_runs(&self, pending: &PendingRuns, target_bytes: usize) -> PendingFile {
+        let mut file = PendingFile::new(self.topology.node_count);
+        while file.in_memory_bytes < target_bytes {
+            match pending.runs.steal() {
+                Steal::Success(run) => file.push(run),
+                Steal::Empty => break,
+                Steal::Retry => {}
+            }
+        }
+        file
+    }
+
     /// Assigns file and row-group identities, then emits either a ready file or
     /// one local-merge request for each participating NUMA node.
     fn emit_pending_file(
-        &mut self,
-        partition_key: Option<OwnedRow>,
+        &self,
+        partition_key: &Option<OwnedRow>,
         pending_file: PendingFile,
         sender: &mut dyn Sender<FileOrderInput>,
     ) -> UnaryResult<()> {
         debug_assert!(pending_file.row_count > 0);
-        let file_id = self.next_file_id;
-        self.next_file_id += 1;
+        let file_id = self.shared.next_file_id.fetch_add(1, Ordering::Relaxed);
         let row_group_count = pending_file.row_count.div_ceil(self.target_rows_per_group);
-        let base_row_group_id = self.next_row_group_id;
-        self.next_row_group_id += row_group_count as u64;
-        let partition_values = match &partition_key {
+        let base_row_group_id = self
+            .shared
+            .next_row_group_id
+            .fetch_add(row_group_count as u64, Ordering::Relaxed);
+        let partition_values = match partition_key {
             Some(_) => Some(
                 scalar_values_from_row(pending_file.first_batch(), &self.partition_column_names, 0)
                     .map_err(WriteError::from)?,
@@ -197,34 +332,42 @@ impl Unary<SortedPartitionRun, FileOrderInput> for FileCollector {
         sender: &mut dyn Sender<FileOrderInput>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
-        let run_row_count: usize = partition_run
+        if partition_run
             .batches
             .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
-        if run_row_count == 0 {
+            .all(|batch| batch.num_rows() == 0)
+        {
             return Ok(());
         }
-        let pending_file = self
-            .pending_files_by_partition
-            .entry(partition_run.partition_key.clone())
-            .or_insert_with(|| PendingFile::new(self.topology.node_count));
-        pending_file.row_count += run_row_count;
-        pending_file.in_memory_bytes += partition_run.in_memory_bytes;
-        pending_file.runs_by_node[partition_run.source_node].push(partition_run.batches);
-        if pending_file.in_memory_bytes >= self.target_in_memory_bytes_per_file {
-            let completed_file = self
-                .pending_files_by_partition
-                .remove(&partition_run.partition_key)
-                .expect("the pending file was inserted above");
-            self.emit_pending_file(partition_run.partition_key, completed_file, sender)?;
+        let partition_key = partition_run.partition_key.clone();
+        let pending = self.pending_runs(&partition_key);
+        let run_bytes = partition_run.in_memory_bytes as i64;
+        pending.runs.push(partition_run);
+        pending
+            .unclaimed_bytes
+            .fetch_add(run_bytes, Ordering::AcqRel);
+        while let Some(file) = self.try_claim_file(&pending) {
+            self.emit_pending_file(&partition_key, file, sender)?;
         }
         Ok(())
     }
 
     fn finish(&mut self, sender: &mut dyn Sender<FileOrderInput>) -> UnaryResult<bool> {
-        for (partition_key, pending_file) in std::mem::take(&mut self.pending_files_by_partition) {
-            self.emit_pending_file(partition_key, pending_file, sender)?;
+        // A worker reaches finish only after its last consume, so once every
+        // other worker has been here no run is still on its way to a queue.
+        if self.shared.remaining_workers.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return Ok(true);
+        }
+        let partitions = self
+            .shared
+            .partitions
+            .read()
+            .expect("partition registry poisoned");
+        for (partition_key, pending) in partitions.iter() {
+            let file = self.pop_runs(pending, usize::MAX);
+            if file.row_count > 0 {
+                self.emit_pending_file(partition_key, file, sender)?;
+            }
         }
         Ok(true)
     }

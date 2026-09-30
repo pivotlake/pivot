@@ -6,8 +6,9 @@
 //!    each piece, and copies it into independent memory. Each piece is one
 //!    sorted run located on the NUMA node that produced it.
 //! 2. [`file_collector`] chooses the runs belonging to each output file and
-//!    groups them by source node. Its byte target applies to the retained Arrow
-//!    data of each pending partition file.
+//!    groups them by source node. Every worker collects the runs it sorted
+//!    into pending runs all workers share, and the byte target applies to the
+//!    retained Arrow data each partition has pending.
 //!
 //! Compaction replaces those two stages: its selected files already share one
 //! known partition, and every decoded batch retains its source file's sort
@@ -108,8 +109,6 @@ pub fn encode_record_batches_spec(
     let order_by = sort_order(&schema, &sort_column_names);
 
     let (dispatcher, heads) = spec.into_parts();
-    let worker_count = heads.len();
-    let file_collector_worker = dispatcher.next_worker();
     let input_batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
     let topology = input_batches.dispatcher().topology();
     let files = input_batches
@@ -121,8 +120,10 @@ pub fn encode_record_batches_spec(
                 topology,
             ),
         )
+        // Each worker collects the runs it sorted: the collectors share their
+        // pending runs, so no run queues behind a single collecting worker.
         .chain(
-            to_single_worker_mpsc::<SortedPartitionRun>(worker_count, file_collector_worker)
+            stealable::<SortedPartitionRun>(topology)
                 .into_iter()
                 .collect(),
             file_collector::factories(
