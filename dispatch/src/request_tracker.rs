@@ -110,11 +110,22 @@ impl RequestTracker {
 
         for location in &request.locations {
             let mut parts = Vec::new();
-            for segment in memory_ctx().decompressed_cache().get_range(
-                &request.open_file,
-                location.offset,
-                location.len,
-            ) {
+            // A raw-bytes read is served from the file's stored bytes alone.
+            let segments = if !request.raw_bytes_only {
+                memory_ctx().decompressed_cache().get_range(
+                    &request.open_file,
+                    location.offset,
+                    location.len,
+                )
+            } else if location.len == 0 {
+                Vec::new()
+            } else {
+                vec![Segment::Gap {
+                    offset: location.offset,
+                    len: location.len,
+                }]
+            };
+            for segment in segments {
                 match segment {
                     Segment::Cached {
                         offset,
@@ -354,6 +365,7 @@ mod tests {
             id,
             open_file: file,
             locations: locations.into_iter().collect(),
+            raw_bytes_only: false,
         };
         (id, request)
     }
@@ -488,6 +500,24 @@ mod tests {
         assert_eq!(span, 4096);
         assert_eq!(header.as_ref(), b"header");
         assert_eq!(data.as_ref(), b"data");
+    }
+
+    /// A raw-bytes read over a range holding a decompressed page (a
+    /// footer probe spanning a small file's data pages) gets the stored bytes.
+    #[test]
+    fn a_raw_bytes_read_skips_decompressed_pages() {
+        init_test_free_pool(4);
+        let (file, _dir) = registered_file();
+        cache_decompressed(file.clone(), FileRange::new(0, 4096));
+        let (_, mut pending) = pending_read(file, [FileRange::new(0, 8192)]);
+        pending.raw_bytes_only = true;
+        let mut tracker = RequestTracker::default();
+
+        let physical = register_local(&mut tracker, ROUTE, pending);
+        complete_reads(&mut tracker, physical);
+        let response = tracker.take_ready().pop().unwrap().response;
+
+        assert_eq!(response.into_bytes(), vec![0u8; 8192]);
     }
 
     #[test]

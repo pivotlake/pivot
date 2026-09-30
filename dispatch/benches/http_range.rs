@@ -283,6 +283,7 @@ fn run_batch(
                     id: ReadRequestId(off),
                     open_file: loc.clone(),
                     locations: vec![FileRange::new(off, block)],
+                    raw_bytes_only: false,
                 },
                 stats,
             )

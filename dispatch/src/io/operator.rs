@@ -82,9 +82,9 @@ impl ReadResponse {
         self.locations
     }
 
-    /// Consume a one-location raw-byte response and concatenate its cache
-    /// fragments. Intended for metadata reads, whose ranges never describe a
-    /// decompressed data page.
+    /// Consume a one-location response of a
+    /// [`read_raw_bytes`](OperatorIO::read_raw_bytes) request and concatenate its cache
+    /// fragments: a raw-bytes read never resolves to a decompressed page.
     pub fn into_bytes(self) -> Vec<u8> {
         assert_eq!(
             self.locations.len(),
@@ -100,7 +100,7 @@ impl ReadResponse {
                     }
                 }
                 ReadData::Decompressed { .. } => {
-                    panic!("raw file read unexpectedly resolved to decompressed data")
+                    panic!("into_bytes on a read that was not raw_bytes_only")
                 }
             }
         }
@@ -113,6 +113,11 @@ pub struct PendingReadRequest {
     pub id: ReadRequestId,
     pub open_file: OpenFile,
     pub locations: Vec<FileRange>,
+    /// Whether the read is answered only with the file's stored bytes (the
+    /// compressed cache), never a decompressed page. Set for a read whose
+    /// ranges are not made of whole Parquet pages, such as a footer's: the
+    /// decompressed cache answers a range with every page starting inside it.
+    pub raw_bytes_only: bool,
 }
 
 /// A logical write waiting for the worker to select its transport.
@@ -160,12 +165,33 @@ impl<'a> OperatorIO<'a> {
         open_file: OpenFile,
         locations: impl IntoIterator<Item = FileRange>,
     ) -> Result<ReadRequestId, crate::io::IORequesterError> {
+        self.submit_read(open_file, locations, false)
+    }
+
+    /// Request one or more locations from a single file as the bytes stored
+    /// there ([`PendingReadRequest::raw_bytes_only`]), for a response read
+    /// with [`ReadResponse::into_bytes`].
+    pub fn read_raw_bytes(
+        &mut self,
+        open_file: OpenFile,
+        locations: impl IntoIterator<Item = FileRange>,
+    ) -> Result<ReadRequestId, crate::io::IORequesterError> {
+        self.submit_read(open_file, locations, true)
+    }
+
+    fn submit_read(
+        &mut self,
+        open_file: OpenFile,
+        locations: impl IntoIterator<Item = FileRange>,
+        raw_bytes_only: bool,
+    ) -> Result<ReadRequestId, crate::io::IORequesterError> {
         let id = ReadRequestId(*self.next_read_id);
         *self.next_read_id += 1;
         let request = PendingReadRequest {
             id,
             open_file,
             locations: locations.into_iter().collect(),
+            raw_bytes_only,
         };
         self.requester
             .request_read(self.data_flow_id, self.operator_idx, request, self.stats)?;

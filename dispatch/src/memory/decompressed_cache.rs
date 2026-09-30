@@ -592,9 +592,9 @@ impl DecompressedCache {
         dropped
     }
 
-    /// Remove `open_file`'s table if it is now empty, so its never-reused
-    /// `OpenFile` (a `LocalFile`/`Arc<RemoteFile>` pinning the file/connection
-    /// it holds) isn't kept alive for every file ever opened. Re-checks emptiness
+    /// Remove `open_file`'s table if it is now empty, so its `OpenFile` (a
+    /// `LocalFile`/`Arc<RemoteFile>` pinning the file/connection it holds)
+    /// isn't kept alive for every file ever opened. Re-checks emptiness
     /// under the outer write lock so a concurrent `claim` that just re-created the
     /// table isn't dropped.
     fn prune_empty_file(&self, open_file: &OpenFile) {

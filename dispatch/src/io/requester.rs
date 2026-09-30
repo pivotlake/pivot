@@ -874,6 +874,7 @@ mod tests {
             id: ReadRequestId(0),
             open_file,
             locations: vec![FileRange::new(0, 4096)],
+            raw_bytes_only: false,
         }
     }
 
@@ -908,6 +909,7 @@ mod tests {
                         id: ReadRequestId(block),
                         open_file: open_file.clone(),
                         locations: vec![FileRange::new(block * 4096, 4096)],
+                        raw_bytes_only: false,
                     },
                     &mut disabled_stats(),
                 )
@@ -955,6 +957,7 @@ mod tests {
                     id: ReadRequestId(0),
                     open_file: open_file.clone(),
                     locations: vec![FileRange::new(0, 4096)],
+                    raw_bytes_only: false,
                 },
                 &mut disabled_stats(),
             )
@@ -967,6 +970,7 @@ mod tests {
                     id: ReadRequestId(1),
                     open_file,
                     locations: vec![FileRange::new(4096, 4096)],
+                    raw_bytes_only: false,
                 },
                 &mut disabled_stats(),
             )
@@ -1456,6 +1460,21 @@ mod tests {
         assert_cached(&loc, 4096, 2 * 4096);
     }
 
+    /// Opening a remote object again keeps what memory caches for it: the reopen
+    /// is the same object, so its bytes hit without another request.
+    #[test]
+    fn a_reopened_remote_object_hits_what_memory_cached() {
+        init_test_free_pool(16);
+        let mut requester = IORequester::with_http_config(client_config());
+        let port = spawn_server(1);
+        fetch(&mut requester, &remote_loc(port), 0, 4096);
+        settle(&mut requester);
+
+        let reopened = remote_loc(port);
+
+        assert_cached(&reopened, 0, 4096);
+    }
+
     #[test]
     fn stale_pooled_connection_is_retried_on_a_fresh_one() {
         init_test_free_pool(16);
@@ -1673,6 +1692,7 @@ mod tests {
                     id: ReadRequestId(0),
                     open_file: loc.clone(),
                     locations: vec![FileRange::new(offset, len)],
+                    raw_bytes_only: false,
                 },
                 &mut disabled_stats(),
             )

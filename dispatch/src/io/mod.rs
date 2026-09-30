@@ -35,7 +35,6 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use url::Url;
 
@@ -108,8 +107,8 @@ impl AsRawFd for LocalFile {
 /// cache's pin re-check runs on every hit. `Local` compares the raw fd (an
 /// `i32`; stable while the `LocalFile` is held, and holding it in the key means
 /// a cached file's fd can never be closed and reused under the cache); `Remote`
-/// carries an [`Arc<RemoteFile>`] whose `Hash`/`Eq` delegate to a single
-/// interned id (never the URL string).
+/// carries an [`Arc<RemoteFile>`] that compares equal to every other open of
+/// the same object.
 #[derive(Clone)]
 pub enum OpenFile {
     Local(LocalFile),
@@ -120,7 +119,6 @@ impl PartialEq for OpenFile {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (OpenFile::Local(a), OpenFile::Local(b)) => a.as_raw_fd() == b.as_raw_fd(),
-            // RemoteFile's Eq compares the interned id, not the URL.
             (OpenFile::Remote(a), OpenFile::Remote(b)) => a == b,
             _ => false,
         }
@@ -153,8 +151,6 @@ impl Debug for OpenFile {
     }
 }
 
-static NEXT_REMOTE_FILE_ID: AtomicU32 = AtomicU32::new(0);
-
 /// Produces the `Authorization` header value for a remote read — typically a
 /// GCS bearer token. Invoked once per request on a worker thread, so it must be
 /// cheap and non-blocking: it reads an already-minted, cached token, it never
@@ -167,15 +163,14 @@ pub type AuthHeader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
 /// A remote HTTP(S) object, resolved once and reused for every range request
 /// against it.
 ///
-/// `Hash`/`Eq` delegate solely to the interned `id`, so using a `RemoteFile` as
-/// (part of) a cache key is as cheap as comparing a `u32` — the host/addr are
-/// only read by the HTTP transport when actually issuing a request.
+/// Two opens of one object are equal: `Hash`/`Eq` look only at its
+/// [`cache_identity`](Self::cache_identity), as the disk cache does, so what the
+/// caches hold for an object keeps serving a reopen. A remote object is never
+/// rewritten in place: new data is written under a new name.
 ///
 /// The fields are pre-parsed from the URL at [`open`](Self::open) so the request
 /// hot path never re-parses it; the `Url` itself isn't kept.
 pub struct RemoteFile {
-    /// Process-unique id; the only thing `Hash`/`Eq` look at.
-    id: u32,
     /// `IP:port`, resolved once at construction (the port lives here too).
     addr: SocketAddr,
     /// Bare hostname for TLS SNI — `addr` only carries the IP, and SNI must not
@@ -266,7 +261,6 @@ impl RemoteFile {
         let cache_identity = format!("{host_header}\0{path}");
 
         Ok(Self {
-            id: NEXT_REMOTE_FILE_ID.fetch_add(1, Ordering::Relaxed),
             addr,
             host,
             host_header,
@@ -333,7 +327,7 @@ impl RemoteFile {
 
 impl PartialEq for RemoteFile {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        self.cache_identity == other.cache_identity
     }
 }
 
@@ -341,7 +335,7 @@ impl Eq for RemoteFile {}
 
 impl Hash for RemoteFile {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.cache_identity.hash(state);
     }
 }
 

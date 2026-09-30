@@ -903,7 +903,7 @@ impl CompressedCache {
     }
 
     /// Remove `file_maps` entries for the given locations whose extent map is now
-    /// empty. `file_maps` is keyed by a never-reused [`OpenFile`] (an
+    /// empty. `file_maps` is keyed by an [`OpenFile`] (a
     /// `LocalFile` / `Arc<RemoteFile>`), so without this a dead entry - pinning its
     /// `Arc` and the file/connection it holds - lingers for every file ever opened.
     /// Re-checks emptiness under the write lock so a concurrent `get` that just
@@ -923,22 +923,31 @@ impl CompressedCache {
     }
 
     /// Register a [`OpenFile`] (a local fd or a remote object) so its extents can
-    /// be cached. Clears any extents from a previous registration of an equal file
-    /// (e.g. a reused fd number) by dropping its extent map - the next lookup then
-    /// misses. The orphaned tenants in their slots self-clean on eviction (their
-    /// extent is gone, so the per-slot guard skips them).
+    /// be cached. A local fd clears any extents from a previous registration of
+    /// an equal file (a reused fd number) by dropping its extent map - the next
+    /// lookup then misses. The orphaned tenants in their slots self-clean on
+    /// eviction (their extent is gone, so the per-slot guard skips them). A
+    /// remote object keeps what is cached: a reopen of it equals the earlier
+    /// open, since a `RemoteFile` is keyed by the object it names.
     pub fn open_entry(&self, open_file: OpenFile) {
-        // Drop any decompressed pages cached under this (possibly reused) file
-        // for the same reason the compressed map is reset below: a reopened fd may
-        // now name a different file, so its old pages must not serve a later read.
-        memory_ctx().decompressed_cache().invalidate(&open_file);
-        // The `file_maps` write lock serializes with
-        // `try_add_extent_for_location`'s read, so a racing miss either sees the
-        // fresh empty map or has its extent dropped here.
-        self.file_maps
-            .write()
-            .unwrap()
-            .insert(open_file, Default::default());
+        // Only a local fd can name a different file when reopened (a reused fd
+        // number), so only it starts over. A remote object is keyed by its own
+        // identity: resetting it would drop what the last open cached. Its map
+        // is created on its first cached extent.
+        if matches!(open_file, OpenFile::Local(_)) {
+            // Drop any decompressed pages cached under this (possibly reused) file
+            // for the same reason the compressed map is reset below: a reopened fd
+            // may now name a different file, so its old pages must not serve a
+            // later read.
+            memory_ctx().decompressed_cache().invalidate(&open_file);
+            // The `file_maps` write lock serializes with
+            // `try_add_extent_for_location`'s read, so a racing miss either sees
+            // the fresh empty map or has its extent dropped here.
+            self.file_maps
+                .write()
+                .unwrap()
+                .insert(open_file, Default::default());
+        }
     }
 
     /// Evict every cached extent: drop all extent maps and recycle the ring slots they
