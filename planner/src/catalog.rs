@@ -522,19 +522,25 @@ pub trait BoundTable: Debug + Send + Sync {
     /// can be answered without scanning any rows (e.g. Parquet row-group
     /// statistics covering every row group, with no predicates pushed into this
     /// binding). The scalars carry the column's physical storage type. `None`
-    /// means "unknown, scan instead" and is always a safe answer. Answered from
-    /// the binding's captured snapshot, as in [`compile_scan`](BoundTable::compile_scan).
-    fn column_min_max(&self, _column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
-        None
+    /// means "unknown, scan instead" and is always a safe answer; an error
+    /// means the metadata could not be read, which fails the query. Answered
+    /// from the binding's captured snapshot, as in
+    /// [`compile_scan`](BoundTable::compile_scan).
+    fn column_min_max(
+        &self,
+        _column: usize,
+    ) -> Result<Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)>> {
+        Ok(None)
     }
 
     /// The table's total row count derived purely from metadata, if it can be
     /// answered without scanning any rows (e.g. summing Parquet row-group row
     /// counts, with no predicates pushed into this binding). `None` means
-    /// "unknown, scan instead" and is always a safe answer. Answered from the
+    /// "unknown, scan instead" and is always a safe answer; an error means the
+    /// metadata could not be read, which fails the query. Answered from the
     /// binding's captured snapshot, as in [`compile_scan`](BoundTable::compile_scan).
-    fn row_count(&self) -> Option<i64> {
-        None
+    fn row_count(&self) -> Result<Option<i64>> {
+        Ok(None)
     }
 
     /// The table's estimated total row count for cost-based planning (join
@@ -543,10 +549,11 @@ pub trait BoundTable: Debug + Send + Sync {
     /// answer: predicates pushed into this binding don't invalidate it, since
     /// the cost model wants the base table's size and applies filter
     /// selectivity itself. `None` means unknown; the planner then uses its own
-    /// defaults. Answered from the binding's captured snapshot, as in
+    /// defaults. An error means the metadata could not be read, which fails
+    /// the query. Answered from the binding's captured snapshot, as in
     /// [`compile_scan`](BoundTable::compile_scan).
-    fn estimate_row_count(&self) -> Option<u64> {
-        None
+    fn estimate_row_count(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
 }
 
@@ -594,8 +601,8 @@ impl DuckDBTable for DuckDBTableAdapter {
         Ok(self.table.pushdown_filter(filter)?)
     }
 
-    fn estimate_row_count(&self) -> Option<u64> {
-        self.table.estimate_row_count()
+    fn estimate_row_count(&self) -> duckdb_planner::catalog_provider::Result<Option<u64>> {
+        Ok(self.table.estimate_row_count()?)
     }
 }
 

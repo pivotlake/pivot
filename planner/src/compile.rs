@@ -154,6 +154,8 @@ pub enum Error {
     UnexpectedCreateTableInputs,
     #[error("compiling table scan: {0}")]
     TableScan(#[source] crate::catalog::Error),
+    #[error("reading table statistics: {0}")]
+    TableStatistics(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
     #[error("DROP TABLE does not support CASCADE: there are no dependent objects to cascade over")]

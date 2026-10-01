@@ -25,9 +25,9 @@ impl DuckDBTable for CountingTable {
         }]
     }
 
-    fn estimate_row_count(&self) -> Option<u64> {
+    fn estimate_row_count(&self) -> duckdb_planner::catalog_provider::Result<Option<u64>> {
         self.asked.fetch_add(1, Ordering::Relaxed);
-        Some(self.rows)
+        Ok(Some(self.rows))
     }
 }
 

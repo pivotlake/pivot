@@ -55,9 +55,10 @@ pub trait DuckDBTable: Any {
     /// alone. Feeds DuckDB's cardinality hook during optimization, so its cost
     /// model (join ordering, hash-join build/probe side choice) sees real
     /// table sizes. `None` means unknown; DuckDB then falls back to its own
-    /// defaults.
-    fn estimate_row_count(&self) -> Option<u64> {
-        None
+    /// defaults. An error means the metadata could not be read, and fails the
+    /// query the way a failed [`pushdown_filter`](Self::pushdown_filter) does.
+    fn estimate_row_count(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
 }
 
@@ -285,18 +286,20 @@ pub(crate) fn pushdown_filter(
     table.pushdown_filter(Expr::from_raw(expr))
 }
 
-pub(crate) fn table_estimate_row_count(table: &OptionalTableWrapper) -> ffi::CardinalityEstimate {
+pub(crate) fn table_estimate_row_count(
+    table: &OptionalTableWrapper,
+) -> Result<ffi::CardinalityEstimate> {
     let table = table
         .table
         .as_ref()
         .expect("estimate_row_count called on unbound table");
-    match table.estimate_row_count() {
+    Ok(match table.estimate_row_count()? {
         Some(rows) => ffi::CardinalityEstimate { known: true, rows },
         None => ffi::CardinalityEstimate {
             known: false,
             rows: 0,
         },
-    }
+    })
 }
 
 /// Whether the currently bound table implements the materialization half of

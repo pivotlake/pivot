@@ -153,15 +153,15 @@ impl BoundTable for ExternalParquetTable {
         Ok(false)
     }
 
-    fn row_count(&self) -> Option<i64> {
+    fn row_count(&self) -> CatalogResult<Option<i64>> {
         if !self.predicates.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(self.parquet.total_rows())
+        Ok(Some(self.parquet.total_rows()))
     }
 
-    fn estimate_row_count(&self) -> Option<u64> {
-        Some(self.parquet.total_rows() as u64)
+    fn estimate_row_count(&self) -> CatalogResult<Option<u64>> {
+        Ok(Some(self.parquet.total_rows() as u64))
     }
 }
 

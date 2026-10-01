@@ -655,12 +655,12 @@ impl BoundTable for BoundRelation {
     }
 
     /// Exact, and answered without scanning: the rows are already here.
-    fn row_count(&self) -> Option<i64> {
-        i64::try_from(self.held_row_count()).ok()
+    fn row_count(&self) -> Result<Option<i64>> {
+        Ok(i64::try_from(self.held_row_count()).ok())
     }
 
-    fn estimate_row_count(&self) -> Option<u64> {
-        Some(self.held_row_count() as u64)
+    fn estimate_row_count(&self) -> Result<Option<u64>> {
+        Ok(Some(self.held_row_count() as u64))
     }
 }
 
@@ -719,12 +719,12 @@ impl BoundTable for ScannedRelation {
         Box::new(self.clone())
     }
 
-    fn row_count(&self) -> Option<i64> {
-        None
+    fn row_count(&self) -> Result<Option<i64>> {
+        Ok(None)
     }
 
-    fn estimate_row_count(&self) -> Option<u64> {
-        None
+    fn estimate_row_count(&self) -> Result<Option<u64>> {
+        Ok(None)
     }
 }
 

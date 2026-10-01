@@ -244,43 +244,47 @@ impl BoundTable for TableBinding {
         Ok(false)
     }
 
-    fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+    fn column_min_max(
+        &self,
+        column: usize,
+    ) -> CatalogResult<Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)>> {
         // Only sound for the whole, unfiltered table: a pushed-down predicate
         // means the scan this binding stands for excludes rows.
         if !self.predicates.is_empty() {
-            return None;
+            return Ok(None);
         }
-        // Read the captured snapshot files, the same view a scan would see; an
-        // unresolvable view means "scan".
-        self.resolve_files().ok()?.column_min_max(column)
+        // Read the captured snapshot files, the same view a scan would see.
+        Ok(self.resolve_files()?.column_min_max(column))
     }
 
-    fn row_count(&self) -> Option<i64> {
+    fn row_count(&self) -> CatalogResult<Option<i64>> {
         // Only sound for the whole, unfiltered table: a pushed-down predicate
         // means the scan this binding stands for excludes rows.
         if !self.predicates.is_empty() {
-            return None;
+            return Ok(None);
         }
         // The parquet footer carries each row group's exact row count, so the
         // table's count is their sum, with no data pages read.
-        let parquet = self.resolve_files().ok()?;
-        Some(parquet.total_rows())
+        Ok(Some(self.resolve_files()?.total_rows()))
     }
 
-    fn estimate_row_count(&self) -> Option<u64> {
+    fn estimate_row_count(&self) -> CatalogResult<Option<u64>> {
         // A planning estimate wants the base table's full size: pushed
         // predicates and partition pruning deliberately don't apply, since the
         // cost model accounts for filter selectivity itself. Build the whole
         // (unfiltered) view over the captured snapshot and sum the footers'
         // row-group counts.
-        let parquet = self.table.build_scan_view(&[], &[]).ok()?;
-        Some(
+        let parquet = self
+            .table
+            .build_scan_view(&[], &[])
+            .map_err(|e| CatalogError::Other(Box::new(e)))?;
+        Ok(Some(
             parquet
                 .row_groups()
                 .iter()
                 .map(|rg| rg.num_rows as u64)
                 .sum(),
-        )
+        ))
     }
 }
 

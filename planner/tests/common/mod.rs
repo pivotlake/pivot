@@ -172,14 +172,14 @@ impl BoundTable for TestTable {
         ))
     }
 
-    fn estimate_row_count(&self) -> Option<u64> {
-        Some(
+    fn estimate_row_count(&self) -> planner::catalog::Result<Option<u64>> {
+        Ok(Some(
             self.parquet_table
                 .row_groups()
                 .iter()
                 .map(|rg| rg.num_rows as u64)
                 .sum(),
-        )
+        ))
     }
 }
 

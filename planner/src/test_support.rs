@@ -179,14 +179,25 @@ impl BoundTable for TestTable {
         unreachable!("the in-memory test table is never late-materialized")
     }
 
-    fn estimate_row_count(&self) -> Option<u64> {
-        Some(self.batch.num_rows() as u64)
+    fn estimate_row_count(&self) -> crate::catalog::Result<Option<u64>> {
+        Ok(Some(self.batch.num_rows() as u64))
     }
 
     /// Exact min/max over the stored column as a scalar of its physical int type,
     /// so the no-scan global MIN/MAX peephole ([`Aggregate::try_compile_from_stats`])
     /// can be exercised. Only the int columns the peephole supports are answered.
-    fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+    fn column_min_max(
+        &self,
+        column: usize,
+    ) -> crate::catalog::Result<Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)>> {
+        Ok(self.column_extremes(column))
+    }
+}
+
+impl TestTable {
+    /// The least and greatest value of `column`, for a column of a type the
+    /// peephole answers that holds no NULL.
+    fn column_extremes(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         let arr = self.batch.column(column);
         // `values()` below reads the zero-filled null slots too, which would
         // fabricate a 0 extreme; a nullable column just skips the peephole.

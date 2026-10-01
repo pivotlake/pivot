@@ -118,22 +118,26 @@ impl BoundTable for IcebergTableBinding {
         Ok(false)
     }
 
-    fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+    fn column_min_max(
+        &self,
+        column: usize,
+    ) -> CatalogResult<Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)>> {
         // Only sound for the whole, unfiltered table: a pushed predicate means
         // the scan this binding stands for excludes rows.
         if !self.predicates.is_empty() {
-            return None;
+            return Ok(None);
         }
-        self.parquet.column_min_max(column)
+        Ok(self.parquet.column_min_max(column))
     }
 
-    fn row_count(&self) -> Option<i64> {
-        self.predicates
+    fn row_count(&self) -> CatalogResult<Option<i64>> {
+        Ok(self
+            .predicates
             .is_empty()
-            .then(|| self.parquet.total_rows())
+            .then(|| self.parquet.total_rows()))
     }
 
-    fn estimate_row_count(&self) -> Option<u64> {
-        Some(self.parquet.total_rows() as u64)
+    fn estimate_row_count(&self) -> CatalogResult<Option<u64>> {
+        Ok(Some(self.parquet.total_rows() as u64))
     }
 }

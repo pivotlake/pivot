@@ -166,7 +166,7 @@ pub mod ffi {
             name: &str,
         ) -> CatalogGetScalarFunctionResult;
         fn pushdown_filter(table: &mut OptionalTableWrapper, expr: &Expression) -> Result<bool>;
-        fn table_estimate_row_count(table: &OptionalTableWrapper) -> CardinalityEstimate;
+        fn table_estimate_row_count(table: &OptionalTableWrapper) -> Result<CardinalityEstimate>;
         fn table_supports_late_materialization(table: &OptionalTableWrapper) -> bool;
     }
 

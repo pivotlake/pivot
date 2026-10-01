@@ -63,7 +63,7 @@ impl Aggregate {
         // A lone unfiltered COUNT(*) is the sum of every row group's row count.
         // Emit the same Int64 "count" column the scan-based aggregate path does.
         if self.is_lone_count_star() {
-            let Some(count) = scan.table.row_count() else {
+            let Some(count) = scan.table.row_count().map_err(Error::TableStatistics)? else {
                 return Ok(None);
             };
             let array = Int64Array::from(vec![count]);
@@ -114,7 +114,11 @@ impl Aggregate {
                 Some(Expression::Ref(r)) => r.column_idx,
                 _ => return Ok(None),
             };
-            let Some((min, max)) = scan.table.column_min_max(table_col) else {
+            let Some((min, max)) = scan
+                .table
+                .column_min_max(table_col)
+                .map_err(Error::TableStatistics)?
+            else {
                 return Ok(None);
             };
             let scalar = if is_min { min } else { max };
