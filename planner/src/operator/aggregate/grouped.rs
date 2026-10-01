@@ -33,8 +33,8 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, CountSlot, CountValidSlot, Distinct, Dynamic,
-    GroupLimit, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, RecordBatchOperatorSpec,
-    RowKeyExtractor, StringKeyExtractor, SumSlot,
+    GroupLimit, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, MaxSlot, MinSlot,
+    RecordBatchOperatorSpec, RowKeyExtractor, StringKeyExtractor, SumSlot,
 };
 use std::sync::Arc;
 
@@ -473,13 +473,17 @@ fn project_leading_columns(
 ///
 /// COUNT and COUNT(*) share one signature because they use the same accumulator
 /// operation; a COUNT over a nullable column is its own shape, since it must
-/// consult the column's validity. SUM retains its input type so the reader type
-/// can be selected.
+/// consult the column's validity. SUM, MIN and MAX retain the type of the
+/// column they read so the reader type can be selected.
 pub(super) enum AggregationSignature {
     Count,
     /// `COUNT(col)` over a nullable column: counts only the non-NULL rows.
     CountNullable,
     Sum(Type),
+    /// `MIN(col)`. A temporal column carries the integer type it is read as.
+    Min(Type),
+    /// `MAX(col)`. See [`Min`](AggregationSignature::Min).
+    Max(Type),
     /// Any operation without a compiled specialization.
     Other,
 }
@@ -502,9 +506,25 @@ fn aggregation_signatures(
                     AggregationSignature::Count
                 }
             }
+            Expression::AggregateFunc(AggregateFunc::Min(argument)) => {
+                AggregationSignature::Min(extreme_read_type(&argument.column().return_type))
+            }
+            Expression::AggregateFunc(AggregateFunc::Max(argument)) => {
+                AggregationSignature::Max(extreme_read_type(&argument.column().return_type))
+            }
             _ => AggregationSignature::Other,
         })
         .collect()
+}
+
+/// The column type a `MIN`/`MAX` reader sees: a temporal column is
+/// reinterpreted as the integer it stores before the group operator reads it.
+fn extreme_read_type(ty: &Type) -> Type {
+    match ty {
+        Type::Date => Type::Int32,
+        Type::Timestamp | Type::TimestampTz => Type::Int64,
+        other => other.clone(),
+    }
 }
 
 /// Returns supported integer pairs for the packed two-key extractor.
@@ -740,7 +760,19 @@ fn select_group_by_types(
             }
         };
     }
+    // A compiled tuple tracks its seen mask only when an aggregated column can
+    // hold NULLs, matching the `Dynamic` mask selection.
+    macro_rules! compiled {
+        ($K:ty, $Ops:ty, $key_config:expr) => {
+            if values_nullable {
+                build_group_by!($K, Compiled<$Ops, u8>, $key_config)
+            } else {
+                build_group_by!($K, Compiled<$Ops>, $key_config)
+            }
+        };
+    }
     // Keep the compiled list small and route every other signature to Dynamic.
+    // Every compiled signature is instantiated once per key extractor.
     macro_rules! select_value {
         ($K:ty, $key_config:expr) => {
             match signatures {
@@ -760,20 +792,39 @@ fn select_group_by_types(
                     AggregationSignature::Count,
                     AggregationSignature::Sum(Type::Int16),
                     AggregationSignature::Sum(Type::Int16),
-                ] if !values_nullable => build_group_by!(
+                ] => compiled!(
                     $K,
-                    Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>)>,
+                    (CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>),
                     $key_config
                 ),
+                // A lone SUM. A 64-bit column accumulates in `i128`.
+                [AggregationSignature::Sum(Type::Int32)] => {
+                    compiled!($K, (SumSlot<Int32Type>,), $key_config)
+                }
+                [AggregationSignature::Sum(Type::Int64)] => {
+                    compiled!($K, (SumSlot<Int64Type, i128>,), $key_config)
+                }
+                // `AVG(col)` lowers to its sum followed by its count.
+                [AggregationSignature::Sum(Type::Int64), AggregationSignature::Count] => {
+                    compiled!($K, (SumSlot<Int64Type, i128>, CountSlot), $key_config)
+                }
                 [
-                    AggregationSignature::Count,
-                    AggregationSignature::Sum(Type::Int16),
-                    AggregationSignature::Sum(Type::Int16),
+                    AggregationSignature::Sum(Type::Int64),
+                    AggregationSignature::CountNullable,
                 ] => build_group_by!(
                     $K,
-                    Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>), u8>,
+                    Compiled<(SumSlot<Int64Type, i128>, CountValidSlot), u8>,
                     $key_config
                 ),
+                // `COUNT(*)` beside a SUM or an AVG of the same column.
+                [AggregationSignature::Count, AggregationSignature::Sum(Type::Int64)] => {
+                    compiled!($K, (CountSlot, SumSlot<Int64Type, i128>), $key_config)
+                }
+                // The span of a 64-bit column, typically a timestamp.
+                [
+                    AggregationSignature::Min(Type::Int64),
+                    AggregationSignature::Max(Type::Int64),
+                ] => compiled!($K, (MinSlot<Int64Type>, MaxSlot<Int64Type>), $key_config),
                 _ => dynamic!($K, $key_config),
             }
         };
@@ -1787,5 +1838,135 @@ mod tests {
         let z_group = rows.iter().find(|r| r["s"].as_str() == Some("z")).unwrap();
         assert!(z_group["b"].is_null());
         assert_eq!(z_group["c"].as_i64(), Some(1));
+    }
+
+    /// `readings`: `(g Int32, i Int32, v Int64, n Int64, ts Timestamp)` where
+    /// group 1 sums `v` past `i64::MAX` and group 2 has only NULL `n`.
+    fn add_readings_table(testing_planner: &TestingPlanner) {
+        use arrow_array::{Int64Array, TimestampMicrosecondArray};
+        testing_planner.add_table(
+            "readings",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2, 3])) as ArrayRef,
+                ),
+                (
+                    "i",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+                ),
+                (
+                    "v",
+                    Type::Int64,
+                    Arc::new(Int64Array::from(vec![i64::MAX, i64::MAX, -4, 6])) as ArrayRef,
+                ),
+                (
+                    "n",
+                    Type::Int64,
+                    Arc::new(Int64Array::from(vec![Some(2), Some(4), None, Some(9)])) as ArrayRef,
+                ),
+                (
+                    "ts",
+                    Type::Timestamp,
+                    Arc::new(TimestampMicrosecondArray::from(vec![100, 50, 7, 9])) as ArrayRef,
+                ),
+            ],
+        );
+    }
+
+    #[rstest]
+    fn grouped_lone_sum_over_int(mut testing_planner: TestingPlanner) {
+        add_readings_table(&testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT g, SUM(i) AS s FROM readings GROUP BY g ORDER BY g",
+        );
+
+        let sums: Vec<_> = rows.iter().map(|r| r["s"].as_i64()).collect();
+        assert_eq!(sums, vec![Some(3), Some(3), Some(4)]);
+    }
+
+    #[rstest]
+    fn grouped_lone_sum_over_bigint_does_not_overflow(mut testing_planner: TestingPlanner) {
+        use arrow_array::types::Decimal128Type;
+        add_readings_table(&testing_planner);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, SUM(v) FROM readings GROUP BY g ORDER BY g",
+        );
+
+        let sums = batches[0].column(1).as_primitive::<Decimal128Type>();
+        assert_eq!(sums.value(0), 2 * i64::MAX as i128);
+        assert_eq!(sums.value(1), -4);
+        assert_eq!(sums.value(2), 6);
+    }
+
+    #[rstest]
+    fn grouped_count_and_avg_over_bigint(mut testing_planner: TestingPlanner) {
+        add_readings_table(&testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT g, COUNT(*) AS c, AVG(v) AS a FROM readings WHERE g > 1 \
+             GROUP BY g ORDER BY g",
+        );
+
+        assert_eq!(rows[0]["c"].as_i64(), Some(1));
+        assert_eq!(rows[0]["a"].as_f64(), Some(-4.0));
+        assert_eq!(rows[1]["a"].as_f64(), Some(6.0));
+    }
+
+    #[rstest]
+    fn grouped_avg_over_nullable_bigint_skips_nulls(mut testing_planner: TestingPlanner) {
+        add_readings_table(&testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT g, AVG(n) AS a FROM readings GROUP BY g ORDER BY g",
+        );
+
+        assert_eq!(rows[0]["a"].as_f64(), Some(3.0));
+        assert!(rows[1]["a"].is_null());
+        assert_eq!(rows[2]["a"].as_f64(), Some(9.0));
+    }
+
+    #[rstest]
+    fn grouped_min_max_over_timestamp(mut testing_planner: TestingPlanner) {
+        use arrow_array::types::TimestampMicrosecondType;
+        add_readings_table(&testing_planner);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, MIN(ts), MAX(ts) FROM readings GROUP BY g ORDER BY g",
+        );
+
+        let min = batches[0]
+            .column(1)
+            .as_primitive::<TimestampMicrosecondType>();
+        let max = batches[0]
+            .column(2)
+            .as_primitive::<TimestampMicrosecondType>();
+        assert_eq!((min.value(0), max.value(0)), (50, 100));
+        assert_eq!((min.value(1), max.value(1)), (7, 7));
+    }
+
+    #[rstest]
+    fn grouped_min_max_over_nullable_bigint(mut testing_planner: TestingPlanner) {
+        add_readings_table(&testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT g, MIN(n) AS lo, MAX(n) AS hi FROM readings GROUP BY g ORDER BY g",
+        );
+
+        assert_eq!(
+            (rows[0]["lo"].as_i64(), rows[0]["hi"].as_i64()),
+            (Some(2), Some(4))
+        );
+        assert!(rows[1]["lo"].is_null() && rows[1]["hi"].is_null());
     }
 }
