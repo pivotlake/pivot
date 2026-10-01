@@ -14,6 +14,7 @@ use iceberg::table::Table;
 use object_storage::{ExternalStoreFactory, load_objects};
 use parquet_engine::{
     FileRowGroups, ParquetTable, PushedPredicate, TableColumns, load_file_row_groups,
+    prune_file_row_groups,
 };
 use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 use planner::types::physical_arrow_type;
@@ -107,7 +108,7 @@ impl LoadedTable {
         })
     }
 
-    /// Select files using metadata bounds, then fetch only their footers.
+    /// Select files using metadata bounds, then fetch and prune their row groups.
     /// Manifest order, then file-local row-group order, makes the same predicates
     /// yield the same row-group positions for scanning and materialization.
     pub(crate) fn load_scan_metadata(
@@ -126,7 +127,7 @@ impl LoadedTable {
         let row_groups: Vec<_> = self
             .read_footers(&files)?
             .into_iter()
-            .flat_map(|loaded| loaded.row_groups)
+            .flat_map(|loaded| prune_file_row_groups(&loaded.row_groups, predicates))
             .collect();
         Ok(if row_groups.is_empty() {
             ParquetTable::empty(self.declared_schema())

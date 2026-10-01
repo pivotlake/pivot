@@ -53,7 +53,7 @@ pub use metadata::{FileRowGroups, create_load_and_stage_spec};
 pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
 
 mod pushdown;
-pub use pushdown::{PushedPredicate, equality_predicates, prune_parquet};
+pub use pushdown::{PushedPredicate, equality_predicates, prune_file_row_groups, prune_parquet};
 
 pub mod pruning;
 

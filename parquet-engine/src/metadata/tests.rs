@@ -8,7 +8,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use planner::expression::CompareType;
 
-use crate::{TableColumns, row_group_eliminated};
+use crate::TableColumns;
+use crate::pruning::row_group_eliminated;
 
 use super::load_file_row_groups;
 

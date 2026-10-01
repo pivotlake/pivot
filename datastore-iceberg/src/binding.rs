@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use parquet_engine::pruning::{equality_predicates, row_group_filter_from};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, materialize, scan_order_from,
+    table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
@@ -55,8 +56,7 @@ impl IcebergTableBinding {
         if let Some(table) = cached.as_ref() {
             return Ok(table.clone());
         }
-        let parquet = self.table.load_scan_metadata(&self.predicates)?;
-        let table = Arc::new(prune_parquet(&parquet, &self.predicates));
+        let table = Arc::new(self.table.load_scan_metadata(&self.predicates)?);
         *cached = Some(table.clone());
         Ok(table)
     }

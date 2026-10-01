@@ -1,18 +1,19 @@
 //! Static filter pushdown for Parquet-backed table bindings.
 //!
 //! Planner filters are translated into [`PushedPredicate`]s once, then reused
-//! for partition, file, row-group, and decoder pruning. The row-group decision
-//! itself remains in [`super::row_group_stats`] so static and dynamic pruning
-//! share the same min/max semantics.
+//! for partition, file, row-group, and decoder pruning. [`prune_parquet`] uses
+//! scalar statistics; [`prune_file_row_groups`] evaluates per-file arrays with
+//! the conservative bounds semantics in [`crate::pruning`].
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Scalar, TimestampMicrosecondArray};
-use arrow_schema::{DataType, TimeUnit};
+use arrow_array::{Array, ArrayRef, BooleanArray, Scalar, TimestampMicrosecondArray};
+use arrow_schema::{DataType, Fields, TimeUnit};
 
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
 use planner::types::{Type, UTC_TIMEZONE, physical_arrow_type};
 
+use super::pruning::ColumnBounds;
 use super::row_group_stats::row_group_eliminated;
 use super::types::leaves::{
     first_leaf, leaf_fields, variant_shredded_leaves, variant_value_leaf_is_semantically_null,
@@ -151,6 +152,24 @@ impl PushedPredicate {
             })
             .then_some(leaves.typed_leaf)
     }
+
+    /// Resolve the statistics leaf and any VARIANT fallback leaves in this
+    /// file's schema. Fallbacks must be semantically null in a row group before
+    /// the typed leaf's bounds can exclude it.
+    fn resolve_leaf(&self, fields: &Fields) -> Option<(usize, Vec<usize>)> {
+        if self.path.is_empty() {
+            return Some((first_leaf(fields, self.column_idx), Vec::new()));
+        }
+        let leaves = variant_shredded_leaves(fields, self.column_idx, &self.path)?;
+        let target = self
+            .as_type
+            .as_ref()
+            .expect("a variant path predicate has a cast target");
+        if leaf_fields(fields)[leaves.typed_leaf].data_type() != target {
+            return None;
+        }
+        Some((leaves.typed_leaf, leaves.value_leaves))
+    }
 }
 
 /// The equality predicates among `predicates`, in the shape a scan applies
@@ -188,6 +207,69 @@ pub fn prune_parquet(parquet: &ParquetTable, predicates: &[PushedPredicate]) -> 
         })
     });
     parquet
+}
+
+/// Select row groups from one file, preserving their order. The groups must
+/// share a schema and file statistics; their file-local indexes may have gaps.
+/// Call this while metadata is still grouped by file, before assembling the
+/// flat scan view used by scanning and materialization.
+pub fn prune_file_row_groups(
+    row_groups: &[Arc<RowGroupMetadata>],
+    predicates: &[PushedPredicate],
+) -> Vec<Arc<RowGroupMetadata>> {
+    if predicates.is_empty() {
+        return row_groups.to_vec();
+    }
+    let Some(first) = row_groups.first() else {
+        return Vec::new();
+    };
+    let mut keep = vec![true; row_groups.len()];
+    for predicate in predicates {
+        let Some((leaf, fallback_leaves)) = predicate.resolve_leaf(first.schema.fields()) else {
+            continue;
+        };
+        let Some(statistics) = first.statistics.get(leaf).and_then(Option::as_ref) else {
+            continue;
+        };
+        let len = statistics.null_counts.len();
+        let bounds = ColumnBounds {
+            lower: statistics.min.clone(),
+            upper: statistics.max.clone(),
+            nan_free: Some(BooleanArray::from(vec![statistics.nan_free; len])),
+            ..Default::default()
+        };
+        // Unusable statistics cannot prove that a group is empty.
+        let Ok(mask) = bounds.may_match(len, predicate.compare_type, &predicate.value) else {
+            continue;
+        };
+        for (keep, row_group) in keep.iter_mut().zip(row_groups) {
+            if !*keep {
+                continue;
+            }
+            let fallback_is_null = fallback_leaves.iter().enumerate().all(|(level, &leaf)| {
+                variant_value_leaf_is_semantically_null(
+                    row_group,
+                    leaf,
+                    predicate
+                        .as_type
+                        .as_ref()
+                        .expect("a variant path predicate has a cast target"),
+                    level + 1 == fallback_leaves.len(),
+                )
+            });
+            let index = row_group.file_row_group_idx;
+            if fallback_is_null {
+                *keep &=
+                    mask.value(index) && statistics.null_counts[index] != Some(row_group.num_rows);
+            }
+        }
+    }
+    row_groups
+        .iter()
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|(group, _)| group.clone())
+        .collect()
 }
 
 /// A top-level column and the optional variant path whose statistics can prune.
@@ -237,3 +319,6 @@ fn as_timestamp_constant(value: &Scalar<ArrayRef>) -> Option<Scalar<ArrayRef>> {
         .with_timezone_opt(None::<Arc<str>>);
     Some(Scalar::new(Arc::new(timestamp) as ArrayRef))
 }
+
+#[cfg(test)]
+mod tests;
