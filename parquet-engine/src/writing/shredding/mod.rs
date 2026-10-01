@@ -24,7 +24,10 @@
 //!   they can be regrouped into fresh files.
 //! - [`plan_file_shredding`] runs in the
 //!   [`row_group_planner`](super::row_group_planner) once a file's rows are
-//!   known. It picks the file's layout without rewriting the rows.
+//!   known. It picks the file's layout without rewriting the rows. A sorted
+//!   compaction encodes its rows as they are laid out, so it plans ahead
+//!   from the same rows, found through the sorted order and decoded alone
+//!   ([`plan_compaction_shredding`](super::plan_compaction_shredding)).
 //! - [`shred_column`] applies the plan in the [`shredder`](super::shredder)
 //!   stage, one slice of a row group's variant column at a time. The rewrite
 //!   is the heavy half: it parallelizes across workers there, and slicing it
@@ -36,6 +39,7 @@
 mod infer;
 mod shred;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
@@ -99,7 +103,7 @@ fn copy_value_field_to_slabs(
 /// describe, and each variant column's inferred layout for the encode workers
 /// to apply. Plain columns, and variants with nothing worth shredding, carry
 /// `None`.
-pub(super) struct FileShredding {
+pub struct FileShredding {
     pub(super) schema: arrow_schema::SchemaRef,
     pub(super) column_shredding: Vec<Option<Arc<arrow_schema::DataType>>>,
 }
@@ -114,20 +118,39 @@ pub(super) struct FileShredding {
 /// shredder stage ([`shred_column`]).
 pub(super) fn plan_file_shredding(chunks: &[RecordBatch]) -> WriteResult<FileShredding> {
     let schema = chunks[0].schema();
-    let mut fields: Vec<FieldRef> = schema.fields().to_vec();
+    let variant_columns: Vec<(usize, usize)> = (0..schema.fields().len())
+        .filter(|&column| crate::is_variant_field(schema.field(column)))
+        .map(|column| (column, column))
+        .collect();
+    plan_shredding(
+        schema.fields().to_vec(),
+        schema.metadata().clone(),
+        chunks,
+        &variant_columns,
+    )
+}
+
+/// Decide the shredding of a file with `fields` from `chunks`, which need hold
+/// only its variant columns: `variant_columns` pairs each variant column's
+/// index in `fields` with its index in `chunks`. Each variant field is taken
+/// from `chunks`, so it comes out in the unshredded shape the rows are in.
+pub(super) fn plan_shredding(
+    mut fields: Vec<FieldRef>,
+    metadata: HashMap<String, String>,
+    chunks: &[RecordBatch],
+    variant_columns: &[(usize, usize)],
+) -> WriteResult<FileShredding> {
     let mut column_shredding = vec![None; fields.len()];
-    for column in 0..fields.len() {
-        if !crate::is_variant_field(schema.field(column)) {
-            continue;
-        }
+    for &(column, chunk_column) in variant_columns {
+        fields[column] = chunks[0].schema().fields()[chunk_column].clone();
         let arrays = chunks
             .iter()
-            .map(|chunk| VariantArray::try_new(chunk.column(column).as_ref()))
+            .map(|chunk| VariantArray::try_new(chunk.column(chunk_column).as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         let Some(shredding_type) = infer::infer_shredding_type(&arrays) else {
             continue;
         };
-        let no_rows = VariantArray::try_new(chunks[0].column(column).slice(0, 0).as_ref())?;
+        let no_rows = VariantArray::try_new(chunks[0].column(chunk_column).slice(0, 0).as_ref())?;
         let widened = shred_variant(&no_rows, &shredding_type)?;
         // `VariantArray::field` re-applies the variant extension tag, so the
         // widened column is still recognized as a variant by the footer's
@@ -136,9 +159,15 @@ pub(super) fn plan_file_shredding(chunks: &[RecordBatch]) -> WriteResult<FileShr
         column_shredding[column] = Some(Arc::new(shredding_type));
     }
     Ok(FileShredding {
-        schema: Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        schema: Arc::new(Schema::new_with_metadata(fields, metadata)),
         column_shredding,
     })
+}
+
+/// The rows of a file of `rows` rows that its shredding is planned from, as
+/// [`plan_file_shredding`] samples them.
+pub(super) fn sampled_rows(rows: usize) -> impl Iterator<Item = usize> {
+    infer::sample_rows(rows)
 }
 
 /// Apply one column's planned `shredding` to a run of its rows: the heavy half

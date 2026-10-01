@@ -72,3 +72,41 @@ pub fn with_row_group_metadata(batch: RecordBatch, group: usize, offset: usize) 
 
     unsafe { RecordBatch::new_unchecked(new_schema, columns, row_count) }
 }
+
+/// Replaces a batch's run-encoded row-group column with a plain one, so a
+/// sort can gather it as a fixed-width column.
+pub fn plain_row_group_column(batch: RecordBatch) -> RecordBatch {
+    let groups = global_row_group(&batch);
+    // The batch may be a logical slice, so walk the logical runs, whose ends
+    // are already adjusted by the slice offset, and map each run to its
+    // physical group value from the slice's first physical index.
+    let run_ends = groups.run_ends();
+    let physical_start = run_ends.get_start_physical_index();
+    let group_values = groups
+        .values()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .expect("row group ids are unsigned");
+    let mut plain = Vec::with_capacity(batch.num_rows());
+    for (run_offset, logical_end) in run_ends.sliced_values().enumerate() {
+        plain.resize(
+            logical_end as usize,
+            group_values.value(physical_start + run_offset),
+        );
+    }
+    let group_column = batch.num_columns() - GLOBAL_ROW_GROUP_OFFSET_FROM_END;
+    let (schema, mut columns, row_count) = batch.into_parts();
+    columns[group_column] = Arc::new(UInt32Array::from(plain));
+    let mut fields = schema.fields().to_vec();
+    fields[group_column] = Arc::new(Field::new(
+        dispatch::ROW_GROUP_IDX_FIELD,
+        DataType::UInt32,
+        false,
+    ));
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )
+    .expect("the plain column has the batch's rows")
+}

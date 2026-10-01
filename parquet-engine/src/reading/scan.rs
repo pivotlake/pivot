@@ -18,6 +18,7 @@ use dispatch::{
     stealable, stealable_fifo, to_single_worker_mpsc,
 };
 
+use crate::reading::decode_gate::{DecodeGate, DecodeGateFactory};
 use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
     IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
@@ -92,6 +93,96 @@ where
                 .collect(),
         );
     RecordBatchOperatorSpec::from_spec(decoded)
+}
+
+/// Fetch and decode the row groups that `requests` name, each read as the
+/// request selects. The decoded batches carry the metadata columns when
+/// `add_row_group_metadata`, so a consumer can tell which row group and rows
+/// each holds.
+pub fn fetch_row_groups<OF>(
+    requests: OperatorSpec<RowGroupRequest, OF>,
+    table: &ParquetTable,
+    projection: Projection,
+    add_row_group_metadata: bool,
+) -> RecordBatchOperatorSpec
+where
+    OF: OperatorFactory<RowGroupRequest> + 'static,
+{
+    let n = requests.dispatcher().worker_count();
+    let pending_row_groups = pending_row_group_counters(n);
+    let buffers = fetch_buffers(requests, &pending_row_groups, pending_claim_bound(table));
+    read_parquet(
+        buffers,
+        projection,
+        RECORD_BATCH_SIZE,
+        add_row_group_metadata,
+        Arc::new(Vec::new()),
+        pending_row_groups,
+        // Row groups are claimed by explicit request, not by the injector,
+        // so this count is never consulted.
+        Arc::new(AtomicUsize::new(0)),
+    )
+}
+
+/// [`fetch_row_groups`] for a consumer that lays the rows out itself: every
+/// requested row group is fetched without waiting on decode, then held on
+/// `gate_worker` until `gate` releases it to the decode stages. The decoded
+/// batches carry the metadata columns.
+pub fn fetch_row_groups_gated<OF>(
+    requests: OperatorSpec<RowGroupRequest, OF>,
+    projection: Projection,
+    gate: DecodeGate,
+    gate_worker: usize,
+) -> RecordBatchOperatorSpec
+where
+    OF: OperatorFactory<RowGroupRequest> + 'static,
+{
+    let n = requests.dispatcher().worker_count();
+    let pending_row_groups = pending_row_group_counters(n);
+    // The gate holds fetched row groups back from decode, so a claim bound
+    // counting undecoded row groups would stop the fetch at the first few.
+    let buffers = fetch_buffers(requests, &pending_row_groups, usize::MAX).chain(
+        to_single_worker_mpsc::<RowGroupBuffer>(n, gate_worker)
+            .into_iter()
+            .collect(),
+        (0..n)
+            .map(|_| DecodeGateFactory::new(gate.clone()))
+            .collect(),
+    );
+    read_parquet(
+        buffers,
+        projection,
+        RECORD_BATCH_SIZE,
+        true,
+        Arc::new(Vec::new()),
+        pending_row_groups,
+        // Row groups are claimed by explicit request, not by the injector,
+        // so this count is never consulted.
+        Arc::new(AtomicUsize::new(0)),
+    )
+}
+
+/// The fetch stage for explicit requests. The requests keep their order on
+/// the way to the fetchers, so the row groups arrive in about the order they
+/// were asked for.
+fn fetch_buffers<OF>(
+    requests: OperatorSpec<RowGroupRequest, OF>,
+    pending_row_groups: &[Arc<AtomicUsize>],
+    claim_bound: usize,
+) -> OperatorSpec<RowGroupBuffer, impl OperatorFactory<RowGroupBuffer> + Send + 'static>
+where
+    OF: OperatorFactory<RowGroupRequest> + 'static,
+{
+    let topology = requests.dispatcher().topology();
+    requests.chain(
+        stealable_fifo::<RowGroupRequest>(topology)
+            .into_iter()
+            .collect(),
+        pending_row_groups
+            .iter()
+            .map(|pending| RowGroupFetcherFactory::new(pending.clone(), claim_bound))
+            .collect(),
+    )
 }
 
 /// One claimed-but-not-yet-cut row-group counter per worker, shared by the

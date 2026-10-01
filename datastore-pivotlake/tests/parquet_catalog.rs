@@ -2416,3 +2416,196 @@ fn late_materialization_rows_satisfy_their_own_predicate() {
         .collect();
     assert_eq!(bands, vec![6; 4]);
 }
+
+/// A sorted compaction plans the output's shredding from the variant column
+/// alone, wherever it sits among the table's columns.
+#[test]
+fn compact_sorted_table_shreds_a_variant_column_after_a_plain_one() {
+    let columns = vec![
+        Column {
+            name: "id".to_string(),
+            col_type: Type::Int32,
+        },
+        Column {
+            name: "doc".to_string(),
+            col_type: Type::Variant,
+        },
+    ];
+    let (_database, datastore) = empty_datastore();
+    let mut request = empty_request("t", columns);
+    request
+        .options
+        .insert("sort_by".to_string(), "id".to_string());
+    create_table(&datastore, request).unwrap();
+    run_sql(
+        &datastore,
+        r#"INSERT INTO t VALUES (30, '{"age":3}'::VARIANT), (10, '{"age":1}'::VARIANT)"#,
+    );
+    run_sql(
+        &datastore,
+        r#"INSERT INTO t VALUES (20, '{"age":2}'::VARIANT)"#,
+    );
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    table.refresh().unwrap();
+    let inputs = table.file_refs();
+
+    datastore_pivotlake::compact_table_files(
+        &datastore,
+        table.id(),
+        &inputs,
+        128 * 1024,
+        128 * 1024,
+    )
+    .unwrap();
+
+    let parquet = current_parquet(&datastore, "t");
+    let DataType::Struct(doc_fields) = parquet.schema().field(1).data_type() else {
+        panic!("a variant column is a struct");
+    };
+    assert!(
+        doc_fields.find("typed_value").is_some(),
+        "`age` is shredded"
+    );
+    let batches = run_sql(&datastore, "SELECT id, CAST(doc->'age' AS INTEGER) FROM t");
+    let rows: Vec<(i32, i32)> = batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch.column(0).as_primitive::<Int32Type>().clone();
+            let ages = batch.column(1).as_primitive::<Int32Type>().clone();
+            (0..batch.num_rows()).map(move |row| (ids.value(row), ages.value(row)))
+        })
+        .collect();
+    assert_eq!(rows, [(10, 1), (20, 2), (30, 3)]);
+}
+
+/// Writes `ids` with their `docs` as an `(id, doc)` file of `rows_per_group`
+/// row groups.
+fn write_id_docs_file(dir: &Path, name: &str, ids: &[i32], docs: &[String], rows_per_group: usize) {
+    use parquet_variant_compute::json_to_variant;
+
+    let json: ArrayRef = Arc::new(StringArray::from(
+        docs.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    let variant = json_to_variant(&json).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            variant.field("doc"),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
+            Arc::new(variant.into_inner()) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(rows_per_group))
+        .build();
+    let file = File::create(dir.join(name)).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// An `(id, doc)` table sorted by `id` over two files that split `ids` into
+/// even and odd, so the files overlap across the whole key range.
+fn interleaved_sorted_table(
+    ids: std::ops::Range<i32>,
+    doc: impl Fn(i32) -> String,
+    rows_per_group: usize,
+) -> (TempDir, TempDir, Arc<PivotlakeDatastore>) {
+    let dir = TempDir::new().unwrap();
+    for (name, parity) in [("even.parquet", 0), ("odd.parquet", 1)] {
+        let file_ids: Vec<i32> = ids.clone().filter(|id| id % 2 == parity).collect();
+        let docs: Vec<String> = file_ids.iter().map(|&id| doc(id)).collect();
+        write_id_docs_file(dir.path(), name, &file_ids, &docs, rows_per_group);
+    }
+    let columns = vec![
+        Column {
+            name: "id".to_string(),
+            col_type: Type::Int32,
+        },
+        Column {
+            name: "doc".to_string(),
+            col_type: Type::Variant,
+        },
+    ];
+    let (database, datastore) = empty_datastore();
+    let mut request = create_request("t", dir.path(), columns);
+    request
+        .options
+        .insert("sort_by".to_string(), "id".to_string());
+    create_table(&datastore, request).unwrap();
+    (dir, database, datastore)
+}
+
+fn compact_all_files(datastore: &Arc<PivotlakeDatastore>, target_rows_per_group: usize) {
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    table.refresh().unwrap();
+    let inputs = table.file_refs();
+    datastore_pivotlake::compact_table_files(
+        datastore,
+        table.id(),
+        &inputs,
+        target_rows_per_group,
+        usize::MAX as u64,
+    )
+    .unwrap();
+}
+
+/// A sorted compaction lays overlapping files, each of many row groups, out in
+/// one sorted run.
+#[test]
+fn compact_sorted_table_interleaves_overlapping_files_of_many_row_groups() {
+    let (_dir, _database, datastore) =
+        interleaved_sorted_table(0..1000, |id| format!(r#"{{"a":{id}}}"#), 7);
+
+    compact_all_files(&datastore, 100);
+
+    let parquet = current_parquet(&datastore, "t");
+    let bounds: Vec<(i32, i32)> = parquet
+        .row_groups()
+        .iter()
+        .map(|row_group| {
+            let stats = row_group.column_statistics(0).unwrap();
+            let bound =
+                |scalar: Scalar<ArrayRef>| scalar.into_inner().as_primitive::<Int32Type>().value(0);
+            (bound(stats.min().unwrap()), bound(stats.max().unwrap()))
+        })
+        .collect();
+    let expected: Vec<(i32, i32)> = (0..10)
+        .map(|group| (group * 100, group * 100 + 99))
+        .collect();
+    assert_eq!(bounds, expected);
+}
+
+/// A sorted compaction shreds from the rows a write of the whole sorted file
+/// samples: 40960 rows sample every tenth, so a path on every fortieth row is
+/// a quarter of the sample and shreds, while a path on a tenth of the rows,
+/// none of them sampled, does not.
+#[test]
+fn compact_sorted_table_shreds_from_the_sorted_files_sample() {
+    let doc = |id: i32| match id {
+        id if id % 40 == 0 => format!(r#"{{"a":{id},"p":1}}"#),
+        id if id % 10 == 5 => format!(r#"{{"a":{id},"r":1}}"#),
+        id => format!(r#"{{"a":{id}}}"#),
+    };
+    let (_dir, _database, datastore) = interleaved_sorted_table(0..40960, doc, 4096);
+
+    compact_all_files(&datastore, 128 * 1024);
+
+    let parquet = current_parquet(&datastore, "t");
+    let DataType::Struct(doc_fields) = parquet.schema().field(1).data_type() else {
+        panic!("a variant column is a struct");
+    };
+    let (_, typed_value) = doc_fields.find("typed_value").expect("`doc` is shredded");
+    let DataType::Struct(paths) = typed_value.data_type() else {
+        panic!("a shredded object is a struct");
+    };
+    let names: Vec<&str> = paths.iter().map(|field| field.name().as_str()).collect();
+    assert_eq!(names, ["a", "p"]);
+}

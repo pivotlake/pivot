@@ -205,7 +205,7 @@ pub(super) fn infer_shredding_type(arrays: &[VariantArray]) -> Option<DataType> 
 
 /// The rows to sample: every row of a small column, else [`SAMPLE_ROWS`] spread
 /// evenly across the whole of a large one.
-fn sample_rows(rows: usize) -> impl Iterator<Item = usize> {
+pub(super) fn sample_rows(rows: usize) -> impl Iterator<Item = usize> {
     let stride = rows.div_ceil(SAMPLE_ROWS).max(1);
     (0..rows).step_by(stride)
 }
