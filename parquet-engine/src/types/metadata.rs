@@ -22,6 +22,7 @@ pub(crate) type FileStatistics = Vec<Option<FileLeafStatistics>>;
 
 /// One leaf column's statistics across a file's row groups. Every field is
 /// indexed by file-local row group position.
+#[derive(Clone)]
 pub(crate) struct FileLeafStatistics {
     /// Lower bounds, one element per row group, null where a row group recorded
     /// none. `None` when the leaf's Arrow type has no decodable bound, which
@@ -31,6 +32,9 @@ pub(crate) struct FileLeafStatistics {
     pub(crate) max: Option<ArrayRef>,
     pub(crate) null_counts: Vec<Option<i64>>,
     pub(crate) distinct_counts: Vec<Option<i64>>,
+    /// A table format's file-level statistics prove that this leaf has no NaNs
+    /// in any row group. The footer alone does not establish this fact.
+    pub(crate) nan_free: bool,
 }
 
 /// One row group's view of its file's statistics for a single leaf. Bounds come
@@ -43,6 +47,8 @@ pub struct ColumnStatistics<'a> {
     max: Option<&'a ArrayRef>,
     pub null_count: Option<i64>,
     pub distinct_count: Option<i64>,
+    /// The file's metadata proves that this column contains no NaNs.
+    pub nan_free: bool,
 }
 
 impl<'a> ColumnStatistics<'a> {
@@ -204,6 +210,7 @@ impl RowGroupMetadata {
             max: leaf.max.as_ref(),
             null_count: leaf.null_counts[self.file_row_group_idx],
             distinct_count: leaf.distinct_counts[self.file_row_group_idx],
+            nan_free: leaf.nan_free,
         })
     }
 }

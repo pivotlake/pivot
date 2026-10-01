@@ -7,12 +7,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar};
+use arrow_array::{ArrayRef, BooleanArray, Scalar};
 use arrow_schema::ArrowError;
 
 use planner::catalog::DynamicScanPredicate;
 use planner::expression::CompareType;
 
+use crate::pruning::ColumnBounds;
 use crate::types::metadata::RowGroupMetadata;
 
 /// Turn the planner's logical [`DynamicScanPredicate`]s into a [`RowGroupFilter`]:
@@ -92,66 +93,34 @@ pub fn row_group_eliminated(
     let Some(stats) = row_group.leaf_statistics(leaf) else {
         return Ok(false);
     };
-    // Every ordinary comparison against SQL NULL is unknown and therefore
-    // cannot pass a WHERE filter. This also handles shredded typed leaves whose
-    // only fallbacks are absent values or JSON nulls.
-    if stats.null_count == Some(row_group.num_rows) {
-        return Ok(true);
-    }
-    let (Some(min), Some(max)) = (stats.min(), stats.max()) else {
-        return Ok(false);
+    let bounds = ColumnBounds {
+        lower: stats.min().map(Scalar::into_inner),
+        upper: stats.max().map(Scalar::into_inner),
+        all_null: Some(BooleanArray::from(vec![
+            stats.null_count == Some(row_group.num_rows),
+        ])),
+        nan_free: Some(BooleanArray::from(vec![stats.nan_free])),
     };
-    bounds_eliminate(&min, &max, compare_type, constant)
+    Ok(!bounds.may_match(1, compare_type, constant)?.value(0))
 }
 
 /// Returns whether the inclusive range `[min, max]` proves that
 /// `col <compare_type> constant` matches no value in it. Shared by row-group
 /// elimination and file-level table-format
 /// stats pruning, so both reason about bounds identically. `min`/`max` are
-/// single-value scalars typed as the physical column.
+/// single-value scalars typed as the physical column. Floating-point bounds
+/// without proof that NaNs are absent can still exclude equality with a
+/// non-NaN constant.
 pub fn bounds_eliminate(
     min: &Scalar<ArrayRef>,
     max: &Scalar<ArrayRef>,
     compare_type: CompareType,
     constant: &Scalar<ArrayRef>,
 ) -> Result<bool, ArrowError> {
-    // Stats come back typed as the physical parquet column (e.g. a DATE stored
-    // as UInt16), while the constant carries the logical type (e.g. Date32).
-    // The comparison kernels need matching types, so when they differ we can't
-    // prune — keep the range (always safe, just no pruning).
-    if min.get().0.data_type() != constant.get().0.data_type() {
-        return Ok(false);
-    }
-
-    Ok(match compare_type {
-        // `col <> k` is true on every row unless every row equals `k` —
-        // provable only when min == max == k.
-        CompareType::NotEqual => {
-            bool_kernel(min, constant, arrow_ord::cmp::eq)?
-                && bool_kernel(max, constant, arrow_ord::cmp::eq)?
-        }
-        // `col = k` can never match when k is strictly outside [min, max].
-        CompareType::Equal => {
-            bool_kernel(constant, min, arrow_ord::cmp::lt)?
-                || bool_kernel(constant, max, arrow_ord::cmp::gt)?
-        }
-        // `col < k` matches nothing when every value is >= k, i.e. min >= k.
-        CompareType::Less => bool_kernel(min, constant, arrow_ord::cmp::gt_eq)?,
-        // `col > k` matches nothing when every value is <= k, i.e. max <= k.
-        CompareType::Greater => bool_kernel(max, constant, arrow_ord::cmp::lt_eq)?,
-        // `col <= k` matches nothing when every value is > k, i.e. min > k.
-        CompareType::LessEqual => bool_kernel(min, constant, arrow_ord::cmp::gt)?,
-        // `col >= k` matches nothing when every value is < k, i.e. max < k.
-        CompareType::GreaterEqual => bool_kernel(max, constant, arrow_ord::cmp::lt)?,
-    })
-}
-
-/// Run an Arrow comparison kernel on two scalars and read its single boolean.
-fn bool_kernel(
-    a: &Scalar<ArrayRef>,
-    b: &Scalar<ArrayRef>,
-    kernel: fn(&dyn Datum, &dyn Datum) -> Result<BooleanArray, ArrowError>,
-) -> Result<bool, ArrowError> {
-    let result = kernel(a as &dyn Datum, b as &dyn Datum)?;
-    Ok(result.len() == 1 && result.value(0))
+    let bounds = ColumnBounds {
+        lower: Some(min.clone().into_inner()),
+        upper: Some(max.clone().into_inner()),
+        ..Default::default()
+    };
+    Ok(!bounds.may_match(1, compare_type, constant)?.value(0))
 }

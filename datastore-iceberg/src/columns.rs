@@ -41,7 +41,7 @@ pub(crate) fn table_columns(table: &str, schema: &Schema) -> Result<TableColumns
 /// The Pivot type an Iceberg type reads as, or `None` for one Pivot has no
 /// column type for (nested types, time, nanosecond timestamps, uuid, fixed,
 /// binary).
-fn to_pivot_type(iceberg_type: &IcebergType) -> Option<Type> {
+pub(crate) fn to_pivot_type(iceberg_type: &IcebergType) -> Option<Type> {
     let IcebergType::Primitive(primitive) = iceberg_type else {
         return None;
     };

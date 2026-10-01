@@ -1,7 +1,7 @@
 //! The per-query binding of one loaded table: the snapshot the query bound
 //! plus the predicates pushed into it, compiled into the Parquet scan.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
@@ -17,16 +17,16 @@ use planner::expression::TableFilter;
 
 use crate::table::LoadedTable;
 
-/// A table bound by one query. The loaded table is shared with every other
-/// binding of it in the same query; the scan view and the predicates are this
-/// binding's own, so each query prunes its own view.
+/// One reference to a table in a query. Filter pushdown finishes before the
+/// binding is cloned for materialization or its scan metadata is loaded.
+/// Clones share the pruned scan metadata.
 #[derive(Clone)]
 pub(crate) struct IcebergTableBinding {
     reference: TableReference,
     table: Arc<LoadedTable>,
-    /// Every row group of the table, the view the predicates prune.
-    parquet: Arc<ParquetTable>,
     predicates: Vec<PushedPredicate>,
+    /// Statistics, scanning, and late materialization reuse this binding's load.
+    cached_scan_metadata: Arc<Mutex<Option<Arc<ParquetTable>>>>,
 }
 
 impl std::fmt::Debug for IcebergTableBinding {
@@ -41,20 +41,24 @@ impl std::fmt::Debug for IcebergTableBinding {
 
 impl IcebergTableBinding {
     pub(crate) fn new(reference: TableReference, table: Arc<LoadedTable>) -> Self {
-        let parquet = Arc::new(table.parquet_table());
         Self {
             reference,
             table,
-            parquet,
             predicates: Vec::new(),
+            cached_scan_metadata: Arc::default(),
         }
     }
 
-    /// The row groups that survive this binding's pushed predicates: what a
-    /// scan reads, and the very view a late materialize must rebuild, since a
-    /// row reference is a position in it.
-    fn prune(&self) -> Arc<ParquetTable> {
-        Arc::new(prune_parquet(&self.parquet, &self.predicates))
+    /// Serialize preparation across clones and retain only successful loads.
+    fn load_scan_metadata(&self) -> CatalogResult<Arc<ParquetTable>> {
+        let mut cached = self.cached_scan_metadata.lock().unwrap();
+        if let Some(table) = cached.as_ref() {
+            return Ok(table.clone());
+        }
+        let parquet = self.table.load_scan_metadata(&self.predicates)?;
+        let table = Arc::new(prune_parquet(&parquet, &self.predicates));
+        *cached = Some(table.clone());
+        Ok(table)
     }
 }
 
@@ -82,7 +86,7 @@ impl BoundTable for IcebergTableBinding {
         let scan_order = scan_order_from(&dynamic_filters);
         Ok(table_input_with_filter_and_eq_predicates(
             dispatcher,
-            &self.prune(),
+            &self.load_scan_metadata()?,
             projection,
             emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
@@ -96,7 +100,7 @@ impl BoundTable for IcebergTableBinding {
     }
 
     fn nullability(&self) -> Vec<bool> {
-        self.table.nullability.clone()
+        self.table.nullability()
     }
 
     fn clone_box(&self) -> Box<dyn BoundTable> {
@@ -108,32 +112,32 @@ impl BoundTable for IcebergTableBinding {
         input: RecordBatchOperatorSpec,
         projection: Projection,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        Ok(materialize(input, self.prune(), projection))
+        Ok(materialize(input, self.load_scan_metadata()?, projection))
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
-        // Recorded for row-group pruning at compile time. The query's own
-        // `Filter` stays above the scan, so this only ever skips work.
         self.predicates.extend(PushedPredicate::from_filter(filter));
+        // Pruning only excludes work; the SQL filter still evaluates rows.
         Ok(false)
     }
 
     fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
-        // Only sound for the whole, unfiltered table: a pushed predicate means
-        // the scan this binding stands for excludes rows.
         if !self.predicates.is_empty() {
             return None;
         }
-        self.parquet.column_min_max(column)
+        // Manifest bounds can be loose. Exact extrema come from the prepared
+        // Parquet view; any preparation error is reported by the ensuing scan.
+        self.load_scan_metadata().ok()?.column_min_max(column)
     }
 
     fn row_count(&self) -> Option<i64> {
         self.predicates
             .is_empty()
-            .then(|| self.parquet.total_rows())
+            .then(|| self.table.row_count())
+            .flatten()
     }
 
     fn estimate_row_count(&self) -> Option<u64> {
-        Some(self.parquet.total_rows() as u64)
+        self.table.row_count().map(|rows| rows as u64)
     }
 }

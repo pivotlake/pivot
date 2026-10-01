@@ -94,6 +94,16 @@ impl ParquetTable {
         Self { row_groups, schema }
     }
 
+    /// An empty table carrying `schema`, for a scan whose row groups were all
+    /// pruned before any footer was read: it holds no data yet still shapes an
+    /// empty result with the right columns.
+    pub fn empty(schema: SchemaRef) -> Self {
+        Self {
+            row_groups: Vec::new(),
+            schema,
+        }
+    }
+
     /// Read-only view of this table's row groups.
     pub fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
         &self.row_groups
@@ -352,6 +362,7 @@ fn absent_leaf_statistics(row_counts: &[i64]) -> FileLeafStatistics {
         max: None,
         null_counts: row_counts.iter().map(|rows| Some(*rows)).collect(),
         distinct_counts: row_counts.iter().map(|_| Some(0)).collect(),
+        nan_free: true,
     }
 }
 
@@ -520,6 +531,7 @@ fn decode_leaf_statistics(
         max: decode_bounds(&max_bytes, data_type, physical_type),
         null_counts,
         distinct_counts,
+        nan_free: false,
     })
 }
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{ArrowPrimitiveType, TimestampMicrosecondType};
-use arrow_array::{ArrayRef, RecordBatch, Scalar, TimestampMicrosecondArray};
+use arrow_array::{ArrayRef, ArrowNativeTypeOp, RecordBatch, Scalar, TimestampMicrosecondArray};
 use arrow_buffer::ArrowNativeType;
 
 use super::{BuiltDictionary, SharedDictionary};
@@ -313,12 +313,20 @@ where
             // aligned so `mid` covers the `size` values exactly.
             let (head, mid, _) = unsafe { data[0][..size * width].align_to::<T::Native>() };
             if head.is_empty() {
+                // Float equality must agree with Arrow's total ordering,
+                // including NaN payloads and the two signs of zero.
+                if matches!(
+                    T::DATA_TYPE,
+                    arrow_schema::DataType::Float32 | arrow_schema::DataType::Float64
+                ) {
+                    return mid.iter().any(|value| value.is_eq(*needle));
+                }
                 return mid.contains(needle);
             }
         }
         let mut position = ReaderPosition::default();
         let mut reader = MultiBufferReader::new(data, &mut position);
-        (0..size).any(|_| T::Native::read_le(&mut reader) == *needle)
+        (0..size).any(|_| T::Native::read_le(&mut reader).is_eq(*needle))
     }
 
     fn len(&self) -> usize {
@@ -473,6 +481,36 @@ mod tests {
     use crate::types::metadata::RowSelection;
     use dispatch::memory::SlabAllocator;
     use dispatch::memory::init_test_free_pool;
+
+    #[test]
+    fn floating_dictionary_equality_preserves_nan_payloads_and_signed_zero() {
+        type FloatDict = PrimitiveDict<Float32Type, SlabBuffer<f32>>;
+        let bytes = Bytes::from(
+            [1.0f32, f32::NAN, -0.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let buffers = [
+            vec![bytes.clone()],
+            vec![bytes.slice(..3), bytes.slice(3..)],
+        ];
+
+        for data in buffers {
+            for (needle, expected) in [
+                (1.0, true),
+                (f32::NAN, true),
+                (-f32::NAN, false),
+                (-0.0, true),
+                (0.0, false),
+                (f32::from_bits(f32::NAN.to_bits() + 1), false),
+            ] {
+                let contains = FloatDict::maybe_contains(&data, 3, &needle);
+
+                assert_eq!(contains, expected, "needle bits: {:x}", needle.to_bits());
+            }
+        }
+    }
 
     #[test]
     fn attaching_a_timestamp_timezone_preserves_the_value_buffer() {

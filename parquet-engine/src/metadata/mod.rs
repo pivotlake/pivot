@@ -24,6 +24,9 @@
 mod fetcher;
 mod writer;
 
+#[cfg(test)]
+mod tests;
+
 use crate::types::columns::TableColumns;
 use crate::types::metadata::RowGroupMetadata;
 use dispatch::{
@@ -43,6 +46,30 @@ use writer::FileRowGroupsSinkFactory;
 pub struct FileRowGroups {
     pub file: FileRef,
     pub row_groups: Vec<Arc<RowGroupMetadata>>,
+}
+
+impl FileRowGroups {
+    /// Record a table format's proof that each listed top-level column contains
+    /// no NaNs anywhere in this file. Every row group inherits that proof; a
+    /// predicate or bounds alone cannot establish it.
+    pub fn mark_columns_nan_free(&mut self, columns: &[usize]) {
+        if columns.is_empty() {
+            return;
+        }
+        let Some(first) = self.row_groups.first() else {
+            return;
+        };
+        let mut statistics = first.statistics.clone();
+        for &column in columns {
+            let leaf = crate::types::leaves::first_leaf(first.schema.fields(), column);
+            if let Some(statistics) = &mut Arc::make_mut(&mut statistics)[leaf] {
+                statistics.nan_free = true;
+            }
+        }
+        for row_group in &mut self.row_groups {
+            Arc::make_mut(row_group).statistics = statistics.clone();
+        }
+    }
 }
 
 /// Builds each worker's [`FileRowGroupsFetcher`], carrying the table's

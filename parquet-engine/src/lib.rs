@@ -55,6 +55,8 @@ pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
 mod pushdown;
 pub use pushdown::{PushedPredicate, equality_predicates, prune_parquet};
 
+pub mod pruning;
+
 mod row_group_stats;
 pub use row_group_stats::{
     RowGroupFilter, ScanOrder, bounds_eliminate, row_group_eliminated, row_group_filter_from,
