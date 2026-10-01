@@ -22,6 +22,7 @@ pub(crate) type FileStatistics = Vec<Option<FileLeafStatistics>>;
 
 /// One leaf column's statistics across a file's row groups. Every field is
 /// indexed by file-local row group position.
+#[derive(Clone)]
 pub(crate) struct FileLeafStatistics {
     /// Lower bounds, one element per row group, null where a row group recorded
     /// none. `None` when the leaf's Arrow type has no decodable bound, which
@@ -31,6 +32,9 @@ pub(crate) struct FileLeafStatistics {
     pub(crate) max: Option<ArrayRef>,
     pub(crate) null_counts: Vec<Option<i64>>,
     pub(crate) distinct_counts: Vec<Option<i64>>,
+    /// How many NaNs each row group holds. `Some(0)` proves none; bounds
+    /// leave NaN out, so only a count can.
+    pub(crate) nan_counts: Vec<Option<i64>>,
 }
 
 /// One row group's view of its file's statistics for a single leaf. Bounds come
@@ -43,6 +47,8 @@ pub struct ColumnStatistics<'a> {
     max: Option<&'a ArrayRef>,
     pub null_count: Option<i64>,
     pub distinct_count: Option<i64>,
+    /// How many NaNs the row group holds. `Some(0)` proves none.
+    pub nan_count: Option<i64>,
 }
 
 impl<'a> ColumnStatistics<'a> {
@@ -204,8 +210,39 @@ impl RowGroupMetadata {
             max: leaf.max.as_ref(),
             null_count: leaf.null_counts[self.file_row_group_idx],
             distinct_count: leaf.distinct_counts[self.file_row_group_idx],
+            nan_count: leaf.nan_counts[self.file_row_group_idx],
         })
     }
+}
+
+/// One file's `row_groups` with the top-level `columns` marked NaN-free in
+/// all of them: what a table format's statistics can add when the footer has
+/// no NaN count. The row groups share the file's statistics, so those are
+/// rebuilt once.
+pub fn with_nan_free_columns(
+    row_groups: Vec<Arc<RowGroupMetadata>>,
+    columns: &[usize],
+) -> Vec<Arc<RowGroupMetadata>> {
+    let Some(first) = row_groups.first() else {
+        return row_groups;
+    };
+    let mut statistics: FileStatistics = first.statistics.as_ref().clone();
+    for &column in columns {
+        let leaf = super::leaves::first_leaf(first.schema.fields(), column);
+        if let Some(Some(leaf)) = statistics.get_mut(leaf) {
+            leaf.nan_counts = vec![Some(0); leaf.nan_counts.len()];
+        }
+    }
+    let statistics = Arc::new(statistics);
+    row_groups
+        .into_iter()
+        .map(|row_group| {
+            Arc::new(RowGroupMetadata {
+                statistics: statistics.clone(),
+                ..(*row_group).clone()
+            })
+        })
+        .collect()
 }
 
 /// Which rows of a row group are read.

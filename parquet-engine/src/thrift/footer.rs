@@ -239,6 +239,9 @@ thrift_struct!(
         4: optional i64 distinct_count;
         5: optional binary max_value;
         6: optional binary min_value;
+        /// How many NaNs the chunk holds. Bounds leave NaN out, so only this
+        /// proves a float chunk has none.
+        9: optional i64 nan_count;
     }
 );
 

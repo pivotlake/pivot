@@ -1825,7 +1825,9 @@ dependencies = [
 name = "datastore-iceberg"
 version = "0.1.1"
 dependencies = [
+ "arrow-arith",
  "arrow-array",
+ "arrow-cast",
  "arrow-schema",
  "async-trait",
  "catalog",

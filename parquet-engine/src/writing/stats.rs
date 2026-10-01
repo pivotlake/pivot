@@ -16,6 +16,44 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 
+/// A float leaf's statistics as the footer records them: how many values are
+/// NaN, and the range of the others as single-element arrays, or no range
+/// when every value is NaN. The format keeps NaN out of the bounds and counts
+/// it instead: NaN sorts above every value, so a reader pruning by bounds
+/// alone would drop it. `None` for a leaf that is not float.
+pub(super) fn floating_point_statistics(
+    array: &ArrayRef,
+) -> Option<(i64, Option<(ArrayRef, ArrayRef)>)> {
+    macro_rules! floating {
+        ($arr:ty) => {{
+            let values = array.as_any().downcast_ref::<$arr>()?;
+            let nan_count = values
+                .iter()
+                .flatten()
+                .filter(|value| value.is_nan())
+                .count() as i64;
+            let mut numbers = values.iter().flatten().filter(|value| !value.is_nan());
+            let bounds = numbers.next().map(|first| {
+                let (lo, hi) = numbers.fold((first, first), |(lo, hi), value| {
+                    (
+                        if value < lo { value } else { lo },
+                        if value > hi { value } else { hi },
+                    )
+                });
+                let lo: ArrayRef = Arc::new(<$arr>::from(vec![lo]));
+                let hi: ArrayRef = Arc::new(<$arr>::from(vec![hi]));
+                (lo, hi)
+            });
+            Some((nan_count, bounds))
+        }};
+    }
+    match array.data_type() {
+        DataType::Float32 => floating!(Float32Array),
+        DataType::Float64 => floating!(Float64Array),
+        _ => None,
+    }
+}
+
 /// A column's min and max, as single-element Arrow arrays.
 ///
 /// `None` when the column is empty or all-null, or when its type is not one the

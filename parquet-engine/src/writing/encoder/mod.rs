@@ -122,9 +122,14 @@ pub(in crate::writing) fn encode_leaf(
 /// leaf with no range to give (a leaf absent on every row has no values to take
 /// one from), because it prunes on its own account: a shredded path's typed leaf
 /// may only be trusted when every `value` fallback beside it is all-null, and the
-/// null count is how a reader establishes that.
+/// null count is how a reader establishes that. A float leaf counts its NaNs
+/// and keeps them out of its range, as the format asks.
 fn leaf_statistics(leaf: &Leaf) -> Statistics {
-    let (min_value, max_value) = match stats::column_min_max(&leaf.values) {
+    let (nan_count, bounds) = match stats::floating_point_statistics(&leaf.values) {
+        Some((nan_count, bounds)) => (Some(nan_count), bounds),
+        None => (None, stats::column_min_max(&leaf.values)),
+    };
+    let (min_value, max_value) = match bounds {
         Some((min, max)) => (stats::stat_bytes(&min), stats::stat_bytes(&max)),
         None => (None, None),
     };
@@ -137,5 +142,6 @@ fn leaf_statistics(leaf: &Leaf) -> Statistics {
         distinct_count: None,
         min_value,
         max_value,
+        nan_count,
     }
 }

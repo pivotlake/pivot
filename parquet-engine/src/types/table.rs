@@ -94,6 +94,16 @@ impl ParquetTable {
         Self { row_groups, schema }
     }
 
+    /// An empty table carrying `schema`, for a scan whose row groups were all
+    /// pruned before any footer was read: it holds no data yet still shapes an
+    /// empty result with the right columns.
+    pub fn empty(schema: SchemaRef) -> Self {
+        Self {
+            row_groups: Vec::new(),
+            schema,
+        }
+    }
+
     /// Read-only view of this table's row groups.
     pub fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
         &self.row_groups
@@ -352,6 +362,7 @@ fn absent_leaf_statistics(row_counts: &[i64]) -> FileLeafStatistics {
         max: None,
         null_counts: row_counts.iter().map(|rows| Some(*rows)).collect(),
         distinct_counts: row_counts.iter().map(|_| Some(0)).collect(),
+        nan_counts: row_counts.iter().map(|_| Some(0)).collect(),
     }
 }
 
@@ -494,23 +505,29 @@ fn decode_leaf_statistics(
     let mut max_bytes = Vec::with_capacity(chunks.len());
     let mut null_counts = Vec::with_capacity(chunks.len());
     let mut distinct_counts = Vec::with_capacity(chunks.len());
+    let mut nan_counts = Vec::with_capacity(chunks.len());
     let mut recorded = false;
     for chunk in chunks {
-        let (min, max, null_count, distinct_count) = match chunk {
+        let (min, max, null_count, distinct_count, nan_count) = match chunk {
             Some(stats) => (
                 stats.min_value.or(stats.min),
                 stats.max_value.or(stats.max),
                 stats.null_count,
                 stats.distinct_count,
+                stats.nan_count,
             ),
-            None => (None, None, None, None),
+            None => (None, None, None, None, None),
         };
-        recorded |=
-            min.is_some() || max.is_some() || null_count.is_some() || distinct_count.is_some();
+        recorded |= min.is_some()
+            || max.is_some()
+            || null_count.is_some()
+            || distinct_count.is_some()
+            || nan_count.is_some();
         min_bytes.push(min);
         max_bytes.push(max);
         null_counts.push(null_count);
         distinct_counts.push(distinct_count);
+        nan_counts.push(nan_count);
     }
     if !recorded {
         return None;
@@ -520,6 +537,7 @@ fn decode_leaf_statistics(
         max: decode_bounds(&max_bytes, data_type, physical_type),
         null_counts,
         distinct_counts,
+        nan_counts,
     })
 }
 
@@ -726,7 +744,7 @@ fn i128_from_be_bytes(bytes: &[u8]) -> Option<i128> {
 }
 
 /// Deserialises raw Thrift bytes into a [`FileMetaData`].
-fn parse_footer_thrift(buf: &[u8]) -> Result<FileMetaData> {
+pub(crate) fn parse_footer_thrift(buf: &[u8]) -> Result<FileMetaData> {
     let mut prot = ThriftSliceInputProtocol::new(buf);
     FileMetaData::read_thrift(&mut prot)
         .map_err(|e| Error::IO(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))

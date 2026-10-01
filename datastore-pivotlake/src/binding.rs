@@ -9,7 +9,7 @@ use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
+    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet_row_groups,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
@@ -296,6 +296,6 @@ impl TableBinding {
     /// (kept) — never wrong, just unoptimized. No footer I/O. Exposed so pruning
     /// can be asserted directly.
     pub fn pruned_parquet(&self, parquet: &ParquetTable) -> ParquetTable {
-        prune_parquet(parquet, &self.predicates)
+        prune_parquet_row_groups(parquet, &self.predicates)
     }
 }

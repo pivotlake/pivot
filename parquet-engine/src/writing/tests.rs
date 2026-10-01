@@ -168,6 +168,19 @@ fn read_back(bytes: &[u8]) -> RecordBatch {
     arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap()
 }
 
+/// A file's first row group's statistics per leaf as the footer records
+/// them, through this crate's own footer reader.
+fn footer_statistics(bytes: &[u8]) -> Vec<Option<crate::thrift::footer::Statistics>> {
+    let end = bytes.len() - 8;
+    let footer_len = u32::from_le_bytes(bytes[end..end + 4].try_into().unwrap()) as usize;
+    let footer = crate::types::table::parse_footer_thrift(&bytes[end - footer_len..end]).unwrap();
+    footer.row_groups[0]
+        .columns
+        .iter()
+        .map(|chunk| chunk.meta_data.as_ref().unwrap().statistics.clone())
+        .collect()
+}
+
 /// A file's first row group's statistics per leaf, keyed by dotted path.
 fn leaf_stats(bytes: &[u8]) -> Vec<(String, Option<u64>, bool)> {
     let reader =
@@ -482,6 +495,19 @@ fn the_footer_names_a_type_defined_order_for_every_leaf() {
 /// fallback beside it holds nothing, and a reader establishes that from the
 /// fallback's null count against the row count. So an unused fallback has to
 /// record one, even though it is all-null and has no range to report.
+#[test]
+fn a_floating_point_leaf_counts_its_nans_and_keeps_them_out_of_its_bounds() {
+    let amounts: ArrayRef = Arc::new(Float64Array::from(vec![1.0, f64::NAN, 3.0]));
+    let files = write(vec![ColumnsItem(vec![("amount", amounts)])], 128 * 1024);
+
+    let statistics = footer_statistics(&files[0]);
+
+    let amount = statistics[0].as_ref().expect("the leaf has statistics");
+    assert_eq!(amount.nan_count, Some(1));
+    let max = f64::from_le_bytes(amount.max_value.as_deref().unwrap().try_into().unwrap());
+    assert_eq!(max, 3.0);
+}
+
 #[test]
 fn an_unused_fallback_leaf_records_a_full_null_count() {
     let documents = rows(&[r#"{"id": 1}"#, r#"{"id": 5}"#, r#"{"id": 9}"#]);

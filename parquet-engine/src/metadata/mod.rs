@@ -24,6 +24,8 @@
 mod fetcher;
 mod writer;
 
+use std::collections::HashMap;
+
 use crate::types::columns::TableColumns;
 use crate::types::metadata::RowGroupMetadata;
 use dispatch::{
@@ -107,11 +109,14 @@ fn fetch_file_row_group_factories(
 }
 
 /// Read every file's footer in parallel and collect the resulting
-/// [`FileRowGroups`] on the coordinator (file order is not preserved — the table's
-/// row groups are flattened across whichever order the workers finish in). The
-/// fetch stage already emits `FileRowGroups`, so the dataflow's typed `collect`
-/// drains them directly — no terminal sink. Drives the dataflow, so it must run
-/// on the **coordinator**, not inside a `run_on_worker` closure.
+/// [`FileRowGroups`] on the coordinator, one per file in the order `files`
+/// lists them. The workers finish in whatever order they do, so the results
+/// are put back in request order here, where every caller would otherwise
+/// have to: a table's row groups are laid out in file order, and a late
+/// materialize finds rows by position in that layout. The fetch stage already
+/// emits `FileRowGroups`, so the dataflow's typed `collect` drains them
+/// directly with no terminal sink. Drives the dataflow, so it must run on the
+/// **coordinator**, not inside a `run_on_worker` closure.
 pub fn load_file_row_groups(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
@@ -123,11 +128,29 @@ pub fn load_file_row_groups(
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    OperatorSpec::new(
+    let loaded: Vec<FileRowGroups> = OperatorSpec::new(
         dispatcher.clone(),
         fetch_file_row_group_factories(files, dispatcher.worker_count(), table_columns),
     )
-    .collect()
+    .collect()?;
+    // Keyed by path, with a list per path so a file requested twice is handed
+    // back twice.
+    let mut by_path: HashMap<_, Vec<FileRowGroups>> = HashMap::new();
+    for file in loaded {
+        by_path
+            .entry(file.file.path.clone())
+            .or_default()
+            .push(file);
+    }
+    Ok(files
+        .iter()
+        .map(|file| {
+            by_path
+                .get_mut(&file.file.path)
+                .and_then(Vec::pop)
+                .expect("the fetch emits one result per requested file")
+        })
+        .collect())
 }
 
 /// A `RecordBatchOperatorSpec` that, when executed, reads every file's footer in

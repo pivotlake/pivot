@@ -110,9 +110,13 @@ impl DeltaFileEntry {
             ) else {
                 return true;
             };
+            // The writer's bounds come from Arrow's `min` and `max`, which
+            // return NaN when any value is NaN, so they already cover it.
+            let may_hold_nan = false;
             !parquet_engine::bounds_eliminate(
                 &Scalar::new(min.clone()),
                 &Scalar::new(max.clone()),
+                may_hold_nan,
                 filter.compare_type,
                 &filter.value,
             )

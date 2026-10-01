@@ -12,7 +12,10 @@ catalog = { workspace = true }
 dispatch = { workspace = true }
 object-storage = { workspace = true }
 parquet-engine = { workspace = true }
+arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 async-trait = "0.1"

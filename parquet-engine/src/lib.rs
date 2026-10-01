@@ -33,6 +33,9 @@ pub(crate) fn http_readahead() -> usize {
     *VALUE.get_or_init(|| dispatch::env::get_env_var_with_default("PIVOT_HTTP_READAHEAD", 64))
 }
 
+mod bounds;
+pub use bounds::{BoundKey, Bounds, Range, RangePredicate};
+
 mod external;
 pub use external::bind_read_parquet;
 
@@ -53,12 +56,12 @@ pub use metadata::{FileRowGroups, create_load_and_stage_spec};
 pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
 
 mod pushdown;
-pub use pushdown::{PushedPredicate, equality_predicates, prune_parquet};
+pub use pushdown::{PushedPredicate, equality_predicates, prune_parquet_row_groups};
 
 mod row_group_stats;
 pub use row_group_stats::{
-    RowGroupFilter, ScanOrder, bounds_eliminate, row_group_eliminated, row_group_filter_from,
-    scan_order_from,
+    RowGroupFilter, ScanOrder, bounds_eliminate, bounds_exclude, nan_satisfies,
+    row_group_eliminated, row_group_filter_from, scan_order_from,
 };
 
 pub mod thrift;
@@ -73,7 +76,7 @@ pub use types::leaves::{
     ShreddedScalarPath, first_leaf, leaf_count, leaf_fields, variant_shredded_leaves,
     variant_value_leaf_is_semantically_null,
 };
-pub use types::metadata::{ColumnStatistics, RowGroupMetadata};
+pub use types::metadata::{ColumnStatistics, RowGroupMetadata, with_nan_free_columns};
 pub use types::page::{CompressedPage, DecompressedPage};
 pub use types::requests::{RowGroupBuffer, RowGroupRequest};
 pub use types::table::{

@@ -7,8 +7,12 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar};
-use arrow_schema::ArrowError;
+use arrow_arith::boolean::{and, or};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, Float64Type};
+use arrow_array::{Array, ArrayRef, BooleanArray, Datum, Scalar};
+use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq};
+use arrow_schema::{ArrowError, DataType};
 
 use planner::catalog::DynamicScanPredicate;
 use planner::expression::CompareType;
@@ -101,57 +105,174 @@ pub fn row_group_eliminated(
     let (Some(min), Some(max)) = (stats.min(), stats.max()) else {
         return Ok(false);
     };
-    bounds_eliminate(&min, &max, compare_type, constant)
+    bounds_eliminate(
+        &min,
+        &max,
+        stats.nan_count != Some(0),
+        compare_type,
+        constant,
+    )
 }
 
-/// Returns whether the inclusive range `[min, max]` proves that
-/// `col <compare_type> constant` matches no value in it. Shared by row-group
-/// elimination and file-level table-format
-/// stats pruning, so both reason about bounds identically. `min`/`max` are
-/// single-value scalars typed as the physical column.
+/// Whether `[min, max]` proves `col <compare_type> constant` false for every
+/// row. `min` and `max` are single-value scalars in the column's physical
+/// type. Statistics leave NaN out of the bounds, so `may_hold_nan` says
+/// whether the rows may hold one anyway, as a float column with no NaN count
+/// may. Such a range is never proven false where a NaN would match.
 pub fn bounds_eliminate(
     min: &Scalar<ArrayRef>,
     max: &Scalar<ArrayRef>,
+    may_hold_nan: bool,
     compare_type: CompareType,
     constant: &Scalar<ArrayRef>,
 ) -> Result<bool, ArrowError> {
-    // Stats come back typed as the physical parquet column (e.g. a DATE stored
-    // as UInt16), while the constant carries the logical type (e.g. Date32).
-    // The comparison kernels need matching types, so when they differ we can't
-    // prune — keep the range (always safe, just no pruning).
-    if min.get().0.data_type() != constant.get().0.data_type() {
+    if may_hold_nan && nan_satisfies(compare_type, constant) {
         return Ok(false);
     }
-
-    Ok(match compare_type {
-        // `col <> k` is true on every row unless every row equals `k` —
-        // provable only when min == max == k.
-        CompareType::NotEqual => {
-            bool_kernel(min, constant, arrow_ord::cmp::eq)?
-                && bool_kernel(max, constant, arrow_ord::cmp::eq)?
-        }
-        // `col = k` can never match when k is strictly outside [min, max].
-        CompareType::Equal => {
-            bool_kernel(constant, min, arrow_ord::cmp::lt)?
-                || bool_kernel(constant, max, arrow_ord::cmp::gt)?
-        }
-        // `col < k` matches nothing when every value is >= k, i.e. min >= k.
-        CompareType::Less => bool_kernel(min, constant, arrow_ord::cmp::gt_eq)?,
-        // `col > k` matches nothing when every value is <= k, i.e. max <= k.
-        CompareType::Greater => bool_kernel(max, constant, arrow_ord::cmp::lt_eq)?,
-        // `col <= k` matches nothing when every value is > k, i.e. min > k.
-        CompareType::LessEqual => bool_kernel(min, constant, arrow_ord::cmp::gt)?,
-        // `col >= k` matches nothing when every value is < k, i.e. max < k.
-        CompareType::GreaterEqual => bool_kernel(max, constant, arrow_ord::cmp::lt)?,
-    })
+    let excluded = bounds_exclude(min, max, compare_type, constant)?;
+    Ok(excluded.is_some_and(|mask| mask.len() == 1 && mask.is_valid(0) && mask.value(0)))
 }
 
-/// Run an Arrow comparison kernel on two scalars and read its single boolean.
-fn bool_kernel(
-    a: &Scalar<ArrayRef>,
-    b: &Scalar<ArrayRef>,
-    kernel: fn(&dyn Datum, &dyn Datum) -> Result<BooleanArray, ArrowError>,
-) -> Result<bool, ArrowError> {
-    let result = kernel(a as &dyn Datum, b as &dyn Datum)?;
-    Ok(result.len() == 1 && result.value(0))
+/// Whether a NaN matches `col <compare_type> constant`. NaN sorts above every
+/// value: greater than any constant, equal only to NaN, less than none.
+pub fn nan_satisfies(compare_type: CompareType, constant: &Scalar<ArrayRef>) -> bool {
+    let (constant, _) = constant.get();
+    let floating = matches!(constant.data_type(), DataType::Float32 | DataType::Float64);
+    floating
+        && match compare_type {
+            CompareType::Greater | CompareType::GreaterEqual | CompareType::NotEqual => true,
+            CompareType::Equal => constant.is_valid(0) && is_nan(constant),
+            CompareType::Less | CompareType::LessEqual => false,
+        }
+}
+
+/// Whether the one value of `constant`, a floating-point array, is NaN.
+fn is_nan(constant: &dyn Array) -> bool {
+    match constant.data_type() {
+        DataType::Float32 => constant.as_primitive::<Float32Type>().value(0).is_nan(),
+        DataType::Float64 => constant.as_primitive::<Float64Type>().value(0).is_nan(),
+        _ => false,
+    }
+}
+
+/// Which of the inclusive ranges `[min[i], max[i]]` prove that
+/// `col <compare_type> constant` matches no value in them: a mask that is
+/// `true` at every range that excludes the comparison. A null mask element is
+/// a range with no bound, which proves nothing; read the mask as excluded only
+/// where it is valid and true. `min` and `max` are same-typed arrays with one
+/// range per element (a null in one is a null in the other), or one-element
+/// scalars for a single range. `None` when the bounds are not of the
+/// constant's type, in which case nothing is proved either: statistics come
+/// typed as the physical column (a DATE stored as UInt16), while the constant
+/// carries the logical type (Date32), and the kernels need them to match.
+/// Shared by row-group elimination and file-level table-format stats pruning,
+/// so both reason about bounds identically, and a table format's files are
+/// pruned in one comparison over all of them.
+pub fn bounds_exclude(
+    min: &dyn Datum,
+    max: &dyn Datum,
+    compare_type: CompareType,
+    constant: &Scalar<ArrayRef>,
+) -> Result<Option<BooleanArray>, ArrowError> {
+    if min.get().0.data_type() != constant.get().0.data_type() {
+        return Ok(None);
+    }
+    let mask = match compare_type {
+        // `col <> k` is true on every row unless every row equals `k`,
+        // provable only when min == max == k.
+        CompareType::NotEqual => and(&eq(min, constant)?, &eq(max, constant)?)?,
+        // `col = k` can never match when k is strictly outside [min, max].
+        CompareType::Equal => or(&lt(constant, min)?, &gt(constant, max)?)?,
+        // `col < k` matches nothing when every value is >= k, i.e. min >= k.
+        CompareType::Less => gt_eq(min, constant)?,
+        // `col > k` matches nothing when every value is <= k, i.e. max <= k.
+        CompareType::Greater => lt_eq(max, constant)?,
+        // `col <= k` matches nothing when every value is > k, i.e. min > k.
+        CompareType::LessEqual => gt(min, constant)?,
+        // `col >= k` matches nothing when every value is < k, i.e. max < k.
+        CompareType::GreaterEqual => lt(max, constant)?,
+    };
+    Ok(Some(mask))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{Float64Array, Int64Array};
+
+    use super::*;
+
+    fn constant(value: i64) -> Scalar<ArrayRef> {
+        Scalar::new(Arc::new(Int64Array::from(vec![value])) as ArrayRef)
+    }
+
+    /// The ranges `[1, 3]`, `[5, 7]`, `[9, 11]` and one with no bound, and
+    /// which of them `compare` against `value` excludes.
+    fn excluded(compare: CompareType, value: i64) -> Vec<bool> {
+        let min = Int64Array::from(vec![Some(1), Some(5), Some(9), None]);
+        let max = Int64Array::from(vec![Some(3), Some(7), Some(11), None]);
+        let mask = bounds_exclude(&min, &max, compare, &constant(value))
+            .unwrap()
+            .expect("same-typed bounds are compared");
+        (0..mask.len())
+            .map(|range| mask.is_valid(range) && mask.value(range))
+            .collect()
+    }
+
+    #[test]
+    fn every_range_is_judged_in_one_comparison() {
+        assert_eq!(excluded(CompareType::Equal, 6), [true, false, true, false]);
+        assert_eq!(
+            excluded(CompareType::NotEqual, 6),
+            [false, false, false, false]
+        );
+        assert_eq!(excluded(CompareType::Less, 5), [false, true, true, false]);
+        assert_eq!(
+            excluded(CompareType::Greater, 7),
+            [true, true, false, false]
+        );
+        assert_eq!(
+            excluded(CompareType::LessEqual, 4),
+            [false, true, true, false]
+        );
+        assert_eq!(
+            excluded(CompareType::GreaterEqual, 8),
+            [true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn a_range_that_may_hold_a_nan_satisfies_what_a_nan_does() {
+        let one: Scalar<ArrayRef> = Scalar::new(Arc::new(Float64Array::from(vec![1.0])));
+        let two: Scalar<ArrayRef> = Scalar::new(Arc::new(Float64Array::from(vec![2.0])));
+        let nan: Scalar<ArrayRef> = Scalar::new(Arc::new(Float64Array::from(vec![f64::NAN])));
+        let may_hold_nan = true;
+
+        // NaN is greater than 2 and not equal to 1, equals only NaN, and is
+        // less than nothing.
+        assert!(!bounds_eliminate(&one, &one, may_hold_nan, CompareType::Greater, &two).unwrap());
+        assert!(!bounds_eliminate(&one, &one, may_hold_nan, CompareType::NotEqual, &one).unwrap());
+        assert!(!bounds_eliminate(&one, &one, may_hold_nan, CompareType::Equal, &nan).unwrap());
+        assert!(bounds_eliminate(&one, &one, may_hold_nan, CompareType::Equal, &two).unwrap());
+        assert!(bounds_eliminate(&two, &two, may_hold_nan, CompareType::Less, &one).unwrap());
+    }
+
+    #[test]
+    fn a_range_proven_free_of_nan_prunes_by_its_bounds_alone() {
+        let one: Scalar<ArrayRef> = Scalar::new(Arc::new(Float64Array::from(vec![1.0])));
+        let two: Scalar<ArrayRef> = Scalar::new(Arc::new(Float64Array::from(vec![2.0])));
+        let may_hold_nan = false;
+
+        assert!(bounds_eliminate(&one, &one, may_hold_nan, CompareType::Greater, &two).unwrap());
+        assert!(bounds_eliminate(&one, &one, may_hold_nan, CompareType::NotEqual, &one).unwrap());
+    }
+
+    #[test]
+    fn bounds_of_another_type_prove_nothing() {
+        let min = arrow_array::Int32Array::from(vec![1]);
+        let max = arrow_array::Int32Array::from(vec![3]);
+
+        let mask = bounds_exclude(&min, &max, CompareType::Equal, &constant(6)).unwrap();
+
+        assert!(mask.is_none());
+    }
 }
