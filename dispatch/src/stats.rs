@@ -163,6 +163,28 @@ impl StatsCollector {
         }
     }
 
+    pub(crate) fn record_whole_read(
+        &mut self,
+        request: DataFlowRequest<crate::io::whole_file::WholeReadStats>,
+    ) {
+        let local = request.request.disk_requests > 0;
+        let cached = request.request.remote.disk_cache_requests > 0;
+        self.record_issued_remote(request.request.remote);
+        if let Some(stats) = &mut self.stats {
+            stats.disk_requests += request.request.disk_requests;
+            stats.disk_bytes += request.request.disk_bytes;
+            if let Some(started) = request.submitted_at {
+                if local {
+                    stats.disk_read_time += started.elapsed();
+                } else if cached {
+                    stats.disk_cache_time += started.elapsed();
+                } else {
+                    stats.http_get_time += started.elapsed();
+                }
+            }
+        }
+    }
+
     /// Bill a completed remote read's in-flight time, each piece's wait charged to
     /// the tier that served it (see [`RemoteReadTime`]).
     pub fn record_http_get_time(&mut self, time: RemoteReadTime) {

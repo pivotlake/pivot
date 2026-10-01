@@ -50,7 +50,8 @@ pub use operator::{
     ReadResponse,
 };
 
-mod cached_http;
+mod cached_io;
+pub(crate) mod whole_file;
 
 pub mod disk_cache;
 pub use disk_cache::{DiskCache, clear_disk_cache};
@@ -170,6 +171,7 @@ pub type AuthHeader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
 ///
 /// The fields are pre-parsed from the URL at [`open`](Self::open) so the request
 /// hot path never re-parses it; the `Url` itself isn't kept.
+#[derive(Clone)]
 pub struct RemoteFile {
     /// `IP:port`, resolved once at construction (the port lives here too).
     addr: SocketAddr,
@@ -198,9 +200,9 @@ pub struct RemoteFile {
     /// two endpoints that share a host but differ by port (e.g. two MinIO
     /// instances) on separate cache files.
     cache_identity: String,
-    /// Total object size in bytes (from the store listing). Lets the disk cache
-    /// size its resident-block bitmap exactly, up front.
-    size: u64,
+    /// Total length, supplied by the caller or discovered from a whole GET.
+    /// None is valid only for a whole-object request.
+    size: Option<u64>,
 }
 
 impl RemoteFile {
@@ -211,6 +213,19 @@ impl RemoteFile {
     /// length (from the store listing), carried so the disk cache can size its
     /// bitmap exactly.
     pub fn open(url: Url, auth: Option<AuthHeader>, size: u64) -> std::io::Result<Self> {
+        Self::open_with_size(url, auth, Some(size))
+    }
+
+    /// Open an immutable object whose length will be learned from a whole GET.
+    pub fn open_whole(url: Url, auth: Option<AuthHeader>) -> std::io::Result<Self> {
+        Self::open_with_size(url, auth, None)
+    }
+
+    fn open_with_size(
+        url: Url,
+        auth: Option<AuthHeader>,
+        size: Option<u64>,
+    ) -> std::io::Result<Self> {
         let host = url
             .host_str()
             .ok_or_else(|| {
@@ -279,8 +294,19 @@ impl RemoteFile {
     }
 
     /// Total object size in bytes.
+    ///
+    /// Panics for an unresolved [`open_whole`](Self::open_whole) handle. A whole
+    /// read's response carries a handle with its discovered length installed.
     pub fn size(&self) -> u64 {
         self.size
+            .expect("range reads require a known object length")
+    }
+
+    pub(crate) fn with_size(&self, size: u64) -> Self {
+        Self {
+            size: Some(size),
+            ..self.clone()
+        }
     }
 
     /// Stable identity (authority + path, no query) for keying the on-disk cache.
@@ -516,6 +542,7 @@ pub enum Completion {
     FsWrite(DataFlowRequest<FsWriteRequest>),
     HttpGet(DataFlowRequest<HttpGetRequest>, RemoteReadTime),
     HttpUpload(DataFlowRequest<HttpUploadRequest>),
+    WholeFile(DataFlowRequest<whole_file::WholeReadStats>),
 }
 
 /// An operation that failed transport-side — an HTTP operation that exhausted

@@ -12,7 +12,7 @@ use iceberg::spec::{
     PrimitiveLiteral, SchemaRef, Transform,
 };
 use iceberg::table::Table;
-use object_storage::{ExternalStoreFactory, load_objects};
+use object_storage::{ExternalStoreFactory, load_objects, load_whole_objects};
 use parquet_engine::{ParquetTable, RowGroupMetadata, TableColumns};
 use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 
@@ -75,15 +75,13 @@ impl TableFile {
 
 impl LoadedTable {
     /// Load `table` as the catalog last returned it: its current snapshot's
-    /// manifest list (of `manifest_list_size` bytes, learned when the table
-    /// was indexed), the manifests it names, and the footer of every live data
+    /// manifest list, the manifests it names, and the footer of every live data
     /// file, each read through `store`, the table's store as opened when it
     /// was indexed.
     pub(crate) fn load(
         name: &SchemaQualifiedTableName,
         table: &Table,
         store: &TableStore,
-        manifest_list_size: Option<u64>,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<Self> {
         let table_name = name.to_string();
@@ -119,13 +117,9 @@ impl LoadedTable {
         let started = Instant::now();
         let manifests = match metadata.current_snapshot() {
             Some(snapshot) => {
-                let size = manifest_list_size.expect(
-                    "a table with a current snapshot is indexed with its manifest list's size",
-                );
                 let list = load_manifest_list(
                     &table_name,
                     snapshot.manifest_list(),
-                    size,
                     metadata.format_version(),
                     store,
                     dispatcher,
@@ -285,41 +279,17 @@ pub(crate) fn open_table_store(
     TableStore::open(&table_name, metadata_location, store_factory, vended)
 }
 
-/// The size of `table`'s current manifest list, or `None` when the table has
-/// no current snapshot. The snapshot names its manifest list without a
-/// length, and a ring read needs one, so the store is asked once, when the
-/// table is indexed, rather than on every query over it.
-pub(crate) fn fetch_manifest_list_size(
-    name: &SchemaQualifiedTableName,
-    table: &Table,
-    store: &TableStore,
-) -> Result<Option<u64>> {
-    let Some(snapshot) = table.metadata().current_snapshot() else {
-        return Ok(None);
-    };
-    let path = snapshot.manifest_list();
-    let size = store
-        .object_size(path)?
-        .ok_or_else(|| Error::MissingMetadataObject {
-            table: name.to_string(),
-            path: path.to_string(),
-        })?;
-    Ok(Some(size))
-}
-
-/// The snapshot's manifest list at `path`, of `size` bytes, read through the
-/// ring and parsed.
+/// Read and parse the snapshot's manifest list through the shared I/O layer.
 fn load_manifest_list(
     table: &str,
     path: &str,
-    size: u64,
     format_version: FormatVersion,
     store: &TableStore,
     dispatcher: &DataFlowDispatcher,
 ) -> Result<ManifestList> {
-    let bytes = load_objects(dispatcher, &[store.data_file(path, size)?])?
+    let bytes = load_whole_objects(dispatcher, &[store.object_source(path)?])?
         .pop()
-        .expect("load_objects returns one object per file")
+        .expect("whole-object loader returns one object per source")
         .bytes;
     let list = ManifestList::parse_with_version(&bytes, format_version).map_err(|source| {
         Error::MalformedMetadataObject {

@@ -485,6 +485,8 @@ pub struct CompressedCache {
     ///   bar.parquet ─── block 12 → Extent { slot 7, slot block 200, 1 block  }
     /// ```
     file_maps: RwLock<HashMap<OpenFile, RwLock<BTreeMap<usize, Extent>>>>,
+    /// Exact lengths learned from successfully completed whole-object reads.
+    whole_lengths: RwLock<HashMap<OpenFile, usize>>,
     /// Per-slot metadata, indexed by ring slot. `UnsafeCell` because `tenants` is
     /// mutated through a shared `&self` under the pin/exclusivity discipline.
     slot_metadatas: Box<[UnsafeCell<SlotMetadata>]>,
@@ -497,6 +499,7 @@ impl CompressedCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             file_maps: Default::default(),
+            whole_lengths: Default::default(),
             slot_metadatas: (0..capacity)
                 .map(|_| {
                     UnsafeCell::new(SlotMetadata {
@@ -507,6 +510,36 @@ impl CompressedCache {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }
+    }
+
+    /// Remember a completed immutable object, independently from which of its
+    /// blocks remain resident. Evicting its final extent forgets this length.
+    pub(crate) fn mark_whole(&self, file: OpenFile, length: usize) {
+        let files = self.file_maps.read().unwrap();
+        if let Some(extents) = files.get(&file)
+            && !extents.read().unwrap().is_empty()
+        {
+            self.whole_lengths.write().unwrap().insert(file, length);
+        }
+    }
+
+    pub(crate) fn read_whole(&self, file: &OpenFile) -> Option<Vec<u8>> {
+        let length = *self.whole_lengths.read().unwrap().get(file)?;
+        let mut bytes = Vec::new();
+        if length == 0 {
+            return Some(bytes);
+        }
+        let last = (length - 1) / BLOCK_SIZE;
+        let mut block = 0;
+        while block <= last {
+            let step = self.try_resolve_lookup_for_location(file, block, last, 0, length)?;
+            if step.lookup.missing().is_some() {
+                return None;
+            }
+            block = step.next_file_block;
+            bytes.extend_from_slice(&step.lookup.into_data());
+        }
+        Some(bytes)
     }
 
     /// Look up the file byte range `[offset, offset + len)` of `open_file`. The
@@ -918,6 +951,7 @@ impl CompressedCache {
                 && extents_lock.read().unwrap().is_empty()
             {
                 file_maps.remove(&open_file);
+                self.whole_lengths.write().unwrap().remove(&open_file);
             }
         }
     }
@@ -964,6 +998,7 @@ impl CompressedCache {
         // Release this worker's fill pin first, so its own fill slot is recyclable
         // below rather than skipped as pinned.
         memory_ctx().compressed_fill_cursor().buffer = None;
+        self.whole_lengths.write().unwrap().clear();
 
         // Drain every file's extents, collecting the slots they lived in.
         let mut slots = HashSet::new();

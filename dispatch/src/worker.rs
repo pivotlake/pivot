@@ -326,6 +326,11 @@ impl Worker {
                         data_flow.stats().record_http_get_time(time);
                     }
                 }
+                Ok(Completion::WholeFile(request)) => {
+                    if let Some(data_flow) = self.data_flows.get_mut(&request.data_flow_id) {
+                        data_flow.stats().record_whole_read(request);
+                    }
+                }
                 Ok(Completion::HttpUpload(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_http_upload_time(r.submitted_at);

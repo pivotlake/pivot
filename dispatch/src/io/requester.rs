@@ -1,6 +1,6 @@
 use crate::Identifier;
 use crate::io::backend::IOBackend;
-use crate::io::cached_http::CachedHttpEngine;
+use crate::io::cached_io::CachedIOEngine;
 use crate::io::disk_cache::DiskCache;
 use crate::io::hardware_queues::{InFlightPermit, WorkerHardwareQueues};
 use crate::io::{
@@ -83,7 +83,7 @@ pub struct IORequester {
     next_id: Identifier,
     /// Remote reads, optionally served from the on-disk cache. Ring-less like the
     /// underlying `HttpEngine`: it borrows `backend` (and `next_id`) to submit.
-    http: CachedHttpEngine,
+    cached_io: CachedIOEngine,
 }
 
 impl Default for IORequester {
@@ -103,7 +103,7 @@ impl IORequester {
             fs_queues: WorkerHardwareQueues::new(),
             piggybacked_reads: Vec::new(),
             next_id: 0,
-            http: CachedHttpEngine::with_default_config(disk_cache)
+            cached_io: CachedIOEngine::with_default_config(disk_cache)
                 .expect("Unable to create http engine"),
         }
     }
@@ -122,7 +122,7 @@ impl IORequester {
             fs_queues: WorkerHardwareQueues::new(),
             piggybacked_reads: Vec::new(),
             next_id: 0,
-            http: CachedHttpEngine::new(http_config, disk_cache)
+            cached_io: CachedIOEngine::new(http_config, disk_cache)
                 .expect("Unable to create http engine"),
         }
     }
@@ -190,6 +190,24 @@ impl IORequester {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn request_whole(
+        &mut self,
+        data_flow_id: Identifier,
+        operator_idx: Identifier,
+        id: super::ReadRequestId,
+        file: OpenFile,
+        stats: &mut StatsCollector,
+    ) -> Result<()> {
+        let mut request = DataFlowRequest::new(
+            data_flow_id,
+            operator_idx,
+            super::whole_file::WholeRequest { id, file },
+        );
+        stats.stamp_issued(std::slice::from_mut(&mut request));
+        self.cached_io
+            .read_whole(&mut self.backend, &mut self.next_id, request)
     }
 
     /// Undo the bookkeeping `register_read` created for a read that will never
@@ -269,7 +287,9 @@ impl IORequester {
     }
 
     pub(crate) fn take_ready_reads(&mut self) -> Vec<RoutedReadResponse> {
-        self.tracker.take_ready()
+        let mut ready = self.tracker.take_ready();
+        ready.extend(self.cached_io.take_whole_responses());
+        ready
     }
 
     /// Discard logical read state for a dataflow that is no longer running.
@@ -399,7 +419,7 @@ impl IORequester {
 
     /// Submit a read for a remote region, served from the on-disk cache where
     /// possible (only the missing ranges hit the network). Delegates to the
-    /// [`CachedHttpEngine`], lending it the shared backend and disk-id counter.
+    /// [`CachedIOEngine`], lending it the shared backend and disk-id counter.
     /// A failure withdraws the request's read registration before the error
     /// is returned, so the caller has nothing left to clean up for it.
     fn submit_http_request_to_backend(
@@ -415,7 +435,7 @@ impl IORequester {
             submitted_at,
         } = request;
         let result = match request {
-            HttpRequest::Get(request) => self.http.get(
+            HttpRequest::Get(request) => self.cached_io.get(
                 &mut self.backend,
                 &mut self.next_id,
                 DataFlowRequest {
@@ -428,7 +448,7 @@ impl IORequester {
             ),
             HttpRequest::Upload(request) => {
                 let bytes = request.data.len() as u64;
-                self.http
+                self.cached_io
                     .upload(
                         &mut self.backend,
                         DataFlowRequest {
@@ -472,18 +492,18 @@ impl IORequester {
     pub fn has_file_pending(&self) -> bool {
         !self.pending_io_requests.is_empty()
             || !self.fs_backlog.is_empty()
-            || self.http.has_disk_pending()
+            || self.cached_io.has_disk_pending()
     }
 
     /// Returns `true` if any HTTP operation is in flight.
     pub fn has_http_pending(&self) -> bool {
-        self.http.has_network_pending()
+        self.cached_io.has_network_pending()
     }
 
     /// Number of HTTP operations issued but not yet completed — the depth a
     /// worker uses to decide whether to submit more.
     pub fn http_in_flight(&self) -> usize {
-        self.http.network_in_flight()
+        self.cached_io.network_in_flight()
     }
 
     /// Resolve reads following another fill of their extent. A successful fill
@@ -526,7 +546,7 @@ impl IORequester {
     /// the worker cancels just the owning dataflow.
     ///
     /// The single per-core ring carries everything: this requester's fs reads,
-    /// the [`CachedHttpEngine`]'s cache-file reads / write-backs, and its HTTP
+    /// the [`CachedIOEngine`]'s cache-file reads / write-backs, and its HTTP
     /// sockets. We drain it once and route each completion to its owner.
     pub fn completions(&mut self) -> Result<Vec<std::result::Result<Completion, FailedIO>>> {
         let raw = self.backend.completions()?;
@@ -537,7 +557,7 @@ impl IORequester {
         #[cfg(target_os = "linux")]
         for &(result, ud) in &raw {
             if (ud as u64) & HTTP_TAG != 0 {
-                self.http
+                self.cached_io
                     .on_socket_completion(&mut self.backend, ud as u64, result)?;
             }
         }
@@ -679,7 +699,13 @@ impl IORequester {
                 }
             } else {
                 // Not one of ours → a cache-file read or write-back.
-                self.http.complete_disk(ud, result, &mut out);
+                self.cached_io.complete_disk(
+                    &mut self.backend,
+                    &mut self.next_id,
+                    ud,
+                    result,
+                    &mut out,
+                )?;
             }
         }
 
@@ -690,7 +716,7 @@ impl IORequester {
         self.drain_fs_backlog()?;
 
         // HTTP reads the engine finished this pass (and any write-backs they queue).
-        self.http
+        self.cached_io
             .drain(&mut self.backend, &mut self.next_id, &mut out)?;
 
         // Reads waiting on fills the ring did not carry for this requester.
@@ -712,7 +738,9 @@ impl IORequester {
                         self.tracker.complete(id);
                     }
                 }
-                Ok(Completion::FsWrite(_) | Completion::HttpUpload(_)) => {}
+                Ok(
+                    Completion::FsWrite(_) | Completion::HttpUpload(_) | Completion::WholeFile(_),
+                ) => {}
                 Err(failed) => {
                     if let Some(id) = failed.tracked_read_id {
                         let _ = self.tracker.fail(id);
@@ -739,14 +767,14 @@ impl IORequester {
     pub fn wait(&mut self) -> Result<()> {
         // Flush any staged disk ops so they are in flight before we park.
         self.backend.submit()?;
-        if self.backend.has_ready_completion() || self.http.has_ready_completion() {
+        if self.backend.has_ready_completion() || self.cached_io.has_ready_completion() {
             return Ok(());
         }
         // Park until either channel has a completion, without consuming it
         // (completions() drains both).
         let mut select = crossbeam_channel::Select::new();
         select.recv(self.backend.completion_receiver());
-        select.recv(self.http.completion_receiver());
+        select.recv(self.cached_io.completion_receiver());
         select.ready();
         Ok(())
     }
@@ -857,7 +885,7 @@ mod tests {
         }
     }
 
-    fn client_config() -> Arc<rustls::ClientConfig> {
+    pub(super) fn client_config() -> Arc<rustls::ClientConfig> {
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -1120,7 +1148,7 @@ mod tests {
     }
 
     /// A self-signed TLS server config for the loopback test server.
-    fn server_tls_config() -> Arc<rustls::ServerConfig> {
+    pub(super) fn server_tls_config() -> Arc<rustls::ServerConfig> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = cert.cert.der().clone();
         let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
@@ -1345,7 +1373,7 @@ mod tests {
     }
 
     /// Read a request head (up to and including the blank-line terminator).
-    fn read_head<R: Read>(r: &mut R) -> Vec<u8> {
+    pub(super) fn read_head<R: Read>(r: &mut R) -> Vec<u8> {
         let mut buf = Vec::new();
         let mut byte = [0u8; 1];
         loop {
@@ -1963,3 +1991,7 @@ mod tests {
         assert_cached(&loc, 0, 4096);
     }
 }
+
+#[cfg(test)]
+#[path = "whole_file_tests.rs"]
+mod whole_file_tests;

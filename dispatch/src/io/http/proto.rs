@@ -1,9 +1,10 @@
-//! Object-store range-read **policy** over the sans-IO HTTP/1.1 helpers
+//! Object-store request policy over the sans-IO HTTP/1.1 helpers
 //! ([`super::http1`]).
 //!
 //! `http1` parses a response head and tracks an identity body; this layer adds
-//! the range-read policy on top: build the `Range` GET, and accept only a `206
-//! Partial Content` response whose `Content-Length` body fits the requested slot.
+//! status and framing policies: range GETs require a `206 Partial Content`
+//! response of the requested length; whole GETs require `200 OK` and learn the
+//! length from the same response. Both require a Content-Length-framed body.
 //! Keeping the policy here (rather than in `http1`) means both platform backends
 //! share identical, socket-free, unit-testable logic.
 
@@ -22,6 +23,10 @@ pub enum ProtoError {
     BodyLengthMismatch { got: u64, want: usize },
     #[error("unexpected upload status {0} (expected a 2xx response)")]
     UnexpectedUploadStatus(u16),
+    #[error("unexpected whole-object HTTP status {0} (expected 200 OK)")]
+    UnexpectedWholeStatus(u16),
+    #[error("whole-object reads require identity encoding and Content-Length")]
+    UnsupportedWholeFraming,
 }
 
 /// Build a whole-object upload request. Always a `PUT` (the only upload method
@@ -56,11 +61,25 @@ pub fn build_range_get(
     auth: Option<&str>,
 ) -> Vec<u8> {
     let end = offset + len as u64 - 1;
+    build_get(
+        host,
+        target,
+        &format!("Range: bytes={offset}-{end}\r\n"),
+        auth,
+    )
+}
+
+/// Build a full GET without a Range header. Length is learned from its response.
+pub fn build_whole_get(host: &str, target: &str, auth: Option<&str>) -> Vec<u8> {
+    build_get(host, target, "", auth)
+}
+
+fn build_get(host: &str, target: &str, range: &str, auth: Option<&str>) -> Vec<u8> {
     let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
     format!(
         "GET {target} HTTP/1.1\r\n\
          Host: {host}\r\n\
-         Range: bytes={offset}-{end}\r\n\
+         {range}\
          {auth}\
          Accept-Encoding: identity\r\n\
          Connection: keep-alive\r\n\
@@ -70,7 +89,28 @@ pub fn build_range_get(
     .into_bytes()
 }
 
-/// A parsed (and validated `206`) response head.
+pub fn parse_whole_response_head(buf: &[u8]) -> Result<HeadParse, ProtoError> {
+    let head = match http1::parse_response_head(buf)? {
+        http1::HeadStatus::Incomplete => return Ok(HeadParse::Incomplete),
+        http1::HeadStatus::Complete(head) => head,
+    };
+    if head.status != 200 {
+        return Err(ProtoError::UnexpectedWholeStatus(head.status));
+    }
+    if head.transfer_encoding || head.encoded {
+        return Err(ProtoError::UnsupportedWholeFraming);
+    }
+    let content_length = head
+        .content_length
+        .ok_or(ProtoError::UnsupportedWholeFraming)?;
+    Ok(HeadParse::Complete(ResponseHead {
+        head_len: head.head_len,
+        content_length,
+        reuse_connection: true,
+    }))
+}
+
+/// A response head validated against the operation's status and framing policy.
 #[derive(Debug, Clone, Copy)]
 pub struct ResponseHead {
     /// Length of the header section, including the terminating `\r\n\r\n`. The
@@ -251,6 +291,41 @@ mod tests {
                 got: 2048,
                 want: 4096
             })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod whole_tests {
+    use super::*;
+
+    #[test]
+    fn full_get_has_no_range_and_keeps_authorization() {
+        let request = build_whole_get("example.com", "/metadata", Some("Bearer token"));
+
+        let request = String::from_utf8(request).unwrap();
+
+        assert!(request.starts_with("GET /metadata HTTP/1.1\r\n"));
+        assert!(request.contains("Authorization: Bearer token\r\n"));
+        assert!(!request.contains("Range:"));
+    }
+
+    #[test]
+    fn full_get_rejects_ambiguous_lengths_and_oversized_headers() {
+        let duplicate = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 6\r\n\r\n";
+        let mut oversized = b"HTTP/1.1 200 OK\r\nUnknown: ".to_vec();
+        oversized.extend(vec![b'a'; 65_536]);
+
+        let duplicate_result = parse_whole_response_head(duplicate);
+        let oversized_result = parse_whole_response_head(&oversized);
+
+        assert!(matches!(
+            duplicate_result,
+            Err(ProtoError::Http1(http1::Http1Error::InvalidContentLength))
+        ));
+        assert!(matches!(
+            oversized_result,
+            Err(ProtoError::Http1(http1::Http1Error::HeadTooLarge))
         ));
     }
 }

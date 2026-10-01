@@ -28,6 +28,12 @@
 //! a filename collision between two distinct objects astronomically unlikely, so
 //! the name alone identifies the object - no on-disk identity check needed.
 //!
+//! A completed whole GET also publishes a `{hash}.whole` marker containing
+//! its exact byte length. The marker is installed only after all body bytes
+//! have been written and synced. It distinguishes a complete object, including
+//! an empty one or a partial final block, from a sparse prefix left by a range
+//! read or failed download. Eviction removes the marker with its data file.
+//!
 //! ## Validity
 //!
 //! Which 4 KB blocks are resident is tracked by an in-memory [`BlockBitmap`] per
@@ -63,7 +69,7 @@ use tracing::warn;
 
 /// Disk-cache block granularity - matches the compressed cache's `SUB_BLOCK_SIZE` and
 /// the direct-I/O alignment. Every cached range is a whole number of these.
-const BLOCK_SIZE: usize = 4096;
+pub(crate) const BLOCK_SIZE: usize = 4096;
 
 /// Hash an object identity to its 128-bit cache filename key: BLAKE3 truncated to
 /// its first 128 bits. BLAKE3 is a fixed, version- and platform-stable spec (so a
@@ -171,6 +177,9 @@ impl Object {
     pub fn split_into_segments(&self, file_offset: usize, len: usize) -> Vec<Segment> {
         debug_assert_eq!(file_offset % BLOCK_SIZE, 0);
         debug_assert_eq!(len % BLOCK_SIZE, 0);
+        if len == 0 {
+            return Vec::new();
+        }
         let present = &self.present;
         let first_block = file_offset / BLOCK_SIZE;
         let blocks = len / BLOCK_SIZE;
@@ -285,6 +294,15 @@ impl DiskCache {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(&self.dir)?.flatten() {
             let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "whole")
+            {
+                if !path.with_extension("").exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
             // Cache files are named `{key:032x}`; anything else isn't one of ours.
             let Some(key) = path
                 .file_name()
@@ -344,7 +362,9 @@ impl DiskCache {
 
         // Fast path: already cached - a read lock so concurrent hits don't
         // serialize.
-        if let Some(obj) = self.objects.read().unwrap().get(&key) {
+        if let Some(obj) = self.objects.read().unwrap().get(&key)
+            && obj.present.words.len() * 64 * BLOCK_SIZE >= remote.size() as usize
+        {
             obj.last_used.store(self.advance_tick(), Ordering::Relaxed);
             return Some(obj.clone());
         }
@@ -362,7 +382,9 @@ impl DiskCache {
 
         // Insert under the write lock, unless another worker beat us to it.
         let mut objects = self.objects.write().unwrap();
-        if let Some(existing) = objects.get(&key) {
+        if let Some(existing) = objects.get(&key)
+            && existing.present.words.len() * 64 * BLOCK_SIZE >= remote.size() as usize
+        {
             existing
                 .last_used
                 .store(self.advance_tick(), Ordering::Relaxed);
@@ -372,7 +394,11 @@ impl DiskCache {
         // stays accurate; `evict_locked` then trims only if a cap is exceeded.
         self.total_bytes
             .fetch_add(obj.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
-        objects.insert(key, obj.clone());
+        if let Some(previous) = objects.insert(key, obj.clone()) {
+            self.total_bytes
+                .fetch_sub(previous.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+            previous.evicted.store(true, Ordering::Release);
+        }
         evict_locked(
             &self.total_bytes,
             &self.needs_recompute,
@@ -381,6 +407,61 @@ impl DiskCache {
             &mut objects,
         );
         Some(obj)
+    }
+
+    /// Only a completed whole GET can establish the length for a future
+    /// unknown-length read. A sparse cache file's filesystem length cannot.
+    pub(crate) fn open_whole(&self, remote: &RemoteFile) -> Option<(Arc<Object>, u64)> {
+        let key = hash_identity(remote.cache_identity());
+        let marker = std::fs::read(self.dir.join(format!("{key:032x}.whole"))).ok()?;
+        if marker.len() != 16 || &marker[..8] != b"PIVWHOLE" {
+            return None;
+        }
+        let length = u64::from_le_bytes(marker[8..].try_into().ok()?);
+        let path = self.dir.join(format!("{key:032x}"));
+        if length > std::fs::metadata(path).ok()?.len() {
+            return None;
+        }
+        let object = self.open_object(&remote.with_size(length))?;
+        let rounded = usize::try_from(length)
+            .ok()?
+            .div_ceil(BLOCK_SIZE)
+            .checked_mul(BLOCK_SIZE)?;
+        if !object
+            .split_into_segments(0, rounded)
+            .iter()
+            .all(|segment| segment.present)
+        {
+            return None;
+        }
+        Some((object, length))
+    }
+
+    /// Publish only after every whole-object write-back completed. Syncing the
+    /// data before atomically installing the marker prevents a restart from
+    /// treating an incomplete sparse file as a complete object.
+    pub(crate) fn mark_whole(&self, object: &Object, length: u64) -> std::io::Result<()> {
+        if object.evicted.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        object.file.sync_data()?;
+        let target = object.path.with_extension("whole");
+        let temporary = object
+            .path
+            .with_extension(format!("whole-{:016x}", rand::random::<u64>()));
+        let mut bytes = b"PIVWHOLE".to_vec();
+        bytes.extend_from_slice(&length.to_le_bytes());
+        let result = (|| {
+            use std::io::Write;
+            let mut marker = File::create(&temporary)?;
+            marker.write_all(&bytes)?;
+            marker.sync_all()?;
+            std::fs::rename(&temporary, target)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temporary);
+        }
+        result
     }
 
     /// Fold a write-back's just-landed range into the cache: mark it resident on
@@ -426,6 +507,7 @@ impl DiskCache {
         for (_, obj) in objects.drain() {
             obj.evicted.store(true, Ordering::Release);
             let _ = std::fs::remove_file(&obj.path);
+            let _ = std::fs::remove_file(obj.path.with_extension("whole"));
         }
         self.total_bytes.store(0, Ordering::Relaxed);
         self.needs_recompute.store(true, Ordering::Relaxed);
@@ -495,6 +577,7 @@ fn evict_locked(
         obj.evicted.store(true, Ordering::Release);
         total_bytes.fetch_sub(obj.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
         let _ = std::fs::remove_file(&obj.path);
+        let _ = std::fs::remove_file(obj.path.with_extension("whole"));
     }
 }
 

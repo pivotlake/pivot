@@ -6,7 +6,9 @@
 //! reachable, like the other object-store tests.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_array::cast::AsArray;
@@ -57,8 +59,8 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The REST fixture, the writer's view of it, and the pool the reads run on.
-/// One per test binary: the fixture takes seconds to come up, and every test
-/// isolates itself in a namespace of its own.
+/// Shared by the test binary. Tests serialize because refreshes and system
+/// table listings observe every namespace, including those of other tests.
 struct Harness {
     _fixture: Container<GenericImage>,
     catalog_uri: String,
@@ -67,9 +69,32 @@ struct Harness {
     dispatch: Dispatch,
 }
 
-fn harness() -> Option<&'static Harness> {
-    static HARNESS: OnceLock<Option<Harness>> = OnceLock::new();
-    HARNESS.get_or_init(start).as_ref()
+/// Stop background refreshes when a test releases its catalog.
+struct TestCatalog(PivotCatalog);
+
+impl Deref for TestCatalog {
+    type Target = PivotCatalog;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TestCatalog {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn harness() -> Option<MutexGuard<'static, Harness>> {
+    static HARNESS: OnceLock<Option<Mutex<Harness>>> = OnceLock::new();
+    HARNESS
+        .get_or_init(|| start().map(Mutex::new))
+        .as_ref()
+        .map(|harness| {
+            harness
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
 }
 
 /// Bring the fixture up against the harness's MinIO, or `None` (with a note)
@@ -92,7 +117,9 @@ fn start() -> Option<Harness> {
 
     let fixture = GenericImage::new("apache/iceberg-rest-fixture", "1.9.1")
         .with_exposed_port(ContainerPort::Tcp(8181))
-        .with_wait_for(WaitFor::message_on_stdout("Started"))
+        .with_wait_for(WaitFor::message_on_stderr("Started Server@"))
+        // Every pooled JDBC connection must see the same database.
+        .with_env_var("CATALOG_URI", "jdbc:sqlite:/tmp/iceberg-catalog.db")
         .with_env_var("CATALOG_WAREHOUSE", WAREHOUSE)
         .with_env_var("CATALOG_IO__IMPL", "org.apache.iceberg.aws.s3.S3FileIO")
         .with_env_var(
@@ -104,13 +131,7 @@ fn start() -> Option<Harness> {
         .with_env_var("AWS_SECRET_ACCESS_KEY", &secret_key)
         .with_env_var("AWS_REGION", &region)
         .with_host("host.docker.internal", Host::HostGateway);
-    let fixture = match fixture.start() {
-        Ok(fixture) => fixture,
-        Err(error) => {
-            eprintln!("[rest_catalog] skipping: REST fixture unavailable: {error}");
-            return None;
-        }
-    };
+    let fixture = fixture.start().expect("start the Iceberg REST fixture");
     let port = fixture.get_host_port_ipv4(8181.tcp()).unwrap();
     let catalog_uri = format!("http://localhost:{port}");
     wait_for_catalog(&catalog_uri);
@@ -121,7 +142,7 @@ fn start() -> Option<Harness> {
         .build()
         .unwrap();
     let writer = runtime
-        .block_on(
+        .block_on(async {
             RestCatalogBuilder::default()
                 .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
                     customized_credential_load: None,
@@ -136,8 +157,9 @@ fn start() -> Option<Harness> {
                         ("s3.region".to_string(), region),
                         ("s3.path-style-access".to_string(), "true".to_string()),
                     ]),
-                ),
-        )
+                )
+                .await
+        })
         .expect("build the writer catalog");
     Some(Harness {
         _fixture: fixture,
@@ -224,6 +246,7 @@ impl Harness {
             .expect("the partition field is in the schema")
             .to_string();
         let spec = UnboundPartitionSpec::builder()
+            .with_spec_id(0)
             .add_partition_field(partition_field_id, field_name, Transform::Identity)
             .unwrap()
             .build();
@@ -300,8 +323,12 @@ impl Harness {
         partition_key: Option<PartitionKey>,
     ) -> Vec<DataFile> {
         let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
-        let file_name_generator =
-            DefaultFileNameGenerator::new("part".to_string(), None, DataFileFormat::Parquet);
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let file_name_generator = DefaultFileNameGenerator::new(
+            format!("part-{}", NEXT_FILE.fetch_add(1, Ordering::Relaxed)),
+            None,
+            DataFileFormat::Parquet,
+        );
         let parquet_writer = ParquetWriterBuilder::new(
             WriterProperties::default(),
             table.metadata().current_schema().clone(),
@@ -459,7 +486,7 @@ impl Harness {
 
     /// The Pivot side: a fresh datastore over the fixture, served as the
     /// default datastore of a one-datastore catalog, with a planner over it.
-    fn pivot(&self) -> (Arc<PivotCatalog>, Planner) {
+    fn pivot(&self) -> (Arc<TestCatalog>, Planner) {
         self.pivot_with(HashMap::new(), Arc::new(AmbientExternalStoreFactory))
     }
 
@@ -470,7 +497,7 @@ impl Harness {
         &self,
         properties: HashMap<String, String>,
         store_factory: Arc<dyn ExternalStoreFactory>,
-    ) -> (Arc<PivotCatalog>, Planner) {
+    ) -> (Arc<TestCatalog>, Planner) {
         let config = IcebergCatalogConfig {
             uri: self.catalog_uri.clone(),
             properties,
@@ -496,7 +523,7 @@ impl Harness {
         let planner =
             Planner::from_datastore_names(vec![DATASTORE.to_string()], DATASTORE.to_string())
                 .unwrap();
-        (Arc::new(catalog), planner)
+        (Arc::new(TestCatalog(catalog)), planner)
     }
 
     fn query(&self, catalog: &PivotCatalog, planner: &mut Planner, sql: &str) -> Vec<RecordBatch> {
@@ -879,10 +906,11 @@ fn a_column_with_an_initial_default_refuses_the_table_by_name() {
             ),
         ],
     );
-    let _namespace = harness.v3_namespace("defaults", "orders", scored);
+    let namespace = harness.v3_namespace("defaults", "orders", scored);
     let (catalog, mut planner) = harness.pivot();
 
     let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM defaults.orders");
+    harness.drop_table(&namespace, "orders");
 
     assert!(
         error.contains("score") && error.contains("initial default"),
@@ -966,10 +994,11 @@ fn a_column_pivot_cannot_represent_refuses_the_table_by_name() {
             field(2, "token", PrimitiveType::Uuid),
         ],
     );
-    let _namespace = harness.namespace("odd", "tokens", tokens);
+    let namespace = harness.namespace("odd", "tokens", tokens);
     let (catalog, mut planner) = harness.pivot();
 
     let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM odd.tokens");
+    harness.drop_table(&namespace, "tokens");
 
     assert!(error.contains("token") && error.contains("uuid"), "{error}");
 }
@@ -1062,7 +1091,7 @@ fn the_datastore_describes_its_tables_to_the_system_catalog() {
     assert!(
         orders.files[0]
             .min_max_stats
-            .contains(r#""id":{"min":"1","max":"3"}"#),
+            .contains(r#""id":{"min":1,"max":3}"#),
         "{}",
         orders.files[0].min_max_stats
     );
@@ -1151,7 +1180,7 @@ fn a_filter_prunes_across_several_files() {
     let above = harness.query(
         &catalog,
         &mut planner,
-        "SELECT count(*), sum(id) FROM multi.orders WHERE id > 2",
+        "SELECT count(*), CAST(sum(id) AS BIGINT) FROM multi.orders WHERE id > 2",
     );
     let middle = harness.query(
         &catalog,
@@ -1279,7 +1308,7 @@ fn a_compacted_table_reads_only_the_rewritten_file() {
     let after = harness.query(
         &catalog,
         &mut planner,
-        "SELECT count(*), sum(id) FROM compacted.orders",
+        "SELECT count(*), CAST(sum(id) AS BIGINT) FROM compacted.orders",
     );
 
     assert_eq!(before, 2);

@@ -1,4 +1,4 @@
-//! Sans-IO HTTP/1.1 response helpers for the object-store range-read path.
+//! Sans-IO HTTP/1.1 response helpers for object-store reads and uploads.
 //!
 //! The transport (io_uring on Linux, blocking `std::net` elsewhere) owns the
 //! socket and the buffers; this module just turns received bytes into a parsed
@@ -6,16 +6,9 @@
 //! lets both backends share one implementation and lets it be unit-tested
 //! without a socket.
 //!
-//! The scope is deliberately exactly what a `Range` GET into a fixed cache slot
-//! needs: parse the response head (status + `Content-Length`) and decode an
-//! identity body straight into the slot. There is no request encoding (the
-//! request is a fixed `Range` GET, formatted in [`super::proto`]), no
-//! chunked/close-delimited framing, and no general method/status handling.
-//!
-//! (An earlier revision generalised this into a full sans-IO core — the typed
-//! `http` model, chunked decoding, request encoding — but nothing on the range
-//! path used it, so it was trimmed back to the live surface. Re-introduce those
-//! pieces alongside the first non-range consumer that needs them.)
+//! Range and whole-object GETs use identity bodies framed by Content-Length.
+//! Request formatting and status/length policy live in [`super::proto`]; this
+//! module parses bounded response headers and counts body bytes.
 
 use thiserror::Error;
 
@@ -33,6 +26,8 @@ pub enum Http1Error {
     InvalidContentLength,
     #[error("body longer than declared Content-Length")]
     BodyOverflow,
+    #[error("HTTP response headers exceed 64 KiB")]
+    HeadTooLarge,
 }
 
 /// A parsed response head.
@@ -45,6 +40,8 @@ pub struct ParsedHead {
     pub status: u16,
     /// `Content-Length`, if the header was present (and a valid integer).
     pub content_length: Option<u64>,
+    pub transfer_encoding: bool,
+    pub encoded: bool,
 }
 
 /// Outcome of parsing a (possibly incomplete) response head.
@@ -61,10 +58,23 @@ pub fn parse_response_head(buf: &[u8]) -> Result<HeadStatus, Http1Error> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
     let head_len = match resp.parse(buf)? {
+        httparse::Status::Partial if buf.len() > 64 * 1024 => return Err(Http1Error::HeadTooLarge),
         httparse::Status::Partial => return Ok(HeadStatus::Incomplete),
         httparse::Status::Complete(n) => n,
     };
 
+    if head_len > 64 * 1024 {
+        return Err(Http1Error::HeadTooLarge);
+    }
+    if resp
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+        .count()
+        > 1
+    {
+        return Err(Http1Error::InvalidContentLength);
+    }
     let status = resp.code.ok_or(Http1Error::MissingStatus)?;
 
     let content_length = match resp
@@ -85,6 +95,14 @@ pub fn parse_response_head(buf: &[u8]) -> Result<HeadStatus, Http1Error> {
         head_len,
         status,
         content_length,
+        transfer_encoding: resp
+            .headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding")),
+        encoded: resp.headers.iter().any(|h| {
+            h.name.eq_ignore_ascii_case("content-encoding")
+                && !h.value.eq_ignore_ascii_case(b"identity")
+        }),
     }))
 }
 

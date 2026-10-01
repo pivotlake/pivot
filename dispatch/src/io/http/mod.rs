@@ -99,6 +99,7 @@ pub(crate) struct RemoteUpload {
 pub(crate) enum RemoteRequest {
     Read(RemoteRead),
     Upload(RemoteUpload),
+    Whole(Arc<RemoteFile>),
 }
 
 impl RemoteRequest {
@@ -106,6 +107,7 @@ impl RemoteRequest {
         match self {
             Self::Read(r) => &r.remote,
             Self::Upload(r) => &r.remote,
+            Self::Whole(remote) => remote,
         }
     }
 
@@ -118,6 +120,11 @@ impl RemoteRequest {
                 remote.request_target(),
                 read.offset,
                 read.len,
+                auth.as_deref(),
+            ),
+            Self::Whole(_) => proto::build_whole_get(
+                remote.host_header(),
+                remote.request_target(),
                 auth.as_deref(),
             ),
             Self::Upload(upload) => proto::build_upload(
@@ -133,3 +140,10 @@ impl RemoteRequest {
 // The read pointer has the safety argument above; uploads contain only Arc-owned
 // data and are Send without an unsafe implementation of their own.
 unsafe impl Send for RemoteRequest {}
+
+/// One bounded piece of a whole GET. The transport waits for acknowledgement
+/// before receiving another piece, so cache write-back provides backpressure.
+pub(crate) struct WholeChunk {
+    pub length: Option<u64>,
+    pub bytes: Vec<u8>,
+}

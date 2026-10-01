@@ -1,6 +1,6 @@
-//! HTTP(S) range reads backed by an optional on-disk cache.
+//! Cached remote ranges and bounded whole-file reads on the shared I/O backend.
 //!
-//! Every remote read becomes one [`RequestedRead`], satisfied by one or more
+//! Every remote range read becomes one [`RequestedRead`], satisfied by one or more
 //! pieces and completed once every piece has landed:
 //!
 //! * With a [`DiskCache`], the requested run is split against what's on disk -
@@ -16,7 +16,9 @@
 //! it the worker's shared [`IOBackend`] (and the disk-op id counter) at submit
 //! and drain time, so cache-file reads and write-backs ride the same per-core
 //! io_uring as fs reads and HTTP sockets. The requester drains that ring and
-//! routes each completion back here.
+//! routes each completion back here. Whole-file reads use [`super::whole_file`]
+//! to assemble bounded chunks after discovering the length from GET headers or
+//! local file metadata; they share the same transport, ring, and caches.
 //!
 //! [`IORequester`]: super::IORequester
 
@@ -39,8 +41,8 @@ type Result<T> = std::result::Result<T, Error>;
 /// [`IORequester::completions`](super::IORequester::completions)'s element type.
 type ReadResult = std::result::Result<Completion, FailedIO>;
 
-/// HTTP range reads with an optional disk cache in front of the network.
-pub(crate) struct CachedHttpEngine {
+/// Range and whole-file reads sharing the HTTP transport and disk cache.
+pub(crate) struct CachedIOEngine {
     /// Declared before `http_reads`/`cache_writes` on purpose: on non-Linux the
     /// engine's `Drop` blocks until every in-flight fetch reports back, and Rust
     /// drops fields in declaration order, so `http` must drain while those maps
@@ -65,6 +67,7 @@ pub(crate) struct CachedHttpEngine {
     /// driven by the same connection pool as reads.
     http_uploads: HashMap<Identifier, DataFlowRequest<HttpUploadRequest>>,
     next_http_id: Identifier,
+    whole: super::whole_file::WholeFiles,
     /// Write-backs populating the cache file after an HTTP piece landed (backend
     /// disk-id space). Each holds the slot pin until the write has read it.
     cache_writes: HashMap<Identifier, CacheWrite>,
@@ -110,7 +113,7 @@ struct CacheWrite {
     _block: MissingExtent,
 }
 
-impl CachedHttpEngine {
+impl CachedIOEngine {
     pub fn new(
         http_config: Arc<rustls::ClientConfig>,
         disk_cache: Option<Arc<DiskCache>>,
@@ -124,12 +127,40 @@ impl CachedHttpEngine {
             http_reads: HashMap::new(),
             http_uploads: HashMap::new(),
             next_http_id: 0,
+            whole: Default::default(),
             cache_writes: HashMap::new(),
         })
     }
 
     pub fn with_default_config(disk_cache: Option<Arc<DiskCache>>) -> Result<Self> {
         Self::new(default_client_config(), disk_cache)
+    }
+
+    #[cfg(test)]
+    pub fn reject_whole_cache_writes(&mut self) {
+        self.whole.reject_cache_writes = true;
+    }
+
+    pub fn read_whole(
+        &mut self,
+        backend: &mut IOBackend,
+        disk_id: &mut Identifier,
+        request: DataFlowRequest<super::whole_file::WholeRequest>,
+    ) -> Result<()> {
+        let id = self.next_http_id;
+        self.next_http_id += 1;
+        self.whole.start(
+            backend,
+            &mut self.http,
+            self.disk_cache.as_deref(),
+            disk_id,
+            id,
+            request,
+        )
+    }
+
+    pub fn take_whole_responses(&mut self) -> Vec<crate::request_tracker::RoutedReadResponse> {
+        std::mem::take(&mut self.whole.ready)
     }
 
     /// Submit a read for a remote region as one [`RequestedRead`]: resident pieces
@@ -315,8 +346,30 @@ impl CachedHttpEngine {
     /// Handle a finished backend disk op that belongs to this engine - a
     /// cache-file read (advances its read) or a write-back (records the bytes
     /// resident). The caller has already ruled out its own fs reads.
-    pub fn complete_disk(&mut self, id: Identifier, result: i32, out: &mut Vec<ReadResult>) {
-        if let Some(cache_read) = self.cache_reads.remove(&id) {
+    pub fn complete_disk(
+        &mut self,
+        backend: &mut IOBackend,
+        disk_id: &mut Identifier,
+        id: Identifier,
+        result: i32,
+        out: &mut Vec<ReadResult>,
+    ) -> Result<()> {
+        if let Some(read) = self
+            .whole
+            .complete_disk(self.disk_cache.as_deref(), id, result)
+        {
+            if self.whole.has_read(read) {
+                self.whole.advance_disk(
+                    backend,
+                    &mut self.http,
+                    self.disk_cache.as_deref(),
+                    disk_id,
+                    read,
+                )?;
+            } else {
+                self.http.cancel_whole(read);
+            }
+        } else if let Some(cache_read) = self.cache_reads.remove(&id) {
             self.complete_cache_read(cache_read, result, out);
         } else if let Some(write) = self.cache_writes.remove(&id) {
             // Only record the bytes resident if the *whole* range landed - a
@@ -334,6 +387,7 @@ impl CachedHttpEngine {
             // unknown to both maps means a completion was tracked nowhere - a bug.
             debug_assert!(false, "disk completion id {id} belongs to no in-flight op");
         }
+        Ok(())
     }
 
     /// Drain HTTP reads the engine finished this pass: each piece commits, gets
@@ -345,15 +399,39 @@ impl CachedHttpEngine {
         disk_id: &mut Identifier,
         out: &mut Vec<ReadResult>,
     ) -> Result<()> {
+        for (id, chunk) in self.http.take_whole_chunks() {
+            if let Err(error) = self.whole.receive(self.disk_cache.as_deref(), id, chunk) {
+                self.http.cancel_whole(id);
+                self.whole.fail(id, error);
+            } else {
+                self.whole.drive(
+                    backend,
+                    &mut self.http,
+                    self.disk_cache.as_deref(),
+                    disk_id,
+                    id,
+                )?;
+            }
+        }
         for id in self.http.take_completed() {
-            if let Some(http_read) = self.http_reads.remove(&id) {
+            if self.whole.finish_network(id) {
+                self.whole.drive(
+                    backend,
+                    &mut self.http,
+                    self.disk_cache.as_deref(),
+                    disk_id,
+                    id,
+                )?;
+            } else if let Some(http_read) = self.http_reads.remove(&id) {
                 self.complete_http_read(backend, disk_id, http_read, out)?;
             } else if let Some(upload) = self.http_uploads.remove(&id) {
                 out.push(Ok(Completion::HttpUpload(upload)));
             }
         }
         for (id, error) in self.http.take_failed() {
-            if let Some(http_read) = self.http_reads.remove(&id)
+            if self.whole.has_read(id) {
+                self.whole.fail(id, error.into());
+            } else if let Some(http_read) = self.http_reads.remove(&id)
                 && let Some(request) = self.fail_read(http_read.read)
             {
                 request
@@ -377,12 +455,22 @@ impl CachedHttpEngine {
                 }));
             }
         }
+        out.extend(
+            self.whole
+                .completed
+                .drain(..)
+                .map(|request| Ok(Completion::WholeFile(request))),
+        );
+        out.extend(self.whole.failed.drain(..).map(Err));
         Ok(())
     }
 
     /// `true` while any HTTP GET or upload is in flight.
     pub fn has_network_pending(&self) -> bool {
-        self.http.has_active() || !self.http_reads.is_empty() || !self.http_uploads.is_empty()
+        self.http.has_active()
+            || !self.http_reads.is_empty()
+            || !self.http_uploads.is_empty()
+            || self.whole.has_pending()
     }
 
     /// `true` if an HTTP completion is already in hand (non-Linux only, where the
@@ -404,13 +492,15 @@ impl CachedHttpEngine {
 
     /// `true` while any cache-file read or write-back is in flight on the backend.
     pub fn has_disk_pending(&self) -> bool {
-        !self.cache_reads.is_empty() || !self.cache_writes.is_empty()
+        !self.cache_reads.is_empty()
+            || !self.cache_writes.is_empty()
+            || self.whole.has_disk_pending()
     }
 
     /// Number of network operations currently outstanding. With no cache this
     /// is one per GET; with a cache it counts GET holes, plus every upload.
     pub fn network_in_flight(&self) -> usize {
-        self.http_reads.len() + self.http_uploads.len()
+        self.http_reads.len() + self.http_uploads.len() + self.whole.network_in_flight()
     }
 
     /// A cache-file piece landed: commit its sub-blocks and, if it was the last

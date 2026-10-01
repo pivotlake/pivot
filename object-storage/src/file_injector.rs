@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 /// Builds a [`FileInjector`] per worker, all sharing one queue of the files.
 #[derive(Clone)]
-pub struct FileInjectorFactory {
-    files: Arc<Injector<DataFile>>,
+pub struct FileInjectorFactory<T = DataFile> {
+    files: Arc<Injector<T>>,
 }
 
-impl FileInjectorFactory {
-    pub fn new(files: &[DataFile]) -> Self {
+impl<T: Clone> FileInjectorFactory<T> {
+    pub fn new(files: &[T]) -> Self {
         let injector = Injector::new();
         for file in files {
             injector.push(file.clone());
@@ -25,19 +25,19 @@ impl FileInjectorFactory {
     }
 }
 
-impl RootChannelFactory<DataFile> for FileInjectorFactory {
-    type Receiver = FileInjector;
+impl<T: Clone + Send + Sync + 'static> RootChannelFactory<T> for FileInjectorFactory<T> {
+    type Receiver = FileInjector<T>;
 
-    fn build(self) -> FileInjector {
+    fn build(self) -> FileInjector<T> {
         FileInjector { files: self.files }
     }
 }
 
-pub struct FileInjector {
-    files: Arc<Injector<DataFile>>,
+pub struct FileInjector<T = DataFile> {
+    files: Arc<Injector<T>>,
 }
 
-impl FileInjector {
+impl<T> FileInjector<T> {
     /// Wake the pool if this claim was the one that emptied the queue.
     ///
     /// A worker whose `try_finish` saw the queue non-empty (so it did not
@@ -60,12 +60,12 @@ impl FileInjector {
     }
 }
 
-impl Receiver<DataFile> for FileInjector {
+impl<T: Send + Sync> Receiver<T> for FileInjector<T> {
     fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
 
-    fn try_recv(&self) -> Option<DataFile> {
+    fn try_recv(&self) -> Option<T> {
         // Drive the fetch from the eager `run_cpu_work` path (which calls
         // `try_recv`), not only the worker's idle `steal` path; otherwise each
         // worker fetches one file at a time and a large catch-up (many new
@@ -81,7 +81,7 @@ impl Receiver<DataFile> for FileInjector {
         }
     }
 
-    fn steal(&self) -> Option<DataFile> {
+    fn steal(&self) -> Option<T> {
         loop {
             match self.files.steal() {
                 Steal::Empty => return None,

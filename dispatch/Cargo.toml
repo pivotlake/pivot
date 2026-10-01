@@ -78,6 +78,8 @@ nix = { version = "0.31.2", features = ["fs", "uio"] }
 crossbeam-channel = "0.5"
 
 [dev-dependencies]
+# Compile and exercise the blocking HTTP transport on Linux too.
+crossbeam-channel = "0.5"
 tempfile = { workspace = true }
 # Generate a self-signed cert so tests can stand up a loopback HTTPS server the
 # client trusts via an injected root store.

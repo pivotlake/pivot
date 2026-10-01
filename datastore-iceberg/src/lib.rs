@@ -81,7 +81,7 @@ use planner::catalog::{
 use crate::binding::IcebergTableBinding;
 use crate::rest_catalog::{block_on, build_rest_catalog};
 use crate::store::TableStore;
-use crate::table::{LoadedTable, fetch_manifest_list_size, open_table_store};
+use crate::table::{LoadedTable, open_table_store};
 
 /// How to reach the REST catalog. The fields mirror the properties the
 /// Iceberg REST client is configured with; `properties` passes any further
@@ -168,8 +168,6 @@ pub enum Error {
         file: String,
         format: String,
     },
-    #[error("table `{table}` metadata object `{path}` is not in the store")]
-    MissingMetadataObject { table: String, path: String },
     #[error("table `{table}` metadata object `{path}` does not parse: {source}")]
     MalformedMetadataObject {
         table: String,
@@ -267,27 +265,10 @@ struct SchemaEntry {
     tables: HashMap<String, Result<TableEntry, String>>,
 }
 
-/// One table's entry in the index: the table as the catalog returned it, with
-/// what a load needs that the response does not say: the store its files are
-/// read through, opened with the credentials the catalog vended, and the size
-/// of the current snapshot's manifest list.
+/// The catalog's table metadata and the store opened with its credentials.
 struct TableEntry {
     table: Table,
     store: TableStore,
-    /// Iceberg names the manifest list without a length, and a ring read needs
-    /// one, so the store is asked once, at refresh, and the answer kept here
-    /// rather than asked again by every query. Ugly, but off the query path.
-    /// `None` for a table with no current snapshot.
-    manifest_list_size: Option<u64>,
-}
-
-impl TableEntry {
-    fn manifest_list_path(&self) -> Option<&str> {
-        self.table
-            .metadata()
-            .current_snapshot()
-            .map(|snapshot| snapshot.manifest_list())
-    }
 }
 
 impl std::fmt::Debug for IcebergDatastore {
@@ -345,7 +326,6 @@ impl IcebergDatastore {
     /// namespace, and every table of theirs. Namespaces nested below the top
     /// level are not schemas of this datastore and are not listed.
     fn fetch_index(&self) -> Result<DatastoreIndex> {
-        let previous = self.index();
         let mut index = DatastoreIndex::default();
         let namespaces = block_on(self.catalog.list_namespaces(None)).map_err(Box::new)?;
         for namespace in namespaces {
@@ -361,7 +341,7 @@ impl IcebergDatastore {
                 let name = SchemaQualifiedTableName::new(schema.clone(), ident.name.clone());
                 let entry = match block_on(self.catalog.load_table(&ident)) {
                     Ok(table) => self
-                        .build_table_entry(&name, table, previous.table_entry(&name))
+                        .build_table_entry(&name, table)
                         .map_err(|error| error.to_string()),
                     // A table dropped between the listing and its load is
                     // simply not there any more.
@@ -394,33 +374,14 @@ impl IcebergDatastore {
         Ok(index)
     }
 
-    /// `table`'s entry: with its store, opened now from the credentials the
-    /// catalog just vended, and its manifest list's size, the one `previous`
-    /// learned when the snapshot is the one it entered, else asked of the
-    /// store now.
+    /// Bind table metadata to the storage credentials the catalog vended.
     fn build_table_entry(
         &self,
         name: &SchemaQualifiedTableName,
         table: Table,
-        previous: Option<&Result<TableEntry, String>>,
     ) -> Result<TableEntry> {
         let store = open_table_store(name, &table, &*self.store_factory)?;
-        let path = table
-            .metadata()
-            .current_snapshot()
-            .map(|snapshot| snapshot.manifest_list());
-        let unchanged = previous
-            .and_then(|previous| previous.as_ref().ok())
-            .filter(|previous| path.is_some() && previous.manifest_list_path() == path);
-        let manifest_list_size = match unchanged {
-            Some(previous) => previous.manifest_list_size,
-            None => fetch_manifest_list_size(name, &table, &store)?,
-        };
-        Ok(TableEntry {
-            table,
-            store,
-            manifest_list_size,
-        })
+        Ok(TableEntry { table, store })
     }
 
     /// The index as of now: the `Arc` a query pins for its lifetime, so the
@@ -443,13 +404,7 @@ impl IcebergDatastore {
             table: name.to_string(),
             message: message.clone(),
         })?;
-        let loaded = LoadedTable::load(
-            name,
-            &entry.table,
-            &entry.store,
-            entry.manifest_list_size,
-            &self.dispatcher,
-        )?;
+        let loaded = LoadedTable::load(name, &entry.table, &entry.store, &self.dispatcher)?;
         Ok(Some(Arc::new(loaded)))
     }
 

@@ -71,18 +71,12 @@ impl TableStore {
         })
     }
 
-    /// The size of the object at `location`, or `None` when no such object
-    /// exists: one listing narrowed to the object's own name. What a file the
-    /// catalog names without a length (a manifest list) is sized by.
-    pub(crate) fn object_size(&self, location: &str) -> Result<Option<u64>> {
-        let key = self.key_under_root(location)?;
-        let directory = key.parent().unwrap_or_default();
-        let listing = self.store.list_with_name_prefix(&directory, key.name())?;
-        Ok(listing
-            .objects
-            .into_iter()
-            .find(|object| object.file.path.as_str() == key.name())
-            .map(|object| object.file.size))
+    /// Locate an object without a listing or metadata request for its size.
+    pub(crate) fn object_source(&self, location: &str) -> Result<object_storage::ObjectSource> {
+        Ok(object_storage::ObjectSource {
+            path: ObjectPath::new(location),
+            source: self.store.source(&self.key_under_root(location)?)?,
+        })
     }
 
     /// The key of `location` under the table's root, refusing a location

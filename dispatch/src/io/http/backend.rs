@@ -32,6 +32,34 @@ pub(crate) use blocking_engine::{HttpCompletion, HttpEngine};
 #[cfg(target_os = "linux")]
 pub(crate) const HTTP_TAG: u64 = 1 << 63;
 
+/// Decode one bounded transport chunk without retaining a body's history.
+fn consume_whole_bytes(
+    head: &mut Vec<u8>,
+    body: &mut Option<super::http1::BodyDecoder>,
+    output: &mut super::WholeChunk,
+    input: &[u8],
+) -> super::Result<()> {
+    if let Some(body) = body {
+        if body.decode(input, |bytes| output.bytes.extend_from_slice(bytes)) != input.len() {
+            return Err(super::http1::Http1Error::BodyOverflow.into());
+        }
+        return Ok(());
+    }
+    head.extend_from_slice(input);
+    if let proto::HeadParse::Complete(parsed) = proto::parse_whole_response_head(head)? {
+        let mut decoder = super::http1::BodyDecoder::new(parsed.content_length);
+        output.length = Some(parsed.content_length);
+        let leftover = &head[parsed.head_len..];
+        if decoder.decode(leftover, |bytes| output.bytes.extend_from_slice(bytes)) != leftover.len()
+        {
+            return Err(super::http1::Http1Error::BodyOverflow.into());
+        }
+        *body = Some(decoder);
+        head.clear();
+    }
+    Ok(())
+}
+
 /// Per-host pool key.
 fn host_key(remote: &crate::io::RemoteFile) -> String {
     format!("{}:{}", remote.host(), remote.port())
@@ -41,7 +69,8 @@ fn host_key(remote: &crate::io::RemoteFile) -> String {
 // Other Unix (macOS): blocking std::net + rustls thread pool
 // ============================================================================
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+#[cfg_attr(all(test, target_os = "linux"), allow(dead_code))]
 mod blocking_engine {
     use super::*;
     use crate::Identifier;
@@ -64,7 +93,10 @@ mod blocking_engine {
     /// A finished fetch handed back from a pool thread: `Ok` once the body landed
     /// in the slot, `Err` for a terminal transport failure (the engine surfaces it
     /// to the owning dataflow). The id is the read's engine-side request id.
-    pub(crate) type HttpCompletion = (Identifier, Result<()>);
+    pub(crate) enum HttpCompletion {
+        Finished(Identifier, Result<()>),
+        Chunk(Identifier, super::super::WholeChunk),
+    }
 
     /// One range read for a pool thread to perform: fetch `read` into its pinned
     /// slot and report `(id, outcome)` on `sink`. `client_config` builds any fresh
@@ -74,6 +106,7 @@ mod blocking_engine {
         request: RemoteRequest,
         client_config: Arc<rustls::ClientConfig>,
         sink: Sender<HttpCompletion>,
+        resume: Option<Receiver<()>>,
     }
 
     /// A pooled connection: TLS-wrapped or plain TCP.
@@ -142,7 +175,7 @@ mod blocking_engine {
     /// per-worker read-ahead to keep the pool fed without exceeding a laptop's
     /// cross-region connection budget; raise it on a host close to the store.
     fn http_pool_thread_count() -> usize {
-        crate::env::get_env_var_with_default("PIVOT_HTTP_THREADS", 512)
+        crate::env::get_env_var_with_default("PIVOT_HTTP_THREADS", if cfg!(test) { 4 } else { 512 })
     }
 
     fn run_http_thread(jobs: &Receiver<HttpJob>, conns: &ConnPool) {
@@ -154,13 +187,25 @@ mod blocking_engine {
                 request,
                 client_config,
                 sink,
+                resume,
             } = job;
             // Every job MUST yield one completion (a worker parks until its read
             // reports back) and this thread must survive to serve the next job, so
             // a panic in the fetch fails just this read rather than stranding the
             // worker or shrinking the pool.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_fetch(conns, &client_config, &request)
+                if matches!(request, RemoteRequest::Whole(_)) {
+                    run_whole(
+                        conns,
+                        &client_config,
+                        &request,
+                        id,
+                        &sink,
+                        resume.as_ref().unwrap(),
+                    )
+                } else {
+                    run_fetch(conns, &client_config, &request)
+                }
             }))
             .unwrap_or_else(|_| {
                 Err(Error::Io(std::io::Error::other(
@@ -175,7 +220,95 @@ mod blocking_engine {
             drop(request);
             // The issuing engine may have been dropped mid-flight (its receiver
             // gone); a failed send is then expected and ignored.
-            let _ = sink.send((id, outcome));
+            let _ = sink.send(HttpCompletion::Finished(id, outcome));
+        }
+    }
+
+    fn run_whole(
+        conns: &ConnPool,
+        config: &Arc<rustls::ClientConfig>,
+        request: &RemoteRequest,
+        id: Identifier,
+        sink: &Sender<HttpCompletion>,
+        resume: &Receiver<()>,
+    ) -> Result<()> {
+        let key = host_key(request.remote());
+        let pooled = conns
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(&key)
+            .and_then(Vec::pop);
+        let mut started = false;
+        let conn = match pooled {
+            Some(conn) => match receive_whole(conn, request, id, sink, resume, &mut started) {
+                Ok(conn) => conn,
+                Err(_) if !started => receive_whole(
+                    connect(config, request)?,
+                    request,
+                    id,
+                    sink,
+                    resume,
+                    &mut started,
+                )?,
+                Err(error) => return Err(error),
+            },
+            None => receive_whole(
+                connect(config, request)?,
+                request,
+                id,
+                sink,
+                resume,
+                &mut started,
+            )?,
+        };
+        conns
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(key)
+            .or_default()
+            .push(conn);
+        Ok(())
+    }
+
+    fn receive_whole(
+        mut conn: Conn,
+        request: &RemoteRequest,
+        id: Identifier,
+        sink: &Sender<HttpCompletion>,
+        resume: &Receiver<()>,
+        started: &mut bool,
+    ) -> Result<Conn> {
+        conn.write_all(&request.request_head())?;
+        conn.flush()?;
+        let mut head = Vec::new();
+        let mut body = None;
+        let mut buffer = [0u8; IO_CHUNK_SIZE];
+        loop {
+            let count = conn.read(&mut buffer)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed mid-response",
+                )
+                .into());
+            }
+            let mut chunk = super::super::WholeChunk {
+                length: None,
+                bytes: Vec::new(),
+            };
+            consume_whole_bytes(&mut head, &mut body, &mut chunk, &buffer[..count])?;
+            let complete = body.as_ref().is_some_and(|body| body.is_complete());
+            if chunk.length.is_some() || !chunk.bytes.is_empty() {
+                *started = true;
+                sink.send(HttpCompletion::Chunk(id, chunk))
+                    .map_err(|_| std::io::Error::other("whole read cancelled"))?;
+                if complete {
+                    return Ok(conn);
+                }
+                resume
+                    .recv()
+                    .map_err(|_| std::io::Error::other("whole read cancelled"))?;
+            }
         }
     }
 
@@ -248,6 +381,7 @@ mod blocking_engine {
             // per-response whether the connection may be reused.
             RemoteRequest::Read(read) => do_read(conn, read).map(Some),
             RemoteRequest::Upload(upload) => do_upload(conn, upload),
+            RemoteRequest::Whole(_) => unreachable!("whole reads stream through their job channel"),
         }
     }
 
@@ -408,6 +542,8 @@ mod blocking_engine {
         completed: Vec<Identifier>,
         /// Drained failures with their error, awaiting [`take_failed`](Self::take_failed).
         failed: Vec<(Identifier, Error)>,
+        whole_chunks: Vec<(Identifier, super::super::WholeChunk)>,
+        whole_resumes: HashMap<Identifier, Sender<()>>,
     }
 
     impl HttpEngine {
@@ -421,7 +557,33 @@ mod blocking_engine {
                 active: 0,
                 completed: Vec::new(),
                 failed: Vec::new(),
+                whole_chunks: Vec::new(),
+                whole_resumes: HashMap::new(),
             })
+        }
+
+        pub fn start_whole(
+            &mut self,
+            id: Identifier,
+            remote: Arc<crate::io::RemoteFile>,
+        ) -> Result<()> {
+            self.start_request(id, RemoteRequest::Whole(remote))
+        }
+
+        pub fn cancel_whole(&mut self, id: Identifier) {
+            self.whole_resumes.remove(&id);
+        }
+
+        pub fn resume_whole(&mut self, id: Identifier) -> Result<()> {
+            if let Some(resume) = self.whole_resumes.get(&id) {
+                let _ = resume.send(());
+            }
+            Ok(())
+        }
+
+        pub fn take_whole_chunks(&mut self) -> Vec<(Identifier, super::super::WholeChunk)> {
+            self.drain_rx();
+            std::mem::take(&mut self.whole_chunks)
         }
 
         /// Dispatch a range read onto the pool (non-blocking); it completes later
@@ -435,12 +597,20 @@ mod blocking_engine {
         }
 
         fn start_request(&mut self, id: Identifier, request: RemoteRequest) -> Result<()> {
+            let resume = if matches!(request, RemoteRequest::Whole(_)) {
+                let (sender, receiver) = crossbeam_channel::bounded(1);
+                self.whole_resumes.insert(id, sender);
+                Some(receiver)
+            } else {
+                None
+            };
             self.pool
                 .send(HttpJob {
                     id,
                     request,
                     client_config: self.client_config.clone(),
                     sink: self.sink.clone(),
+                    resume,
                 })
                 .expect("http pool thread gone");
             self.active += 1;
@@ -450,22 +620,34 @@ mod blocking_engine {
         /// Move every completion the pool has delivered into the success/failure
         /// buckets (non-blocking).
         fn drain_rx(&mut self) {
-            while let Ok((id, outcome)) = self.rx.try_recv() {
-                self.active -= 1;
-                match outcome {
-                    Ok(()) => self.completed.push(id),
-                    Err(error) => self.failed.push((id, error)),
+            while let Ok(event) = self.rx.try_recv() {
+                match event {
+                    HttpCompletion::Chunk(id, chunk) => self.whole_chunks.push((id, chunk)),
+                    HttpCompletion::Finished(id, outcome) => {
+                        self.active -= 1;
+                        self.whole_resumes.remove(&id);
+                        match outcome {
+                            Ok(()) => self.completed.push(id),
+                            Err(error) => self.failed.push((id, error)),
+                        }
+                    }
                 }
             }
         }
 
         pub fn take_completed(&mut self) -> Vec<Identifier> {
             self.drain_rx();
+            if !self.whole_chunks.is_empty() {
+                return Vec::new();
+            }
             std::mem::take(&mut self.completed)
         }
 
         pub fn take_failed(&mut self) -> Vec<(Identifier, Error)> {
             self.drain_rx();
+            if !self.whole_chunks.is_empty() {
+                return Vec::new();
+            }
             std::mem::take(&mut self.failed)
         }
 
@@ -475,7 +657,10 @@ mod blocking_engine {
 
         /// `true` if a completion is already in hand, so the worker need not park.
         pub fn has_ready_completion(&self) -> bool {
-            !self.rx.is_empty() || !self.completed.is_empty() || !self.failed.is_empty()
+            !self.rx.is_empty()
+                || !self.completed.is_empty()
+                || !self.failed.is_empty()
+                || !self.whole_chunks.is_empty()
         }
 
         /// The completion channel, so the requester can park on it alongside the
@@ -491,14 +676,71 @@ mod blocking_engine {
         /// writes into a cache slot after the issuing read's pin is dropped. The
         /// socket timeouts bound how long this can take.
         fn drop(&mut self) {
+            self.whole_resumes.clear();
             self.drain_rx();
             while self.active > 0 {
                 match self.rx.recv() {
-                    Ok(_) => self.active -= 1,
+                    Ok(HttpCompletion::Finished(..)) => self.active -= 1,
+                    Ok(HttpCompletion::Chunk(..)) => {}
                     Err(_) => break,
                 }
             }
         }
+    }
+    #[cfg(test)]
+    #[test]
+    fn blocking_whole_read_delivers_every_chunk_before_completion() {
+        use std::net::TcpListener;
+        use std::time::Instant;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = vec![37; IO_CHUNK_SIZE * 19 + 123];
+        let body = expected.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            assert!(!String::from_utf8(head).unwrap().contains("Range:"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let remote = Arc::new(
+            crate::io::RemoteFile::open_whole(
+                format!("http://localhost:{port}/data").parse().unwrap(),
+                None,
+            )
+            .unwrap(),
+        );
+        let mut engine = HttpEngine::new(super::super::default_client_config()).unwrap();
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        engine.start_whole(1, remote).unwrap();
+        loop {
+            assert!(Instant::now() < deadline, "whole read stalled");
+            for (id, chunk) in engine.take_whole_chunks() {
+                assert_eq!(id, 1);
+                received.extend(chunk.bytes);
+                engine.resume_whole(id).unwrap();
+            }
+            assert!(engine.take_failed().is_empty());
+            if !engine.take_completed().is_empty() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        assert_eq!(received, expected);
+        server.join().unwrap();
     }
 }
 
@@ -623,13 +865,14 @@ mod uring_engine {
         conn_reusable: bool,
 
         state: State,
+        whole_chunk: super::super::WholeChunk,
     }
 
     impl HttpExchange {
         fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Self {
             let (dest, expected_body_len) = match &request {
                 RemoteRequest::Read(read) => (read.dest, read.expected_body_len()),
-                RemoteRequest::Upload(_) => (std::ptr::null_mut(), 0),
+                RemoteRequest::Upload(_) | RemoteRequest::Whole(_) => (std::ptr::null_mut(), 0),
             };
             let request_bytes = request.request_head();
             Self {
@@ -650,6 +893,10 @@ mod uring_engine {
                 recv_in_dest: false,
                 conn_reusable: true,
                 state,
+                whole_chunk: super::super::WholeChunk {
+                    length: None,
+                    bytes: Vec::new(),
+                },
             }
         }
 
@@ -714,6 +961,9 @@ mod uring_engine {
         /// buffer and `read` moves the plaintext out (no decrypt-into-user-buffer
         /// API exists).
         fn consume_received(&mut self, n: usize) -> Result<()> {
+            if matches!(self.request, RemoteRequest::Whole(_)) {
+                return self.consume_whole_received(n);
+            }
             let HttpExchange {
                 conn,
                 head_acc,
@@ -858,6 +1108,52 @@ mod uring_engine {
             }
         }
 
+        fn consume_whole_received(&mut self, n: usize) -> Result<()> {
+            let Self {
+                conn,
+                head_acc,
+                body,
+                whole_chunk,
+                ..
+            } = self;
+            match &mut conn.transport {
+                Transport::Plain => {
+                    consume_whole_bytes(head_acc, body, whole_chunk, &conn.in_buf[..n])
+                }
+                Transport::Tls(tls) => {
+                    let mut input = &conn.in_buf[..n];
+                    let mut plaintext = [0u8; IO_CHUNK_SIZE];
+                    while !input.is_empty() {
+                        let fed = tls.read_tls(&mut input)?;
+                        tls.process_new_packets()?;
+                        let mut drained = 0;
+                        loop {
+                            match tls.reader().read(&mut plaintext) {
+                                Ok(0) => break,
+                                Ok(count) => {
+                                    drained += count;
+                                    consume_whole_bytes(
+                                        head_acc,
+                                        body,
+                                        whole_chunk,
+                                        &plaintext[..count],
+                                    )?;
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    break;
+                                }
+                                Err(error) => return Err(error.into()),
+                            }
+                        }
+                        if fed == 0 && drained == 0 {
+                            break;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        }
+
         fn request_complete(&self) -> bool {
             self.body.as_ref().is_some_and(|b| b.is_complete())
         }
@@ -882,6 +1178,7 @@ mod uring_engine {
         let parsed = match request {
             RemoteRequest::Read(_) => proto::parse_get_response_head(head_acc, expected_body_len)?,
             RemoteRequest::Upload(_) => proto::parse_upload_response_head(head_acc)?,
+            RemoteRequest::Whole(_) => unreachable!("whole reads use their streaming decoder"),
         };
         if let proto::HeadParse::Complete(h) = parsed {
             *conn_reusable = h.reuse_connection;
@@ -929,6 +1226,7 @@ mod uring_engine {
         /// Ids whose transport failed terminally (retries exhausted or a
         /// non-retryable error), paired with the error to report to the dataflow.
         failed: Vec<(Identifier, Error)>,
+        whole_chunks: Vec<(Identifier, super::super::WholeChunk)>,
     }
 
     impl HttpEngine {
@@ -941,6 +1239,7 @@ mod uring_engine {
                 active: 0,
                 completed: Vec::new(),
                 failed: Vec::new(),
+                whole_chunks: Vec::new(),
             })
         }
 
@@ -954,6 +1253,42 @@ mod uring_engine {
 
         pub fn take_failed(&mut self) -> Vec<(Identifier, Error)> {
             std::mem::take(&mut self.failed)
+        }
+
+        pub fn take_whole_chunks(&mut self) -> Vec<(Identifier, super::super::WholeChunk)> {
+            std::mem::take(&mut self.whole_chunks)
+        }
+
+        pub fn start_whole(
+            &mut self,
+            ring: &mut IoUring,
+            id: Identifier,
+            remote: Arc<crate::io::RemoteFile>,
+        ) -> Result<()> {
+            self.start_request(ring, id, RemoteRequest::Whole(remote))
+        }
+
+        pub fn cancel_whole(&mut self, id: Identifier) {
+            if let Some(index) = self
+                .exchanges
+                .iter()
+                .position(|exchange| exchange.as_ref().is_some_and(|exchange| exchange.id == id))
+            {
+                self.exchanges[index] = None;
+                self.free_slots.push(index);
+                self.active -= 1;
+            }
+        }
+
+        pub fn resume_whole(&mut self, ring: &mut IoUring, id: Identifier) -> Result<()> {
+            if let Some(index) = self
+                .exchanges
+                .iter()
+                .position(|exchange| exchange.as_ref().is_some_and(|exchange| exchange.id == id))
+            {
+                self.pump(ring, index)?;
+            }
+            Ok(())
         }
 
         /// Begin a range read: bind it to a pooled or fresh connection and submit
@@ -1023,6 +1358,19 @@ mod uring_engine {
                 Err(e) => return self.retry_or_fail(ring, idx, e),
             };
 
+            let exchange = self.exchanges[idx].as_mut().unwrap();
+            let yielded =
+                exchange.whole_chunk.length.is_some() || !exchange.whole_chunk.bytes.is_empty();
+            if yielded {
+                let chunk = std::mem::replace(
+                    &mut exchange.whole_chunk,
+                    super::super::WholeChunk {
+                        length: None,
+                        bytes: Vec::new(),
+                    },
+                );
+                self.whole_chunks.push((exchange.id, chunk));
+            }
             if finished {
                 let exchange = self.exchanges[idx]
                     .take()
@@ -1042,7 +1390,11 @@ mod uring_engine {
                 return Ok(());
             }
 
-            self.pump(ring, idx)
+            if yielded {
+                Ok(())
+            } else {
+                self.pump(ring, idx)
+            }
         }
 
         /// Fold `size` freshly transferred bytes into the connection's request
@@ -1098,6 +1450,8 @@ mod uring_engine {
                 .take()
                 .expect("cqe for an active HTTP exchange");
             self.free_slots.push(idx);
+            let whole_started =
+                matches!(dead.request, RemoteRequest::Whole(_)) && dead.body.is_some();
             let HttpExchange {
                 conn,
                 id,
@@ -1108,7 +1462,7 @@ mod uring_engine {
             let key = conn.host_key.clone();
             drop(conn); // close the failed socket before reconnecting
 
-            if is_retryable(&err) && retries < MAX_HTTP_RETRIES {
+            if !whole_started && is_retryable(&err) && retries < MAX_HTTP_RETRIES {
                 match self.new_conn(key, &request) {
                     Ok(conn) => {
                         let mut fresh = HttpExchange::new(conn, id, request, State::Connecting);

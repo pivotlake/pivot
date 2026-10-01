@@ -32,7 +32,7 @@ mod s3;
 pub mod test_support;
 pub use gcs::GcsStore;
 pub use local::LocalStore;
-pub use object_fetcher::{LoadedObject, load_objects};
+pub use object_fetcher::{LoadedObject, ObjectSource, load_objects, load_whole_objects};
 pub use object_path::ObjectPath;
 pub use s3::{S3Credentials, S3Keys, S3Store};
 
@@ -156,6 +156,16 @@ impl DataFileLocation {
                 OpenFile::Remote(Arc::new(RemoteFile::open(url, auth, size)?))
             }
         })
+    }
+
+    /// Open an immutable object without discovering its size first.
+    pub fn open_whole_read(self) -> std::io::Result<OpenFile> {
+        match self {
+            Self::Local(path) => open_direct_read(&path).map(OpenFile::Local),
+            Self::Remote { url, auth } => {
+                RemoteFile::open_whole(url, auth).map(|remote| OpenFile::Remote(Arc::new(remote)))
+            }
+        }
     }
 }
 

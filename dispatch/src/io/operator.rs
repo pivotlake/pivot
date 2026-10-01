@@ -91,8 +91,15 @@ impl ReadResponse {
             1,
             "into_bytes requires exactly one requested location"
         );
+        let mut parts = self.locations.into_iter().next().unwrap();
+        if parts.len() == 1
+            && let ReadData::Compressed { bytes, .. } = &mut parts[0]
+            && bytes.len() == 1
+        {
+            return bytes.pop().unwrap().into();
+        }
         let mut bytes = Vec::new();
-        for part in self.locations.into_iter().next().unwrap() {
+        for part in parts {
             match part {
                 ReadData::Compressed { bytes: runs, .. } => {
                     for run in runs {
@@ -177,6 +184,25 @@ impl<'a> OperatorIO<'a> {
         locations: impl IntoIterator<Item = FileRange>,
     ) -> Result<ReadRequestId, crate::io::IORequesterError> {
         self.submit_read(open_file, locations, true)
+    }
+
+    /// Read an immutable file in full without a caller-provided length. Remote
+    /// files use a full GET with Content-Length; local files use their open fd.
+    /// Transport and cache buffers are bounded independently of the file size.
+    pub fn read_whole_file(
+        &mut self,
+        open_file: OpenFile,
+    ) -> Result<ReadRequestId, crate::io::IORequesterError> {
+        let id = ReadRequestId(*self.next_read_id);
+        *self.next_read_id += 1;
+        self.requester.request_whole(
+            self.data_flow_id,
+            self.operator_idx,
+            id,
+            open_file,
+            self.stats,
+        )?;
+        Ok(id)
     }
 
     fn submit_read(
