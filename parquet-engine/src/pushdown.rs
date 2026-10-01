@@ -170,7 +170,10 @@ pub fn equality_predicates(predicates: &[PushedPredicate]) -> Vec<ScanEqualityPr
 /// Clone a table and retain only the row groups which the recorded predicates
 /// do not eliminate. The clone preserves [`ParquetTable`]'s captured schema
 /// even when every row group is removed.
-pub fn prune_parquet(parquet: &ParquetTable, predicates: &[PushedPredicate]) -> ParquetTable {
+pub fn prune_parquet_row_groups(
+    parquet: &ParquetTable,
+    predicates: &[PushedPredicate],
+) -> ParquetTable {
     let mut parquet = parquet.clone();
     parquet.row_groups_mut().retain(|rg| {
         !predicates.iter().any(|predicate| {

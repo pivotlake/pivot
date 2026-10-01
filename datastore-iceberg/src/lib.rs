@@ -26,9 +26,11 @@
 //! Manifest lists and manifests are read as whole objects over the io_uring
 //! ring ([`object_storage::load_objects`]), so they pass through the
 //! compressed cache and the disk cache exactly as data does: a restarted server
-//! finds them on local disk. Data files are Parquet, read by the same engine
-//! that reads every other datastore, with row-group pruning, late
-//! materialization and dynamic filters. Columns are matched to each file by
+//! finds them on local disk. A filtered query reads only the manifests whose
+//! partition summaries admit its predicates, and only the footers of the files
+//! whose partition values and column bounds do. Data files are Parquet, read
+//! by the same engine that reads every other datastore, with row-group
+//! pruning, late materialization and dynamic filters. Columns are matched to each file by
 //! Parquet field id, so renamed columns read correctly and a column added after
 //! a file was written reads as NULL for that file.
 //!
@@ -58,9 +60,11 @@
 mod binding;
 mod columns;
 pub mod env;
+mod partition;
 mod rest_catalog;
 mod store;
 mod table;
+mod values;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -170,6 +174,23 @@ pub enum Error {
     },
     #[error("table `{table}` metadata object `{path}` is not in the store")]
     MissingMetadataObject { table: String, path: String },
+    #[error(
+        "table `{table}` manifest `{manifest}` was written under partition spec {spec_id}, which the table metadata does not have"
+    )]
+    UnknownPartitionSpec {
+        table: String,
+        manifest: String,
+        spec_id: i32,
+    },
+    #[error(
+        "table `{table}` predicate on column `{column}` does not project onto its partition: {source}"
+    )]
+    PartitionProjection {
+        table: String,
+        column: String,
+        #[source]
+        source: Box<iceberg::Error>,
+    },
     #[error("table `{table}` metadata object `{path}` does not parse: {source}")]
     MalformedMetadataObject {
         table: String,
@@ -189,8 +210,6 @@ pub enum Error {
     },
     #[error("table `{table}` was vended an S3 access key without its secret key, or the reverse")]
     IncompleteVendedCredentials { table: String },
-    #[error("table `{table}` data file `{file}` returned no footer")]
-    FooterNotLoaded { table: String, file: String },
     #[error(transparent)]
     Store(#[from] object_storage::StoreError),
     #[error("reading table metadata over the pool: {0}")]
@@ -446,7 +465,7 @@ impl IcebergDatastore {
         let loaded = LoadedTable::load(
             name,
             &entry.table,
-            &entry.store,
+            entry.store.clone(),
             entry.manifest_list_size,
             &self.dispatcher,
         )?;
@@ -600,12 +619,13 @@ impl DatastoreTransaction for IcebergTransaction {
     fn tables(&self) -> CatalogResult<Vec<DatastoreTableMetadata>> {
         let tables = self.datastore.load_all_tables(&self.index)?;
         let mut memo = self.loaded_tables.lock().unwrap();
-        Ok(tables
+        let described = tables
             .into_iter()
             .map(|table| {
                 memo.insert(table.name.clone(), Some(table.clone()));
                 table.describe()
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(described)
     }
 }
