@@ -2,7 +2,7 @@
 //! transaction resolve derives from its snapshot, so a query's filter pushdown
 //! prunes its own view without affecting anyone else.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
 use arrow_array::{ArrayRef, Scalar};
@@ -47,6 +47,11 @@ pub struct TableBinding {
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
+    /// The row groups a scan of this binding reads (see
+    /// [`scan_view`](Self::scan_view)), built on first use. The snapshot and,
+    /// once planning is over, the predicates are fixed, so every compile of
+    /// the plan this binding belongs to reads the same view.
+    scan_view: OnceLock<Arc<ParquetTable>>,
     /// The transaction's shared queue of finished INSERT files. Shared (`Arc`)
     /// with the [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
     /// binding, so a file this binding's [`compile_insert`](BoundTable::compile_insert)
@@ -80,6 +85,7 @@ impl TableBinding {
             columns,
             nullability,
             predicates: Vec::new(),
+            scan_view: OnceLock::new(),
             uploaded_files,
         }
     }
@@ -95,6 +101,18 @@ impl TableBinding {
         self.table
             .build_scan_view(&partition_filters, &stat_filters)
             .map_err(|e| CatalogError::Other(Box::new(e)))
+    }
+
+    /// The row groups a scan of this binding reads: the captured snapshot's,
+    /// partition-pruned and with the row groups the pushed predicates'
+    /// statistics rule out removed.
+    fn scan_view(&self) -> CatalogResult<Arc<ParquetTable>> {
+        if let Some(view) = self.scan_view.get() {
+            return Ok(view.clone());
+        }
+        let current = self.resolve_files()?;
+        let view = Arc::new(self.pruned_parquet(&current));
+        Ok(self.scan_view.get_or_init(|| view).clone())
     }
 
     /// This binding's pushed equality predicates as partition-filter candidates:
@@ -163,16 +181,15 @@ impl BoundTable for TableBinding {
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         // The captured snapshot copy hands back the file set this query was
-        // bound against, partition-pruned. All in-memory: the background
-        // refresh already materialized every footer.
-        let current = self.resolve_files()?;
+        // bound against, partition-pruned, minus the row groups the
+        // pushed-down predicates' stats rule out. All in-memory: the
+        // background refresh already materialized every footer.
+        let parquet = self.scan_view()?;
 
         // A variant path predicate reaches its shredded typed leaf only in the
         // files that shred it, so each row group resolves the path itself.
         let eq_predicates = equality_predicates(&self.predicates);
 
-        // Prune the row groups by the pushed-down predicates' stats.
-        let parquet = Arc::new(self.pruned_parquet(&current));
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
@@ -185,6 +202,10 @@ impl BoundTable for TableBinding {
             scan_order,
             Arc::new(eq_predicates),
         ))
+    }
+
+    fn scan_bytes(&self, projection: &Projection) -> Option<u64> {
+        Some(self.scan_view().ok()?.projected_scan_bytes(projection))
     }
 
     fn compile_insert(
@@ -226,12 +247,7 @@ impl BoundTable for TableBinding {
         // [`compile_scan`](BoundTable::compile_scan) applies. Re-reading from a
         // view that kept even one row group the scan dropped shifts every later
         // index and silently returns another row group's rows.
-        let current = self.resolve_files()?;
-        Ok(materialize(
-            input,
-            Arc::new(self.pruned_parquet(&current)),
-            projection,
-        ))
+        Ok(materialize(input, self.scan_view()?, projection))
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
@@ -240,6 +256,8 @@ impl BoundTable for TableBinding {
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
         self.predicates.extend(PushedPredicate::from_filter(filter));
+        // The view was pruned by the predicates pushed before this one.
+        self.scan_view = OnceLock::new();
 
         Ok(false)
     }

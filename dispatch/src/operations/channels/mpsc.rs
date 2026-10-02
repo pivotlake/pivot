@@ -24,6 +24,8 @@ pub struct MpscSender<T> {
     /// `None` when the receiver is not a worker (the final output channel,
     /// whose consumer blocks on the inner mpsc directly).
     receiving_worker: Option<usize>,
+    /// How many workers the dataflow `receiving_worker` is an index of runs on.
+    dataflow_workers: usize,
 }
 
 impl<T> Clone for MpscSender<T> {
@@ -32,6 +34,7 @@ impl<T> Clone for MpscSender<T> {
             inner: self.inner.clone(),
             count: self.count.clone(),
             receiving_worker: self.receiving_worker,
+            dataflow_workers: self.dataflow_workers,
         }
     }
 }
@@ -55,7 +58,10 @@ impl<T> MpscSender<T> {
         // through this channel, so without a notify the target worker can sit
         // parked while its mpsc has work waiting.
         if let Some(worker) = self.receiving_worker {
-            waker_set().notify_worker(worker);
+            waker_set().notify_worker(crate::worker::pool_worker_idx(
+                worker,
+                self.dataflow_workers,
+            ));
         }
         Ok(())
     }
@@ -124,18 +130,23 @@ pub fn mpsc_channel<T>() -> (MpscSender<T>, MpscReceiver<T>) {
             inner: tx,
             count: count.clone(),
             receiving_worker: None,
+            dataflow_workers: 0,
         },
         MpscReceiver { inner: rx, count },
     )
 }
 
-/// Build an mpsc channel read by the worker with global index
-/// `receiving_worker`; every send wakes that worker's node.
-pub fn mpsc_channel_to<T>(receiving_worker: usize) -> (MpscSender<T>, MpscReceiver<T>) {
+/// Build an mpsc channel read by worker `receiving_worker` of a dataflow
+/// running on `dataflow_workers` workers; every send wakes that worker.
+pub fn mpsc_channel_to<T>(
+    receiving_worker: usize,
+    dataflow_workers: usize,
+) -> (MpscSender<T>, MpscReceiver<T>) {
     let (tx, rx) = mpsc_channel();
     (
         MpscSender {
             receiving_worker: Some(receiving_worker),
+            dataflow_workers,
             ..tx
         },
         rx,

@@ -56,7 +56,7 @@ pub fn to_single_worker_mpsc<T: 'static + Send>(
     target: Identifier,
 ) -> impl IntoIterator<Item = SingleWorkerMpscFactory<T>> {
     let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
-        .map(|worker| mpsc_channel_to::<T>(worker))
+        .map(|worker| mpsc_channel_to::<T>(worker, count))
         .unzip();
     let senders: Arc<[MpscSender<T>]> = senders.into();
 

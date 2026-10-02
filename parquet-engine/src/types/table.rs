@@ -9,8 +9,11 @@ use crate::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::thrift::general::{Encoding, PageType};
 use crate::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::types::columns::{ColumnResolution, TableColumns};
-use crate::types::leaves::leaf_count;
-use crate::types::metadata::{ColumnChunkMeta, FileLeafStatistics, RowGroupMetadata};
+use crate::types::leaves::{leaf_count, projected_leaves};
+use crate::types::metadata::{
+    ColumnChunkMeta, FileLeafStatistics, QueryRowGroupMetadata, RowGroupMetadata, RowSelection,
+};
+use crate::types::projection::Projection;
 use arrow_array::builder::{BinaryViewBuilder, StringViewBuilder};
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
@@ -95,6 +98,31 @@ impl ParquetTable {
     }
 
     /// Read-only view of this table's row groups.
+    /// Decoded bytes of the column chunks a scan with `projection` reads:
+    /// how much work the scan is, known from the footers alone.
+    pub fn projected_scan_bytes(&self, projection: &Projection) -> u64 {
+        let mut bytes = 0;
+        // Row groups of one file share a schema, and with it the leaves a
+        // projection resolves to.
+        let mut resolved: Option<(SchemaRef, Vec<usize>)> = None;
+        for index in 0..self.row_groups.len() {
+            let row_group = &self.row_groups[index];
+            let leaves = match &resolved {
+                Some((schema, leaves)) if Arc::ptr_eq(schema, &row_group.schema) => leaves,
+                _ => {
+                    let metadata = QueryRowGroupMetadata::new(self, index, RowSelection::All);
+                    let leaves = projected_leaves(row_group.schema.fields(), &metadata, projection);
+                    &resolved.insert((row_group.schema.clone(), leaves)).1
+                }
+            };
+            bytes += leaves
+                .iter()
+                .map(|&leaf| row_group.columns[leaf].total_uncompressed_size.max(0) as u64)
+                .sum::<u64>();
+        }
+        bytes
+    }
+
     pub fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
         &self.row_groups
     }

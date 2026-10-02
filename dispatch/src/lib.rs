@@ -176,9 +176,14 @@ impl Shutdown {
         // Workers parked on a waker won't observe `exit_flag` until someone
         // wakes them. Notify every group's waker so every parked worker returns
         // from `wait_if_unchanged` and sees the flag on its next loop iteration.
-        self.wakers.notify_all();
+        self.wakers.notify_all_including_idle();
     }
 }
+
+/// The most workers a dataflow runs on for each scan size, as (decoded bytes
+/// the scan stays below, workers), smallest first. A scan at or above the last
+/// size runs on the whole pool.
+const SCAN_WORKER_LIMITS: [(u64, usize); 2] = [(25 << 20, 48), (1000 << 20, 96)];
 
 #[derive(Clone)]
 pub struct DataFlowDispatcher {
@@ -226,19 +231,105 @@ impl DataFlowDispatcher {
 
 impl DataFlowDispatcher {
     /// Dispatch one pre-built `DataFlow` bundle across the node groups.
-    /// Builder `i` goes to global worker `i` (node `i / workers_per_node`). A
-    /// full bundle has one builder per worker; a shorter one reaches only the
-    /// first workers, consistent with the dense `0..builder_count` indexing its
-    /// channels were built for. Returns the wakers of every node, so cancellation
+    /// Builder `i` goes to worker `i` of this handle's topology: global worker
+    /// `i` at full width, the first workers of every node on a narrowed
+    /// handle. A full bundle has one builder per worker; a shorter one reaches
+    /// only the first of them, consistent with the dense `0..builder_count`
+    /// indexing its channels were built for. Returns the wakers of every node, so cancellation
     /// can wake parked workers on any node.
     pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) -> WakerSet {
-        for (worker, builder) in builders.into_iter().enumerate() {
-            self.senders[worker].send(builder).unwrap();
+        let workers_per_node = self.topology.workers_per_node;
+        let pool_workers_per_node = self.pool_workers_per_node();
+        if workers_per_node < pool_workers_per_node {
+            // A dataflow for part of the pool goes to the first workers of
+            // every node. Only they are woken, the rest having nothing to
+            // pick up: the first one of each node from here, its siblings by
+            // that worker once it holds the builder.
+            for (worker, builder) in builders.into_iter().enumerate() {
+                let (node, position) = (worker / workers_per_node, worker % workers_per_node);
+                let builder = if position == 0 {
+                    builder.waking_siblings(workers_per_node - 1)
+                } else {
+                    builder
+                };
+                self.senders[node * pool_workers_per_node + position]
+                    .send(builder)
+                    .unwrap();
+            }
+            for node in 0..self.topology.node_count {
+                self.waker_set.notify_worker(node * pool_workers_per_node);
+            }
+        } else {
+            for (worker, builder) in builders.into_iter().enumerate() {
+                self.senders[worker].send(builder).unwrap();
+            }
+            // Wake idle workers on every node so they pick up the new dataflow
+            // without waiting out their park.
+            self.waker_set.notify_all_delegated();
         }
-        // Wake idle workers on every node so they pick up the new dataflow
-        // without waiting out their park.
-        self.waker_set.notify_all_delegated();
         self.waker_set.clone()
+    }
+
+    /// A handle whose dataflows run on only as many workers as a scan of
+    /// `scan_bytes` (the decoded size of what it reads) can keep busy.
+    ///
+    /// Every worker a dataflow runs on costs it a fixed amount whatever the
+    /// work: its share of each stage's channels to build, a wake-up, and a
+    /// turn at every stage's finish. Spread over the whole pool, that fixed
+    /// part outweighs the work of a small scan:
+    ///
+    /// ```text
+    /// time ^        fixed cost per worker
+    ///      |  \     /
+    ///      |   \___/        <- narrow enough to stay cheap,
+    ///      |                   wide enough to split the work
+    ///      +----------------> workers
+    /// ```
+    ///
+    /// A scan therefore runs on no more workers than [`SCAN_WORKER_LIMITS`]
+    /// allows its size, spread evenly over the nodes; a large one keeps the
+    /// whole pool.
+    ///
+    /// `groups_every_row` says the plan groups (or counts distinct values of)
+    /// every row the scan emits, with no filter in between. That work is many
+    /// times the decode the scan size measures, so such a plan keeps the whole
+    /// pool unless its scan is within the smallest limit.
+    pub fn sized_for_scan(&self, scan_bytes: u64, groups_every_row: bool) -> Self {
+        let limits = if groups_every_row {
+            &SCAN_WORKER_LIMITS[..1]
+        } else {
+            &SCAN_WORKER_LIMITS[..]
+        };
+        match limits
+            .iter()
+            .find(|(below_bytes, _)| scan_bytes < *below_bytes)
+        {
+            Some((_, workers)) => self.narrowed_to(*workers),
+            None => self.clone(),
+        }
+    }
+
+    /// A handle whose dataflows run on `workers` workers, split evenly over
+    /// the nodes and taking the first workers of each (the whole pool when it
+    /// has no more than that).
+    pub fn narrowed_to(&self, workers: usize) -> Self {
+        let nodes = self.topology.node_count;
+        let workers_per_node = (workers / nodes).max(1);
+        if workers_per_node >= self.pool_workers_per_node() {
+            return self.clone();
+        }
+        let mut narrowed = self.clone();
+        narrowed.topology = numa::Topology {
+            workers_per_node,
+            node_count: nodes,
+        };
+        narrowed
+    }
+
+    /// Workers on each node of the pool, whatever width this handle's
+    /// dataflows run at.
+    fn pool_workers_per_node(&self) -> usize {
+        self.senders.len() / self.topology.node_count
     }
 
     /// The total worker count across all node groups. Every dataflow's
@@ -534,6 +625,43 @@ mod tests {
     }
 
     #[test]
+    fn narrowed_dispatcher_runs_on_the_first_workers_of_every_node() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 3), 16, None);
+
+        let mut indices = dispatch
+            .dispatcher()
+            .narrowed_to(4)
+            .run_on_workers(|| crate::worker::WORKER_IDX.get());
+
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 3, 4]);
+        dispatch.exit();
+    }
+
+    #[test]
+    fn narrowing_past_the_pool_keeps_every_worker() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+
+        let narrowed = dispatch.dispatcher().narrowed_to(8);
+
+        assert_eq!(narrowed.topology(), dispatch.dispatcher().topology());
+        dispatch.exit();
+    }
+
+    #[test]
+    fn small_scan_runs_narrower_than_a_large_one() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 64), 16, None);
+        let dispatcher = dispatch.dispatcher();
+
+        let small = dispatcher.sized_for_scan(1 << 20, false).worker_count();
+        let large = dispatcher.sized_for_scan(1 << 40, false).worker_count();
+
+        assert!(small < large);
+        assert_eq!(large, 128);
+        dispatch.exit();
+    }
+
+    #[test]
     fn single_worker_hosts_rotate_across_dispatcher_clones() {
         let dispatch = Dispatch::spin_up_groups(synthetic_groups(1, 3), 16, None);
         let first_handle = dispatch.dispatcher().clone();
@@ -599,6 +727,66 @@ mod tests {
             counts.iter().all(|&(_, c)| c == 8),
             "every key seen 8 times"
         );
+        dispatch.exit();
+    }
+
+    #[test]
+    fn scan_grouped_whole_keeps_the_pool_past_the_smallest_limit() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 64), 16, None);
+        let dispatcher = dispatch.dispatcher();
+
+        let filtered = dispatcher.sized_for_scan(100 << 20, false).worker_count();
+        let grouped = dispatcher.sized_for_scan(100 << 20, true).worker_count();
+
+        assert!(filtered < 128);
+        assert_eq!(grouped, 128);
+        dispatch.exit();
+    }
+
+    #[test]
+    fn group_by_on_a_narrowed_dispatcher_counts_every_row() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Int32Type, Int64Type};
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 4), 256, None);
+        let narrowed = dispatch.dispatcher().narrowed_to(4);
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|_| {
+                let keys: ArrayRef = Arc::new(Int32Array::from((0..100).collect::<Vec<_>>()));
+                RecordBatch::try_new(schema.clone(), vec![keys]).unwrap()
+            })
+            .collect();
+
+        let results = values_input(&narrowed, batches)
+            .record_batches()
+            .group_by_aggregate::<IntKeyExtractor<Int32Type>, Compiled<(CountSlot,), u8>>(
+                vec![0],
+                vec![AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    arrow_schema::DataType::Int64,
+                )],
+                None,
+                (),
+            )
+            .collect()
+            .unwrap();
+
+        let mut counts: Vec<(i32, i64)> = results
+            .iter()
+            .flat_map(|batch| {
+                let keys = batch.column(0).as_primitive::<Int32Type>();
+                let values = batch.column(1).as_primitive::<Int64Type>();
+                (0..batch.num_rows())
+                    .map(|i| (keys.value(i), values.value(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        counts.sort();
+        assert_eq!(counts, (0..100).map(|k| (k, 8)).collect::<Vec<_>>());
         dispatch.exit();
     }
 

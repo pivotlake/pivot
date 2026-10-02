@@ -51,7 +51,9 @@ impl<O> WorkerAwareSender<O> {
 
 impl<O: WorkerIdOutput> Sender<O> for WorkerAwareSender<O> {
     fn send(&mut self, item: O) -> channels::Result<()> {
-        let worker_idx = item.worker_id();
+        // The item names its worker by pool index; the channels are laid out
+        // by dataflow index.
+        let worker_idx = crate::worker::dataflow_worker_idx(item.worker_id(), self.senders.len());
         self.senders[worker_idx].send_ref(item)?;
         Ok(())
     }
@@ -65,7 +67,7 @@ pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(
     count: usize,
 ) -> impl IntoIterator<Item = ReturnToWorkerMpscFactory<T>> {
     let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
-        .map(|worker| mpsc_channel_to::<T>(worker))
+        .map(|worker| mpsc_channel_to::<T>(worker, count))
         .unzip();
     let senders: Arc<[MpscSender<T>]> = senders.into();
 

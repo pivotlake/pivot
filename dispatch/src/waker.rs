@@ -30,6 +30,9 @@ struct ParkSlot {
     /// (the parker on wake-up, or a notifier claiming the slot) decrements
     /// `parked_workers`.
     parked: AtomicBool,
+    /// Whether this worker holds a dataflow, as of its last park (see
+    /// [`set_holds_dataflow`](WorkerWaker::set_holds_dataflow)).
+    holds_dataflow: AtomicBool,
     /// The worker's thread handle, registered once at worker startup.
     thread: OnceLock<Thread>,
     /// Whether this worker is blocked inside its IO ring's completion wait
@@ -93,6 +96,9 @@ pub struct WorkerWaker {
     /// Number of workers currently thread-parked. The no-sleeper send path
     /// checks this before scanning slots.
     parked_workers: AtomicUsize,
+    /// Number of workers currently thread-parked while holding a dataflow:
+    /// the ones a data-availability send can usefully wake.
+    parked_dataflow_workers: AtomicUsize,
     /// Number of workers currently blocked in their IO ring wait.
     ring_parked_workers: AtomicUsize,
     slots: Box<[ParkSlot]>,
@@ -111,10 +117,12 @@ impl WorkerWaker {
             wake_count: AtomicU64::new(0),
             ring_wake_count: AtomicU64::new(0),
             parked_workers: AtomicUsize::new(0),
+            parked_dataflow_workers: AtomicUsize::new(0),
             ring_parked_workers: AtomicUsize::new(0),
             slots: (0..worker_count)
                 .map(|_| ParkSlot {
                     parked: AtomicBool::new(false),
+                    holds_dataflow: AtomicBool::new(true),
                     thread: OnceLock::new(),
                     ring_parked: AtomicBool::new(false),
                     ring_wake: OnceLock::new(),
@@ -123,6 +131,11 @@ impl WorkerWaker {
             next_wake: AtomicUsize::new(0),
             broadcast_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// How many workers this node has.
+    pub fn worker_count(&self) -> usize {
+        self.slots.len()
     }
 
     /// Register the calling thread as worker `local_idx` in this node. Must be
@@ -165,7 +178,7 @@ impl WorkerWaker {
     /// data-availability sends fire far too often to afford.
     fn wake_thread_parked_slot(&self, slot: &ParkSlot) -> bool {
         if slot.parked.swap(false, Ordering::SeqCst) {
-            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            self.count_unparked(slot);
             if let Some(thread) = slot.thread.get() {
                 thread.unpark();
             }
@@ -174,8 +187,38 @@ impl WorkerWaker {
         false
     }
 
+    /// Record whether worker `local_idx` holds a dataflow. Called by the
+    /// worker itself before it parks, so the answer stands for the whole park.
+    ///
+    /// A worker parked between dataflows has nothing a data-availability send
+    /// could give it: it can only steal within a dataflow it holds. When a
+    /// dataflow runs on part of the pool, the rest of the pool is parked that
+    /// way for the whole query, and [`notify_one`](Self::notify_one) must not
+    /// spend every send waking one of them.
+    pub fn set_holds_dataflow(&self, local_idx: usize, holds_dataflow: bool) {
+        self.slots[local_idx]
+            .holds_dataflow
+            .store(holds_dataflow, Ordering::SeqCst);
+    }
+
+    /// Count `slot`'s worker as parked.
+    fn count_parked(&self, slot: &ParkSlot) {
+        self.parked_workers.fetch_add(1, Ordering::SeqCst);
+        if slot.holds_dataflow.load(Ordering::SeqCst) {
+            self.parked_dataflow_workers.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Count `slot`'s worker as no longer parked.
+    fn count_unparked(&self, slot: &ParkSlot) {
+        self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+        if slot.holds_dataflow.load(Ordering::SeqCst) {
+            self.parked_dataflow_workers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     /// Record a data-availability notification and wake one thread-parked
-    /// worker, if any.
+    /// worker that holds a dataflow, if any.
     ///
     /// This is used when one new stealable item needs one same-node consumer.
     /// Workers blocked in their IO ring wait are deliberately not interrupted:
@@ -184,12 +227,13 @@ impl WorkerWaker {
     /// another node when they need to grow the pool-wide working set.
     pub fn notify_one(&self) -> bool {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
-        if self.parked_workers.load(Ordering::SeqCst) == 0 {
+        if self.parked_dataflow_workers.load(Ordering::SeqCst) == 0 {
             return false;
         }
         let start = self.next_wake.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.slots.len() {
-            if self.wake_thread_parked_slot(&self.slots[(start + i) % self.slots.len()]) {
+            let slot = &self.slots[(start + i) % self.slots.len()];
+            if slot.holds_dataflow.load(Ordering::SeqCst) && self.wake_thread_parked_slot(slot) {
                 return true;
             }
         }
@@ -207,12 +251,36 @@ impl WorkerWaker {
         }
     }
 
-    /// Record a notification and wake every parked worker in this node,
-    /// interrupting ring waits.
+    /// Record a notification and wake every parked worker in this node that
+    /// holds a dataflow, interrupting ring waits.
     ///
-    /// Used for events any local worker may be waiting on, such as cancellation
-    /// or a sibling counter reaching zero.
+    /// Used for events a worker running a dataflow may be waiting on, such as
+    /// cancellation or a sibling counter reaching zero. A worker parked between
+    /// dataflows waits on none of them, and when a dataflow runs on part of
+    /// the pool there are many such workers: waking them on every one of these
+    /// events would cost the notifier an unpark each, every time.
     pub fn notify(&self) {
+        self.wake_count.fetch_add(1, Ordering::SeqCst);
+        self.ring_wake_count.fetch_add(1, Ordering::SeqCst);
+        if self.parked_dataflow_workers.load(Ordering::SeqCst) == 0
+            && self.ring_parked_workers.load(Ordering::SeqCst) == 0
+        {
+            return;
+        }
+        for slot in &self.slots {
+            if slot.ring_parked.load(Ordering::SeqCst) || slot.holds_dataflow.load(Ordering::SeqCst)
+            {
+                self.wake_slot(slot);
+            }
+        }
+    }
+
+    /// Record a notification and wake every parked worker in this node,
+    /// whether or not it holds a dataflow.
+    ///
+    /// Used for what concerns the workers themselves: a new dataflow to pick
+    /// up, buffers to clean between queries, shutdown.
+    pub fn notify_including_idle(&self) {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
         self.ring_wake_count.fetch_add(1, Ordering::SeqCst);
         self.wake_all_parked();
@@ -267,7 +335,7 @@ impl WorkerWaker {
         let epoch = self.broadcast_epoch.load(Ordering::SeqCst);
         if epoch != *last_seen {
             *last_seen = epoch;
-            self.notify();
+            self.notify_including_idle();
         }
     }
 
@@ -292,18 +360,18 @@ impl WorkerWaker {
     pub fn wait_if_unchanged(&self, last_seen: u64, local_idx: usize) -> u64 {
         let slot = &self.slots[local_idx];
         slot.parked.store(true, Ordering::SeqCst);
-        self.parked_workers.fetch_add(1, Ordering::SeqCst);
+        self.count_parked(slot);
         if self.wake_count.load(Ordering::SeqCst) != last_seen {
             // Withdraw the slot unless a notifier already claimed it and
-            // decremented `parked_workers`.
+            // counted it unparked.
             if slot.parked.swap(false, Ordering::SeqCst) {
-                self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+                self.count_unparked(slot);
             }
             return self.wake_count.load(Ordering::SeqCst);
         }
         park();
         if slot.parked.swap(false, Ordering::SeqCst) {
-            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            self.count_unparked(slot);
         }
         self.wake_count.load(Ordering::SeqCst)
     }
@@ -410,11 +478,20 @@ impl WakerSet {
         }
     }
 
-    /// Wake every node group. Cheap when no workers are parked: one atomic
-    /// increment and parked-count check per node.
+    /// Wake the workers of every node group that hold a dataflow. Cheap when
+    /// none of them is parked: one atomic increment and parked-count check per
+    /// node.
     pub fn notify_all(&self) {
         for waker in self.node_wakers.iter() {
             waker.notify();
+        }
+    }
+
+    /// Wake every parked worker of every node group, including those parked
+    /// between dataflows.
+    pub fn notify_all_including_idle(&self) {
+        for waker in self.node_wakers.iter() {
+            waker.notify_including_idle();
         }
     }
 
@@ -564,6 +641,36 @@ mod tests {
         waker.notify();
         a.join().unwrap();
         b.join().unwrap();
+    }
+
+    #[test]
+    fn notify_one_leaves_a_worker_parked_between_dataflows() {
+        let waker = Arc::new(WorkerWaker::new(1));
+        waker.set_holds_dataflow(0, false);
+        let parked = park_worker(&waker, 0);
+        await_parked(&waker, 1);
+
+        let woke = waker.notify_one();
+
+        assert!(!woke);
+        waker.notify_including_idle();
+        parked.join().unwrap();
+    }
+
+    #[test]
+    fn notify_leaves_a_worker_parked_between_dataflows() {
+        let waker = Arc::new(WorkerWaker::new(2));
+        waker.set_holds_dataflow(0, false);
+        let idle = park_worker(&waker, 0);
+        let busy = park_worker(&waker, 1);
+        await_parked(&waker, 2);
+
+        waker.notify();
+        busy.join().unwrap();
+
+        assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 1);
+        waker.notify_including_idle();
+        idle.join().unwrap();
     }
 
     #[test]
