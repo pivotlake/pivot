@@ -11,8 +11,8 @@
 //!
 //! [`types`] (the table, row-group metadata, pages, requests), [`pushdown`]
 //! (static filter pushdown shared by catalog and external bindings), and
-//! [`row_group_stats`] (min/max elimination shared by static and dynamic
-//! filters) are common to both.
+//! [`row_group_stats`] (dynamic filter and scan-order adapters) are common to
+//! both. The `pruning` crate evaluates bounds for every metadata level.
 
 #![allow(rustdoc::private_intra_doc_links)]
 
@@ -53,13 +53,10 @@ pub use metadata::{FileRowGroups, create_load_and_stage_spec};
 pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
 
 mod pushdown;
-pub use pushdown::{PushedPredicate, equality_predicates, prune_parquet};
+pub use pushdown::equality_predicates;
 
 mod row_group_stats;
-pub use row_group_stats::{
-    RowGroupFilter, ScanOrder, bounds_eliminate, row_group_eliminated, row_group_filter_from,
-    scan_order_from,
-};
+pub use row_group_stats::{RowGroupFilter, ScanOrder, row_group_filter_from, scan_order_from};
 
 pub mod thrift;
 

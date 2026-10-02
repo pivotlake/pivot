@@ -5,6 +5,7 @@
 //! execution use the same captured files and schema as an ordinary catalog
 //! table scan.
 
+use ::pruning::ColumnPredicate;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use planner::expression::TableFilter;
 use planner::types::{Type, type_from_physical};
 
 use crate::{
-    ParquetTable, PushedPredicate, is_variant_field, materialize, prune_parquet,
+    FileRowGroups, ParquetTable, is_variant_field, materialize,
     table_input_with_filter_and_eq_predicates,
 };
 use object_storage::{
@@ -66,12 +67,44 @@ pub fn bind_read_parquet(
     Ok(Box::new(table))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ExternalParquetTable {
     location: String,
     columns: Vec<Column>,
-    parquet: Arc<ParquetTable>,
-    predicates: Vec<PushedPredicate>,
+    files: Arc<Vec<FileRowGroups>>,
+    predicates: Vec<ColumnPredicate>,
+}
+
+impl std::fmt::Debug for ExternalParquetTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalParquetTable")
+            .field("location", &self.location)
+            .field("columns", &self.columns)
+            .field("predicates", &self.predicates)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExternalParquetTable {
+    fn build_scan_view(&self) -> ParquetTable {
+        // Binding validates that every file has row groups. Capture the schema
+        // before pruning so a fully excluded scan still has its columns.
+        let mut parquet = ParquetTable::empty(self.files[0].row_groups()[0].schema.clone());
+        for file in self.files.iter() {
+            parquet
+                .row_groups_mut()
+                .extend(file.prune(&self.predicates));
+        }
+        parquet
+    }
+
+    fn total_rows(&self) -> i64 {
+        self.files
+            .iter()
+            .flat_map(|file| file.row_groups())
+            .map(|group| group.num_rows)
+            .sum()
+    }
 }
 
 impl BoundTable for ExternalParquetTable {
@@ -106,7 +139,7 @@ impl BoundTable for ExternalParquetTable {
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         let equality_predicates = crate::equality_predicates(&self.predicates);
-        let parquet = Arc::new(prune_parquet(&self.parquet, &self.predicates));
+        let parquet = Arc::new(self.build_scan_view());
         Ok(table_input_with_filter_and_eq_predicates(
             dispatcher,
             &parquet,
@@ -141,13 +174,13 @@ impl BoundTable for ExternalParquetTable {
         // renumber them.
         Ok(materialize(
             input,
-            Arc::new(prune_parquet(&self.parquet, &self.predicates)),
+            Arc::new(self.build_scan_view()),
             projection,
         ))
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
-        self.predicates.extend(PushedPredicate::from_filter(filter));
+        self.predicates.extend(filter.pruning_predicates());
         // Statistics and dictionaries may skip work, but the SQL filter stays
         // above the scan and remains responsible for query correctness.
         Ok(false)
@@ -157,11 +190,11 @@ impl BoundTable for ExternalParquetTable {
         if !self.predicates.is_empty() {
             return None;
         }
-        Some(self.parquet.total_rows())
+        Some(self.total_rows())
     }
 
     fn estimate_row_count(&self) -> Option<u64> {
-        Some(self.parquet.total_rows() as u64)
+        Some(self.total_rows() as u64)
     }
 }
 
@@ -173,11 +206,11 @@ fn bind_external_table(
     let selection = ParquetLocationPattern::parse(location)?;
     let store = store_factory.open(&selection.store_root)?;
     let files = selection.find_files(store.as_ref(), location)?;
-    let (columns, parquet) = load_strict_table(dispatcher, files)?;
+    let (columns, files) = load_strict_table(dispatcher, files)?;
     Ok(ExternalParquetTable {
         location: location.to_string(),
         columns,
-        parquet: Arc::new(parquet),
+        files: Arc::new(files),
         predicates: Vec::new(),
     })
 }
@@ -328,7 +361,7 @@ impl ParquetLocationPattern {
 fn load_strict_table(
     dispatcher: &DataFlowDispatcher,
     files: Vec<DataFile>,
-) -> Result<(Vec<Column>, ParquetTable), Error> {
+) -> Result<(Vec<Column>, Vec<FileRowGroups>), Error> {
     let file_order: Vec<ObjectPath> = files.iter().map(|file| file.file.path.clone()).collect();
     // No declared columns: every file column passes through as it is stored.
     let columns = crate::TableColumns::by_name(Vec::new());
@@ -344,19 +377,19 @@ fn load_strict_table(
         .get(&file_order[0])
         .expect("metadata loading returns every requested file");
     let first_schema = &first
-        .row_groups
+        .row_groups()
         .first()
         .ok_or_else(|| Error::NoRowGroups(first_path.clone()))?
         .schema;
     let expected = columns_from_schema(first_schema)?;
-    let mut row_groups = Vec::new();
+    let mut ordered_files = Vec::with_capacity(file_order.len());
     for path in file_order {
         let loaded = loaded_by_path
             .remove(&path)
             .expect("metadata loading returns every requested file");
         let file_path = path.to_string();
         let file_schema = &loaded
-            .row_groups
+            .row_groups()
             .first()
             .ok_or_else(|| Error::NoRowGroups(file_path.clone()))?
             .schema;
@@ -369,9 +402,9 @@ fn load_strict_table(
                 actual,
             });
         }
-        row_groups.extend(loaded.row_groups);
+        ordered_files.push(loaded);
     }
-    Ok((expected, ParquetTable::new(row_groups)))
+    Ok((expected, ordered_files))
 }
 
 fn columns_from_schema(schema: &arrow_schema::Schema) -> Result<Vec<Column>, Error> {

@@ -10,7 +10,9 @@ use crate::thrift::general::{Encoding, PageType};
 use crate::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::types::columns::{ColumnResolution, TableColumns};
 use crate::types::leaves::leaf_count;
-use crate::types::metadata::{ColumnChunkMeta, FileLeafStatistics, RowGroupMetadata};
+use crate::types::metadata::{
+    ColumnChunkMeta, DecodedLeafStatistics, FileStatistics, RowGroupMetadata,
+};
 use arrow_array::builder::{BinaryViewBuilder, StringViewBuilder};
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
@@ -94,6 +96,16 @@ impl ParquetTable {
         Self { row_groups, schema }
     }
 
+    /// An empty table carrying `schema`, for a scan whose row groups were all
+    /// pruned before any footer was read: it holds no data yet still shapes an
+    /// empty result with the right columns.
+    pub fn empty(schema: SchemaRef) -> Self {
+        Self {
+            row_groups: Vec::new(),
+            schema,
+        }
+    }
+
     /// Read-only view of this table's row groups.
     pub fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
         &self.row_groups
@@ -145,8 +157,8 @@ impl ParquetTable {
         )
         .map_err(|e| Error::Materialize(e.to_string()))?;
         let row_groups = loaded
-            .iter()
-            .flat_map(|f| f.row_groups.iter().cloned())
+            .into_iter()
+            .flat_map(crate::FileRowGroups::into_row_groups)
             .collect();
         Ok(Self::new(row_groups))
     }
@@ -314,7 +326,7 @@ pub(crate) fn row_groups_from_metadata(
     }
 
     let row_counts: Vec<i64> = row_groups.iter().map(|(num_rows, _)| *num_rows).collect();
-    let statistics = Arc::new(
+    let statistics = Arc::new(FileStatistics::new(
         leaf_sources
             .iter()
             .enumerate()
@@ -327,7 +339,9 @@ pub(crate) fn row_groups_from_metadata(
                 LeafSource::Absent => Some(absent_leaf_statistics(&row_counts)),
             })
             .collect::<Vec<_>>(),
-    );
+        &row_counts,
+        schema.fields(),
+    ));
 
     Ok(row_groups
         .into_iter()
@@ -346,8 +360,8 @@ pub(crate) fn row_groups_from_metadata(
 
 /// The statistics of a leaf the file has no chunk for: every row is NULL, so
 /// each row group's null count is its row count and there are no bounds.
-fn absent_leaf_statistics(row_counts: &[i64]) -> FileLeafStatistics {
-    FileLeafStatistics {
+fn absent_leaf_statistics(row_counts: &[i64]) -> DecodedLeafStatistics {
+    DecodedLeafStatistics {
         min: None,
         max: None,
         null_counts: row_counts.iter().map(|rows| Some(*rows)).collect(),
@@ -478,7 +492,7 @@ fn data_pages_all_dictionary(encoding_stats: Option<&[PageEncodingStats]>) -> bo
 }
 
 /// Decode one leaf's Parquet `Statistics` across a file's row groups into the
-/// column-wise [`FileLeafStatistics`], using `data_type` to choose the physical-bytes
+/// column-wise [`DecodedLeafStatistics`], using `data_type` to choose the physical-bytes
 /// to Arrow conversion. `physical_type` disambiguates a decimal's byte encoding,
 /// which follows the column's physical storage rather than its arrow type.
 ///
@@ -489,7 +503,7 @@ fn decode_leaf_statistics(
     chunks: Vec<Option<Statistics>>,
     data_type: &DataType,
     physical_type: i32,
-) -> Option<FileLeafStatistics> {
+) -> Option<DecodedLeafStatistics> {
     let mut min_bytes = Vec::with_capacity(chunks.len());
     let mut max_bytes = Vec::with_capacity(chunks.len());
     let mut null_counts = Vec::with_capacity(chunks.len());
@@ -515,7 +529,7 @@ fn decode_leaf_statistics(
     if !recorded {
         return None;
     }
-    Some(FileLeafStatistics {
+    Some(DecodedLeafStatistics {
         min: decode_bounds(&min_bytes, data_type, physical_type),
         max: decode_bounds(&max_bytes, data_type, physical_type),
         null_counts,
@@ -1461,9 +1475,11 @@ mod tests {
                 .windows(2)
                 .all(|pair| Arc::ptr_eq(&pair[0].statistics, &pair[1].statistics))
         );
-        let file_stats = table.row_groups[0].statistics[0].as_ref().unwrap();
-        assert_eq!(file_stats.min.as_ref().unwrap().len(), 3);
-        assert_eq!(file_stats.max.as_ref().unwrap().len(), 3);
+        let file_stats = table.row_groups[0].statistics.bounds.column_stats()[&0]
+            .primitive()
+            .unwrap();
+        assert_eq!(file_stats.lower.as_ref().unwrap().len(), 3);
+        assert_eq!(file_stats.upper.as_ref().unwrap().len(), 3);
 
         let bounds: Vec<(i64, i64)> = table
             .row_groups
@@ -1640,7 +1656,7 @@ mod tests {
         .unwrap();
         let row_groups = loaded
             .into_iter()
-            .flat_map(|file| file.row_groups)
+            .flat_map(|file| file.into_row_groups())
             .collect();
         Arc::new(ParquetTable::new(row_groups))
     }

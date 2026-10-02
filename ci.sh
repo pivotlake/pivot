@@ -17,7 +17,7 @@ set -uo pipefail
 # The crates CI checks and the checks it runs. Edit these in one place; both the
 # local run-all and the CI matrix follow. Every workspace member is listed, so a
 # change to one cannot pass CI without its own tests, lints and docs running.
-CRATES=(dispatch planner duckdb-planner catalog datastore-pivotlake datastore-iceberg
+CRATES=(pruning dispatch planner duckdb-planner catalog datastore-pivotlake datastore-iceberg
         metastore-disk object-storage parquet-engine benchmarks bin)
 CHECKS=(fmt clippy test doc)
 

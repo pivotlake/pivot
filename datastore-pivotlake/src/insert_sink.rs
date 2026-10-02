@@ -19,8 +19,7 @@ use planner::catalog::Column;
 use uuid::Uuid;
 
 use crate::CatalogTable;
-use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
-use parquet_engine::RowGroupMetadata;
+use object_storage::{DataFileLocation, ObjectPath, ObjectStore};
 use parquet_engine::writing::{AssembledFile, encode_record_batches_spec, unshred_batches_spec};
 
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
@@ -155,14 +154,12 @@ where
 
 /// One finished upload waiting to be committed, drained from `uploaded_files` by
 /// whoever owns it (a statement's transaction, or compaction). Its consumer
-/// builds the `DeltaFileEntry` (from `file`/`partition`) and
-/// `TableFile` (from `file`/`row_groups`) it commits. Carries the table's durable
-/// id, not its name, so the commit resolves the live table regardless of a rename.
+/// pairs the footer with its partition values to build the `TableFile` it commits.
+/// Carries the table's durable id, so a rename does not change the commit target.
 pub(crate) struct UploadedFile {
     pub table_id: Uuid,
-    pub file: FileRef,
+    pub footer: parquet_engine::FileRowGroups,
     pub partition: Option<crate::PartitionValues>,
-    pub row_groups: Vec<Arc<RowGroupMetadata>>,
 }
 
 pub(super) struct UploadFactory {
@@ -285,9 +282,8 @@ impl Upload {
         // Delta only after the whole dataflow has succeeded.
         self.uploaded_files.push(UploadedFile {
             table_id: self.table_id,
-            file: pending.file,
+            footer: loaded,
             partition: pending.partition,
-            row_groups: loaded.row_groups,
         });
         // Relaxed: the finish barrier (AcqRel on the sibling counter) publishes
         // this add to whichever worker reads the total.

@@ -1,12 +1,12 @@
 //! The catalog's in-memory projection of one Delta table snapshot.
 
+use ::pruning::ColumnPredicate;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Error;
-use crate::manifest::{
-    ColumnStatFilter, DeltaFileEntry, FileStats, PartitionEqFilter, PartitionValues, scalar_equal,
-};
+use crate::manifest::{DeltaFileEntry, FileStats, PartitionValues, scalar_equal};
+use ::pruning::StatisticsBatch;
 use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::DataType;
@@ -14,7 +14,7 @@ use catalog::datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, Datasto
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{DataFlowDispatcher, Projection};
 use object_storage::{self, DataFile, FileRef, ObjectPath, ObjectStore};
-use parquet_engine::{ParquetTable, RowGroupMetadata};
+use parquet_engine::{FileRowGroups, ParquetTable};
 use planner::catalog::{Column, SchemaQualifiedTableName};
 
 /// One data file of a table, materialized: its Delta log entry
@@ -25,24 +25,25 @@ use planner::catalog::{Column, SchemaQualifiedTableName};
 #[derive(Clone)]
 pub struct TableFile {
     pub(super) entry: DeltaFileEntry,
-    pub(super) row_groups: Vec<Arc<RowGroupMetadata>>,
+    pub(super) footer: FileRowGroups,
 }
 
 impl TableFile {
-    /// Pair a file's Delta log entry with the row groups read from its footer.
-    /// The footer fetcher builds one with a bare [`DeltaFileEntry::new`] (identity
-    /// only); the catalog then joins in the log entry's partition/stats.
+    /// Pair a file's Delta log entry with its parsed footer. Newly adopted
+    /// files start with [`DeltaFileEntry::new`]; reloaded files keep the log's
+    /// partition values and statistics.
     ///
     /// Derive the file's stats from its footers when the entry carries none, so
     /// file-level range pruning always has min/max bounds. Usually the entry
-    /// already has them -- a fresh INSERT records them, and a reload reads the
-    /// log's persisted stats -- so this covers only a file with neither: one
-    /// adopted at CREATE, or whose log entry recorded no stats.
-    pub(crate) fn new(mut entry: DeltaFileEntry, row_groups: Vec<Arc<RowGroupMetadata>>) -> Self {
-        if entry.stats.is_none() && !row_groups.is_empty() {
-            entry.stats = Some(Arc::new(parquet_engine::aggregate_file_stats(&row_groups)));
+    /// has them on reload. Freshly written files and files adopted at CREATE
+    /// derive them here before the entry is committed to the log.
+    pub(crate) fn new(mut entry: DeltaFileEntry, footer: FileRowGroups) -> Self {
+        if entry.stats.is_none() {
+            entry.stats = Some(Arc::new(parquet_engine::aggregate_file_stats(
+                footer.row_groups(),
+            )));
         }
-        Self { entry, row_groups }
+        Self { entry, footer }
     }
 
     /// The file's store identity (path and size), for a caller that names the
@@ -54,7 +55,8 @@ impl TableFile {
 
     /// What this file's bytes hold decoded, summed over its column chunks.
     fn uncompressed_size(&self) -> u64 {
-        self.row_groups
+        self.footer
+            .row_groups()
             .iter()
             .flat_map(|row_group| row_group.columns.iter())
             .map(|chunk| chunk.total_uncompressed_size.max(0) as u64)
@@ -94,6 +96,8 @@ pub struct CatalogTable {
     /// The active files: each a log entry (identity + partition + stats) paired
     /// with its materialized footers.
     pub(super) files: Vec<TableFile>,
+    /// Same row order as `files`; immutable buffers shared by snapshot clones.
+    file_statistics: Arc<StatisticsBatch>,
     /// The files the log retired but still remembers, each by the Unix ms its
     /// commit retired it: what vacuum ages a retired file by, so the retention
     /// window runs from the moment the file stopped being referenced rather
@@ -134,7 +138,13 @@ impl CatalogTable {
         dispatcher: DataFlowDispatcher,
         engine: crate::log::DeltaEngine,
     ) -> Self {
+        let file_statistics = Arc::new(crate::pruning::file_statistics(
+            &columns,
+            &partition_by,
+            files.iter().map(|file| &file.entry),
+        ));
         Self {
+            file_statistics,
             id,
             location,
             snapshot,
@@ -171,7 +181,7 @@ impl CatalogTable {
         // derives its stats from the footers.
         let mut files: Vec<TableFile> = loaded
             .into_iter()
-            .map(|file| TableFile::new(DeltaFileEntry::new(file.file), file.row_groups))
+            .map(|file| TableFile::new(DeltaFileEntry::new(file.file.clone()), file))
             .collect();
         // For a partitioned table, a discovered file whose partition columns are
         // constant belongs to that partition; stamp it from the file's stats so it
@@ -198,7 +208,13 @@ impl CatalogTable {
             &sort_by,
             &entries,
         )?;
+        let file_statistics = Arc::new(crate::pruning::file_statistics(
+            &columns,
+            &partition_by,
+            files.iter().map(|file| &file.entry),
+        ));
         Ok(Self {
+            file_statistics,
             id,
             location,
             snapshot,
@@ -239,7 +255,7 @@ impl CatalogTable {
         // Reconcile the files first: it is the only step that can fail, and it
         // leaves this copy untouched when it does, so a copy never ends up at a
         // version whose files it does not hold.
-        self.rebuild_files(file_entries, &columns)?;
+        self.rebuild_files(file_entries, &columns, &partition_by)?;
         self.snapshot = snapshot;
         self.columns = columns;
         self.partition_by = partition_by;
@@ -257,6 +273,15 @@ impl CatalogTable {
         self.files
             .retain(|file| !removed.contains(&file.entry.file.path));
         self.files.extend(added);
+        self.rebuild_statistics();
+    }
+
+    fn rebuild_statistics(&mut self) {
+        self.file_statistics = Arc::new(crate::pruning::file_statistics(
+            &self.columns,
+            &self.partition_by,
+            self.files.iter().map(|file| &file.entry),
+        ));
     }
 
     /// Commit file changes against this copy's snapshot. Each attempt first
@@ -312,8 +337,7 @@ impl CatalogTable {
                 data_change,
             )? {
                 self.snapshot = committed;
-                self.files.retain(|f| !removed.contains(&f.entry.file.path));
-                self.files.extend(added);
+                self.apply_file_swap(removed, added);
                 self.record_retirements(removed, retired_at_ms);
                 return Ok(());
             }
@@ -389,25 +413,24 @@ impl CatalogTable {
                 // whole before this copy moves onto the committed version, so a
                 // failed read leaves it where it was rather than at a version
                 // whose files it does not hold.
-                let mut footers: HashMap<ObjectPath, Vec<Arc<RowGroupMetadata>>> = self
+                let mut footers: HashMap<ObjectPath, FileRowGroups> = self
                     .fetch_footers(added, &self.columns)?
                     .into_iter()
-                    .map(|f| (f.file.path.clone(), f.row_groups))
+                    .map(|f| (f.file.path.clone(), f))
                     .collect();
                 let mut committed_files = Vec::with_capacity(added.len());
                 for entry in added {
-                    let row_groups =
+                    let footer =
                         footers
                             .remove(&entry.file.path)
                             .ok_or_else(|| Error::FooterNotLoaded {
                                 location: self.location.as_str().to_string(),
                                 file: entry.file.path.as_str().to_string(),
                             })?;
-                    committed_files.push(TableFile::new(entry.clone(), row_groups));
+                    committed_files.push(TableFile::new(entry.clone(), footer));
                 }
                 self.snapshot = committed;
-                self.files.retain(|f| !removed.contains(&f.entry.file.path));
-                self.files.extend(committed_files);
+                self.apply_file_swap(removed, committed_files);
                 self.record_retirements(removed, retired_at_ms);
                 return Ok(());
             }
@@ -428,6 +451,7 @@ impl CatalogTable {
         &mut self,
         entries: Vec<DeltaFileEntry>,
         columns: &[Column],
+        partition_by: &[String],
     ) -> crate::Result<()> {
         let held: HashMap<&ObjectPath, &TableFile> = self
             .files
@@ -439,16 +463,16 @@ impl CatalogTable {
             .filter(|entry| !held.contains_key(&entry.file.path))
             .cloned()
             .collect();
-        let mut fetched: HashMap<ObjectPath, Vec<Arc<RowGroupMetadata>>> = self
+        let mut fetched: HashMap<ObjectPath, FileRowGroups> = self
             .fetch_footers(&to_fetch, columns)?
             .into_iter()
-            .map(|f| (f.file.path.clone(), f.row_groups))
+            .map(|f| (f.file.path.clone(), f))
             .collect();
 
         let mut files = Vec::with_capacity(entries.len());
         for entry in entries {
-            let row_groups = match held.get(&entry.file.path) {
-                Some(held_file) => held_file.row_groups.clone(),
+            let footer = match held.get(&entry.file.path) {
+                Some(held_file) => held_file.footer.clone(),
                 None => fetched
                     .remove(&entry.file.path)
                     .ok_or_else(|| Error::FooterNotLoaded {
@@ -456,9 +480,15 @@ impl CatalogTable {
                         file: entry.file.path.as_str().to_string(),
                     })?,
             };
-            files.push(TableFile::new(entry, row_groups));
+            files.push(TableFile::new(entry, footer));
         }
+        let statistics = crate::pruning::file_statistics(
+            columns,
+            partition_by,
+            files.iter().map(|file| &file.entry),
+        );
         self.files = files;
+        self.file_statistics = Arc::new(statistics);
         Ok(())
     }
 
@@ -564,7 +594,7 @@ impl CatalogTable {
             total_rows: self
                 .files
                 .iter()
-                .flat_map(|file| file.row_groups.iter())
+                .flat_map(|file| file.footer.row_groups().iter())
                 .map(|row_group| row_group.num_rows.max(0) as u64)
                 .sum(),
             bytes: self.files.iter().map(|file| file.entry.file.size).sum(),
@@ -586,7 +616,11 @@ impl CatalogTable {
             .collect();
 
         let mut totals = vec![(0, 0); self.columns.len()];
-        for row_group in self.files.iter().flat_map(|file| file.row_groups.iter()) {
+        for row_group in self
+            .files
+            .iter()
+            .flat_map(|file| file.footer.row_groups().iter())
+        {
             let mut leaf = 0;
             for field in row_group.schema.fields() {
                 let leaves = parquet_engine::leaf_count(field);
@@ -639,7 +673,7 @@ impl CatalogTable {
             .files
             .iter()
             .filter(|f| want.contains(&f.entry.file.path))
-            .flat_map(|f| f.row_groups.iter().cloned())
+            .flat_map(|f| f.footer.row_groups().iter().cloned())
             .collect();
         Arc::new(ParquetTable::new(row_groups))
     }
@@ -736,39 +770,47 @@ impl CatalogTable {
         self.snapshot.version()
     }
 
-    /// A flat scan view of the files a query's pushed-down predicates cannot rule
-    /// out — every surviving file's row groups concatenated in manifest order,
-    /// where a row group's global index is simply its position. A file survives
-    /// when its recorded partition tuple can still match every `partition_filters`
-    /// *and* its Parquet stats can still match every `stat_filters`. Empty filters
-    /// keep every file.
-    ///
-    /// Read-only: it is built entirely from the row groups this copy already
-    /// holds, so it does **no** I/O. Every surviving file's footer must have
-    /// been fetched (the refresh path keeps `files` synced to the manifest); a
-    /// missing one is an error, never a silently narrower scan.
-    ///
-    /// The row group's global index is its position in this returned flat list, so
-    /// a scan and its materialize must build it from the *same* filters (they do:
-    /// both go through the binding's predicates) to address the same groups.
+    /// Evaluate the captured snapshot's partition, file, and row-group bounds.
+    /// This performs no I/O and preserves file order and file-local group order.
+    /// Scan and materialization use the same predicates and snapshot so their
+    /// global row-group positions agree, even when some or all groups are pruned.
     pub fn build_scan_view(
         &self,
-        partition_filters: &[PartitionEqFilter],
-        stat_filters: &[ColumnStatFilter],
+        predicates: &[ColumnPredicate],
     ) -> crate::Result<Arc<ParquetTable>> {
-        let mut row_groups = Vec::new();
-        for file in self
+        let keep = self.file_statistics.prune(predicates)?;
+        let row_groups: Vec<_> = self
             .files
             .iter()
-            .filter(|f| {
-                f.entry
-                    .maybe_matches_partition(&self.partition_by, partition_filters)
-            })
-            .filter(|f| f.entry.maybe_matches_stats(stat_filters))
-        {
-            row_groups.extend(file.row_groups.iter().cloned());
-        }
-        Ok(Arc::new(ParquetTable::new(row_groups)))
+            .enumerate()
+            .filter(|(row, _)| keep.value(*row))
+            .flat_map(|(_, file)| file.footer.prune(predicates))
+            .collect();
+        let parquet = if row_groups.is_empty() {
+            let schema = self
+                .files
+                .iter()
+                .find_map(|file| file.footer.row_groups().first())
+                .map(|group| group.schema.clone())
+                .unwrap_or_else(|| {
+                    Arc::new(arrow_schema::Schema::new(
+                        self.columns
+                            .iter()
+                            .map(|column| {
+                                arrow_schema::Field::new(
+                                    &column.name,
+                                    planner::types::physical_arrow_type(&column.col_type),
+                                    true,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                });
+            ParquetTable::empty(schema)
+        } else {
+            ParquetTable::new(row_groups)
+        };
+        Ok(Arc::new(parquet))
     }
 
     /// The table's columns (schema), as the planner's [`Column`]s.
@@ -793,7 +835,7 @@ impl CatalogTable {
     fn column_may_hold_nulls(&self, name: &str) -> bool {
         self.files
             .iter()
-            .flat_map(|file| file.row_groups.iter())
+            .flat_map(|file| file.footer.row_groups().iter())
             .any(|rg| match rg.schema.index_of(name) {
                 Ok(field_idx) => rg.column_may_hold_nulls(field_idx),
                 Err(_) => true,
@@ -886,20 +928,14 @@ impl CatalogTable {
                 Steal::Success(uploaded) => {
                     // table_id is ignored: this table is the commit target.
                     let super::insert_sink::UploadedFile {
-                        file,
-                        partition,
-                        row_groups,
-                        ..
+                        footer, partition, ..
                     } = uploaded;
-                    let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
-                        &row_groups,
-                    )));
                     let entry = DeltaFileEntry {
-                        file,
+                        file: footer.file.clone(),
                         partition,
-                        stats,
+                        stats: None,
                     };
-                    added.push(TableFile::new(entry, row_groups));
+                    added.push(TableFile::new(entry, footer));
                 }
                 Steal::Retry => continue,
                 Steal::Empty => break,

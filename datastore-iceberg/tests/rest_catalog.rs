@@ -5,26 +5,32 @@
 //! planner, exactly as a query would. Every test skips when Docker is not
 //! reachable, like the other object-store tests.
 
+mod support;
+use support::ReadLog;
+
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{ArrowPrimitiveType, Float64Type, Int64Type};
-use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{Datastore, PivotCatalog};
 use datastore_iceberg::{IcebergCatalogConfig, IcebergDatastore};
 use dispatch::{DataFlowDispatcher, Dispatch};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{
-    DataFile, DataFileFormat, FormatVersion, Literal, ManifestList, ManifestListWriter,
-    ManifestWriterBuilder, NestedField, NestedFieldRef, Operation, PartitionKey, PrimitiveType,
-    Schema, Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary, Transform, Type,
-    UnboundPartitionSpec,
+    DataFile, DataFileFormat, Datum, FormatVersion, Literal, ManifestList, ManifestListWriter,
+    ManifestWriterBuilder, NestedField, NestedFieldRef, Operation, PartitionKey, PrimitiveLiteral,
+    PrimitiveType, Schema, Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary,
+    Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::transform::create_transform_function;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
@@ -57,8 +63,8 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The REST fixture, the writer's view of it, and the pool the reads run on.
-/// One per test binary: the fixture takes seconds to come up, and every test
-/// isolates itself in a namespace of its own.
+/// One per test binary. Tests serialize their use of the catalog because a
+/// refresh or system-table listing observes every test's namespaces.
 struct Harness {
     _fixture: Container<GenericImage>,
     catalog_uri: String,
@@ -67,9 +73,33 @@ struct Harness {
     dispatch: Dispatch,
 }
 
-fn harness() -> Option<&'static Harness> {
-    static HARNESS: OnceLock<Option<Harness>> = OnceLock::new();
-    HARNESS.get_or_init(start).as_ref()
+/// Stop background refreshes when a test releases its catalog.
+struct TestCatalog(PivotCatalog);
+
+impl Deref for TestCatalog {
+    type Target = PivotCatalog;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for TestCatalog {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn harness() -> Option<MutexGuard<'static, Harness>> {
+    static HARNESS: OnceLock<Option<Mutex<Harness>>> = OnceLock::new();
+    HARNESS
+        .get_or_init(|| start().map(Mutex::new))
+        .as_ref()
+        .map(|harness| {
+            harness
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
 }
 
 /// Bring the fixture up against the harness's MinIO, or `None` (with a note)
@@ -92,7 +122,9 @@ fn start() -> Option<Harness> {
 
     let fixture = GenericImage::new("apache/iceberg-rest-fixture", "1.9.1")
         .with_exposed_port(ContainerPort::Tcp(8181))
-        .with_wait_for(WaitFor::message_on_stdout("Started"))
+        .with_wait_for(WaitFor::message_on_stderr("Started Server@"))
+        // The fixture's connection pool needs a database shared by connections.
+        .with_env_var("CATALOG_URI", "jdbc:sqlite:/tmp/iceberg-catalog.db")
         .with_env_var("CATALOG_WAREHOUSE", WAREHOUSE)
         .with_env_var("CATALOG_IO__IMPL", "org.apache.iceberg.aws.s3.S3FileIO")
         .with_env_var(
@@ -104,13 +136,7 @@ fn start() -> Option<Harness> {
         .with_env_var("AWS_SECRET_ACCESS_KEY", &secret_key)
         .with_env_var("AWS_REGION", &region)
         .with_host("host.docker.internal", Host::HostGateway);
-    let fixture = match fixture.start() {
-        Ok(fixture) => fixture,
-        Err(error) => {
-            eprintln!("[rest_catalog] skipping: REST fixture unavailable: {error}");
-            return None;
-        }
-    };
+    let fixture = fixture.start().expect("start the Iceberg REST fixture");
     let port = fixture.get_host_port_ipv4(8181.tcp()).unwrap();
     let catalog_uri = format!("http://localhost:{port}");
     wait_for_catalog(&catalog_uri);
@@ -121,7 +147,7 @@ fn start() -> Option<Harness> {
         .build()
         .unwrap();
     let writer = runtime
-        .block_on(
+        .block_on(async {
             RestCatalogBuilder::default()
                 .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
                     customized_credential_load: None,
@@ -136,8 +162,9 @@ fn start() -> Option<Harness> {
                         ("s3.region".to_string(), region),
                         ("s3.path-style-access".to_string(), "true".to_string()),
                     ]),
-                ),
-        )
+                )
+                .await
+        })
         .expect("build the writer catalog");
     Some(Harness {
         _fixture: fixture,
@@ -207,24 +234,24 @@ impl Harness {
         namespace
     }
 
-    /// A namespace of the test's own with one table, partitioned by the
-    /// identity of the field `partition_field_id` under the field's name.
+    /// A namespace of the test's own with one table, partitioned by
+    /// `transform` of the field `partition_field_id`, the partition field
+    /// named `partition_name`.
     fn partitioned_namespace(
         &self,
         name: &str,
         table: &str,
         schema: Schema,
         partition_field_id: i32,
+        partition_name: &str,
+        transform: Transform,
     ) -> NamespaceIdent {
         let namespace = NamespaceIdent::new(name.to_string());
         self.block_on(self.writer.create_namespace(&namespace, HashMap::new()))
             .expect("create namespace");
-        let field_name = schema
-            .name_by_field_id(partition_field_id)
-            .expect("the partition field is in the schema")
-            .to_string();
         let spec = UnboundPartitionSpec::builder()
-            .add_partition_field(partition_field_id, field_name, Transform::Identity)
+            .with_spec_id(0)
+            .add_partition_field(partition_field_id, partition_name, transform)
             .unwrap()
             .build();
         let creation = TableCreation::builder()
@@ -258,18 +285,35 @@ impl Harness {
     /// snapshot, the way an engine appends. The batch's schema is the arrow
     /// form of the table's current schema.
     fn append(&self, namespace: &NamespaceIdent, table: &str, batch: RecordBatch) {
-        self.append_to_partition(namespace, table, batch, None);
+        self.append_to_partition(namespace, table, batch, None, WriterProperties::default());
+    }
+
+    /// [`append`](Self::append), writing the file in row groups of
+    /// `rows_per_group` rows, so one file holds several row groups with
+    /// footer statistics of their own.
+    fn append_in_row_groups(
+        &self,
+        namespace: &NamespaceIdent,
+        table: &str,
+        batch: RecordBatch,
+        rows_per_group: usize,
+    ) {
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_group))
+            .build();
+        self.append_to_partition(namespace, table, batch, None, properties);
     }
 
     /// [`append`](Self::append) into the partition whose values are
     /// `partition`, for a partitioned table; every row of `batch` must belong
-    /// to it.
+    /// to it. The files are written with `properties`.
     fn append_to_partition(
         &self,
         namespace: &NamespaceIdent,
         table: &str,
         batch: RecordBatch,
         partition: Option<Vec<Option<Literal>>>,
+        properties: WriterProperties,
     ) {
         let table = self.load(namespace, table);
         let partition_key = partition.map(|values| {
@@ -280,7 +324,9 @@ impl Harness {
             )
         });
         self.block_on(async {
-            let files = self.write_data_files(&table, batch, partition_key).await;
+            let files = self
+                .write_data_files(&table, batch, partition_key, properties)
+                .await;
             let transaction = Transaction::new(&table);
             let transaction = transaction
                 .fast_append()
@@ -298,14 +344,17 @@ impl Harness {
         table: &Table,
         batch: RecordBatch,
         partition_key: Option<PartitionKey>,
+        properties: WriterProperties,
     ) -> Vec<DataFile> {
         let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
-        let file_name_generator =
-            DefaultFileNameGenerator::new("part".to_string(), None, DataFileFormat::Parquet);
-        let parquet_writer = ParquetWriterBuilder::new(
-            WriterProperties::default(),
-            table.metadata().current_schema().clone(),
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let file_name_generator = DefaultFileNameGenerator::new(
+            format!("part-{}", NEXT_FILE.fetch_add(1, Ordering::Relaxed)),
+            None,
+            DataFileFormat::Parquet,
         );
+        let parquet_writer =
+            ParquetWriterBuilder::new(properties, table.metadata().current_schema().clone());
         let rolling_writer = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_writer,
             table.file_io().clone(),
@@ -365,7 +414,10 @@ impl Harness {
                         .unwrap();
                 }
             }
-            for data_file in self.write_data_files(&loaded, merged, None).await {
+            for data_file in self
+                .write_data_files(&loaded, merged, None, WriterProperties::default())
+                .await
+            {
                 writer.add_file(data_file, sequence_number).unwrap();
             }
             let manifest = writer.write_manifest_file().await.unwrap();
@@ -457,9 +509,30 @@ impl Harness {
         .expect("update the table's schema");
     }
 
+    fn set_partition_spec(
+        &self,
+        namespace: &NamespaceIdent,
+        table: &str,
+        spec: UnboundPartitionSpec,
+    ) {
+        ureq::post(&format!(
+            "{}/v1/namespaces/{}/tables/{table}",
+            self.catalog_uri,
+            namespace.to_url_string()
+        ))
+        .send_json(serde_json::json!({
+            "requirements": [],
+            "updates": [
+                {"action": "add-spec", "spec": spec},
+                {"action": "set-default-spec", "spec-id": -1}
+            ]
+        }))
+        .expect("update the table's partition spec");
+    }
+
     /// The Pivot side: a fresh datastore over the fixture, served as the
     /// default datastore of a one-datastore catalog, with a planner over it.
-    fn pivot(&self) -> (Arc<PivotCatalog>, Planner) {
+    fn pivot(&self) -> (TestCatalog, Planner) {
         self.pivot_with(HashMap::new(), Arc::new(AmbientExternalStoreFactory))
     }
 
@@ -470,7 +543,7 @@ impl Harness {
         &self,
         properties: HashMap<String, String>,
         store_factory: Arc<dyn ExternalStoreFactory>,
-    ) -> (Arc<PivotCatalog>, Planner) {
+    ) -> (TestCatalog, Planner) {
         let config = IcebergCatalogConfig {
             uri: self.catalog_uri.clone(),
             properties,
@@ -496,7 +569,7 @@ impl Harness {
         let planner =
             Planner::from_datastore_names(vec![DATASTORE.to_string()], DATASTORE.to_string())
                 .unwrap();
-        (Arc::new(catalog), planner)
+        (TestCatalog(catalog), planner)
     }
 
     fn query(&self, catalog: &PivotCatalog, planner: &mut Planner, sql: &str) -> Vec<RecordBatch> {
@@ -657,6 +730,44 @@ fn orders(ids: &[i64], customers: &[&str], amounts: &[f64]) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+/// `id BIGINT NOT NULL, at TIMESTAMP`, with field ids 1..2.
+fn events_schema() -> Schema {
+    schema(
+        0,
+        vec![
+            field(1, "id", PrimitiveType::Long),
+            field(2, "at", PrimitiveType::Timestamp),
+        ],
+    )
+}
+
+/// Rows of [`events_schema`], `at` in microseconds since the epoch, in its
+/// arrow form ready for the iceberg writer.
+fn events(ids: &[i64], at_micros: &[i64]) -> RecordBatch {
+    let schema = Arc::new(schema_to_arrow_schema(&events_schema()).unwrap());
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(TimestampMicrosecondArray::from(at_micros.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+/// The bucket `transform`, a bucket transform, puts `id` in.
+fn bucket_of(transform: &Transform, id: i64) -> i32 {
+    let bucket = create_transform_function(transform)
+        .unwrap()
+        .transform_literal(&Datum::long(id))
+        .unwrap()
+        .expect("a long has a bucket");
+    let PrimitiveLiteral::Int(bucket) = *bucket.literal() else {
+        panic!("a bucket is an int");
+    };
+    bucket
 }
 
 fn total_rows(batches: &[RecordBatch]) -> usize {
@@ -879,10 +990,11 @@ fn a_column_with_an_initial_default_refuses_the_table_by_name() {
             ),
         ],
     );
-    let _namespace = harness.v3_namespace("defaults", "orders", scored);
+    let namespace = harness.v3_namespace("defaults", "orders", scored);
     let (catalog, mut planner) = harness.pivot();
 
     let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM defaults.orders");
+    harness.drop_table(&namespace, "orders");
 
     assert!(
         error.contains("score") && error.contains("initial default"),
@@ -913,6 +1025,63 @@ fn a_query_over_only_a_newer_column_returns_null_for_older_files() {
 
     assert_eq!(int64_column(&batches, 0), [Some(2)]);
     assert_eq!(int64_column(&batches, 1), [Some(0)]);
+}
+
+#[test]
+fn a_predicate_on_an_added_column_keeps_the_files_that_predate_it() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("evolved", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    let mut fields = orders_schema().as_struct().fields().to_vec();
+    fields.push(field(4, "score", PrimitiveType::Long));
+    let widened = schema(1, fields);
+    harness.set_schema(&namespace, "orders", &widened);
+    let widened_arrow = Arc::new(schema_to_arrow_schema(&widened).unwrap());
+    harness.append(
+        &namespace,
+        "orders",
+        RecordBatch::try_new(
+            widened_arrow,
+            vec![
+                Arc::new(Int64Array::from(vec![3])),
+                Arc::new(StringArray::from(vec!["cy"])),
+                Arc::new(Float64Array::from(vec![3.0])),
+                Arc::new(Int64Array::from(vec![9])),
+            ],
+        )
+        .unwrap(),
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    // The first file's manifest knows nothing of `score`: no bound and no
+    // null count. It reads as NULL there, so a comparison finds only the
+    // newer file's row, IS NULL finds the older rows, and the extremes come
+    // from the one file that holds the column.
+    let above = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM evolved.orders WHERE score > 5",
+    );
+    let missing = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM evolved.orders WHERE score IS NULL ORDER BY id",
+    );
+    let extremes = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT min(score), max(score), count(score) FROM evolved.orders",
+    );
+
+    assert_eq!(int64_column(&above, 0), [Some(3)]);
+    assert_eq!(int64_column(&missing, 0), [Some(1), Some(2)]);
+    assert_eq!(int64_column(&extremes, 0), [Some(9)]);
+    assert_eq!(int64_column(&extremes, 1), [Some(9)]);
+    assert_eq!(int64_column(&extremes, 2), [Some(1)]);
 }
 
 #[test]
@@ -966,10 +1135,12 @@ fn a_column_pivot_cannot_represent_refuses_the_table_by_name() {
             field(2, "token", PrimitiveType::Uuid),
         ],
     );
-    let _namespace = harness.namespace("odd", "tokens", tokens);
+    let namespace = harness.namespace("odd", "tokens", tokens);
     let (catalog, mut planner) = harness.pivot();
 
     let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM odd.tokens");
+
+    harness.drop_table(&namespace, "tokens");
 
     assert!(error.contains("token") && error.contains("uuid"), "{error}");
 }
@@ -1059,12 +1230,13 @@ fn the_datastore_describes_its_tables_to_the_system_catalog() {
             .collect::<Vec<_>>(),
         ["id", "customer", "amount"]
     );
-    assert!(
-        orders.files[0]
-            .min_max_stats
-            .contains(r#""id":{"min":"1","max":"3"}"#),
-        "{}",
-        orders.files[0].min_max_stats
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&orders.files[0].min_max_stats).unwrap(),
+        serde_json::json!({
+            "id": { "min": 1, "max": 3 },
+            "customer": { "min": "ann", "max": "cy" },
+            "amount": { "min": 1.0, "max": 3.0 },
+        })
     );
 }
 
@@ -1151,7 +1323,7 @@ fn a_filter_prunes_across_several_files() {
     let above = harness.query(
         &catalog,
         &mut planner,
-        "SELECT count(*), sum(id) FROM multi.orders WHERE id > 2",
+        "SELECT count(*), CAST(sum(id) AS BIGINT) FROM multi.orders WHERE id > 2",
     );
     let middle = harness.query(
         &catalog,
@@ -1162,6 +1334,509 @@ fn a_filter_prunes_across_several_files() {
     assert_eq!(int64_column(&above, 0), [Some(4)]);
     assert_eq!(int64_column(&above, 1), [Some(18)]);
     assert_eq!(int64_column(&middle, 0), [Some(3), Some(4)]);
+}
+
+#[test]
+fn a_predicate_no_file_can_match_returns_an_empty_result_with_its_columns() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("nomatch", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[3, 4], &["cy", "di"], &[3.0, 4.0]),
+    );
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    // Every file's `id` bounds sit below 100, so the manifests prune them all
+    // and no footer is read; the scan still shapes the projected columns.
+    let count = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT count(*) FROM nomatch.orders WHERE id > 100",
+    );
+    let transaction = catalog.begin_transaction();
+    let plan = planner
+        .plan(
+            "SELECT id, customer FROM nomatch.orders WHERE id > 100",
+            transaction.clone(),
+        )
+        .unwrap();
+    let rows = plan
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert!(reads.take().iter().all(|path| !path.ends_with(".parquet")));
+    assert_eq!(int64_column(&count, 0), [Some(0)]);
+    assert_eq!(total_rows(&rows), 0);
+    assert_eq!(plan.output_names, ["id", "customer"]);
+}
+
+#[test]
+fn a_predicate_keeping_one_file_reads_it_and_late_materializes_from_it() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("onefile", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[3, 4], &["cy", "di"], &[3.0, 4.0]),
+    );
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[5, 6], &["ed", "flo"], &[5.0, 6.0]),
+    );
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    // Equality admits only the third file. The ordered limit admits two files
+    // and materializes its row using the scan's row-group indexes.
+    let one = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT customer FROM onefile.orders WHERE id = 5",
+    );
+    let first_reads = reads.take();
+    let transaction = catalog.begin_transaction();
+    let plan = planner
+        .plan(
+            "SELECT customer FROM onefile.orders WHERE id > 2 ORDER BY id LIMIT 1",
+            transaction.clone(),
+        )
+        .unwrap();
+    let plan_text = plan.to_string();
+    let ranked = plan
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+    let ranked_reads = reads.take();
+
+    assert!(plan_text.contains("Materialize"), "{plan_text}");
+    assert_eq!(
+        first_reads
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1
+    );
+    let footers = ranked_reads
+        .iter()
+        .filter(|path| path.ends_with(".parquet"))
+        .collect::<Vec<_>>();
+    assert_eq!(footers.len(), 2, "{ranked_reads:?}");
+    let mut unique_footers = footers.clone();
+    unique_footers.sort_unstable();
+    unique_footers.dedup();
+    assert_eq!(unique_footers.len(), 2, "{ranked_reads:?}");
+    for path in unique_footers {
+        assert_eq!(footers.iter().filter(|&footer| *footer == path).count(), 1);
+    }
+
+    assert_eq!(string_column(&one, 0), [Some("ed".to_string())]);
+    assert_eq!(string_column(&ranked, 0), [Some("cy".to_string())]);
+}
+
+#[test]
+fn late_materialization_preserves_row_indexes_across_files_and_row_groups() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("ordered_groups", "orders", orders_schema());
+    for (ids, customers) in [
+        ([1, 4], ["ann", "di"]),
+        ([2, 5], ["bob", "ed"]),
+        ([3, 6], ["cy", "flo"]),
+    ] {
+        harness.append_in_row_groups(
+            &namespace,
+            "orders",
+            orders(&ids, &customers, &[1.0, 2.0]),
+            1,
+        );
+    }
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let transaction = catalog.begin_transaction();
+
+    // Prepare a narrower binding before independently preparing the wider scan.
+    let first = planner
+        .plan(
+            "SELECT customer FROM ordered_groups.orders WHERE id = 5",
+            transaction.clone(),
+        )
+        .unwrap()
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+    let plan = planner
+        .plan(
+            "SELECT customer FROM ordered_groups.orders WHERE id >= 2 ORDER BY id DESC LIMIT 5",
+            transaction.clone(),
+        )
+        .unwrap();
+    let plan_text = plan.to_string();
+    let rows = plan
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+    let reads = reads.take();
+
+    assert!(plan_text.contains("Materialize"), "{plan_text}");
+    assert_eq!(string_column(&first, 0), [Some("ed".to_string())]);
+    assert_eq!(
+        string_column(&rows, 0),
+        ["flo", "ed", "di", "cy", "bob"].map(|name| Some(name.to_string()))
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        5,
+        "{reads:?}"
+    );
+}
+
+#[test]
+fn min_and_max_return_exact_values_across_files() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("bounds", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[3, 4], &["cy", "di"], &[3.0, 4.0]),
+    );
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[5, 6], &["ed", "flo"], &[5.0, 6.0]),
+    );
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let extremes = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT min(id), max(id), min(customer), max(customer), min(amount), max(amount) \
+         FROM bounds.orders",
+    );
+
+    assert_eq!(int64_column(&extremes, 0), [Some(1)]);
+    assert_eq!(int64_column(&extremes, 1), [Some(6)]);
+    assert_eq!(string_column(&extremes, 2), [Some("ann".to_string())]);
+    assert_eq!(string_column(&extremes, 3), [Some("flo".to_string())]);
+    assert_eq!(float64_column(&extremes, 4), [Some(1.0)]);
+    assert_eq!(float64_column(&extremes, 5), [Some(6.0)]);
+    assert_eq!(
+        reads
+            .take()
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        3,
+        "the scan fallback must reuse metadata loaded for the integer aggregates"
+    );
+}
+
+#[test]
+fn multiple_column_aggregates_load_metadata_once() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("cached_bounds", "events", events_schema());
+    harness.append(&namespace, "events", events(&[1, 2], &[30, 40]));
+    harness.append(&namespace, "events", events(&[3, 4], &[10, 20]));
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        r#"SELECT min(id), max(id), min("at"), max("at") FROM cached_bounds.events"#,
+    );
+    let paths = reads.take();
+
+    assert_eq!(int64_column(&rows, 0), [Some(1)]);
+    assert_eq!(int64_column(&rows, 1), [Some(4)]);
+    assert_eq!(
+        column::<arrow_array::types::TimestampMicrosecondType>(&rows, 2),
+        [Some(10)]
+    );
+    assert_eq!(
+        column::<arrow_array::types::TimestampMicrosecondType>(&rows, 3),
+        [Some(40)]
+    );
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        2,
+        "{paths:?}"
+    );
+    assert_eq!(
+        paths.iter().filter(|path| path.ends_with(".avro")).count(),
+        3,
+        "one list and two manifests: {paths:?}"
+    );
+}
+
+#[test]
+fn missing_statistics_reuse_loaded_metadata_for_the_scan() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("missing_bounds", "orders", orders_schema());
+    harness.append_to_partition(
+        &namespace,
+        "orders",
+        orders(&[1, 60, 100], &["ann", "bob", "cy"], &[1.0, 2.0, 3.0]),
+        None,
+        WriterProperties::builder()
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+            .build(),
+    );
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT min(id), max(id) FROM missing_bounds.orders",
+    );
+    let paths = reads.take();
+
+    assert_eq!(int64_column(&rows, 0), [Some(1)]);
+    assert_eq!(int64_column(&rows, 1), [Some(100)]);
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1,
+        "{paths:?}"
+    );
+}
+
+#[test]
+fn concurrent_clones_share_one_metadata_load() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("concurrent_bounds", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    let reads = ReadLog::default();
+    let (catalog, _) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let transaction = catalog.begin_transaction();
+    let reference = planner::catalog::TableReference {
+        datastore: DATASTORE.to_string(),
+        schema: "concurrent_bounds".to_string(),
+        table: "orders".to_string(),
+    };
+    let binding = transaction.bind_table(&reference).unwrap().unwrap();
+    let bindings: Vec<_> = (0..8).map(|_| binding.clone_box()).collect();
+    let barrier = std::sync::Barrier::new(bindings.len());
+    reads.take();
+
+    let bounds = std::thread::scope(|scope| {
+        let tasks: Vec<_> = bindings
+            .iter()
+            .map(|binding| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let (lower, upper) = binding.column_min_max(0).unwrap();
+                    (
+                        lower.into_inner().as_primitive::<Int64Type>().value(0),
+                        upper.into_inner().as_primitive::<Int64Type>().value(0),
+                    )
+                })
+            })
+            .collect();
+        tasks
+            .into_iter()
+            .map(|task| task.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let paths = reads.take();
+
+    assert_eq!(bounds, vec![(1, 2); 8]);
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1,
+        "{paths:?}"
+    );
+    assert_eq!(
+        paths.iter().filter(|path| path.ends_with(".avro")).count(),
+        1,
+        "{paths:?}"
+    );
+}
+
+#[test]
+fn failed_metadata_loads_can_be_retried() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("retry_metadata", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let transaction = catalog.begin_transaction();
+    let plan = planner
+        .plan("SELECT id FROM retry_metadata.orders", transaction.clone())
+        .unwrap();
+    reads.fail_next_footer();
+
+    let error = plan
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .err()
+        .expect("the first load must fail");
+    let rows = plan
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+    let loaded_paths = reads.take();
+    let repeated = plan
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert!(
+        error.to_string().contains("injected footer read failure"),
+        "{error}"
+    );
+    assert_eq!(int64_column(&rows, 0), [Some(1)]);
+    assert_eq!(int64_column(&repeated, 0), [Some(1)]);
+    assert_eq!(
+        loaded_paths
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        2,
+        "one failure and one successful load: {loaded_paths:?}"
+    );
+    assert!(
+        reads.take().is_empty(),
+        "the successful retry must be cached"
+    );
+}
+
+#[test]
+fn min_and_max_under_a_filter_come_from_the_pruned_scan() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("filtered", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[3, 4], &["cy", "di"], &[3.0, 4.0]),
+    );
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[5, 6], &["ed", "flo"], &[5.0, 6.0]),
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    // The surviving [3, 4] row group has minimum 3, but the filter admits only 4.
+    // Its metadata cannot answer the filtered aggregate directly.
+    let above = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT min(id), max(id), count(*) FROM filtered.orders WHERE id > 3",
+    );
+    let one_file = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT min(id), max(id), min(customer) FROM filtered.orders WHERE id BETWEEN 3 AND 4",
+    );
+    let none = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT min(id), max(id), count(*) FROM filtered.orders WHERE id > 100",
+    );
+
+    assert_eq!(int64_column(&above, 0), [Some(4)]);
+    assert_eq!(int64_column(&above, 1), [Some(6)]);
+    assert_eq!(int64_column(&above, 2), [Some(3)]);
+    assert_eq!(int64_column(&one_file, 0), [Some(3)]);
+    assert_eq!(int64_column(&one_file, 1), [Some(4)]);
+    assert_eq!(string_column(&one_file, 2), [Some("cy".to_string())]);
+    assert_eq!(int64_column(&none, 0), [None]);
+    assert_eq!(int64_column(&none, 1), [None]);
+    assert_eq!(int64_column(&none, 2), [Some(0)]);
+}
+
+#[test]
+fn row_groups_of_a_surviving_file_are_pruned_by_their_own_stats() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("grouped", "orders", orders_schema());
+    // One file of three row groups, two rows each: its manifest bounds span
+    // ids 1 to 6, so no filter below prunes the file itself; only its row
+    // groups' footer statistics can narrow what is read.
+    harness.append_in_row_groups(
+        &namespace,
+        "orders",
+        orders(
+            &[1, 2, 3, 4, 5, 6],
+            &["ann", "bob", "cy", "di", "ed", "flo"],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        ),
+        2,
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let all = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT count(*), min(id), max(id) FROM grouped.orders",
+    );
+    let middle = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id, customer FROM grouped.orders WHERE id BETWEEN 3 AND 4 ORDER BY id",
+    );
+    let top = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT count(*), min(id), min(customer) FROM grouped.orders WHERE id > 4",
+    );
+
+    assert_eq!(int64_column(&all, 0), [Some(6)]);
+    assert_eq!(int64_column(&all, 1), [Some(1)]);
+    assert_eq!(int64_column(&all, 2), [Some(6)]);
+    assert_eq!(int64_column(&middle, 0), [Some(3), Some(4)]);
+    assert_eq!(
+        string_column(&middle, 1),
+        [Some("cy".to_string()), Some("di".to_string())]
+    );
+    assert_eq!(int64_column(&top, 0), [Some(2)]);
+    assert_eq!(int64_column(&top, 1), [Some(5)]);
+    assert_eq!(string_column(&top, 2), [Some("ed".to_string())]);
 }
 
 #[test]
@@ -1193,18 +1868,27 @@ fn an_ordered_limit_reads_the_row_it_selects_across_files() {
 #[test]
 fn a_partitioned_table_reports_its_partition_and_reads_by_it() {
     let Some(harness) = harness() else { return };
-    let namespace = harness.partitioned_namespace("parted", "orders", orders_schema(), 2);
+    let namespace = harness.partitioned_namespace(
+        "parted",
+        "orders",
+        orders_schema(),
+        2,
+        "customer",
+        Transform::Identity,
+    );
     harness.append_to_partition(
         &namespace,
         "orders",
         orders(&[1, 2], &["ann", "ann"], &[1.0, 2.0]),
         Some(vec![Some(Literal::string("ann"))]),
+        WriterProperties::default(),
     );
     harness.append_to_partition(
         &namespace,
         "orders",
         orders(&[3], &["bob"], &[3.0]),
         Some(vec![Some(Literal::string("bob"))]),
+        WriterProperties::default(),
     );
     let (catalog, mut planner) = harness.pivot();
     let datastore = catalog.get_datastore(DATASTORE).unwrap().clone();
@@ -1279,10 +1963,763 @@ fn a_compacted_table_reads_only_the_rewritten_file() {
     let after = harness.query(
         &catalog,
         &mut planner,
-        "SELECT count(*), sum(id) FROM compacted.orders",
+        "SELECT count(*), CAST(sum(id) AS BIGINT) FROM compacted.orders",
     );
 
     assert_eq!(before, 2);
     assert_eq!(int64_column(&after, 0), [Some(4)]);
     assert_eq!(int64_column(&after, 1), [Some(10)]);
+}
+
+#[test]
+fn a_bucket_partition_prunes_files_by_the_constants_bucket() {
+    let Some(harness) = harness() else { return };
+    let buckets = Transform::Bucket(8);
+    let namespace = harness.partitioned_namespace(
+        "bucketed",
+        "orders",
+        orders_schema(),
+        1,
+        "id_bucket",
+        buckets,
+    );
+    let bucket_of_5 = bucket_of(&buckets, 5);
+    harness.append_to_partition(
+        &namespace,
+        "orders",
+        orders(&[5], &["ann"], &[5.0]),
+        Some(vec![Some(Literal::int(bucket_of_5))]),
+        WriterProperties::default(),
+    );
+    let other_bucket = (1..=4)
+        .map(|id| bucket_of(&buckets, id))
+        .find(|bucket| *bucket != bucket_of_5)
+        .unwrap();
+    let below = (1..=4)
+        .find(|id| bucket_of(&buckets, *id) == other_bucket)
+        .unwrap();
+    let above = (6..100)
+        .find(|id| bucket_of(&buckets, *id) == other_bucket)
+        .unwrap();
+    harness.append_to_partition(
+        &namespace,
+        "orders",
+        orders(&[below, above], &["bob", "cy"], &[1.0, 6.0]),
+        Some(vec![Some(Literal::int(other_bucket))]),
+        WriterProperties::default(),
+    );
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let equal = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT count(*) FROM bucketed.orders WHERE id = 5",
+    );
+    let equal_reads = reads.take();
+    let range = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT count(*) FROM bucketed.orders WHERE id > 0",
+    );
+
+    assert_eq!(
+        equal_reads
+            .iter()
+            .filter(|path| path.ends_with(".avro"))
+            .count(),
+        2,
+        "{equal_reads:?}"
+    );
+    assert_eq!(
+        equal_reads
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1
+    );
+    assert_eq!(int64_column(&equal, 0), [Some(1)]);
+    // A bucket carries no range, so the range reads both files.
+    assert_eq!(int64_column(&range, 0), [Some(3)]);
+}
+
+#[test]
+fn a_day_partition_keeps_the_file_holding_the_boundary_row() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "daily",
+        "events",
+        events_schema(),
+        2,
+        "at_day",
+        Transform::Day,
+    );
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    const MICROS_PER_HOUR: i64 = 3_600_000_000;
+    let (jan_1, jan_2) = (18_262, 18_263);
+    let day = |days: i32| Some(vec![Some(Literal::Primitive(PrimitiveLiteral::Int(days)))]);
+    let midnight = |days: i32| i64::from(days) * MICROS_PER_DAY;
+    harness.append_to_partition(
+        &namespace,
+        "events",
+        events(
+            &[1, 2],
+            &[midnight(jan_1), midnight(jan_1) + MICROS_PER_HOUR],
+        ),
+        day(jan_1),
+        WriterProperties::default(),
+    );
+    harness.append_to_partition(
+        &namespace,
+        "events",
+        events(
+            &[3, 4],
+            &[midnight(jan_2), midnight(jan_2) + MICROS_PER_HOUR],
+        ),
+        day(jan_2),
+        WriterProperties::default(),
+    );
+    let (catalog, mut planner) = harness.pivot();
+    let count_where = |planner: &mut Planner, condition: &str| {
+        let batches = harness.query(
+            &catalog,
+            planner,
+            &format!(r#"SELECT count(*) FROM daily.events WHERE "at" {condition}"#),
+        );
+        int64_column(&batches, 0)[0]
+    };
+
+    let before_jan_2 = count_where(&mut planner, "< TIMESTAMP '2020-01-02 00:00:00'");
+    let up_to_jan_2 = count_where(&mut planner, "<= TIMESTAMP '2020-01-02 00:00:00'");
+    let from_jan_2 = count_where(&mut planner, ">= TIMESTAMP '2020-01-02 00:00:00'");
+    let after_jan_1_one_am = count_where(&mut planner, "> TIMESTAMP '2020-01-01 01:00:00'");
+
+    assert_eq!(before_jan_2, Some(2));
+    assert_eq!(up_to_jan_2, Some(3));
+    assert_eq!(from_jan_2, Some(2));
+    assert_eq!(after_jan_1_one_am, Some(2));
+}
+
+#[test]
+fn partition_values_prune_files_with_overlapping_bounds_in_one_manifest() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "partition_files",
+        "orders",
+        orders_schema(),
+        2,
+        "customer",
+        Transform::Identity,
+    );
+    let table = harness.load(&namespace, "orders");
+    harness.block_on(async {
+        let mut files = Vec::new();
+        for customer in ["ann", "bob"] {
+            let key = PartitionKey::new(
+                table.metadata().default_partition_spec().as_ref().clone(),
+                table.metadata().current_schema().clone(),
+                Struct::from_iter([Some(Literal::string(customer))]),
+            );
+            // Disabling column statistics makes the partition tuple the only
+            // way to distinguish these files before reading their footers.
+            let properties = WriterProperties::builder()
+                .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+                .build();
+            files.extend(
+                harness
+                    .write_data_files(
+                        &table,
+                        orders(&[1], &[customer], &[1.0]),
+                        Some(key),
+                        properties,
+                    )
+                    .await,
+            );
+        }
+        let transaction = Transaction::new(&table);
+        transaction
+            .fast_append()
+            .add_data_files(files)
+            .apply(transaction)
+            .unwrap()
+            .commit(&harness.writer)
+            .await
+            .unwrap();
+    });
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM partition_files.orders WHERE customer = 'ann'",
+    );
+    let reads = reads.take();
+
+    assert_eq!(int64_column(&rows, 0), [Some(1)]);
+    assert_eq!(
+        reads.iter().filter(|path| path.ends_with(".avro")).count(),
+        2,
+        "{reads:?}"
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1,
+        "{reads:?}"
+    );
+}
+
+#[test]
+fn separate_bindings_keep_their_own_filters() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("independent", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    harness.append(&namespace, "orders", orders(&[2], &["ann"], &[2.0]));
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let rows = harness.query(&catalog, &mut planner,
+        "SELECT a.id, b.id FROM independent.orders a JOIN independent.orders b ON a.customer = b.customer WHERE a.id = 1 AND b.id = 2");
+    let reads = reads.take();
+
+    assert_eq!(int64_column(&rows, 0), [Some(1)]);
+    assert_eq!(int64_column(&rows, 1), [Some(2)]);
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        2,
+        "{reads:?}"
+    );
+}
+
+#[test]
+fn overlapping_bindings_reload_metadata_and_keep_independent_row_group_filters() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("overlapping", "orders", orders_schema());
+    for ids in [[1, 2], [3, 4]] {
+        harness.append_in_row_groups(
+            &namespace,
+            "orders",
+            orders(&ids, &["ann", "ann"], &[1.0, 2.0]),
+            1,
+        );
+    }
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT a.id, b.id FROM overlapping.orders a
+         JOIN overlapping.orders b ON a.customer = b.customer
+         WHERE a.id <= 3 AND b.id >= 2 ORDER BY a.id, b.id",
+    );
+    let reads = reads.take();
+
+    assert_eq!(
+        int64_column(&rows, 0),
+        [1, 1, 1, 2, 2, 2, 3, 3, 3].map(Some)
+    );
+    assert_eq!(
+        int64_column(&rows, 1),
+        [2, 3, 4, 2, 3, 4, 2, 3, 4].map(Some)
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        4,
+        "{reads:?}"
+    );
+    assert_eq!(
+        reads.iter().filter(|path| path.ends_with(".avro")).count(),
+        5,
+        "{reads:?}"
+    );
+}
+
+#[test]
+fn floating_point_predicates_prune_files_without_nans() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("float_files", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    harness.append(&namespace, "orders", orders(&[3], &["bob"], &[3.0]));
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    for (predicate, expected) in [
+        ("= 1", 1),
+        ("<> 1", 3),
+        ("< 2", 1),
+        ("<= 1", 1),
+        ("> 2", 3),
+        (">= 3", 3),
+    ] {
+        reads.take();
+        let rows = harness.query(
+            &catalog,
+            &mut planner,
+            &format!("SELECT id FROM float_files.orders WHERE amount {predicate}"),
+        );
+        let paths = reads.take();
+
+        assert_eq!(int64_column(&rows, 0), [Some(expected)], "{predicate}");
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.ends_with(".parquet"))
+                .count(),
+            1,
+            "{predicate}: {paths:?}"
+        );
+    }
+}
+
+#[test]
+fn floating_partition_summaries_prune_manifests_without_nans() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "float_partitions",
+        "orders",
+        orders_schema(),
+        3,
+        "amount_partition",
+        Transform::Identity,
+    );
+    for value in [1, 3] {
+        harness.append_to_partition(
+            &namespace,
+            "orders",
+            orders(&[value], &["ann"], &[value as f64]),
+            Some(vec![Some(Literal::Primitive(PrimitiveLiteral::Double(
+                (value as f64).into(),
+            )))]),
+            WriterProperties::default(),
+        );
+    }
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM float_partitions.orders WHERE amount > 2",
+    );
+    let paths = reads.take();
+
+    assert_eq!(int64_column(&rows, 0), [Some(3)]);
+    assert_eq!(
+        paths.iter().filter(|path| path.ends_with(".avro")).count(),
+        2,
+        "{paths:?}"
+    );
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1,
+        "{paths:?}"
+    );
+}
+
+#[test]
+fn floating_point_pruning_does_not_discard_nan_rows() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("nan_rows", "orders", orders_schema());
+    harness.append_in_row_groups(
+        &namespace,
+        "orders",
+        orders(
+            &[1, 2, 3],
+            &["ann", "bob", "cy"],
+            &[1.0, f64::NAN, -f64::NAN],
+        ),
+        1,
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let greater = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM nan_rows.orders WHERE amount > 2",
+    );
+    let unequal = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM nan_rows.orders WHERE amount <> 1 ORDER BY id",
+    );
+    let less = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM nan_rows.orders WHERE amount < 0",
+    );
+    let equal = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM nan_rows.orders WHERE amount = CAST('NaN' AS DOUBLE)",
+    );
+
+    assert_eq!(int64_column(&greater, 0), [Some(2)]);
+    assert_eq!(int64_column(&unequal, 0), [Some(2), Some(3)]);
+    assert_eq!(int64_column(&less, 0), [Some(3)]);
+    assert_eq!(int64_column(&equal, 0), [Some(2)]);
+}
+
+#[test]
+fn loose_manifest_bounds_do_not_answer_exact_min_and_max() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("loose_bounds", "orders", orders_schema());
+    let table = harness.load(&namespace, "orders");
+    harness.block_on(async {
+        let files = harness
+            .write_data_files(
+                &table,
+                orders(&[5], &["ann"], &[1.0]),
+                None,
+                WriterProperties::default(),
+            )
+            .await;
+        let original = &files[0];
+        let loose = iceberg::spec::DataFileBuilder::default()
+            .content(iceberg::spec::DataContentType::Data)
+            .file_path(original.file_path().to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(original.file_size_in_bytes())
+            .record_count(original.record_count())
+            .lower_bounds(HashMap::from([(1, iceberg::spec::Datum::long(0))]))
+            .upper_bounds(HashMap::from([(1, iceberg::spec::Datum::long(10))]))
+            .build()
+            .unwrap();
+        let transaction = Transaction::new(&table);
+        transaction
+            .fast_append()
+            .add_data_files([loose])
+            .apply(transaction)
+            .unwrap()
+            .commit(&harness.writer)
+            .await
+            .unwrap();
+    });
+    let (catalog, mut planner) = harness.pivot();
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT min(id), max(id) FROM loose_bounds.orders",
+    );
+
+    assert_eq!(int64_column(&rows, 0), [Some(5)]);
+    assert_eq!(int64_column(&rows, 1), [Some(5)]);
+}
+
+#[test]
+fn a_table_without_a_snapshot_preserves_its_empty_scan_schema() {
+    let Some(harness) = harness() else { return };
+    let _namespace = harness.namespace("no_snapshot", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    let transaction = catalog.begin_transaction();
+    let plan = planner
+        .plan(
+            "SELECT id, customer FROM no_snapshot.orders",
+            transaction.clone(),
+        )
+        .unwrap();
+    let rows = plan
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+    let count = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT count(*) FROM no_snapshot.orders",
+    );
+
+    assert_eq!(total_rows(&rows), 0);
+    assert_eq!(plan.output_names, ["id", "customer"]);
+    assert_eq!(int64_column(&count, 0), [Some(0)]);
+}
+
+#[test]
+fn an_unfiltered_count_reads_only_the_manifest_list() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("count_metadata", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let count = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT count(*) FROM count_metadata.orders",
+    );
+    let reads = reads.take();
+
+    assert_eq!(int64_column(&count, 0), [Some(2)]);
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(reads[0].ends_with(".avro"));
+}
+
+#[test]
+fn a_dropped_partition_source_keeps_its_historical_spec_readable() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "evolved_partition",
+        "orders",
+        orders_schema(),
+        2,
+        "customer",
+        Transform::Identity,
+    );
+    harness.append_to_partition(
+        &namespace,
+        "orders",
+        orders(&[1], &["ann"], &[1.0]),
+        Some(vec![Some(Literal::string("ann"))]),
+        WriterProperties::default(),
+    );
+    harness.set_partition_spec(
+        &namespace,
+        "orders",
+        UnboundPartitionSpec::builder().with_spec_id(1).build(),
+    );
+    harness.set_schema(
+        &namespace,
+        "orders",
+        &schema(
+            1,
+            vec![
+                field(1, "id", PrimitiveType::Long),
+                field(3, "amount", PrimitiveType::Double),
+            ],
+        ),
+    );
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let batches = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM evolved_partition.orders WHERE id = 1",
+    );
+
+    assert_eq!(int64_column(&batches, 0), [Some(1)]);
+    assert_eq!(
+        reads
+            .take()
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn decimal_constants_prune_using_their_unscaled_value() {
+    let Some(harness) = harness() else { return };
+    let prices = schema(
+        0,
+        vec![field(
+            1,
+            "price",
+            PrimitiveType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        )],
+    );
+    let arrow_schema = Arc::new(schema_to_arrow_schema(&prices).unwrap());
+    let namespace = harness.namespace("decimal_bounds", "prices", prices);
+    for values in [vec![100, 200], vec![500, 600]] {
+        let prices = arrow_array::Decimal128Array::from(values)
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        harness.append(
+            &namespace,
+            "prices",
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(prices)]).unwrap(),
+        );
+    }
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let batches = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT CAST(price AS BIGINT) FROM decimal_bounds.prices WHERE price = 5.00",
+    );
+
+    assert_eq!(int64_column(&batches, 0), [Some(5)]);
+    assert_eq!(
+        reads
+            .take()
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn promoted_partition_bounds_skip_older_files_before_reading_their_footers() {
+    let Some(harness) = harness() else { return };
+    let original = schema(0, vec![field(1, "id", PrimitiveType::Int)]);
+    let namespace = harness.partitioned_namespace(
+        "promoted_partition",
+        "numbers",
+        original.clone(),
+        1,
+        "id_partition",
+        Transform::Identity,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema_to_arrow_schema(&original).unwrap()),
+        vec![Arc::new(arrow_array::Int32Array::from(vec![5]))],
+    )
+    .unwrap();
+    harness.append_to_partition(
+        &namespace,
+        "numbers",
+        batch,
+        Some(vec![Some(Literal::int(5))]),
+        WriterProperties::default(),
+    );
+    let promoted = schema(1, vec![field(1, "id", PrimitiveType::Long)]);
+    harness.set_schema(&namespace, "numbers", &promoted);
+    let large = i64::from(i32::MAX) + 1;
+    let batch = RecordBatch::try_new(
+        Arc::new(schema_to_arrow_schema(&promoted).unwrap()),
+        vec![Arc::new(Int64Array::from(vec![large]))],
+    )
+    .unwrap();
+    harness.append_to_partition(
+        &namespace,
+        "numbers",
+        batch,
+        Some(vec![Some(Literal::long(large))]),
+        WriterProperties::default(),
+    );
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM promoted_partition.numbers WHERE id > 2147483647",
+    );
+    let objects = reads.take();
+    // Catalog-wide descriptions would try to read the old file, whose physical
+    // type promotion is not supported by the Parquet reader.
+    harness.drop_table(&namespace, "numbers");
+
+    assert_eq!(int64_column(&rows, 0), [Some(large)]);
+    assert_eq!(
+        objects
+            .iter()
+            .filter(|path| path.ends_with(".avro"))
+            .count(),
+        2,
+        "{objects:?}"
+    );
+    assert_eq!(
+        objects
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1,
+        "{objects:?}"
+    );
+}
+
+#[test]
+fn one_metadata_batch_reads_month_day_and_unpartitioned_files_together() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "mixed_layouts",
+        "events",
+        events_schema(),
+        2,
+        "at_month",
+        Transform::Month,
+    );
+    const DAY: i64 = 86_400_000_000;
+    for (id, day, month) in [(1, 18_262, 600), (2, 18_293, 601)] {
+        harness.append_to_partition(
+            &namespace,
+            "events",
+            events(&[id], &[day * DAY]),
+            Some(vec![Some(Literal::int(month))]),
+            WriterProperties::default(),
+        );
+    }
+    harness.set_partition_spec(
+        &namespace,
+        "events",
+        UnboundPartitionSpec::builder()
+            .with_spec_id(1)
+            .add_partition_field(2, "at_day", Transform::Day)
+            .unwrap()
+            .build(),
+    );
+    for (id, day) in [(3, 18_263), (4, 18_262)] {
+        harness.append_to_partition(
+            &namespace,
+            "events",
+            events(&[id], &[i64::from(day) * DAY + DAY / 2]),
+            Some(vec![Some(Literal::int(day))]),
+            WriterProperties::default(),
+        );
+    }
+    harness.set_partition_spec(
+        &namespace,
+        "events",
+        UnboundPartitionSpec::builder().with_spec_id(2).build(),
+    );
+    // An empty partition key still carries the evolved spec ID. Omitting the
+    // key makes the SDK writer default to spec 0 even after evolution.
+    harness.append_to_partition(
+        &namespace,
+        "events",
+        events(&[5], &[18_262 * DAY]),
+        Some(vec![]),
+        WriterProperties::default(),
+    );
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let before = harness.query(&catalog, &mut planner,
+        r#"SELECT id FROM mixed_layouts.events WHERE "at" < TIMESTAMP '2020-01-02 00:00:00' ORDER BY id"#);
+    assert_eq!(int64_column(&before, 0), [Some(1), Some(4), Some(5)]);
+    let before_reads = reads.take();
+    // One manifest list plus the matching month, day and unpartitioned manifests.
+    assert_eq!(
+        before_reads
+            .iter()
+            .filter(|path| path.ends_with(".avro"))
+            .count(),
+        4,
+        "{before_reads:?}"
+    );
+    assert_eq!(
+        before_reads
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        3,
+        "{before_reads:?}"
+    );
+    let after = harness.query(&catalog, &mut planner,
+        r#"SELECT id FROM mixed_layouts.events WHERE "at" >= TIMESTAMP '2020-01-02 00:00:00' ORDER BY id"#);
+    assert_eq!(int64_column(&after, 0), [Some(2), Some(3)]);
 }

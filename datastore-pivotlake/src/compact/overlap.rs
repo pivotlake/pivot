@@ -32,7 +32,8 @@ impl<'a> LayoutCandidate<'a> {
         let row_group_ranges = sort_by
             .iter()
             .map(|sort_column| {
-                file.row_groups
+                file.footer
+                    .row_groups()
                     .iter()
                     .map(|row_group| {
                         let column = row_group.schema.index_of(sort_column).ok()?;

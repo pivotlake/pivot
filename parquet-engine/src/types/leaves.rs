@@ -270,7 +270,17 @@ pub fn variant_value_leaf_is_semantically_null(
     let Some(stats) = row_group.leaf_statistics(leaf) else {
         return false;
     };
-    if stats.null_count == Some(row_group.num_rows) {
+    variant_statistics_are_null(&stats, row_group.num_rows, target, terminal)
+}
+
+/// Shared by footer normalization and the decoder's fallback checks.
+pub(crate) fn variant_statistics_are_null(
+    stats: &crate::ColumnStatistics<'_>,
+    num_rows: i64,
+    target: &DataType,
+    terminal: bool,
+) -> bool {
+    if stats.null_count == Some(num_rows) {
         return true;
     }
     (!terminal || !target.is_string())
@@ -342,6 +352,29 @@ pub fn variant_shredded_leaves(
         typed_leaf: field_first_leaf + typed_offset,
         value_leaves,
     })
+}
+
+/// Enumerate the scalar paths represented by a file's shredded schema. The
+/// existing path resolver supplies their physical offsets; this walk only
+/// discovers logical names and never interprets metadata/value leaves as paths.
+pub(crate) fn variant_shredded_paths(field: &FieldRef) -> Vec<Vec<String>> {
+    fn visit(field: &FieldRef, path: &mut Vec<String>, paths: &mut Vec<Vec<String>>) {
+        let Some((_, typed)) = find_child_leaf_offset(field, "typed_value") else {
+            return;
+        };
+        if let DataType::Struct(children) = typed.data_type() {
+            for child in children {
+                path.push(child.name().clone());
+                visit(child, path, paths);
+                path.pop();
+            }
+        } else {
+            paths.push(path.clone());
+        }
+    }
+    let mut paths = Vec::new();
+    visit(field, &mut Vec::new(), &mut paths);
+    paths
 }
 
 /// Prunes a variant node to the single branch that reaches `path`.

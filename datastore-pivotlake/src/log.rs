@@ -882,6 +882,7 @@ fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTabl
         .map(|raw| raw.split(',').map(str::to_string).collect())
         .unwrap_or_default();
 
+    // Request only ordinary columns: VARIANT and its paths use row-group stats.
     // Ask Kernel for the typed `stats_parsed` struct (min/max/nullCount/numRecords)
     // alongside the scan files, so a reloaded file carries its Parquet statistics
     // straight from the log -- the in-memory view no longer needs the footers in
@@ -889,7 +890,13 @@ fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTabl
     let scan = snapshot
         .clone()
         .scan_builder()
-        .with_stats(StatsOptions::all_struct())
+        .with_stats(StatsOptions::struct_columns(
+            columns
+                .iter()
+                .filter(|column| !matches!(column.col_type, Type::Variant))
+                .map(|column| ColumnName::new([column.name.clone()]))
+                .collect(),
+        ))
         .build()?;
     let mut files = Vec::new();
     let mut stats_by_path: HashMap<String, crate::manifest::FileStats> = HashMap::new();
@@ -1209,8 +1216,8 @@ fn struct_row_values(values: Option<&StructArray>, row: usize) -> HashMap<String
 }
 
 /// Each `Long` leaf of a `nullCount` struct at `row`, keyed by column name.
-/// Non-`Long` leaves (a nested null count for a variant/complex column) are
-/// skipped: file-level range pruning only reads the flat per-column counts.
+/// Nested null counts are skipped: file pruning reads flat ordinary columns,
+/// and VARIANT statistics are excluded when constructing the metadata scan.
 fn struct_row_null_counts(counts: Option<&StructArray>, row: usize) -> HashMap<String, i64> {
     let mut out = HashMap::new();
     let Some(counts) = counts else {

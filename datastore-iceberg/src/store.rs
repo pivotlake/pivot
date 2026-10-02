@@ -26,6 +26,7 @@ use crate::{Error, Result};
 /// on. Every read goes through it so that a file is located by its key under
 /// that root, and a file under any other root is refused before it is read:
 /// the two must travel together, and a reader cannot skip the check.
+#[derive(Clone)]
 pub(crate) struct TableStore {
     table: String,
     /// The root every file of the table must be under, as

@@ -187,7 +187,7 @@ pub fn current_parquet(
         .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
         .expect("table exists");
     table.refresh().expect("manifest reload");
-    table.build_scan_view(&[], &[]).expect("build scan view")
+    table.build_scan_view(&[]).expect("build scan view")
 }
 
 /// Where `name` keeps its own storage under a database rooted at

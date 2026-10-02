@@ -11,32 +11,65 @@
 use crate::thrift::general::CompressionCodec;
 use crate::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Scalar};
-use arrow_schema::SchemaRef;
+use arrow_schema::{Fields, SchemaRef};
 use dispatch::io::OpenFile;
+use pruning::StatisticsBatch;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// One entry per leaf in column-chunk order, shared by every row group in the
-/// file. Each leaf holds one bound array indexed by file-local row-group index.
-pub(crate) type FileStatistics = Vec<Option<FileLeafStatistics>>;
+/// Physical leaf statistics for readers and logical column statistics for
+/// pruning. Both views share the same Arrow min/max buffers; physical leaf
+/// positions and counts remain a Parquet concern.
+#[derive(Clone)]
+pub(crate) struct FileStatistics {
+    pub(crate) bounds: StatisticsBatch,
+    leaves: Vec<Option<DecodedLeafStatistics>>,
+}
 
-/// One leaf column's statistics across a file's row groups. Every field is
-/// indexed by file-local row group position.
-pub(crate) struct FileLeafStatistics {
-    /// Lower bounds, one element per row group, null where a row group recorded
-    /// none. `None` when the leaf's Arrow type has no decodable bound, which
-    /// simply leaves it out of range pruning.
+impl Default for FileStatistics {
+    fn default() -> Self {
+        Self::new(Vec::new(), &[], &Fields::empty())
+    }
+}
+
+impl FileStatistics {
+    pub(crate) fn new(
+        leaves: Vec<Option<DecodedLeafStatistics>>,
+        row_counts: &[i64],
+        fields: &Fields,
+    ) -> Self {
+        let columns = crate::pushdown::statistics_columns(fields, &leaves, row_counts);
+        let bounds = StatisticsBatch::new(row_counts.len(), columns, Vec::new())
+            .expect("footer columns have one slot per row group");
+        Self { bounds, leaves }
+    }
+}
+
+/// Decoded footer statistics retained in physical leaf order. Logical pruning
+/// bounds share these arrays, including for safe typed VARIANT paths.
+#[derive(Clone)]
+pub(crate) struct DecodedLeafStatistics {
     pub(crate) min: Option<ArrayRef>,
-    /// Upper bounds, on the same terms as `min`.
     pub(crate) max: Option<ArrayRef>,
     pub(crate) null_counts: Vec<Option<i64>>,
     pub(crate) distinct_counts: Vec<Option<i64>>,
 }
 
-/// One row group's view of its file's statistics for a single leaf. Bounds come
-/// out as single-value [`Scalar<ArrayRef>`], the shape the planner uses for SQL
-/// constants, so a pushdown predicate compares a query constant against them
-/// without further conversion.
+impl DecodedLeafStatistics {
+    pub(crate) fn row(&self, row: usize) -> ColumnStatistics<'_> {
+        ColumnStatistics {
+            row_group: row,
+            min: self.min.as_ref(),
+            max: self.max.as_ref(),
+            null_count: self.null_counts[row],
+            distinct_count: self.distinct_counts[row],
+        }
+    }
+}
+
+/// One row group's view of a leaf's statistics. Scalar consumers such as
+/// aggregate statistics and compaction borrow the canonical bounds arrays;
+/// [`Self::min`] and [`Self::max`] slice them only when a scalar is requested.
 pub struct ColumnStatistics<'a> {
     row_group: usize,
     min: Option<&'a ArrayRef>,
@@ -197,14 +230,13 @@ impl RowGroupMetadata {
     /// groups. A leaf the file records elsewhere but not here comes back with
     /// every field empty, which reads the same to every caller.
     pub fn leaf_statistics(&self, leaf: usize) -> Option<ColumnStatistics<'_>> {
-        let leaf = self.statistics.get(leaf)?.as_ref()?;
-        Some(ColumnStatistics {
-            row_group: self.file_row_group_idx,
-            min: leaf.min.as_ref(),
-            max: leaf.max.as_ref(),
-            null_count: leaf.null_counts[self.file_row_group_idx],
-            distinct_count: leaf.distinct_counts[self.file_row_group_idx],
-        })
+        Some(
+            self.statistics
+                .leaves
+                .get(leaf)?
+                .as_ref()?
+                .row(self.file_row_group_idx),
+        )
     }
 }
 

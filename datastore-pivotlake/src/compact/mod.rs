@@ -1091,7 +1091,7 @@ mod tests {
             .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
             .expect("table exists");
         table.refresh().expect("manifest reload");
-        table.build_scan_view(&[], &[]).expect("build scan view")
+        table.build_scan_view(&[]).expect("build scan view")
     }
 
     /// Drive one full compaction sweep to completion on a temporary runtime.
@@ -1570,7 +1570,7 @@ mod tests {
                 .all(|file| file.path.name().starts_with("pivot-"))
         );
         let row_count: i64 = compacted
-            .build_scan_view(&[], &[])
+            .build_scan_view(&[])
             .unwrap()
             .row_groups()
             .iter()
@@ -1705,7 +1705,7 @@ mod tests {
         assert!(ranges[0].1 < ranges[1].0, "ranges are disjoint: {ranges:?}");
 
         let row_count: i64 = compacted
-            .build_scan_view(&[], &[])
+            .build_scan_view(&[])
             .unwrap()
             .row_groups()
             .iter()
@@ -1834,7 +1834,7 @@ mod tests {
             assert!(window[0].1 < window[1].0, "ranges are disjoint: {ranges:?}");
         }
         let row_count: i64 = compacted
-            .build_scan_view(&[], &[])
+            .build_scan_view(&[])
             .unwrap()
             .row_groups()
             .iter()
@@ -2141,7 +2141,7 @@ mod tests {
                     .is_some_and(|actual| scalar_values_equal(actual, &expected))
             }));
         }
-        let parquet = reloaded.build_scan_view(&[], &[]).unwrap();
+        let parquet = reloaded.build_scan_view(&[]).unwrap();
         assert_eq!(
             parquet
                 .row_groups()

@@ -4,13 +4,11 @@
 //! Each table's schema, version, and active files come from its Delta log.
 
 use planner::catalog::SchemaQualifiedTableName;
-use planner::expression::CompareType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid as TableId;
 
-use arrow_array::{ArrayRef, Scalar};
 pub use parquet_engine::{
     FileStats, PartitionValues, pivot_scalar, scalar_equal, scalar_values_equal,
     scalar_values_from_row,
@@ -69,79 +67,6 @@ impl DeltaFileEntry {
             stats: None,
         }
     }
-
-    /// Whether this file *can* hold a row matching every partition filter — a
-    /// soft test, so it never wrongly drops a file. A filter on a non-partition
-    /// column, an entry with no recorded tuple, or a tuple missing the column all
-    /// keep the entry (absence of a value is not proof of a mismatch). Only a
-    /// recorded partition value that differs from the filter's excludes it.
-    /// Both sides are Pivot-native typed scalars.
-    pub fn maybe_matches_partition(
-        &self,
-        partition_by: &[String],
-        filters: &[PartitionEqFilter],
-    ) -> bool {
-        let Some(tuple) = self.partition.as_ref() else {
-            return true;
-        };
-        filters.iter().all(|filter| {
-            !partition_by.iter().any(|c| c == &filter.column)
-                || match tuple.get(&filter.column) {
-                    Some(value) => scalar_equal(value, &filter.value).unwrap_or(true),
-                    None => true,
-                }
-        })
-    }
-
-    /// Whether this file *can* hold a row matching every stat filter — a soft
-    /// test (like [`maybe_matches_partition`](Self::maybe_matches_partition)), so
-    /// it never wrongly drops a file. A file with no recorded stats, or a filter
-    /// on a column the stats don't bound, keeps the file. Only a min/max range
-    /// that proves no row can match excludes it. Skips a whole file (all its row
-    /// groups) before the finer row-group stats pruning looks inside it.
-    pub fn maybe_matches_stats(&self, filters: &[ColumnStatFilter]) -> bool {
-        let Some(stats) = self.stats.as_ref() else {
-            return true;
-        };
-        filters.iter().all(|filter| {
-            let (Some(min), Some(max)) = (
-                stats.min_values.get(&filter.column),
-                stats.max_values.get(&filter.column),
-            ) else {
-                return true;
-            };
-            !parquet_engine::bounds_eliminate(
-                &Scalar::new(min.clone()),
-                &Scalar::new(max.clone()),
-                filter.compare_type,
-                &filter.value,
-            )
-            .unwrap_or(false)
-        })
-    }
-}
-
-/// A `partition column = constant` predicate the query pushed down, with the
-/// constant retained as Pivot's typed Arrow scalar.
-/// [`DeltaFileEntry::maybe_matches_partition`] uses it to skip a file whose
-/// recorded partition value can't match *before* its footer is fetched — the
-/// HTTP a stats prune can't save, since stats live in the footer.
-#[derive(Clone, Debug)]
-pub struct PartitionEqFilter {
-    pub column: String,
-    pub value: Scalar<ArrayRef>,
-}
-
-/// A `column <cmp> constant` range predicate the query pushed down, retained as
-/// Pivot's typed Arrow scalar. [`DeltaFileEntry::maybe_matches_stats`] uses it to
-/// skip a whole file whose Parquet stats prove no row can match, before the finer
-/// row-group pruning descends into the file. Plain top-level columns only: a
-/// variant path's stats live in a shredded leaf, pruned per row group.
-#[derive(Clone, Debug)]
-pub struct ColumnStatFilter {
-    pub column: String,
-    pub compare_type: CompareType,
-    pub value: Scalar<ArrayRef>,
 }
 
 /// The schema an entry belongs to when the document omits the field: the
@@ -403,21 +328,11 @@ impl CatalogManifest {
 mod tests {
     use super::*;
     use arrow_array::{Array, Datum, Int64Array, RecordBatch, StringArray, StringViewArray};
+    use arrow_array::{ArrayRef, Scalar};
     use arrow_schema::{DataType, Field, Schema};
 
     fn scalar<T: Array + 'static>(array: T) -> Scalar<ArrayRef> {
         Scalar::new(Arc::new(array))
-    }
-
-    fn manifest_entry(partition: HashMap<String, Scalar<ArrayRef>>) -> DeltaFileEntry {
-        DeltaFileEntry {
-            file: FileRef {
-                path: ObjectPath::new("part.parquet"),
-                size: 1,
-            },
-            partition: Some(partition),
-            stats: None,
-        }
     }
 
     #[test]
@@ -456,34 +371,6 @@ mod tests {
                 .unwrap()
                 .value(0),
             20
-        );
-    }
-
-    #[test]
-    fn partition_pruning_compares_typed_scalars_softly() {
-        let entry = manifest_entry(HashMap::from([(
-            "service".to_string(),
-            scalar(StringViewArray::from(vec!["api"])),
-        )]));
-        let partition_by = ["service".to_string()];
-        let filter = |value| PartitionEqFilter {
-            column: "service".to_string(),
-            value: scalar(StringViewArray::from(vec![value])),
-        };
-
-        assert!(entry.maybe_matches_partition(&partition_by, &[filter("api")]));
-        assert!(!entry.maybe_matches_partition(&partition_by, &[filter("worker")]));
-
-        // A mismatched physical type or absent field is unknown, so pruning
-        // keeps the file instead of risking a false negative.
-        let mismatched = PartitionEqFilter {
-            column: "service".to_string(),
-            value: scalar(Int64Array::from(vec![1])),
-        };
-        assert!(entry.maybe_matches_partition(&partition_by, &[mismatched]));
-        assert!(
-            manifest_entry(HashMap::new())
-                .maybe_matches_partition(&partition_by, &[filter("worker")])
         );
     }
 

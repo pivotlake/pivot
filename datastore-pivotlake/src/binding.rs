@@ -2,21 +2,21 @@
 //! transaction resolve derives from its snapshot, so a query's filter pushdown
 //! prunes its own view without affecting anyone else.
 
+use ::pruning::ColumnPredicate;
 use std::sync::Arc;
 
-use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
 use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, equality_predicates, materialize, row_group_filter_from, scan_order_from,
+    table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use planner::expression::{CompareType, TableFilter};
+use planner::expression::TableFilter;
 
 use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
@@ -46,7 +46,7 @@ pub struct TableBinding {
     /// Single-column predicates pushed down for this binding (recorded here
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
-    predicates: Vec<PushedPredicate>,
+    predicates: Vec<ColumnPredicate>,
     /// The transaction's shared queue of finished INSERT files. Shared (`Arc`)
     /// with the [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
     /// binding, so a file this binding's [`compile_insert`](BoundTable::compile_insert)
@@ -84,52 +84,13 @@ impl TableBinding {
         }
     }
 
-    /// This table's row groups in the captured snapshot, partition-pruned by the
-    /// pushed equality predicates. Pure in-memory; the snapshot copy is
-    /// immutable, so a scan and its late materialize (same filters) build
+    /// This table's row groups after evaluating its stored metadata bounds.
+    /// The snapshot copy is immutable, so scan and materialization build
     /// identical views addressing the same global row-group indices.
-    fn resolve_files(&self) -> CatalogResult<Arc<ParquetTable>> {
-        let partition_filters: Vec<PartitionEqFilter> =
-            self.partition_filter_candidates().collect();
-        let stat_filters: Vec<ColumnStatFilter> = self.stat_filter_candidates().collect();
+    pub fn build_scan_view(&self) -> CatalogResult<Arc<ParquetTable>> {
         self.table
-            .build_scan_view(&partition_filters, &stat_filters)
+            .build_scan_view(&self.predicates)
             .map_err(|e| CatalogError::Other(Box::new(e)))
-    }
-
-    /// This binding's pushed equality predicates as partition-filter candidates:
-    /// the column name and the typed scalar. The catalog intersects these with
-    /// the table's partition columns, so yielding every equality predicate (not
-    /// just ones on partition columns, which the binding can't tell apart) is fine;
-    /// a non-partition column prunes no files.
-    fn partition_filter_candidates(&self) -> impl Iterator<Item = PartitionEqFilter> + '_ {
-        self.predicates
-            .iter()
-            .filter(|p| matches!(p.compare_type, CompareType::Equal))
-            .filter_map(|p| {
-                Some(PartitionEqFilter {
-                    column: self.columns.get(p.column_idx)?.name.clone(),
-                    value: p.value.clone(),
-                })
-            })
-    }
-
-    /// This binding's pushed predicates as file-level stat-filter candidates: a
-    /// plain top-level column comparison (no variant path) paired with its typed
-    /// constant. Variant paths are excluded — their stats live in a shredded leaf,
-    /// pruned per row group, not in the file's column stats. A column the file's
-    /// stats don't bound simply prunes no files.
-    fn stat_filter_candidates(&self) -> impl Iterator<Item = ColumnStatFilter> + '_ {
-        self.predicates
-            .iter()
-            .filter(|p| p.path.is_empty())
-            .filter_map(|p| {
-                Some(ColumnStatFilter {
-                    column: self.columns.get(p.column_idx)?.name.clone(),
-                    compare_type: p.compare_type,
-                    value: p.value.clone(),
-                })
-            })
     }
 }
 
@@ -162,17 +123,14 @@ impl BoundTable for TableBinding {
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        // The captured snapshot copy hands back the file set this query was
-        // bound against, partition-pruned. All in-memory: the background
-        // refresh already materialized every footer.
-        let current = self.resolve_files()?;
+        // The snapshot evaluates partition, file, and row-group bounds in memory;
+        // refresh already materialized the footer metadata.
+        let parquet = self.build_scan_view()?;
 
         // A variant path predicate reaches its shredded typed leaf only in the
         // files that shred it, so each row group resolves the path itself.
         let eq_predicates = equality_predicates(&self.predicates);
 
-        // Prune the row groups by the pushed-down predicates' stats.
-        let parquet = Arc::new(self.pruned_parquet(&current));
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
@@ -226,12 +184,8 @@ impl BoundTable for TableBinding {
         // [`compile_scan`](BoundTable::compile_scan) applies. Re-reading from a
         // view that kept even one row group the scan dropped shifts every later
         // index and silently returns another row group's rows.
-        let current = self.resolve_files()?;
-        Ok(materialize(
-            input,
-            Arc::new(self.pruned_parquet(&current)),
-            projection,
-        ))
+        let current = self.build_scan_view()?;
+        Ok(materialize(input, current, projection))
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
@@ -239,7 +193,7 @@ impl BoundTable for TableBinding {
         // equality/dictionary pruning) happens in `compile`, once the row-group
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
-        self.predicates.extend(PushedPredicate::from_filter(filter));
+        self.predicates.extend(filter.pruning_predicates());
 
         Ok(false)
     }
@@ -252,7 +206,7 @@ impl BoundTable for TableBinding {
         }
         // Read the captured snapshot files, the same view a scan would see; an
         // unresolvable view means "scan".
-        self.resolve_files().ok()?.column_min_max(column)
+        self.build_scan_view().ok()?.column_min_max(column)
     }
 
     fn row_count(&self) -> Option<i64> {
@@ -263,7 +217,7 @@ impl BoundTable for TableBinding {
         }
         // The parquet footer carries each row group's exact row count, so the
         // table's count is their sum, with no data pages read.
-        let parquet = self.resolve_files().ok()?;
+        let parquet = self.build_scan_view().ok()?;
         Some(parquet.total_rows())
     }
 
@@ -273,7 +227,7 @@ impl BoundTable for TableBinding {
         // cost model accounts for filter selectivity itself. Build the whole
         // (unfiltered) view over the captured snapshot and sum the footers'
         // row-group counts.
-        let parquet = self.table.build_scan_view(&[], &[]).ok()?;
+        let parquet = self.table.build_scan_view(&[]).ok()?;
         Some(
             parquet
                 .row_groups()
@@ -281,17 +235,5 @@ impl BoundTable for TableBinding {
                 .map(|rg| rg.num_rows as u64)
                 .sum(),
         )
-    }
-}
-
-impl TableBinding {
-    /// Clone `parquet`'s row groups and keep only those that survive this
-    /// binding's pushed-down predicates — i.e. what [`BoundTable::compile_scan`] actually
-    /// scans over the table's current files. A min/max stat that proves no row in
-    /// a group can match drops it; a stats-comparison error means "can't prune"
-    /// (kept) — never wrong, just unoptimized. No footer I/O. Exposed so pruning
-    /// can be asserted directly.
-    pub fn pruned_parquet(&self, parquet: &ParquetTable) -> ParquetTable {
-        prune_parquet(parquet, &self.predicates)
     }
 }

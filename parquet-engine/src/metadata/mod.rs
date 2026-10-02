@@ -24,6 +24,9 @@
 mod fetcher;
 mod writer;
 
+#[cfg(test)]
+mod tests;
+
 use crate::types::columns::TableColumns;
 use crate::types::metadata::RowGroupMetadata;
 use dispatch::{
@@ -40,9 +43,42 @@ use writer::FileRowGroupsSinkFactory;
 /// A file's footer metadata: its store identity ([`FileRef`]) and the row groups
 /// read from its footer, in file-local order. The Parquet-level result of the
 /// metadata-fetch pipeline; a table format can join it with its own file entry.
+#[derive(Clone)]
 pub struct FileRowGroups {
     pub file: FileRef,
-    pub row_groups: Vec<Arc<RowGroupMetadata>>,
+    row_groups: Vec<Arc<RowGroupMetadata>>,
+}
+
+impl FileRowGroups {
+    /// The groups parsed from this file. Construction and mutation stay inside
+    /// the footer loader, preserving their shared schema and statistics.
+    pub fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
+        &self.row_groups
+    }
+
+    /// Consume the file metadata when assembling a flat scan view.
+    pub fn into_row_groups(self) -> Vec<Arc<RowGroupMetadata>> {
+        self.row_groups
+    }
+
+    /// Record a table format's proof that each listed top-level column contains
+    /// no NaNs anywhere in this file. Every row group inherits that proof; a
+    /// predicate or bounds alone cannot establish it.
+    pub fn mark_columns_nan_free(&mut self, columns: &[usize]) {
+        if columns.is_empty() {
+            return;
+        }
+        let Some(first) = self.row_groups.first() else {
+            return;
+        };
+        let mut statistics = first.statistics.clone();
+        Arc::make_mut(&mut statistics)
+            .bounds
+            .mark_columns_nan_free(columns);
+        for row_group in &mut self.row_groups {
+            Arc::make_mut(row_group).statistics = statistics.clone();
+        }
+    }
 }
 
 /// Builds each worker's [`FileRowGroupsFetcher`], carrying the table's

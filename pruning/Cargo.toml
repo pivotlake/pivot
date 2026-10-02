@@ -1,0 +1,18 @@
+[package]
+name = "pruning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Conservative predicate evaluation over Arrow metadata bounds."
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-select = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+murmur3 = "0.5"

@@ -34,6 +34,7 @@ mod insert_sink;
 mod local_lock;
 mod log;
 mod manifest;
+mod pruning;
 mod table;
 /// A Docker-backed object-store test harness (MinIO) plus Delta test helpers.
 /// Gated behind the `test-support` feature so it, and its heavy testcontainers
@@ -49,8 +50,7 @@ pub use compact::{
     DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, compact_table_files, default_merge_target_bytes,
 };
 pub use manifest::{
-    ColumnStatFilter, DeltaFileEntry, PartitionEqFilter, PartitionValues, pivot_scalar,
-    scalar_values_equal, scalar_values_from_row,
+    DeltaFileEntry, PartitionValues, pivot_scalar, scalar_values_equal, scalar_values_from_row,
 };
 pub use object_storage::FileRef;
 pub use vacuum::{DEFAULT_VACUUM_POLL, VacuumConfig, Vacuumer};
@@ -455,10 +455,10 @@ impl PivotlakeDatastore {
         let declared_columns = parquet_engine::TableColumns::by_name(state.columns.clone());
         // The footer fetch returns each file's row groups keyed by identity; join
         // each back to its log entry (partition tuple) by path.
-        let mut footers: HashMap<ObjectPath, Vec<Arc<parquet_engine::RowGroupMetadata>>> =
+        let mut footers: HashMap<ObjectPath, parquet_engine::FileRowGroups> =
             parquet_engine::load_file_row_groups(dispatcher, &data_files, declared_columns)?
                 .into_iter()
-                .map(|loaded| (loaded.file.path.clone(), loaded.row_groups))
+                .map(|loaded| (loaded.file.path.clone(), loaded))
                 .collect();
         // A file the fetch returned nothing for would scan as an empty file, so
         // the table fails to open rather than silently serving a narrower one.
@@ -466,14 +466,14 @@ impl PivotlakeDatastore {
             .file_entries
             .into_iter()
             .map(|entry| {
-                let row_groups =
+                let footer =
                     footers
                         .remove(&entry.file.path)
                         .ok_or_else(|| Error::FooterNotLoaded {
                             location: location.as_str().to_string(),
                             file: entry.file.path.as_str().to_string(),
                         })?;
-                Ok(TableFile::new(entry, row_groups))
+                Ok(TableFile::new(entry, footer))
             })
             .collect::<Result<Vec<TableFile>>>()?;
         Ok(CatalogTable::new(
@@ -1191,22 +1191,18 @@ fn commit_uploaded_files(
     for uploaded in drained {
         let insert_sink::UploadedFile {
             table_id,
-            file,
+            footer,
             partition,
-            row_groups,
         } = uploaded;
-        let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
-            &row_groups,
-        )));
         let entry = DeltaFileEntry {
-            file,
+            file: footer.file.clone(),
             partition,
-            stats,
+            stats: None,
         };
         files_by_table
             .entry(table_id)
             .or_default()
-            .push(TableFile::new(entry, row_groups));
+            .push(TableFile::new(entry, footer));
     }
 
     for (table_id, files) in files_by_table {

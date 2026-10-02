@@ -21,7 +21,7 @@ use tempfile::TempDir;
 use catalog::datastore::{Datastore, DatastoreTransaction};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{commit_datastore_transaction, current_parquet};
-use datastore_pivotlake::{ColumnStatFilter, PartitionEqFilter, PivotlakeDatastore, TableBinding};
+use datastore_pivotlake::{PivotlakeDatastore, TableBinding};
 use object_storage::ObjectPath;
 use planner::PlanNode;
 use planner::Planner;
@@ -34,6 +34,7 @@ use planner::expression::{
 };
 use planner::operator::{Input, Operator};
 use planner::types::Type;
+use pruning::ColumnPredicate;
 
 /// A shared single-worker dispatch pool for the whole test binary, handed to
 /// each `PivotlakeDatastore` so `create_table` can read footers once (via the
@@ -223,14 +224,9 @@ fn constant_comparison(
     })))
 }
 
-// Row groups that survive `table`'s pushed-down predicates over the table's
-// current files (what `compile` would scan). Pruning is a pure in-memory filter
-// — no dispatcher needed.
-fn row_group_count(datastore: &PivotlakeDatastore, name: &str, table: &TableBinding) -> usize {
-    table
-        .pruned_parquet(&current_parquet(datastore, name))
-        .row_groups()
-        .len()
+// Inspect exactly the captured view that scanning and materialization use.
+fn row_group_count(table: &TableBinding) -> usize {
+    table.build_scan_view().unwrap().row_groups().len()
 }
 
 fn first_input(node: &PlanNode) -> Option<&Input> {
@@ -538,14 +534,14 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
         .unwrap();
-    assert_eq!(row_group_count(&datastore, "t", &table), 3);
+    assert_eq!(row_group_count(&table), 3);
 
     table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
 
     // Row group whose single value is 20 has min == max == 20 and is pruned.
-    assert_eq!(row_group_count(&datastore, "t", &table), 2);
+    assert_eq!(row_group_count(&table), 2);
 }
 
 /// DuckDB binds a comparison between a zone-less TIMESTAMP column and a
@@ -731,7 +727,7 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
     first
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
-    assert_eq!(row_group_count(&datastore, "t", &first), 2);
+    assert_eq!(row_group_count(&first), 2);
 
     // A fresh bind starts from the master entry's full row group set.
     let second = datastore
@@ -742,7 +738,7 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
         .unwrap();
-    assert_eq!(row_group_count(&datastore, "t", &second), 3);
+    assert_eq!(row_group_count(&second), 3);
 }
 
 #[test]
@@ -763,7 +759,7 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
     table
         .pushdown_filter(col_eq_filter(0, int_constant(999)))
         .unwrap();
-    assert_eq!(row_group_count(&datastore, "t", &table), 0);
+    assert_eq!(row_group_count(&table), 0);
 }
 
 #[test]
@@ -784,7 +780,7 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
-    assert_eq!(row_group_count(&datastore, "t", &table), 1);
+    assert_eq!(row_group_count(&table), 1);
 }
 
 #[test]
@@ -824,7 +820,7 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
         .pushdown_filter(col_neq_filter(0, int_constant(999)))
         .unwrap();
 
-    assert_eq!(row_group_count(&datastore, "t", &table), 3);
+    assert_eq!(row_group_count(&table), 3);
 }
 
 /// Write one Parquet file of `ids` (single row group) into `dir`, mirroring the
@@ -1561,7 +1557,7 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
         "with the files of that version"
     );
     assert_eq!(
-        reader.build_scan_view(&[], &[]).unwrap().row_groups().len(),
+        reader.build_scan_view(&[]).unwrap().row_groups().len(),
         3,
         "and still scans them"
     );
@@ -1665,13 +1661,13 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
-    assert_eq!(row_group_count(&datastore, "t", &table), 1);
+    assert_eq!(row_group_count(&table), 1);
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
     append(&datastore, "t", &new_file);
 
     // `id = 20` still prunes to the single matching row group, now over 4 files.
-    assert_eq!(row_group_count(&datastore, "t", &table), 1);
+    assert_eq!(row_group_count(&table), 1);
 }
 
 /// Restart reads the committed manifest, not the directory: files appended
@@ -1804,7 +1800,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
         .unwrap();
-    assert_eq!(row_group_count(&datastore, "t", &table), 6);
+    assert_eq!(row_group_count(&table), 6);
 
     table
         .pushdown_filter(col_eq_filter(0, int_constant(1)))
@@ -1812,7 +1808,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
 
     // `id = 1` excludes the part-2 file's three row groups entirely; only the
     // part-1 file's three survive.
-    assert_eq!(row_group_count(&datastore, "t", &table), 3);
+    assert_eq!(row_group_count(&table), 3);
 }
 
 /// A table partitioned by `name` with one committed file per partition: a
@@ -1872,11 +1868,12 @@ fn string_values(name: &str, value: &str) -> HashMap<String, Scalar<ArrayRef>> {
     )])
 }
 
-fn name_eq(value: &str) -> PartitionEqFilter {
-    PartitionEqFilter {
-        column: "name".to_string(),
-        value: Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef),
-    }
+fn name_eq(value: &str) -> Vec<ColumnPredicate> {
+    col_eq_filter(
+        1,
+        Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef),
+    )
+    .pruning_predicates()
 }
 
 #[test]
@@ -1887,7 +1884,7 @@ fn partition_filter_builds_only_the_matching_partitions_files() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
         .unwrap();
     table.refresh().unwrap();
-    let kept = table.build_scan_view(&[name_eq("keep")], &[]).unwrap();
+    let kept = table.build_scan_view(&name_eq("keep")).unwrap();
 
     // Only the one-group `keep` file enters the scan view; the three-group
     // `drop` file's partition tuple can't match.
@@ -1902,7 +1899,7 @@ fn no_partition_filter_builds_every_partitions_files() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
         .unwrap();
     table.refresh().unwrap();
-    let all = table.build_scan_view(&[], &[]).unwrap();
+    let all = table.build_scan_view(&[]).unwrap();
 
     // Without a filter both files are in view: keep's 1 group + drop's 3.
     assert_eq!(all.row_groups().len(), 4);
@@ -1966,11 +1963,8 @@ fn create_over_partitioned_files_stamps_each_file_with_its_partition() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
     table.refresh().unwrap();
-    let part_is_one = PartitionEqFilter {
-        column: "part".to_string(),
-        value: int_constant(1),
-    };
-    let kept = table.build_scan_view(&[part_is_one], &[]).unwrap();
+    let part_is_one = col_eq_filter(0, int_constant(1)).pruning_predicates();
+    let kept = table.build_scan_view(&part_is_one).unwrap();
 
     // Each discovered file's constant `part` was recorded as its partition, so the
     // part=1 filter drops the part=2 file's three row groups and keeps part=1's.
@@ -2015,12 +2009,9 @@ fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
     }
     table.refresh().unwrap();
 
-    let id_below_fifty = ColumnStatFilter {
-        column: "id".to_string(),
-        compare_type: CompareType::Less,
-        value: int_constant(50),
-    };
-    let kept = table.build_scan_view(&[], &[id_below_fifty]).unwrap();
+    let id_below_fifty =
+        constant_comparison(0, CompareType::Less, int_constant(50)).pruning_predicates();
+    let kept = table.build_scan_view(&id_below_fifty).unwrap();
 
     // The high file's aggregate min (100) proves no row is `< 50`, so all three
     // of its groups drop before row-group pruning; the low file's three survive.
@@ -2033,6 +2024,20 @@ fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
 /// JSON, with `shred_path` shredded into a typed Int64 leaf when given, one
 /// row group per document, so a per-group min/max prune is observable.
 fn write_docs_file_into(dir: &Path, name: &str, docs: &[String], shred_path: Option<&str>) {
+    write_typed_docs_file_into(
+        dir,
+        name,
+        docs,
+        shred_path.map(|path| (path, &DataType::Int64)),
+    );
+}
+
+fn write_typed_docs_file_into(
+    dir: &Path,
+    name: &str,
+    docs: &[String],
+    shred_path: Option<(&str, &DataType)>,
+) {
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let json: ArrayRef = Arc::new(StringArray::from(
@@ -2040,9 +2045,9 @@ fn write_docs_file_into(dir: &Path, name: &str, docs: &[String], shred_path: Opt
     ));
     let variant = json_to_variant(&json).unwrap();
     let (field, array) = match shred_path {
-        Some(path) => {
+        Some((path, data_type)) => {
             let shred = ShreddedSchemaBuilder::new()
-                .with_path(path, &DataType::Int64)
+                .with_path(path, data_type)
                 .unwrap()
                 .build();
             let shredded = shred_variant(&variant, &shred).unwrap();
@@ -2116,27 +2121,34 @@ fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<PivotlakeDatastore>, Tab
 fn variant_pushdown_equality_keeps_only_the_matching_row_group() {
     let dir = write_shredded_ages(&[10, 20, 30]);
     let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
-    assert_eq!(row_group_count(&datastore, "docs", &table), 3);
+    assert_eq!(row_group_count(&table), 3);
+
+    let parquet = current_parquet(&datastore, "docs");
+    let file_stats = parquet_engine::aggregate_file_stats(parquet.row_groups());
+    assert_eq!(file_stats.num_records, Some(3));
+    assert!(file_stats.min_values.is_empty());
+    assert!(file_stats.max_values.is_empty());
+    assert!(file_stats.null_counts.is_empty());
 
     table
         .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20))
         .unwrap();
 
     // Only the row group whose shredded `age` leaf holds 20 survives.
-    assert_eq!(row_group_count(&datastore, "docs", &table), 1);
+    assert_eq!(row_group_count(&table), 1);
 }
 
 #[test]
 fn variant_pushdown_range_prunes_by_the_shredded_leaf() {
     let dir = write_shredded_ages(&[10, 20, 30]);
-    let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
+    let (_database, _datastore, mut table) = shredded_docs_datastore(dir.path());
 
     table
         .pushdown_filter(variant_filter(&["age"], CompareType::Less, 20))
         .unwrap();
 
     // `age < 20` keeps only the group whose min is below 20 (the 10 group).
-    assert_eq!(row_group_count(&datastore, "docs", &table), 1);
+    assert_eq!(row_group_count(&table), 1);
 }
 
 #[test]
@@ -2150,7 +2162,7 @@ fn variant_pushdown_prunes_json_null_and_missing_groups() {
         r#"{"age":30}"#.to_string(),
     ];
     write_docs_file_into(dir.path(), "docs.parquet", &docs, Some("age"));
-    let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
+    let (_database, _datastore, mut table) = shredded_docs_datastore(dir.path());
 
     // Execute
     table
@@ -2158,7 +2170,7 @@ fn variant_pushdown_prunes_json_null_and_missing_groups() {
         .unwrap();
 
     // Assert
-    assert_eq!(row_group_count(&datastore, "docs", &table), 1);
+    assert_eq!(row_group_count(&table), 1);
 }
 
 /// Soundness: a path this file doesn't shred has no typed leaf to read stats
@@ -2166,13 +2178,13 @@ fn variant_pushdown_prunes_json_null_and_missing_groups() {
 #[test]
 fn variant_pushdown_keeps_all_groups_for_an_unshredded_path() {
     let dir = write_shredded_ages(&[10, 20, 30]);
-    let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
+    let (_database, _datastore, mut table) = shredded_docs_datastore(dir.path());
 
     table
         .pushdown_filter(variant_filter(&["salary"], CompareType::Equal, 20))
         .unwrap();
 
-    assert_eq!(row_group_count(&datastore, "docs", &table), 3);
+    assert_eq!(row_group_count(&table), 3);
 }
 
 /// Soundness: a row may store the path's value in the binary `value` fallback
@@ -2242,7 +2254,7 @@ fn variant_pushdown_keeps_groups_whose_value_fallback_holds_data() {
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
-    let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
+    let (_database, _datastore, mut table) = shredded_docs_datastore(dir.path());
 
     table
         .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20))
@@ -2250,7 +2262,7 @@ fn variant_pushdown_keeps_groups_whose_value_fallback_holds_data() {
 
     // Group 0's typed stats ([10, 10]) exclude 20, but its fallback row could
     // still hold a matching age, so it survives alongside group 1.
-    assert_eq!(row_group_count(&datastore, "docs", &table), 2);
+    assert_eq!(row_group_count(&table), 2);
 }
 
 /// Mixed files: the shredding file prunes by its typed leaf's stats while the
@@ -2265,8 +2277,8 @@ fn variant_pushdown_prunes_only_the_file_that_shreds_the_path() {
     let unshredded = vec![r#"{"age":50}"#.to_string()];
     write_docs_file_into(dir.path(), "shredded.parquet", &shredded, Some("age"));
     write_docs_file_into(dir.path(), "plain.parquet", &unshredded, None);
-    let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
-    assert_eq!(row_group_count(&datastore, "docs", &table), 4);
+    let (_database, _datastore, mut table) = shredded_docs_datastore(dir.path());
+    assert_eq!(row_group_count(&table), 4);
 
     table
         .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20))
@@ -2274,7 +2286,32 @@ fn variant_pushdown_prunes_only_the_file_that_shreds_the_path() {
 
     // The shredded file keeps only its age=20 group; the unshredded file's
     // group has no typed leaf to prune by and must survive.
-    assert_eq!(row_group_count(&datastore, "docs", &table), 2);
+    assert_eq!(row_group_count(&table), 2);
+}
+
+#[test]
+fn variant_row_group_bounds_are_resolved_against_each_files_type() {
+    let dir = TempDir::new().unwrap();
+    write_docs_file_into(
+        dir.path(),
+        "ints.parquet",
+        &[r#"{"age":1}"#.into(), r#"{"age":2}"#.into()],
+        Some("age"),
+    );
+    write_typed_docs_file_into(
+        dir.path(),
+        "doubles.parquet",
+        &[r#"{"age":1.5}"#.into(), r#"{"age":2.5}"#.into()],
+        Some(("age", &DataType::Float64)),
+    );
+    let (_database, _datastore, mut table) = shredded_docs_datastore(dir.path());
+    assert_eq!(row_group_count(&table), 4);
+    table
+        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 2))
+        .unwrap();
+    // The integer file prunes. Bounds on doubles do not describe the result
+    // of casting those values to BIGINT, so both groups in that file survive.
+    assert_eq!(row_group_count(&table), 3);
 }
 
 /// A nested path (`user.id`) prunes by the typed leaf two shredding levels
@@ -2287,14 +2324,14 @@ fn variant_pushdown_prunes_by_a_nested_shredded_path() {
         .map(|id| format!(r#"{{"user":{{"id":{id}}}}}"#))
         .collect();
     write_docs_file_into(dir.path(), "docs.parquet", &docs, Some("user.id"));
-    let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
-    assert_eq!(row_group_count(&datastore, "docs", &table), 3);
+    let (_database, _datastore, mut table) = shredded_docs_datastore(dir.path());
+    assert_eq!(row_group_count(&table), 3);
 
     table
         .pushdown_filter(variant_filter(&["user", "id"], CompareType::Equal, 20))
         .unwrap();
 
-    assert_eq!(row_group_count(&datastore, "docs", &table), 1);
+    assert_eq!(row_group_count(&table), 1);
 }
 
 /// Row `i`'s payload in [`banded_table`], wide enough that a query selecting a
@@ -2415,4 +2452,42 @@ fn late_materialization_rows_satisfy_their_own_predicate() {
         })
         .collect();
     assert_eq!(bands, vec![6; 4]);
+}
+
+#[test]
+fn stored_bounds_follow_file_swaps_and_refresh_without_changing_older_snapshots() {
+    let (_dir, _database, datastore) = table_partitioned_by_name();
+    let name = SchemaQualifiedTableName::in_default_schema("p");
+    let mut writer = datastore.table_handle(&name).unwrap();
+    writer.refresh().unwrap();
+    let frozen = writer.clone();
+    let mut reader = writer.clone();
+    let keep = name_eq("keep");
+    let drop = name_eq("drop");
+    assert_eq!(frozen.build_scan_view(&keep).unwrap().row_groups().len(), 1);
+    assert_eq!(frozen.build_scan_view(&drop).unwrap().row_groups().len(), 3);
+
+    writer
+        .replace_data_files(&[ObjectPath::new("keep.parquet")], &[])
+        .unwrap();
+    assert!(
+        writer
+            .build_scan_view(&keep)
+            .unwrap()
+            .row_groups()
+            .is_empty()
+    );
+    assert_eq!(writer.build_scan_view(&drop).unwrap().row_groups().len(), 3);
+    assert!(reader.refresh().unwrap());
+    let empty = reader.build_scan_view(&keep).unwrap();
+    assert!(empty.row_groups().is_empty());
+    // The fixture stores its partition value in Delta metadata; its Parquet
+    // schema contains only `id`. Preserve that same scan schema when empty.
+    assert_eq!(
+        empty.schema(),
+        frozen.build_scan_view(&[]).unwrap().schema()
+    );
+    assert_eq!(reader.build_scan_view(&drop).unwrap().row_groups().len(), 3);
+    assert_eq!(frozen.build_scan_view(&keep).unwrap().row_groups().len(), 1);
+    assert_eq!(frozen.build_scan_view(&drop).unwrap().row_groups().len(), 3);
 }
