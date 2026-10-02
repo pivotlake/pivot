@@ -528,6 +528,14 @@ pub trait BoundTable: Debug + Send + Sync {
         None
     }
 
+    /// Decoded bytes a scan with `projection` reads, after the pruning this
+    /// binding's pushed predicates allow: a measure of how much work the scan
+    /// is, used to size the query's parallelism. `None` means unknown, and the
+    /// query then runs at full width.
+    fn scan_bytes(&self, _projection: &Projection) -> Option<u64> {
+        None
+    }
+
     /// The table's total row count derived purely from metadata, if it can be
     /// answered without scanning any rows (e.g. summing Parquet row-group row
     /// counts, with no predicates pushed into this binding). `None` means

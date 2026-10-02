@@ -49,6 +49,21 @@ pub struct Aggregate {
     pub output_limit: Option<GroupLimit>,
 }
 
+impl Aggregate {
+    /// Whether this aggregate builds a group per distinct value of something
+    /// in its input (GROUP BY keys, or the values a `COUNT(DISTINCT)` counts),
+    /// rather than folding its input into one row.
+    pub(crate) fn groups_rows(&self) -> bool {
+        !self.groups.is_empty()
+            || self.expressions.iter().any(|expression| {
+                matches!(
+                    expression,
+                    Expression::AggregateFunc(AggregateFunc::CountDistinct(_))
+                )
+            })
+    }
+}
+
 impl fmt::Display for Aggregate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let groups = render(&self.groups);
@@ -395,4 +410,51 @@ fn needs_wide_accumulator(exprs: &[Expression]) -> bool {
         }
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expression::{CountStar, Ref};
+
+    fn count_star() -> Expression {
+        Expression::AggregateFunc(AggregateFunc::CountStar(CountStar {
+            params: Vec::new(),
+            return_type: Type::Int64,
+        }))
+    }
+
+    fn column() -> Expression {
+        Expression::Ref(Ref {
+            column_idx: 0,
+            return_type: Type::Int64,
+            name: None,
+        })
+    }
+
+    #[test]
+    fn global_fold_groups_no_rows() {
+        let aggregate = Aggregate {
+            groups: Vec::new(),
+            expressions: vec![count_star()],
+            output_limit: None,
+        };
+
+        let groups_rows = aggregate.groups_rows();
+
+        assert!(!groups_rows);
+    }
+
+    #[test]
+    fn group_by_groups_rows() {
+        let aggregate = Aggregate {
+            groups: vec![column()],
+            expressions: vec![count_star()],
+            output_limit: None,
+        };
+
+        let groups_rows = aggregate.groups_rows();
+
+        assert!(groups_rows);
+    }
 }

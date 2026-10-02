@@ -28,7 +28,7 @@ impl<T: Send + 'static> ChannelFactory<T> for FanInChannelFactory<T> {
 /// `target`'s receiver.
 pub fn fan_in<T: Send + 'static>(count: usize, target: usize) -> Vec<FanInChannelFactory<T>> {
     assert!(target < count, "fan-in target must name a worker");
-    let (sender, receiver) = mpsc_channel_to::<T>(target);
+    let (sender, receiver) = mpsc_channel_to::<T>(target, count);
     let mut receiver = Some(receiver);
     let mut factories = Vec::with_capacity(count);
     for worker in 0..count {

@@ -70,6 +70,13 @@ impl fmt::Display for Input {
 }
 
 impl Input {
+    /// Decoded bytes this scan reads, when its table can tell (see
+    /// [`BoundTable::scan_bytes`]).
+    pub(crate) fn scan_bytes(&self) -> Option<u64> {
+        let (projection, _) = plan_scan_projection(&self.columns, self.table.as_ref()).ok()?;
+        self.table.scan_bytes(&projection)
+    }
+
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,

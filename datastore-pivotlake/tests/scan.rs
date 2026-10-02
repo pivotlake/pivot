@@ -38,6 +38,26 @@ fn scan_all_columns() {
     assert_eq!(results[0].num_columns(), 2);
 }
 
+/// The scan size of a projection counts only the column chunks it reads.
+#[test]
+fn projected_scan_bytes_grow_with_the_projection() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(
+        &dispatch,
+        &[strings_and_ints(
+            &["first", "second", "third", "fourth", "fifth"],
+            &[1, 2, 3, 4, 5],
+        )],
+        false,
+    );
+
+    let one_column = table.projected_scan_bytes(&Projection::columns([1]));
+    let both_columns = table.projected_scan_bytes(&Projection::all(2));
+
+    assert!(one_column > 0);
+    assert!(both_columns > one_column);
+}
+
 /// One row group cut into several decode ranges, with more workers than
 /// row groups to take them, still scans every row once.
 #[test]

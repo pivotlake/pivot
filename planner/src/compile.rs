@@ -206,8 +206,40 @@ impl Plan {
         // snapshot. A cached plan reaches this compile only after the server
         // verifies that every recorded table revision matches this transaction.
         let mut slots = RuntimeFilterSlots::default();
+        let dispatcher = &self.root.dispatcher_sized_for_scan(dispatcher);
         let compiled = self.root.compile(dispatcher, transaction, &mut slots)?;
         Ok(stamp_output_names(compiled, &self.output_names))
+    }
+}
+
+impl PlanNode {
+    /// The dispatcher this plan's dataflow should be built on: narrowed to
+    /// the workers its scan can keep busy when the plan is one pipeline over
+    /// a single table scan of known size, the given one otherwise.
+    fn dispatcher_sized_for_scan(&self, dispatcher: &DataFlowDispatcher) -> DataFlowDispatcher {
+        let mut node = self;
+        // Whether the lowest grouping seen so far reads every row the scan
+        // emits: set by a grouping, cleared by a filter beneath it.
+        let mut groups_every_row = false;
+        loop {
+            match &node.operator {
+                crate::Operator::Input(input) => {
+                    return match input.scan_bytes() {
+                        Some(scan_bytes) => dispatcher.sized_for_scan(scan_bytes, groups_every_row),
+                        None => dispatcher.clone(),
+                    };
+                }
+                crate::Operator::Aggregate(aggregate) if aggregate.groups_rows() => {
+                    groups_every_row = true;
+                }
+                crate::Operator::Filter(_) => groups_every_row = false,
+                _ => {}
+            }
+            match node.inputs.as_slice() {
+                [only] => node = only,
+                _ => return dispatcher.clone(),
+            }
+        }
     }
 }
 

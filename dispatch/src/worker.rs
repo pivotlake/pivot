@@ -82,6 +82,55 @@ thread_local! {
     pub static NUM_WORKERS: Cell<usize> = const { Cell::new(usize::MAX) };
     /// The NUMA node group this worker belongs to.
     static NODE_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
+    /// Workers in each node group of this worker's pool.
+    static WORKERS_PER_NODE: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// How many of each node's workers a dataflow of `dataflow_workers` workers
+/// runs on, and how many workers each node of the pool has. `None` when the
+/// dataflow spans the calling worker's whole pool (or the caller is no pool
+/// worker), where the two indexings below coincide.
+///
+/// A dataflow narrower than the pool runs on the first workers of every node,
+/// the same number on each:
+///
+/// ```text
+/// pool worker     0  1  2  3 | 4  5  6  7      (two nodes of four)
+/// dataflow index  0  1  .  . | 2  3  .  .      (a dataflow of four workers)
+/// ```
+///
+/// Everything a dataflow sizes by its worker count is indexed by the dataflow
+/// index; a worker knows itself, and is woken, by its pool index.
+fn narrow_dataflow_shape(dataflow_workers: usize) -> Option<(usize, usize)> {
+    let pool_workers = NUM_WORKERS.get();
+    let pool_workers_per_node = WORKERS_PER_NODE.get();
+    if pool_workers_per_node == usize::MAX || dataflow_workers >= pool_workers {
+        return None;
+    }
+    let nodes = pool_workers / pool_workers_per_node;
+    Some((dataflow_workers.div_ceil(nodes), pool_workers_per_node))
+}
+
+/// Pool worker `worker`'s index within a dataflow of `dataflow_workers`
+/// workers (see [`narrow_dataflow_shape`]).
+pub fn dataflow_worker_idx(worker: usize, dataflow_workers: usize) -> usize {
+    match narrow_dataflow_shape(dataflow_workers) {
+        Some((per_node, pool_per_node)) => {
+            (worker / pool_per_node) * per_node + worker % pool_per_node
+        }
+        None => worker,
+    }
+}
+
+/// The pool index of the worker at `dataflow_worker` in a dataflow of
+/// `dataflow_workers` workers (see [`narrow_dataflow_shape`]).
+pub fn pool_worker_idx(dataflow_worker: usize, dataflow_workers: usize) -> usize {
+    match narrow_dataflow_shape(dataflow_workers) {
+        Some((per_node, pool_per_node)) => {
+            (dataflow_worker / per_node) * pool_per_node + dataflow_worker % per_node
+        }
+        None => dataflow_worker,
+    }
 }
 
 /// The node group of the current worker thread.
@@ -195,6 +244,7 @@ impl Worker {
                 WORKER_IDX.set(idx);
                 NUM_WORKERS.set(num_workers);
                 NODE_IDX.set(node);
+                WORKERS_PER_NODE.set(waker.worker_count());
                 // Pin to this worker's core BEFORE touching any memory, so everything
                 // this worker first-faults - its node-local ring (via `prefault_buffers`),
                 // free pools, and io_uring buffers - lands on this core's NUMA node. Pages
@@ -406,7 +456,7 @@ impl Worker {
     /// [`Self::clear_dirty_buffer_or_park`].
     fn release_live_dataflow(&self) {
         if LIVE_DATAFLOWS.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.waker.notify();
+            self.waker.notify_including_idle();
         }
     }
 
@@ -470,6 +520,8 @@ impl Worker {
             }
         }
 
+        self.waker
+            .set_holds_dataflow(self.node_local_idx, !self.data_flows.is_empty());
         self.last_seen_wake_count = self
             .waker
             .wait_if_unchanged(self.last_seen_wake_count, self.node_local_idx);
@@ -518,6 +570,11 @@ impl Worker {
         // or park waiting for this worker's operator to ever exist).
         while let Ok(builder) = self.data_flow_queue.try_recv() {
             debug!("Received data flow...");
+            // The first worker of a node to get a narrow dataflow wakes the
+            // node's other workers it went to, before building its own share.
+            for sibling in 1..=builder.siblings_to_wake() {
+                self.waker.notify_slot(self.node_local_idx + sibling);
+            }
             match builder.build() {
                 Ok(data_flow) => {
                     LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
