@@ -4,7 +4,7 @@
 //! all published values, runs the completion work, and wakes the worker pool.
 
 use crate::waker::waker_set;
-use crate::worker::WORKER_IDX;
+use crate::worker::{WORKER_IDX, dataflow_worker_idx};
 use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,7 +59,8 @@ impl<T> GatherBarrier<T> {
     /// Panics if the calling thread has no valid worker index or that worker has
     /// already arrived.
     pub fn arrive<R>(&self, value: T, on_complete: impl FnOnce(Vec<T>) -> R) -> Option<R> {
-        self.arrive_at(WORKER_IDX.get(), value, on_complete)
+        let worker = dataflow_worker_idx(WORKER_IDX.get(), self.values.len());
+        self.arrive_at(worker, value, on_complete)
     }
 
     /// Publishes `value` in an explicitly selected slot.

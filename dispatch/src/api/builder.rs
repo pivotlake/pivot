@@ -167,6 +167,9 @@ pub struct DataFlowBuilder {
     /// launching dispatcher was marked (see [`with_profiling`](Self::with_profiling)).
     #[cfg(feature = "perf")]
     profiled: bool,
+    /// How many of its node's following workers the receiving worker wakes
+    /// (see [`waking_siblings`](Self::waking_siblings)).
+    siblings_to_wake: usize,
     /// Builds the per-worker operator graph.
     build: Box<dyn FnOnce(&mut BuildContext) -> OperatorGraphBuilder + Send>,
 }
@@ -186,8 +189,22 @@ impl DataFlowBuilder {
             collect_stats,
             #[cfg(feature = "perf")]
             profiled: false,
+            siblings_to_wake: 0,
             build,
         }
+    }
+
+    /// Have the worker that receives this builder wake the next `siblings`
+    /// workers of its node. A dataflow for part of the pool is dispatched by
+    /// waking one worker per node, which wakes the rest of its node's share.
+    pub fn waking_siblings(mut self, siblings: usize) -> Self {
+        self.siblings_to_wake = siblings;
+        self
+    }
+
+    /// How many of its node's following workers the receiving worker wakes.
+    pub fn siblings_to_wake(&self) -> usize {
+        self.siblings_to_wake
     }
 
     /// Mark this builder's dataflow profiled, so it runs exclusively while a
