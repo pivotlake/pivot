@@ -1826,6 +1826,7 @@ name = "datastore-iceberg"
 version = "0.1.1"
 dependencies = [
  "arrow-array",
+ "arrow-ord",
  "arrow-schema",
  "async-trait",
  "catalog",
@@ -1837,6 +1838,7 @@ dependencies = [
  "parquet",
  "parquet-engine",
  "planner",
+ "pruning",
  "reqwest 0.12.28",
  "serde_json",
  "testcontainers",
@@ -1875,6 +1877,7 @@ dependencies = [
  "parquet-variant-compute",
  "parquet-variant-json",
  "planner",
+ "pruning",
  "serde",
  "serde_json",
  "tempfile",
@@ -4135,6 +4138,7 @@ dependencies = [
  "parquet-variant-compute",
  "parquet-variant-json",
  "planner",
+ "pruning",
  "snap 1.1.1 (git+https://github.com/pivotlake/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5)",
  "tempfile",
  "thiserror 2.0.18",
@@ -4376,6 +4380,7 @@ dependencies = [
  "parquet-variant-compute",
  "parquet-variant-json",
  "pcre2",
+ "pruning",
  "regex",
  "rstest",
  "serde",
@@ -4556,6 +4561,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pruning"
+version = "0.1.1"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-ord",
+ "arrow-schema",
+ "arrow-select",
+ "chrono",
+ "murmur3",
 ]
 
 [[package]]

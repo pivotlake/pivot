@@ -16,9 +16,10 @@ use planner::catalog::{
 };
 use planner::expression::TableFilter;
 use planner::types::{Type, type_from_physical};
+use pruning::Predicate;
 
 use crate::{
-    ParquetTable, PushedPredicate, is_variant_field, materialize, prune_parquet,
+    ParquetTable, is_variant_field, materialize, prune_parquet,
     table_input_with_filter_and_eq_predicates,
 };
 use object_storage::{
@@ -71,7 +72,7 @@ struct ExternalParquetTable {
     location: String,
     columns: Vec<Column>,
     parquet: Arc<ParquetTable>,
-    predicates: Vec<PushedPredicate>,
+    predicates: Vec<Predicate>,
 }
 
 impl BoundTable for ExternalParquetTable {
@@ -147,7 +148,7 @@ impl BoundTable for ExternalParquetTable {
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
-        self.predicates.extend(PushedPredicate::from_filter(filter));
+        self.predicates.extend(filter.pruning_predicates());
         // Statistics and dictionaries may skip work, but the SQL filter stays
         // above the scan and remains responsible for query correctness.
         Ok(false)

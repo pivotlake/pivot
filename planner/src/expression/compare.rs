@@ -26,6 +26,19 @@ pub enum CompareType {
     GreaterEqual,
 }
 
+impl From<CompareType> for pruning::Comparison {
+    fn from(compare: CompareType) -> Self {
+        match compare {
+            CompareType::Equal => Self::Equal,
+            CompareType::NotEqual => Self::NotEqual,
+            CompareType::Less => Self::Less,
+            CompareType::Greater => Self::Greater,
+            CompareType::LessEqual => Self::LessEqual,
+            CompareType::GreaterEqual => Self::GreaterEqual,
+        }
+    }
+}
+
 impl TryFrom<ExpressionType> for CompareType {
     type Error = Error;
     fn try_from(c: ExpressionType) -> Result<Self, Self::Error> {

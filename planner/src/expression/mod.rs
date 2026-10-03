@@ -33,6 +33,7 @@ mod maybe_error;
 mod normalized_interval;
 mod not;
 mod prefix;
+mod pruning;
 mod reference;
 mod regexp;
 mod regexp_jit;

@@ -94,6 +94,15 @@ impl ParquetTable {
         Self { row_groups, schema }
     }
 
+    /// A table of `schema` without row groups: a scan whose files were all
+    /// pruned before their footers were read still has its columns.
+    pub fn empty(schema: SchemaRef) -> Self {
+        Self {
+            row_groups: Vec::new(),
+            schema,
+        }
+    }
+
     /// Read-only view of this table's row groups.
     pub fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
         &self.row_groups

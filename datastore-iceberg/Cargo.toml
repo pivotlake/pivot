@@ -7,23 +7,25 @@ publish.workspace = true
 description = "A read-only Iceberg datastore: tables of a REST catalog, read through Pivot's Parquet engine and object caches."
 
 [dependencies]
+pruning = { workspace = true }
 planner = { workspace = true }
 catalog = { workspace = true }
 dispatch = { workspace = true }
 object-storage = { workspace = true }
 parquet-engine = { workspace = true }
 arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 thiserror = { workspace = true }
-serde_json = { workspace = true }
+# Keep decimal bounds exact when rendering catalog statistics as JSON numbers.
+serde_json = { workspace = true, features = ["raw_value"] }
 async-trait = "0.1"
 tracing = { workspace = true }
 # The REST catalog client is async: catalog calls block on the ambient runtime
 # from the blocking pool, or on a runtime of this crate's own when there is
 # none; the background refresh is a timer task on the ambient runtime.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
-# Spec types (table metadata, manifest lists, manifests, schemas) and the REST
-# catalog client. The catalog's own storage layer is never used: every file is
-# read through Pivot's ring and caches.
+# Spec metadata and the REST catalog client. Every
+# file is read through Pivot's ring and caches, not the catalog's storage layer.
 iceberg = "0.10.1"
 iceberg-catalog-rest = "0.10.1"
 # The REST client's reqwest carries no TLS backend of its own; a catalog behind
@@ -31,6 +33,7 @@ iceberg-catalog-rest = "0.10.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
+arrow-ord = { workspace = true }
 # The integration tests stand up a real REST catalog (apache/iceberg-rest-fixture)
 # in Docker, backed by the MinIO the object-storage harness starts, and write
 # tables into it through the iceberg crate's own writer and S3 storage.

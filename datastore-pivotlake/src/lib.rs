@@ -34,6 +34,7 @@ mod insert_sink;
 mod local_lock;
 mod log;
 mod manifest;
+mod pruning;
 mod table;
 /// A Docker-backed object-store test harness (MinIO) plus Delta test helpers.
 /// Gated behind the `test-support` feature so it, and its heavy testcontainers
@@ -49,8 +50,7 @@ pub use compact::{
     DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, compact_table_files, default_merge_target_bytes,
 };
 pub use manifest::{
-    ColumnStatFilter, DeltaFileEntry, PartitionEqFilter, PartitionValues, pivot_scalar,
-    scalar_values_equal, scalar_values_from_row,
+    DeltaFileEntry, PartitionValues, pivot_scalar, scalar_values_equal, scalar_values_from_row,
 };
 pub use object_storage::FileRef;
 pub use vacuum::{DEFAULT_VACUUM_POLL, VacuumConfig, Vacuumer};

@@ -208,6 +208,10 @@ pub fn aggregate_file_stats(row_groups: &[Arc<crate::RowGroupMetadata>]) -> crat
         };
     };
     for (column, field) in first.schema.fields().iter().enumerate() {
+        // Keep VARIANT and its paths exclusively in row-group statistics.
+        if crate::is_variant_field(field) {
+            continue;
+        }
         // Fold the row groups' stats into the file's: the smallest group min, the
         // largest group max, and the sum of null counts. Each running bound is a
         // single-value stat array sliced out of its file's column of bounds; a

@@ -7,6 +7,7 @@ publish.workspace = true
 description = "PivotDB's Parquet metadata, scan, materialization, and write engines."
 
 [dependencies]
+pruning = { workspace = true }
 planner = { workspace = true }
 dispatch = { workspace = true }
 object-storage = { workspace = true }

@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+pruning = { workspace = true }
 # `chrono-tz` so a cast to TIMESTAMP WITH TIME ZONE accepts a named zone such
 # as `UTC`; without it arrow parses only fixed offsets.
 arrow-array = { workspace = true, features = ["chrono-tz"] }

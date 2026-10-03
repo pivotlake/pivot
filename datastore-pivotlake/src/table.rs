@@ -4,9 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Error;
-use crate::manifest::{
-    ColumnStatFilter, DeltaFileEntry, FileStats, PartitionEqFilter, PartitionValues, scalar_equal,
-};
+use crate::manifest::{DeltaFileEntry, FileStats, PartitionValues, scalar_equal};
+use ::pruning::Predicate;
 use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::DataType;
@@ -736,12 +735,11 @@ impl CatalogTable {
         self.snapshot.version()
     }
 
-    /// A flat scan view of the files a query's pushed-down predicates cannot rule
-    /// out — every surviving file's row groups concatenated in manifest order,
-    /// where a row group's global index is simply its position. A file survives
-    /// when its recorded partition tuple can still match every `partition_filters`
-    /// *and* its Parquet stats can still match every `stat_filters`. Empty filters
-    /// keep every file.
+    /// A flat scan view of the row groups a query's pushed-down predicates
+    /// cannot rule out, in manifest order, where a row group's global index is
+    /// simply its position. A file is ruled out by its recorded partition
+    /// tuple or column statistics, and a row group of a surviving file by its
+    /// footer statistics. Empty predicates keep every row group.
     ///
     /// Read-only: it is built entirely from the row groups this copy already
     /// holds, so it does **no** I/O. Every surviving file's footer must have
@@ -749,26 +747,25 @@ impl CatalogTable {
     /// missing one is an error, never a silently narrower scan.
     ///
     /// The row group's global index is its position in this returned flat list, so
-    /// a scan and its materialize must build it from the *same* filters (they do:
-    /// both go through the binding's predicates) to address the same groups.
-    pub fn build_scan_view(
-        &self,
-        partition_filters: &[PartitionEqFilter],
-        stat_filters: &[ColumnStatFilter],
-    ) -> crate::Result<Arc<ParquetTable>> {
-        let mut row_groups = Vec::new();
-        for file in self
-            .files
-            .iter()
-            .filter(|f| {
-                f.entry
-                    .maybe_matches_partition(&self.partition_by, partition_filters)
-            })
-            .filter(|f| f.entry.maybe_matches_stats(stat_filters))
-        {
-            row_groups.extend(file.row_groups.iter().cloned());
-        }
-        Ok(Arc::new(ParquetTable::new(row_groups)))
+    /// a scan and its materialize must build it from the *same* predicates (they
+    /// do: both go through the binding's predicates) to address the same groups.
+    pub fn build_scan_view(&self, predicates: &[Predicate]) -> crate::Result<Arc<ParquetTable>> {
+        let file_statistics = crate::pruning::file_statistics(
+            &self.columns,
+            &self.partition_by,
+            self.files.iter().map(|file| &file.entry),
+            predicates,
+        );
+        let row_groups: Vec<_> = file_statistics
+            .select(&self.files, predicates)
+            .flat_map(|file| file.row_groups.iter().cloned())
+            .collect();
+        // The schema comes from the table's files rather than the survivors, so
+        // a scan that prunes every row group still has its columns.
+        let any_row_group = self.files.iter().find_map(|file| file.row_groups.first());
+        let mut parquet = ParquetTable::new(any_row_group.cloned().into_iter().collect());
+        *parquet.row_groups_mut() = parquet_engine::prune_row_groups(&row_groups, predicates);
+        Ok(Arc::new(parquet))
     }
 
     /// The table's columns (schema), as the planner's [`Column`]s.
