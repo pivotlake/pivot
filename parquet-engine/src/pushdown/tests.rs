@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, Scalar, StringArray,
+    Array, ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, Scalar, StringArray,
     StringViewArray,
 };
 use arrow_schema::{DataType, Field, Schema};
@@ -60,13 +60,14 @@ fn write_and_load_batch(
 /// row group, next to a plain `id` column.
 fn write_and_load_shredded(
     dispatch: &Dispatch,
-    documents: Vec<&str>,
+    documents: impl Into<StringArray>,
     shredded_paths: &[(&str, DataType)],
 ) -> Vec<Arc<RowGroupMetadata>> {
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
+    let documents: StringArray = documents.into();
     let ids: Vec<f64> = (1..=documents.len()).map(|id| id as f64 * 10.0).collect();
-    let documents = Arc::new(StringArray::from(documents)) as ArrayRef;
+    let documents = Arc::new(documents) as ArrayRef;
     let variant = json_to_variant(&documents).unwrap();
     let mut schema = ShreddedSchemaBuilder::new();
     for (path, data_type) in shredded_paths {
@@ -286,6 +287,29 @@ fn a_variant_field_cast_to_another_type_than_its_leaf_is_not_pruned() {
     let pruned = prune_row_groups(&groups, &[as_double]);
 
     assert_groups(&pruned, &[&groups[0], &groups[1]]);
+}
+
+#[test]
+fn a_null_variant_is_pruned_whatever_the_path_and_whether_or_not_it_is_shredded() {
+    let dispatch = Dispatch::spin_up(1, 32, None);
+    let groups = write_and_load_shredded(
+        &dispatch,
+        vec![Some(r#"{"price":10,"tag":7}"#), None],
+        &[("price", DataType::Int64)],
+    );
+    let whole = int_predicate(0, CompareType::Equal, 5);
+    let unshredded_field = int_predicate(field(0, &["tag"]), CompareType::Equal, 7);
+    let shredded_as_another_type = predicate(
+        field(0, &["price"]),
+        CompareType::Equal,
+        Arc::new(Float64Array::from(vec![10.0])),
+    );
+
+    for predicate in [whole, unshredded_field, shredded_as_another_type] {
+        let pruned = prune_row_groups(&groups, &[predicate]);
+
+        assert_groups(&pruned, &[&groups[0]]);
+    }
 }
 
 #[test]

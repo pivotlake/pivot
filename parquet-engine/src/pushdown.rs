@@ -79,7 +79,7 @@ pub(crate) fn row_group_statistics<G: Borrow<RowGroupMetadata>>(
     row_groups: &[G],
     predicates: &[Predicate],
 ) -> Statistics {
-    let statistics = Predicate::columns(predicates)
+    let mut statistics: Vec<Statistic> = Predicate::columns(predicates)
         .into_iter()
         .filter_map(|column| {
             Some(Statistic {
@@ -89,7 +89,48 @@ pub(crate) fn row_group_statistics<G: Borrow<RowGroupMetadata>>(
             })
         })
         .collect();
+    statistics.extend(
+        predicates
+            .iter()
+            .filter_map(|predicate| null_variant_statistic(row_groups, predicate)),
+    );
     Statistics::new(row_groups.len(), statistics)
+}
+
+/// Which row groups hold only NULLs in the VARIANT column `predicate` reads. A
+/// NULL VARIANT is NULL at every path and under every cast, whether or not the
+/// file shreds the path, so the statistic takes the type of the constant.
+fn null_variant_statistic<G: Borrow<RowGroupMetadata>>(
+    row_groups: &[G],
+    predicate: &Predicate,
+) -> Option<Statistic> {
+    let first = row_groups.first()?.borrow();
+    let fields = first.schema.fields();
+    let field = fields.get(predicate.column.column_idx)?;
+    if !crate::is_variant_field(field) {
+        return None;
+    }
+    // Every VARIANT value has metadata, its first leaf, so the leaf is null
+    // exactly where the VARIANT is.
+    let metadata = first_leaf(fields, predicate.column.column_idx);
+    let statistics = first.statistics.get(metadata)?.as_ref()?;
+    let unknown = new_null_array(predicate.value.get().0.data_type(), row_groups.len());
+    Some(Statistic {
+        column: predicate.column.clone(),
+        transform: Transform::Identity,
+        bounds: Bounds {
+            lower: unknown.clone(),
+            upper: unknown,
+            all_null: row_groups
+                .iter()
+                .map(|row_group| {
+                    let row_group = row_group.borrow();
+                    let null_count = statistics.null_counts[row_group.file_row_group_idx];
+                    Some(null_count == Some(row_group.num_rows))
+                })
+                .collect(),
+        },
+    })
 }
 
 /// The bounds of `column` in each row group, or `None` when the file records
