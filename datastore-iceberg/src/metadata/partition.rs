@@ -58,16 +58,19 @@ fn fields(schema: &SchemaRef, spec: &PartitionSpec) -> Vec<PartitionField> {
 /// The prunable fields of the partition specs a table's objects were written
 /// under, by spec id. A table that changed its partitioning has several, and
 /// each manifest and data file follows the one it was written under.
-#[derive(Default)]
 pub(super) struct PartitionSpecs {
     fields_by_spec: BTreeMap<i32, Vec<PartitionField>>,
 }
 
 impl PartitionSpecs {
-    pub fn insert(&mut self, schema: &SchemaRef, spec: &PartitionSpec) {
-        self.fields_by_spec
-            .entry(spec.spec_id())
-            .or_insert_with(|| fields(schema, spec));
+    /// `specs` are told apart by their own ids. The table's current `schema`
+    /// only says which column each of their fields derives from, and its type.
+    pub fn new<'a>(schema: &SchemaRef, specs: impl IntoIterator<Item = &'a PartitionSpec>) -> Self {
+        let fields_by_spec = specs
+            .into_iter()
+            .map(|spec| (spec.spec_id(), fields(schema, spec)))
+            .collect();
+        Self { fields_by_spec }
     }
 
     /// One field for each distinct transform of a column among the specs.
@@ -83,11 +86,15 @@ impl PartitionSpecs {
 
     /// Where a partition tuple written under `spec_id` holds the same
     /// transform of the same column as `field`, if that spec has it.
-    fn position(&self, spec_id: i32, field: &PartitionField) -> Option<usize> {
-        let same = self.fields_by_spec[&spec_id]
-            .iter()
-            .find(|other| other.is_same_as(field))?;
-        Some(same.position)
+    fn position(&self, spec_id: i32, field: &PartitionField) -> Result<Option<usize>> {
+        let fields = self.fields_by_spec.get(&spec_id).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("unknown partition spec {spec_id}"),
+            )
+        })?;
+        let same = fields.iter().find(|other| other.is_same_as(field));
+        Ok(same.map(|same| same.position))
     }
 }
 
@@ -114,7 +121,7 @@ impl PartitionField {
     ) -> Result<Statistic> {
         let mut summaries: Vec<Option<&FieldSummary>> = Vec::with_capacity(manifests.len());
         for manifest in manifests {
-            let position = specs.position(manifest.partition_spec_id, self);
+            let position = specs.position(manifest.partition_spec_id, self)?;
             let summary = match (position, &manifest.partitions) {
                 (Some(position), Some(summaries)) => {
                     Some(summaries.get(position).ok_or_else(|| {
@@ -174,7 +181,7 @@ impl PartitionField {
         let mut values: Vec<Option<&Option<Literal>>> = Vec::with_capacity(files.len());
         for file in files {
             let spec_id = file.manifest.metadata().partition_spec.spec_id();
-            let value = match specs.position(spec_id, self) {
+            let value = match specs.position(spec_id, self)? {
                 Some(position) => Some(file.data.partition().fields().get(position).ok_or_else(
                     || {
                         Error::new(

@@ -6,8 +6,8 @@
 use crate::columns::to_pivot_type;
 use crate::values::build_array;
 use ::pruning::{Bounds, Predicate, Statistic, Statistics, Transform};
+use iceberg::Result;
 use iceberg::spec::{DataFile, Datum, Manifest, ManifestFile, SchemaRef, TableMetadata};
-use iceberg::{Error, ErrorKind, Result};
 use planner::types::physical_arrow_type;
 
 mod partition;
@@ -30,17 +30,10 @@ pub(crate) struct ManifestList {
 
 impl ManifestList {
     pub fn new(metadata: &TableMetadata, manifests: &[ManifestFile]) -> Result<Self> {
-        let mut specs = PartitionSpecs::default();
-        for manifest in manifests {
-            let spec_id = manifest.partition_spec_id;
-            let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("unknown partition spec {spec_id}"),
-                )
-            })?;
-            specs.insert(metadata.current_schema(), spec);
-        }
+        let specs = PartitionSpecs::new(
+            metadata.current_schema(),
+            metadata.partition_specs_iter().map(|spec| spec.as_ref()),
+        );
         let statistics = specs
             .distinct_fields()
             .into_iter()
@@ -107,7 +100,12 @@ pub(crate) fn select_files(
     predicates: &[Predicate],
 ) -> Result<Vec<FileDescriptor>> {
     let files: Vec<LiveFile> = manifests.iter().flat_map(live_files).collect();
-    let statistics = file_statistics(schema, &files, predicates)?;
+    // Each manifest records the spec its files were written under.
+    let manifest_specs = manifests
+        .iter()
+        .map(|manifest| &manifest.metadata().partition_spec);
+    let specs = PartitionSpecs::new(schema, manifest_specs);
+    let statistics = file_statistics(schema, &specs, &files, predicates)?;
     Ok(statistics
         .select(&files, predicates)
         .filter(|file| file.data.record_count() > 0)
@@ -137,6 +135,7 @@ pub(crate) fn live_files(manifest: &Manifest) -> impl Iterator<Item = LiveFile<'
 /// partition field derived from the column.
 fn file_statistics(
     schema: &SchemaRef,
+    specs: &PartitionSpecs,
     files: &[LiveFile],
     predicates: &[Predicate],
 ) -> Result<Statistics> {
@@ -157,13 +156,9 @@ fn file_statistics(
             })
         })
         .collect();
-    let mut specs = PartitionSpecs::default();
-    for file in files {
-        specs.insert(schema, &file.manifest.metadata().partition_spec);
-    }
     for field in specs.distinct_fields() {
         if columns.contains(&field.column_idx) {
-            statistics.push(field.file_statistic(&specs, files)?);
+            statistics.push(field.file_statistic(specs, files)?);
         }
     }
     Ok(Statistics::new(files.len(), statistics))
