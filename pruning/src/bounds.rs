@@ -8,8 +8,9 @@ use crate::Comparison;
 /// What metadata knows about some values in each object, one slot per object.
 ///
 /// The order is Arrow's total order, which places NaNs outside the finite
-/// range. A source whose bounds skip NaNs must leave null the sides it cannot
-/// vouch for.
+/// range. Bounds are taken as given: where a source leaves NaNs out of its
+/// bounds, a range comparison can exclude an object whose only matching rows
+/// are NaNs.
 #[derive(Clone, Debug)]
 pub struct Bounds {
     /// Every non-null value is at least this. Null where unknown.

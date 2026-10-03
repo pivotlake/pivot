@@ -43,9 +43,10 @@
 //! materialization share the same cached metadata and row-group indexes.
 //! The cache lives with its binding and clones, including any cached plans;
 //! runtime filters and execution state are never stored in it.
-//! Iceberg bounds exclude NaNs and Pivot orders them, so a floating-point
-//! column's bounds prune a file only when the manifest counts no NaNs in it.
-//! Unfiltered counts use manifest-list row counts;
+//! Bounds are taken as recorded: Iceberg and Parquet leave NaNs out of theirs,
+//! so a range filter on a floating-point column can skip a file or row group
+//! whose only matching rows are NaNs. Unfiltered counts use manifest-list row
+//! counts;
 //! exact extrema still require Parquet statistics, since Iceberg bounds may be
 //! truncated or otherwise loose.
 //!

@@ -9,6 +9,7 @@ use iceberg::spec::{
 };
 use iceberg::{Error, ErrorKind, Result};
 use planner::types::physical_arrow_type;
+use std::collections::BTreeMap;
 
 use super::LiveFile;
 use crate::columns::to_pivot_type;
@@ -29,7 +30,7 @@ pub(super) struct PartitionField {
 
 /// The fields of `spec` whose values can prune: a transform Pivot evaluates, of
 /// a column the current schema still has.
-pub(super) fn fields(schema: &SchemaRef, spec: &PartitionSpec) -> Vec<PartitionField> {
+fn fields(schema: &SchemaRef, spec: &PartitionSpec) -> Vec<PartitionField> {
     spec.fields()
         .iter()
         .enumerate()
@@ -54,93 +55,99 @@ pub(super) fn fields(schema: &SchemaRef, spec: &PartitionSpec) -> Vec<PartitionF
         .collect()
 }
 
-/// One statistic for each distinct transform of a column among the partition
-/// fields of `rows`. A row is bounded by the field of its own spec, wherever
-/// that spec holds it, and is unknown when its spec has no such field.
-pub(super) fn statistics<'a, Row>(
-    rows: &'a [Row],
-    fields_of: impl Fn(&'a Row) -> &'a Vec<PartitionField>,
-    bounds_of: impl Fn(&PartitionField, &[Option<(&'a PartitionField, &'a Row)>]) -> Result<Bounds>,
-) -> Result<Vec<Statistic>> {
-    let mut statistics: Vec<Statistic> = Vec::new();
-    for field in rows.iter().flat_map(&fields_of) {
-        let is_described = statistics.iter().any(|statistic| {
-            statistic.column.column_idx == field.column_idx
-                && statistic.transform == field.transform
-        });
-        if is_described {
-            continue;
-        }
-        let entries: Vec<_> = rows
-            .iter()
-            .map(|row| {
-                let same = fields_of(row).iter().find(|other| {
-                    other.column_idx == field.column_idx && other.transform == field.transform
-                })?;
-                Some((same, row))
-            })
-            .collect();
-        statistics.push(Statistic {
-            column: field.column_idx.into(),
-            transform: field.transform,
-            bounds: bounds_of(field, &entries)?,
-        });
+/// The prunable fields of the partition specs a table's objects were written
+/// under, by spec id. A table that changed its partitioning has several, and
+/// each manifest and data file follows the one it was written under.
+#[derive(Default)]
+pub(super) struct PartitionSpecs {
+    fields_by_spec: BTreeMap<i32, Vec<PartitionField>>,
+}
+
+impl PartitionSpecs {
+    pub fn insert(&mut self, schema: &SchemaRef, spec: &PartitionSpec) {
+        self.fields_by_spec
+            .entry(spec.spec_id())
+            .or_insert_with(|| fields(schema, spec));
     }
-    Ok(statistics)
+
+    /// One field for each distinct transform of a column among the specs.
+    pub fn distinct_fields(&self) -> Vec<&PartitionField> {
+        let mut distinct: Vec<&PartitionField> = Vec::new();
+        for field in self.fields_by_spec.values().flatten() {
+            if !distinct.iter().any(|other| other.is_same_as(field)) {
+                distinct.push(field);
+            }
+        }
+        distinct
+    }
+
+    /// Where a partition tuple written under `spec_id` holds the same
+    /// transform of the same column as `field`, if that spec has it.
+    fn position(&self, spec_id: i32, field: &PartitionField) -> Option<usize> {
+        let same = self.fields_by_spec[&spec_id]
+            .iter()
+            .find(|other| other.is_same_as(field))?;
+        Some(same.position)
+    }
 }
 
 impl PartitionField {
+    fn is_same_as(&self, other: &Self) -> bool {
+        self.column_idx == other.column_idx && self.transform == other.transform
+    }
+
+    fn statistic(&self, bounds: Bounds) -> Statistic {
+        Statistic {
+            column: self.column_idx.into(),
+            transform: self.transform,
+            bounds,
+        }
+    }
+
     /// The range of this field's values in each manifest, from the summary its
-    /// manifest-list entry keeps per partition field.
-    pub fn manifest_bounds(
+    /// manifest-list entry keeps per partition field. A manifest whose spec
+    /// lacks the field, or that has no summaries, is unknown.
+    pub fn manifest_statistic(
         &self,
-        manifests: &[Option<(&PartitionField, &ManifestFile)>],
-    ) -> Result<Bounds> {
-        let summaries = manifests
-            .iter()
-            .map(|entry| {
-                let Some((field, manifest)) = entry else {
-                    return Ok(None);
-                };
-                let Some(summaries) = &manifest.partitions else {
-                    return Ok(None);
-                };
-                summaries.get(field.position).map(Some).ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "manifest summary does not match its partition spec",
-                    )
-                })
-            })
-            .collect::<Result<Vec<Option<&FieldSummary>>>>()?;
-        // A summary's bounds skip NaNs, which Pivot orders outside the finite
-        // range, so they bound floating values only when it reports none.
-        let is_floating = matches!(
-            self.value_type,
-            PrimitiveType::Float | PrimitiveType::Double
-        );
-        let nan_free = |summary: &FieldSummary| !is_floating || summary.contains_nan == Some(false);
-        let decode = |bound: fn(&FieldSummary) -> Option<&iceberg::spec::ByteBuf>| {
-            let bounds = summaries
-                .iter()
-                .map(|summary| {
-                    summary
-                        .filter(|summary| nan_free(summary))
-                        .and_then(bound)
-                        .map(|bytes| Datum::try_from_bytes(bytes, self.value_type.clone()))
-                        .transpose()
-                })
-                .collect::<Result<Vec<Option<Datum>>>>()?;
-            Ok::<_, Error>(build_array(
+        specs: &PartitionSpecs,
+        manifests: &[ManifestFile],
+    ) -> Result<Statistic> {
+        let mut summaries: Vec<Option<&FieldSummary>> = Vec::with_capacity(manifests.len());
+        for manifest in manifests {
+            let position = specs.position(manifest.partition_spec_id, self);
+            let summary = match (position, &manifest.partitions) {
+                (Some(position), Some(summaries)) => {
+                    Some(summaries.get(position).ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "manifest summary does not match its partition spec",
+                        )
+                    })?)
+                }
+                _ => None,
+            };
+            summaries.push(summary);
+        }
+        let mut lower = Vec::with_capacity(summaries.len());
+        let mut upper = Vec::with_capacity(summaries.len());
+        for summary in &summaries {
+            lower
+                .push(self.decode_bound(summary.and_then(|summary| summary.lower_bound.as_ref()))?);
+            upper
+                .push(self.decode_bound(summary.and_then(|summary| summary.upper_bound.as_ref()))?);
+        }
+        let literals = |bounds: &[Option<Datum>]| {
+            build_array(
                 &self.data_type,
                 bounds
                     .iter()
                     .map(|bound| bound.as_ref().map(Datum::literal)),
-            ))
+            )
         };
-        Ok(Bounds {
-            lower: decode(|summary| summary.lower_bound.as_ref())?,
-            upper: decode(|summary| summary.upper_bound.as_ref())?,
+        Ok(self.statistic(Bounds {
+            lower: literals(&lower),
+            upper: literals(&upper),
+            // A summary without bounds has no non-null value to bound.
             all_null: summaries
                 .iter()
                 .map(|summary| {
@@ -148,32 +155,38 @@ impl PartitionField {
                     Some(
                         summary.contains_null
                             && summary.lower_bound.is_none()
-                            && summary.upper_bound.is_none()
-                            && nan_free(summary),
+                            && summary.upper_bound.is_none(),
                     )
                 })
                 .collect(),
-        })
+        }))
+    }
+
+    fn decode_bound(&self, bytes: Option<&iceberg::spec::ByteBuf>) -> Result<Option<Datum>> {
+        bytes
+            .map(|bytes| Datum::try_from_bytes(bytes, self.value_type.clone()))
+            .transpose()
     }
 
     /// This field's value in each data file. Every row of a file shares it, so
-    /// it is both bounds.
-    pub fn file_bounds(&self, files: &[Option<(&PartitionField, &LiveFile)>]) -> Result<Bounds> {
-        let values = files
-            .iter()
-            .map(|entry| {
-                let Some((field, file)) = entry else {
-                    return Ok(None);
-                };
-                let value = file.data.partition().fields().get(field.position);
-                value.map(Some).ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "file partition does not match its spec",
-                    )
-                })
-            })
-            .collect::<Result<Vec<Option<&Option<Literal>>>>>()?;
+    /// it is both bounds. A file whose spec lacks the field is unknown.
+    pub fn file_statistic(&self, specs: &PartitionSpecs, files: &[LiveFile]) -> Result<Statistic> {
+        let mut values: Vec<Option<&Option<Literal>>> = Vec::with_capacity(files.len());
+        for file in files {
+            let spec_id = file.manifest.metadata().partition_spec.spec_id();
+            let value = match specs.position(spec_id, self) {
+                Some(position) => Some(file.data.partition().fields().get(position).ok_or_else(
+                    || {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "file partition does not match its spec",
+                        )
+                    },
+                )?),
+                None => None,
+            };
+            values.push(value);
+        }
         let bounds = build_array(
             &self.data_type,
             values.iter().map(|value| match value {
@@ -181,7 +194,7 @@ impl PartitionField {
                 _ => None,
             }),
         );
-        Ok(Bounds {
+        Ok(self.statistic(Bounds {
             lower: bounds.clone(),
             upper: bounds,
             // A NULL partition value means the column is NULL in every row.
@@ -189,7 +202,7 @@ impl PartitionField {
                 .iter()
                 .map(|value| Some((*value)?.is_none()))
                 .collect(),
-        })
+        }))
     }
 }
 

@@ -2330,49 +2330,6 @@ fn floating_partition_summaries_prune_manifests_without_nans() {
 }
 
 #[test]
-fn floating_point_pruning_does_not_discard_nan_rows() {
-    let Some(harness) = harness() else { return };
-    let namespace = harness.namespace("nan_rows", "orders", orders_schema());
-    harness.append_in_row_groups(
-        &namespace,
-        "orders",
-        orders(
-            &[1, 2, 3],
-            &["ann", "bob", "cy"],
-            &[1.0, f64::NAN, -f64::NAN],
-        ),
-        1,
-    );
-    let (catalog, mut planner) = harness.pivot();
-
-    let greater = harness.query(
-        &catalog,
-        &mut planner,
-        "SELECT id FROM nan_rows.orders WHERE amount > 2",
-    );
-    let unequal = harness.query(
-        &catalog,
-        &mut planner,
-        "SELECT id FROM nan_rows.orders WHERE amount <> 1 ORDER BY id",
-    );
-    let less = harness.query(
-        &catalog,
-        &mut planner,
-        "SELECT id FROM nan_rows.orders WHERE amount < 0",
-    );
-    let equal = harness.query(
-        &catalog,
-        &mut planner,
-        "SELECT id FROM nan_rows.orders WHERE amount = CAST('NaN' AS DOUBLE)",
-    );
-
-    assert_eq!(int64_column(&greater, 0), [Some(2)]);
-    assert_eq!(int64_column(&unequal, 0), [Some(2), Some(3)]);
-    assert_eq!(int64_column(&less, 0), [Some(3)]);
-    assert_eq!(int64_column(&equal, 0), [Some(2)]);
-}
-
-#[test]
 fn loose_manifest_bounds_do_not_answer_exact_min_and_max() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("loose_bounds", "orders", orders_schema());

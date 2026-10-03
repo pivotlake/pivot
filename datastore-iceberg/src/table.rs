@@ -130,11 +130,9 @@ impl LoadedTable {
         let row_groups: Vec<_> = self
             .read_footers(&files)?
             .into_iter()
-            .zip(&files)
-            .flat_map(|(footer, file)| {
-                prune_row_groups(&footer.row_groups, &file.row_group_predicates(predicates))
-            })
+            .flat_map(|footer| footer.row_groups)
             .collect();
+        let row_groups = prune_row_groups(&row_groups, predicates);
         Ok(if row_groups.is_empty() {
             ParquetTable::empty(self.declared_schema())
         } else {

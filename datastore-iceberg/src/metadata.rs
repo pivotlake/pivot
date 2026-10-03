@@ -6,17 +6,13 @@
 use crate::columns::to_pivot_type;
 use crate::values::build_array;
 use ::pruning::{Bounds, Predicate, Statistic, Statistics, Transform};
-use iceberg::spec::{
-    DataFile, Datum, Manifest, ManifestFile, PrimitiveType, SchemaRef, TableMetadata,
-};
+use iceberg::spec::{DataFile, Datum, Manifest, ManifestFile, SchemaRef, TableMetadata};
 use iceberg::{Error, ErrorKind, Result};
 use planner::types::physical_arrow_type;
-use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
 
 mod partition;
 
-use partition::PartitionField;
+use partition::PartitionSpecs;
 
 pub(crate) struct ManifestDescriptor {
     pub path: String,
@@ -34,25 +30,22 @@ pub(crate) struct ManifestList {
 
 impl ManifestList {
     pub fn new(metadata: &TableMetadata, manifests: &[ManifestFile]) -> Result<Self> {
-        let mut fields_by_spec = BTreeMap::new();
+        let mut specs = PartitionSpecs::default();
         for manifest in manifests {
             let spec_id = manifest.partition_spec_id;
-            if fields_by_spec.contains_key(&spec_id) {
-                continue;
-            }
             let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!("unknown partition spec {spec_id}"),
                 )
             })?;
-            fields_by_spec.insert(spec_id, partition::fields(metadata.current_schema(), spec));
+            specs.insert(metadata.current_schema(), spec);
         }
-        let statistics = partition::statistics(
-            manifests,
-            |manifest| &fields_by_spec[&manifest.partition_spec_id],
-            PartitionField::manifest_bounds,
-        )?;
+        let statistics = specs
+            .distinct_fields()
+            .into_iter()
+            .map(|field| field.manifest_statistic(&specs, manifests))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             statistics: Statistics::new(manifests.len(), statistics),
             manifests: manifests
@@ -91,13 +84,10 @@ impl ManifestList {
     }
 }
 
-/// A data file to read: where it is and how long, which is all a footer read
-/// needs.
+/// Where a data file is and how long, which is all a footer read needs.
 pub(crate) struct FileDescriptor {
     pub path: String,
     pub length: u64,
-    /// The filtered columns that may hold a NaN in this file.
-    nan_columns: Vec<usize>,
 }
 
 impl FileDescriptor {
@@ -105,22 +95,7 @@ impl FileDescriptor {
         Self {
             path: file.file_path().to_string(),
             length: file.file_size_in_bytes(),
-            nan_columns: Vec::new(),
         }
-    }
-
-    /// The predicates this file's Parquet statistics can answer. Those
-    /// statistics skip NaNs, which Pivot orders outside the finite range, so
-    /// they say nothing about a column that may hold one.
-    pub fn row_group_predicates<'a>(&self, predicates: &'a [Predicate]) -> Cow<'a, [Predicate]> {
-        if self.nan_columns.is_empty() {
-            return Cow::Borrowed(predicates);
-        }
-        predicates
-            .iter()
-            .filter(|predicate| !self.nan_columns.contains(&predicate.column.column_idx))
-            .cloned()
-            .collect()
     }
 }
 
@@ -133,30 +108,11 @@ pub(crate) fn select_files(
 ) -> Result<Vec<FileDescriptor>> {
     let files: Vec<LiveFile> = manifests.iter().flat_map(live_files).collect();
     let statistics = file_statistics(schema, &files, predicates)?;
-    let columns = Predicate::columns(predicates);
     Ok(statistics
         .select(&files, predicates)
         .filter(|file| file.data.record_count() > 0)
-        .map(|file| FileDescriptor {
-            nan_columns: columns
-                .iter()
-                .map(|column| column.column_idx)
-                .filter(|&column_idx| may_hold_nan(schema, column_idx, file.data))
-                .collect(),
-            ..FileDescriptor::of(file.data)
-        })
+        .map(|file| FileDescriptor::of(file.data))
         .collect())
-}
-
-/// Whether `file` may hold a NaN in the column: only a floating-point column
-/// can, and not in a file the manifest counts none in.
-fn may_hold_nan(schema: &SchemaRef, column_idx: usize, file: &DataFile) -> bool {
-    let field = &schema.as_struct().fields()[column_idx];
-    let is_floating = matches!(
-        field.field_type.as_primitive_type(),
-        Some(PrimitiveType::Float | PrimitiveType::Double)
-    );
-    is_floating && file.nan_value_counts().get(&field.id) != Some(&0)
 }
 
 /// A data file a manifest lists as part of the snapshot.
@@ -201,20 +157,15 @@ fn file_statistics(
             })
         })
         .collect();
-    let mut fields_by_spec = BTreeMap::new();
+    let mut specs = PartitionSpecs::default();
     for file in files {
-        let spec = &file.manifest.metadata().partition_spec;
-        fields_by_spec.entry(spec.spec_id()).or_insert_with(|| {
-            let mut fields = partition::fields(schema, spec);
-            fields.retain(|field| columns.contains(&field.column_idx));
-            fields
-        });
+        specs.insert(schema, &file.manifest.metadata().partition_spec);
     }
-    statistics.extend(partition::statistics(
-        files,
-        |file| &fields_by_spec[&file.manifest.metadata().partition_spec.spec_id()],
-        PartitionField::file_bounds,
-    )?);
+    for field in specs.distinct_fields() {
+        if columns.contains(&field.column_idx) {
+            statistics.push(field.file_statistic(&specs, files)?);
+        }
+    }
     Ok(Statistics::new(files.len(), statistics))
 }
 
@@ -225,22 +176,15 @@ fn column_bounds(schema: &SchemaRef, column_idx: usize, files: &[LiveFile]) -> O
     field.field_type.as_primitive_type()?;
     let data_type = physical_arrow_type(&to_pivot_type(&field.field_type)?);
     let id = field.id;
-    // Iceberg bounds skip NaNs, which Pivot orders outside the finite range,
-    // so they do not bound a column that may hold one.
-    let bound = |bounds: fn(&DataFile) -> &HashMap<i32, Datum>| {
-        build_array(
-            &data_type,
-            files.iter().map(|file| {
-                bounds(file.data)
-                    .get(&id)
-                    .filter(|_| !may_hold_nan(schema, column_idx, file.data))
-                    .map(Datum::literal)
-            }),
-        )
-    };
+    let lower = files
+        .iter()
+        .map(|file| file.data.lower_bounds().get(&id).map(Datum::literal));
+    let upper = files
+        .iter()
+        .map(|file| file.data.upper_bounds().get(&id).map(Datum::literal));
     Some(Bounds {
-        lower: bound(DataFile::lower_bounds),
-        upper: bound(DataFile::upper_bounds),
+        lower: build_array(&data_type, lower),
+        upper: build_array(&data_type, upper),
         // Initial defaults are rejected on load: a column the file's schema
         // lacks is NULL in every row.
         all_null: files

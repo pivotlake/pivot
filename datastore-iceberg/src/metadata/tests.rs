@@ -51,11 +51,10 @@ fn file(path: &str) -> DataFileBuilder {
     builder
 }
 
-/// A file whose field 1 holds exactly `value`, without NULLs or NaNs.
+/// A file whose field 1 holds exactly `value`, without NULLs.
 fn file_holding(path: &str, value: Datum) -> DataFile {
     file(path)
         .null_value_counts(HashMap::from([(1, 0)]))
-        .nan_value_counts(HashMap::from([(1, 0)]))
         .lower_bounds(HashMap::from([(1, value.clone())]))
         .upper_bounds(HashMap::from([(1, value)]))
         .build()
@@ -170,48 +169,6 @@ fn a_column_added_after_a_manifest_was_written_is_null() {
     let kept = selected(&current, &manifests, &long_predicate(Comparison::Equal, 5));
 
     assert!(kept.is_empty());
-}
-
-#[test]
-fn floating_bounds_count_only_in_a_file_known_to_hold_no_nan() {
-    let schema = schema(1, "value", PrimitiveType::Double);
-    let bounds = HashMap::from([(1, Datum::double(10.0))]);
-    let with_nan_count = |path: &str, count: Option<u64>| {
-        file(path)
-            .lower_bounds(bounds.clone())
-            .upper_bounds(bounds.clone())
-            .nan_value_counts(count.map(|count| (1, count)).into_iter().collect())
-            .build()
-            .unwrap()
-    };
-    let files = vec![
-        with_nan_count("no nan", Some(0)),
-        with_nan_count("one nan", Some(1)),
-        with_nan_count("uncounted", None),
-    ];
-    let manifests = [manifest(&schema, unpartitioned(&schema), files)];
-
-    // Pivot orders a NaN above every number, so it satisfies `> 15`.
-    let above_fifteen = double_predicate(Comparison::Greater, 15.0);
-    let above = select_files(&schema, &manifests, &above_fifteen).unwrap();
-
-    let paths: Vec<_> = above.iter().map(|file| &file.path).collect();
-    assert_eq!(paths, ["one nan", "uncounted"]);
-    // Their Parquet statistics skip NaNs too, so they cannot answer either.
-    assert!(above[0].row_group_predicates(&above_fifteen).is_empty());
-    assert!(above[1].row_group_predicates(&above_fifteen).is_empty());
-}
-
-#[test]
-fn parquet_statistics_answer_for_a_floating_column_counted_free_of_nan() {
-    let schema = schema(1, "value", PrimitiveType::Double);
-    let files = vec![file_holding("no nan", Datum::double(10.0))];
-    let manifests = [manifest(&schema, unpartitioned(&schema), files)];
-    let above_five = double_predicate(Comparison::Greater, 5.0);
-
-    let kept = select_files(&schema, &manifests, &above_five).unwrap();
-
-    assert_eq!(kept[0].row_group_predicates(&above_five).len(), 1);
 }
 
 #[test]
