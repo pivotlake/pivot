@@ -187,11 +187,12 @@ impl DataFile {
     }
 
     /// A data file at a self-authenticating remote URL (no per-request auth); its
-    /// [`FileRef`] path is the URL's path component.
+    /// [`FileRef`] path is the whole URL, so files on different hosts stay
+    /// distinct.
     pub fn remote(url: url::Url, size: u64) -> Self {
         Self {
             file: FileRef {
-                path: ObjectPath::new(url.path()),
+                path: ObjectPath::new(url.as_str()),
                 size,
             },
             source: DataFileLocation::Remote { url, auth: None },

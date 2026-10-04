@@ -189,8 +189,6 @@ pub enum Error {
     },
     #[error("table `{table}` was vended an S3 access key without its secret key, or the reverse")]
     IncompleteVendedCredentials { table: String },
-    #[error("table `{table}` data file `{file}` returned no footer")]
-    FooterNotLoaded { table: String, file: String },
     #[error(transparent)]
     Store(#[from] object_storage::StoreError),
     #[error("reading table metadata over the pool: {0}")]

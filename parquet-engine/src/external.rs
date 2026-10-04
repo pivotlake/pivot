@@ -5,7 +5,6 @@
 //! execution use the same captured files and schema as an ordinary catalog
 //! table scan.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -330,32 +329,21 @@ fn load_strict_table(
     dispatcher: &DataFlowDispatcher,
     files: Vec<DataFile>,
 ) -> Result<(Vec<Column>, ParquetTable), Error> {
-    let file_order: Vec<ObjectPath> = files.iter().map(|file| file.file.path.clone()).collect();
     // No declared columns: every file column passes through as it is stored.
     let columns = crate::TableColumns::by_name(Vec::new());
     let loaded = crate::load_file_row_groups(dispatcher, &files, columns)
         .map_err(|error| Error::Metadata(error.to_string()))?;
-    let mut loaded_by_path: HashMap<_, _> = loaded
-        .into_iter()
-        .map(|file| (file.file.path.clone(), file))
-        .collect();
 
-    let first_path = file_order[0].to_string();
-    let first = loaded_by_path
-        .get(&file_order[0])
-        .expect("metadata loading returns every requested file");
-    let first_schema = &first
+    let first_path = loaded[0].file.path.to_string();
+    let first_schema = &loaded[0]
         .row_groups
         .first()
         .ok_or_else(|| Error::NoRowGroups(first_path.clone()))?
         .schema;
     let expected = columns_from_schema(first_schema)?;
     let mut row_groups = Vec::new();
-    for path in file_order {
-        let loaded = loaded_by_path
-            .remove(&path)
-            .expect("metadata loading returns every requested file");
-        let file_path = path.to_string();
+    for loaded in loaded {
+        let file_path = loaded.file.path.to_string();
         let file_schema = &loaded
             .row_groups
             .first()

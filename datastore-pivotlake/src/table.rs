@@ -389,22 +389,12 @@ impl CatalogTable {
                 // whole before this copy moves onto the committed version, so a
                 // failed read leaves it where it was rather than at a version
                 // whose files it does not hold.
-                let mut footers: HashMap<ObjectPath, Vec<Arc<RowGroupMetadata>>> = self
-                    .fetch_footers(added, &self.columns)?
-                    .into_iter()
-                    .map(|f| (f.file.path.clone(), f.row_groups))
+                let footers = self.fetch_footers(added, &self.columns)?;
+                let committed_files: Vec<TableFile> = added
+                    .iter()
+                    .zip(footers)
+                    .map(|(entry, footer)| TableFile::new(entry.clone(), footer.row_groups))
                     .collect();
-                let mut committed_files = Vec::with_capacity(added.len());
-                for entry in added {
-                    let row_groups =
-                        footers
-                            .remove(&entry.file.path)
-                            .ok_or_else(|| Error::FooterNotLoaded {
-                                location: self.location.as_str().to_string(),
-                                file: entry.file.path.as_str().to_string(),
-                            })?;
-                    committed_files.push(TableFile::new(entry.clone(), row_groups));
-                }
                 self.snapshot = committed;
                 self.files.retain(|f| !removed.contains(&f.entry.file.path));
                 self.files.extend(committed_files);
@@ -439,22 +429,19 @@ impl CatalogTable {
             .filter(|entry| !held.contains_key(&entry.file.path))
             .cloned()
             .collect();
-        let mut fetched: HashMap<ObjectPath, Vec<Arc<RowGroupMetadata>>> = self
-            .fetch_footers(&to_fetch, columns)?
-            .into_iter()
-            .map(|f| (f.file.path.clone(), f.row_groups))
-            .collect();
+        // One footer per file not held, in the order `entries` names them.
+        let mut fetched = self.fetch_footers(&to_fetch, columns)?.into_iter();
 
         let mut files = Vec::with_capacity(entries.len());
         for entry in entries {
             let row_groups = match held.get(&entry.file.path) {
                 Some(held_file) => held_file.row_groups.clone(),
-                None => fetched
-                    .remove(&entry.file.path)
-                    .ok_or_else(|| Error::FooterNotLoaded {
-                        location: self.location.as_str().to_string(),
-                        file: entry.file.path.as_str().to_string(),
-                    })?,
+                None => {
+                    fetched
+                        .next()
+                        .expect("a footer is fetched for every file not held")
+                        .row_groups
+                }
             };
             files.push(TableFile::new(entry, row_groups));
         }
@@ -463,7 +450,7 @@ impl CatalogTable {
     }
 
     /// Fetch the footers for `entries` — the row groups of the files this copy
-    /// does not yet hold, keyed by their store identity for the caller to join.
+    /// does not yet hold, one per entry in the order of `entries`.
     /// Each file's parsed schema is reconciled against `columns`, the schema
     /// declared by the version the entries come from.
     fn fetch_footers(
