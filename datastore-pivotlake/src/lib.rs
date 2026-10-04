@@ -141,10 +141,6 @@ pub enum Error {
     Load(#[from] DataFlowError),
     #[error("running a compaction merge: {0}")]
     Merge(#[source] DataFlowError),
-    #[error(
-        "table at `{location}`: file `{file}` has no loaded row-group metadata; the copy was not synced to its manifest"
-    )]
-    FooterNotLoaded { location: String, file: String },
     #[error("table at `{location}` commit conflict: input file `{file}` is no longer active")]
     CommitConflict { location: String, file: String },
     #[error(
@@ -453,29 +449,16 @@ impl PivotlakeDatastore {
             .map(|e| e.file.clone().into_data_file(store.as_ref(), location))
             .collect::<object_storage::Result<Vec<DataFile>>>()?;
         let declared_columns = parquet_engine::TableColumns::by_name(state.columns.clone());
-        // The footer fetch returns each file's row groups keyed by identity; join
-        // each back to its log entry (partition tuple) by path.
-        let mut footers: HashMap<ObjectPath, Vec<Arc<parquet_engine::RowGroupMetadata>>> =
-            parquet_engine::load_file_row_groups(dispatcher, &data_files, declared_columns)?
-                .into_iter()
-                .map(|loaded| (loaded.file.path.clone(), loaded.row_groups))
-                .collect();
-        // A file the fetch returned nothing for would scan as an empty file, so
-        // the table fails to open rather than silently serving a narrower one.
-        let files = state
+        // The footer fetch returns one result per file, in the order of the log
+        // entries (partition tuples) the files were built from.
+        let footers =
+            parquet_engine::load_file_row_groups(dispatcher, &data_files, declared_columns)?;
+        let files: Vec<TableFile> = state
             .file_entries
             .into_iter()
-            .map(|entry| {
-                let row_groups =
-                    footers
-                        .remove(&entry.file.path)
-                        .ok_or_else(|| Error::FooterNotLoaded {
-                            location: location.as_str().to_string(),
-                            file: entry.file.path.as_str().to_string(),
-                        })?;
-                Ok(TableFile::new(entry, row_groups))
-            })
-            .collect::<Result<Vec<TableFile>>>()?;
+            .zip(footers)
+            .map(|(entry, footer)| TableFile::new(entry, footer.row_groups))
+            .collect();
         Ok(CatalogTable::new(
             id,
             location.clone(),

@@ -3,8 +3,9 @@
 //! A small work-stealing dataflow with one module per stage, carrying one
 //! [`FileRowGroups`] (a file's [`FileRef`] plus the row groups read from its
 //! footer) per file end to end. This layer is Parquet-specific and knows nothing
-//! of any table log: the owning table format joins each result with its file
-//! entry afterward.
+//! of any table log: [`load_file_row_groups`] returns one result per input file,
+//! in input order, so the owning table format pairs each with its file entry by
+//! position.
 //!
 //! - [`FileInjectorFactory`] (from `object_storage::file_injector`) — the source: hands
 //!   out the input files.
@@ -32,7 +33,8 @@ use dispatch::{
 };
 use fetcher::FileRowGroupsFetcher;
 use object_storage::file_injector::FileInjectorFactory;
-use object_storage::{DataFile, DataFileLocation, FileRef};
+use object_storage::{DataFile, DataFileLocation, FileRef, ObjectPath};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use writer::FileRowGroupsSinkFactory;
@@ -107,11 +109,10 @@ fn fetch_file_row_group_factories(
 }
 
 /// Read every file's footer in parallel and collect the resulting
-/// [`FileRowGroups`] on the coordinator (file order is not preserved — the table's
-/// row groups are flattened across whichever order the workers finish in). The
-/// fetch stage already emits `FileRowGroups`, so the dataflow's typed `collect`
-/// drains them directly — no terminal sink. Drives the dataflow, so it must run
-/// on the **coordinator**, not inside a `run_on_worker` closure.
+/// [`FileRowGroups`] on the coordinator: one per file, in the order of `files`,
+/// whose paths must be distinct. The fetch stage already emits `FileRowGroups`, so the dataflow's typed
+/// `collect` drains them directly — no terminal sink. Drives the dataflow, so it
+/// must run on the **coordinator**, not inside a `run_on_worker` closure.
 pub fn load_file_row_groups(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
@@ -123,16 +124,30 @@ pub fn load_file_row_groups(
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    OperatorSpec::new(
+    let loaded: Vec<FileRowGroups> = OperatorSpec::new(
         dispatcher.clone(),
         fetch_file_row_group_factories(files, dispatcher.worker_count(), table_columns),
     )
-    .collect()
+    .collect()?;
+    // Workers finish in any order: hand the footers back in the order of `files`.
+    let mut footers: HashMap<ObjectPath, FileRowGroups> = loaded
+        .into_iter()
+        .map(|footer| (footer.file.path.clone(), footer))
+        .collect();
+    Ok(files
+        .iter()
+        .map(|file| {
+            footers
+                .remove(&file.file.path)
+                .expect("every distinct file's footer is read once")
+        })
+        .collect())
 }
 
 /// A `RecordBatchOperatorSpec` that, when executed, reads every file's footer in
 /// parallel and — at its terminal stage — regroups the [`FileRowGroups`] and
-/// hands them to `stage` once on the terminal worker. Emits no rows. The stage
+/// hands them to `stage` once on the terminal worker, in whichever order the
+/// workers finished. Emits no rows. The stage
 /// closure must only enqueue the loaded metadata; durable table creation belongs
 /// to the transaction's commit path, outside the dispatch pool.
 pub fn create_load_and_stage_spec<C>(

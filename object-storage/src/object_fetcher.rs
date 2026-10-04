@@ -6,7 +6,7 @@
 //! read this way is served from cache the next time round.
 
 use crate::file_injector::FileInjectorFactory;
-use crate::{DataFile, FileRef};
+use crate::{DataFile, FileRef, ObjectPath};
 use dispatch::io::{FileRange, OperatorIO, ReadRequestId, ReadResponse};
 use dispatch::memory::memory_ctx;
 use dispatch::{
@@ -27,8 +27,9 @@ pub struct LoadedObject {
 const MAX_OBJECTS_IN_FLIGHT: usize = 32;
 
 /// Read every object in `files` in full, in parallel over the pool, and
-/// collect them on the coordinator. Completion order is whichever the workers
-/// finish in. Drives the dataflow, so it must run on the **coordinator** (a
+/// collect them on the coordinator: one object per file, in the order of
+/// `files`, whose paths must be distinct. Drives the dataflow, so it must run
+/// on the **coordinator** (a
 /// thread outside the dispatch workers, such as the one planning a query):
 /// it blocks until every worker has finished its share, so a worker calling
 /// it (from an operator, or a `run_on_worker` closure) would wait on itself.
@@ -47,7 +48,20 @@ pub fn load_objects(
             RootUnaryOperatorFactory::new(ObjectFetcherFactory, injector.clone(), siblings.clone())
         })
         .collect();
-    OperatorSpec::new(dispatcher.clone(), factories).collect()
+    let loaded: Vec<LoadedObject> = OperatorSpec::new(dispatcher.clone(), factories).collect()?;
+    // Workers finish in any order: hand the objects back in the order of `files`.
+    let mut objects: HashMap<ObjectPath, LoadedObject> = loaded
+        .into_iter()
+        .map(|object| (object.file.path.clone(), object))
+        .collect();
+    Ok(files
+        .iter()
+        .map(|file| {
+            objects
+                .remove(&file.file.path)
+                .expect("every distinct file is read once")
+        })
+        .collect())
 }
 
 /// Builds each worker's [`ObjectFetcher`].

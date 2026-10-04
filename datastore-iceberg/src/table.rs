@@ -422,20 +422,10 @@ fn load_files(
         }
     }
 
-    let mut fetched: HashMap<String, Vec<Arc<RowGroupMetadata>>> =
-        parquet_engine::load_file_row_groups(dispatcher, &to_fetch, columns.clone())?
-            .into_iter()
-            .map(|loaded| (loaded.file.path.as_str().to_string(), loaded.row_groups))
-            .collect();
-    for file in &mut files {
-        // A file the fetch returned nothing for would scan as empty, so the
-        // table fails to load rather than quietly losing rows.
-        file.row_groups = fetched
-            .remove(&file.location)
-            .ok_or_else(|| Error::FooterNotLoaded {
-                table: table.to_string(),
-                file: file.location.clone(),
-            })?;
+    // One footer per file, in the order the files were listed.
+    let fetched = parquet_engine::load_file_row_groups(dispatcher, &to_fetch, columns.clone())?;
+    for (file, footer) in files.iter_mut().zip(fetched) {
+        file.row_groups = footer.row_groups;
     }
     Ok(files)
 }
