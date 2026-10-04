@@ -16,7 +16,7 @@ use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use planner::expression::{CompareType, TableFilter};
+use planner::expression::{CompareType, Expression};
 
 use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
@@ -234,12 +234,13 @@ impl BoundTable for TableBinding {
         ))
     }
 
-    fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
+    fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
         // Just record it. The actual pruning (min/max row-group elimination and
         // equality/dictionary pruning) happens in `compile`, once the row-group
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
-        self.predicates.extend(PushedPredicate::from_filter(filter));
+        self.predicates
+            .extend(PushedPredicate::from_filter(&filter));
 
         Ok(false)
     }

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use insta::assert_snapshot;
 use planner::catalog::{BoundTable, CatalogTransaction, Column, TableReference, TableRevision};
-use planner::expression::{Expression, TableFilter};
+use planner::expression::Expression;
 use planner::types::Type;
 use planner::{DEFAULT_DATASTORE_NAME, DEFAULT_SCHEMA_NAME, Planner};
 
@@ -20,7 +20,7 @@ struct RecordingTable {
     /// Shared between the original (held by the test) and the per-binding
     /// clone (held by the catalog), so a test can inspect filters that were
     /// pushed into the clone.
-    received: Arc<Mutex<Vec<TableFilter>>>,
+    received: Arc<Mutex<Vec<Expression>>>,
 }
 
 impl RecordingTable {
@@ -67,7 +67,7 @@ impl BoundTable for RecordingTable {
         Box::new(self.clone())
     }
 
-    fn pushdown_filter(&mut self, filter: TableFilter) -> planner::catalog::Result<bool> {
+    fn pushdown_filter(&mut self, filter: Expression) -> planner::catalog::Result<bool> {
         self.received.lock().unwrap().push(filter);
         Ok(self.accept_pushdown)
     }
@@ -189,7 +189,7 @@ fn catalog_returns_error_for_unknown_table() {
     );
 }
 
-fn pushdown_snapshot(received: &[TableFilter]) -> String {
+fn pushdown_snapshot(received: &[Expression]) -> String {
     received
         .iter()
         .map(|f| f.to_string())
@@ -255,10 +255,8 @@ fn now_filter_is_pushed_down_and_plan_is_not_cacheable() {
 
     let received = table.received.lock().unwrap();
     assert_eq!(received.len(), 1);
-    let TableFilter::Expression(filter) = &received[0] else {
-        panic!("expected an expression filter, got {}", received[0]);
-    };
-    let Expression::Compare(compare) = filter.as_ref() else {
+    let filter = &received[0];
+    let Expression::Compare(compare) = filter else {
         panic!("expected a comparison, got {filter}");
     };
     assert!(
@@ -294,10 +292,8 @@ fn now_filter_on_timestamp_without_time_zone_is_pushed_down() {
 
     let received = table.received.lock().unwrap();
     assert_eq!(received.len(), 1);
-    let TableFilter::Expression(filter) = &received[0] else {
-        panic!("expected an expression filter, got {}", received[0]);
-    };
-    let Expression::Compare(compare) = filter.as_ref() else {
+    let filter = &received[0];
+    let Expression::Compare(compare) = filter else {
         panic!("expected a comparison, got {filter}");
     };
     let Expression::Cast(cast) = compare.left.as_ref() else {

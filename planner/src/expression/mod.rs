@@ -6,8 +6,8 @@
 //! evaluable kinds) its `compile` impl producing an
 //! [`ExprFn`]. This module holds the cross-cutting
 //! pieces: the [`Expression`] / [`Function`] enums that tie the kinds together,
-//! the conversion [`enum@Error`], the pushed-down [`TableFilter`], and the small
-//! `Display`/constant helpers shared across kinds.
+//! the conversion [`enum@Error`], and the small `Display`/constant helpers
+//! shared across kinds.
 
 mod aggregate;
 mod arithmetic;
@@ -397,36 +397,6 @@ impl Display for Expression {
             Expression::Not(n) => write!(f, "{n}"),
             Expression::IsNull(n) => write!(f, "{n}"),
             Expression::Cast(c) => write!(f, "{c}"),
-        }
-    }
-}
-
-/// A constant comparison against a single column pushed into a table scan.
-#[derive(Debug)]
-pub struct ConstantComparison {
-    pub column_ref: Box<Expression>,
-    pub compare_type: CompareType,
-    pub constant: Scalar<ArrayRef>,
-}
-
-/// A filter that was pushed down into a table scan.
-#[derive(Debug)]
-pub enum TableFilter {
-    Expression(Box<Expression>),
-    ConstantComparison(ConstantComparison),
-}
-
-impl Display for TableFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TableFilter::Expression(e) => write!(f, "{e}"),
-            TableFilter::ConstantComparison(c) => write!(
-                f,
-                "{} {} {}",
-                c.column_ref,
-                c.compare_type,
-                format_constant(&c.constant),
-            ),
         }
     }
 }

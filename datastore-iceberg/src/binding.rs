@@ -13,7 +13,7 @@ use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
     TableRevision,
 };
-use planner::expression::TableFilter;
+use planner::expression::Expression;
 
 use crate::table::LoadedTable;
 
@@ -111,10 +111,11 @@ impl BoundTable for IcebergTableBinding {
         Ok(materialize(input, self.prune(), projection))
     }
 
-    fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
+    fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
         // Recorded for row-group pruning at compile time. The query's own
         // `Filter` stays above the scan, so this only ever skips work.
-        self.predicates.extend(PushedPredicate::from_filter(filter));
+        self.predicates
+            .extend(PushedPredicate::from_filter(&filter));
         Ok(false)
     }
 
