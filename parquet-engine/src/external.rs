@@ -14,7 +14,7 @@ use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
     TableRevision,
 };
-use planner::expression::TableFilter;
+use planner::expression::Expression;
 use planner::types::{Type, type_from_physical};
 
 use crate::{
@@ -146,8 +146,9 @@ impl BoundTable for ExternalParquetTable {
         ))
     }
 
-    fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
-        self.predicates.extend(PushedPredicate::from_filter(filter));
+    fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
+        self.predicates
+            .extend(PushedPredicate::from_filter(&filter));
         // Statistics and dictionaries may skip work, but the SQL filter stays
         // above the scan and remains responsible for query correctness.
         Ok(false)

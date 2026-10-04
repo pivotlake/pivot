@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, Scalar, TimestampMicrosecondArray};
 use arrow_schema::{DataType, TimeUnit};
 
-use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
+use planner::expression::{CompareType, Expression, Function, JsonPath};
 use planner::types::{Type, UTC_TIMEZONE, physical_arrow_type};
 
 use super::row_group_stats::row_group_eliminated;
@@ -43,11 +43,8 @@ impl PushedPredicate {
     /// Recognize the predicate shapes whose Parquet statistics can safely
     /// eliminate row groups. Unsupported shapes are left entirely upstream and
     /// yield no predicates.
-    pub fn from_filter(filter: TableFilter) -> Vec<Self> {
-        let TableFilter::Expression(expr) = filter else {
-            return Vec::new();
-        };
-        match expr.as_ref() {
+    pub fn from_filter(filter: &Expression) -> Vec<Self> {
+        match filter {
             Expression::Compare(compare) => {
                 // DuckDB normally canonicalizes the column to the left. Keep
                 // constant-left comparisons upstream instead of risking an

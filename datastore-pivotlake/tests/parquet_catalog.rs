@@ -29,9 +29,7 @@ use planner::catalog::{
     BoundTable, CatalogTransaction, Column, CreateTableRequest, Result as CatalogResult,
     SchemaQualifiedTableName,
 };
-use planner::expression::{
-    Compare, CompareType, Expression, Function, Ref, TableFilter, VariantGet,
-};
+use planner::expression::{Compare, CompareType, Expression, Function, Ref, VariantGet};
 use planner::operator::{Input, Operator};
 use planner::types::Type;
 
@@ -196,11 +194,11 @@ fn int_constant(v: i32) -> Scalar<ArrayRef> {
     Scalar::new(Arc::new(Int32Array::new_scalar(v).into_inner()) as ArrayRef)
 }
 
-fn col_neq_filter(column_idx: usize, constant: Scalar<ArrayRef>) -> TableFilter {
+fn col_neq_filter(column_idx: usize, constant: Scalar<ArrayRef>) -> Expression {
     constant_comparison(column_idx, CompareType::NotEqual, constant)
 }
 
-fn col_eq_filter(column_idx: usize, constant: Scalar<ArrayRef>) -> TableFilter {
+fn col_eq_filter(column_idx: usize, constant: Scalar<ArrayRef>) -> Expression {
     constant_comparison(column_idx, CompareType::Equal, constant)
 }
 
@@ -208,10 +206,10 @@ fn constant_comparison(
     column_idx: usize,
     compare_type: CompareType,
     constant: Scalar<ArrayRef>,
-) -> TableFilter {
+) -> Expression {
     // Build the same shape DuckDB pushes through the C++ bridge:
-    // `TableFilter::Expression(Compare { Ref, Constant })`.
-    TableFilter::Expression(Box::new(Expression::Compare(Compare {
+    // `Compare { Ref, Constant }`.
+    Expression::Compare(Compare {
         left: Box::new(Expression::Ref(Ref {
             column_idx,
             return_type: Type::Int32,
@@ -220,7 +218,7 @@ fn constant_comparison(
         right: Box::new(Expression::Constant(constant)),
         compare_type,
         return_type: Type::Boolean,
-    })))
+    })
 }
 
 // Row groups that survive `table`'s pushed-down predicates over the table's
@@ -2076,9 +2074,9 @@ fn write_shredded_ages(ages: &[i64]) -> TempDir {
 
 /// `CAST(doc-><path> AS BIGINT) <cmp> <value>`, the shape plan build pushes for
 /// a typed variant comparison (the cast fused into a typed VariantGet).
-fn variant_filter(path: &[&str], cmp: CompareType, value: i64) -> TableFilter {
+fn variant_filter(path: &[&str], cmp: CompareType, value: i64) -> Expression {
     let constant = Scalar::new(Arc::new(Int64Array::new_scalar(value).into_inner()) as ArrayRef);
-    TableFilter::Expression(Box::new(Expression::Compare(Compare {
+    Expression::Compare(Compare {
         left: Box::new(Expression::Function(Function::VariantGet(VariantGet {
             input: Box::new(Expression::Ref(Ref {
                 column_idx: 0,
@@ -2091,7 +2089,7 @@ fn variant_filter(path: &[&str], cmp: CompareType, value: i64) -> TableFilter {
         right: Box::new(Expression::Constant(constant)),
         compare_type: cmp,
         return_type: Type::Boolean,
-    })))
+    })
 }
 
 fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<PivotlakeDatastore>, TableBinding) {

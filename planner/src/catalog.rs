@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use crate::expression::{CompareType, TableFilter};
+use crate::expression::{CompareType, Expression};
 use crate::operator::built_in_table_function;
 use crate::types::{Type, logical_from_type};
 use arrow_array::{ArrayRef, Scalar};
@@ -514,7 +514,7 @@ pub trait BoundTable: Debug + Send + Sync {
     /// *FULLY* consumed (no upstream `Filter` operator required), `Ok(false)`
     /// if it was kept above. Errors propagate to the FFI boundary as C++
     /// exceptions.
-    fn pushdown_filter(&mut self, _filter: TableFilter) -> Result<bool> {
+    fn pushdown_filter(&mut self, _filter: Expression) -> Result<bool> {
         Ok(false)
     }
 
@@ -586,11 +586,8 @@ impl DuckDBTable for DuckDBTableAdapter {
         &mut self,
         filter: Expr<'_>,
     ) -> duckdb_planner::catalog_provider::Result<bool> {
-        // Translate the borrowed DuckDB filter expression into a Pivot one (the
-        // only filter shape the bridge pushes is a bound expression).
-        let filter = TableFilter::Expression(Box::new(crate::expression::Expression::from_handle(
-            filter,
-        )?));
+        // Translate the borrowed DuckDB filter expression into a Pivot one.
+        let filter = Expression::from_handle(filter)?;
         Ok(self.table.pushdown_filter(filter)?)
     }
 
