@@ -13,12 +13,11 @@
 //! background, the way the pivotlake datastore refreshes its own tables, so a
 //! query never waits on the catalog and reads a snapshot at most one interval
 //! old. A table created or committed to between refreshes is seen at the next
-//! one. What is indexed is small (kilobytes per table); a table's manifests and
-//! footers are read when a query binds it, through the ring's caches, and are
-//! not indexed.
+//! one. What is indexed is small (kilobytes per table). Binding reads the
+//! manifest list; preparing a scan lazily reads selected manifests and footers
+//! through the ring's caches. Those objects are not indexed.
 //!
-//! A query that names a table twice loads it once, and every bind of one
-//! query resolves against the same index, so a refresh landing
+//! Every bind of one query resolves against the same index, so a refresh landing
 //! mid-query does not move a table under it.
 //!
 //! # Reading through the ring
@@ -26,11 +25,17 @@
 //! Manifest lists and manifests are read as whole objects over the io_uring
 //! ring ([`object_storage::load_objects`]), so they pass through the
 //! compressed cache and the disk cache exactly as data does: a restarted server
-//! finds them on local disk. Data files are Parquet, read by the same engine
-//! that reads every other datastore, with row-group pruning, late
-//! materialization and dynamic filters. Columns are matched to each file by
-//! Parquet field id, so renamed columns read correctly and a column added after
+//! finds them on local disk. A filtered query reads only the manifests whose
+//! partition summaries admit its predicates, and only the footers of the files
+//! whose partition values and column bounds do. Data files are Parquet, read
+//! by the same engine that reads every other datastore, with row-group
+//! pruning, late materialization and dynamic filters. Columns are matched to
+//! each file by Parquet field id, so renamed columns read correctly and a column added after
 //! a file was written reads as NULL for that file.
+//!
+//! Bounds are taken as recorded: Iceberg and Parquet leave NaNs out of theirs,
+//! so a range filter on a floating-point column can skip a file or row group
+//! whose only matching rows are NaNs.
 //!
 //! # Credentials
 //!
@@ -51,13 +56,17 @@
 //! # What is refused
 //!
 //! A table is refused, with an error naming the reason, rather than served
-//! partially or wrongly: format version 3, a snapshot that carries delete files
+//! partially or wrongly: encryption, a snapshot that carries delete files
 //! (row-level deletes are not applied), data files that are not Parquet, and a
-//! column whose Iceberg type has no Pivot type.
+//! column whose Iceberg type has no Pivot type or whose initial default would
+//! require synthesizing values for older files.
 
 mod binding;
 mod columns;
+mod describe;
 pub mod env;
+mod manifests;
+mod pruning;
 mod rest_catalog;
 mod store;
 mod table;
@@ -170,6 +179,12 @@ pub enum Error {
     },
     #[error("table `{table}` metadata object `{path}` is not in the store")]
     MissingMetadataObject { table: String, path: String },
+    #[error("table `{table}` partition metadata is invalid: {source}")]
+    InvalidPartitionMetadata {
+        table: String,
+        #[source]
+        source: Box<iceberg::Error>,
+    },
     #[error("table `{table}` metadata object `{path}` does not parse: {source}")]
     MalformedMetadataObject {
         table: String,
@@ -444,7 +459,7 @@ impl IcebergDatastore {
         let loaded = LoadedTable::load(
             name,
             &entry.table,
-            &entry.store,
+            entry.store.clone(),
             entry.manifest_list_size,
             &self.dispatcher,
         )?;
@@ -598,12 +613,13 @@ impl DatastoreTransaction for IcebergTransaction {
     fn tables(&self) -> CatalogResult<Vec<DatastoreTableMetadata>> {
         let tables = self.datastore.load_all_tables(&self.index)?;
         let mut memo = self.loaded_tables.lock().unwrap();
-        Ok(tables
+        let described = tables
             .into_iter()
             .map(|table| {
                 memo.insert(table.name.clone(), Some(table.clone()));
-                table.describe()
+                crate::describe::describe_table(&table)
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(described)
     }
 }
