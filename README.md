@@ -16,7 +16,16 @@
   </p>
 </div>
 
-Pivot is a high-performance analytics engine that runs on open data formats. It delivers low-latency queries and high concurrency without replicating data into a dedicated database or proprietary format.
+Pivot is a high-performance analytics engine that runs on open data formats. It delivers low-latency queries and high concurrency without replicating data into a dedicated real-time analytics database such as ClickHouse / Druid.
+
+<p align="center">
+  <a href="https://github.com/pivotlake/benchmarks">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/assets/benchmarks-dark.svg">
+      <img alt="Relative query time on ClickBench, TPC-H SF1000 and the Star Schema Benchmark SF1000: Pivot is the fastest engine on all three" src=".github/assets/benchmarks.svg">
+    </picture>
+  </a>
+</p>
 
 ## Key features
 

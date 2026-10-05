@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 364" width="900" height="364" role="img" aria-labelledby="title">
+<title id="title">Relative query time on ClickBench, TPC-H SF1000 and the Star Schema Benchmark SF1000, lower is better</title>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif;font-size:12.5px;font-variant-numeric:tabular-nums}
+.title{font-size:15px;font-weight:600;fill:#1f2328}
+.muted{fill:#59636e}
+.subtitle{font-size:11.5px;fill:#59636e}
+.pivot{font-weight:600;fill:#1f2328}
+.value{text-anchor:end}
+</style>
+<rect x="0.5" y="0.5" width="899" height="335" rx="6" fill="none" stroke="#d1d9e0"/>
+<text class="title" x="22" y="36">ClickBench</text>
+<text class="subtitle" x="22" y="54">43 queries</text>
+<text class="pivot" x="22" y="82">pivot (Parquet)</text>
+<text class="pivot value" x="278" y="82">1.09×</text>
+<path d="M22 90h59.0089a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-59.0089z" fill="#3049c9"/>
+<text class="muted" x="22" y="118">ClickHouse (native)</text>
+<text class="muted value" x="278" y="118">2.17×</text>
+<path d="M22 126h120.449a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-120.449z" fill="#b7b5ad"/>
+<text class="muted" x="22" y="154">DataFusion (Parquet)</text>
+<text class="muted value" x="278" y="154">3.09×</text>
+<path d="M22 162h172.787a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-172.787z" fill="#b7b5ad"/>
+<text class="muted" x="22" y="190">ClickHouse (Parquet)</text>
+<text class="muted value" x="278" y="190">3.61×</text>
+<path d="M22 198h202.369a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-202.369z" fill="#b7b5ad"/>
+<text class="muted" x="22" y="226">DuckDB (native)</text>
+<text class="muted value" x="278" y="226">4.17×</text>
+<path d="M22 234h234.227a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-234.227z" fill="#b7b5ad"/>
+<text class="muted" x="22" y="262">DuckDB (Parquet)</text>
+<text class="muted value" x="278" y="262">4.31×</text>
+<path d="M22 270h242.191a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-242.191z" fill="#b7b5ad"/>
+<text class="muted" x="22" y="298">Spark</text>
+<text class="muted value" x="278" y="298">53.73×</text>
+<path d="M22 306H245.16L242.16 314H22zM249.16 306H278V314H246.16z" fill="#b7b5ad"/>
+<path d="M300.5 1V335" stroke="#d1d9e0"/>
+<text class="title" x="322" y="36">TPC-H</text>
+<text class="subtitle" x="322" y="54">SF1000</text>
+<text class="pivot" x="322" y="82">pivot (Parquet)</text>
+<text class="pivot value" x="578" y="82">1.00×</text>
+<path d="M322 90h29a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-29z" fill="#3049c9"/>
+<text class="muted" x="322" y="118">DuckDB (Parquet)</text>
+<text class="muted value" x="578" y="118">2.16×</text>
+<path d="M322 126h66.12a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-66.12z" fill="#b7b5ad"/>
+<text class="muted" x="322" y="154">DuckDB (native)</text>
+<text class="muted value" x="578" y="154">3.10×</text>
+<path d="M322 162h96.2a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-96.2z" fill="#b7b5ad"/>
+<text class="muted" x="322" y="190">ClickHouse (native)</text>
+<text class="muted value" x="578" y="190">4.68×</text>
+<path d="M322 198h146.76a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-146.76z" fill="#b7b5ad"/>
+<text class="muted" x="322" y="226">DataFusion (Parquet)</text>
+<text class="muted value" x="578" y="226">7.37×</text>
+<path d="M322 234h232.84a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-232.84z" fill="#b7b5ad"/>
+<text class="muted" x="322" y="262">ClickHouse (Parquet)</text>
+<text class="muted value" x="578" y="262">27.14×</text>
+<path d="M322 270H545.16L542.16 278H322zM549.16 270H578V278H546.16z" fill="#b7b5ad"/>
+<text class="muted" x="322" y="298">Spark</text>
+<text class="muted value" x="578" y="298">43.59×</text>
+<path d="M322 306H545.16L542.16 314H322zM549.16 306H578V314H546.16z" fill="#b7b5ad"/>
+<path d="M600.5 1V335" stroke="#d1d9e0"/>
+<text class="title" x="622" y="36">Star Schema Benchmark</text>
+<text class="subtitle" x="622" y="54">SF1000</text>
+<text class="pivot" x="622" y="82">pivot (Parquet)</text>
+<text class="pivot value" x="878" y="82">1.00×</text>
+<path d="M622 90h15.2857a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-15.2857z" fill="#3049c9"/>
+<text class="muted" x="622" y="118">DuckDB (Parquet)</text>
+<text class="muted value" x="878" y="118">2.58×</text>
+<path d="M622 126h44.1771a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-44.1771z" fill="#b7b5ad"/>
+<text class="muted" x="622" y="154">ClickHouse (native)</text>
+<text class="muted value" x="878" y="154">3.36×</text>
+<path d="M622 162h58.44a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-58.44z" fill="#b7b5ad"/>
+<text class="muted" x="622" y="190">DuckDB (native)</text>
+<text class="muted value" x="878" y="190">5.00×</text>
+<path d="M622 198h88.4286a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-88.4286z" fill="#b7b5ad"/>
+<text class="muted" x="622" y="226">DataFusion (Parquet)</text>
+<text class="muted value" x="878" y="226">12.86×</text>
+<path d="M622 234h232.154a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-232.154z" fill="#b7b5ad"/>
+<text class="muted" x="622" y="262">Spark</text>
+<text class="muted value" x="878" y="262">44.38×</text>
+<path d="M622 270H845.16L842.16 278H622zM849.16 270H878V278H846.16z" fill="#b7b5ad"/>
+<text class="muted" x="622" y="298">ClickHouse (Parquet)</text>
+<text class="muted value" x="878" y="298">120.51×</text>
+<path d="M622 306H845.16L842.16 314H622zM849.16 306H878V314H846.16z" fill="#b7b5ad"/>
+<text class="subtitle" x="2" y="355">Relative query time, lower is better. All runs: AWS c8gd.metal-48xl</text>
+<text class="subtitle value" x="898" y="355">Reproduce: github.com/pivotlake/benchmarks</text>
+</svg>
