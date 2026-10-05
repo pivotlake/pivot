@@ -52,11 +52,13 @@ pub(crate) fn build_rest_catalog(name: &str, config: &IcebergCatalogConfig) -> R
         }
         None => {}
     }
-    let catalog = block_on(
+    // `load` captures the current runtime before returning its future.
+    let catalog = block_on(async {
         RestCatalogBuilder::default()
             .with_storage_factory(Arc::new(MemoryStorageFactory))
-            .load(name, properties),
-    )
+            .load(name, properties)
+            .await
+    })
     .map_err(Box::new)?;
     Ok(catalog)
 }
