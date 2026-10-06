@@ -98,10 +98,10 @@ impl TableBinding {
     }
 
     /// This binding's pushed equality predicates as partition-filter candidates:
-    /// the column name and the typed scalar. The catalog intersects these with
-    /// the table's partition columns, so yielding every equality predicate (not
-    /// just ones on partition columns, which the binding can't tell apart) is fine;
-    /// a non-partition column prunes no files.
+    /// the column name and the typed scalars the column may equal. The catalog
+    /// intersects these with the table's partition columns, so yielding every
+    /// equality predicate (not just ones on partition columns, which the binding
+    /// can't tell apart) is fine; a non-partition column prunes no files.
     fn partition_filter_candidates(&self) -> impl Iterator<Item = PartitionEqFilter> + '_ {
         self.predicates
             .iter()
@@ -109,16 +109,16 @@ impl TableBinding {
             .filter_map(|p| {
                 Some(PartitionEqFilter {
                     column: self.columns.get(p.column_idx)?.name.clone(),
-                    value: p.value.clone(),
+                    values: p.values.clone(),
                 })
             })
     }
 
     /// This binding's pushed predicates as file-level stat-filter candidates: a
     /// plain top-level column comparison (no variant path) paired with its typed
-    /// constant. Variant paths are excluded — their stats live in a shredded leaf,
-    /// pruned per row group, not in the file's column stats. A column the file's
-    /// stats don't bound simply prunes no files.
+    /// constants. Variant paths are excluded — their stats live in a shredded
+    /// leaf, pruned per row group, not in the file's column stats. A column the
+    /// file's stats don't bound simply prunes no files.
     fn stat_filter_candidates(&self) -> impl Iterator<Item = ColumnStatFilter> + '_ {
         self.predicates
             .iter()
@@ -127,7 +127,7 @@ impl TableBinding {
                 Some(ColumnStatFilter {
                     column: self.columns.get(p.column_idx)?.name.clone(),
                     compare_type: p.compare_type,
-                    value: p.value.clone(),
+                    values: p.values.clone(),
                 })
             })
     }

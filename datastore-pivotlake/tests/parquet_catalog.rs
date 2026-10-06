@@ -21,7 +21,9 @@ use tempfile::TempDir;
 use catalog::datastore::{Datastore, DatastoreTransaction};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{commit_datastore_transaction, current_parquet};
-use datastore_pivotlake::{ColumnStatFilter, PartitionEqFilter, PivotlakeDatastore, TableBinding};
+use datastore_pivotlake::{
+    CatalogTable, ColumnStatFilter, PartitionEqFilter, PivotlakeDatastore, TableBinding,
+};
 use object_storage::ObjectPath;
 use planner::PlanNode;
 use planner::Planner;
@@ -29,7 +31,7 @@ use planner::catalog::{
     BoundTable, CatalogTransaction, Column, CreateTableRequest, Result as CatalogResult,
     SchemaQualifiedTableName,
 };
-use planner::expression::{Compare, CompareType, Expression, Function, Ref, VariantGet};
+use planner::expression::{Compare, CompareType, Expression, Function, InList, Ref, VariantGet};
 use planner::operator::{Input, Operator};
 use planner::types::Type;
 
@@ -196,6 +198,17 @@ fn int_constant(v: i32) -> Scalar<ArrayRef> {
 
 fn col_neq_filter(column_idx: usize, constant: Scalar<ArrayRef>) -> Expression {
     constant_comparison(column_idx, CompareType::NotEqual, constant)
+}
+
+fn in_list_filter(column_idx: usize, constants: Vec<Scalar<ArrayRef>>) -> Expression {
+    Expression::InList(InList {
+        input: Box::new(Expression::Ref(Ref {
+            column_idx,
+            return_type: Type::Int32,
+            name: None,
+        })),
+        values: constants.into_iter().map(Expression::Constant).collect(),
+    })
 }
 
 fn col_eq_filter(column_idx: usize, constant: Scalar<ArrayRef>) -> Expression {
@@ -783,6 +796,47 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 1);
+}
+
+#[test]
+fn in_list_pushdown_keeps_the_row_groups_a_listed_value_may_be_in() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut table = datastore
+        .clone()
+        .begin_transaction()
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
+        .unwrap();
+
+    table
+        .pushdown_filter(in_list_filter(
+            0,
+            vec![int_constant(10), int_constant(30), int_constant(999)],
+        ))
+        .unwrap();
+
+    // The groups holding 10 and 30 each may hold a listed value; 999 lies
+    // outside every group's range, so the group holding 20 drops.
+    assert_eq!(row_group_count(&datastore, "t", &table), 2);
+}
+
+/// DuckDB offers a short `IN` list as an `OR` of equalities on the column, so
+/// both spellings must prune the same row groups.
+#[test]
+fn in_list_and_or_queries_scan_only_the_row_groups_they_can_match() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+
+    for predicate in ["id IN (10, 30)", "id = 10 OR id = 30"] {
+        let scanned = scanned_row_count(&datastore, &format!("SELECT id FROM t WHERE {predicate}"));
+
+        assert_eq!(scanned, 2, "{predicate}");
+    }
 }
 
 #[test]
@@ -1870,10 +1924,13 @@ fn string_values(name: &str, value: &str) -> HashMap<String, Scalar<ArrayRef>> {
     )])
 }
 
-fn name_eq(value: &str) -> PartitionEqFilter {
+fn name_in(values: &[&str]) -> PartitionEqFilter {
     PartitionEqFilter {
         column: "name".to_string(),
-        value: Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef),
+        values: values
+            .iter()
+            .map(|value| Scalar::new(Arc::new(StringViewArray::from(vec![*value])) as ArrayRef))
+            .collect(),
     }
 }
 
@@ -1885,11 +1942,28 @@ fn partition_filter_builds_only_the_matching_partitions_files() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
         .unwrap();
     table.refresh().unwrap();
-    let kept = table.build_scan_view(&[name_eq("keep")], &[]).unwrap();
+    let kept = table.build_scan_view(&[name_in(&["keep"])], &[]).unwrap();
 
     // Only the one-group `keep` file enters the scan view; the three-group
     // `drop` file's partition tuple can't match.
     assert_eq!(kept.row_groups().len(), 1);
+}
+
+#[test]
+fn partition_in_list_builds_every_listed_partitions_files() {
+    let (_dir, _database, datastore) = table_partitioned_by_name();
+
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
+        .unwrap();
+    table.refresh().unwrap();
+    let kept = table
+        .build_scan_view(&[name_in(&["drop", "other"])], &[])
+        .unwrap();
+
+    // The `drop` file's tuple equals a listed value, so its three groups enter
+    // the view; the `keep` file's equals none and stays out.
+    assert_eq!(kept.row_groups().len(), 3);
 }
 
 #[test]
@@ -1966,7 +2040,7 @@ fn create_over_partitioned_files_stamps_each_file_with_its_partition() {
     table.refresh().unwrap();
     let part_is_one = PartitionEqFilter {
         column: "part".to_string(),
-        value: int_constant(1),
+        values: vec![int_constant(1)],
     };
     let kept = table.build_scan_view(&[part_is_one], &[]).unwrap();
 
@@ -1975,34 +2049,24 @@ fn create_over_partitioned_files_stamps_each_file_with_its_partition() {
     assert_eq!(kept.row_groups().len(), 3);
 }
 
-#[test]
-fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
+/// An `id` table created empty, then each of `files` (a name and its ids, one
+/// row group each) appended into the table's own location through the returned
+/// handle, so the file stats under test are the ones the append path records.
+fn table_of_appended_id_files(
+    files: &[(&str, &[i32])],
+) -> (TempDir, Arc<PivotlakeDatastore>, CatalogTable) {
     let dir = TempDir::new().unwrap();
-    write_ids_one_group_each(dir.path(), "low.parquet", &[1, 2, 3]);
-    write_ids_one_group_each(dir.path(), "high.parquet", &[100, 200, 300]);
     let columns = vec![Column {
         name: "id".to_string(),
         col_type: Type::Int32,
     }];
-    let (_database, datastore) = empty_datastore();
-    // Created empty, then each file appended into the table's own location, so
-    // the stats under test are the ones the append path records.
-    create_table(
-        &datastore,
-        CreateTableRequest {
-            datastore_name: None,
-            schema_name: None,
-            name: "t".to_string(),
-            columns,
-            options: HashMap::new(),
-            if_not_exists: false,
-        },
-    )
-    .unwrap();
+    let (database, datastore) = empty_datastore();
+    create_table(&datastore, empty_request("t", columns)).unwrap();
     let mut table = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
-    for name in ["low.parquet", "high.parquet"] {
+    for &(name, ids) in files {
+        write_ids_one_group_each(dir.path(), name, ids);
         table
             .append_data_file(
                 ObjectPath::new(name),
@@ -2012,17 +2076,46 @@ fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
             .unwrap();
     }
     table.refresh().unwrap();
+    (database, datastore, table)
+}
+
+#[test]
+fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
+    let (_database, _datastore, table) = table_of_appended_id_files(&[
+        ("low.parquet", &[1, 2, 3]),
+        ("high.parquet", &[100, 200, 300]),
+    ]);
 
     let id_below_fifty = ColumnStatFilter {
         column: "id".to_string(),
         compare_type: CompareType::Less,
-        value: int_constant(50),
+        values: vec![int_constant(50)],
     };
     let kept = table.build_scan_view(&[], &[id_below_fifty]).unwrap();
 
     // The high file's aggregate min (100) proves no row is `< 50`, so all three
     // of its groups drop before row-group pruning; the low file's three survive.
     assert_eq!(kept.row_groups().len(), 3);
+}
+
+#[test]
+fn file_level_stats_prune_keeps_every_file_a_listed_value_may_be_in() {
+    let (_database, _datastore, table) = table_of_appended_id_files(&[
+        ("low.parquet", &[1, 2, 3]),
+        ("mid.parquet", &[10, 20, 30]),
+        ("high.parquet", &[100, 200, 300]),
+    ]);
+
+    let id_in_list = ColumnStatFilter {
+        column: "id".to_string(),
+        compare_type: CompareType::Equal,
+        values: vec![int_constant(2), int_constant(200)],
+    };
+    let kept = table.build_scan_view(&[], &[id_in_list]).unwrap();
+
+    // The low and high files' ranges each hold a listed value; the mid file's
+    // range holds neither, so its three groups drop.
+    assert_eq!(kept.row_groups().len(), 6);
 }
 
 // -- Variant shredded-path pushdown --

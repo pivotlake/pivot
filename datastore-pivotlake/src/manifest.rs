@@ -74,8 +74,8 @@ impl DeltaFileEntry {
     /// soft test, so it never wrongly drops a file. A filter on a non-partition
     /// column, an entry with no recorded tuple, or a tuple missing the column all
     /// keep the entry (absence of a value is not proof of a mismatch). Only a
-    /// recorded partition value that differs from the filter's excludes it.
-    /// Both sides are Pivot-native typed scalars.
+    /// recorded partition value that differs from every one of the filter's
+    /// excludes it. Both sides are Pivot-native typed scalars.
     pub fn maybe_matches_partition(
         &self,
         partition_by: &[String],
@@ -87,7 +87,10 @@ impl DeltaFileEntry {
         filters.iter().all(|filter| {
             !partition_by.iter().any(|c| c == &filter.column)
                 || match tuple.get(&filter.column) {
-                    Some(value) => scalar_equal(value, &filter.value).unwrap_or(true),
+                    Some(value) => filter
+                        .values
+                        .iter()
+                        .any(|candidate| scalar_equal(value, candidate).unwrap_or(true)),
                     None => true,
                 }
         })
@@ -97,8 +100,9 @@ impl DeltaFileEntry {
     /// test (like [`maybe_matches_partition`](Self::maybe_matches_partition)), so
     /// it never wrongly drops a file. A file with no recorded stats, or a filter
     /// on a column the stats don't bound, keeps the file. Only a min/max range
-    /// that proves no row can match excludes it. Skips a whole file (all its row
-    /// groups) before the finer row-group stats pruning looks inside it.
+    /// that proves no row can match any of the filter's values excludes it.
+    /// Skips a whole file (all its row groups) before the finer row-group stats
+    /// pruning looks inside it.
     pub fn maybe_matches_stats(&self, filters: &[ColumnStatFilter]) -> bool {
         let Some(stats) = self.stats.as_ref() else {
             return true;
@@ -110,26 +114,26 @@ impl DeltaFileEntry {
             ) else {
                 return true;
             };
-            !parquet_engine::bounds_eliminate(
-                &Scalar::new(min.clone()),
-                &Scalar::new(max.clone()),
-                filter.compare_type,
-                &filter.value,
-            )
-            .unwrap_or(false)
+            let (min, max) = (Scalar::new(min.clone()), Scalar::new(max.clone()));
+            !filter.values.iter().all(|value| {
+                parquet_engine::bounds_eliminate(&min, &max, filter.compare_type, value)
+                    .unwrap_or(false)
+            })
         })
     }
 }
 
-/// A `partition column = constant` predicate the query pushed down, with the
-/// constant retained as Pivot's typed Arrow scalar.
+/// A `partition column = constant` predicate the query pushed down, with each
+/// constant the column may equal (one for `=`, every value of an `IN` list)
+/// retained as Pivot's typed Arrow scalar.
 /// [`DeltaFileEntry::maybe_matches_partition`] uses it to skip a file whose
 /// recorded partition value can't match *before* its footer is fetched — the
 /// HTTP a stats prune can't save, since stats live in the footer.
 #[derive(Clone, Debug)]
 pub struct PartitionEqFilter {
     pub column: String,
-    pub value: Scalar<ArrayRef>,
+    /// Never empty: the file matches when its value equals any one of them.
+    pub values: Vec<Scalar<ArrayRef>>,
 }
 
 /// A `column <cmp> constant` range predicate the query pushed down, retained as
@@ -141,7 +145,9 @@ pub struct PartitionEqFilter {
 pub struct ColumnStatFilter {
     pub column: String,
     pub compare_type: CompareType,
-    pub value: Scalar<ArrayRef>,
+    /// Never empty: the file matches when the comparison with any one of them
+    /// may hold. One for a plain comparison, every value of an `IN` list.
+    pub values: Vec<Scalar<ArrayRef>>,
 }
 
 /// The schema an entry belongs to when the document omits the field: the
@@ -466,24 +472,30 @@ mod tests {
             scalar(StringViewArray::from(vec!["api"])),
         )]));
         let partition_by = ["service".to_string()];
-        let filter = |value| PartitionEqFilter {
+        let filter = |values: &[&str]| PartitionEqFilter {
             column: "service".to_string(),
-            value: scalar(StringViewArray::from(vec![value])),
+            values: values
+                .iter()
+                .map(|value| scalar(StringViewArray::from(vec![*value])))
+                .collect(),
         };
 
-        assert!(entry.maybe_matches_partition(&partition_by, &[filter("api")]));
-        assert!(!entry.maybe_matches_partition(&partition_by, &[filter("worker")]));
+        assert!(entry.maybe_matches_partition(&partition_by, &[filter(&["api"])]));
+        assert!(!entry.maybe_matches_partition(&partition_by, &[filter(&["worker"])]));
+        // A file matches a list of values when its value is any one of them.
+        assert!(entry.maybe_matches_partition(&partition_by, &[filter(&["worker", "api"])]));
+        assert!(!entry.maybe_matches_partition(&partition_by, &[filter(&["worker", "web"])]));
 
         // A mismatched physical type or absent field is unknown, so pruning
         // keeps the file instead of risking a false negative.
         let mismatched = PartitionEqFilter {
             column: "service".to_string(),
-            value: scalar(Int64Array::from(vec![1])),
+            values: vec![scalar(Int64Array::from(vec![1]))],
         };
         assert!(entry.maybe_matches_partition(&partition_by, &[mismatched]));
         assert!(
             manifest_entry(HashMap::new())
-                .maybe_matches_partition(&partition_by, &[filter("worker")])
+                .maybe_matches_partition(&partition_by, &[filter(&["worker"])])
         );
     }
 
