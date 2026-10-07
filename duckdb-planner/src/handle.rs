@@ -1372,6 +1372,11 @@ impl<'plan> AggregateFunc<'plan> {
             .collect()
     }
 
+    /// Whether the call carries a `FILTER (WHERE …)` clause.
+    pub fn has_filter(self) -> Result<bool> {
+        Ok(ffi::expr_aggregate_has_filter(self.raw)?)
+    }
+
     /// DuckDB's declared result type for the call.
     pub fn return_type(self) -> Result<BoundLogicalType> {
         Ok(bound_type_from(ffi::expr_return_type(self.raw)?))

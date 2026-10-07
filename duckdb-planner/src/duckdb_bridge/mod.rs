@@ -585,6 +585,7 @@ pub mod ffi {
         fn expr_aggregate_distinct(expr: &Expression) -> Result<bool>;
         fn expr_aggregate_child_count(expr: &Expression) -> Result<usize>;
         fn expr_aggregate_child(expr: &Expression, index: usize) -> Result<&Expression>;
+        fn expr_aggregate_has_filter(expr: &Expression) -> Result<bool>;
 
         // BoundFunctionExpression
         fn expr_function_name(expr: &Expression) -> Result<String>;

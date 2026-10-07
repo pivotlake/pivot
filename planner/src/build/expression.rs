@@ -263,6 +263,14 @@ impl AggregateFunc {
             )));
         }
 
+        // `FILTER (WHERE …)` is not supported; reject it rather than silently
+        // aggregating over every row.
+        if view.has_filter()? {
+            return Err(Error::UnsupportedAggregateFunction(format!(
+                "{function} with a FILTER clause"
+            )));
+        }
+
         match function.as_str() {
             "count_star" => Ok(AggregateFunc::CountStar(CountStar {
                 params,

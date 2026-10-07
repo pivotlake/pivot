@@ -1376,6 +1376,11 @@ const Expression &expr_aggregate_child(const Expression &expr, size_t index) {
 	return *as_expr<duckdb::BoundAggregateExpression>(expr).children[index];
 }
 
+// Whether the aggregate call carries a `FILTER (WHERE …)` clause.
+bool expr_aggregate_has_filter(const Expression &expr) {
+	return as_expr<duckdb::BoundAggregateExpression>(expr).filter != nullptr;
+}
+
 rust::String expr_function_name(const Expression &expr) {
 	return rust::String::lossy(as_expr<duckdb::BoundFunctionExpression>(expr).function.name);
 }

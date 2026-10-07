@@ -320,6 +320,7 @@ rust::String expr_aggregate_name(const Expression &expr);
 bool expr_aggregate_distinct(const Expression &expr);
 size_t expr_aggregate_child_count(const Expression &expr);
 const Expression &expr_aggregate_child(const Expression &expr, size_t index);
+bool expr_aggregate_has_filter(const Expression &expr);
 
 rust::String expr_function_name(const Expression &expr);
 size_t expr_function_child_count(const Expression &expr);

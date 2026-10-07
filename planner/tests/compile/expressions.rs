@@ -1136,6 +1136,20 @@ fn grouped_count_distinct_over_product(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn aggregate_with_a_filter_clause_is_refused(mut testing_planner: TestingPlanner) {
+    let error = testing_planner
+        .plan("SELECT COUNT(*) FILTER (WHERE a > 2) AS n FROM example_table")
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("count_star with a FILTER clause"),
+        "unexpected error: {error}"
+    );
+}
+
+#[rstest]
 fn computed_group_key_with_computed_aggregate_argument(mut testing_planner: TestingPlanner) {
     // Group by a computed key (a bucket) and aggregate a computed argument: both
     // are materialised into leading columns before the aggregate.
