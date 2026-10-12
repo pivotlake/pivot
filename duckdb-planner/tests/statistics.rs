@@ -6,6 +6,7 @@ use duckdb_planner::{DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId
 struct CountingTable {
     rows: u64,
     asked: Arc<AtomicUsize>,
+    distinct_asked: Arc<AtomicUsize>,
 }
 
 impl DuckDBTable for CountingTable {
@@ -13,6 +14,7 @@ impl DuckDBTable for CountingTable {
         Box::new(CountingTable {
             rows: self.rows,
             asked: self.asked.clone(),
+            distinct_asked: self.distinct_asked.clone(),
         })
     }
 
@@ -29,10 +31,16 @@ impl DuckDBTable for CountingTable {
         self.asked.fetch_add(1, Ordering::Relaxed);
         Some(self.rows)
     }
+
+    fn column_distinct_count(&self, _column: usize) -> Option<u64> {
+        self.distinct_asked.fetch_add(1, Ordering::Relaxed);
+        Some(self.rows)
+    }
 }
 
 struct StatsTransaction {
     asked: Arc<AtomicUsize>,
+    distinct_asked: Arc<AtomicUsize>,
 }
 
 impl DuckDBTransaction for StatsTransaction {
@@ -58,6 +66,7 @@ impl DuckDBTransaction for StatsTransaction {
         Ok(Some(Box::new(CountingTable {
             rows,
             asked: self.asked.clone(),
+            distinct_asked: self.distinct_asked.clone(),
         })))
     }
 }
@@ -73,9 +82,29 @@ fn join_planning_consults_table_row_counts() {
             "SELECT small.id FROM small JOIN big ON small.id = big.id",
             Arc::new(StatsTransaction {
                 asked: asked.clone(),
+                distinct_asked: Arc::new(AtomicUsize::new(0)),
             }),
         )
         .unwrap();
 
     assert!(asked.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn join_planning_consults_column_distinct_counts() {
+    let distinct_asked = Arc::new(AtomicUsize::new(0));
+    let mut planner =
+        PlannerContext::new(Vec::new(), vec!["db".to_string()], "db".to_string()).unwrap();
+
+    planner
+        .plan(
+            "SELECT small.id FROM small JOIN big ON small.id = big.id",
+            Arc::new(StatsTransaction {
+                asked: Arc::new(AtomicUsize::new(0)),
+                distinct_asked: distinct_asked.clone(),
+            }),
+        )
+        .unwrap();
+
+    assert!(distinct_asked.load(Ordering::Relaxed) > 0);
 }

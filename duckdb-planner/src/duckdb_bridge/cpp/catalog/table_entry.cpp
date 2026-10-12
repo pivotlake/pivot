@@ -2,6 +2,7 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/bridge.h"
 
 #include "duckdb/common/column_index.hpp"
+#include "duckdb/common/constants.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -9,6 +10,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
@@ -19,11 +21,13 @@ static BindInfo PivotScanGetBindInfo(const optional_ptr<FunctionData> bind_data)
 	return BindInfo(data.catalog_entry);
 }
 
-// Feed DuckDB's cost model the table's real size. The optimizer reaches this
-// through LogicalGet::EstimateCardinality, and the join order optimizer's
-// relation stats build on it — so join ordering (and with it the hash join's
-// build/probe side choice) sees actual row counts instead of the default
-// guess. Returning null means "unknown" and keeps DuckDB's defaults.
+// Feed DuckDB's cost model the scan's estimated size: the table's rows after
+// the filters pushed into it. The optimizer reaches this through
+// LogicalGet::EstimateCardinality, and the join order optimizer's relation
+// stats build on it — so join ordering (and with it the hash join's
+// build/probe side choice) sees how many rows each scan really feeds in
+// instead of the default guess. Returning null means "unknown" and keeps
+// DuckDB's defaults.
 static unique_ptr<NodeStatistics> PivotScanCardinality(ClientContext &context, const FunctionData *bind_data) {
 	auto &data = bind_data->Cast<PivotScanBindData>();
 	auto estimate = table_estimate_row_count(data.table);
@@ -31,6 +35,30 @@ static unique_ptr<NodeStatistics> PivotScanCardinality(ClientContext &context, c
 		return nullptr;
 	}
 	return make_uniq<NodeStatistics>(estimate.rows, estimate.rows);
+}
+
+// Per-column statistics for DuckDB's cost model: the column's estimated
+// distinct-value count, which the join order optimizer takes as the domain of
+// a join key (a join's output is the product of its inputs over that domain)
+// and an equality filter's estimate divides by. Nothing else is claimed (no
+// bounds, nulls possible), so the statistics propagator folds no filter on
+// it. Null means "unknown" and keeps DuckDB's defaults; a virtual column (the
+// row id) has no estimate.
+static unique_ptr<BaseStatistics> PivotScanStatistics(ClientContext &context,
+                                                      TableFunctionGetStatisticsInput &input) {
+	auto &data = input.bind_data->Cast<PivotScanBindData>();
+	auto column_index = input.column_index.GetPrimaryIndex();
+	if (IsVirtualColumn(column_index)) {
+		return nullptr;
+	}
+	auto estimate = table_column_distinct_count(data.table, column_index);
+	if (!estimate.known) {
+		return nullptr;
+	}
+	auto &column = data.catalog_entry.GetColumns().GetColumn(LogicalIndex(column_index));
+	auto stats = BaseStatistics::CreateUnknown(column.GetType());
+	stats.SetDistinctCount(estimate.count);
+	return stats.ToUnique();
 }
 
 // Walk an expression tree and rewrite every BoundReferenceExpression's index
@@ -155,8 +183,10 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	func.projection_pushdown = true;
 	// Push variant/struct field extracts into this scan's column_ids so we read
 	// only the referenced leaves. Gated by the optimizer on `func.statistics`
-	// being unset, which it is.
+	// being unset; per-column statistics go through `statistics_extended`
+	// instead, which the gate allows.
 	func.supports_pushdown_extract = PivotScanSupportsPushdownExtract;
+	func.statistics_extended = PivotScanStatistics;
 	// A capable table lets DuckDB rewrite a wide Top-N into a narrow row-id
 	// scan whose survivors Pivot materializes. The row-id is a plan-time marker;
 	// the default virtual column from TableCatalogEntry is sufficient. Tables
@@ -170,9 +200,9 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	return func;
 }
 
-// Per-column statistics (min/max, distinct counts) are not plumbed from the
-// Rust catalog; table-level cardinality (PivotScanCardinality) is. Null means
-// "unknown" and is always safe.
+// Per-column statistics reach the optimizer through the scan function's
+// `statistics_extended` hook (PivotScanStatistics), which has the bound
+// table at hand; this catalog-entry hook stays unknown, which is always safe.
 unique_ptr<BaseStatistics> PivotTableCatalogEntry::GetStatistics(ClientContext &context, column_t column_id) {
 	return nullptr;
 }

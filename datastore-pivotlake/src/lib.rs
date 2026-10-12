@@ -301,6 +301,9 @@ pub struct PivotlakeDatastore {
     /// The worker pool every footer fetch runs on. Held by the datastore because
     /// refreshes drive their own dataflows, with no dispatcher passed in.
     dispatcher: DataFlowDispatcher,
+    /// Distinct-count estimates the planner asked for, derived once per table
+    /// version and shared by every binding (see [`binding::DistinctCountCache`]).
+    distinct_counts: binding::DistinctCountCache,
 
     /// The background maintenance this datastore runs once [`start`](Datastore::start)
     /// is called: a periodic refresh sweep and optional compaction. `None` for a
@@ -372,6 +375,7 @@ impl PivotlakeDatastore {
             _local_lock: local_lock,
             engine,
             dispatcher: dispatcher.clone(),
+            distinct_counts: Arc::new(Mutex::new(HashMap::new())),
             maintenance,
             maintenance_tasks: Arc::new(Mutex::new(Vec::new())),
             compacter: Arc::new(Mutex::new(None)),
@@ -1420,7 +1424,8 @@ impl PivotlakeTransaction {
     /// needs a `Box<dyn BoundTable>`, while a concrete caller wants the
     /// `TableBinding`, and one function cannot return both). The binding captures
     /// the snapshot's copy of the table and shares this transaction's
-    /// uploaded-files injector, so it is self-contained.
+    /// uploaded-files injector and the datastore's statistics, so it is
+    /// self-contained.
     pub fn table(&self, datastore: &str, name: &SchemaQualifiedTableName) -> Option<TableBinding> {
         Some(TableBinding::new(
             planner::catalog::TableReference {
@@ -1430,6 +1435,7 @@ impl PivotlakeTransaction {
             },
             self.snapshot.catalog_table_by_name(name)?,
             self.uploaded_files.clone(),
+            self.datastore.distinct_counts.clone(),
         ))
     }
 }

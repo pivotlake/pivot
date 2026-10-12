@@ -12,8 +12,8 @@ use crate::catalog_provider::{
     CatalogContext, OptionalTableWrapper, TransactionContext, catalog_bind_table_function,
     catalog_context_default, catalog_context_names, catalog_does_schema_exist,
     catalog_get_scalar_function, catalog_get_table, catalog_table_functions,
-    clone_table_function_table, pushdown_filter, table_estimate_row_count,
-    table_supports_late_materialization,
+    clone_table_function_table, pushdown_filter, table_column_distinct_count,
+    table_estimate_row_count, table_supports_late_materialization,
 };
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
@@ -109,6 +109,14 @@ pub mod ffi {
         pub rows: u64,
     }
 
+    /// A column's estimated distinct-value count for DuckDB's cost model.
+    /// `known = false` when the backend cannot estimate it; DuckDB then uses
+    /// its own defaults.
+    struct DistinctCountEstimate {
+        pub known: bool,
+        pub count: u64,
+    }
+
     /// Outcome of `extract_plan`.
     ///
     /// On success `error_kind` is empty and `plan` owns DuckDB's resolved plan
@@ -167,6 +175,10 @@ pub mod ffi {
         ) -> CatalogGetScalarFunctionResult;
         fn pushdown_filter(table: &mut OptionalTableWrapper, expr: &Expression) -> Result<bool>;
         fn table_estimate_row_count(table: &OptionalTableWrapper) -> CardinalityEstimate;
+        fn table_column_distinct_count(
+            table: &OptionalTableWrapper,
+            column: usize,
+        ) -> DistinctCountEstimate;
         fn table_supports_late_materialization(table: &OptionalTableWrapper) -> bool;
     }
 

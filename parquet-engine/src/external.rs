@@ -161,7 +161,13 @@ impl BoundTable for ExternalParquetTable {
     }
 
     fn estimate_row_count(&self) -> Option<u64> {
-        Some(self.parquet.total_rows() as u64)
+        // The scan's own size: the rows of the row groups its pushed predicates
+        // keep, which the footers count exactly.
+        Some(prune_parquet(&self.parquet, &self.predicates).total_rows() as u64)
+    }
+
+    fn column_distinct_count(&self, column: usize) -> Option<u64> {
+        self.parquet.bound_distinct_count(column)
     }
 }
 

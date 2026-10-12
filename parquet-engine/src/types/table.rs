@@ -9,9 +9,10 @@ use crate::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::thrift::general::{Encoding, PageType};
 use crate::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::types::columns::{ColumnResolution, TableColumns};
-use crate::types::leaves::leaf_count;
+use crate::types::leaves::{first_leaf, leaf_count};
 use crate::types::metadata::{ColumnChunkMeta, FileLeafStatistics, RowGroupMetadata};
 use arrow_array::builder::{BinaryViewBuilder, StringViewBuilder};
+use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
     Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -25,7 +26,7 @@ use dispatch::DataFlowDispatcher;
 use object_storage::DataFile;
 use planner::catalog::Column;
 use planner::types::Type;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
@@ -195,6 +196,39 @@ impl ParquetTable {
         Some((min?, max?))
     }
 
+    /// The most distinct values `column` can hold, judged from the footers
+    /// alone: for an integer or date column, the width of its value range over
+    /// every row group. A column that references a dense key (ids handed out in
+    /// sequence) sits right at this bound. `None` when the range is no narrower
+    /// than the row count, since then it adds nothing to what the row count
+    /// already says and a planner would wrongly take it for a measured count
+    /// (a sparse key over a long table ranges far beyond its values); `None`
+    /// too for other types (how many decimals or timestamps a range could hold
+    /// says nothing about how many the column does) and when any row group
+    /// recorded no bound.
+    pub fn bound_distinct_count(&self, column: usize) -> Option<u64> {
+        if !counts_values_by_range(self.schema.field(column).data_type()) {
+            return None;
+        }
+        let mut lowest: Option<i128> = None;
+        let mut highest: Option<i128> = None;
+        // A file's bounds are shared by all of its row groups: fold each file once.
+        let mut folded_files = HashSet::new();
+        for row_group in &self.row_groups {
+            if !folded_files.insert(Arc::as_ptr(&row_group.statistics)) {
+                continue;
+            }
+            let leaf = first_leaf(row_group.schema.fields(), column);
+            let leaf_stats = row_group.statistics.get(leaf)?.as_ref()?;
+            let (file_lowest, _) = integer_bounds(leaf_stats.min.as_ref()?)?;
+            let (_, file_highest) = integer_bounds(leaf_stats.max.as_ref()?)?;
+            lowest = Some(lowest.map_or(file_lowest, |held| held.min(file_lowest)));
+            highest = Some(highest.map_or(file_highest, |held| held.max(file_highest)));
+        }
+        let range = highest? - lowest? + 1;
+        (range < i128::from(self.total_rows())).then_some(range as u64)
+    }
+
     /// Returns the table's Arrow schema. Preserved across pruning, so a table
     /// whose row groups were all eliminated still reports its real schema.
     pub fn schema(&self) -> &SchemaRef {
@@ -209,6 +243,58 @@ impl ParquetTable {
 pub(crate) fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
     arrow_ord::cmp::lt(a, b)
         .is_ok_and(|result| result.len() == 1 && result.is_valid(0) && result.value(0))
+}
+
+/// Whether a column of `data_type` holds at most one value per unit of its
+/// range, so the range's width bounds its distinct count: integers and dates do,
+/// a decimal or timestamp range spans far more units than values.
+fn counts_values_by_range(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Date32
+    )
+}
+
+/// The smallest and largest value in a column of integer-like bounds, or `None`
+/// when a bound is missing (a row group recorded none) or the bounds are of
+/// another type.
+fn integer_bounds(bounds: &ArrayRef) -> Option<(i128, i128)> {
+    fn fold<T: ArrowPrimitiveType>(bounds: &ArrayRef) -> Option<(i128, i128)>
+    where
+        T::Native: Into<i128>,
+    {
+        if bounds.null_count() > 0 {
+            return None;
+        }
+        let values = bounds.as_primitive::<T>().values().iter().copied();
+        values
+            .map(Into::into)
+            .fold(None, |held: Option<(i128, i128)>, value| {
+                Some(held.map_or((value, value), |(lowest, highest)| {
+                    (lowest.min(value), highest.max(value))
+                }))
+            })
+    }
+    match bounds.data_type() {
+        DataType::Int8 => fold::<Int8Type>(bounds),
+        DataType::Int16 => fold::<Int16Type>(bounds),
+        DataType::Int32 => fold::<Int32Type>(bounds),
+        DataType::Int64 => fold::<Int64Type>(bounds),
+        DataType::UInt8 => fold::<UInt8Type>(bounds),
+        DataType::UInt16 => fold::<UInt16Type>(bounds),
+        DataType::UInt32 => fold::<UInt32Type>(bounds),
+        DataType::UInt64 => fold::<UInt64Type>(bounds),
+        DataType::Date32 => fold::<Date32Type>(bounds),
+        _ => None,
+    }
 }
 
 /// How much of a file's tail to fetch when probing for the footer. Almost every
@@ -1044,6 +1130,30 @@ mod tests {
                 .value(0),
             &[2]
         );
+    }
+
+    #[test]
+    fn a_distinct_count_bound_is_an_integer_range_narrower_than_the_row_count() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("cycle", DataType::Int32, false),
+                Field::new("sparse", DataType::Int64, false),
+                Field::new("name", DataType::Utf8View, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from_iter_values((0..100).map(|i| i % 10))) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values((0..100).map(|i| i * 10))) as ArrayRef,
+                Arc::new(StringViewArray::from_iter_values(
+                    (0..100).map(|i| format!("n{i}")),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let (_dir, table) = write_parquet(&batch, EnabledStatistics::Chunk);
+
+        let bounds = [0, 1, 2].map(|column| table.bound_distinct_count(column));
+
+        assert_eq!(bounds, [Some(10), None, None]);
     }
 
     #[test]

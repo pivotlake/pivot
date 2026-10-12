@@ -2414,3 +2414,73 @@ fn late_materialization_rows_satisfy_their_own_predicate() {
         .collect();
     assert_eq!(bands, vec![6; 4]);
 }
+
+/// A table of `(id, name)` rows adopted from one file holding `ids`, one row
+/// group per row.
+fn id_table(ids: &[i32]) -> (TempDir, Arc<PivotlakeDatastore>) {
+    let names: Vec<String> = ids.iter().map(|i| format!("n{i}")).collect();
+    let batches: Vec<RecordBatch> = ids
+        .iter()
+        .zip(&names)
+        .map(|(id, name)| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("name", DataType::Utf8View, false),
+                ])),
+                vec![
+                    Arc::new(Int32Array::from(vec![*id])) as ArrayRef,
+                    Arc::new(StringViewArray::from(vec![name.as_str()])) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let dir = write_one_row_per_group(&batches);
+    let (database, datastore) = empty_datastore();
+    let (_, columns) = three_row_table();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    (database, datastore)
+}
+
+fn bind_t(datastore: &Arc<PivotlakeDatastore>) -> TableBinding {
+    datastore
+        .clone()
+        .begin_transaction()
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_pushed_filter_shrinks_the_row_estimate_to_the_row_groups_it_keeps() {
+    let ids: Vec<i32> = (0..100).collect();
+    let (_database, datastore) = id_table(&ids);
+    let mut table = bind_t(&datastore);
+    let unfiltered = table.estimate_row_count();
+
+    table
+        .pushdown_filter(constant_comparison(
+            0,
+            CompareType::GreaterEqual,
+            int_constant(70),
+        ))
+        .unwrap();
+
+    assert_eq!(unfiltered, Some(100));
+    assert_eq!(table.estimate_row_count(), Some(30));
+}
+
+#[test]
+fn a_column_distinct_count_is_bounded_by_its_integer_range() {
+    let ids: Vec<i32> = (0..100).map(|i| i % 10).collect();
+    let (_database, datastore) = id_table(&ids);
+    let table = bind_t(&datastore);
+
+    let ids_distinct = table.column_distinct_count(0);
+    let names_distinct = table.column_distinct_count(1);
+
+    assert_eq!((ids_distinct, names_distinct), (Some(10), None));
+}

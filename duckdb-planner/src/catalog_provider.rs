@@ -51,12 +51,21 @@ pub trait DuckDBTable: Any {
         Ok(false)
     }
 
-    /// The table's total row count, if the backend can answer from metadata
-    /// alone. Feeds DuckDB's cardinality hook during optimization, so its cost
-    /// model (join ordering, hash-join build/probe side choice) sees real
-    /// table sizes. `None` means unknown; DuckDB then falls back to its own
-    /// defaults.
+    /// The estimated number of rows this table's scan produces, after the
+    /// filters pushed into it. Feeds DuckDB's cardinality hook during
+    /// optimization, so its cost model (join ordering, hash-join build/probe
+    /// side choice) sees real scan sizes. `None` means unknown; DuckDB then
+    /// falls back to its own defaults.
     fn estimate_row_count(&self) -> Option<u64> {
+        None
+    }
+
+    /// The estimated number of distinct non-null values in the table's
+    /// `column` (a storage index). Feeds DuckDB's column statistics hook, which
+    /// sizes a join by its key columns' domain and an equality filter by the
+    /// values it picks from. `None` means unknown; DuckDB then falls back to
+    /// its own defaults.
+    fn column_distinct_count(&self, _column: usize) -> Option<u64> {
         None
     }
 }
@@ -295,6 +304,23 @@ pub(crate) fn table_estimate_row_count(table: &OptionalTableWrapper) -> ffi::Car
         None => ffi::CardinalityEstimate {
             known: false,
             rows: 0,
+        },
+    }
+}
+
+pub(crate) fn table_column_distinct_count(
+    table: &OptionalTableWrapper,
+    column: usize,
+) -> ffi::DistinctCountEstimate {
+    let table = table
+        .table
+        .as_ref()
+        .expect("column_distinct_count called on unbound table");
+    match table.column_distinct_count(column) {
+        Some(count) => ffi::DistinctCountEstimate { known: true, count },
+        None => ffi::DistinctCountEstimate {
+            known: false,
+            count: 0,
         },
     }
 }
