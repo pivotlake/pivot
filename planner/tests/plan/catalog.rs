@@ -15,6 +15,7 @@ use crate::common::*;
 /// to drive the "rejected" vs "accepted" plan shapes.
 #[derive(Clone, Debug)]
 struct RecordingTable {
+    name: String,
     columns: Vec<Column>,
     accept_pushdown: bool,
     /// Shared between the original (held by the test) and the per-binding
@@ -25,7 +26,12 @@ struct RecordingTable {
 
 impl RecordingTable {
     fn new(columns: Vec<Column>, accept_pushdown: bool) -> Self {
+        Self::named("t", columns, accept_pushdown)
+    }
+
+    fn named(name: &str, columns: Vec<Column>, accept_pushdown: bool) -> Self {
         Self {
+            name: name.to_string(),
             columns,
             accept_pushdown,
             received: Arc::new(Mutex::new(Vec::new())),
@@ -38,13 +44,13 @@ impl BoundTable for RecordingTable {
         TableReference {
             datastore: DEFAULT_DATASTORE_NAME.to_string(),
             schema: DEFAULT_SCHEMA_NAME.to_string(),
-            table: "t".to_string(),
+            table: self.name.clone(),
         }
     }
 
     fn table_revision(&self) -> TableRevision {
         TableRevision {
-            identity: format!("{DEFAULT_DATASTORE_NAME}:t"),
+            identity: format!("{DEFAULT_DATASTORE_NAME}:{}", self.name),
             version: "0".to_string(),
         }
     }
@@ -73,16 +79,21 @@ impl BoundTable for RecordingTable {
     }
 }
 
-/// Minimal `Catalog` that resolves a single, known table name. Used instead
+/// Minimal `Catalog` that resolves a few known table names. Used instead
 /// of the shared `TestCatalog` because we need a hand-rolled `BoundTable` impl.
-/// Its transaction snapshot is the catalog itself: the table never changes.
+/// Its transaction snapshot is the catalog itself: the tables never change.
 #[derive(Debug)]
-struct SingleTableCatalog {
-    name: String,
-    table: RecordingTable,
+struct RecordingCatalog {
+    tables: Vec<RecordingTable>,
 }
 
-impl CatalogTransaction for SingleTableCatalog {
+impl RecordingCatalog {
+    fn find_table(&self, name: &str) -> Option<&RecordingTable> {
+        self.tables.iter().find(|table| table.name == name)
+    }
+}
+
+impl CatalogTransaction for RecordingCatalog {
     // The one table lives in the default schema, so that is the only schema
     // this catalog defines.
     fn does_schema_exist(&self, _datastore: &str, schema: &str) -> planner::catalog::Result<bool> {
@@ -93,26 +104,28 @@ impl CatalogTransaction for SingleTableCatalog {
         &self,
         reference: &TableReference,
     ) -> planner::catalog::Result<Option<Box<dyn BoundTable>>> {
-        Ok((reference.table == self.name)
-            .then(|| Box::new(self.table.clone()) as Box<dyn BoundTable>))
+        Ok(self
+            .find_table(&reference.table)
+            .map(|table| Box::new(table.clone()) as Box<dyn BoundTable>))
     }
 
     fn table_revision(
         &self,
         reference: &TableReference,
     ) -> planner::catalog::Result<Option<TableRevision>> {
-        Ok((reference.table == self.name).then(|| TableRevision {
-            identity: format!("{}:{}", reference.datastore, reference.table),
-            version: "0".to_string(),
-        }))
+        Ok(self
+            .find_table(&reference.table)
+            .map(|table| TableRevision {
+                identity: format!("{}:{}", reference.datastore, table.name),
+                version: "0".to_string(),
+            }))
     }
 }
 
-impl SingleTableCatalog {
+impl RecordingCatalog {
     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
-        Arc::new(SingleTableCatalog {
-            name: self.name.clone(),
-            table: self.table.clone(),
+        Arc::new(RecordingCatalog {
+            tables: self.tables.clone(),
         })
     }
 }
@@ -137,11 +150,12 @@ fn timestamp_col(col_type: Type) -> Vec<Column> {
     }]
 }
 
-fn build_planner(table: RecordingTable) -> (Planner, Arc<SingleTableCatalog>) {
-    let catalog = Arc::new(SingleTableCatalog {
-        name: "t".to_string(),
-        table,
-    });
+fn build_planner(table: RecordingTable) -> (Planner, Arc<RecordingCatalog>) {
+    build_planner_over(vec![table])
+}
+
+fn build_planner_over(tables: Vec<RecordingTable>) -> (Planner, Arc<RecordingCatalog>) {
+    let catalog = Arc::new(RecordingCatalog { tables });
     (
         Planner::from_datastore_names(
             vec![DEFAULT_DATASTORE_NAME.to_string()],
@@ -154,7 +168,7 @@ fn build_planner(table: RecordingTable) -> (Planner, Arc<SingleTableCatalog>) {
 
 fn plan_sql(
     planner: &mut Planner,
-    catalog: &Arc<SingleTableCatalog>,
+    catalog: &Arc<RecordingCatalog>,
     sql: &str,
 ) -> Result<planner::Plan, planner::Error> {
     planner.plan(sql, catalog.begin_transaction())
@@ -325,4 +339,37 @@ fn no_where_clause_skips_pushdown() {
     let _plan = plan_sql(&mut planner, &catalog, "SELECT a FROM t").unwrap();
 
     assert!(table.received.lock().unwrap().is_empty());
+}
+
+/// A filter above a CTE that concatenates two tables reaches each table's own
+/// `pushdown_filter`, so every scan under the union can prune on it; with both
+/// accepting, no `Filter` operator is left anywhere in the plan.
+#[test]
+fn filter_above_a_cte_union_all_is_pushed_into_each_table() {
+    let north = RecordingTable::named("north", two_int_cols(), true);
+    let south = RecordingTable::named("south", two_int_cols(), true);
+    let (mut planner, catalog) = build_planner_over(vec![north.clone(), south.clone()]);
+
+    let plan = plan_sql(
+        &mut planner,
+        &catalog,
+        "WITH both_tables AS (SELECT a FROM north UNION ALL SELECT a FROM south) \
+         SELECT a FROM both_tables WHERE a > 5",
+    )
+    .unwrap();
+
+    let north_received = north.received.lock().unwrap();
+    let south_received = south.received.lock().unwrap();
+    assert_snapshot!(pushdown_snapshot(&north_received), @"a:Int32 > 5:Int32 -> Boolean");
+    assert_snapshot!(pushdown_snapshot(&south_received), @"a:Int32 > 5:Int32 -> Boolean");
+    drop((north_received, south_received));
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32)
+      UnionAll
+        Projection(a:Int32)
+          Input([a:Int32])
+        Projection(a:Int32)
+          Input([a:Int32])
+    ");
 }
