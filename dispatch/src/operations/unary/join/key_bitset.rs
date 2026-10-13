@@ -9,7 +9,7 @@
 //! finds its [`KeyBitsetSlot`] unarmed simply filters nothing.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -19,9 +19,13 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 
-/// Widest key domain (`max - min + 1`) the filter covers: 64M values is 8MB
-/// of bits, small enough to stay cache-resident under probing.
-const MAX_DOMAIN: u64 = 1 << 26;
+/// Widest key domain (`max - min + 1`) the filter covers: 256M values is
+/// 32MB of bits. That no longer fits a core's private cache, but a random
+/// bit test in a last-level-cache-sized array is still far cheaper than the
+/// directory probe and arena key compare it spares every rejected row, and
+/// the dimension-sized key spaces that filter most of their fact rows (tens
+/// to hundreds of millions of keys) only qualify at this width.
+const MAX_DOMAIN: u64 = 1 << 28;
 
 /// Build-key density (`build rows / domain width`) at or above which the
 /// filter is not built. A set that dense passes nearly every row the build
@@ -30,9 +34,10 @@ const MAX_DOMAIN: u64 = 1 << 26;
 const MAX_DENSITY: f64 = 0.9;
 
 /// Most build rows the filter is built from. The set pass runs between the
-/// build's gather and its readiness gate, so a huge build side would hold
-/// back the probe for longer than the filter could ever save.
-const MAX_BUILD_ROWS: usize = 1 << 24;
+/// build's gather and its readiness gate, split across the build workers, so
+/// a huge build side would hold back the probe for longer than the filter
+/// could ever save; 64M rows is a few hundred thousand bit sets per worker.
+const MAX_BUILD_ROWS: usize = 1 << 26;
 
 /// One bit per value of `[min, min + domain)`; a set bit means some build row
 /// carries that key.
@@ -214,9 +219,14 @@ fn integer_values<'array>(
 /// filters that consume its [`KeyBitset`]. Unarmed until the build seals;
 /// consumers that read `None` filter nothing, so arming is an optimization
 /// and never a correctness event.
+///
+/// A build seals exactly once, so the cell is write-once: every scan batch
+/// on every worker reads it, and a read is a single acquire load that
+/// touches no shared line a lock or a reference count would bounce between
+/// the workers.
 #[derive(Debug, Default)]
 pub struct KeyBitsetSlot {
-    filter: RwLock<Option<Arc<KeyBitset>>>,
+    filter: OnceLock<Option<KeyBitset>>,
 }
 
 impl KeyBitsetSlot {
@@ -226,16 +236,16 @@ impl KeyBitsetSlot {
 
     /// Arm the slot with the sealed build's filter; `None` (the build's key
     /// shape or distribution made a filter not worth having) leaves it
-    /// unarmed.
+    /// unarmed for good.
     pub fn publish(&self, filter: Option<KeyBitset>) {
-        *self.filter.write().expect("key bitset slot poisoned") = filter.map(Arc::new);
+        assert!(
+            self.filter.set(filter).is_ok(),
+            "a key bitset slot is published once, when its build seals"
+        );
     }
 
     /// The armed filter, or `None` while the build has not sealed one.
-    pub fn get(&self) -> Option<Arc<KeyBitset>> {
-        self.filter
-            .read()
-            .expect("key bitset slot poisoned")
-            .clone()
+    pub fn get(&self) -> Option<&KeyBitset> {
+        self.filter.get().and_then(Option::as_ref)
     }
 }
