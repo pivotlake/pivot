@@ -34,7 +34,7 @@ use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
     Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
     JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
-    TopN, TransactionStatement, Values,
+    TopN, TransactionStatement, UnionAll, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -228,6 +228,16 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             Operator::CteScan(ctx.create_cte_scan(cte_ref.cte_index()?)?)
         }
         DuckOperator::DelimGet(get) => Operator::CteScan(build_delim_get_scan(get, ctx)?),
+        DuckOperator::Union => {
+            // DuckDB's filter pushdown drops a union input it proved empty,
+            // which can leave a single input: that input is then the whole
+            // result, and the union has nothing to concatenate.
+            if inputs.len() == 1 {
+                return Ok(inputs.pop().expect("one input was just counted"));
+            }
+            check_union_inputs_agree(&inputs)?;
+            Operator::UnionAll(UnionAll)
+        }
         // A delim join is walked above, before its children.
         DuckOperator::DelimJoin(_) => {
             unreachable!("a delim join walks its own children")
@@ -1005,6 +1015,33 @@ fn build_pushed_conditions(list: PushedConditions) -> Result<Vec<Expression>, Op
         .into_iter()
         .map(Expression::from_handle)
         .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Check that every union input emits the same column types as the first.
+///
+/// DuckDB's binder casts each side of a set operation to the common types,
+/// so a mismatch here means a side was shaped in a way the planner doesn't
+/// expect, and the union would concatenate columns of different types.
+fn check_union_inputs_agree(inputs: &[PlanNode]) -> Result<(), OperatorError> {
+    let first_types = inputs[0].output_types()?;
+    for input in &inputs[1..] {
+        let types = input.output_types()?;
+        if types != first_types {
+            let describe = |types: &[Type]| {
+                types
+                    .iter()
+                    .map(Type::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return Err(OperatorError::Unsupported(format!(
+                "UNION inputs emit different column types: [{}] and [{}]",
+                describe(&first_types),
+                describe(&types)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Walk a CTE: its definition first, so the scans reading it in the body know

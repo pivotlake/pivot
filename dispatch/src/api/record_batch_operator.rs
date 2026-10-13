@@ -62,7 +62,7 @@ use crate::operations::{
     JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
     NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory,
     OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
-    UnaryOperatorFactory, WideCell, copy_out, create_join_factories,
+    UnaryOperatorFactory, UnionAllFactory, WideCell, copy_out, create_join_factories,
     create_normalizing_join_factories, create_normalizing_order_by_factories,
     create_range_join_factories,
 };
@@ -304,6 +304,59 @@ impl RecordBatchOperatorSpec {
             dispatcher: self.dispatcher,
             factories,
             stream_ordered: self.stream_ordered,
+        }
+    }
+
+    /// Concatenate the rows of this spec and of every spec in `others`: a
+    /// UNION ALL, in whatever order the batches arrive.
+    ///
+    /// Every input runs as a root of the one dataflow, concurrently with the
+    /// others. The inputs' batches must agree in column count and types;
+    /// `nullable` declares, per output column, whether any input can hold a
+    /// NULL there, and is the nullability every output batch is stamped with.
+    pub fn union_all(self, others: Vec<RecordBatchOperatorSpec>, nullable: Vec<bool>) -> Self {
+        let worker_count = self.worker_count();
+        for other in &others {
+            assert_eq!(
+                worker_count,
+                other.worker_count(),
+                "UNION ALL inputs must use the same worker count"
+            );
+            assert!(
+                self.dispatcher
+                    .waker_set
+                    .wakes_same_pool(&other.dispatcher.waker_set),
+                "UNION ALL inputs must use the same worker pool"
+            );
+        }
+
+        let nullable = Arc::new(nullable);
+        let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        // One head list per worker: this spec's head, then each other's.
+        let mut per_worker_inputs: Vec<Vec<Box<dyn OperatorFactory<RecordBatch>>>> =
+            self.factories.into_iter().map(|head| vec![head]).collect();
+        for other in others {
+            let (_, heads) = other.into_parts();
+            for (inputs, head) in per_worker_inputs.iter_mut().zip(heads) {
+                inputs.push(head);
+            }
+        }
+        let factories = per_worker_inputs
+            .into_iter()
+            .zip(stealable::<RecordBatch>(self.dispatcher.topology()))
+            .map(|(inputs, channel_factory)| {
+                Box::new(UnionAllFactory {
+                    inputs,
+                    channel_factory,
+                    siblings_left: siblings_left.clone(),
+                    nullable: nullable.clone(),
+                }) as Box<dyn OperatorFactory<RecordBatch>>
+            })
+            .collect();
+        Self {
+            dispatcher: self.dispatcher,
+            factories,
+            stream_ordered: false,
         }
     }
 

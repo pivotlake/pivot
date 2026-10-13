@@ -904,3 +904,86 @@ fn group_by_under_a_limit_still_coalesces_its_filter(mut testing_planner: Testin
 
     assert_eq!(filter_deliveries(&plan.root), vec![RowDelivery::Coalesced]);
 }
+
+fn add_other_table(planner: &TestingPlanner) {
+    use arrow_array::{ArrayRef, Int32Array};
+    use planner::types::Type;
+    use std::sync::Arc;
+
+    let int_col = |values: Vec<i32>| -> ArrayRef { Arc::new(Int32Array::from(values)) };
+    planner.add_table(
+        "other_table",
+        &[
+            ("a", Type::Int32, int_col(vec![6, 7])),
+            ("b", Type::Int32, int_col(vec![60, 70])),
+        ],
+    );
+}
+
+#[rstest]
+fn union_all_concatenates_its_inputs(mut testing_planner: TestingPlanner) {
+    add_other_table(&testing_planner);
+
+    let plan = testing_planner
+        .plan("SELECT a FROM example_table UNION ALL SELECT b FROM other_table")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    UnionAll
+      Projection(a:Int32)
+        Input([a:Int32])
+      Projection(b:Int32)
+        Input([b:Int32])
+    ");
+}
+
+// A filter on a CTE that is a UNION ALL reaches every scan under the union:
+// DuckDB inlines the once-read CTE, copies the predicate into each side of
+// the union, and pushes it into the scans, so no row crosses the union only
+// to be dropped above it.
+#[rstest]
+fn filter_on_a_cte_union_all_pushes_into_every_scan(mut testing_planner: TestingPlanner) {
+    add_other_table(&testing_planner);
+
+    let plan = testing_planner
+        .plan(
+            "WITH both_tables AS (SELECT a, b FROM example_table \
+                                 UNION ALL SELECT a, b FROM other_table) \
+             SELECT a FROM both_tables WHERE a > 5",
+        )
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32)
+      UnionAll
+        Projection(#0:Int32)
+          Projection(a:Int32)
+            Filter(a:Int32 > 5:Int32 -> Boolean)
+              Input([a:Int32])
+        Projection(#0:Int32)
+          Projection(a:Int32)
+            Filter(a:Int32 > 5:Int32 -> Boolean)
+              Input([a:Int32])
+    ");
+}
+
+// A plain UNION is the same concatenation with DuckDB's DISTINCT modifier
+// above it, so the union node never dedups on its own.
+#[rstest]
+fn plain_union_dedups_above_the_concatenation(mut testing_planner: TestingPlanner) {
+    add_other_table(&testing_planner);
+
+    let plan = testing_planner
+        .plan("SELECT a FROM example_table UNION SELECT a FROM other_table")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Distinct(keys: [0])
+      Projection(#0:Int32)
+        UnionAll
+          Projection(a:Int32)
+            Input([a:Int32])
+          Projection(a:Int32)
+            Input([a:Int32])
+    ");
+}

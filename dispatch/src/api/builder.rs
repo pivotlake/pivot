@@ -127,6 +127,21 @@ impl OperatorGraphBuilder {
         merged
     }
 
+    /// Merge a side graph whose output feeds this graph's output node.
+    ///
+    /// The two halves end up connected, as with
+    /// [`with_producer_side_graph`](Self::with_producer_side_graph), but the
+    /// subscriber is this graph's own output rather than nodes registered
+    /// under a tag: the output node converges several inputs, and the
+    /// scheduler holds its finish until every one of them has finished.
+    pub fn with_input_side_graph(self, side: Self) -> Self {
+        let producer = self.operators.len() + side.output;
+        let subscriber = self.output;
+        let mut merged = self.with_side_graph(side);
+        merged.edges.push((producer, subscriber));
+        merged
+    }
+
     /// Convert this build-time graph into an executable `DataFlow`.
     pub fn into_data_flow(
         self,

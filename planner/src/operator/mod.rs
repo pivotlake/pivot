@@ -36,6 +36,7 @@ mod set_variable;
 mod table_function;
 mod top_n;
 mod transaction;
+mod union_all;
 mod values;
 
 pub use aggregate::Aggregate;
@@ -62,6 +63,7 @@ pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignatur
 pub(crate) use table_function::{built_in_table_function, built_in_table_function_defs};
 pub use top_n::TopN;
 pub use transaction::TransactionStatement;
+pub use union_all::UnionAll;
 pub use values::Values;
 
 use crate::compile;
@@ -138,6 +140,8 @@ pub enum Operator {
     CteScan(CteScan),
     /// The distinct values of a tuple of input columns (see [`Distinct`]).
     Distinct(Distinct),
+    /// The rows of every input, concatenated (see [`UnionAll`]).
+    UnionAll(UnionAll),
 }
 
 impl Operator {
@@ -204,6 +208,9 @@ impl Operator {
             Operator::Distinct(distinct) => {
                 Ok(distinct.keys.iter().map(|(_, ty)| ty.clone()).collect())
             }
+            // A union's inputs all emit the same columns, so any one of them
+            // speaks for the output.
+            Operator::UnionAll(_) => Ok(inputs[0].clone()),
             // Statements, not queries: no result columns.
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
@@ -301,6 +308,10 @@ impl Operator {
                 .iter()
                 .map(|&(idx, _)| inputs[0][idx])
                 .collect(),
+            // A union column holds a NULL wherever any input can put one.
+            Operator::UnionAll(_) => (0..inputs[0].len())
+                .map(|column| inputs.iter().any(|input| input[column]))
+                .collect(),
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)
@@ -348,6 +359,7 @@ impl fmt::Display for Operator {
             Operator::Cte(c) => write!(f, "{c}"),
             Operator::CteScan(c) => write!(f, "{c}"),
             Operator::Distinct(d) => write!(f, "{d}"),
+            Operator::UnionAll(u) => write!(f, "{u}"),
         }
     }
 }

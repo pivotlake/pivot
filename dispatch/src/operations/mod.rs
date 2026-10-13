@@ -57,6 +57,9 @@ pub use cte::{CteFactory, CteScanFactory};
 pub mod in_memory;
 pub use in_memory::{Forward, InjectorSourceFactory};
 
+pub mod union_all;
+pub use union_all::UnionAllFactory;
+
 pub mod streamed;
 pub use streamed::{ChannelInputFull, ChannelInputSender, ChannelSourceFactory};
 

@@ -240,6 +240,7 @@ impl<'plan> LogicalOp<'plan> {
                 Operator::MaterializedCte(MaterializedCte { raw: self.raw })
             }
             L::LOGICAL_CTE_REF => Operator::CteRef(CteRef { raw: self.raw }),
+            L::LOGICAL_UNION => Operator::Union,
             L::LOGICAL_CHUNK_GET => Operator::ChunkGet(ChunkGet { raw: self.raw }),
             L::LOGICAL_DUMMY_SCAN => Operator::DummyScan,
             L::LOGICAL_EXPLAIN => Operator::Explain(Explain { raw: self.raw }),
@@ -303,6 +304,11 @@ pub enum Operator<'plan> {
     MaterializedCte(MaterializedCte<'plan>),
     /// One place a CTE's rows are read.
     CteRef(CteRef<'plan>),
+    /// A `UNION` set operation: the concatenation of its children's rows,
+    /// each child emitting the same column list. DuckDB plans a plain `UNION`
+    /// as a `DISTINCT` above this node, so the node itself is always the
+    /// `ALL` concatenation.
+    Union,
     /// A scan of an in-memory constant chunk (a long `IN` list's rewrite).
     ChunkGet(ChunkGet<'plan>),
     /// The single-row source under a `FROM`-less `SELECT`.

@@ -1734,3 +1734,31 @@ async fn statements_between_begin_and_rollback_stay_committed(#[future] conn: Co
     let count = single_value(&conn, "SELECT COUNT(*) FROM transaction_noop").await;
     assert_eq!(count, "1");
 }
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_cte_union_all_reads_both_tables(#[future] conn: Conn) {
+    let first_dir = write_parquet(&people_batch());
+    let second_dir = write_parquet(&people_batch());
+    create_people_table(&conn, "union_people_first", first_dir.path()).await;
+    create_people_table(&conn, "union_people_second", second_dir.path()).await;
+
+    let rows = select_rows(
+        &conn,
+        "WITH everyone AS (SELECT id, name FROM union_people_first \
+                           UNION ALL SELECT id, name FROM union_people_second) \
+         SELECT id, name FROM everyone WHERE id >= 2 ORDER BY id, name",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("2".into()), Some("bob".into())],
+            vec![Some("2".into()), Some("bob".into())],
+            vec![Some("3".into()), Some("carol".into())],
+            vec![Some("3".into()), Some("carol".into())],
+        ]
+    );
+}
