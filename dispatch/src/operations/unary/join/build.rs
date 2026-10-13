@@ -276,6 +276,9 @@ pub struct JoinBuilder<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> {
     /// Hash partitions of the build, one scatter job each; see [`partitions_for`].
     partitions: usize,
     build_output_indices: Vec<usize>,
+    /// The build columns the residual predicate reads, prepared for the
+    /// probe's drains alongside the output columns.
+    residual_build_indices: Vec<usize>,
     /// Key filters to publish for sibling probe scans once every build row
     /// is present (the final gather arrival) — publishing any earlier would
     /// expose bounds or a key set tighter than the complete build side and
@@ -403,6 +406,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
         gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
         partitions: usize,
         build_output_indices: Vec<usize>,
+        residual_build_indices: Vec<usize>,
         build_filters: Vec<JoinBuildFilter>,
         filter_arrays: WorkerFilterArrays,
         pending_key_bitsets: PendingKeyBitsets,
@@ -416,6 +420,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
             gather,
             partitions,
             build_output_indices,
+            residual_build_indices,
             build_filters,
             filter_arrays,
             pending_key_bitsets,
@@ -538,6 +543,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
                 .iter_mut()
                 .map(|output| std::mem::take(&mut output.build_row_batches)),
             &self.build_output_indices,
+            &self.residual_build_indices,
         )?;
         let row_id_space = build_rows::row_id_space(&build_rows.batches);
         unsafe { *self.table.build_rows.get() = build_rows };

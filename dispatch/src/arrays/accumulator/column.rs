@@ -23,6 +23,14 @@ impl ChunkedColumn {
         let values = data.iter().map(resolve_values_pointer).collect();
         Self { data, values }
     }
+
+    /// The type every chunk shares.
+    pub fn data_type(&self) -> &DataType {
+        self.data
+            .first()
+            .expect("a chunked column spans at least one batch")
+            .data_type()
+    }
 }
 
 fn resolve_values_pointer(data: &ArrayData) -> *const u8 {

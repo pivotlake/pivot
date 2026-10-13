@@ -231,6 +231,10 @@ pub fn create_for_workers<
                 gather.clone(),
                 partitions,
                 spec.build_output_indices.clone(),
+                spec.residual_filters
+                    .as_ref()
+                    .map(|residual| residual.build_column_indices.to_vec())
+                    .unwrap_or_default(),
                 spec.build_filters.clone(),
                 filter_arrays.clone(),
                 pending_key_bitsets.clone(),

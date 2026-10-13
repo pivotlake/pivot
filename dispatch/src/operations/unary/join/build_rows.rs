@@ -33,6 +33,10 @@ pub(crate) struct BuildRows {
     pub(crate) output_batches: Vec<RecordBatch>,
     /// Each output column prepared for gathering matched rows by row id.
     pub(crate) output_columns: Vec<ChunkedColumn>,
+    /// Each build column the residual predicate reads, prepared the same way
+    /// so a drain gathers the candidate rows by row id rather than walking
+    /// every stored batch.
+    pub(crate) residual_columns: Vec<ChunkedColumn>,
     /// One flag per row id for a build-side outer join.
     pub(crate) matched: MultiSlabBuffer<u8>,
 }
@@ -45,6 +49,7 @@ impl BuildRows {
     pub(crate) fn new<const TRACK_MATCHES: bool>(
         workers: impl IntoIterator<Item = Vec<RecordBatch>>,
         output_indices: &[usize],
+        residual_indices: &[usize],
     ) -> Result<(Self, Vec<u64>), ArrowError> {
         let mut batches = Vec::new();
         let mut row_id_bases = Vec::new();
@@ -66,6 +71,17 @@ impl BuildRows {
                 )
             })
             .collect();
+        let residual_columns = residual_indices
+            .iter()
+            .map(|&column| {
+                ChunkedColumn::new(
+                    batches
+                        .iter()
+                        .map(|batch| batch.column(column).to_data())
+                        .collect(),
+                )
+            })
+            .collect();
         let matched = if TRACK_MATCHES {
             let mut allocator = SlabAllocator::new(false);
             allocator.create_multi_slab_buffer::<u8>(row_id_space(&batches).max(1), true)
@@ -77,6 +93,7 @@ impl BuildRows {
                 batches,
                 output_batches,
                 output_columns,
+                residual_columns,
                 matched,
             },
             row_id_bases,
@@ -88,6 +105,7 @@ impl BuildRows {
             batches: Vec::new(),
             output_batches: Vec::new(),
             output_columns: Vec::new(),
+            residual_columns: Vec::new(),
             matched: MultiSlabBuffer::new(Vec::new()),
         }
     }

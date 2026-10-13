@@ -504,7 +504,7 @@ impl<R: RowId> ProbeMatchOutputter<R> {
         if let Some(residual_filters) = &mut self.residual_filters {
             self.matched = residual_filters.filter_combined_batch(
                 probe_batch,
-                &build_rows.batches,
+                build_rows,
                 &mut self.probe_indices,
                 &mut self.build_indices,
                 self.matched,
