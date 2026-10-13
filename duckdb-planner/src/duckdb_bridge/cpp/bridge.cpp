@@ -3,6 +3,7 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/storage_info.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/table_entry.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/schema_entry.h"
+#include "duckdb-planner/src/duckdb_bridge/cpp/eager_aggregation.h"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_data.hpp"
@@ -237,6 +238,7 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 		if (context.config.enable_optimizer) {
 			duckdb::Optimizer optimizer(*planner.binder, context);
 			plan = optimizer.Optimize(std::move(plan));
+			push_aggregates_below_outer_joins(context, *planner.binder, plan);
 		}
 		plan->ResolveOperatorTypes();
 		duckdb::ColumnBindingResolver resolver;

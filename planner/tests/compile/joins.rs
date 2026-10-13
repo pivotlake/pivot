@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, StringViewArray};
+use arrow_array::{ArrayRef, Float64Array, Int64Array, StringViewArray};
 
 use crate::common::*;
 use planner::types::Type;
@@ -1293,4 +1293,78 @@ fn left_join_pads_null_keyed_probe_rows(mut testing_planner: TestingPlanner) {
             .unwrap()
             .clone()
     );
+}
+
+fn add_customers_and_purchases(planner: &TestingPlanner) {
+    planner.add_table(
+        "customers",
+        &[("c_key", Type::Int64, int64_col(vec![1, 2, 3]))],
+    );
+    planner.add_table(
+        "purchases",
+        &[
+            (
+                "p_customer",
+                Type::Int64,
+                int64_col(vec![1, 1, 1, 3, 3, 9, 9, 9]),
+            ),
+            (
+                "p_amount",
+                Type::Float64,
+                Arc::new(Float64Array::from(vec![
+                    5.0, 6.0, 7.0, 8.0, 9.0, 1.0, 1.0, 1.0,
+                ])),
+            ),
+        ],
+    );
+}
+
+const PURCHASES_PER_CUSTOMER: &str = "SELECT c_key, count(p_amount) AS purchases, count(*) AS total, \
+     sum(p_amount) AS spent, max(p_amount) AS biggest \
+     FROM customers LEFT JOIN purchases ON p_customer = c_key GROUP BY c_key";
+
+/// A GROUP BY over an outer join whose aggregates read only the null-extended
+/// side is computed per join key on that side first, so the join sees one row
+/// per key. A preserved row without a partner still counts as it did.
+#[rstest]
+fn aggregates_over_the_bigger_outer_join_side_are_grouped_before_the_join(
+    mut testing_planner: TestingPlanner,
+) {
+    add_customers_and_purchases(&testing_planner);
+
+    let plan = testing_planner.plan(PURCHASES_PER_CUSTOMER).unwrap();
+    let mut rows = run(&mut testing_planner, PURCHASES_PER_CUSTOMER);
+    rows.sort_by_key(|r| r["c_key"].as_i64().unwrap());
+
+    assert_eq!(plan.to_string().matches("Aggregate(").count(), 2, "{plan}");
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"c_key": 1, "purchases": 3, "total": 3, "spent": 18.0, "biggest": 7.0},
+            // Its null sum and max are left out of the row, as nulls are.
+            {"c_key": 2, "purchases": 0, "total": 1},
+            {"c_key": 3, "purchases": 2, "total": 2, "spent": 17.0, "biggest": 9.0},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+/// Grouping the null-extended side first only pays when it is much bigger
+/// than the preserved side; a join of similar sides keeps the single GROUP BY.
+#[rstest]
+fn aggregates_over_a_small_outer_join_side_stay_above_the_join(
+    mut testing_planner: TestingPlanner,
+) {
+    add_customers_and_purchases(&testing_planner);
+
+    let plan = testing_planner
+        .plan(
+            "SELECT p_customer, count(c_key) AS known \
+             FROM purchases LEFT JOIN customers ON p_customer = c_key GROUP BY p_customer",
+        )
+        .unwrap();
+
+    assert_eq!(plan.to_string().matches("Aggregate(").count(), 1, "{plan}");
 }

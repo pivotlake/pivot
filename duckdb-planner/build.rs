@@ -98,6 +98,7 @@ fn main() {
     // cxx build for manual bridge functions
     cxx_build::bridge("src/duckdb_bridge/mod.rs")
         .file("src/duckdb_bridge/cpp/bridge.cpp")
+        .file("src/duckdb_bridge/cpp/eager_aggregation.cpp")
         .file("src/duckdb_bridge/cpp/extension_loader.cpp")
         .file("src/duckdb_bridge/cpp/extension.cpp")
         .file("src/duckdb_bridge/cpp/storage_info.cpp")
@@ -117,6 +118,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/duckdb_bridge/duckdb_types.rs");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/bridge.h");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/bridge.cpp");
+    println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/eager_aggregation.h");
+    println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/eager_aggregation.cpp");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/common.h");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/extension_loader.cpp");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/extension.h");
