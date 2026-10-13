@@ -61,6 +61,22 @@ impl<T> MultiSlabBuffer<T> {
             slab.zero_out();
         }
     }
+
+    /// Zero the elements `start..end`, one slab-contiguous run at a time, so
+    /// the owners of disjoint ranges of a buffer allocated dirty can each clear
+    /// their own in parallel instead of one thread clearing the whole buffer.
+    ///
+    /// # Safety
+    /// The caller must have exclusive access to the range, and all-zero bytes
+    /// must be a valid `T`.
+    pub unsafe fn zero_range(&self, start: usize, end: usize) {
+        let mut index = start;
+        while index < end {
+            let run = self.elements_left_in_slab(index).min(end - index);
+            unsafe { std::ptr::write_bytes(self.ptr_at_index(index), 0, run) };
+            index += run;
+        }
+    }
 }
 
 impl<T> Index<usize> for MultiSlabBuffer<T> {

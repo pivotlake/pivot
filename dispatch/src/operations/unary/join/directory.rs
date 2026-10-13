@@ -89,22 +89,15 @@ impl JoinDirectory {
         unsafe { (&mut *self.entries.get())[slot] = value };
     }
 
-    /// Add `value` to the entry at slot.
+    /// Clear the slots `start..end`. The directory is allocated dirty and each
+    /// partition job clears its own slot range before counting into it, so
+    /// the clearing runs on every worker instead of on the one thread that
+    /// sized the table.
     ///
     /// # Safety
-    /// Caller must ensure exclusive access to this slot.
-    #[inline(always)]
-    pub unsafe fn add_to_entry(&self, slot: usize, value: u64) {
-        unsafe { (&mut *self.entries.get())[slot] += value };
-    }
-
-    /// OR `value` into the entry at slot.
-    ///
-    /// # Safety
-    /// Caller must ensure exclusive access to this slot.
-    #[inline(always)]
-    pub unsafe fn or_to_entry(&self, slot: usize, value: u64) {
-        unsafe { (&mut *self.entries.get())[slot] |= value };
+    /// Caller must ensure exclusive access to the slot range.
+    pub unsafe fn zero_slots(&self, start: usize, end: usize) {
+        unsafe { (*self.entries.get()).zero_range(start, end) };
     }
 
     #[inline(always)]

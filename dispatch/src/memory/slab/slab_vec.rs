@@ -126,6 +126,36 @@ impl<T: Copy> SlabVec<T> {
         }
     }
 
+    /// The number of elements chunk `ci` holds: the last chunk its fill, every
+    /// earlier one its capacity.
+    #[inline(always)]
+    fn chunk_len(&self, ci: usize) -> usize {
+        if ci + 1 == self.chunks.len() {
+            self.last_len
+        } else {
+            Self::chunk_cap(ci)
+        }
+    }
+
+    /// Each chunk's elements as one contiguous slice, in insertion order.
+    pub fn chunk_slices(&self) -> impl Iterator<Item = &[T]> {
+        self.chunks.iter().enumerate().map(|(ci, chunk)| {
+            let base = chunk.ptr_at_index(0) as *const T;
+            unsafe { std::slice::from_raw_parts(base, self.chunk_len(ci)) }
+        })
+    }
+
+    /// Visit each chunk's elements as one mutable slice, in insertion order,
+    /// so a caller can reorder the elements of a chunk in place.
+    pub fn for_each_chunk_mut(&mut self, mut f: impl FnMut(&mut [T])) {
+        for ci in 0..self.chunks.len() {
+            let len = self.chunk_len(ci);
+            let base = self.chunks[ci].ptr_at_index(0);
+            let slice = unsafe { std::slice::from_raw_parts_mut(base, len) };
+            f(slice);
+        }
+    }
+
     /// Visit every element in insertion order — sequentially off each chunk's base.
     #[inline(always)]
     pub fn for_each(&self, mut f: impl FnMut(T)) {

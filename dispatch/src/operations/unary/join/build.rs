@@ -313,44 +313,176 @@ pub struct PartitionScatterJob<K: Copy + Send> {
 
 unsafe impl<K: Copy + Send> Send for PartitionScatterJob<K> {}
 
+/// How many tuples ahead the counting and scatter passes prefetch the
+/// directory slot of.
+const PREFETCH_AHEAD: usize = 64;
+
+/// Largest working set (a job's directory slot range plus its share of the
+/// arenas) that the counting and scatter passes walk at random as one piece.
+/// Within it the range stays in a core's private cache across both passes;
+/// a wider job walks its tuples sub-partition by sub-partition instead, so
+/// each cache line of the range is pulled in once rather than once per
+/// tuple that lands on it.
+const RANDOM_ACCESS_WORKING_SET: usize = 1 << 20;
+
+/// Most hash bits a job sub-partitions by. 256 sub-ranges keep the per-chunk
+/// bucket bookkeeping small while splitting a partition hundreds of
+/// megabytes wide down to the working set above.
+const MAX_SUB_PARTITION_BITS: u32 = 8;
+
+/// The hash bits a job walks its tuples by so that each walked piece of its
+/// `slots` directory slots and `tuple_count` arena entries (of `entry_bytes`
+/// each) fits [`RANDOM_ACCESS_WORKING_SET`]; zero when the whole job does.
+fn sub_partition_bits(slots: usize, tuple_count: usize, entry_bytes: usize) -> u32 {
+    let working_set = slots * size_of::<u64>() + tuple_count * entry_bytes;
+    let mut bits = 0;
+    while bits < MAX_SUB_PARTITION_BITS.min(slots.trailing_zeros())
+        && (working_set >> bits) > RANDOM_ACCESS_WORKING_SET
+    {
+        bits += 1;
+    }
+    bits
+}
+
+/// A job's tuples regrouped for a walk in sub-partition order without moving
+/// them between chunks: every chunk of every worker list is counting-sorted
+/// in place by sub-partition, and `bucket_starts` records, per chunk, where
+/// each bucket begins (`buckets + 1` entries, the last one the chunk's
+/// length). Walking bucket `b` then visits that bucket's run of every chunk.
+struct SubPartitionedTuples<'a, K: Copy> {
+    /// Every chunk with the row id base of the worker list it came from.
+    chunks: Vec<(u64, &'a [BuildTuple<K>])>,
+    bucket_starts: Vec<u32>,
+    buckets: usize,
+}
+
+impl<'a, K: Copy> SubPartitionedTuples<'a, K> {
+    fn new(
+        lists: &'a mut [(u64, SlabVec<BuildTuple<K>>)],
+        buckets: usize,
+        bucket_of: impl Fn(&BuildTuple<K>) -> usize,
+    ) -> Self {
+        let mut bucket_starts = Vec::new();
+        let mut starts = vec![0u32; buckets + 1];
+        let mut cursors = vec![0u32; buckets];
+        let mut scratch: Vec<BuildTuple<K>> = Vec::new();
+        for (_, list) in lists.iter_mut() {
+            list.for_each_chunk_mut(|chunk| {
+                starts.fill(0);
+                for tuple in chunk.iter() {
+                    starts[bucket_of(tuple) + 1] += 1;
+                }
+                for bucket in 0..buckets {
+                    starts[bucket + 1] += starts[bucket];
+                }
+                cursors.copy_from_slice(&starts[..buckets]);
+                scratch.clear();
+                scratch.extend_from_slice(chunk);
+                for tuple in &scratch {
+                    let bucket = bucket_of(tuple);
+                    chunk[cursors[bucket] as usize] = *tuple;
+                    cursors[bucket] += 1;
+                }
+                bucket_starts.extend_from_slice(&starts);
+            });
+        }
+        let chunks = lists
+            .iter()
+            .flat_map(|(row_base, list)| list.chunk_slices().map(move |chunk| (*row_base, chunk)))
+            .collect();
+        Self {
+            chunks,
+            bucket_starts,
+            buckets,
+        }
+    }
+
+    /// Visit every tuple, bucket by bucket, with the row id base of the
+    /// worker list it belongs to.
+    #[inline(always)]
+    fn for_each_in_bucket_order(&self, mut visit: impl FnMut(u64, &BuildTuple<K>)) {
+        for bucket in 0..self.buckets {
+            for (chunk_index, (row_base, chunk)) in self.chunks.iter().enumerate() {
+                let starts = &self.bucket_starts[chunk_index * (self.buckets + 1)..];
+                for tuple in &chunk[starts[bucket] as usize..starts[bucket + 1] as usize] {
+                    visit(*row_base, tuple);
+                }
+            }
+        }
+    }
+}
+
 impl<K: Copy + Send> PartitionScatterJob<K> {
-    fn run(self) {
+    fn run(mut self) {
         debug!("Running partition job");
         let directory = unsafe { &*self.table.directory.get() };
         let shift = directory.shift;
         let keys = unsafe { &*self.table.keys.get() };
-
-        // Pass 1: accumulate counts in upper 48 bits, OR bloom tags into
-        // lower 16 bits
-        for (_, worker_tuples) in &self.tuples {
-            worker_tuples.for_each(|tuple| {
-                let slot = (tuple.hash >> shift) as usize;
-                unsafe {
-                    directory.add_to_entry(slot, 1 << 16);
-                    directory.or_to_entry(slot, JoinDirectory::compute_tag(tuple.hash) as u64);
-                }
-            });
-        }
-
-        // Pass 2: convert counts to absolute write cursors. Linear sweep
-        // over this partition's directory slot range replaces each count
-        // with a running arena pointer while preserving the tag bits.
+        let rows = unsafe { &*self.table.rows.get() };
         let slot_end = self.slot_start + self.slots_per_partition;
-        let mut cur = self.arena_offset as u64;
 
-        for i in self.slot_start..slot_end {
-            let entry = directory.entry(i);
-            let count = entry >> 16;
-            let tag = entry & 0xFFFF;
-            cur += count;
-            directory.set_entry(i, (cur << 16) | tag);
-        }
+        // This partition's slots arrive dirty; clearing them here, right
+        // before the counting pass walks them, spreads the clearing over
+        // every job and leaves the range warm for the pass.
+        unsafe { directory.zero_slots(self.slot_start, slot_end) };
 
-        // Pass 3 scatters into the row arena of whichever width the build
-        // chose.
-        match unsafe { &*self.table.rows.get() } {
-            RowArena::Narrow(rows) => self.scatter(directory, keys, rows),
-            RowArena::Wide(rows) => self.scatter(directory, keys, rows),
+        let tuple_count: usize = self.tuples.iter().map(|(_, list)| list.len()).sum();
+        let sub_partition_bits = sub_partition_bits(
+            self.slots_per_partition,
+            tuple_count,
+            size_of::<K>() + size_of::<u64>(),
+        );
+        if sub_partition_bits == 0 {
+            Self::count_prefetched(&self.tuples, directory);
+            Self::convert_counts_to_cursors(
+                directory,
+                self.slot_start,
+                slot_end,
+                self.arena_offset,
+            );
+            match rows {
+                RowArena::Narrow(rows) => {
+                    Self::scatter_prefetched(&self.tuples, directory, keys, rows)
+                }
+                RowArena::Wide(rows) => {
+                    Self::scatter_prefetched(&self.tuples, directory, keys, rows)
+                }
+            }
+        } else {
+            // A sub-partition is the next `sub_partition_bits` of the slot
+            // below the partition's own bits, so walking the buckets in order
+            // walks the slot range, and with it the arena range the cursors
+            // hand out, in ascending pieces of the working set's size.
+            debug_assert!(self.slots_per_partition.is_power_of_two());
+            let sub_partition_shift =
+                shift + self.slots_per_partition.trailing_zeros() - sub_partition_bits;
+            let bucket_mask = (1usize << sub_partition_bits) - 1;
+            let tuples =
+                SubPartitionedTuples::new(&mut self.tuples, 1 << sub_partition_bits, |tuple| {
+                    ((tuple.hash >> sub_partition_shift) as usize) & bucket_mask
+                });
+            tuples.for_each_in_bucket_order(|_, tuple| {
+                let slot = (tuple.hash >> shift) as usize;
+                let entry = directory.entry(slot);
+                directory.set_entry(
+                    slot,
+                    (entry + (1 << 16)) | JoinDirectory::compute_tag(tuple.hash) as u64,
+                );
+            });
+            Self::convert_counts_to_cursors(
+                directory,
+                self.slot_start,
+                slot_end,
+                self.arena_offset,
+            );
+            match rows {
+                RowArena::Narrow(rows) => {
+                    Self::scatter_sub_partitioned(&tuples, directory, keys, rows)
+                }
+                RowArena::Wide(rows) => {
+                    Self::scatter_sub_partitioned(&tuples, directory, keys, rows)
+                }
+            }
         }
 
         // Release-publish this job's writes; the outputter's Acquire load of
@@ -358,34 +490,102 @@ impl<K: Copy + Send> PartitionScatterJob<K> {
         self.remaining_jobs.fetch_sub(1, Ordering::Release);
     }
 
-    /// Pass 3: scatter tuples into the parallel key/row arenas. For each
-    /// tuple read the directory to get its arena write pointer, advance the
-    /// cursor, and write the key and globalized row id. The element
-    /// `PREFETCH_AHEAD` positions ahead is used to prefetch its directory
-    /// slot before we reach it.
-    fn scatter<R: RowId>(
-        &self,
-        directory: &JoinDirectory,
-        keys: &MultiSlabBuffer<K>,
-        rows: &MultiSlabBuffer<R>,
-    ) {
-        const PREFETCH_AHEAD: usize = 64;
+    /// Pass 1: accumulate counts in upper 48 bits, OR bloom tags into lower
+    /// 16 bits. One read-modify-write per tuple, with the slot of the tuple
+    /// `PREFETCH_AHEAD` positions on prefetched so the random accesses
+    /// overlap instead of each stalling on its own miss.
+    fn count_prefetched(tuples: &[(u64, SlabVec<BuildTuple<K>>)], directory: &JoinDirectory) {
         let shift = directory.shift;
-        for (row_base, worker_tuples) in &self.tuples {
+        for (_, worker_tuples) in tuples {
             worker_tuples.for_each_prefetched::<PREFETCH_AHEAD>(|tuple, ahead| {
                 if let Some(ahead_tuple) = ahead {
                     directory.prefetch_l2(ahead_tuple.hash);
                 }
                 let slot = (tuple.hash >> shift) as usize;
-                let entry = directory.entry(slot).wrapping_sub(1 << 16);
-                directory.set_entry(slot, entry);
-                let arena_idx = (entry >> 16) as usize;
-                unsafe {
-                    keys.ptr_at_index(arena_idx).write(tuple.key);
-                    rows.ptr_at_index(arena_idx)
-                        .write(R::from_row_id(row_base + tuple.row));
-                }
+                let entry = directory.entry(slot);
+                directory.set_entry(
+                    slot,
+                    (entry + (1 << 16)) | JoinDirectory::compute_tag(tuple.hash) as u64,
+                );
             });
+        }
+    }
+
+    /// Pass 2: convert counts to absolute write cursors. Linear sweep over
+    /// the partition's directory slot range replaces each count with a
+    /// running arena pointer while preserving the tag bits.
+    fn convert_counts_to_cursors(
+        directory: &JoinDirectory,
+        slot_start: usize,
+        slot_end: usize,
+        arena_offset: usize,
+    ) {
+        let mut cur = arena_offset as u64;
+        for i in slot_start..slot_end {
+            let entry = directory.entry(i);
+            let count = entry >> 16;
+            let tag = entry & 0xFFFF;
+            cur += count;
+            directory.set_entry(i, (cur << 16) | tag);
+        }
+    }
+
+    /// Pass 3: scatter tuples into the parallel key/row arenas. For each
+    /// tuple read the directory to get its arena write pointer, advance the
+    /// cursor, and write the key and globalized row id. The element
+    /// `PREFETCH_AHEAD` positions ahead is used to prefetch its directory
+    /// slot before we reach it.
+    fn scatter_prefetched<R: RowId>(
+        tuples: &[(u64, SlabVec<BuildTuple<K>>)],
+        directory: &JoinDirectory,
+        keys: &MultiSlabBuffer<K>,
+        rows: &MultiSlabBuffer<R>,
+    ) {
+        let shift = directory.shift;
+        for (row_base, worker_tuples) in tuples {
+            worker_tuples.for_each_prefetched::<PREFETCH_AHEAD>(|tuple, ahead| {
+                if let Some(ahead_tuple) = ahead {
+                    directory.prefetch_l2(ahead_tuple.hash);
+                }
+                Self::place(directory, keys, rows, shift, *row_base, &tuple);
+            });
+        }
+    }
+
+    /// Pass 3 over sub-partitioned tuples: the same placement, walked
+    /// bucket by bucket so the slots and arena entries it touches stay
+    /// within one cache-sized piece at a time.
+    fn scatter_sub_partitioned<R: RowId>(
+        tuples: &SubPartitionedTuples<'_, K>,
+        directory: &JoinDirectory,
+        keys: &MultiSlabBuffer<K>,
+        rows: &MultiSlabBuffer<R>,
+    ) {
+        let shift = directory.shift;
+        tuples.for_each_in_bucket_order(|row_base, tuple| {
+            Self::place(directory, keys, rows, shift, row_base, tuple);
+        });
+    }
+
+    /// Claim the next arena entry of `tuple`'s slot and write the key and
+    /// globalized row id into it.
+    #[inline(always)]
+    fn place<R: RowId>(
+        directory: &JoinDirectory,
+        keys: &MultiSlabBuffer<K>,
+        rows: &MultiSlabBuffer<R>,
+        shift: u32,
+        row_base: u64,
+        tuple: &BuildTuple<K>,
+    ) {
+        let slot = (tuple.hash >> shift) as usize;
+        let entry = directory.entry(slot).wrapping_sub(1 << 16);
+        directory.set_entry(slot, entry);
+        let arena_idx = (entry >> 16) as usize;
+        unsafe {
+            keys.ptr_at_index(arena_idx).write(tuple.key);
+            rows.ptr_at_index(arena_idx)
+                .write(R::from_row_id(row_base + tuple.row));
         }
     }
 }
@@ -554,8 +754,11 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
             .max(self.partitions);
         let directory = unsafe { &mut *self.table.directory.get() };
         let mut directory_alloc = SlabAllocator::new(false);
+        // Dirty: each partition job clears its own slot range (see
+        // `PartitionScatterJob::run`), so no single thread clears the whole
+        // directory while the rest of the pool waits for the jobs.
         *directory = JoinDirectory::new(
-            directory_alloc.create_multi_slab_buffer(directory_capacity + 1, true),
+            directory_alloc.create_multi_slab_buffer(directory_capacity + 1, false),
             directory_capacity,
         );
 
@@ -704,5 +907,73 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Outputter<()>
         }
 
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::init_test_free_pool;
+
+    #[test]
+    fn a_job_that_fits_the_working_set_is_not_sub_partitioned() {
+        assert_eq!(sub_partition_bits(1 << 10, 1_000, 16), 0);
+        assert_eq!(sub_partition_bits(1 << 16, 1 << 15, 16), 0);
+    }
+
+    #[test]
+    fn a_wide_job_is_split_down_to_the_working_set() {
+        // 4M slots (32MB) plus 3M entries of 16 bytes (48MB): 80MB halves
+        // seven times before a piece fits in 1MB.
+        assert_eq!(sub_partition_bits(1 << 22, 3_000_000, 16), 7);
+        // Never more buckets than slots, nor more than the bookkeeping bound.
+        assert_eq!(sub_partition_bits(4, 1 << 20, 16), 2);
+        assert_eq!(
+            sub_partition_bits(1 << 30, 1 << 30, 16),
+            MAX_SUB_PARTITION_BITS
+        );
+    }
+
+    #[test]
+    fn sub_partitioned_tuples_visit_every_tuple_bucket_by_bucket() {
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(false);
+        let mut lists: Vec<(u64, SlabVec<BuildTuple<i64>>)> = Vec::new();
+        let mut expected: Vec<(u64, u64, i64, u64)> = Vec::new();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for list_index in 0..3u64 {
+            let row_base = list_index * 100_000;
+            let mut list = SlabVec::new();
+            for row in 0..10_000u64 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let tuple = BuildTuple {
+                    hash: state,
+                    key: (state >> 1) as i64,
+                    row,
+                };
+                list.push(&mut allocator, tuple);
+                expected.push((row_base, tuple.hash, tuple.key, tuple.row));
+            }
+            lists.push((row_base, list));
+        }
+        let bucket_of = |tuple: &BuildTuple<i64>| (tuple.hash >> 60) as usize;
+
+        let tuples = SubPartitionedTuples::new(&mut lists, 16, bucket_of);
+        let mut visited = Vec::new();
+        let mut last_bucket = 0;
+        tuples.for_each_in_bucket_order(|row_base, tuple| {
+            assert!(
+                bucket_of(tuple) >= last_bucket,
+                "buckets are visited in order"
+            );
+            last_bucket = bucket_of(tuple);
+            visited.push((row_base, tuple.hash, tuple.key, tuple.row));
+        });
+
+        visited.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(visited, expected);
     }
 }
