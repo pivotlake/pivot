@@ -19,7 +19,10 @@ fn a_commit_from_outside_the_shell_becomes_visible_to_later_queries() {
     let instance = runtime
         .block_on(async {
             ShellInstance::open_with_resources(
-                &ShellTarget::pivot(directory.path().to_str().unwrap()),
+                &ShellTarget::pivot_with_table_format(
+                    directory.path().to_str().unwrap(),
+                    Some(datastore_pivotlake::TableFormat::Delta),
+                ),
                 1,
                 32,
                 Duration::from_millis(100),

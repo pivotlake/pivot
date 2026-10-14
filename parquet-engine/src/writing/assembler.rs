@@ -412,15 +412,36 @@ fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> 
     Ok(elements)
 }
 
+/// The field id `field` declares in its metadata under
+/// [`PARQUET_FIELD_ID_METADATA_KEY`], or `None` when it declares none. A value
+/// that is not an id is an error: a table format that resolves columns by id
+/// would silently stop finding the column.
+fn declared_field_id(field: &FieldRef) -> WriteResult<Option<i32>> {
+    field
+        .metadata()
+        .get(crate::PARQUET_FIELD_ID_METADATA_KEY)
+        .map(|value| {
+            value.parse::<i32>().map_err(|_| {
+                WriteError::Schema(format!(
+                    "field `{}` declares the Parquet field id `{value}`, which is not an integer",
+                    field.name()
+                ))
+            })
+        })
+        .transpose()
+}
+
 /// Append `field`'s schema element, and for a struct its children's after it. A
 /// nullable field is OPTIONAL, which is what tells the reader its leaves carry
-/// definition levels.
+/// definition levels. A field id the arrow field declares in its metadata is
+/// written with the element, so a reader resolving columns by id finds it.
 fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> WriteResult<()> {
     let repetition_type = Some(if field.is_nullable() {
         REPETITION_OPTIONAL
     } else {
         REPETITION_REQUIRED
     });
+    let field_id = declared_field_id(field)?;
     match field.data_type() {
         DataType::Struct(children) => {
             elements.push(SchemaElement {
@@ -432,7 +453,7 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
                 converted_type: None,
                 scale: None,
                 precision: None,
-                field_id: None,
+                field_id,
                 // The VARIANT annotation is the whole difference between a
                 // variant column and a plain struct of binary leaves: it is what
                 // a reader keys off to treat the group as semi-structured.
@@ -456,7 +477,7 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
                 converted_type: annotation.converted_type,
                 scale: annotation.scale,
                 precision: annotation.precision,
-                field_id: None,
+                field_id,
                 logical_type: annotation.logical_type,
             })
         }
@@ -612,6 +633,67 @@ mod tests {
         let read: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
         assert_eq!(read.len(), 1);
         read.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn writer_records_arrow_field_ids_in_the_footer() {
+        let with_id = |field: Field, id: &str| {
+            field.with_metadata(std::collections::HashMap::from([(
+                crate::PARQUET_FIELD_ID_METADATA_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let inner = Fields::from(vec![with_id(Field::new("a", DataType::Int64, true), "7")]);
+        let schema = Arc::new(Schema::new(vec![
+            with_id(Field::new("n", DataType::Int64, true), "3"),
+            with_id(Field::new("s", DataType::Struct(inner.clone()), true), "5"),
+            Field::new("unnumbered", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(StructArray::new(
+                    inner,
+                    vec![Arc::new(Int64Array::from(vec![2])) as ArrayRef],
+                    None,
+                )),
+                Arc::new(Int64Array::from(vec![3])),
+            ],
+        )
+        .unwrap();
+
+        let bytes = encode(&batch);
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes)).unwrap();
+        let fields = reader.parquet_schema().root_schema().get_fields().to_vec();
+        let ids: Vec<Option<i32>> = fields
+            .iter()
+            .map(|field| {
+                field
+                    .get_basic_info()
+                    .has_id()
+                    .then(|| field.get_basic_info().id())
+            })
+            .collect();
+        assert_eq!(ids, [Some(3), Some(5), None]);
+        let child = &fields[1].get_fields()[0];
+        assert_eq!(child.get_basic_info().id(), 7);
+    }
+
+    #[test]
+    fn a_field_id_that_is_not_an_integer_is_refused() {
+        let field = Field::new("n", DataType::Int64, true).with_metadata(
+            std::collections::HashMap::from([(
+                crate::PARQUET_FIELD_ID_METADATA_KEY.to_string(),
+                "seven".to_string(),
+            )]),
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+
+        let error = build_schema_elements(&schema).unwrap_err();
+
+        assert!(matches!(error, WriteError::Schema(_)), "{error}");
     }
 
     /// A nullable column and a nullable struct round-trip through arrow-rs: the

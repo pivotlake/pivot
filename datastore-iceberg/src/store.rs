@@ -27,15 +27,43 @@ use crate::{Error, Result};
 /// that root, and a file under any other root is refused before it is read:
 /// the two must travel together, and a reader cannot skip the check.
 #[derive(Clone)]
-pub(crate) struct TableStore {
+pub struct TableStore {
     table: String,
     /// The root every file of the table must be under, as
     /// [`split_location`] names it.
     root: String,
     store: Arc<dyn ObjectStore>,
+    /// Whether `store` is rooted below `root` (a datastore's own store, opened
+    /// on a prefix of its bucket), so a key under `root` addresses it as a
+    /// store-root-absolute key rather than one relative to the prefix.
+    keys_from_store_root: bool,
 }
 
 impl TableStore {
+    /// The store a managed table's files are read through: the datastore's
+    /// own `store`, which every file of the table lives in. Keys are formed
+    /// from the store's root (the bucket, or the filesystem root), because the
+    /// store itself may be opened on a prefix below it.
+    pub fn over_datastore_store(table: &str, store: Arc<dyn ObjectStore>) -> Result<Self> {
+        let location = store.location_uri();
+        let root = match StoreScheme::of(&location)? {
+            StoreScheme::Local => "/".to_string(),
+            scheme => {
+                let (_, rest) = location
+                    .split_once("://")
+                    .expect("a bucket location carries a scheme");
+                let bucket = rest.split('/').next().unwrap_or(rest);
+                format!("{}{bucket}", scheme.uri_prefix())
+            }
+        };
+        Ok(Self {
+            table: table.to_string(),
+            root,
+            store,
+            keys_from_store_root: true,
+        })
+    }
+
     /// Open the store `table`'s files live in: the root of
     /// `metadata_location`, with `vended` credentials when the catalog vended
     /// any and the root is S3, else through `factory`.
@@ -56,12 +84,13 @@ impl TableStore {
             table: table.to_string(),
             root,
             store,
+            keys_from_store_root: false,
         })
     }
 
     /// The file at `location`, of `size` bytes, located for reading. Its
     /// identity is the full location, as the catalog names it.
-    pub(crate) fn data_file(&self, location: &str, size: u64) -> Result<DataFile> {
+    pub fn data_file(&self, location: &str, size: u64) -> Result<DataFile> {
         let source = self.store.source(&self.key_under_root(location)?)?;
         Ok(DataFile {
             file: FileRef {
@@ -75,7 +104,7 @@ impl TableStore {
     /// The size of the object at `location`, or `None` when no such object
     /// exists: one listing narrowed to the object's own name. What a file the
     /// catalog names without a length (a manifest list) is sized by.
-    pub(crate) fn object_size(&self, location: &str) -> Result<Option<u64>> {
+    pub fn object_size(&self, location: &str) -> Result<Option<u64>> {
         let key = self.key_under_root(location)?;
         let directory = key.parent().unwrap_or_default();
         let listing = self.store.list_with_name_prefix(&directory, key.name())?;
@@ -96,6 +125,9 @@ impl TableStore {
                 file: location.to_string(),
                 root: self.root.clone(),
             });
+        }
+        if self.keys_from_store_root {
+            return Ok(ObjectPath::new(format!("/{}", key.as_str())));
         }
         Ok(key)
     }
@@ -137,7 +169,7 @@ pub(crate) fn read_vended_s3_credentials(
 /// Split a file location into the root the store is opened on and the key of
 /// the object under it: a bucket root for `s3://`, `s3a://` and `gs://`
 /// locations, the filesystem root for a local path.
-fn split_location(location: &str) -> Result<(String, ObjectPath)> {
+pub fn split_location(location: &str) -> Result<(String, ObjectPath)> {
     let unsupported = |message: String| Error::UnsupportedLocation {
         path: location.to_string(),
         message,
@@ -182,7 +214,28 @@ mod tests {
             table: "db.t".to_string(),
             root: "s3://lake".to_string(),
             store: Arc::new(LocalStore::new(std::env::temp_dir()).unwrap()),
+            keys_from_store_root: false,
         }
+    }
+
+    #[test]
+    fn a_datastores_own_store_addresses_files_from_its_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::new(dir.path().join("db")).unwrap());
+
+        let table_store = TableStore::over_datastore_store("main.t", store).unwrap();
+        let file = table_store
+            .data_file(
+                &format!("file://{}/db/t/pivot-1.parquet", dir.path().display()),
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(table_store.root, "/");
+        assert!(matches!(
+            file.source,
+            DataFileLocation::Local(path) if path == dir.path().join("db/t/pivot-1.parquet")
+        ));
     }
 
     #[test]

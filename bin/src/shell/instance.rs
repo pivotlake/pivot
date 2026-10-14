@@ -252,18 +252,21 @@ impl Drop for ShellInstance {
 }
 
 /// Open the datastore `target` names, refreshing it every `refresh_interval`
-/// once the catalog starts it. A pivotlake datastore is opened without
-/// maintenance (see [`ShellInstance::open_with_resources`]); an Iceberg
-/// datastore reads its tables' files through the process's own credential
-/// policy, the same one the `AWS_*` and `GOOGLE_*` variables set for a pivotlake
-/// datastore in a bucket.
+/// once the catalog starts it. A pivotlake datastore
+/// is opened without maintenance (see [`ShellInstance::open_with_resources`]);
+/// a REST-catalog Iceberg datastore reads its tables' files through the
+/// process's own credential policy, the same one the `AWS_*` and `GOOGLE_*`
+/// variables set for a datastore in a bucket.
 fn open_datastore(
     target: &ShellTarget,
     dispatcher: &DataFlowDispatcher,
     refresh_interval: Duration,
 ) -> Result<Arc<dyn Datastore>, Box<dyn std::error::Error>> {
     match target {
-        ShellTarget::Pivotlake { location } => {
+        ShellTarget::Pivotlake {
+            location,
+            table_format,
+        } => {
             let store: Arc<dyn ObjectStore> = open_store(location)?.into();
             let maintenance = MaintenanceConfig {
                 refresh_interval,
@@ -274,6 +277,7 @@ fn open_datastore(
                 store,
                 dispatcher,
                 Some(maintenance),
+                *table_format,
             )?)
         }
         ShellTarget::Iceberg(config) => Ok(IcebergDatastore::open(

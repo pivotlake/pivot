@@ -122,7 +122,12 @@ fn create_table_over_adopted_parquet_scans_rows() {
         &strings_and_ints(&["a", "b", "c"], &[1, 2, 3]),
     );
 
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create(
         &dispatch,
         &datastore,
@@ -162,7 +167,12 @@ fn tables_persist_across_reopen() {
 
     // Create the table, then drop the datastore, only the on-disk manifest remains.
     {
-        let datastore = PivotlakeDatastore::open(db_uri, &dispatch).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db_uri,
+            &dispatch,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
         create(
             &dispatch,
             &datastore,
@@ -172,7 +182,12 @@ fn tables_persist_across_reopen() {
     }
 
     // Reopening (as a restart would) reloads the table and its data.
-    let reopened = PivotlakeDatastore::open(db_uri, &dispatch).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db_uri,
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let table = reopened
         .clone()
         .begin_transaction()
@@ -198,7 +213,12 @@ fn background_refresh_advances_to_latest_delta_snapshot() {
     let second = data.path().join("b.parquet");
     write_parquet(&first, &strings_and_ints(&["a"], &[1]));
 
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create(
         &dispatch,
         &datastore,
@@ -251,7 +271,12 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
     let db_uri = db.path().to_str().unwrap();
 
     {
-        let datastore = PivotlakeDatastore::open(db_uri, &dispatch).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db_uri,
+            &dispatch,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
         create(&dispatch, &datastore, rooted_request("t", columns())).unwrap();
 
         // A data-less table: registered, with no row groups (its data lives at
@@ -293,7 +318,12 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
     }
 
     // And it survives a reopen.
-    let reopened = PivotlakeDatastore::open(db_uri, &dispatch).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db_uri,
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     assert!(
         reopened
             .clone()
@@ -328,7 +358,12 @@ fn create_fetches_footers_across_workers_before_commit() {
         );
     }
 
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create(
         &dispatch,
         &datastore,
@@ -363,7 +398,12 @@ fn create_fetches_footers_across_workers_before_commit() {
 fn rejects_an_object_store_scheme_in_the_adopt_path() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
 
     let err = create(
         &dispatch,

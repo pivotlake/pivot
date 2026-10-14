@@ -13,6 +13,7 @@ use parquet_engine::{FileRowGroups, ParquetTable, TableColumns, load_file_row_gr
 use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 use planner::types::physical_arrow_type;
 
+use crate::columns::read_logical_types;
 use crate::columns::table_columns;
 use crate::manifests::{DataFiles, FileDescriptor, ManifestList};
 use crate::store::{TableStore, read_vended_s3_credentials};
@@ -40,24 +41,20 @@ impl LoadedTable {
     /// before pruning can hide them. Manifests and data footers remain lazy.
     pub(crate) fn load(
         name: &SchemaQualifiedTableName,
-        table: &Table,
+        metadata: TableMetadataRef,
+        metadata_location: &str,
         store: TableStore,
         manifest_list_size: Option<u64>,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<Self> {
         let table_name = name.to_string();
-        let metadata = table.metadata_ref();
-        let metadata_location = table
-            .metadata_location()
-            .ok_or_else(|| Error::StagedTable {
-                table: table_name.clone(),
-            })?
-            .to_string();
+        let metadata_location = metadata_location.to_string();
         if metadata.encryption_keys_iter().len() > 0 {
             return Err(Error::EncryptedTable { table: table_name });
         }
         let schema = metadata.current_schema();
-        let columns = table_columns(&table_name, schema)?;
+        let logical_types = read_logical_types(metadata.properties())?;
+        let columns = table_columns(&table_name, schema, &logical_types)?;
         let partition_by = identity_columns(
             schema,
             metadata
@@ -144,7 +141,7 @@ impl LoadedTable {
     }
 
     /// Read file metadata in parallel and return it in request order.
-    pub(super) fn read_footers(&self, files: &[FileDescriptor]) -> Result<Vec<FileRowGroups>> {
+    pub(crate) fn read_footers(&self, files: &[FileDescriptor]) -> Result<Vec<FileRowGroups>> {
         let data_files = files
             .iter()
             .map(|file| self.store.data_file(&file.path, file.length))
@@ -203,7 +200,7 @@ impl LoadedTable {
 /// The names of the columns `fields` (a partition spec's or a sort order's,
 /// as source field id and transform) take by identity, in field order. A
 /// transformed field (a bucket, a day) is not a column value, so it is left out.
-fn identity_columns<'a>(
+pub fn identity_columns<'a>(
     schema: &SchemaRef,
     fields: impl Iterator<Item = (i32, &'a Transform)>,
 ) -> Vec<String> {

@@ -23,6 +23,47 @@ use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 use parquet_engine::RowGroupMetadata;
 use parquet_engine::writing::{AssembledFile, encode_record_batches_spec, unshred_batches_spec};
 
+/// The Arrow schema a table's files are written under: its declared columns
+/// in order, each tagged the way the writer and the readers need. With
+/// `field_ids`, each field also carries the Parquet field id (in `columns`
+/// order) a format that resolves columns by id assigned it.
+pub(crate) fn write_schema(columns: &[Column], field_ids: Option<&[i32]>) -> Arc<Schema> {
+    let fields = columns
+        .iter()
+        .enumerate()
+        .map(|(position, column)| {
+            // Every column is nullable: the catalog carries no NOT NULL
+            // constraint, so a row is free to arrive with a NULL in any of
+            // them. Marking the field OPTIONAL is what lets the written
+            // leaves carry definition levels; readers do not lose the
+            // no-NULLs fast path over it, since they refine nullability
+            // from each chunk's null count rather than from this flag.
+            let field = Field::new(
+                column.name.clone(),
+                planner::types::physical_arrow_type(&column.col_type),
+                true,
+            );
+            // The Arrow extension tag lives on the field, not on the data
+            // type, so a variant built from `physical_arrow_type` alone is
+            // indistinguishable from any other struct. Put the tag back, or
+            // the shredding stage further down this pipeline does not
+            // recognize the column and writes the documents unshredded.
+            let mut metadata = match column.col_type {
+                planner::types::Type::Variant => parquet_engine::variant_extension_metadata(),
+                _ => HashMap::new(),
+            };
+            if let Some(field_ids) = field_ids {
+                metadata.insert(
+                    parquet_engine::PARQUET_FIELD_ID_METADATA_KEY.to_string(),
+                    field_ids[position].to_string(),
+                );
+            }
+            field.with_metadata(metadata)
+        })
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(fields))
+}
+
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
 /// emits the inserted-row count. Each finished file is pushed onto `uploaded_files`
 /// for the statement's transaction to commit (by the table's durable id). This is
@@ -43,36 +84,7 @@ pub(super) fn build_insert_spec(
     // already bound and cast each expression to its target column by position, so
     // stamp the table's declared schema onto the batches for Parquet files and
     // partitioning.
-    let schema = Arc::new(Schema::new(
-        table
-            .columns()
-            .into_iter()
-            .map(|column| {
-                // Every column is nullable: the catalog carries no NOT NULL
-                // constraint, so a row is free to arrive with a NULL in any of
-                // them. Marking the field OPTIONAL is what lets the written
-                // leaves carry definition levels; readers do not lose the
-                // no-NULLs fast path over it, since they refine nullability
-                // from each chunk's null count rather than from this flag.
-                let field = Field::new(
-                    column.name,
-                    planner::types::physical_arrow_type(&column.col_type),
-                    true,
-                );
-                // The Arrow extension tag lives on the field, not on the data
-                // type, so a variant built from `physical_arrow_type` alone is
-                // indistinguishable from any other struct. Put the tag back, or
-                // the shredding stage further down this pipeline does not
-                // recognize the column and writes the documents unshredded.
-                match column.col_type {
-                    planner::types::Type::Variant => {
-                        field.with_metadata(parquet_engine::variant_extension_metadata())
-                    }
-                    _ => field,
-                }
-            })
-            .collect::<Vec<_>>(),
-    ));
+    let schema = write_schema(&table.columns(), table.field_ids().as_deref());
     let input = unshred_batches_spec(input).project({
         let schema = schema.clone();
         move || {

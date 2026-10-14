@@ -27,8 +27,8 @@
 
 use super::{
     DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
-    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, object_key,
-    parse_iso8601_millis, percent_encode,
+    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, encode_child_key,
+    object_key, parse_iso8601_millis, percent_encode,
 };
 use base64::Engine;
 use std::path::PathBuf;
@@ -391,28 +391,31 @@ impl ObjectStore for GcsStore {
         }
     }
 
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
+        self.put_if_generation(key, data, None)
+    }
+
     /// Objects directly under `prefix`, one level deep. The narrowing
     /// `name_prefix` goes into the request's `prefix` parameter, so the
-    /// service never returns (or pages through) children outside it.
-    fn list_with_name_prefix(
+    /// service never returns (or pages through) children outside it, and the
+    /// cursor into `startOffset`, which is inclusive: a child named exactly
+    /// `after_name` is dropped here.
+    fn list_from(
         &self,
         prefix: &ObjectPath,
         name_prefix: &str,
+        after_name: &str,
     ) -> Result<DirectoryListing> {
         let object_prefix = object_key(&self.prefix, prefix);
-        let encoded_prefix = if object_prefix.is_empty() {
-            percent_encode(name_prefix)
-        } else {
-            format!(
-                "{}%2F{}",
-                percent_encode(&object_prefix),
-                percent_encode(name_prefix)
-            )
-        };
-        let base_url = format!(
+        let encoded_prefix = encode_child_key(&object_prefix, name_prefix);
+        let mut base_url = format!(
             "{}/storage/v1/b/{}/o?prefix={encoded_prefix}&delimiter=%2F",
             self.endpoint, self.bucket
         );
+        if !after_name.is_empty() {
+            base_url.push_str("&startOffset=");
+            base_url.push_str(&encode_child_key(&object_prefix, after_name));
+        }
         let mut page_token: Option<String> = None;
         let mut objects = Vec::new();
         let mut prefixes = Vec::new();
@@ -441,6 +444,9 @@ impl ObjectStore for GcsStore {
             objects.extend(
                 body.items
                     .into_iter()
+                    .filter(|item| {
+                        after_name.is_empty() || super::key_name(&item.name) != after_name
+                    })
                     .map(|item| {
                         let size = item.size.parse().map_err(|_| {
                             StoreError::Http(format!(

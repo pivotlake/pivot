@@ -23,8 +23,8 @@
 
 use super::{
     DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
-    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, object_key,
-    parse_iso8601_millis, percent_encode,
+    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, encode_child_key,
+    object_key, parse_iso8601_millis, percent_encode,
 };
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -371,26 +371,27 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn list_with_name_prefix(
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
+        self.put_if_version(key, data, None)
+    }
+
+    fn list_from(
         &self,
         prefix: &ObjectPath,
         name_prefix: &str,
+        after_name: &str,
     ) -> Result<DirectoryListing> {
         let object_prefix = object_key(&self.prefix, prefix);
-        let encoded_prefix = if object_prefix.is_empty() {
-            percent_encode(name_prefix)
-        } else {
-            format!(
-                "{}%2F{}",
-                percent_encode(&object_prefix),
-                percent_encode(name_prefix)
-            )
-        };
+        let encoded_prefix = encode_child_key(&object_prefix, name_prefix);
         let mut continuation: Option<String> = None;
         let mut objects = Vec::new();
         let mut prefixes = Vec::new();
         loop {
             let mut query = format!("list-type=2&prefix={encoded_prefix}&delimiter=%2F");
+            if !after_name.is_empty() {
+                query.push_str("&start-after=");
+                query.push_str(&encode_child_key(&object_prefix, after_name));
+            }
             if let Some(token) = &continuation {
                 query.push_str("&continuation-token=");
                 query.push_str(&percent_encode(token));
@@ -750,6 +751,27 @@ mod tests {
                 .join()
                 .unwrap()
                 .starts_with("GET /moved-bucket/?list-type=2")
+        );
+    }
+
+    #[test]
+    fn a_listing_from_a_cursor_starts_the_request_after_that_child_key() {
+        let (endpoint, request) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        );
+        let store =
+            S3Store::anonymous_with_options("s3://bucket/root", "eu-west-1", Some(endpoint))
+                .unwrap();
+
+        let _ = store.list_from(&ObjectPath::new("t/metadata"), "v", "v02");
+
+        let request = request.join().unwrap();
+        assert!(
+            request.starts_with(
+                "GET /bucket/?list-type=2&prefix=root%2Ft%2Fmetadata%2Fv&delimiter=%2F\
+                 &start-after=root%2Ft%2Fmetadata%2Fv02"
+            ),
+            "{request}"
         );
     }
 

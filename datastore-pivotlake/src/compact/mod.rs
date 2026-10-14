@@ -129,7 +129,7 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-use crate::manifest::DeltaFileEntry;
+use crate::file_entry::FileEntry;
 use crate::{CatalogTable, FileRef, PivotlakeDatastore, TableFile, scalar_values_equal};
 use object_storage::ObjectPath;
 use planner::catalog::SchemaQualifiedTableName;
@@ -417,7 +417,7 @@ impl CompacterActor {
             let id = table.id();
 
             while in_flight.len() < self.max_concurrent_merges {
-                let Some((inputs, kind)) = self.next_batch(&table, pass, &reserved) else {
+                let Some((inputs, kind)) = self.next_batch(&table, pass, &reserved)? else {
                     break;
                 };
                 reserved.extend(inputs.iter().map(|file| file.path.clone()));
@@ -475,12 +475,13 @@ impl CompacterActor {
         table: &CatalogTable,
         pass: CompactionPass,
         reserved: &HashSet<ObjectPath>,
-    ) -> Option<(Vec<FileRef>, MergeKind)> {
+    ) -> crate::Result<Option<(Vec<FileRef>, MergeKind)>> {
         if let Some(inputs) = self.next_small_batch(table, pass, reserved) {
-            return Some((inputs, MergeKind::SmallFiles));
+            return Ok(Some((inputs, MergeKind::SmallFiles)));
         }
-        let inputs = self.next_layout_optimization(table, reserved, pass)?;
-        Some((inputs, MergeKind::LayoutOptimization))
+        Ok(self
+            .next_layout_optimization(table, reserved, pass)?
+            .map(|inputs| (inputs, MergeKind::LayoutOptimization)))
     }
 
     /// Pick one group of files below the target size from a single partition.
@@ -494,9 +495,8 @@ impl CompacterActor {
         pass: CompactionPass,
         reserved: &HashSet<ObjectPath>,
     ) -> Option<Vec<FileRef>> {
-        let mut by_partition: Vec<(Option<crate::PartitionValues>, Vec<&DeltaFileEntry>)> =
-            Vec::new();
-        for entry in table.file_entries() {
+        let mut by_partition: Vec<(Option<crate::PartitionValues>, Vec<&FileEntry>)> = Vec::new();
+        for entry in table.file_entries().iter() {
             if !is_small_file(entry.file.size, self.target_bytes)
                 || reserved.contains(&entry.file.path)
             {
@@ -531,24 +531,33 @@ impl CompacterActor {
         table: &CatalogTable,
         reserved: &HashSet<ObjectPath>,
         pass: CompactionPass,
-    ) -> Option<Vec<FileRef>> {
-        table.sort_by().first()?;
+    ) -> crate::Result<Option<Vec<FileRef>>> {
+        if table.sort_by().is_empty() {
+            return Ok(None);
+        }
 
+        // A candidate is measured on its row groups' bounds, which the table
+        // reads for the large files (in memory for a format that holds every
+        // footer, once per version for one that reads them on demand).
+        let large: Vec<&FileEntry> = table
+            .file_entries()
+            .iter()
+            .filter(|entry| !is_small_file(entry.file.size, self.target_bytes))
+            .collect();
+        let footers = table.row_groups_for(&large)?;
         let mut by_partition: Vec<(
             Option<crate::PartitionValues>,
             Vec<overlap::LayoutCandidate<'_>>,
         )> = Vec::new();
-        for file in table.files() {
-            if is_small_file(file.entry.file.size, self.target_bytes) {
-                continue;
-            }
-            let candidate = overlap::LayoutCandidate::from_table_file(file, table.sort_by());
+        for (entry, row_groups) in large.iter().zip(&footers) {
+            let candidate =
+                overlap::LayoutCandidate::from_entry(entry, row_groups, table.sort_by());
             match by_partition
                 .iter_mut()
-                .find(|(partition, _)| partition_values_equal(partition, &file.entry.partition))
+                .find(|(partition, _)| partition_values_equal(partition, &entry.partition))
             {
                 Some((_, files)) => files.push(candidate),
-                None => by_partition.push((file.entry.partition.clone(), vec![candidate])),
+                None => by_partition.push((entry.partition.clone(), vec![candidate])),
             }
         }
 
@@ -558,18 +567,20 @@ impl CompacterActor {
             .collect();
         let cache = self.overlap_caches.entry(table.id()).or_default();
         cache.observe(&partitions, table.sort_by());
-        let group = cache.select_group(reserved, pass, self.layout_clique_size)?;
+        let Some(group) = cache.select_group(reserved, pass, self.layout_clique_size) else {
+            return Ok(None);
+        };
         let files_by_path: HashMap<&str, &FileRef> = by_partition
             .iter()
             .flat_map(|(_, candidates)| candidates.iter())
             .map(|candidate| (candidate.entry.file.path.as_str(), &candidate.entry.file))
             .collect();
-        Some(
+        Ok(Some(
             group
                 .iter()
                 .map(|path| files_by_path[path.as_str()].clone())
                 .collect(),
-        )
+        ))
     }
 }
 
@@ -655,7 +666,7 @@ fn is_small_file(size: u64, target_bytes: u64) -> bool {
 }
 
 fn small_file_batch(
-    files: Vec<&DeltaFileEntry>,
+    files: Vec<&FileEntry>,
     merge_target_bytes: u64,
     min_files: usize,
 ) -> Option<Vec<FileRef>> {
@@ -767,8 +778,8 @@ mod tests {
 
     const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
 
-    fn file_entry(path: &str, size: u64) -> DeltaFileEntry {
-        DeltaFileEntry::new(FileRef {
+    fn file_entry(path: &str, size: u64) -> FileEntry {
+        FileEntry::new(FileRef {
             path: ObjectPath::new(path),
             size,
         })
@@ -1212,8 +1223,12 @@ mod tests {
         std::fs::create_dir_all(&adopted).unwrap();
         write_parquet_file(&adopted, "a.parquet", vec![1]);
         write_parquet_file(&adopted, "b.parquet", vec![2]);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1263,8 +1278,12 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
         write_parquet_file(&adopted_dir, "c.parquet", vec![1_000, 1_100]);
         write_parquet_file(&adopted_dir, "d.parquet", vec![1_000, 1_100]);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1308,8 +1327,12 @@ mod tests {
         ] {
             write_parquet_file(&adopted_dir, file, rows);
         }
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1344,8 +1367,12 @@ mod tests {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let encoded = tempfile::tempdir().unwrap();
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let mut table = datastore.table_handle(&name).unwrap();
@@ -1410,8 +1437,12 @@ mod tests {
         write_parquet_file_with_row_group_size(&adopted, "b.parquet", (12..32).collect(), 1);
         write_parquet_file_with_row_group_size(&adopted, "c.parquet", (100..120).collect(), 1);
         write_parquet_file_with_row_group_size(&adopted, "d.parquet", (119..139).collect(), 1);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1481,8 +1512,12 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![4, 5]);
         write_parquet_file(&adopted_dir, "c.parquet", vec![6, 7, 8, 9]);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1542,8 +1577,12 @@ mod tests {
         write_wide_parquet_file(&adopted, "b.parquet", ROWS_PER_INPUT, 29);
         write_wide_parquet_file(&adopted, "c.parquet", ROWS_PER_INPUT, 47);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1590,8 +1629,12 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
         write_parquet_file(&adopted_dir, "c.parquet", vec![1_000, 1_100]);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1634,8 +1677,12 @@ mod tests {
         write_wide_parquet_file(&adopted, "left.parquet", ROWS_PER_INPUT, 11);
         write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1687,6 +1734,7 @@ mod tests {
 
         let mut ranges: Vec<(i64, i64)> = compacted
             .file_entries()
+            .iter()
             .map(|entry| {
                 let stats = entry.stats.as_ref().unwrap();
                 let scalar = |values: &std::collections::HashMap<String, ArrayRef>| {
@@ -1784,8 +1832,12 @@ mod tests {
         write_wide_parquet_file(&adopted, "first.parquet", ROWS_PER_INPUT, 11);
         write_wide_parquet_file(&adopted, "second.parquet", ROWS_PER_INPUT, 29);
         write_wide_parquet_file(&adopted, "third.parquet", ROWS_PER_INPUT, 47);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1815,6 +1867,7 @@ mod tests {
         assert!(outputs.iter().all(|file| !is_small_file(file.size, target)));
         let mut ranges: Vec<(i64, i64)> = compacted
             .file_entries()
+            .iter()
             .map(|entry| {
                 let stats = entry.stats.as_ref().unwrap();
                 let scalar = |values: &std::collections::HashMap<String, ArrayRef>| {
@@ -1878,8 +1931,12 @@ mod tests {
         std::fs::create_dir_all(&adopted_dir).unwrap();
         write_parquet_file(&adopted_dir, "a.parquet", vec![0, 100]);
         write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1944,8 +2001,12 @@ mod tests {
         write_parquet_file(&adopted, "s1.parquet", vec![2, 3]);
         write_parquet_file(&adopted, "s2.parquet", vec![8, 9]);
         write_parquet_file(&adopted, "s3.parquet", vec![14, 15]);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1987,6 +2048,7 @@ mod tests {
         );
         let mut ranges: Vec<(i64, i64)> = settled
             .file_entries()
+            .iter()
             .map(|entry| {
                 let stats = entry.stats.as_ref().unwrap();
                 let scalar = |values: &std::collections::HashMap<String, ArrayRef>| {
@@ -2028,8 +2090,12 @@ mod tests {
         write_wide_parquet_file(&adopted, "left.parquet", ROWS_PER_INPUT, 11);
         write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let table = datastore
             .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
@@ -2061,8 +2127,12 @@ mod tests {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let encoded = tempfile::tempdir().unwrap();
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
 
         // Two inputs in each partition. If batching crossed the partition
@@ -2217,8 +2287,12 @@ mod tests {
         write_parquet_file(&adopted_dir, "a.parquet", vec![1, 2]);
         write_parquet_file(&adopted_dir, "b.parquet", vec![3]);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
         // A relative adoption path: the files are read at `events` under the
         // store root, rather than at an absolute path of their own.
         create_table(

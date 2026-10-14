@@ -24,7 +24,10 @@ fn age_file(path: &Path) {
 async fn vacuum_in_shell_reclaims_expired_files_and_dropped_tables() {
     let directory = tempfile::tempdir().unwrap();
     let instance = ShellInstance::open_with_resources(
-        &ShellTarget::pivot(directory.path().to_str().unwrap()),
+        &ShellTarget::pivot_with_table_format(
+            directory.path().to_str().unwrap(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        ),
         1,
         32,
         DEFAULT_REFRESH_INTERVAL,
@@ -111,7 +114,10 @@ async fn vacuum_in_shell_reclaims_expired_files_and_dropped_tables() {
 async fn vacuum_reports_unsupported_forms_and_cleanup_errors() {
     let directory = tempfile::tempdir().unwrap();
     let instance = ShellInstance::open_with_resources(
-        &ShellTarget::pivot(directory.path().to_str().unwrap()),
+        &ShellTarget::pivot_with_table_format(
+            directory.path().to_str().unwrap(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        ),
         1,
         32,
         DEFAULT_REFRESH_INTERVAL,

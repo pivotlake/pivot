@@ -60,6 +60,10 @@ impl ObjectStore for RecordingStore {
         self.inner.put(key, data)
     }
 
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
+        self.inner.put_if_absent(key, data)
+    }
+
     fn update(
         &self,
         key: &ObjectPath,
@@ -72,12 +76,13 @@ impl ObjectStore for RecordingStore {
         self.inner.delete(key)
     }
 
-    fn list_with_name_prefix(
+    fn list_from(
         &self,
         prefix: &ObjectPath,
         name_prefix: &str,
+        after_name: &str,
     ) -> Result<DirectoryListing> {
-        self.inner.list_with_name_prefix(prefix, name_prefix)
+        self.inner.list_from(prefix, name_prefix, after_name)
     }
 
     fn sink(&self, key: &ObjectPath) -> Result<DataFileLocation> {

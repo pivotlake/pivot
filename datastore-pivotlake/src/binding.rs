@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
+use crate::file_entry::{ColumnStatFilter, PartitionEqFilter};
 use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};

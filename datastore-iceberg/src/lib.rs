@@ -1,5 +1,7 @@
 //! A read-only [`catalog::datastore::Datastore`] over the tables of an Iceberg
-//! REST catalog.
+//! REST catalog. The Iceberg tables Pivot writes itself live in the
+//! `pivotlake` datastore, which borrows this crate's column mapping and store
+//! plumbing (the `pub` items below the datastore) to read and write them.
 //!
 //! The catalog is the only source of table identity: namespaces are the
 //! datastore's schemas (single-level namespaces only, as a Pivot schema is one
@@ -70,6 +72,11 @@ mod pruning;
 mod rest_catalog;
 mod store;
 mod table;
+/// Helpers for tests that inspect or drive a managed table's metadata from
+/// outside the datastore. Gated behind the `test-support` feature so they,
+/// and the object-store harness they re-export, never enter a normal build.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -88,8 +95,12 @@ use planner::catalog::{
 };
 
 use crate::binding::IcebergTableBinding;
-use crate::rest_catalog::{block_on, build_rest_catalog};
-use crate::store::TableStore;
+pub use crate::columns::{LOGICAL_TYPES_PROPERTY, read_logical_types, table_columns};
+pub use crate::manifests::FileDescriptor;
+pub use crate::rest_catalog::block_on;
+use crate::rest_catalog::build_rest_catalog;
+pub use crate::store::{TableStore, split_location};
+pub use crate::table::identity_columns;
 use crate::table::{LoadedTable, fetch_manifest_list_size, open_table_store};
 
 /// How to reach the REST catalog. The fields mirror the properties the
@@ -208,6 +219,14 @@ pub enum Error {
     Store(#[from] object_storage::StoreError),
     #[error("reading table metadata over the pool: {0}")]
     Load(#[from] dispatch::DataFlowError),
+    #[error("metadata json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("table property `{property}` is malformed: {message}")]
+    MalformedProperty { property: String, message: String },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    ParquetTable(#[from] parquet_engine::ParquetTableError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -456,9 +475,17 @@ impl IcebergDatastore {
             table: name.to_string(),
             message: message.clone(),
         })?;
+        let metadata_location =
+            entry
+                .table
+                .metadata_location()
+                .ok_or_else(|| Error::StagedTable {
+                    table: name.to_string(),
+                })?;
         let loaded = LoadedTable::load(
             name,
-            &entry.table,
+            entry.table.metadata_ref(),
+            metadata_location,
             entry.store.clone(),
             entry.manifest_list_size,
             &self.dispatcher,

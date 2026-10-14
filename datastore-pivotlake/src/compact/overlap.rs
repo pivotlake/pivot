@@ -8,9 +8,10 @@ use arrow_ord::ord::make_comparator;
 use arrow_schema::SortOptions;
 
 use super::CompactionPass;
-use crate::TableFile;
-use crate::manifest::DeltaFileEntry;
+
+use crate::file_entry::FileEntry;
 use object_storage::ObjectPath;
+use parquet_engine::RowGroupMetadata;
 
 /// A layout-optimization candidate: a file's manifest entry beside its row
 /// groups' min/max on every sort column, in the table's sort order. A pair is
@@ -21,18 +22,22 @@ use object_storage::ObjectPath;
 /// column; its rows can lie anywhere in the file's range, so the
 /// contested-group count includes it.
 pub(super) struct LayoutCandidate<'a> {
-    pub(super) entry: &'a DeltaFileEntry,
+    pub(super) entry: &'a FileEntry,
     pub(super) row_group_ranges: Vec<Vec<Option<(ArrayRef, ArrayRef)>>>,
 }
 
 impl<'a> LayoutCandidate<'a> {
     /// Extract each of the file's row groups' min/max on each of `sort_by`
-    /// from its footer metadata.
-    pub(super) fn from_table_file(file: &'a TableFile, sort_by: &[String]) -> Self {
+    /// from `row_groups`, its footer metadata.
+    pub(super) fn from_entry(
+        entry: &'a FileEntry,
+        row_groups: &[Arc<RowGroupMetadata>],
+        sort_by: &[String],
+    ) -> Self {
         let row_group_ranges = sort_by
             .iter()
             .map(|sort_column| {
-                file.row_groups
+                row_groups
                     .iter()
                     .map(|row_group| {
                         let column = row_group.schema.index_of(sort_column).ok()?;
@@ -45,7 +50,7 @@ impl<'a> LayoutCandidate<'a> {
             })
             .collect();
         Self {
-            entry: &file.entry,
+            entry,
             row_group_ranges,
         }
     }
@@ -594,8 +599,8 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 
     use super::*;
-    use crate::manifest::FileStats;
     use object_storage::{FileRef, ObjectPath};
+    use parquet_engine::FileStats;
 
     /// The best remembered bar-clearing pair in `cache` among `partitions`,
     /// measuring the files no earlier round has seen: the pair a routine
@@ -692,8 +697,8 @@ mod tests {
         Arc::new(StringViewArray::from(vec![value]))
     }
 
-    fn stats_entry(path: &str, columns: &[(&str, ArrayRef, ArrayRef)]) -> DeltaFileEntry {
-        let mut entry = DeltaFileEntry::new(FileRef {
+    fn stats_entry(path: &str, columns: &[(&str, ArrayRef, ArrayRef)]) -> FileEntry {
+        let mut entry = FileEntry::new(FileRef {
             path: ObjectPath::new(path),
             size: 1,
         });
@@ -713,7 +718,7 @@ mod tests {
     }
 
     /// An entry sorted by one integer `id` column, `size` bytes large.
-    fn sized_entry(path: &str, min: i64, max: i64, size: u64) -> DeltaFileEntry {
+    fn sized_entry(path: &str, min: i64, max: i64, size: u64) -> FileEntry {
         let mut entry = stats_entry(path, &[("id", int_stat(min), int_stat(max))]);
         entry.file.size = size;
         entry
@@ -725,7 +730,7 @@ mod tests {
 
     /// A candidate whose file has one row group spanning its whole range on
     /// each of `sort_by`, the layout a small single-group parquet has.
-    fn candidate<'a>(entry: &'a DeltaFileEntry, sort_by: &[&str]) -> LayoutCandidate<'a> {
+    fn candidate<'a>(entry: &'a FileEntry, sort_by: &[&str]) -> LayoutCandidate<'a> {
         let stats = entry.stats.as_ref().unwrap();
         LayoutCandidate {
             entry,
@@ -744,7 +749,7 @@ mod tests {
     /// A candidate of a singly sorted table, whose row groups span `groups` on
     /// its one sort column.
     fn candidate_with_row_groups<'a>(
-        entry: &'a DeltaFileEntry,
+        entry: &'a FileEntry,
         groups: &[(i64, i64)],
     ) -> LayoutCandidate<'a> {
         LayoutCandidate {
@@ -762,7 +767,7 @@ mod tests {
     /// integer column last, `leading` giving each leading key's row-group
     /// bounds and `trailing` the last key's.
     fn keyed_candidate<'a>(
-        entry: &'a DeltaFileEntry,
+        entry: &'a FileEntry,
         leading_keys: usize,
         leading: &[(&str, &str)],
         trailing: &[(i64, i64)],
@@ -785,7 +790,7 @@ mod tests {
     }
 
     fn candidate_with_string_row_groups<'a>(
-        entry: &'a DeltaFileEntry,
+        entry: &'a FileEntry,
         groups: &[(&str, &str)],
     ) -> LayoutCandidate<'a> {
         LayoutCandidate {
@@ -1060,10 +1065,10 @@ mod tests {
     /// Four files of five row groups each: a wide file, a file shifted half a
     /// range past it, a narrow file inside it, and one nowhere near the rest.
     fn layered_candidates() -> Vec<LayoutCandidate<'static>> {
-        static WIDE: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
-        static SHIFTED: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
-        static CONTAINED: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
-        static DISJOINT: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
+        static WIDE: std::sync::OnceLock<FileEntry> = std::sync::OnceLock::new();
+        static SHIFTED: std::sync::OnceLock<FileEntry> = std::sync::OnceLock::new();
+        static CONTAINED: std::sync::OnceLock<FileEntry> = std::sync::OnceLock::new();
+        static DISJOINT: std::sync::OnceLock<FileEntry> = std::sync::OnceLock::new();
         let wide = WIDE.get_or_init(|| stats_entry("wide", &[("id", int_stat(0), int_stat(100))]));
         let shifted =
             SHIFTED.get_or_init(|| stats_entry("shifted", &[("id", int_stat(50), int_stat(150))]));
@@ -1281,7 +1286,7 @@ mod tests {
     fn waits_for_a_full_clique_before_merging() {
         let shape = [(0, 50), (50, 100)];
         let range = [("id", int_stat(0), int_stat(100))];
-        let entries: Vec<DeltaFileEntry> = (0..6)
+        let entries: Vec<FileEntry> = (0..6)
             .map(|index| stats_entry(&format!("file-{index}"), &range))
             .collect();
         let five: Vec<LayoutCandidate> = entries[..5]
@@ -1309,7 +1314,7 @@ mod tests {
         let range = [("id", int_stat(500), int_stat(600))];
         let hot_first = stats_entry("hot-a", &range);
         let hot_second = stats_entry("hot-b", &range);
-        let steps: Vec<DeltaFileEntry> = (0..6i64)
+        let steps: Vec<FileEntry> = (0..6i64)
             .map(|step| {
                 stats_entry(
                     &format!("step-{step}"),
@@ -1347,7 +1352,7 @@ mod tests {
     fn final_sweep_takes_a_group_short_of_the_clique_size() {
         let shape = [(0, 50), (50, 100)];
         let range = [("id", int_stat(0), int_stat(100))];
-        let entries: Vec<DeltaFileEntry> = (0..5)
+        let entries: Vec<FileEntry> = (0..5)
             .map(|index| stats_entry(&format!("file-{index}"), &range))
             .collect();
         let files: Vec<LayoutCandidate> = entries
