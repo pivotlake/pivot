@@ -19,8 +19,8 @@ Shell commands:
   quit;              quit
   \\timing            toggle statement timing
   \\timing on|off     set statement timing
-  \\copy <table> [(columns)] FROM '<file>' WITH (FORMAT arrow)
-                     load a local Arrow IPC file into a table
+  \\copy <table> [(columns)] FROM '<file>' [WITH (option, ...)]
+                     load a local text (psql COPY) or Arrow IPC file into a table
   \\h, \\help         show this help
 
 Session settings:
@@ -146,7 +146,7 @@ enum MetaCommand {
         #[arg(ignore_case = true)]
         state: Option<Switch>,
     },
-    /// Load a local Arrow IPC file into a table.
+    /// Load a local text (psql COPY) or Arrow IPC file into a table.
     #[command(name = "\\copy")]
     Copy {
         /// `<table> [(columns)] FROM '<file>' [WITH (option, ...)]`, split

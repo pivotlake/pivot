@@ -185,7 +185,7 @@ Shell commands start with a backslash and take no `;`.
 | `\h`, `\help` | Show the list of shell commands. |
 | `\timing` | Toggle printing the elapsed time after each statement. |
 | `\timing on \| off` | Turn statement timing on or off. `true`/`false` and `1`/`0` are also accepted. |
-| `\copy table [(columns)] FROM 'file' WITH (FORMAT arrow)` | Load a local Arrow IPC file into a table. See [Loading a file](#loading-a-file). |
+| `\copy table [(columns)] FROM 'file' [WITH (option, ...)]` | Load a local text (psql `COPY`) or Arrow IPC file into a table. See [Loading a file](#loading-a-file). |
 
 ### Loading a file
 
@@ -195,6 +195,8 @@ takes the same table, column list, and options as
 place of `STDIN`:
 
 ```text
+pivot=> \copy events (id, region) FROM 'events.tsv'
+COPY 1000
 pivot=> \copy events (id, region) FROM 'events.arrow' WITH (FORMAT arrow)
 COPY 1000
 ```
