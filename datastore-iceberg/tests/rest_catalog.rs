@@ -23,10 +23,10 @@ use datastore_iceberg::{IcebergCatalogConfig, IcebergDatastore};
 use dispatch::{DataFlowDispatcher, Dispatch};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{
-    DataFile, DataFileFormat, Datum, FormatVersion, Literal, ManifestList, ManifestListWriter,
-    ManifestWriterBuilder, NestedField, NestedFieldRef, Operation, PartitionKey, PrimitiveLiteral,
-    PrimitiveType, Schema, Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary,
-    Transform, Type, UnboundPartitionSpec,
+    DataFile, DataFileFormat, Datum, FormatVersion, Literal, Manifest, ManifestList,
+    ManifestListWriter, ManifestWriterBuilder, NestedField, NestedFieldRef, Operation,
+    PartitionKey, PrimitiveLiteral, PrimitiveType, Schema, Snapshot, SnapshotReference,
+    SnapshotRetention, Struct, Summary, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -403,13 +403,24 @@ impl Harness {
             )
             .build_v2_data();
             for manifest_file in list.entries() {
-                let manifest = manifest_file.load_manifest(file_io).await.unwrap();
+                let manifest_bytes = file_io
+                    .new_input(&manifest_file.manifest_path)
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap();
+                let manifest = Manifest::parse_avro(&manifest_bytes).unwrap();
                 for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                    // An added entry inherits the sequence numbers of its manifest.
                     writer
                         .add_delete_file(
                             entry.data_file().clone(),
-                            entry.sequence_number().unwrap(),
-                            entry.file_sequence_number,
+                            entry
+                                .sequence_number()
+                                .unwrap_or(manifest_file.sequence_number),
+                            entry
+                                .file_sequence_number
+                                .or(Some(manifest_file.sequence_number)),
                         )
                         .unwrap();
                 }
@@ -549,14 +560,9 @@ impl Harness {
             properties,
             ..IcebergCatalogConfig::default()
         };
-        let datastore = IcebergDatastore::open(
-            DATASTORE,
-            &config,
-            store_factory,
-            self.dispatcher(),
-            REFRESH_INTERVAL,
-        )
-        .expect("open the iceberg datastore");
+        let datastore =
+            IcebergDatastore::open(&config, store_factory, self.dispatcher(), REFRESH_INTERVAL)
+                .expect("open the iceberg datastore");
         let catalog = PivotCatalog::new(
             HashMap::from([(DATASTORE.to_string(), datastore as Arc<dyn Datastore>)]),
             DATASTORE.to_string(),
