@@ -23,6 +23,7 @@
 #     [--before-label <sha>] [--after-label <sha>] \
 #     [--query 7,20]     # ClickBench query numbers (0-based), empty = all
 #     [--server-env 'PIVOT_X=1 PIVOT_Y=true']   # env applied to both sides
+#     [--reserve-cores 2]   # cores per NUMA node kept off the workers (0 = none)
 
 set -uo pipefail
 
@@ -46,6 +47,7 @@ after_label="after"
 queries=""
 duckdb_data=""
 server_env=""
+reserve_cores=2
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -72,6 +74,15 @@ while [[ $# -gt 0 ]]; do
         # space-separated KEY=VALUE pairs. Applied to both sides identically so
         # the comparison stays a like-for-like A/B (e.g. PIVOT_* runtime knobs).
         --server-env)     server_env="$2"; shift 2 ;;
+        # Cores per NUMA node kept for everything that is not a server worker:
+        # the harness, its psql client, and the server's own control-plane
+        # threads (runtime, connection handlers, IO). The workers pin
+        # themselves to every core they are allowed, so without this they
+        # saturate the machine and every other runnable thread (the client
+        # measuring the query among them) has to preempt a worker; which
+        # worker, and for how long, changes from try to try and shows up as
+        # millisecond jitter on short queries. 0 keeps the old behaviour.
+        --reserve-cores)  reserve_cores="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -122,6 +133,53 @@ fi
 adapter="$clickbench_dir/pivot-parquet"
 [[ -x "$adapter/benchmark.sh" ]] || { echo "error: no ClickBench pivot-parquet adapter at $adapter" >&2; exit 2; }
 
+# Expand a sysfs cpulist ("0-3,8,10-11") into one cpu per line.
+expand_cpulist() {
+    local part
+    IFS=',' read -ra parts <<<"$1"
+    for part in "${parts[@]}"; do
+        if [[ "$part" == *-* ]]; then
+            seq "${part%-*}" "${part#*-}"
+        else
+            printf '%s\n' "$part"
+        fi
+    done
+}
+
+# Split the machine's cores into a reserved set (the first $reserve_cores of
+# every NUMA node) and the worker set (the rest). Printed as two comma-separated
+# cpulists: reserved, then workers. A machine without NUMA topology in sysfs
+# is treated as one node.
+split_cores() {
+    local node reserved=() workers=() cpus i
+    local nodes=(/sys/devices/system/node/node[0-9]*)
+    [[ -e "${nodes[0]}" ]] || nodes=("")
+    for node in "${nodes[@]}"; do
+        if [[ -n "$node" ]]; then
+            mapfile -t cpus < <(expand_cpulist "$(cat "$node/cpulist")")
+        else
+            mapfile -t cpus < <(seq 0 $(($(nproc --all) - 1)))
+        fi
+        (( ${#cpus[@]} > reserve_cores )) || {
+            echo "error: --reserve-cores $reserve_cores leaves no workers on a node with ${#cpus[@]} cores" >&2
+            exit 2
+        }
+        for i in "${!cpus[@]}"; do
+            if (( i < reserve_cores )); then reserved+=("${cpus[i]}"); else workers+=("${cpus[i]}"); fi
+        done
+    done
+    (IFS=,; printf '%s\n' "${reserved[*]}"; printf '%s\n' "${workers[*]}")
+}
+
+reserved_cores=""
+worker_cores=""
+if (( reserve_cores > 0 )); then
+    { read -r reserved_cores; read -r worker_cores; } < <(split_cores)
+    # split_cores ran in a subshell, so its failure surfaces here as empty sets.
+    [[ -n "$reserved_cores" && -n "$worker_cores" ]] || exit 2
+    echo "reserving cores $reserved_cores for the harness and the server's control plane; workers on $worker_cores"
+fi
+
 # If a query subset was requested, build a filtered queries file (ClickBench
 # query numbers are 0-based line offsets into queries.sql) and remember which
 # original number each kept line maps back to, for labelling the report.
@@ -163,7 +221,16 @@ run_harness() {
         export PIVOT_SERVER_BIN="$bin" PIVOT_SOURCE="$source_path" \
                PIVOT_PORT="$port" PIVOT_CATALOG="$catalog" BENCH_TRIES="$iterations"
         [[ -n "$queries_file" ]] && export BENCH_QUERIES_FILE="$queries_file"
-        ./benchmark.sh
+        if [[ -n "$worker_cores" ]]; then
+            # The adapter's ./start confines the server to PIVOT_WORKER_CORES
+            # and its ./check moves the server's unpinned threads onto
+            # PIVOT_CONTROL_CORES; the harness itself (and the psql client it
+            # spawns per try) stays on the reserved cores.
+            export PIVOT_WORKER_CORES="$worker_cores" PIVOT_CONTROL_CORES="$reserved_cores"
+            taskset -c "$reserved_cores" ./benchmark.sh
+        else
+            ./benchmark.sh
+        fi
     ) >"$out" 2>&1 || true   # a nonzero exit (e.g. the QPS watchdog) is fine; we read the timings
     # Make sure the server is down before the other side reuses the box.
     ( cd "$adapter"; PIVOT_PORT="$port" ./stop >/dev/null 2>&1 || true )
@@ -253,6 +320,7 @@ duck_out="/tmp/ab-duck.out";     duck_tsv="/tmp/ab-duck.tsv"
 echo "=== A/B via ClickBench pivot-parquet: '$before_label' (before) vs '$after_label' (after) ===" >"$report"
 echo "source=$source_path tries=$iterations regression_pct=$regression_pct queries=${queries:-all}" >>"$report"
 [[ -n "$server_env" ]] && echo "server_env=$server_env" >>"$report"
+[[ -n "$worker_cores" ]] && echo "reserved_cores=$reserved_cores worker_cores=$worker_cores" >>"$report"
 echo >>"$report"
 
 echo ">>> timing BEFORE through ClickBench harness"
