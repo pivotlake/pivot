@@ -39,6 +39,9 @@ pub struct CompressedPage {
     /// [`RowGroupBuffer::columns`](crate::types::requests::RowGroupBuffer),
     /// used to route the decompressed page back to its column decoder).
     pub column_idx: usize,
+    /// The column chunk's index among the row group's leaves, under which the
+    /// decompressed cache counts this page.
+    pub leaf_idx: usize,
     /// Absolute byte offset of this page in the file. Unique per page, so it is
     /// the decompressed cache's key.
     pub file_offset: usize,

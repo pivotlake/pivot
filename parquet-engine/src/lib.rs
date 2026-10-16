@@ -89,7 +89,7 @@ pub use values::{
 pub(crate) mod test_utils {
     use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata, RowSelection};
     use crate::types::table::ParquetTable;
-    use arrow_schema::Schema;
+    use arrow_schema::{DataType, Field, Schema};
     use dispatch::io::{LocalFile, OpenFile};
     use std::sync::Arc;
 
@@ -98,7 +98,7 @@ pub(crate) mod test_utils {
             open_file: OpenFile::Local(
                 LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap(),
             ),
-            schema: Arc::new(Schema::empty()),
+            schema: Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
             columns: vec![crate::types::metadata::ColumnChunkMeta {
                 codec: crate::thrift::general::CompressionCodec::SNAPPY,
                 dictionary_page_offset: None,

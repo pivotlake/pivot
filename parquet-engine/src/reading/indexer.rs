@@ -79,6 +79,7 @@ enum PagePayload {
 /// parts.
 struct ColumnPageBuilder {
     col_idx: usize,
+    leaf_idx: usize,
     codec: CompressionCodec,
     query_row_group_metadata: QueryRowGroupMetadata,
     worker_id: usize,
@@ -123,6 +124,7 @@ impl ColumnPageBuilder {
             codec: self.codec,
             row_group: self.query_row_group_metadata.clone(),
             column_idx: self.col_idx,
+            leaf_idx: self.leaf_idx,
             file_offset,
             span,
             page_idx,
@@ -183,6 +185,7 @@ fn build_column_pages(
 ) -> Result<Vec<CompressedPage>, ParquetError> {
     let mut builder = ColumnPageBuilder {
         col_idx,
+        leaf_idx: column.leaf,
         codec: column.codec,
         query_row_group_metadata,
         worker_id,
@@ -347,7 +350,9 @@ mod tests {
             metadata: dummy_metadata(selection),
             columns: columns
                 .into_iter()
-                .map(|parts| ColumnBuffer {
+                .enumerate()
+                .map(|(leaf, parts)| ColumnBuffer {
+                    leaf,
                     codec: CompressionCodec::SNAPPY,
                     parts,
                 })

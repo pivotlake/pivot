@@ -171,7 +171,7 @@ impl Decompressor {
                             key,
                             serialize_header(&page.header),
                             reservation,
-                            metadata.live_decompressed_pages[page.column_idx].clone(),
+                            metadata.live_decompressed_pages[page.leaf_idx].clone(),
                         )
                     }
                 }
@@ -358,6 +358,7 @@ mod tests {
             codec: CompressionCodec::SNAPPY,
             row_group: dummy_metadata(RowSelection::All),
             column_idx: 0,
+            leaf_idx: 0,
             file_offset: 0,
             span: compressed.len(),
             page_idx: 0,
@@ -423,6 +424,7 @@ mod tests {
             codec: CompressionCodec::SNAPPY,
             row_group: dummy_metadata(RowSelection::All),
             column_idx: 0,
+            leaf_idx: 0,
             file_offset: 0,
             span: compressed.len(),
             page_idx: 0,
@@ -893,6 +895,7 @@ mod tests {
             codec: CompressionCodec::SNAPPY,
             row_group: dummy_metadata(RowSelection::All),
             column_idx: 0,
+            leaf_idx: 0,
             file_offset: 0,
             span: compressed.len(),
             page_idx: 0,

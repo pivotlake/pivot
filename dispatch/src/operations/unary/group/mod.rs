@@ -433,11 +433,14 @@ unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionJob
 /// milliseconds on the critical path.
 struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// One slot per node, `None` until that node's job sends its table.
-    node_tables: Box<[Mutex<Option<MultiSlabTable<K::Persisted, V>>>]>,
+    node_tables: Box<[NodeTableSlot<K, V>]>,
     /// Sends still outstanding; the sender that decrements this to zero is
     /// the receiver.
     pending_sends: AtomicUsize,
 }
+
+/// A node's slot in a [`CrossNodeMerge`]: its merged table once sent.
+type NodeTableSlot<K, V> = Mutex<Option<MultiSlabTable<<K as KeyExtractor>::Persisted, V>>>;
 
 unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for CrossNodeMerge<K, V> {}
 unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for CrossNodeMerge<K, V> {}

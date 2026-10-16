@@ -29,6 +29,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::types::leaves::leaf_range;
 use crate::{RowGroupFilter, ScanOrder};
 
 /// The NUMA node a row group belongs to, by a hash of its stable identity (its
@@ -111,20 +112,26 @@ fn steal_order(table: &ParquetTable, order: &ScanOrder, projection: &Projection)
 }
 
 /// Whether every projected column of the row group has pages in the
-/// decompressed cache: the scan reads it from memory.
+/// decompressed cache: the scan reads it from memory. The cache counts pages
+/// per leaf chunk; a projected column is taken as cached once any of its
+/// leaves is, which is exact for a plain column and errs toward cached for a
+/// shredded one whose read touches only some leaves.
 fn is_cache_resident(row_group: &RowGroupMetadata, projection: &Projection) -> bool {
-    projection
-        .indices()
-        .iter()
-        .all(|&column| row_group.live_decompressed_pages[column].load(Ordering::Relaxed) > 0)
+    let fields = row_group.schema.fields();
+    projection.indices().iter().all(|&column| {
+        leaf_range(fields, column)
+            .any(|leaf| row_group.live_decompressed_pages[leaf].load(Ordering::Relaxed) > 0)
+    })
 }
 
 /// How many of the row group's projected pages are in the decompressed cache.
 fn cached_projected_pages(row_group: &RowGroupMetadata, projection: &Projection) -> usize {
+    let fields = row_group.schema.fields();
     projection
         .indices()
         .iter()
-        .map(|&column| row_group.live_decompressed_pages[column].load(Ordering::Relaxed))
+        .flat_map(|&column| leaf_range(fields, column))
+        .map(|leaf| row_group.live_decompressed_pages[leaf].load(Ordering::Relaxed))
         .sum()
 }
 

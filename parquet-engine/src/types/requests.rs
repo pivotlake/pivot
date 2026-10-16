@@ -55,10 +55,10 @@ fn parse_page_header(bytes: &[Bytes]) -> PageHeader {
 pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
     open_file: OpenFile,
-    /// Each projected leaf's file range, paired with the page codec its footer
-    /// entry recorded so the buffer built from the response can tag every
-    /// column's parts with it.
-    locations: Vec<(CompressionCodec, FileRange)>,
+    /// Each projected leaf's index among the row group's column chunks and its
+    /// file range, paired with the page codec its footer entry recorded so the
+    /// buffer built from the response can tag every column's parts with both.
+    locations: Vec<(usize, CompressionCodec, FileRange)>,
 }
 
 impl RowGroupRequest {
@@ -80,7 +80,7 @@ impl RowGroupRequest {
                     meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize,
                     meta.total_compressed_size as usize,
                 );
-                (meta.codec, range)
+                (leaf, meta.codec, range)
             })
             .collect();
 
@@ -96,7 +96,7 @@ impl RowGroupRequest {
     }
 
     pub fn file_ranges(&self) -> impl Iterator<Item = FileRange> + '_ {
-        self.locations.iter().map(|&(_, range)| range)
+        self.locations.iter().map(|&(_, _, range)| range)
     }
 
     /// Pair this row group's domain metadata with dispatch's resolved response.
@@ -110,7 +110,8 @@ impl RowGroupRequest {
             columns: resolved
                 .into_iter()
                 .zip(self.locations)
-                .map(|(parts, (codec, _))| ColumnBuffer {
+                .map(|(parts, (leaf, codec, _))| ColumnBuffer {
+                    leaf,
                     codec,
                     parts: parts
                         .into_iter()
@@ -153,6 +154,9 @@ pub struct RowGroupBuffer {
 /// One projected column's resolved parts, tagged with the codec its compressed
 /// pages were written with (from the column chunk's footer metadata).
 pub struct ColumnBuffer {
+    /// The column chunk's index among the row group's leaves, which is how the
+    /// decompressed cache counts the column's pages.
+    pub leaf: usize,
     pub codec: CompressionCodec,
     /// The column's resolved parts, in file order.
     pub parts: Vec<ColumnPart>,
