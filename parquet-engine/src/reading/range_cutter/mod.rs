@@ -278,6 +278,7 @@ mod tests {
             num_rows,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            decompressed_pages_node: Arc::new(AtomicUsize::new(usize::MAX)),
         })]))
     }
 
