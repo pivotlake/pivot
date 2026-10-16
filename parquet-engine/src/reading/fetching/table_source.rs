@@ -24,10 +24,9 @@ use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{Receiver, RootChannelFactory};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
-use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::types::leaves::leaf_range;
 use crate::{RowGroupFilter, ScanOrder};
@@ -253,19 +252,6 @@ pub struct SpeculationGate {
     /// Row groups still queued, scan-wide (see
     /// [`SpeculationGate::note_claimed`]).
     remaining: AtomicUsize,
-    /// The row groups that were cache-resident when the scan was ordered,
-    /// each with the node queue it was pushed to; they lead every queue (see
-    /// [`steal_order`]).
-    cache_resident: HashMap<usize, usize>,
-    /// How many of `cache_resident` are still queued, scan-wide and per node
-    /// queue (see [`RowGroupInjector::acquire_speculation_ticket`]).
-    cache_resident_remaining: AtomicUsize,
-    cache_resident_remaining_by_node: Vec<AtomicUsize>,
-    /// Whether a row group that was not cache-resident has been handed out
-    /// yet, admitted or pruned. Until then the first uncached claim waits for
-    /// every cached one to be decoded; from then on the allowance alone
-    /// throttles (see [`RowGroupInjector::acquire_speculation_ticket`]).
-    uncached_claimed: AtomicBool,
 }
 
 impl SpeculationGate {
@@ -326,10 +312,6 @@ impl ClaimRelease {
             outstanding: AtomicUsize::new(outstanding),
             admitted_claims: AtomicUsize::new(0),
             remaining: AtomicUsize::new(0),
-            cache_resident_remaining: AtomicUsize::new(0),
-            cache_resident_remaining_by_node: Vec::new(),
-            cache_resident: HashMap::new(),
-            uncached_claimed: AtomicBool::new(false),
         });
         (Self(Some(gate.clone())), gate)
     }
@@ -369,30 +351,10 @@ impl RowGroupInjectorFactory {
             .map(|&idx| QueryRowGroupMetadata::new(table, idx, RowSelection::All))
             .collect();
         let speculation = scan_order.map(|_| {
-            let cache_resident: HashMap<usize, usize> = row_groups
-                .iter()
-                .filter(|row_group| is_cache_resident(row_group.get_metadata(), &projection))
-                .map(|row_group| {
-                    (
-                        row_group.row_group_index,
-                        affinity_node(row_group.get_metadata(), node_count),
-                    )
-                })
-                .collect();
-            let cache_resident_remaining_by_node = (0..node_count)
-                .map(|node| {
-                    let on_node = cache_resident.values().filter(|&&n| n == node).count();
-                    AtomicUsize::new(on_node)
-                })
-                .collect();
             Arc::new(SpeculationGate {
                 outstanding: AtomicUsize::new(0),
                 admitted_claims: AtomicUsize::new(0),
                 remaining: AtomicUsize::new(row_groups.len()),
-                cache_resident_remaining: AtomicUsize::new(cache_resident.len()),
-                cache_resident_remaining_by_node,
-                cache_resident,
-                uncached_claimed: AtomicBool::new(false),
             })
         });
         for row_group in row_groups {
@@ -452,27 +414,21 @@ impl RowGroupInjector {
     /// (see [`NodeQueues`]). Emptiness and the idle-path steal agree on this
     /// set, so a worker finishes its scan when nothing it may claim is left,
     /// even while another node's uncached row groups are still queued.
-    fn claim_targets(
-        &self,
-    ) -> impl Iterator<Item = (usize, &Injector<QueryRowGroupMetadata>)> + '_ {
+    fn claim_targets(&self) -> impl Iterator<Item = &Injector<QueryRowGroupMetadata>> + '_ {
         let queue_count = self.row_group_queues.len();
         let own = &self.row_group_queues[self.numa_node_idx];
         let other_nodes_cached = (1..queue_count).map(move |offset| {
-            let node = (self.numa_node_idx + offset) % queue_count;
-            (node, &self.row_group_queues[node].cached)
+            &self.row_group_queues[(self.numa_node_idx + offset) % queue_count].cached
         });
-        [
-            (self.numa_node_idx, &own.cached),
-            (self.numa_node_idx, &own.uncached),
-        ]
-        .into_iter()
-        .chain(other_nodes_cached)
+        [&own.cached, &own.uncached]
+            .into_iter()
+            .chain(other_nodes_cached)
     }
 }
 
 impl Receiver<RowGroupRequest> for RowGroupInjector {
     fn is_empty(&self) -> bool {
-        self.claim_targets().all(|(_, queue)| queue.is_empty())
+        self.claim_targets().all(|queue| queue.is_empty())
     }
 
     /// Pull eagerly from this node's own queue. The injector is the *only*
@@ -495,7 +451,7 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
         } else {
             return None;
         };
-        let ticket = self.acquire_speculation_ticket(self.numa_node_idx)?;
+        let ticket = self.acquire_speculation_ticket()?;
         match queue.steal() {
             Steal::Success(row_group) => self.build_request_unless_pruned(row_group, ticket),
             // Dropping the ticket releases its reservation; the next call
@@ -512,18 +468,13 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
         // steal race or a queue drained under us carries it to the next
         // attempt rather than bouncing the reservation off the gate.
         let mut ticket = None;
-        for (target_node, queue) in self.claim_targets() {
+        for queue in self.claim_targets() {
             while !queue.is_empty() {
                 let held = match ticket.take() {
                     Some(held) => held,
-                    // A refusal is about this queue (its head would be judged
-                    // ahead of cached row groups elsewhere) or about the whole
-                    // scan (throttled); either way the next queue gets its
-                    // turn.
-                    None => match self.acquire_speculation_ticket(target_node) {
-                        Some(held) => held,
-                        None => break,
-                    },
+                    // A refusal means the scan is throttled; no queue has
+                    // anything to offer until a claim is released.
+                    None => self.acquire_speculation_ticket()?,
                 };
                 match queue.steal() {
                     Steal::Success(row_group) => {
@@ -590,14 +541,6 @@ impl RowGroupInjector {
     ) -> Option<RowGroupRequest> {
         if let Some(gate) = &self.speculation {
             gate.note_claimed();
-            match gate.cache_resident.get(&row_group.row_group_index) {
-                Some(&node) => {
-                    gate.cache_resident_remaining
-                        .fetch_sub(1, Ordering::Relaxed);
-                    gate.cache_resident_remaining_by_node[node].fetch_sub(1, Ordering::Relaxed);
-                }
-                None => gate.uncached_claimed.store(true, Ordering::Relaxed),
-            }
         }
         if let Some(filter) = &self.filter
             && !filter(row_group.get_metadata())
@@ -642,50 +585,10 @@ impl RowGroupInjector {
     /// claims release their ticket without raising the allowance, so a
     /// well-converged boundary keeps the scan at the small cap while the
     /// remaining queue drains as cheap stats checks.
-    fn acquire_speculation_ticket(&self, target_node: usize) -> Option<SpeculationTicket<'_>> {
+    fn acquire_speculation_ticket(&self) -> Option<SpeculationTicket<'_>> {
         let Some(speculation) = self.speculation.as_deref() else {
             return Some(SpeculationTicket::Unthrottled);
         };
-        if !speculation.cache_resident.is_empty() {
-            let cached_queued = speculation.cache_resident_remaining.load(Ordering::Relaxed);
-            // The cache-resident row groups lead the queues. While another
-            // node's queue still holds some, a queue with none left offers
-            // only uncached row groups, which would be judged ahead of them:
-            // the claim waits, and a worker whose own queue is in that state
-            // steals the other node's cached row groups instead. The node
-            // still holding cached row groups may have parked every worker
-            // (an admitted claim wakes a worker near the claimant), so the
-            // refusal nudges it; the nudge is one atomic check when nobody
-            // there is parked.
-            if cached_queued > 0
-                && speculation.cache_resident_remaining_by_node[target_node].load(Ordering::Relaxed)
-                    == 0
-            {
-                for (node, remaining) in speculation
-                    .cache_resident_remaining_by_node
-                    .iter()
-                    .enumerate()
-                {
-                    if remaining.load(Ordering::Relaxed) > 0 {
-                        dispatch::waker::waker_set().notify_one_on_node(node);
-                    }
-                }
-                return None;
-            }
-            // Once the cached row groups are all claimed, the next claim is
-            // the first uncached one: hold it until the cached ones have all
-            // been decoded, so the boundary that judges it has seen everything
-            // an earlier run found worth reading (see [`steal_order`]). Only
-            // the first uncached claim waits; the ones after it are judged by
-            // that same boundary and flow under the allowance. A scan with
-            // nothing cached never waits here.
-            if cached_queued == 0
-                && !speculation.uncached_claimed.load(Ordering::Relaxed)
-                && speculation.outstanding.load(Ordering::Relaxed) > 0
-            {
-                return None;
-            }
-        }
         let allowance = SPECULATION_ALLOWANCE_FLOOR
             .max(speculation.admitted_claims.load(Ordering::Relaxed) / 2);
         if speculation.outstanding.load(Ordering::Relaxed) >= allowance {
