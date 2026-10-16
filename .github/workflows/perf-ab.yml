@@ -63,9 +63,9 @@ on:
         required: false
         default: "5"
       clickbench_ref:
-        description: "Ref of the ClickBench fork (Epsio-Labs/ClickBench) providing the pivot-parquet harness. reserve_cores needs a harness whose start/check honour PIVOT_WORKER_CORES / PIVOT_CONTROL_CORES."
+        description: "Ref of the ClickBench fork (Epsio-Labs/ClickBench) providing the pivot-parquet harness."
         required: false
-        default: "pivotdb-ab-core-reservation"
+        default: "pivotdb-ab-server-bin"
       run_duckdb:
         description: "Also time DuckDB (parquet, partitioned) as a reference. Needs the PERF_DUCKDB_DATA variable."
         type: boolean
@@ -74,10 +74,6 @@ on:
         description: "Extra env for both server builds/runs, space-separated KEY=VALUE (e.g. PIVOT_DECOMPRESSED_CACHE=true PIVOT_RING_GB=20)."
         required: false
         default: ""
-      reserve_cores:
-        description: "Cores per NUMA node kept off the server's workers, for the harness, its psql client and the server's control-plane threads. 0 lets the workers take every core (the client then preempts a worker on every try, which is millisecond-scale jitter on short queries)."
-        required: false
-        default: "2"
       instance_type:
         description: "EC2 instance type to run the perf box as. c8g* runs on the Graviton fleet (perf-1..5); every other type retypes the x86 box (perf-x86-1) to that microarchitecture: c7a = Zen 4, m6a = Milan (x86-64-v3), m5 = Cascade Lake (x86-64-v4), m6i = Ice Lake, m7i = Sapphire Rapids. Switched before starting if it differs; the box is restored to its family's default after the run."
         type: choice
@@ -340,7 +336,6 @@ jobs:
           QUERY: ${{ inputs.query }}
           ITERATIONS: ${{ inputs.iterations }}
           REGRESSION_PCT: ${{ inputs.regression_pct }}
-          RESERVE_CORES: ${{ inputs.reserve_cores }}
           RUN_DUCKDB: ${{ inputs.run_duckdb }}
           DUCKDB_DATA: ${{ vars.PERF_DUCKDB_DATA }}
           SERVER_ENV: ${{ inputs.server_env }}
@@ -389,7 +384,6 @@ jobs:
               --clickbench-dir ~/perf-ab/ClickBench \
               --source '$HITS_PATH' --pgo-subset '$PGO_SUBSET_PATH' \
               --iterations '$ITERATIONS' --regression-pct '$REGRESSION_PCT' \
-              --reserve-cores '$RESERVE_CORES' \
               --report /tmp/ab-report.txt \
               --before-label '${BEFORE_SHA:0:12}' --after-label '${AFTER_SHA:0:12}' \
               $query_arg $duckdb_arg $env_arg
