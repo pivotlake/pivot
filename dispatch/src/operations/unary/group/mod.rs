@@ -555,7 +555,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             if let Some(b) = out.buffers {
                 buffers_by_node[out.node].push(b);
             }
-            hll.merge(&out.hll);
+            if let Some(worker_hll) = &out.hll {
+                hll.merge(worker_hll);
+            }
             self.zero_hash_pending |= out.zero_hash_seen;
         }
         let any_switched = buffers_by_node.iter().any(|b| !b.is_empty());
@@ -563,8 +565,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // Estimate the global distinct count: the HLL covers switched
         // workers, and a non-switched worker's exact per-table count stands
         // in for its keys (over-counting keys a switched worker also holds,
-        // which is safe).
-        let estimate = hll.estimate() + non_switched_groups;
+        // which is safe). With nobody switched the sketch is empty and the
+        // count is exact.
+        let estimate = if any_switched {
+            hll.estimate() + non_switched_groups
+        } else {
+            non_switched_groups
+        };
         let (num_partitions, partition_capacity) = if !any_switched {
             // How many entries we want in each table for a partition job
             const TARGET_SCANNED_ENTRIES_PER_JOB: usize = 16 * 1024;

@@ -136,8 +136,10 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     pub tables: Vec<MultiSlabTable<K::Persisted, V>>,
     /// Per-partition scatter buffers, present only after a radix transition.
     pub buffers: Option<PartitionBuffers<K::Persisted, V>>,
-    /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
-    pub hll: Hll,
+    /// Distinct-count sketch over the worker's rows, for sizing the merge
+    /// targets. Present only for a worker that switched to radix mode; an
+    /// in-place worker's groups are counted exactly from its tables.
+    pub hll: Option<Hll>,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
     /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
     pub zero_hash_seen: bool,
@@ -157,8 +159,11 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     tables: Vec<MultiSlabTable<K::Persisted, V>>,
     /// Per-partition buffers allocated on the first radix transition.
     buffers: Option<Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>>,
-    /// Distinct-count sketch used to size merge targets.
-    hll: Hll,
+    /// Distinct-count sketch used to size merge targets. Created on the radix
+    /// transition: an in-place worker's groups are counted exactly from its
+    /// tables, and a sketch it never fills would still be a page of registers
+    /// for the merging worker to pick up and free.
+    hll: Option<Hll>,
     /// Whether this worker has entered radix mode.
     switched_to_radix: bool,
     /// Radix threshold and partition count.
@@ -194,7 +199,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             allocator,
             tables: vec![table],
             buffers: None,
-            hll: Hll::new(),
+            hll: None,
             switched_to_radix: false,
             radix_config,
             hashes: HashScratch::take(),
@@ -473,7 +478,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 key_arena,
                 worker_context,
                 allocator,
-                hll,
+                hll: hll.get_or_insert_with(Hll::new),
                 hashes,
                 shift,
                 start,
@@ -499,6 +504,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         } = self;
         let table = tables.last_mut().unwrap();
         let buffers = buffers.as_mut().unwrap();
+        let hll = hll.get_or_insert_with(Hll::new);
         let scatter_layout =
             StridedScatterRows::<<K as KeyExtractor>::Persisted, V>::layout::<0>(shared_context);
         for entry in table.iter(0) {
@@ -517,9 +523,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
         if self.switched_to_radix {
             // Add pre-transition groups to the scatter-side estimate.
+            let hll = self.hll.get_or_insert_with(Hll::new);
             for table in &self.tables {
                 for entry in table.iter(0) {
-                    self.hll.add(entry.hash);
+                    hll.add(entry.hash);
                 }
             }
         }
