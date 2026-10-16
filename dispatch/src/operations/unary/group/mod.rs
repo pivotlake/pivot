@@ -244,6 +244,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
+        radix_switched: Arc<AtomicBool>,
     ) -> Self {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
         let value_output_types: Arc<[DataType]> =
@@ -265,6 +266,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
             shared_context.clone(),
             shared_context.worker(),
             radix,
+            radix_switched,
         );
         Self {
             key_cols,
@@ -539,16 +541,17 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         let mut buffers_by_node: Vec<Vec<PartitionBuffers<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
         let mut hll = Hll::new();
-        // A worker only folds its keys into the sketch once it switches to
-        // radix; a worker that stayed in-place (`buffers.is_none()`) is absent
-        // from the merged HLL. Add its exact distinct count (each table tracks
-        // its own `len`, no scan) so the estimate below isn't skewed low when
-        // some workers switched and others didn't. Counting a key here that a
-        // switched worker also holds over-counts, which only over-sizes the
-        // merge targets (safe); under-counting is what forces mid-merge resizes.
+        // A worker folds its keys into a sketch once it switches to radix, or
+        // at flush once any worker has, so the merged sketch normally covers
+        // every key. A worker without a sketch flushed before any switch was
+        // visible to it; its exact distinct count (each table tracks its own
+        // `len`, no scan) stands in for its keys so the estimate isn't skewed
+        // low. Counting a key there that a switched worker also holds
+        // over-counts, which only over-sizes the merge targets (safe);
+        // under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
         for out in outputs {
-            if out.buffers.is_none() {
+            if out.hll.is_none() {
                 non_switched_groups += out.tables.iter().map(|t| t.len()).sum::<usize>();
             }
             tables_by_node[out.node].extend(out.tables);
@@ -915,6 +918,7 @@ mod tests {
         let state = RandomState::new();
         let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
+        let radix_switched = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(worker_count));
 
         let groups: Vec<_> = (0..worker_count)
@@ -932,6 +936,7 @@ mod tests {
                     gather.clone(),
                     partition_jobs_injected.clone(),
                     radix,
+                    radix_switched.clone(),
                 )
             })
             .collect();
@@ -1243,6 +1248,7 @@ mod tests {
         let state = RandomState::new();
         let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
+        let radix_switched = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(worker_count));
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
@@ -1259,6 +1265,7 @@ mod tests {
                     gather.clone(),
                     partition_jobs_injected.clone(),
                     radix,
+                    radix_switched.clone(),
                 )
             })
             .collect();

@@ -40,6 +40,8 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     hash_state: RandomState,
     injectors: Arc<Vec<Injector<PartitionJob<K, V>>>>,
     partition_jobs_injected: Arc<AtomicBool>,
+    /// Set by the first worker to switch to radix (see `AggregatedTable`).
+    radix_switched: Arc<AtomicBool>,
     gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
     /// Radix scatter config with the per-worker bucket count sized for the pool
     /// (see [`get_scatter_bucket_count_for_worker`](super::get_scatter_bucket_count_for_worker)).
@@ -62,13 +64,19 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
     ) -> impl IntoIterator<Item = GroupFactory<K, V>> {
         let key_arena = SharedArena::new(buffers);
         let value_arena = SharedArena::new(buffers);
-        let hash_state = RandomState::new();
+        // A fixed seed, as the join uses: the distinct-count sketch that sizes
+        // the merge reads the same hashes, and with a seed drawn per query its
+        // estimate of the same data moved by its sampling error from one run
+        // to the next, far enough to pick a different merge partition count.
+        // Group keys come from stored data, so hash flooding is no concern.
+        let hash_state = RandomState::with_seeds(0, 0, 0, 0);
         let injectors = Arc::new(
             (0..topology.node_count)
                 .map(|_| Injector::new())
                 .collect::<Vec<_>>(),
         );
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
+        let radix_switched = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(topology.total_workers()));
         let radix = RadixConfig {
             partitions: crate::operations::unary::group::get_scatter_bucket_count_for_worker(
@@ -88,6 +96,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             hash_state: hash_state.clone(),
             injectors: injectors.clone(),
             partition_jobs_injected: partition_jobs_injected.clone(),
+            radix_switched: radix_switched.clone(),
             gather: gather.clone(),
             radix,
         })
@@ -113,6 +122,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
             self.gather,
             self.partition_jobs_injected,
             self.radix,
+            self.radix_switched,
         ))
     }
 }

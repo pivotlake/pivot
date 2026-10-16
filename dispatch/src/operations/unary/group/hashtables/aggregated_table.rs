@@ -33,6 +33,7 @@ use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     /// This worker's hash scratch buffers between queries (see [`HashScratch`]).
@@ -137,8 +138,10 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     /// Per-partition scatter buffers, present only after a radix transition.
     pub buffers: Option<PartitionBuffers<K::Persisted, V>>,
     /// Distinct-count sketch over the worker's rows, for sizing the merge
-    /// targets. Present only for a worker that switched to radix mode; an
-    /// in-place worker's groups are counted exactly from its tables.
+    /// targets. Present for a worker that switched to radix mode and for one
+    /// that flushed after any worker had; absent only while no worker had
+    /// switched by the time this one flushed, and then its groups are counted
+    /// exactly from its tables.
     pub hll: Option<Hll>,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
     /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
@@ -160,12 +163,22 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Per-partition buffers allocated on the first radix transition.
     buffers: Option<Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>>,
     /// Distinct-count sketch used to size merge targets. Created on the radix
-    /// transition: an in-place worker's groups are counted exactly from its
-    /// tables, and a sketch it never fills would still be a page of registers
-    /// for the merging worker to pick up and free.
+    /// transition, or at flush once any worker of the query has switched (see
+    /// `radix_switched`): while nobody switches, every worker's groups are
+    /// counted exactly from its tables, and a sketch nobody fills would still
+    /// be a page of registers for the merging worker to pick up and free.
     hll: Option<Hll>,
     /// Whether this worker has entered radix mode.
     switched_to_radix: bool,
+    /// Whether any worker of the query has entered radix mode, set by the
+    /// first to do so. Once the merge is going to be sized from a sketch, every
+    /// worker folds its keys into one, so the merged sketch covers every key
+    /// exactly once and the estimate depends on the data alone, not on which
+    /// workers happened to switch: a count of an in-place worker's groups
+    /// added to the sketch of the others counts their shared keys twice, by a
+    /// margin that moved the merge's partition count across a power of two
+    /// from one run of the same query to the next.
+    radix_switched: Arc<AtomicBool>,
     /// Radix threshold and partition count.
     radix_config: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
@@ -188,6 +201,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         shared_context: V::SharedContext,
         worker_context: V::WorkerContext,
         radix_config: RadixConfig,
+        radix_switched: Arc<AtomicBool>,
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = BaseHashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
@@ -201,6 +215,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             buffers: None,
             hll: None,
             switched_to_radix: false,
+            radix_switched,
             radix_config,
             hashes: HashScratch::take(),
             scratch: K::Scratch::default(),
@@ -443,6 +458,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             );
         }
         self.switched_to_radix = true;
+        self.radix_switched.store(true, Ordering::Relaxed);
         if K::RADIX_DEDUP_BEFORE_SCATTER {
             self.scatter_active_table_to_radix_partitions();
             false
@@ -521,8 +537,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
 
     /// Finishes worker state for the merge phase.
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
-        if self.switched_to_radix {
-            // Add pre-transition groups to the scatter-side estimate.
+        if self.switched_to_radix || self.radix_switched.load(Ordering::Relaxed) {
+            // Add the in-place groups to the estimate: a switched worker's
+            // pre-transition groups, or all of a worker that stayed in place
+            // while others switched.
             let hll = self.hll.get_or_insert_with(Hll::new);
             for table in &self.tables {
                 for entry in table.iter(0) {

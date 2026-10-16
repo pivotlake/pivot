@@ -539,6 +539,7 @@ mod tests {
             (),
             (),
             RadixConfig::DEFAULT,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
@@ -786,6 +787,7 @@ mod tests {
             (),
             (),
             RadixConfig::DEFAULT,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         // Consume one batch at a time because hash scratch has a fixed size.
