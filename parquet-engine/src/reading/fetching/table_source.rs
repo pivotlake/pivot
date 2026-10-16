@@ -31,24 +31,21 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::{RowGroupFilter, ScanOrder};
 
-/// The NUMA node a row group is assigned to. A row group with pages in the
-/// decompressed cache goes to the node whose memory holds them: that is where
-/// its last decode ran, which, in a filtered scan with few surviving row
-/// groups, is often not its hash node (an idle node steals them during the
-/// first read). Routing by hash alone then made every later scan of such a row
-/// group read its pages across the interconnect, a 30 percent slowdown that
-/// held for the life of the server and differed from one start to the next.
-/// Otherwise, by a hash of its stable identity (its file and its index within
-/// that file): deterministic across queries so assignment is sticky for as
-/// long as the file stays open, and uniform enough to split any table's row
-/// groups evenly across nodes.
-fn affinity_node(row_group: &RowGroupMetadata, node_count: usize) -> usize {
-    if row_group.live_decompressed_pages.load(Ordering::Relaxed) > 0 {
-        let cached_node = row_group.decompressed_pages_node.load(Ordering::Relaxed);
-        if cached_node < node_count {
-            return cached_node;
-        }
-    }
+/// The NUMA node a row group belongs to, by a hash of its stable identity (its
+/// file and its index within that file): deterministic across queries, so the
+/// assignment is sticky for as long as the file stays open, and uniform enough
+/// to split any table's row groups evenly across nodes.
+///
+/// This node's queue feeds the row group to the scan, and only its workers
+/// cache the row group's decompressed pages (see the decompressor): a worker
+/// of another node that takes the row group off this queue to keep busy
+/// decompresses for its own query alone. Every cached page therefore sits in
+/// the memory of the node that reads it in every later query. Letting the
+/// cache land wherever a page happened to be decompressed first made a
+/// filtered scan's few surviving row groups remote for the life of the
+/// server on some starts and local on others, a 30 percent swing in a query's
+/// hot time from one server start to the next.
+pub(crate) fn affinity_node(row_group: &RowGroupMetadata, node_count: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     row_group.open_file.hash(&mut hasher);
     row_group.file_row_group_idx.hash(&mut hasher);
@@ -72,7 +69,7 @@ fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 /// can't be pruned (missing stats are never eliminated), so they must be read
 /// regardless — they go last. Reordering is purely an optimization: any order is
 /// correct (the Top-N re-sorts), this just minimizes how much gets read.
-fn steal_order(table: &ParquetTable, order: &ScanOrder) -> Vec<usize> {
+fn steal_order(table: &ParquetTable, order: &ScanOrder, projection: &Projection) -> Vec<usize> {
     let n = table.row_groups.len();
     let mut keyed: Vec<(usize, Scalar<ArrayRef>)> = Vec::with_capacity(n);
     let mut unkeyed: Vec<usize> = Vec::new();
@@ -109,13 +106,26 @@ fn steal_order(table: &ParquetTable, order: &ScanOrder) -> Vec<usize> {
     // read. A cold scan has nothing cached and keeps the plain key order.
     let (cached, uncached): (Vec<usize>, Vec<usize>) = result
         .into_iter()
-        .partition(|&idx| is_cache_resident(&table.row_groups[idx]));
+        .partition(|&idx| is_cache_resident(&table.row_groups[idx], projection));
     cached.into_iter().chain(uncached).collect()
 }
 
-/// Whether any of the row group's pages are in the decompressed cache.
-fn is_cache_resident(row_group: &RowGroupMetadata) -> bool {
-    row_group.live_decompressed_pages.load(Ordering::Relaxed) > 0
+/// Whether every projected column of the row group has pages in the
+/// decompressed cache: the scan reads it from memory.
+fn is_cache_resident(row_group: &RowGroupMetadata, projection: &Projection) -> bool {
+    projection
+        .indices()
+        .iter()
+        .all(|&column| row_group.live_decompressed_pages[column].load(Ordering::Relaxed) > 0)
+}
+
+/// How many of the row group's projected pages are in the decompressed cache.
+fn cached_projected_pages(row_group: &RowGroupMetadata, projection: &Projection) -> usize {
+    projection
+        .indices()
+        .iter()
+        .map(|&column| row_group.live_decompressed_pages[column].load(Ordering::Relaxed))
+        .sum()
 }
 
 /// Order a plain scan's row groups for handout, by two keys:
@@ -152,9 +162,7 @@ fn plain_scan_order(table: &ParquetTable, projection: &Projection) -> Vec<usize>
     // guarantees the single read.
     order.sort_by_cached_key(|&idx| {
         Reverse((
-            table.row_groups[idx]
-                .live_decompressed_pages
-                .load(Ordering::Relaxed),
+            cached_projected_pages(&table.row_groups[idx], projection),
             projected_size(idx),
         ))
     });
@@ -164,9 +172,29 @@ fn plain_scan_order(table: &ParquetTable, projection: &Projection) -> Vec<usize>
 /// Factory that populates one [`Injector`] per NUMA node with the table's row
 /// groups (split by [`affinity_node`]) and produces [`RowGroupInjector`]
 /// receivers for each worker.
+/// One node's share of a scan's row groups: those whose decompressed pages
+/// its memory already holds, and those nobody has decompressed yet. The node's
+/// own workers drain both, cached first. Another node's workers take only from
+/// `cached`: an uncached row group is decompressed, and cached, by the node
+/// that reads it in every later query (see [`affinity_node`]), so a thief
+/// decompressing it would do work the cache cannot keep.
+struct NodeQueues {
+    cached: Injector<QueryRowGroupMetadata>,
+    uncached: Injector<QueryRowGroupMetadata>,
+}
+
+impl NodeQueues {
+    fn new() -> Self {
+        Self {
+            cached: Injector::new(),
+            uncached: Injector::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RowGroupInjectorFactory {
-    row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>>,
+    row_group_queues: Arc<Vec<NodeQueues>>,
     projection: Projection,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
@@ -323,10 +351,10 @@ impl RowGroupInjectorFactory {
         scan_order: Option<ScanOrder>,
         node_count: usize,
     ) -> Self {
-        let row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>> =
-            Arc::new((0..node_count).map(|_| Injector::new()).collect());
+        let row_group_queues: Arc<Vec<NodeQueues>> =
+            Arc::new((0..node_count).map(|_| NodeQueues::new()).collect());
         let order = match &scan_order {
-            Some(order) => steal_order(table, order),
+            Some(order) => steal_order(table, order, &projection),
             None => plain_scan_order(table, &projection),
         };
         let row_groups: Vec<QueryRowGroupMetadata> = order
@@ -336,7 +364,7 @@ impl RowGroupInjectorFactory {
         let speculation = scan_order.map(|_| {
             let cache_resident: HashMap<usize, usize> = row_groups
                 .iter()
-                .filter(|row_group| is_cache_resident(row_group.get_metadata()))
+                .filter(|row_group| is_cache_resident(row_group.get_metadata(), &projection))
                 .map(|row_group| {
                     (
                         row_group.row_group_index,
@@ -361,8 +389,12 @@ impl RowGroupInjectorFactory {
             })
         });
         for row_group in row_groups {
-            let node = affinity_node(row_group.get_metadata(), node_count);
-            row_group_queues[node].push(row_group);
+            let queues = &row_group_queues[affinity_node(row_group.get_metadata(), node_count)];
+            if is_cache_resident(row_group.get_metadata(), &projection) {
+                queues.cached.push(row_group);
+            } else {
+                queues.uncached.push(row_group);
+            }
         }
         Self {
             row_group_queues,
@@ -395,21 +427,45 @@ impl RootChannelFactory<RowGroupRequest> for RowGroupInjectorFactory {
     }
 }
 
-/// A [`Receiver`] that claims row groups from the per-node [`Injector`]
-/// queues: its own node's queue on the hot path, other nodes' queues only
-/// when its own runs dry.
+/// A [`Receiver`] that claims row groups from the per-node queues: its own
+/// node's queues on the hot path, other nodes' cached row groups only when
+/// its own run dry (see [`NodeQueues`]).
 pub struct RowGroupInjector {
-    row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>>,
-    /// Index of this worker's node's queue in `row_group_queues`.
+    row_group_queues: Arc<Vec<NodeQueues>>,
+    /// Index of this worker's node's queues in `row_group_queues`.
     numa_node_idx: usize,
     projection: Projection,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
 }
 
+impl RowGroupInjector {
+    /// The queues this worker claims from, in claiming order: its own node's
+    /// cached then uncached row groups, then the other nodes' cached ones
+    /// (see [`NodeQueues`]). Emptiness and the idle-path steal agree on this
+    /// set, so a worker finishes its scan when nothing it may claim is left,
+    /// even while another node's uncached row groups are still queued.
+    fn claim_targets(
+        &self,
+    ) -> impl Iterator<Item = (usize, &Injector<QueryRowGroupMetadata>)> + '_ {
+        let queue_count = self.row_group_queues.len();
+        let own = &self.row_group_queues[self.numa_node_idx];
+        let other_nodes_cached = (1..queue_count).map(move |offset| {
+            let node = (self.numa_node_idx + offset) % queue_count;
+            (node, &self.row_group_queues[node].cached)
+        });
+        [
+            (self.numa_node_idx, &own.cached),
+            (self.numa_node_idx, &own.uncached),
+        ]
+        .into_iter()
+        .chain(other_nodes_cached)
+    }
+}
+
 impl Receiver<RowGroupRequest> for RowGroupInjector {
     fn is_empty(&self) -> bool {
-        self.row_group_queues.iter().all(|queue| queue.is_empty())
+        self.claim_targets().all(|(_, queue)| queue.is_empty())
     }
 
     /// Pull eagerly from this node's own queue. The injector is the *only*
@@ -421,13 +477,17 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
     /// iteration retries. A pruned row group also returns `None` (it has been
     /// removed; the next call advances).
     fn try_recv(&self) -> Option<RowGroupRequest> {
-        // This pre-check is a plain load; once the queue drains (every pass
-        // for the rest of the query) it avoids an epoch-pinning steal per
+        // These pre-checks are plain loads; once the queues drain (every pass
+        // for the rest of the query) they avoid an epoch-pinning steal per
         // call.
-        let queue = &self.row_group_queues[self.numa_node_idx];
-        if queue.is_empty() {
+        let own = &self.row_group_queues[self.numa_node_idx];
+        let queue = if !own.cached.is_empty() {
+            &own.cached
+        } else if !own.uncached.is_empty() {
+            &own.uncached
+        } else {
             return None;
-        }
+        };
         let ticket = self.acquire_speculation_ticket(self.numa_node_idx)?;
         match queue.steal() {
             Steal::Success(row_group) => self.build_request_unless_pruned(row_group, ticket),
@@ -437,18 +497,15 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
         }
     }
 
-    /// Pull on the idle path: drain this node's queue first, then fall back
-    /// to other nodes' queues so a node that finished its share keeps its
-    /// CPUs busy instead of waiting out the tail.
+    /// Pull on the idle path: drain this node's queues first, then fall back
+    /// to other nodes' cached row groups so a node that finished its share
+    /// keeps its CPUs busy instead of waiting out the tail.
     fn steal(&self) -> Option<RowGroupRequest> {
-        let queue_count = self.row_group_queues.len();
         // A ticket is acquired only once a non-empty queue is found; a lost
         // steal race or a queue drained under us carries it to the next
         // attempt rather than bouncing the reservation off the gate.
         let mut ticket = None;
-        for offset in 0..queue_count {
-            let target_node = (self.numa_node_idx + offset) % queue_count;
-            let queue = &self.row_group_queues[target_node];
+        for (target_node, queue) in self.claim_targets() {
             while !queue.is_empty() {
                 let held = match ticket.take() {
                     Some(held) => held,
@@ -644,6 +701,7 @@ impl RowGroupInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reading::decoding::tests::{i32_schema, make_test_table};
     use crate::test_utils::dummy_row_group;
 
     fn table_of(count: usize) -> Arc<ParquetTable> {
@@ -655,14 +713,10 @@ mod tests {
     #[test]
     fn cache_covered_row_groups_are_fed_first() {
         let table = table_of(3);
-        table.row_groups[1]
-            .live_decompressed_pages
-            .store(5, Ordering::Relaxed);
-        table.row_groups[2]
-            .live_decompressed_pages
-            .store(2, Ordering::Relaxed);
+        table.row_groups[1].live_decompressed_pages[0].store(5, Ordering::Relaxed);
+        table.row_groups[2].live_decompressed_pages[0].store(2, Ordering::Relaxed);
 
-        let order = plain_scan_order(&table, &Projection::columns([]));
+        let order = plain_scan_order(&table, &Projection::columns([0]));
 
         assert_eq!(order, vec![1, 2, 0]);
     }
@@ -685,24 +739,57 @@ mod tests {
     #[test]
     fn cache_resident_row_groups_lead_a_top_n_order() {
         let table = table_of(4);
-        table.row_groups[2]
-            .live_decompressed_pages
-            .store(1, Ordering::Relaxed);
+        table.row_groups[2].live_decompressed_pages[0].store(1, Ordering::Relaxed);
         let scan_order = ScanOrder {
             column_idx: 0,
             descending: false,
         };
 
-        let order = steal_order(&table, &scan_order);
+        let order = steal_order(&table, &scan_order, &Projection::columns([0]));
 
         assert_eq!(order, vec![2, 0, 1, 3]);
+    }
+
+    fn injector_on_node(factory: &RowGroupInjectorFactory, node: usize) -> RowGroupInjector {
+        RowGroupInjector {
+            row_group_queues: factory.row_group_queues.clone(),
+            numa_node_idx: node,
+            projection: factory.projection.clone(),
+            filter: None,
+            speculation: None,
+        }
+    }
+
+    #[test]
+    fn an_uncached_row_group_is_claimed_only_by_its_home_node() {
+        let table = make_test_table(i32_schema(&["a"]), 0);
+        let factory = RowGroupInjectorFactory::new(&table, Projection::columns([0]), None, None, 2);
+        let home = affinity_node(&table.row_groups[0], 2);
+
+        let stolen_away = injector_on_node(&factory, 1 - home).steal();
+        let claimed_at_home = injector_on_node(&factory, home).steal();
+
+        assert!(stolen_away.is_none());
+        assert!(claimed_at_home.is_some());
+    }
+
+    #[test]
+    fn a_cached_row_group_is_stolen_across_nodes() {
+        let table = make_test_table(i32_schema(&["a"]), 0);
+        table.row_groups[0].live_decompressed_pages[0].store(1, Ordering::Relaxed);
+        let factory = RowGroupInjectorFactory::new(&table, Projection::columns([0]), None, None, 2);
+        let home = affinity_node(&table.row_groups[0], 2);
+
+        let stolen_away = injector_on_node(&factory, 1 - home).steal();
+
+        assert!(stolen_away.is_some());
     }
 
     #[test]
     fn equal_size_ties_keep_file_order() {
         let table = table_of(4);
 
-        let order = plain_scan_order(&table, &Projection::columns([]));
+        let order = plain_scan_order(&table, &Projection::columns([0]));
 
         assert_eq!(order, vec![0, 1, 2, 3]);
     }
@@ -726,8 +813,7 @@ mod tests {
             statistics: Arc::default(),
             num_rows: 0,
             file_row_group_idx: 0,
-            live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
-            decompressed_pages_node: Arc::new(AtomicUsize::new(usize::MAX)),
+            live_decompressed_pages: vec![Arc::new(AtomicUsize::new(0))],
         })
     }
 

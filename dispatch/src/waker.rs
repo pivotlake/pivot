@@ -404,6 +404,11 @@ impl WakerSet {
         }
     }
 
+    /// How many node groups the set routes to.
+    pub fn node_count(&self) -> usize {
+        self.node_wakers.len()
+    }
+
     /// Wake one parked worker of `node` and no other: the caller knows that
     /// node has work queued that only its workers should take. Unlike
     /// [`notify_one_near`](Self::notify_one_near) this never spills to

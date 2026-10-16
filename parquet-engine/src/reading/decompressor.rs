@@ -10,6 +10,7 @@
 //!
 //! [`FilterMask`]: crate::types::filter_mask::FilterMask
 
+use crate::reading::fetching::affinity_node;
 use crate::thrift::general::{CompressionCodec, PageType};
 use crate::thrift::headers::PageHeader;
 use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
@@ -67,6 +68,30 @@ impl Default for Decompressor {
 }
 
 impl Decompressor {
+    /// Decompress a page body, possibly scattered over several input buffers,
+    /// into `outputs`, returning the bytes written.
+    fn decompress_into(
+        &mut self,
+        codec: CompressionCodec,
+        input: &[&[u8]],
+        mut outputs: Vec<&mut [u8]>,
+    ) -> Result<usize> {
+        match codec {
+            CompressionCodec::SNAPPY => {
+                Ok(self.snappy_decoder.decompress_scattered(input, outputs)?)
+            }
+            CompressionCodec::LZ4_RAW => {
+                Ok(lz4_flex::block::decompress_scattered(input, &mut outputs)?)
+            }
+            CompressionCodec::ZSTD => {
+                decompress_zstd_scattered(&mut self.zstd_decoder, input, &mut outputs)
+            }
+            // UNCOMPRESSED takes the zero-copy passthrough before any
+            // decompression.
+            other => Err(Error::UnsupportedCodec(other)),
+        }
+    }
+
     fn decompress(&mut self, mut page: CompressedPage) -> Result<DecompressedPage> {
         let is_dict = match page.header.r#type {
             PageType::DATA_PAGE => false,
@@ -110,65 +135,45 @@ impl Decompressor {
                 // its typed leaf). Nothing to cache either.
                 None if page.header.uncompressed_page_size == 0 => Vec::new(),
                 None => {
-                    // Reserve the page's output region in the cache (packed into
-                    // shared slots via this worker's fill cursor), decompress
-                    // straight into it, and insert. The header is stored
-                    // alongside it, opaque to the cache, so a later `get_range`
-                    // hit can hand a caller a full page identity without touching
-                    // disk (see `requests::parse_page_header`).
                     let uncompressed_size = page.header.uncompressed_page_size as usize;
-                    let mut reservation = memory_ctx()
-                        .decompressed_cache()
-                        .reserve(&key, uncompressed_size);
                     let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
-                    let written = match page.codec {
-                        CompressionCodec::SNAPPY => self
-                            .snappy_decoder
-                            .decompress_scattered(&input, reservation.as_mut_slices())?,
-                        CompressionCodec::LZ4_RAW => lz4_flex::block::decompress_scattered(
-                            &input,
-                            &mut reservation.as_mut_slices(),
-                        )?,
-                        CompressionCodec::ZSTD => decompress_zstd_scattered(
-                            &mut self.zstd_decoder,
-                            &input,
-                            &mut reservation.as_mut_slices(),
-                        )?,
-                        // UNCOMPRESSED took the zero-copy passthrough above.
-                        other => return Err(Error::UnsupportedCodec(other)),
-                    };
-                    // The reservation's capacity says nothing about the true
-                    // page length (a disabled cache hands out whole pooled
-                    // slots), so verify the decoded byte count against the
-                    // footer's recorded size.
-                    if written != uncompressed_size {
-                        return Err(Error::DecompressedLength {
-                            written,
-                            expected: uncompressed_size,
-                        });
+                    let metadata = page.row_group.get_metadata();
+                    let node_count = dispatch::waker::waker_set().node_count();
+                    if dispatch::worker::current_node() != affinity_node(metadata, node_count) {
+                        // A row group's cached pages live on its home node,
+                        // where the scan routes it (see `affinity_node`), so
+                        // every later read of them is local. This worker is on
+                        // another node: it took the row group off its home
+                        // node's queue to keep itself busy while that node was
+                        // behind, so it decompresses for this query alone.
+                        // Caching here would leave the page remote for every
+                        // later query; the next query to read the row group
+                        // caches it from home.
+                        let mut scratch = vec![0u8; uncompressed_size];
+                        let written =
+                            self.decompress_into(page.codec, &input, vec![scratch.as_mut_slice()])?;
+                        verify_decompressed_length(written, uncompressed_size)?;
+                        vec![Bytes::from(scratch)]
+                    } else {
+                        // Reserve the page's output region in the cache (packed into
+                        // shared slots via this worker's fill cursor), decompress
+                        // straight into it, and insert. The header is stored
+                        // alongside it, opaque to the cache, so a later `get_range`
+                        // hit can hand a caller a full page identity without touching
+                        // disk (see `requests::parse_page_header`).
+                        let mut reservation = memory_ctx()
+                            .decompressed_cache()
+                            .reserve(&key, uncompressed_size);
+                        let written =
+                            self.decompress_into(page.codec, &input, reservation.as_mut_slices())?;
+                        verify_decompressed_length(written, uncompressed_size)?;
+                        memory_ctx().decompressed_cache().insert(
+                            key,
+                            serialize_header(&page.header),
+                            reservation,
+                            metadata.live_decompressed_pages[page.column_idx].clone(),
+                        )
                     }
-                    // The first decompressed page fixes the node whose memory
-                    // holds this row group's cache; the scan routes the row
-                    // group there from now on (see the table source).
-                    let _ = page
-                        .row_group
-                        .get_metadata()
-                        .decompressed_pages_node
-                        .compare_exchange(
-                            usize::MAX,
-                            dispatch::worker::current_node(),
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    memory_ctx().decompressed_cache().insert(
-                        key,
-                        serialize_header(&page.header),
-                        reservation,
-                        page.row_group
-                            .get_metadata()
-                            .live_decompressed_pages
-                            .clone(),
-                    )
                 }
             }
         };
@@ -195,6 +200,16 @@ impl Decompressor {
             first_row: page.first_row,
         })
     }
+}
+
+/// The output's capacity says nothing about the true page length (a disabled
+/// cache hands out whole pooled slots), so the decoded byte count is checked
+/// against the footer's recorded size.
+fn verify_decompressed_length(written: usize, expected: usize) -> Result<()> {
+    if written != expected {
+        return Err(Error::DecompressedLength { written, expected });
+    }
+    Ok(())
 }
 
 /// Decompress one zstd frame (a page body) from `inputs` into `outputs`,
@@ -318,10 +333,12 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reading::decoding::tests::{i32_schema, make_test_table};
     use crate::test_utils::dummy_metadata;
     use crate::thrift::general::{CompressionCodec, Encoding};
     use crate::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
     use crate::types::filter_mask::FilterMask;
+    use crate::types::metadata::QueryRowGroupMetadata;
     use crate::types::metadata::RowSelection;
     use dispatch::memory::init_test_free_pool;
     use dispatch::test_utils::{CollectSender, run_unary};
@@ -467,6 +484,8 @@ mod tests {
         init_test_free_pool(4);
         let payload = vec![1u8; 128];
         let mut page = compressed_data_page(&payload, 5, None);
+        let four_columns = make_test_table(i32_schema(&["a", "b", "c", "d"]), 5);
+        page.row_group = QueryRowGroupMetadata::new(&four_columns, 0, RowSelection::All);
         page.worker_id = 7;
         page.column_idx = 3;
         page.page_idx = 12;
@@ -742,9 +761,7 @@ mod tests {
         let _out = run_unary(Decompressor::default(), vec![page]);
 
         assert_eq!(
-            metadata
-                .get_metadata()
-                .live_decompressed_pages
+            metadata.get_metadata().live_decompressed_pages[0]
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );

@@ -99,12 +99,21 @@ pub(crate) mod test_utils {
                 LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap(),
             ),
             schema: Arc::new(Schema::empty()),
-            columns: vec![],
+            columns: vec![crate::types::metadata::ColumnChunkMeta {
+                codec: crate::thrift::general::CompressionCodec::SNAPPY,
+                dictionary_page_offset: None,
+                data_page_offset: 0,
+                total_compressed_size: 0,
+                total_uncompressed_size: 0,
+                max_def_level: 0,
+                physical_type: 0,
+                fixed_len_byte_width: None,
+                data_pages_all_dictionary: false,
+            }],
             statistics: Arc::default(),
             num_rows: 0,
             file_row_group_idx: 0,
-            live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            decompressed_pages_node: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+            live_decompressed_pages: vec![Arc::new(std::sync::atomic::AtomicUsize::new(0))],
         })
     }
 

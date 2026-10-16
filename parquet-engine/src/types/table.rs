@@ -253,12 +253,13 @@ pub(crate) fn row_groups_from_metadata(
         .map(|(i, (num_rows, columns))| RowGroupMetadata {
             open_file: open_file.clone(),
             schema: schema.clone(),
+            live_decompressed_pages: (0..columns.len())
+                .map(|_| Arc::new(AtomicUsize::new(0)))
+                .collect(),
             columns,
             statistics: statistics.clone(),
             num_rows,
             file_row_group_idx: i,
-            live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
-            decompressed_pages_node: Arc::new(AtomicUsize::new(usize::MAX)),
         })
         .collect())
 }

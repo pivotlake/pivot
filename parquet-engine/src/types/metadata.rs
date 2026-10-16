@@ -124,18 +124,12 @@ pub struct RowGroupMetadata {
     /// not be conflated with the row group's *global* index, which is simply
     /// its position in the table's flat `row_groups` list.
     pub file_row_group_idx: usize,
-    /// How many of this row group's pages are currently resident in the
-    /// decompressed cache. The cache itself maintains it (a clone rides on every
-    /// cached page, incremented on insert and decremented when the page leaves);
-    /// the scan feed reads it to hand out cache-covered row groups first, so a
-    /// repeated scan consumes what's already decompressed before its own churn
-    /// can evict it.
-    pub live_decompressed_pages: Arc<AtomicUsize>,
-    /// The NUMA node whose ring memory holds this row group's decompressed
-    /// pages: the node of the worker that inserted the first one, `usize::MAX`
-    /// until then. The scan feed routes a cache-covered row group to this node
-    /// so its pages are read from local memory.
-    pub decompressed_pages_node: Arc<AtomicUsize>,
+    /// Per column chunk, how many of its pages are in the decompressed cache
+    /// (counted up by the decompressor's inserts and down by evictions). A
+    /// row group whose projected columns all have pages cached reads from
+    /// memory; the scan feeds those first and lets other nodes' workers take
+    /// them (see the table source).
+    pub live_decompressed_pages: Vec<Arc<AtomicUsize>>,
 }
 
 impl RowGroupMetadata {
