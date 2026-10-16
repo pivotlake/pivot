@@ -176,6 +176,12 @@ impl<G: NormalizationBatches> BatchesOutputter<G, G> for Normalizer<G> {
 
 impl<G: NormalizationBatches> Outputter<G> for Normalizer<G> {
     fn output(&mut self, sender: &mut dyn Sender<G>) -> unary::Result<bool> {
+        // Nothing to claim before the jobs are published; polling the flag
+        // rather than the queue keeps the pool off the line the publishing
+        // worker is pushing into (see the group-by outputter).
+        if !self.shared.jobs_injected.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         match self.shared.jobs.steal() {
             Steal::Success(job) => {
                 job.run()?;
@@ -185,9 +191,7 @@ impl<G: NormalizationBatches> Outputter<G> for Normalizer<G> {
             Steal::Empty => {}
         }
 
-        if !self.shared.jobs_injected.load(Ordering::Acquire)
-            || self.shared.remaining.load(Ordering::Acquire) != 0
-        {
+        if self.shared.remaining.load(Ordering::Acquire) != 0 {
             return Ok(false);
         }
 

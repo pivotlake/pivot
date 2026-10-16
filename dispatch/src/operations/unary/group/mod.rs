@@ -126,8 +126,8 @@ use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, DataType};
 use crossbeam_deque::{Injector, Steal};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use unary::pipeline_breaker::{Consumer, Outputter};
 
@@ -392,6 +392,9 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// them by slot range at `num_partitions` granularity.
     tables: Arc<Vec<MultiSlabTable<K::Persisted, V>>>,
     index: usize,
+    /// The node whose sources this job merges, and whose slot in
+    /// `cross_node_merge` its table fills.
+    node: usize,
     /// One shared instance per partition on a multi-node hierarchical merge;
     /// `None` when this job's merge result is already final (single-node pool
     /// or direct merge).
@@ -422,11 +425,15 @@ unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionJob
 /// One partition's pending cross-node merge: each node's job sends the node's
 /// merged aggregated table; the send that completes the set hands every
 /// node's table back to that caller, electing it to run the final merge
-/// ([`merge::merge_node_aggregated_tables`]) and emit. Senders never block
-/// and no job ever waits: the mailbox is a lock-free queue and the election
-/// is one atomic countdown.
+/// ([`merge::merge_node_aggregated_tables`]) and emit. No job ever waits:
+/// each node writes its own slot and the election is one atomic countdown.
+/// The slots are a plain array because one of these exists per partition,
+/// created by one worker while every other waits for the jobs: a queue per
+/// partition allocated a block each, and at a thousand partitions that was
+/// milliseconds on the critical path.
 struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    node_tables: Injector<MultiSlabTable<K::Persisted, V>>,
+    /// One slot per node, `None` until that node's job sends its table.
+    node_tables: Box<[Mutex<Option<MultiSlabTable<K::Persisted, V>>>]>,
     /// Sends still outstanding; the sender that decrements this to zero is
     /// the receiver.
     pending_sends: AtomicUsize,
@@ -438,33 +445,38 @@ unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for CrossNodeMer
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
     fn new(node_count: usize) -> Self {
         Self {
-            node_tables: Injector::new(),
+            node_tables: (0..node_count).map(|_| Mutex::new(None)).collect(),
             pending_sends: AtomicUsize::new(node_count),
         }
     }
 
-    /// Send this node's merged table. Exactly one call - the last - returns
-    /// the full set; that caller must run the final merge. Each sender's push
-    /// happens-before its countdown decrement, and the last sender's
-    /// decrement observes all of them, so the drain below is guaranteed to
-    /// see every node's table (and after the election nobody else touches
-    /// the queue).
+    /// Send `node`'s merged table. Exactly one call - the last - returns the
+    /// full set, in node order; that caller must run the final merge. Each
+    /// sender's slot write happens-before its countdown decrement, and the
+    /// last sender's decrement observes all of them, so every slot it reads
+    /// is filled (and after the election nobody else touches the slots).
     fn send(
         &self,
+        node: usize,
         table: MultiSlabTable<K::Persisted, V>,
     ) -> Option<Vec<MultiSlabTable<K::Persisted, V>>> {
-        self.node_tables.push(table);
+        *self.node_tables[node]
+            .lock()
+            .expect("a cross-node merge slot is never poisoned") = Some(table);
         if self.pending_sends.fetch_sub(1, Ordering::AcqRel) != 1 {
             return None;
         }
-        let mut all = Vec::new();
-        loop {
-            match self.node_tables.steal() {
-                Steal::Success(table) => all.push(table),
-                Steal::Empty => return Some(all),
-                Steal::Retry => continue,
-            }
-        }
+        Some(
+            self.node_tables
+                .iter()
+                .map(|slot| {
+                    slot.lock()
+                        .expect("a cross-node merge slot is never poisoned")
+                        .take()
+                        .expect("every node sent its table before the last send")
+                })
+                .collect(),
+        )
     }
 }
 
@@ -491,7 +503,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         );
         let result_map = match &self.cross_node_merge {
             None => result_map,
-            Some(cross_node) => match cross_node.send(result_map) {
+            Some(cross_node) => match cross_node.send(self.node, result_map) {
                 // Another node's job for this partition is still running; it
                 // will receive the tables and run the final merge.
                 None => return Ok(()),
@@ -550,10 +562,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // over-counts, which only over-sizes the merge targets (safe);
         // under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
+        let mut scattered_rows = 0usize;
         for out in outputs {
             if out.hll.is_none() {
                 non_switched_groups += out.tables.iter().map(|t| t.len()).sum::<usize>();
             }
+            scattered_rows += out.scattered_rows;
             tables_by_node[out.node].extend(out.tables);
             if let Some(b) = out.buffers {
                 buffers_by_node[out.node].push(b);
@@ -654,17 +668,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // so merge every node's sources directly and pay the remote reads
         // once. An all-in-place merge is always direct: its tables are
         // per-worker aggregated already and their estimate equals their
-        // total, so the test is never met. Counting the scattered rows walks
-        // every switched worker's every bucket, so only pay for it when a
-        // second node exists at all.
-        let hierarchical = node_count > 1 && {
-            let scatter_rows: usize = buffers_by_node
-                .iter()
-                .flatten()
-                .map(|b| b.0.iter().map(|bucket| bucket.len()).sum::<usize>())
-                .sum();
-            total_in_place + scatter_rows > 2 * estimate
-        };
+        // total, so the test is never met. Each worker counted its scattered
+        // rows when it flushed, in parallel, so this is a sum over workers.
+        let hierarchical = node_count > 1 && total_in_place + scattered_rows > 2 * estimate;
         // Wrap the arena's ring buffers once for the whole output phase (consume
         // is done, so `next_idx` is final). Every partition job shares this one
         // `Arc<[Buffer]>` for zero-copy string output, so a batch attaches it with
@@ -676,6 +682,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // queue means a finished phase.
         let push_job = |injector: &Injector<PartitionJob<K, V>>,
                         index: usize,
+                        node: usize,
                         cross_node_merge: Option<Arc<CrossNodeMerge<K, V>>>,
                         buffers: Arc<Vec<PartitionBuffers<K::Persisted, V>>>,
                         tables: Arc<Vec<MultiSlabTable<K::Persisted, V>>>| {
@@ -683,6 +690,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 buffers,
                 tables,
                 index,
+                node,
                 cross_node_merge,
                 key_arena: self.key_arena.clone(),
                 output_buffers: output_buffers.clone(),
@@ -713,6 +721,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                     push_job(
                         injector,
                         i,
+                        node,
                         Some(cross_node_merge.clone()),
                         buffers_by_node[node].clone(),
                         tables_by_node[node].clone(),
@@ -728,6 +737,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 push_job(
                     &self.injectors[i % node_count],
                     i,
+                    i % node_count,
                     None,
                     buffers.clone(),
                     tables.clone(),
@@ -752,12 +762,22 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
             output::emit_count(1, sender).map_err(unary::Error::from)?;
         }
 
+        // Until the jobs are published there is nothing to claim. Checking
+        // the flag first keeps the workers that reach this phase early (every
+        // pass, until the dataflow finishes) polling a line nobody writes
+        // until the publication, instead of the queue heads the publishing
+        // worker is pushing into: with the whole pool reading those lines,
+        // each of its pushes took microseconds and a thousand-partition merge
+        // started milliseconds late, by an amount that varied with how many
+        // workers happened to be awake.
+        if !self.partition_jobs_injected.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         // Claim a job, trying the own node's queue first (its sources are
         // node-local), then other nodes' queues so a node that finished its
         // share helps with the tail instead of idling. The plain-load
-        // `is_empty` pre-checks keep the drained-queue polls (every pass
-        // until the dataflow finishes) from pinning a crossbeam epoch each
-        // time.
+        // `is_empty` pre-checks keep the drained-queue polls from pinning a
+        // crossbeam epoch each time.
         let queue_count = self.injectors.len();
         let mut steal = Steal::Empty;
         for offset in 0..queue_count {
@@ -782,16 +802,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
                     .map_err(unary::Error::from)?;
             }
             Steal::Empty => {
-                if self.partition_jobs_injected.load(Ordering::Acquire) {
-                    // Queue drained: emit this worker's last partial batch.
-                    if let (Some(acc), Some(allocator)) = (
-                        self.output_accumulator.as_mut(),
-                        self.output_allocator.as_mut(),
-                    ) {
-                        acc.flush(allocator, sender).map_err(unary::Error::from)?;
-                    }
-                    return Ok(true);
+                // Queues drained: emit this worker's last partial batch.
+                if let (Some(acc), Some(allocator)) = (
+                    self.output_accumulator.as_mut(),
+                    self.output_allocator.as_mut(),
+                ) {
+                    acc.flush(allocator, sender).map_err(unary::Error::from)?;
                 }
+                return Ok(true);
             }
             Steal::Retry => {}
         }

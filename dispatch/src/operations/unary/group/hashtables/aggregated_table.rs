@@ -146,6 +146,9 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
     /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
     pub zero_hash_seen: bool,
+    /// Rows in `buffers` across every partition, counted here so the merge
+    /// planner sums one number per worker instead of walking every bucket.
+    pub scattered_rows: usize,
 }
 
 /// Per-worker aggregation state.
@@ -550,12 +553,18 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         }
         self.key_arena.flush();
         self.worker_context.flush();
+        let scattered_rows = self
+            .buffers
+            .as_ref()
+            .map(|buffers| buffers.iter().map(StridedScatterRows::len).sum())
+            .unwrap_or(0);
         AggregatedTableOutput {
             node: crate::worker::current_node(),
             tables: self.tables,
             buffers: self.buffers.map(PartitionBuffers),
             hll: self.hll,
             zero_hash_seen: self.zero_hash_seen,
+            scattered_rows,
         }
     }
 }
