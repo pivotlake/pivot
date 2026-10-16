@@ -58,13 +58,13 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CteFactory, CteScanFactory, Distinct,
-    DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind,
+    DynamicRowKey, F64Cell, GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind,
     JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
     NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory,
     OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
-    UnaryOperatorFactory, WideCell, copy_out, create_join_factories,
-    create_normalizing_join_factories, create_normalizing_order_by_factories,
-    create_range_join_factories,
+    UnaryOperatorFactory, WideCell, WorkerBuiltFilterFactory, WorkerBuiltMapFactory, copy_out,
+    create_join_factories, create_normalizing_join_factories,
+    create_normalizing_order_by_factories, create_range_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -406,7 +406,7 @@ impl RecordBatchOperatorSpec {
             ) -> crate::RowSelection
             + Send
             + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         self.filter_with_delivery(builder, crate::RowDelivery::Coalesced)
     }
@@ -427,10 +427,11 @@ impl RecordBatchOperatorSpec {
             ) -> crate::RowSelection
             + Send
             + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| FilterFactory(builder(), delivery)))
+        let builder = Arc::new(builder);
+        self.unary((0..worker_count).map(|_| WorkerBuiltFilterFactory(builder.clone(), delivery)))
     }
 
     /// Apply a per-batch 1→1 transform that can change the output type.
@@ -528,10 +529,11 @@ impl RecordBatchOperatorSpec {
     pub fn project<F, FB>(self, builder: FB) -> Self
     where
         F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| MapFactory(builder())))
+        let builder = Arc::new(builder);
+        self.unary((0..worker_count).map(|_| WorkerBuiltMapFactory(builder.clone())))
     }
 
     /// Global aggregates (no GROUP BY): one or more `SUM`/`COUNT` slots over
