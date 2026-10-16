@@ -23,9 +23,10 @@
 //! # Reading through the ring
 //!
 //! Manifest lists and manifests are read as whole objects over the io_uring
-//! ring ([`object_storage::load_objects`]), so they pass through the
-//! compressed cache and the disk cache exactly as data does: a restarted server
-//! finds them on local disk. A filtered query reads only the manifests whose
+//! ring ([`object_storage::load_objects`]), and deletion vectors as their
+//! blob's range of its Puffin file, so they pass through the compressed cache
+//! and the disk cache exactly as data does: a restarted server finds them on
+//! local disk. A filtered query reads only the manifests whose
 //! partition summaries admit its predicates, and only the footers of the files
 //! whose partition values and column bounds do. Data files are Parquet, read
 //! by the same engine that reads every other datastore, with row-group
@@ -57,12 +58,14 @@
 //!
 //! A table is refused, with an error naming the reason, rather than served
 //! partially or wrongly: encryption, a snapshot that carries delete files
-//! (row-level deletes are not applied), data files that are not Parquet, and a
-//! column whose Iceberg type has no Pivot type or whose initial default would
-//! require synthesizing values for older files.
+//! other than deletion vectors (position-delete and equality-delete files are
+//! not applied), data files that are not Parquet, and a column whose Iceberg
+//! type has no Pivot type or whose initial default would require synthesizing
+//! values for older files.
 
 mod binding;
 mod columns;
+mod deletes;
 mod describe;
 pub mod env;
 mod manifests;
@@ -168,9 +171,11 @@ pub enum Error {
         default: String,
     },
     #[error(
-        "table `{table}` carries delete files in its current snapshot (manifest `{manifest}`); row-level deletes are not applied, so the table is not served"
+        "delete file `{file}` is not a deletion vector; only deletion vectors are applied, so the table is not served"
     )]
-    DeleteFiles { table: String, manifest: String },
+    DeleteFile { file: String },
+    #[error("the deletion vector for `{file}` is invalid: {message}")]
+    DeletionVector { file: String, message: String },
     #[error("table `{table}` data file `{file}` is {format}; only Parquet data files are read")]
     NonParquetFile {
         table: String,
@@ -185,9 +190,8 @@ pub enum Error {
         #[source]
         source: Box<iceberg::Error>,
     },
-    #[error("table `{table}` metadata object `{path}` does not parse: {source}")]
+    #[error("metadata object `{path}` does not parse: {source}")]
     MalformedMetadataObject {
-        table: String,
         path: String,
         #[source]
         source: Box<iceberg::Error>,

@@ -13,6 +13,7 @@ use crate::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use dispatch::io::OpenFile;
+use roaring::RoaringBitmap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -145,8 +146,13 @@ pub struct RowGroupMetadata {
     /// The whole file's statistics, shared by every row group in it and read at
     /// this row group's `file_row_group_idx`.
     pub(crate) statistics: Arc<FileStatistics>,
-    /// Total number of rows in this row group.
+    /// Total number of rows in this row group, deleted ones included.
     pub num_rows: i64,
+    /// The rows a table format's row-level deletes removed, by position in
+    /// the row group; `None` when it has none. The file still holds them: the
+    /// scan decodes them and drops them before a batch leaves the decoder,
+    /// and a count or bound read from the footer discounts them.
+    pub deleted_rows: Option<RoaringBitmap>,
     /// Index of this row group within its Parquet file. Note that this should
     /// not be conflated with the row group's *global* index, which is simply
     /// its position in the table's flat `row_groups` list.
@@ -161,6 +167,15 @@ pub struct RowGroupMetadata {
 }
 
 impl RowGroupMetadata {
+    /// How many of this row group's rows a scan returns: those not deleted.
+    pub fn live_rows(&self) -> i64 {
+        let deleted = self
+            .deleted_rows
+            .as_ref()
+            .map_or(0, |deleted| deleted.len() as i64);
+        self.num_rows - deleted
+    }
+
     /// This row group's statistics for the top-level column `column`, if the
     /// file recorded any for it. Chunks are per leaf, so the column is resolved
     /// to its first leaf. Callers that need a nested field's statistics resolve

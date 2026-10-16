@@ -103,6 +103,7 @@ pub(crate) mod test_utils {
             columns: vec![],
             statistics: Arc::default(),
             num_rows: 0,
+            deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })

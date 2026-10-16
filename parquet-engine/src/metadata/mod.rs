@@ -34,6 +34,7 @@ use dispatch::{
 use fetcher::FileRowGroupsFetcher;
 use object_storage::file_injector::FileInjectorFactory;
 use object_storage::{DataFile, DataFileLocation, FileRef, ObjectPath};
+use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -45,6 +46,35 @@ use writer::FileRowGroupsSinkFactory;
 pub struct FileRowGroups {
     pub file: FileRef,
     pub row_groups: Vec<Arc<RowGroupMetadata>>,
+}
+
+impl FileRowGroups {
+    /// Record the file's deleted rows, given as their positions in the file,
+    /// which the caller has checked against the file's row count, on the row
+    /// groups holding them, so a scan drops them. Only for row groups fresh
+    /// from the footer read, which nothing shares yet.
+    pub fn mark_deleted_rows(&mut self, positions: impl IntoIterator<Item = u64>) {
+        // Each row group's first position in the file, then the file's row count.
+        let mut starts = Vec::with_capacity(self.row_groups.len() + 1);
+        starts.push(0u64);
+        for row_group in &self.row_groups {
+            starts.push(starts.last().unwrap() + row_group.num_rows as u64);
+        }
+        let rows = *starts.last().unwrap();
+        for position in positions {
+            assert!(
+                position < rows,
+                "deleted row {position} is past the file's {rows} rows"
+            );
+            let row_group = starts.partition_point(|start| *start <= position) - 1;
+            let deleted_rows = &mut Arc::get_mut(&mut self.row_groups[row_group])
+                .expect("row groups fresh from the footer read are not shared")
+                .deleted_rows;
+            deleted_rows
+                .get_or_insert_with(RoaringBitmap::new)
+                .insert((position - starts[row_group]) as u32);
+        }
+    }
 }
 
 /// Builds each worker's [`FileRowGroupsFetcher`], carrying the table's
@@ -177,4 +207,62 @@ where
     RecordBatchOperatorSpec::from_spec(
         fetch.chain(fan_in::<FileRowGroups>(worker_count, target), sinks),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::dummy_row_group;
+
+    /// A file of row groups holding `rows` rows each.
+    fn file_of_row_groups(rows: &[i64]) -> FileRowGroups {
+        let dummy = dummy_row_group();
+        FileRowGroups {
+            file: FileRef {
+                path: ObjectPath::new("data.parquet"),
+                size: 0,
+            },
+            row_groups: rows
+                .iter()
+                .enumerate()
+                .map(|(index, rows)| {
+                    Arc::new(RowGroupMetadata {
+                        num_rows: *rows,
+                        file_row_group_idx: index,
+                        ..(*dummy).clone()
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_deleted_position_lands_on_the_row_group_holding_it() {
+        let mut file = file_of_row_groups(&[3, 2, 4]);
+
+        file.mark_deleted_rows([8, 0, 2, 3]);
+
+        let deleted: Vec<Option<Vec<u32>>> = file
+            .row_groups
+            .iter()
+            .map(|row_group| {
+                row_group
+                    .deleted_rows
+                    .as_ref()
+                    .map(|deleted| deleted.iter().collect())
+            })
+            .collect();
+        assert_eq!(
+            deleted,
+            vec![Some(vec![0, 2]), Some(vec![0]), Some(vec![3])]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "deleted row 5 is past the file's 5 rows")]
+    fn a_position_past_the_file_is_an_invariant_violation() {
+        let mut file = file_of_row_groups(&[3, 2]);
+
+        file.mark_deleted_rows([5]);
+    }
 }

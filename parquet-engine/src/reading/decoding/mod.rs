@@ -9,11 +9,14 @@
 //! took a range from a peer skips into the range's first pages.
 
 use crate::reading::range_cutter::DecodeRange;
+use crate::reading::record_batch_metadata::with_row_group;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use dispatch::Sender;
 use dispatch::WorkStatus;
+use dispatch::arrays::accumulator::BatchAccumulator;
 use dispatch::memory::SlabAllocator;
 use dispatch::{Unary, UnaryFactory};
+use row_group_decoder::DecodedBatch;
 use std::sync::{Arc, Mutex};
 
 pub(crate) mod leaf_decoders;
@@ -96,6 +99,11 @@ impl UnaryFactory<DecodeRange, RecordBatch> for DecoderFactory {
 /// next range of the same row group usually continues it, and it is dropped
 /// once every range of the row group is decoded, on any worker.
 ///
+/// A batch the table format deleted rows of does not leave as the runt the
+/// drop would make of it: its kept rows are gathered, as a filter's survivors
+/// are, and leave in full batches. The rows leave in the order they were
+/// decoded, so a batch with nothing deleted goes after the kept rows held.
+///
 /// There is no table-wide output schema here: each [`RowGroupDecoder`] derives
 /// its own from its file, because a variant column's physical layout (its
 /// shredded leaves) can differ file to file.
@@ -108,6 +116,10 @@ pub struct Decoder {
     /// Decoders that finished a range, kept for the row group's next range.
     idle: Vec<RowGroupDecoder>,
     add_row_group_metadata: bool,
+    /// The kept rows gathered so far, all of the row group `kept_rows_group`:
+    /// a batch carries one row group.
+    kept_rows: Option<BatchAccumulator>,
+    kept_rows_group: usize,
 }
 
 impl Decoder {
@@ -122,7 +134,86 @@ impl Decoder {
             active: None,
             idle: Vec::new(),
             add_row_group_metadata,
+            kept_rows: None,
+            kept_rows_group: 0,
         }
+    }
+
+    /// Sends `batch`, whose rows are all of row group `group`.
+    fn send(
+        &self,
+        batch: RecordBatch,
+        group: usize,
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> dispatch::UnaryResult<()> {
+        let batch = if self.add_row_group_metadata {
+            with_row_group(batch, group)
+        } else {
+            batch
+        };
+        sender.send(batch)?;
+        Ok(())
+    }
+
+    /// Sends the kept rows held, if any.
+    fn flush_kept_rows(
+        &mut self,
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> dispatch::UnaryResult<()> {
+        if let Some(accumulator) = &mut self.kept_rows
+            && !accumulator.is_empty()
+        {
+            let batch = self
+                .allocator
+                .with(|allocator| accumulator.take_batch(allocator))?;
+            self.send(batch, self.kept_rows_group, sender)?;
+        }
+        Ok(())
+    }
+
+    /// Gathers the rows of `batch` at `kept_rows`, of row group `group`, after
+    /// the kept rows held, sending every full batch that makes.
+    fn gather_kept_rows(
+        &mut self,
+        batch: &RecordBatch,
+        kept_rows: &[u32],
+        group: usize,
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> dispatch::UnaryResult<()> {
+        let other_schema = self
+            .kept_rows
+            .as_ref()
+            .is_some_and(|accumulator| accumulator.schema() != &batch.schema());
+        if other_schema || self.kept_rows_group != group {
+            self.flush_kept_rows(sender)?;
+        }
+        if other_schema {
+            self.kept_rows = None;
+        }
+        self.kept_rows_group = group;
+        let mut full_batches = Vec::new();
+        let Self {
+            kept_rows: accumulator,
+            allocator,
+            ..
+        } = self;
+        allocator.with(|allocator| {
+            accumulator
+                .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), allocator))
+                .append_batch_by_indices_flushing::<dispatch::UnaryError>(
+                    batch,
+                    kept_rows,
+                    allocator,
+                    &mut |full| {
+                        full_batches.push(full);
+                        Ok(())
+                    },
+                )
+        })?;
+        for full in full_batches {
+            self.send(full, group, sender)?;
+        }
+        Ok(())
     }
 
     /// Emits one batch of the active range, retiring the range once its
@@ -134,13 +225,14 @@ impl Decoder {
         let Some(decoder) = self.active.as_mut() else {
             return Ok(false);
         };
-        let Some(batch) = self
+        let Some(DecodedBatch { batch, kept_rows }) = self
             .allocator
             .with(|allocator| decoder.try_read(allocator))
             .map_err(crate::op_err)?
         else {
             return Ok(false);
         };
+        let group = decoder.row_group_index();
         if decoder.exhausted() {
             let mut decoder = self.active.take().unwrap();
             decoder.finish_range().decoded();
@@ -150,7 +242,13 @@ impl Decoder {
             // still hold.
             self.idle.retain(|idle| !idle.row_group_done());
         }
-        sender.send(batch)?;
+        match kept_rows {
+            Some(kept_rows) => self.gather_kept_rows(&batch, &kept_rows, group, sender)?,
+            None => {
+                self.flush_kept_rows(sender)?;
+                self.send(batch, group, sender)?;
+            }
+        }
         Ok(true)
     }
 }
@@ -191,11 +289,15 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
         }
     }
 
-    fn finish(&mut self, _output: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<bool> {
+    fn finish(&mut self, output: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<bool> {
         // No range arrives after this, so the decoders kept for a next range
         // are done with.
         self.idle.clear();
-        Ok(self.active.is_none())
+        if self.active.is_some() {
+            return Ok(false);
+        }
+        self.flush_kept_rows(output)?;
+        Ok(true)
     }
 }
 
@@ -203,6 +305,7 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
 pub(crate) mod tests {
     use super::*;
     use crate::reading::range_cutter::RangeCutter;
+    use crate::reading::record_batch_metadata::row_index;
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
     use crate::types::filter_mask::FilterMask;
@@ -241,6 +344,7 @@ pub(crate) mod tests {
                 .collect(),
             statistics: Arc::default(),
             num_rows,
+            deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
         })]))
@@ -334,6 +438,7 @@ pub(crate) mod tests {
             columns: vec![column(true, all_dictionary), column(false, false)],
             statistics: Arc::default(),
             num_rows,
+            deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
         })]))
@@ -613,6 +718,84 @@ pub(crate) mod tests {
 
         let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 0)).collect();
         assert_eq!(rows, vec![10, 20, 30, 40, 50]);
+    }
+
+    /// `table` with the `deleted` rows of its one row group marked deleted.
+    fn with_deleted_rows(mut table: Arc<ParquetTable>, deleted: &[u32]) -> Arc<ParquetTable> {
+        let row_groups = Arc::get_mut(&mut table).unwrap().row_groups_mut();
+        Arc::get_mut(&mut row_groups[0]).unwrap().deleted_rows =
+            Some(deleted.iter().copied().collect());
+        table
+    }
+
+    #[test]
+    fn deleted_rows_are_dropped_from_every_batch() {
+        init_test_free_pool(4);
+        let table = with_deleted_rows(make_test_table(i32_schema(&["a"]), 5), &[1, 3]);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0, 0);
+
+        let out = decode(&table, vec![page], 2, Vec::new());
+
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 0)).collect();
+        assert_eq!(rows, vec![10, 30, 50]);
+    }
+
+    #[test]
+    fn a_batch_fills_up_with_the_rows_kept_past_the_deleted_ones() {
+        init_test_free_pool(4);
+        let table = with_deleted_rows(make_test_table(i32_schema(&["a"]), 5), &[1, 3]);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0, 0);
+
+        let out = decode(&table, vec![page], 3, Vec::new());
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(extract_i32s(&out[0], 0), vec![10, 30, 50]);
+    }
+
+    #[test]
+    fn the_rows_kept_keep_their_row_index() {
+        init_test_free_pool(4);
+        let table = with_deleted_rows(make_test_table(i32_schema(&["a"]), 5), &[1, 3]);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0, 0);
+
+        let ranges = run_unary_to_completion(new_cutter(&table, Vec::new()), vec![page]);
+        let out = run_unary_to_completion(
+            Decoder::new(2, true, Arc::new(WorkerAllocator::new())),
+            ranges,
+        );
+
+        let positions: Vec<u32> = out
+            .iter()
+            .flat_map(|b| row_index(b).values().to_vec())
+            .collect();
+        assert_eq!(positions, vec![0, 2, 4]);
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 0)).collect();
+        assert_eq!(rows, vec![10, 30, 50]);
+    }
+
+    #[test]
+    fn a_batch_deleted_whole_still_carries_its_row_index() {
+        init_test_free_pool(4);
+        let table = with_deleted_rows(make_test_table(i32_schema(&["a"]), 5), &[0, 1]);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30, 40, 50]), 5, 0, 0);
+
+        let ranges = run_unary_to_completion(new_cutter(&table, Vec::new()), vec![page]);
+        let out = run_unary_to_completion(
+            Decoder::new(2, true, Arc::new(WorkerAllocator::new())),
+            ranges,
+        );
+
+        let positions: Vec<u32> = out
+            .iter()
+            .flat_map(|b| row_index(b).values().to_vec())
+            .collect();
+        assert_eq!(positions, vec![2, 3, 4]);
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 0)).collect();
+        assert_eq!(rows, vec![30, 40, 50]);
     }
 
     #[test]
