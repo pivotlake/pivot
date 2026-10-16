@@ -23,12 +23,14 @@ tracing = { workspace = true }
 # from the blocking pool, or on a runtime of this crate's own when there is
 # none; the background refresh is a timer task on the ambient runtime.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+# The bitmap type a decoded deletion vector hands over to the parquet engine.
+roaring = { workspace = true }
 # Spec metadata and the REST catalog client. Every
 # file is read through Pivot's ring and caches, not the catalog's storage layer.
 # Pinned to our fork's branch off the 0.11.x release branch, the first with
-# the format version 3 deletion-vector work, plus the commit making its
-# `delete_vector` module public (apache/iceberg-rust#3461), until a release
-# carries both.
+# the format version 3 deletion-vector work, plus the commits making its
+# `delete_vector` module public (apache/iceberg-rust#3461) and handing out a
+# vector's bitmap, until a release carries them.
 iceberg = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
 iceberg-catalog-rest = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
 # The REST client's reqwest carries no TLS backend of its own; a catalog behind

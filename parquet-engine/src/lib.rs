@@ -88,7 +88,9 @@ pub use values::{
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata, RowSelection};
+    use crate::types::metadata::{
+        DeletedRows, QueryRowGroupMetadata, RowGroupMetadata, RowSelection,
+    };
     use crate::types::table::ParquetTable;
     use arrow_schema::Schema;
     use dispatch::io::{LocalFile, OpenFile};
@@ -106,6 +108,17 @@ pub(crate) mod test_utils {
             deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    /// The `deleted` rows, by position in a row group of `num_rows` rows,
+    /// as the row group's deleted rows; `None` when there are none.
+    pub fn deleted_rows(deleted: &[u32], num_rows: i64) -> Option<DeletedRows> {
+        (!deleted.is_empty()).then(|| {
+            DeletedRows::new(
+                Arc::new(deleted.iter().copied().collect()),
+                0..num_rows as u32,
+            )
         })
     }
 

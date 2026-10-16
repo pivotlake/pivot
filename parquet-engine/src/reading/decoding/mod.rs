@@ -306,6 +306,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::reading::range_cutter::RangeCutter;
     use crate::reading::record_batch_metadata::row_index;
+    use crate::test_utils::deleted_rows;
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
     use crate::types::filter_mask::FilterMask;
@@ -723,8 +724,8 @@ pub(crate) mod tests {
     /// `table` with the `deleted` rows of its one row group marked deleted.
     fn with_deleted_rows(mut table: Arc<ParquetTable>, deleted: &[u32]) -> Arc<ParquetTable> {
         let row_groups = Arc::get_mut(&mut table).unwrap().row_groups_mut();
-        Arc::get_mut(&mut row_groups[0]).unwrap().deleted_rows =
-            Some(deleted.iter().copied().collect());
+        let row_group = Arc::get_mut(&mut row_groups[0]).unwrap();
+        row_group.deleted_rows = deleted_rows(deleted, row_group.num_rows);
         table
     }
 

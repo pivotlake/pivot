@@ -122,7 +122,7 @@ impl LoadedTable {
         let mut footers = self.read_footers(&files)?;
         for (footer, deleted) in footers.iter_mut().zip(deletion_vectors) {
             if let Some(deleted) = deleted {
-                footer.mark_deleted_rows(deleted.iter());
+                footer.mark_deleted_rows(deleted);
             }
         }
         let row_groups: Vec<_> = footers

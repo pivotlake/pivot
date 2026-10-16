@@ -26,7 +26,7 @@ mod fetcher;
 mod writer;
 
 use crate::types::columns::TableColumns;
-use crate::types::metadata::RowGroupMetadata;
+use crate::types::metadata::{DeletedRows, RowGroupMetadata};
 use dispatch::{
     DataFlowDispatcher, OperatorSpec, RecordBatchOperatorSpec, RootUnaryOperatorFactory,
     UnaryFactory, fan_in,
@@ -49,30 +49,34 @@ pub struct FileRowGroups {
 }
 
 impl FileRowGroups {
-    /// Record the file's deleted rows, given as their positions in the file,
-    /// which the caller has checked against the file's row count, on the row
-    /// groups holding them, so a scan drops them. Only for row groups fresh
-    /// from the footer read, which nothing shares yet.
-    pub fn mark_deleted_rows(&mut self, positions: impl IntoIterator<Item = u64>) {
-        // Each row group's first position in the file, then the file's row count.
-        let mut starts = Vec::with_capacity(self.row_groups.len() + 1);
-        starts.push(0u64);
-        for row_group in &self.row_groups {
-            starts.push(starts.last().unwrap() + row_group.num_rows as u64);
-        }
-        let rows = *starts.last().unwrap();
-        for position in positions {
+    /// Record the rows the file's row-level deletes removed, `deleted` by
+    /// position in the file, on the row groups holding them, so a scan drops
+    /// them. Each shares the bitmap as decoded at its own rows, so no
+    /// position is visited. Only for row groups fresh from the footer read,
+    /// which nothing shares yet.
+    pub fn mark_deleted_rows(&mut self, deleted: RoaringBitmap) {
+        let rows: u64 = self
+            .row_groups
+            .iter()
+            .map(|row_group| row_group.num_rows as u64)
+            .sum();
+        if let Some(last) = deleted.max() {
             assert!(
-                position < rows,
-                "deleted row {position} is past the file's {rows} rows"
+                (last as u64) < rows,
+                "deleted row {last} is past the file's {rows} rows"
             );
-            let row_group = starts.partition_point(|start| *start <= position) - 1;
-            let deleted_rows = &mut Arc::get_mut(&mut self.row_groups[row_group])
+        }
+        let deleted = Arc::new(deleted);
+        let mut start = 0u32;
+        for row_group in &mut self.row_groups {
+            let rows = start..start + row_group.num_rows as u32;
+            start = rows.end;
+            if deleted.range_cardinality(rows.clone()) == 0 {
+                continue;
+            }
+            Arc::get_mut(row_group)
                 .expect("row groups fresh from the footer read are not shared")
-                .deleted_rows;
-            deleted_rows
-                .get_or_insert_with(RoaringBitmap::new)
-                .insert((position - starts[row_group]) as u32);
+                .deleted_rows = Some(DeletedRows::new(deleted.clone(), rows));
         }
     }
 }
@@ -237,10 +241,10 @@ mod tests {
     }
 
     #[test]
-    fn a_deleted_position_lands_on_the_row_group_holding_it() {
+    fn each_row_group_sees_the_deleted_rows_among_its_own() {
         let mut file = file_of_row_groups(&[3, 2, 4]);
 
-        file.mark_deleted_rows([8, 0, 2, 3]);
+        file.mark_deleted_rows([0, 2, 8].into_iter().collect());
 
         let deleted: Vec<Option<Vec<u32>>> = file
             .row_groups
@@ -249,13 +253,10 @@ mod tests {
                 row_group
                     .deleted_rows
                     .as_ref()
-                    .map(|deleted| deleted.iter().collect())
+                    .map(|deleted| deleted.in_range(0..row_group.num_rows as u32).collect())
             })
             .collect();
-        assert_eq!(
-            deleted,
-            vec![Some(vec![0, 2]), Some(vec![0]), Some(vec![3])]
-        );
+        assert_eq!(deleted, vec![Some(vec![0, 2]), None, Some(vec![3])]);
     }
 
     #[test]
@@ -263,6 +264,6 @@ mod tests {
     fn a_position_past_the_file_is_an_invariant_violation() {
         let mut file = file_of_row_groups(&[3, 2]);
 
-        file.mark_deleted_rows([5]);
+        file.mark_deleted_rows([5].into_iter().collect());
     }
 }

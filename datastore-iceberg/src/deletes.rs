@@ -10,6 +10,7 @@ use dispatch::io::FileRange;
 use iceberg::delete_vector::DeleteVector;
 use iceberg::spec::{DataContentType, DataFileFormat, Manifest};
 use object_storage::{FileSlice, load_file_slices};
+use roaring::RoaringBitmap;
 
 use crate::manifests::FileDescriptor;
 use crate::store::TableStore;
@@ -27,16 +28,17 @@ struct DeletionVectorMetadata {
     deleted_row_count: u64,
 }
 
-/// The deletion vector of each of `files`, decoded, among the ones the
-/// delete manifests `manifests` declare: one per file, in order, `None` for
-/// a file without one. The blobs of the files a commit touched share one
-/// Puffin file; only the blobs of `files` are read from it.
+/// The deletion vector of each of `files`, decoded to the positions it
+/// deletes, among the ones the delete manifests `manifests` declare: one per
+/// file, in order, `None` for a file without one. The blobs of the files a
+/// commit touched share one Puffin file; only the blobs of `files` are read
+/// from it.
 pub(crate) fn read_deletion_vectors(
     manifests: Vec<Manifest>,
     files: &[FileDescriptor],
     store: &TableStore,
     dispatcher: &DataFlowDispatcher,
-) -> Result<Vec<Option<DeleteVector>>> {
+) -> Result<Vec<Option<RoaringBitmap>>> {
     let by_data_file = locate_deletion_vectors(manifests)?;
     let metadata: Vec<Option<&DeletionVectorMetadata>> = files
         .iter()
@@ -85,9 +87,24 @@ pub(crate) fn read_deletion_vectors(
                     deleted.len()
                 )));
             }
-            Ok(Some(deleted))
+            deleted_positions(deleted).map(Some).map_err(invalid)
         })
         .collect()
+}
+
+/// The positions `deleted` holds, as the one 32-bit bitmap a deletion vector
+/// has for a file of at most that many rows, which is every Parquet file.
+fn deleted_positions(deleted: DeleteVector) -> std::result::Result<RoaringBitmap, String> {
+    let treemap = deleted.into_treemap();
+    let mut bitmaps = treemap.bitmaps();
+    match (bitmaps.next(), bitmaps.next()) {
+        (None, _) => Ok(RoaringBitmap::new()),
+        (Some((0, bitmap)), None) => Ok(bitmap.clone()),
+        _ => Err(format!(
+            "it deletes rows past the {} a file holds at most",
+            u32::MAX as u64 + 1
+        )),
+    }
 }
 
 /// How many rows the deletion vectors the delete manifests `manifests`

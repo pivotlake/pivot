@@ -141,7 +141,7 @@ impl Nullary<RecordBatch> for EmptyProjectionScan {
 mod tests {
     use super::*;
     use crate::reading::record_batch_metadata::row_index;
-    use crate::test_utils::dummy_row_group;
+    use crate::test_utils::{deleted_rows, dummy_row_group};
     use crate::types::metadata::RowGroupMetadata;
     use dispatch::Dispatch;
 
@@ -156,7 +156,7 @@ mod tests {
             .map(|(index, (rows, deleted))| {
                 Arc::new(RowGroupMetadata {
                     num_rows: *rows,
-                    deleted_rows: (!deleted.is_empty()).then(|| deleted.iter().copied().collect()),
+                    deleted_rows: deleted_rows(deleted, *rows),
                     file_row_group_idx: index,
                     ..(*dummy).clone()
                 })

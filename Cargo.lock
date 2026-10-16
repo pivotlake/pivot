@@ -1849,6 +1849,7 @@ dependencies = [
  "parquet-engine",
  "planner",
  "reqwest 0.12.28",
+ "roaring",
  "serde_json",
  "testcontainers",
  "thiserror 2.0.18",
@@ -2872,7 +2873,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#12007f8e7c1ef4a3f4b08de0e3d45c30a1e944d7"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2931,7 +2932,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#12007f8e7c1ef4a3f4b08de0e3d45c30a1e944d7"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2951,7 +2952,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#12007f8e7c1ef4a3f4b08de0e3d45c30a1e944d7"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2961,7 +2962,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#12007f8e7c1ef4a3f4b08de0e3d45c30a1e944d7"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
 dependencies = [
  "anyhow",
  "async-trait",

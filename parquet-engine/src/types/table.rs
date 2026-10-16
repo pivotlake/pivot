@@ -978,6 +978,7 @@ pub fn is_variant_field(field: &Field) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::deleted_rows;
     use crate::types::metadata::ColumnStatistics;
     use arrow_array::{
         BinaryViewArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, Scalar,
@@ -1044,10 +1045,8 @@ mod tests {
         writer.close().unwrap();
         let mut table = ParquetTable::from_files(test_dispatcher(), &[path], &[]).unwrap();
         for (row_group, rows) in table.row_groups_mut().iter_mut().zip(deleted) {
-            if !rows.is_empty() {
-                Arc::get_mut(row_group).unwrap().deleted_rows =
-                    Some(rows.iter().copied().collect());
-            }
+            let row_group = Arc::get_mut(row_group).unwrap();
+            row_group.deleted_rows = deleted_rows(rows, row_group.num_rows);
         }
         (dir, table)
     }

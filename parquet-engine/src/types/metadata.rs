@@ -14,6 +14,7 @@ use arrow_array::{Array, ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use dispatch::io::OpenFile;
 use roaring::RoaringBitmap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -148,11 +149,11 @@ pub struct RowGroupMetadata {
     pub(crate) statistics: Arc<FileStatistics>,
     /// Total number of rows in this row group, deleted ones included.
     pub num_rows: i64,
-    /// The rows a table format's row-level deletes removed, by position in
-    /// the row group; `None` when it has none. The file still holds them: the
-    /// scan decodes them and drops them before a batch leaves the decoder,
-    /// and a count or bound read from the footer discounts them.
-    pub deleted_rows: Option<RoaringBitmap>,
+    /// The rows a table format's row-level deletes removed; `None` when it
+    /// has none. The file still holds them: the scan decodes them and drops
+    /// them before a batch leaves the decoder, and a count or bound read from
+    /// the footer discounts them.
+    pub deleted_rows: Option<DeletedRows>,
     /// Index of this row group within its Parquet file. Note that this should
     /// not be conflated with the row group's *global* index, which is simply
     /// its position in the table's flat `row_groups` list.
@@ -166,13 +167,62 @@ pub struct RowGroupMetadata {
     pub live_decompressed_pages: Arc<AtomicUsize>,
 }
 
+/// The rows of one row group a table format's row-level deletes removed: a
+/// window onto the file's deleted rows, which every row group of the file
+/// shares as decoded, at the row group's own rows in the file. Rows in and
+/// out are positions in the row group.
+#[derive(Clone)]
+pub struct DeletedRows {
+    file_rows: Arc<RoaringBitmap>,
+    /// The row group's rows, as positions in the file.
+    rows: Range<u32>,
+}
+
+impl DeletedRows {
+    /// The deleted rows of the row group holding the file's `rows`, among
+    /// the `file_rows` the file's deletes removed.
+    pub fn new(file_rows: Arc<RoaringBitmap>, rows: Range<u32>) -> Self {
+        Self { file_rows, rows }
+    }
+
+    /// How many of the row group's rows are deleted.
+    pub fn count(&self) -> u64 {
+        self.file_rows.range_cardinality(self.rows.clone())
+    }
+
+    /// How many of the row group's `rows` are deleted.
+    pub fn count_in(&self, rows: Range<u32>) -> u64 {
+        self.file_rows.range_cardinality(self.in_file(rows))
+    }
+
+    /// The deleted rows among the row group's `rows`, ascending.
+    pub fn in_range(&self, rows: Range<u32>) -> impl Iterator<Item = u32> + '_ {
+        let start = self.rows.start;
+        self.file_rows
+            .range(self.in_file(rows))
+            .map(move |position| position - start)
+    }
+
+    /// Whether the row group's `row` is deleted.
+    pub fn contains(&self, row: u32) -> bool {
+        debug_assert!(row < self.rows.len() as u32);
+        self.file_rows.contains(self.rows.start + row)
+    }
+
+    /// The row group's `rows` as positions in the file.
+    fn in_file(&self, rows: Range<u32>) -> Range<u32> {
+        debug_assert!(rows.end <= self.rows.len() as u32);
+        self.rows.start + rows.start..self.rows.start + rows.end
+    }
+}
+
 impl RowGroupMetadata {
     /// How many of this row group's rows a scan returns: those not deleted.
     pub fn live_rows(&self) -> i64 {
         let deleted = self
             .deleted_rows
             .as_ref()
-            .map_or(0, |deleted| deleted.len() as i64);
+            .map_or(0, |deleted| deleted.count() as i64);
         self.num_rows - deleted
     }
 

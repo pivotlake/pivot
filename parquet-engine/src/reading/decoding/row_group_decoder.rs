@@ -330,12 +330,12 @@ impl RowGroupDecoder {
             Some(deleted) if matches!(self.metadata.selection(), RowSelection::All) => deleted,
             _ => return None,
         };
-        if deleted.range_cardinality(rows.clone()) == 0 {
+        if deleted.count_in(rows.clone()) == 0 {
             return None;
         }
         let mut kept = BooleanBufferBuilder::new(rows.len());
         kept.append_n(rows.len(), true);
-        for position in deleted.range(rows.clone()) {
+        for position in deleted.in_range(rows.clone()) {
             kept.set_bit((position - rows.start) as usize, false);
         }
         Some(kept.finish())
