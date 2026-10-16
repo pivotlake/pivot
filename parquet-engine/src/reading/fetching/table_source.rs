@@ -24,6 +24,7 @@ use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{Receiver, RootChannelFactory};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
+use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -85,7 +86,23 @@ fn steal_order(table: &ParquetTable, order: &ScanOrder) -> Vec<usize> {
     });
     let mut result: Vec<usize> = keyed.into_iter().map(|(idx, _)| idx).collect();
     result.extend(unkeyed);
-    result
+    // Row groups whose pages already sit in the decompressed cache go first,
+    // keeping their key order among themselves. An earlier run of the scan
+    // read exactly the row groups its converged boundary could not prune, so
+    // consuming those first brings the boundary to that converged value before
+    // a single uncached row group is judged; the uncached rest then prunes
+    // without touching the disk. Judging them while the boundary is still
+    // loose admits a timing-dependent handful of them each run, each a disk
+    // read. A cold scan has nothing cached and keeps the plain key order.
+    let (cached, uncached): (Vec<usize>, Vec<usize>) = result
+        .into_iter()
+        .partition(|&idx| is_cache_resident(&table.row_groups[idx]));
+    cached.into_iter().chain(uncached).collect()
+}
+
+/// Whether any of the row group's pages are in the decompressed cache.
+fn is_cache_resident(row_group: &RowGroupMetadata) -> bool {
+    row_group.live_decompressed_pages.load(Ordering::Relaxed) > 0
 }
 
 /// Order a plain scan's row groups for handout, by two keys:
@@ -188,6 +205,14 @@ pub struct SpeculationGate {
     /// Row groups still queued, scan-wide (see
     /// [`SpeculationGate::note_claimed`]).
     remaining: AtomicUsize,
+    /// The row groups that were cache-resident when the scan was ordered; they
+    /// lead every queue (see [`steal_order`]).
+    cache_resident: HashSet<usize>,
+    /// How many of `cache_resident` are still queued. Once it reaches zero,
+    /// every further claim is an uncached row group, which waits for the
+    /// cached ones to finish decoding (see
+    /// [`RowGroupInjector::acquire_speculation_ticket`]).
+    cache_resident_remaining: AtomicUsize,
 }
 
 impl SpeculationGate {
@@ -234,10 +259,17 @@ impl RowGroupInjectorFactory {
             .map(|&idx| QueryRowGroupMetadata::new(table, idx, RowSelection::All))
             .collect();
         let speculation = scan_order.map(|_| {
+            let cache_resident: HashSet<usize> = row_groups
+                .iter()
+                .filter(|row_group| is_cache_resident(row_group.get_metadata()))
+                .map(|row_group| row_group.row_group_index)
+                .collect();
             Arc::new(SpeculationGate {
                 outstanding: outstanding_row_groups,
                 admitted_claims: AtomicUsize::new(0),
                 remaining: AtomicUsize::new(row_groups.len()),
+                cache_resident_remaining: AtomicUsize::new(cache_resident.len()),
+                cache_resident,
             })
         });
         for row_group in row_groups {
@@ -388,6 +420,10 @@ impl RowGroupInjector {
     ) -> Option<RowGroupRequest> {
         if let Some(gate) = &self.speculation {
             gate.note_claimed();
+            if gate.cache_resident.contains(&row_group.row_group_index) {
+                gate.cache_resident_remaining
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
         }
         if let Some(filter) = &self.filter
             && !filter(row_group.get_metadata())
@@ -436,6 +472,17 @@ impl RowGroupInjector {
         let Some(speculation) = self.speculation.as_deref() else {
             return Some(SpeculationTicket::Unthrottled);
         };
+        // The cache-resident row groups lead the queues. Once they are all
+        // claimed, the next claim is the first uncached one: hold it until the
+        // cached ones have all been decoded, so the boundary that judges it
+        // has seen everything an earlier run found worth reading (see
+        // [`steal_order`]). A scan with nothing cached never waits here.
+        if !speculation.cache_resident.is_empty()
+            && speculation.cache_resident_remaining.load(Ordering::Relaxed) == 0
+            && speculation.outstanding.load(Ordering::Relaxed) > 0
+        {
+            return None;
+        }
         let allowance = SPECULATION_ALLOWANCE_FLOOR
             .max(speculation.admitted_claims.load(Ordering::Relaxed) / 2);
         if speculation.outstanding.load(Ordering::Relaxed) >= allowance {
@@ -473,6 +520,22 @@ mod tests {
         let order = plain_scan_order(&table, &Projection::columns([]));
 
         assert_eq!(order, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn cache_resident_row_groups_lead_a_top_n_order() {
+        let table = table_of(4);
+        table.row_groups[2]
+            .live_decompressed_pages
+            .store(1, Ordering::Relaxed);
+        let scan_order = ScanOrder {
+            column_idx: 0,
+            descending: false,
+        };
+
+        let order = steal_order(&table, &scan_order);
+
+        assert_eq!(order, vec![2, 0, 1, 3]);
     }
 
     #[test]
