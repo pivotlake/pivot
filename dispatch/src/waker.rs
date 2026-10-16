@@ -404,6 +404,15 @@ impl WakerSet {
         }
     }
 
+    /// Wake one parked worker of `node` and no other: the caller knows that
+    /// node has work queued that only its workers should take. Unlike
+    /// [`notify_one_near`](Self::notify_one_near) this never spills to
+    /// another node, so a caller with nothing to do itself does not wake its
+    /// own siblings into the same nothing. Returns whether a worker was woken.
+    pub fn notify_one_on_node(&self, node: usize) -> bool {
+        self.node_wakers[node].notify_one()
+    }
+
     /// Wake every node group. Cheap when no workers are parked: one atomic
     /// increment and parked-count check per node.
     pub fn notify_all(&self) {

@@ -50,4 +50,4 @@ pub use fetcher::pending_claim_bound;
 
 mod table_source;
 use crate::reading::fetching::fetcher::RowGroupFetcher;
-pub use table_source::RowGroupInjectorFactory;
+pub use table_source::{ClaimRelease, RowGroupInjectorFactory};
