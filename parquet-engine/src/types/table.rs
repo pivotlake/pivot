@@ -258,7 +258,6 @@ pub(crate) fn row_groups_from_metadata(
             num_rows,
             file_row_group_idx: i,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
-            decompressed_pages_node: Arc::new(AtomicUsize::new(usize::MAX)),
         })
         .collect())
 }

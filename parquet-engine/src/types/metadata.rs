@@ -131,11 +131,6 @@ pub struct RowGroupMetadata {
     /// repeated scan consumes what's already decompressed before its own churn
     /// can evict it.
     pub live_decompressed_pages: Arc<AtomicUsize>,
-    /// The NUMA node whose ring memory holds this row group's decompressed
-    /// pages: the node of the worker that inserted the first one, `usize::MAX`
-    /// until then. The scan feed routes a cache-covered row group to this node
-    /// so its pages are read from local memory.
-    pub decompressed_pages_node: Arc<AtomicUsize>,
 }
 
 impl RowGroupMetadata {

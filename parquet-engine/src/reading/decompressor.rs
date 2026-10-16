@@ -147,19 +147,6 @@ impl Decompressor {
                             expected: uncompressed_size,
                         });
                     }
-                    // The first decompressed page fixes the node whose memory
-                    // holds this row group's cache; the scan routes the row
-                    // group there from now on (see the table source).
-                    let _ = page
-                        .row_group
-                        .get_metadata()
-                        .decompressed_pages_node
-                        .compare_exchange(
-                            usize::MAX,
-                            dispatch::worker::current_node(),
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
                     memory_ctx().decompressed_cache().insert(
                         key,
                         serialize_header(&page.header),

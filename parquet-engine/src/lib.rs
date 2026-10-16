@@ -104,7 +104,6 @@ pub(crate) mod test_utils {
             num_rows: 0,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            decompressed_pages_node: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
         })
     }
 
