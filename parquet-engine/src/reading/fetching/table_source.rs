@@ -31,11 +31,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{RowGroupFilter, ScanOrder};
 
-/// The NUMA node a row group is assigned to, by a hash of its stable identity
-/// (its file and its index within that file). Deterministic across queries so
-/// assignment is sticky for as long as the file stays open, and uniform enough
-/// to split any table's row groups evenly across nodes.
+/// The NUMA node a row group is assigned to. A row group with pages in the
+/// decompressed cache goes to the node whose memory holds them: that is where
+/// its last decode ran, which, in a filtered scan with few surviving row
+/// groups, is often not its hash node (an idle node steals them during the
+/// first read). Routing by hash alone then made every later scan of such a row
+/// group read its pages across the interconnect, a 30 percent slowdown that
+/// held for the life of the server and differed from one start to the next.
+/// Otherwise, by a hash of its stable identity (its file and its index within
+/// that file): deterministic across queries so assignment is sticky for as
+/// long as the file stays open, and uniform enough to split any table's row
+/// groups evenly across nodes.
 fn affinity_node(row_group: &RowGroupMetadata, node_count: usize) -> usize {
+    if row_group.live_decompressed_pages.load(Ordering::Relaxed) > 0 {
+        let cached_node = row_group.decompressed_pages_node.load(Ordering::Relaxed);
+        if cached_node < node_count {
+            return cached_node;
+        }
+    }
     let mut hasher = DefaultHasher::new();
     row_group.open_file.hash(&mut hasher);
     row_group.file_row_group_idx.hash(&mut hasher);
@@ -567,6 +580,7 @@ mod tests {
             num_rows: 0,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            decompressed_pages_node: Arc::new(AtomicUsize::new(usize::MAX)),
         })
     }
 
