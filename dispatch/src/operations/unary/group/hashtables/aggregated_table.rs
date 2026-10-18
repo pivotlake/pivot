@@ -32,9 +32,66 @@ use crate::operations::unary::group::output::topk_pruning::{
 use crate::operations::unary::group::values::{AggregationSlot, ArityBody, WorkerContext};
 use ahash::RandomState;
 use arrow_array::RecordBatch;
-use std::cell::UnsafeCell;
-use std::ops::Range;
+use std::cell::{RefCell, UnsafeCell};
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut, Range};
 use std::sync::Arc;
+
+thread_local! {
+    /// This worker's hash scratch buffers between queries (see [`HashScratch`]).
+    static HASH_SCRATCH_POOL: RefCell<Vec<Box<[u64; RECORD_BATCH_SIZE]>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// A worker's per-row hash scratch buffer, recycled through a worker-local
+/// pool rather than allocated for every table.
+///
+/// Every worker builds its table at the same instant a query is dispatched. A
+/// fresh zeroed 64 KB allocation per table at that instant is served by the
+/// allocator as a recycled extent zeroed through `madvise(MADV_DONTNEED)`: a
+/// TLB flush broadcast to every core and a page fault on each page's first
+/// touch, repeated on every worker at once, on every query. Keeping the buffer
+/// on the worker avoids all of it. The scratch is written for a batch's rows
+/// before any of them is read, so a recycled buffer needs no clearing.
+struct HashScratch(ManuallyDrop<Box<[u64; RECORD_BATCH_SIZE]>>);
+
+impl HashScratch {
+    fn take() -> Self {
+        let buffer = HASH_SCRATCH_POOL
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_else(|| {
+                vec![0u64; RECORD_BATCH_SIZE]
+                    .into_boxed_slice()
+                    .try_into()
+                    .expect("the vector has exactly RECORD_BATCH_SIZE elements")
+            });
+        Self(ManuallyDrop::new(buffer))
+    }
+}
+
+impl Drop for HashScratch {
+    fn drop(&mut self) {
+        // Safety: the buffer is taken exactly once, here, and `self.0` is never
+        // touched again.
+        let buffer = unsafe { ManuallyDrop::take(&mut self.0) };
+        // A thread on its way out has no pool left; the buffer is simply freed.
+        let _ = HASH_SCRATCH_POOL.try_with(|pool| pool.borrow_mut().push(buffer));
+    }
+}
+
+impl Deref for HashScratch {
+    type Target = [u64; RECORD_BATCH_SIZE];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for HashScratch {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// Table capacity at which eligible keys switch to radix scatter.
 const SWITCH_THRESHOLD: usize = 32768;
@@ -226,7 +283,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Radix threshold and partition count.
     radix_config: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
-    hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    hashes: HashScratch,
     /// Per-worker reusable key-extraction scratch (e.g. the row extractor's
     /// encode buffers). Lent to the reader each batch and reused, never
     /// reallocated. `()` for extractors that read columns directly.
@@ -264,10 +321,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             scatter_raw: false,
             rows_since_clear: 0,
             radix_config,
-            hashes: vec![0u64; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
+            hashes: HashScratch::take(),
             scratch: K::Scratch::default(),
             zero_hash_seen: false,
         }
