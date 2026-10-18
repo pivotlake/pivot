@@ -13,9 +13,8 @@ use crate::operations::unary::group::{GroupLimit, Result};
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
-use crossbeam_deque::{Injector, Steal};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// One node's merge sources: its switched workers' scatter buffers and its
 /// workers' in-place stacks.
@@ -84,7 +83,7 @@ unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for SharedMergeS
 /// [`SharedMergeState`], plus which node's sources to read on a hierarchical merge.
 ///
 /// Created by the final worker to reach the gather barrier and pushed to the
-/// node's [`Injector`] for work-stealing execution. Each job merges one node's
+/// node's [`Injector`](crossbeam_deque::Injector) for work-stealing execution. Each job merges one node's
 /// source tables for partition `index` into one result table. On a direct
 /// merge (`SharedMergeState::cross_node` is `None`) that result is the partition's
 /// final table and its rows are emitted directly. On a hierarchical merge,
@@ -105,15 +104,22 @@ unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionJob
 /// One partition's pending cross-node merge: each node's job sends the node's
 /// merged aggregated table; the send that completes the set hands every
 /// node's table back to that caller, electing it to run the final merge
-/// ([`merge::merge_node_aggregated_tables`]) and emit. Senders never block
-/// and no job ever waits: the mailbox is a lock-free queue and the election
-/// is one atomic countdown.
+/// ([`merge::merge_node_aggregated_tables`]) and emit. No job ever waits:
+/// each node writes its own slot and the election is one atomic countdown.
+/// The slots are a plain array because one of these exists per partition,
+/// created by one worker while every other waits for the jobs: a queue per
+/// partition allocated a block each, and at a thousand partitions that was
+/// milliseconds on the critical path.
 pub(super) struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    node_tables: Injector<MultiSlabTable<K::Persisted, V>>,
+    /// One slot per node, `None` until that node's job sends its table.
+    node_tables: Box<[NodeTableSlot<K, V>]>,
     /// Sends still outstanding; the sender that decrements this to zero is
     /// the receiver.
     pending_sends: AtomicUsize,
 }
+
+/// A node's slot in a [`CrossNodeMerge`]: its merged table once sent.
+type NodeTableSlot<K, V> = Mutex<Option<MultiSlabTable<<K as KeyExtractor>::Persisted, V>>>;
 
 unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for CrossNodeMerge<K, V> {}
 unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for CrossNodeMerge<K, V> {}
@@ -121,33 +127,38 @@ unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for CrossNodeMer
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
     fn new(node_count: usize) -> Self {
         Self {
-            node_tables: Injector::new(),
+            node_tables: (0..node_count).map(|_| Mutex::new(None)).collect(),
             pending_sends: AtomicUsize::new(node_count),
         }
     }
 
-    /// Send this node's merged table. Exactly one call - the last - returns
-    /// the full set; that caller must run the final merge. Each sender's push
-    /// happens-before its countdown decrement, and the last sender's
-    /// decrement observes all of them, so the drain below is guaranteed to
-    /// see every node's table (and after the election nobody else touches
-    /// the queue).
+    /// Send `node`'s merged table. Exactly one call - the last - returns the
+    /// full set, in node order; that caller must run the final merge. Each
+    /// sender's slot write happens-before its countdown decrement, and the
+    /// last sender's decrement observes all of them, so every slot it reads
+    /// is filled (and after the election nobody else touches the slots).
     fn send(
         &self,
+        node: usize,
         table: MultiSlabTable<K::Persisted, V>,
     ) -> Option<Vec<MultiSlabTable<K::Persisted, V>>> {
-        self.node_tables.push(table);
+        *self.node_tables[node]
+            .lock()
+            .expect("a cross-node merge slot is never poisoned") = Some(table);
         if self.pending_sends.fetch_sub(1, Ordering::AcqRel) != 1 {
             return None;
         }
-        let mut all = Vec::new();
-        loop {
-            match self.node_tables.steal() {
-                Steal::Success(table) => all.push(table),
-                Steal::Empty => return Some(all),
-                Steal::Retry => continue,
-            }
-        }
+        Some(
+            self.node_tables
+                .iter()
+                .map(|slot| {
+                    slot.lock()
+                        .expect("a cross-node merge slot is never poisoned")
+                        .take()
+                        .expect("every node sent its table before the last send")
+                })
+                .collect(),
+        )
     }
 }
 
@@ -223,7 +234,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
                 // never pay for one.
                 let cross_node =
                     cells[self.index].get_or_init(|| CrossNodeMerge::new(shared.sources.len()));
-                match cross_node.send(result_map) {
+                match cross_node.send(self.node, result_map) {
                     // Another node's job for this partition is still running;
                     // it will receive the tables and run the final merge.
                     None => return Ok(()),

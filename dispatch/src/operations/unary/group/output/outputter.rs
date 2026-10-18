@@ -403,12 +403,22 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
             emit_count(1, sender).map_err(unary::Error::from)?;
         }
 
+        // Until the jobs are published there is nothing to claim. Checking
+        // the flag first keeps the workers that reach this phase early (every
+        // pass, until the dataflow finishes) polling a line nobody writes
+        // until the publication, instead of the queue heads the publishing
+        // worker is pushing into: with the whole pool reading those lines,
+        // each of its pushes took microseconds and a thousand-partition merge
+        // started milliseconds late, by an amount that varied with how many
+        // workers happened to be awake.
+        if !self.partition_jobs_injected.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         // Claim a job, trying the own node's queue first (its sources are
         // node-local), then other nodes' queues so a node that finished its
         // share helps with the tail instead of idling. The plain-load
-        // `is_empty` pre-checks keep the drained-queue polls (every pass
-        // until the dataflow finishes) from pinning a crossbeam epoch each
-        // time.
+        // `is_empty` pre-checks keep the drained-queue polls from pinning a
+        // crossbeam epoch each time.
         let queue_count = self.injectors.len();
         let mut steal = Steal::Empty;
         for offset in 0..queue_count {
@@ -433,16 +443,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
                     .map_err(unary::Error::from)?;
             }
             Steal::Empty => {
-                if self.partition_jobs_injected.load(Ordering::Acquire) {
-                    // Queue drained: emit this worker's last partial batch.
-                    if let (Some(acc), Some(allocator)) = (
-                        self.output_accumulator.as_mut(),
-                        self.output_allocator.as_mut(),
-                    ) {
-                        acc.flush(allocator, sender).map_err(unary::Error::from)?;
-                    }
-                    return Ok(true);
+                // Queues drained: emit this worker's last partial batch.
+                if let (Some(acc), Some(allocator)) = (
+                    self.output_accumulator.as_mut(),
+                    self.output_allocator.as_mut(),
+                ) {
+                    acc.flush(allocator, sender).map_err(unary::Error::from)?;
                 }
+                return Ok(true);
             }
             Steal::Retry => {}
         }
