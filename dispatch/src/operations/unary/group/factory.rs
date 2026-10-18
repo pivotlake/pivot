@@ -50,6 +50,8 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     topk_threshold: Arc<TopKThreshold>,
     /// Pool-wide bin totals every worker adds its own into at the gather barrier.
     shared_bin_totals: Arc<SharedBinTotals>,
+    /// Set by the first worker to switch to radix (see `AggregatedTable`).
+    radix_switched: Arc<AtomicBool>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
@@ -68,7 +70,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
     ) -> impl IntoIterator<Item = GroupFactory<K, V>> {
         let key_arena = SharedArena::new(buffers);
         let value_arena = SharedArena::new(buffers);
-        let hash_state = RandomState::new();
+        // A fixed seed, as the join uses: the distinct-count sketch that sizes
+        // the merge reads the same hashes, and with a seed drawn per query its
+        // estimate of the same data moved by its sampling error from one run
+        // to the next, far enough to pick a different merge partition count.
+        // Group keys come from stored data, so hash flooding is no concern.
+        let hash_state = RandomState::with_seeds(0, 0, 0, 0);
+        let radix_switched = Arc::new(AtomicBool::new(false));
         let injectors = Arc::new(
             (0..topology.node_count)
                 .map(|_| Injector::new())
@@ -100,6 +108,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             radix,
             topk_threshold: topk_threshold.clone(),
             shared_bin_totals: shared_bin_totals.clone(),
+            radix_switched: radix_switched.clone(),
         })
     }
 }
@@ -125,6 +134,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
             self.radix,
             self.topk_threshold,
             self.shared_bin_totals,
+            self.radix_switched,
         ))
     }
 }

@@ -262,6 +262,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         radix: RadixConfig,
         topk_threshold: Arc<TopKThreshold>,
         shared_bin_totals: Arc<SharedBinTotals>,
+        radix_switched: Arc<AtomicBool>,
     ) -> Self {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
         let value_output_types: Arc<[DataType]> =
@@ -284,6 +285,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
             shared_context.worker(),
             radix,
             output::topk_pruning::prunable_topk_slot(output_limit, &value_slots),
+            radix_switched,
         );
         Self {
             key_cols,
@@ -463,6 +465,7 @@ mod tests {
         let gather = Arc::new(GatherBarrier::new(worker_count));
         let topk_threshold = Arc::new(TopKThreshold::for_limit(output_limit));
         let shared_bin_totals = Arc::new(SharedBinTotals::new(1));
+        let radix_switched = Arc::new(AtomicBool::new(false));
 
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
@@ -481,6 +484,7 @@ mod tests {
                     radix,
                     topk_threshold.clone(),
                     shared_bin_totals.clone(),
+                    radix_switched.clone(),
                 )
             })
             .collect();
@@ -801,6 +805,7 @@ mod tests {
         let gather = Arc::new(GatherBarrier::new(worker_count));
         let topk_threshold = Arc::new(TopKThreshold::for_limit(None));
         let shared_bin_totals = Arc::new(SharedBinTotals::new(1));
+        let radix_switched = Arc::new(AtomicBool::new(false));
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
                 Group::<RowKeyExtractor, V>::new(
@@ -818,6 +823,7 @@ mod tests {
                     radix,
                     topk_threshold.clone(),
                     shared_bin_totals.clone(),
+                    radix_switched.clone(),
                 )
             })
             .collect();

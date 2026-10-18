@@ -36,6 +36,7 @@ use std::cell::{RefCell, UnsafeCell};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut, Range};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 thread_local! {
     /// This worker's hash scratch buffers between queries (see [`HashScratch`]).
@@ -221,8 +222,12 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     pub tables: Vec<MultiSlabTable<K::Persisted, V>>,
     /// Per-partition scatter buffers, present only after a radix transition.
     pub buffers: Option<PartitionBuffers<K::Persisted, V>>,
-    /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
-    pub hll: Hll,
+    /// Distinct-count sketch over the worker's rows, for sizing the merge
+    /// targets. Present for a worker that switched to radix mode and for one
+    /// that flushed after any worker had; absent only while no worker had
+    /// switched by the time this one flushed, and then its groups are counted
+    /// exactly from its tables.
+    pub hll: Option<Hll>,
     /// Whether this worker built top-k hash-bin totals (returned beside this output
     /// by [`AggregatedTable::flush`] and added into the pool-wide totals
     /// before the gather).
@@ -256,8 +261,21 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     tables: Vec<MultiSlabTable<K::Persisted, V>>,
     /// Per-partition buffers allocated on the first radix transition.
     buffers: Option<Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>>,
-    /// Distinct-count sketch used to size merge targets.
-    hll: Hll,
+    /// Distinct-count sketch used to size merge targets. Created on the radix
+    /// transition, or at flush once any worker of the query has switched (see
+    /// `radix_switched`): while nobody switches, every worker's groups are
+    /// counted exactly from its tables, and a sketch nobody fills would still
+    /// be a page of registers for the merging worker to pick up and free.
+    hll: Option<Hll>,
+    /// Whether any worker of the query has entered radix mode, set by the
+    /// first to do so. Once the merge is going to be sized from a sketch, every
+    /// worker folds its keys into one, so the merged sketch covers every key
+    /// exactly once and the estimate depends on the data alone, not on which
+    /// workers happened to switch: a count of an in-place worker's groups
+    /// added to the sketch of the others counts their shared keys twice, by a
+    /// margin that moved the merge's partition count across a power of two
+    /// from one run of the same query to the next.
+    radix_switched: Arc<AtomicBool>,
     /// Index into the aggregation slots of the `ORDER BY <agg> DESC LIMIT k`
     /// aggregate of a pushed-down top-k, whose partial values are summed into
     /// the top-k hash-bin totals. Present only when that aggregate is a COUNT
@@ -303,6 +321,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         worker_context: V::WorkerContext,
         radix_config: RadixConfig,
         topk_aggregation_slot: Option<usize>,
+        radix_switched: Arc<AtomicBool>,
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = BaseHashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
@@ -314,7 +333,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             allocator,
             tables: vec![table],
             buffers: None,
-            hll: Hll::new(),
+            hll: None,
+            radix_switched,
             topk_aggregation_slot,
             topk_bin_totals: None,
             switched_to_radix: false,
@@ -567,6 +587,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             && self.tables.last().unwrap().len() * 100
                 >= self.rows_since_clear * self.radix_config.scatter_fallback_distinct_pct;
         self.switched_to_radix = true;
+        self.radix_switched.store(true, Ordering::Relaxed);
         self.rows_since_clear = 0;
         self.create_scatter_buffers();
         self.scatter_active_table_to_radix_partitions();
@@ -615,7 +636,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 key_arena,
                 worker_context,
                 allocator,
-                hll,
+                hll: hll.get_or_insert_with(Hll::new),
                 hashes,
                 shift,
                 start,
@@ -650,6 +671,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         } = self;
         let mut totals =
             topk_aggregation_slot.map(|slot| (topk_bin_totals.as_mut().unwrap(), slot));
+        let hll = hll.get_or_insert_with(Hll::new);
         let table = tables.last_mut().unwrap();
         let buffers = buffers.as_mut().unwrap();
         let scatter_layout =
@@ -673,11 +695,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     /// top-k bin totals beside the output so the caller can fold them into the
     /// pool's shared accumulators before arriving at the gather barrier.
     pub fn flush(mut self) -> (AggregatedTableOutput<K, V>, Option<HashBinTotals>) {
-        if self.switched_to_radix {
-            // Add pre-transition groups to the scatter-side estimate.
+        if self.switched_to_radix || self.radix_switched.load(Ordering::Relaxed) {
+            // Add the in-place groups to the estimate: a switched worker's
+            // pre-transition groups, or all of a worker that stayed in place
+            // while others switched.
+            let hll = self.hll.get_or_insert_with(Hll::new);
             for table in &self.tables {
                 for entry in table.iter(0) {
-                    self.hll.add(entry.hash);
+                    hll.add(entry.hash);
                 }
             }
         }
@@ -1011,6 +1036,7 @@ mod tests {
             (),
             SMALL_RADIX,
             None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         // Unique keys make every post-switch fill 100% distinct, tripping the
@@ -1036,6 +1062,7 @@ mod tests {
             (),
             SMALL_RADIX,
             None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         // Each key repeats twice back to back, so every fill dedups half its
@@ -1060,6 +1087,7 @@ mod tests {
             (),
             SMALL_RADIX,
             Some(0),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         // Deduplicating fills drain into buffers; every drained partial and
@@ -1086,6 +1114,7 @@ mod tests {
             (),
             SMALL_RADIX,
             Some(0),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         // Unique keys make every post-switch fill 100% distinct: the worker

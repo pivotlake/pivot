@@ -146,13 +146,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         let mut buffers_by_node: Vec<Vec<PartitionBuffers<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
         let mut hll = Hll::new();
-        // A worker only folds its keys into the sketch once it switches to
-        // radix; a worker that stayed in-place (`buffers.is_none()`) is absent
-        // from the merged HLL. Add its exact distinct count (each table tracks
-        // its own `len`, no scan) so the estimate below isn't skewed low when
-        // some workers switched and others didn't. Counting a key here that a
-        // switched worker also holds over-counts, which only over-sizes the
-        // merge targets (safe); under-counting is what forces mid-merge resizes.
+        // A worker folds its keys into a sketch once it switches to radix, or
+        // at flush once any worker has, so the merged sketch normally covers
+        // every key. A worker without a sketch flushed before any switch was
+        // visible to it; its exact distinct count (each table tracks its own
+        // `len`, no scan) stands in for its keys so the estimate isn't skewed
+        // low. Counting a key there that a switched worker also holds
+        // over-counts, which only over-sizes the merge targets (safe);
+        // under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
         // Bounds are only valid if every worker holding groups folded its
         // bin totals; a worker that skipped (too small, see the flush) makes them
@@ -163,7 +164,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         let mut raw_bucket_rows: Option<Vec<u64>> = None;
         for out in outputs {
             let table_entries: usize = out.tables.iter().map(|t| t.len()).sum();
-            if out.buffers.is_none() {
+            if out.hll.is_none() {
                 non_switched_groups += table_entries;
             }
             every_group_binned &=
@@ -178,7 +179,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             if let Some(b) = out.buffers {
                 buffers_by_node[out.node].push(b);
             }
-            hll.merge(&out.hll);
+            if let Some(worker_hll) = &out.hll {
+                hll.merge(worker_hll);
+            }
             self.zero_hash_pending |= out.zero_hash_seen;
         }
         let any_switched = buffers_by_node.iter().any(|b| !b.is_empty());
@@ -186,8 +189,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // Estimate the global distinct count: the HLL covers switched
         // workers, and a non-switched worker's exact per-table count stands
         // in for its keys (over-counting keys a switched worker also holds,
-        // which is safe).
-        let estimate = hll.estimate() + non_switched_groups;
+        // which is safe). With nobody switched the sketch is empty and the
+        // count is exact.
+        let estimate = if any_switched {
+            hll.estimate() + non_switched_groups
+        } else {
+            non_switched_groups
+        };
         let (num_partitions, partition_capacity) = if !any_switched {
             // How many entries we want in each table for a partition job
             const TARGET_SCANNED_ENTRIES_PER_JOB: usize = 16 * 1024;
