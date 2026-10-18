@@ -75,10 +75,10 @@ mod aggregate;
 pub use aggregate::AggregateFactory;
 
 pub mod filter;
-pub use filter::FilterFactory;
+pub use filter::WorkerBuiltFilterFactory;
 
 mod map;
-pub use map::MapFactory;
+pub use map::{MapFactory, WorkerBuiltMapFactory};
 
 mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;

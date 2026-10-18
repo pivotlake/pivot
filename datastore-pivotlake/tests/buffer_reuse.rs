@@ -25,7 +25,7 @@ fn dropped_batch_memory_is_reused() {
     let ptrs_clone = ptrs.clone();
 
     table_input(&dispatcher, &table, Projection::columns([1]), false)
-        .project(|| {
+        .project(move || {
             let ptrs = ptrs_clone.clone();
             move |batch: RecordBatch| {
                 ptrs.lock()
@@ -95,7 +95,7 @@ fn decompressed_string_buffer_is_reused() {
     let ptrs_clone = ptrs.clone();
 
     let res = table_input(&dispatcher, &table, Projection::columns([0]), false)
-        .project(|| {
+        .project(move || {
             let ptrs = ptrs_clone.clone();
             move |batch: RecordBatch| {
                 let sv = batch

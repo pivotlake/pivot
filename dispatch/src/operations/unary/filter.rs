@@ -92,6 +92,22 @@ pub enum RowDelivery {
 /// builder passed to [`RecordBatchOperatorSpec::filter`](crate::api::RecordBatchOperatorSpec::filter).
 pub struct FilterFactory<F>(pub F, pub RowDelivery);
 
+/// Factory that builds the per-worker predicate where it runs, on the
+/// worker's own thread (see `WorkerBuiltMapFactory`).
+pub struct WorkerBuiltFilterFactory<FB>(pub std::sync::Arc<FB>, pub RowDelivery);
+
+impl<F, FB> UnaryFactory<RecordBatch, RecordBatch> for WorkerBuiltFilterFactory<FB>
+where
+    FB: Fn() -> F + Send + Sync + 'static,
+    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send + 'static,
+{
+    type Unary = Filter<F>;
+
+    fn build_unary(self) -> Self::Unary {
+        FilterFactory((self.0)(), self.1).build_unary()
+    }
+}
+
 impl<F> UnaryFactory<RecordBatch, RecordBatch> for FilterFactory<F>
 where
     F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send + 'static,

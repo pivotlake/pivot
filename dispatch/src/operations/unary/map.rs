@@ -10,9 +10,31 @@
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::{self, Unary, UnaryFactory};
+use std::sync::Arc;
 
 /// Factory wrapping the per-worker closure.
 pub struct MapFactory<F>(pub F);
+
+/// Factory that builds the per-worker closure where it runs. Every worker's
+/// factory shares one builder and calls it on the worker's own thread when
+/// the dataflow is built there, so a stage of many expressions constructs
+/// its evaluators on all workers at once instead of once per worker on the
+/// thread compiling the plan, where a wide projection spent milliseconds.
+pub struct WorkerBuiltMapFactory<FB>(pub Arc<FB>);
+
+impl<I, O, F, FB> UnaryFactory<I, O> for WorkerBuiltMapFactory<FB>
+where
+    FB: Fn() -> F + Send + Sync + 'static,
+    F: FnMut(I) -> O + Send + 'static,
+    I: 'static,
+    O: 'static,
+{
+    type Unary = Map<F>;
+
+    fn build_unary(self) -> Self::Unary {
+        Map { func: (self.0)() }
+    }
+}
 
 impl<I, O, F> UnaryFactory<I, O> for MapFactory<F>
 where
