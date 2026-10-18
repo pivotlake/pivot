@@ -28,16 +28,51 @@ use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
-use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
+use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker, waker_set};
 use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Live per-worker dataflows across the pool.
 ///
 /// Dirty-buffer cleanup waits for zero to avoid competing with a running query.
 static LIVE_DATAFLOWS: AtomicUsize = AtomicUsize::new(0);
+
+/// How long the pool stays idle after its last dataflow instance finishes
+/// before workers start zeroing the query's returned buffers.
+///
+/// The last instance to finish is also the moment the query's result leaves
+/// the server. The client waiting for it wakes on some core, and every core
+/// has a worker pinned to it; the scheduler lets a running task finish its
+/// slice (milliseconds) before a thread woken onto its core runs, so zeroing
+/// that starts the instant the pool goes idle holds the client's receipt of
+/// the result back by a random fraction of a slice. Waiting a little lets the
+/// client collect its result first. The zeroing still runs long before the
+/// next query arrives in the common case, and a query that arrives sooner
+/// simply finds some buffers still dirty, which every allocation accepts.
+const DIRTY_BUFFER_ZEROING_GRACE: Duration = Duration::from_millis(2);
+
+/// When the pool last went idle, in nanoseconds since [`process_start`].
+static LAST_POOL_IDLE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+fn process_start() -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+fn nanos_since_process_start() -> u64 {
+    process_start().elapsed().as_nanos() as u64
+}
+
+/// Time left in the zeroing grace period, or `None` once it has passed.
+fn zeroing_grace_remaining() -> Option<Duration> {
+    let idle_since = Duration::from_nanos(LAST_POOL_IDLE_NANOS.load(Ordering::Relaxed));
+    let now = Duration::from_nanos(nanos_since_process_start());
+    DIRTY_BUFFER_ZEROING_GRACE.checked_sub(now.saturating_sub(idle_since))
+}
 
 /// Spin budget while a **dataflow is in flight** but this worker momentarily has
 /// nothing to do (waiting on a pipeline-stage barrier / for a sibling to produce
@@ -397,16 +432,17 @@ impl Worker {
 
     /// Decrements the pool-wide count after a dataflow instance is dropped.
     ///
-    /// When the count reaches zero, wake parked workers so they can zero the
-    /// query's returned buffers before the next query. Returning a buffer does
-    /// not wake its home worker, which may already be parked.
+    /// When the count reaches zero the pool is idle; the time is recorded so
+    /// the zeroing of the query's returned buffers can wait out
+    /// [`DIRTY_BUFFER_ZEROING_GRACE`]. Parked workers are woken for it once
+    /// the grace has passed (see [`Self::clear_dirty_buffer_or_park`]);
+    /// returning a buffer does not wake its home worker on its own.
     ///
     /// The dataflow must be dropped before this call so all of its buffers are
-    /// in the free pools when workers wake. See
-    /// [`Self::clear_dirty_buffer_or_park`].
+    /// in the free pools by the time workers zero them.
     fn release_live_dataflow(&self) {
         if LIVE_DATAFLOWS.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.waker.notify();
+            LAST_POOL_IDLE_NANOS.store(nanos_since_process_start(), Ordering::Relaxed);
         }
     }
 
@@ -440,16 +476,37 @@ impl Worker {
         //
         // Ideally, we would do cleanup also when you have dataflows above a certain
         // threshold of dirty buffers - but we don't have that implemented yet.
-        if LIVE_DATAFLOWS.load(Ordering::Relaxed) == 0
-            && let Some(b) = memory_ctx().pop_dirty_buffer()
-        {
-            b.zero_out();
+        if LIVE_DATAFLOWS.load(Ordering::Relaxed) == 0 {
+            if let Some(remaining) = zeroing_grace_remaining() {
+                // The pool has only just gone idle: sleep out the grace period
+                // (see `DIRTY_BUFFER_ZEROING_GRACE`) before any cleanup. A new
+                // dataflow's notify cuts the sleep short. If instead the grace
+                // runs out untouched, bring the whole pool back so every worker
+                // zeros its own returned buffers; most of them parked when their
+                // share of the query finished and would otherwise sleep on them
+                // until the next query.
+                let seen = self.waker.wait_if_unchanged_for(
+                    self.last_seen_wake_count,
+                    self.node_local_idx,
+                    remaining,
+                );
+                if seen == self.last_seen_wake_count {
+                    waker_set().notify_all();
+                }
+                self.last_seen_wake_count = seen;
+                self.waker
+                    .finish_delegated_wake(&mut self.last_seen_broadcast);
+                return;
+            }
+            if let Some(b) = memory_ctx().pop_dirty_buffer() {
+                b.zero_out();
 
-            // Bound work per pass: zero one buffer, then hand
-            // control back to the main loop so a newly-arrived
-            // dataflow / new stealable work isn't starved behind
-            // a long cleanup run.
-            return;
+                // Bound work per pass: zero one buffer, then hand
+                // control back to the main loop so a newly-arrived
+                // dataflow / new stealable work isn't starved behind
+                // a long cleanup run.
+                return;
+            }
         }
 
         // Spin-before-park, but only while a dataflow is in flight. Parking on

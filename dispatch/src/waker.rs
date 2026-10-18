@@ -12,7 +12,6 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, Thread};
-#[cfg(not(any(debug_assertions, feature = "unbounded-park")))]
 use std::time::Duration;
 
 thread_local! {
@@ -302,6 +301,31 @@ impl WorkerWaker {
             return self.wake_count.load(Ordering::SeqCst);
         }
         park();
+        if slot.parked.swap(false, Ordering::SeqCst) {
+            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.wake_count.load(Ordering::SeqCst)
+    }
+
+    /// Like [`wait_if_unchanged`](Self::wait_if_unchanged), but the park gives
+    /// up after `timeout`. Returns the current wake count either way; a count
+    /// equal to `last_seen` means nobody notified during the wait.
+    pub fn wait_if_unchanged_for(
+        &self,
+        last_seen: u64,
+        local_idx: usize,
+        timeout: Duration,
+    ) -> u64 {
+        let slot = &self.slots[local_idx];
+        slot.parked.store(true, Ordering::SeqCst);
+        self.parked_workers.fetch_add(1, Ordering::SeqCst);
+        if self.wake_count.load(Ordering::SeqCst) != last_seen {
+            if slot.parked.swap(false, Ordering::SeqCst) {
+                self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            }
+            return self.wake_count.load(Ordering::SeqCst);
+        }
+        thread::park_timeout(timeout);
         if slot.parked.swap(false, Ordering::SeqCst) {
             self.parked_workers.fetch_sub(1, Ordering::SeqCst);
         }
