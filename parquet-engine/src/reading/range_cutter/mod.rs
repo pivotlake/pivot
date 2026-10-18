@@ -19,6 +19,7 @@ pub use row_group_pages::DecodeRange;
 
 use crate::reading::decoding::leaf_decoders::{BuiltDictionary, LeafDecoder};
 use crate::reading::decoding::{DecodePlan, ScanEqualityPredicate, WorkerAllocator};
+use crate::reading::fetching::ClaimRelease;
 use crate::types::page::{DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
 use ahash::{HashMap, HashSet};
@@ -37,12 +38,12 @@ pub struct RangeCutterFactory {
     /// its fetcher; decremented as row groups are cut or pruned so the
     /// fetcher's claim backpressure releases (see `RowGroupFetcher`).
     pub pending_row_groups: Arc<AtomicUsize>,
-    /// The scan's claimed-but-not-yet-decoded row-group count, shared with
-    /// the row-group injector, which throttles the speculative claims of an
-    /// unarmed Top-N scan against it. A row group counts until its last
+    /// What a claimed row group releases once decoded: its slot in the
+    /// scan's speculation allowance, which throttles the speculative claims
+    /// of an unarmed Top-N scan. A row group holds its slot until its last
     /// range is decoded, on whichever worker; one that is pruned or empty
-    /// is released here.
-    pub outstanding_row_groups: Arc<AtomicUsize>,
+    /// releases it here.
+    pub claim_release: ClaimRelease,
     /// The worker's allocator for the dictionaries it builds.
     pub allocator: Arc<WorkerAllocator>,
 }
@@ -55,7 +56,7 @@ impl UnaryFactory<DecompressedPage, DecodeRange> for RangeCutterFactory {
             self.projection,
             self.eq_predicates,
             self.pending_row_groups,
-            self.outstanding_row_groups,
+            self.claim_release,
             self.allocator,
         )
     }
@@ -83,7 +84,7 @@ pub struct RangeCutter {
     /// arriving late for one is dropped.
     closed: HashSet<usize>,
     pending_row_groups: Arc<AtomicUsize>,
-    outstanding_row_groups: Arc<AtomicUsize>,
+    claim_release: ClaimRelease,
 }
 
 impl RangeCutter {
@@ -91,7 +92,7 @@ impl RangeCutter {
         projection: Projection,
         eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
         pending_row_groups: Arc<AtomicUsize>,
-        outstanding_row_groups: Arc<AtomicUsize>,
+        claim_release: ClaimRelease,
         allocator: Arc<WorkerAllocator>,
     ) -> Self {
         Self {
@@ -101,7 +102,7 @@ impl RangeCutter {
             open: HashMap::default(),
             closed: HashSet::default(),
             pending_row_groups,
-            outstanding_row_groups,
+            claim_release,
         }
     }
 
@@ -118,8 +119,8 @@ impl RangeCutter {
     }
 
     /// Forgets `row_group_index`: its pages from here on are dropped. A row
-    /// group closed with no range to decode is released from the scan's
-    /// outstanding count here, as no decoder will.
+    /// group closed with no range to decode releases its claim here, as no
+    /// decoder will.
     fn close(&mut self, row_group_index: usize) {
         let open = self
             .open
@@ -128,7 +129,7 @@ impl RangeCutter {
         self.closed.insert(row_group_index);
         self.release_claim();
         if open.pages.range_count() == 0 || open.pages.metadata().is_pruned() {
-            self.outstanding_row_groups.fetch_sub(1, Ordering::Relaxed);
+            self.claim_release.release();
         }
     }
 
@@ -175,8 +176,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
             let leaf_decoders = plan
                 .create_leaf_decoders(&metadata)
                 .map_err(crate::op_err)?;
-            let pages =
-                RowGroupPages::new(metadata.clone(), plan, self.outstanding_row_groups.clone());
+            let pages = RowGroupPages::new(metadata.clone(), plan, self.claim_release.clone());
             self.open.insert(
                 row_group_index,
                 OpenRowGroup {
@@ -369,7 +369,7 @@ mod tests {
     }
 
     /// The fetcher's claim is released once the row group is cut; the scan's
-    /// outstanding count once its last range is decoded.
+    /// speculation claim once its last range is decoded.
     #[test]
     fn the_claim_is_released_after_the_last_range() {
         init_test_free_pool(4);
@@ -377,21 +377,21 @@ mod tests {
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30]), 3, 0, 0);
         let pending = Arc::new(AtomicUsize::new(1));
-        let outstanding = Arc::new(AtomicUsize::new(1));
+        let (claim_release, gate) = ClaimRelease::over_gate_holding(1);
         let cutter = RangeCutter::new(
             Projection::all_from_schema(table.schema()),
             Arc::new(Vec::new()),
             pending.clone(),
-            outstanding.clone(),
+            claim_release,
             Arc::new(WorkerAllocator::new()),
         );
 
         let mut ranges = run_unary_to_completion(cutter, vec![page]);
 
         assert_eq!(pending.load(Ordering::Relaxed), 0);
-        let before_decode = outstanding.load(Ordering::Relaxed);
+        let before_decode = gate.outstanding_claims();
         ranges.remove(0).decoded();
-        assert_eq!((before_decode, outstanding.load(Ordering::Relaxed)), (1, 0));
+        assert_eq!((before_decode, gate.outstanding_claims()), (1, 0));
     }
 
     /// A dictionary that excludes the pushed-down constant prunes the row
@@ -408,7 +408,7 @@ mod tests {
             Projection::all_from_schema(table.schema()),
             Arc::new(vec![i32_eq_predicate(5)]),
             pending.clone(),
-            Arc::new(AtomicUsize::new(1)),
+            ClaimRelease::none(),
             Arc::new(WorkerAllocator::new()),
         );
 

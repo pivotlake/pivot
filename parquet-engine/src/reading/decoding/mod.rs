@@ -421,7 +421,7 @@ pub(crate) mod tests {
             Projection::all_from_schema(table.schema()),
             Arc::new(eq_predicates),
             Arc::new(AtomicUsize::new(usize::MAX / 2)),
-            Arc::new(AtomicUsize::new(usize::MAX / 2)),
+            crate::reading::fetching::ClaimRelease::none(),
             Arc::new(WorkerAllocator::new()),
         )
     }

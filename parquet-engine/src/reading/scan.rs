@@ -6,6 +6,7 @@
 //! `RootUnaryOperatorFactory`, the channel factories). The stages are: row-group
 //! injection + fetching (source) → index → decompress → decode.
 
+use super::fetching::ClaimRelease;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -35,7 +36,7 @@ pub(crate) fn read_parquet<OF>(
     add_row_group_metadata: bool,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
     pending_row_groups: Vec<Arc<AtomicUsize>>,
-    outstanding_row_groups: Arc<AtomicUsize>,
+    claim_release: ClaimRelease,
 ) -> RecordBatchOperatorSpec
 where
     OF: OperatorFactory<RowGroupBuffer> + Send + 'static,
@@ -71,7 +72,7 @@ where
                     projection: projection.clone(),
                     eq_predicates: eq_predicates.clone(),
                     pending_row_groups: pending,
-                    outstanding_row_groups: outstanding_row_groups.clone(),
+                    claim_release: claim_release.clone(),
                     allocator,
                 })
                 .collect(),
@@ -163,19 +164,17 @@ pub fn table_input_with_filter_and_eq_predicates(
     if projection.indices().is_empty() {
         return empty_projection_scan(dispatcher, table, filter, add_row_group_metadata);
     }
-    // Counts the row groups the whole scan has claimed but not yet cut into
-    // decode ranges. The injector increments it on claim, the range cutters
-    // decrement it, and a Top-N scan throttles its claims against it while
-    // its boundary converges (see `RowGroupInjector`).
-    let outstanding_row_groups = Arc::new(AtomicUsize::new(0));
     let injector = RowGroupInjectorFactory::new(
         table,
         projection.clone(),
         filter,
         scan_order,
-        outstanding_row_groups.clone(),
         dispatcher.topology().node_count,
     );
+    // A Top-N scan throttles its claims against the row groups claimed but
+    // not yet decoded; each decoded row group releases its claim through
+    // this (see `RowGroupInjector`).
+    let claim_release = injector.claim_release();
     let siblings = Arc::new(AtomicUsize::new(n));
     let pending_row_groups = pending_row_group_counters(n);
     // One fetcher handles disk and HTTP row groups, bounding each medium's
@@ -204,7 +203,7 @@ pub fn table_input_with_filter_and_eq_predicates(
         add_row_group_metadata,
         eq_predicates,
         pending_row_groups,
-        outstanding_row_groups,
+        claim_release,
     )
 }
 
@@ -266,7 +265,7 @@ pub fn materialize(
         Arc::new(Vec::new()),
         pending_row_groups,
         // The materializer path claims by explicit row-group requests, not the
-        // injector, so this count is never consulted.
-        Arc::new(AtomicUsize::new(0)),
+        // injector, so there is no speculation allowance to release into.
+        ClaimRelease::none(),
     )
 }

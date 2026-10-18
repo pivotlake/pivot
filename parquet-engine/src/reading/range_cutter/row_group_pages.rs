@@ -10,6 +10,7 @@
 
 use crate::reading::decoding::DecodePlan;
 use crate::reading::decoding::leaf_decoders::SharedDictionary;
+use crate::reading::fetching::ClaimRelease;
 use crate::thrift::general::Encoding;
 use crate::thrift::headers::DataPageHeader;
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
@@ -91,9 +92,8 @@ struct RangeContents {
     columns: Vec<RangeColumn>,
     /// The row group's ranges still to decode, shared by all of them.
     ranges_left: Arc<AtomicUsize>,
-    /// The scan's count of row groups claimed but not yet decoded, released
-    /// with the row group's last range.
-    outstanding_row_groups: Arc<AtomicUsize>,
+    /// The row group's claim, released with its last range.
+    claim_release: ClaimRelease,
 }
 
 impl DecodeRange {
@@ -123,9 +123,7 @@ impl DecodeRange {
     /// its last range.
     pub fn decoded(self) {
         if self.0.ranges_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0
-                .outstanding_row_groups
-                .fetch_sub(1, Ordering::Relaxed);
+            self.0.claim_release.release();
         }
     }
 }
@@ -156,16 +154,16 @@ pub(crate) struct RowGroupPages {
     /// pages for before the range can be decoded.
     rows_needed: Vec<u32>,
     ranges_left: Arc<AtomicUsize>,
-    outstanding_row_groups: Arc<AtomicUsize>,
+    claim_release: ClaimRelease,
 }
 
 impl RowGroupPages {
     /// An empty collection for `metadata`, decoded by `plan`. The row group
-    /// counts in `outstanding_row_groups` until its last range is decoded.
+    /// holds its claim until its last range is decoded.
     pub(crate) fn new(
         metadata: QueryRowGroupMetadata,
         plan: Arc<DecodePlan>,
-        outstanding_row_groups: Arc<AtomicUsize>,
+        claim_release: ClaimRelease,
     ) -> Self {
         let row_group_rows = metadata.num_rows().max(0) as u32;
         let (ranges, rows_needed) = match metadata.selection() {
@@ -202,7 +200,7 @@ impl RowGroupPages {
             ranges_left: Arc::new(AtomicUsize::new(ranges.len())),
             ranges,
             rows_needed,
-            outstanding_row_groups,
+            claim_release,
         }
     }
 
@@ -302,7 +300,7 @@ impl RowGroupPages {
             rows,
             columns,
             ranges_left: self.ranges_left.clone(),
-            outstanding_row_groups: self.outstanding_row_groups.clone(),
+            claim_release: self.claim_release.clone(),
         }))
     }
 
@@ -326,7 +324,7 @@ mod tests {
         let metadata = QueryRowGroupMetadata::new(table, 0, RowSelection::All);
         let plan =
             DecodePlan::new(&metadata, &Projection::all_from_schema(table.schema()), &[]).unwrap();
-        RowGroupPages::new(metadata, Arc::new(plan), Arc::new(AtomicUsize::new(1)))
+        RowGroupPages::new(metadata, Arc::new(plan), ClaimRelease::none())
     }
 
     fn data_page(rows: u32) -> PageContent {

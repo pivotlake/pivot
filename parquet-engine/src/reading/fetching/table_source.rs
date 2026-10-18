@@ -75,7 +75,23 @@ fn steal_order(table: &ParquetTable, order: &ScanOrder) -> Vec<usize> {
     });
     let mut result: Vec<usize> = keyed.into_iter().map(|(idx, _)| idx).collect();
     result.extend(unkeyed);
-    result
+    // Row groups whose pages already sit in the decompressed cache go first,
+    // keeping their key order among themselves. An earlier run of the scan
+    // read exactly the row groups its converged boundary could not prune, so
+    // consuming those first brings the boundary to that converged value before
+    // a single uncached row group is judged; the uncached rest then prunes
+    // without touching the disk. Judging them while the boundary is still
+    // loose admits a timing-dependent handful of them each run, each a disk
+    // read. A cold scan has nothing cached and keeps the plain key order.
+    let (cached, uncached): (Vec<usize>, Vec<usize>) = result
+        .into_iter()
+        .partition(|&idx| is_cache_resident(&table.row_groups[idx]));
+    cached.into_iter().chain(uncached).collect()
+}
+
+/// Whether any of the row group's pages are in the decompressed cache.
+fn is_cache_resident(row_group: &RowGroupMetadata) -> bool {
+    row_group.live_decompressed_pages.load(Ordering::Relaxed) > 0
 }
 
 /// Order a plain scan's row groups for handout, by two keys:
@@ -166,8 +182,8 @@ const SPECULATION_ALLOWANCE_FLOOR: usize = 16;
 pub struct SpeculationGate {
     /// Row groups claimed but not yet fully decoded, scan-wide (incremented on
     /// claim here, decremented as each row group's last decode range is
-    /// decoded, or when it is pruned).
-    outstanding: Arc<AtomicUsize>,
+    /// decoded, or when it is pruned; see [`SpeculationGate::release_claim`]).
+    outstanding: AtomicUsize,
     /// Claims admitted so far. Every admitted claim raises the allowance on
     /// outstanding claims (half this count, floored at
     /// [`SPECULATION_ALLOWANCE_FLOOR`]); pruned claims don't, which is what
@@ -193,6 +209,60 @@ impl SpeculationGate {
             dispatch::waker::waker_set().notify_all();
         }
     }
+
+    /// Release one outstanding claim: its row group was decoded or pruned, or
+    /// a reservation is being given back. Every release wakes one worker near
+    /// `node`. The gate turns a claim away by handing the worker nothing, so a
+    /// turned-away worker parks with no channel send to wake it, and a freed
+    /// slot is exactly what it waits for. Even when nobody is parked the
+    /// wake's count increment matters: a worker turned away a moment ago by
+    /// this very claim, still on its way to park, sees the count move and
+    /// runs another pass instead of sleeping on a slot that is now free.
+    fn release_claim(&self, node: usize) {
+        let before = self.outstanding.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(before > 0, "released a speculation claim never made");
+        dispatch::waker::waker_set().notify_one_near(node);
+    }
+}
+
+/// What a claimed row group releases once it is decoded (or pruned after the
+/// claim): its slot in the scan's speculation allowance, with the wake that
+/// lets a turned-away worker take it (see [`SpeculationGate::release_claim`]).
+/// A scan without a Top-N boundary has no allowance and releases nothing.
+#[derive(Clone)]
+pub struct ClaimRelease(Option<Arc<SpeculationGate>>);
+
+impl ClaimRelease {
+    /// The release of a scan that is not throttled.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Release the claim, waking a worker on the releasing worker's node.
+    pub fn release(&self) {
+        if let Some(gate) = &self.0 {
+            gate.release_claim(dispatch::worker::current_node());
+        }
+    }
+
+    /// A release over a gate that currently holds `outstanding` claims, with
+    /// the gate alongside so a test can read the count back.
+    #[cfg(test)]
+    pub(crate) fn over_gate_holding(outstanding: usize) -> (Self, Arc<SpeculationGate>) {
+        let gate = Arc::new(SpeculationGate {
+            outstanding: AtomicUsize::new(outstanding),
+            admitted_claims: AtomicUsize::new(0),
+            remaining: AtomicUsize::new(0),
+        });
+        (Self(Some(gate.clone())), gate)
+    }
+}
+
+#[cfg(test)]
+impl SpeculationGate {
+    pub(crate) fn outstanding_claims(&self) -> usize {
+        self.outstanding.load(Ordering::Relaxed)
+    }
 }
 
 impl RowGroupInjectorFactory {
@@ -209,7 +279,6 @@ impl RowGroupInjectorFactory {
         projection: Projection,
         filter: Option<RowGroupFilter>,
         scan_order: Option<ScanOrder>,
-        outstanding_row_groups: Arc<AtomicUsize>,
         node_count: usize,
     ) -> Self {
         let row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>> =
@@ -224,7 +293,7 @@ impl RowGroupInjectorFactory {
             .collect();
         let speculation = scan_order.map(|_| {
             Arc::new(SpeculationGate {
-                outstanding: outstanding_row_groups,
+                outstanding: AtomicUsize::new(0),
                 admitted_claims: AtomicUsize::new(0),
                 remaining: AtomicUsize::new(row_groups.len()),
             })
@@ -238,6 +307,12 @@ impl RowGroupInjectorFactory {
             filter,
             speculation,
         }
+    }
+
+    /// The release a decoded row group of this scan performs (see
+    /// [`ClaimRelease`]).
+    pub fn claim_release(&self) -> ClaimRelease {
+        ClaimRelease(self.speculation.clone())
     }
 }
 
@@ -311,6 +386,8 @@ impl Receiver<QueryRowGroupMetadata> for RowGroupInjector {
             while !queue.is_empty() {
                 let held = match ticket.take() {
                     Some(held) => held,
+                    // A refusal means the scan is throttled; no queue has
+                    // anything to offer until a claim is released.
                     None => self.acquire_speculation_ticket()?,
                 };
                 match queue.steal() {
@@ -342,14 +419,18 @@ enum SpeculationTicket<'a> {
     /// The scan is not throttled (no Top-N boundary): claims need no
     /// reservation.
     Unthrottled,
-    /// A claim's reservation in the speculation allowance.
-    Reserved(&'a SpeculationGate),
+    /// A claim's reservation in the speculation allowance, taken by a worker
+    /// of `node`.
+    Reserved {
+        gate: &'a SpeculationGate,
+        node: usize,
+    },
 }
 
 impl Drop for SpeculationTicket<'_> {
     fn drop(&mut self) {
-        if let SpeculationTicket::Reserved(gate) = self {
-            gate.outstanding.fetch_sub(1, Ordering::Relaxed);
+        if let SpeculationTicket::Reserved { gate, node } = self {
+            gate.release_claim(*node);
         }
     }
 }
@@ -379,7 +460,7 @@ impl RowGroupInjector {
         {
             return None;
         }
-        if let SpeculationTicket::Reserved(gate) = &ticket {
+        if let SpeculationTicket::Reserved { gate, .. } = &ticket {
             // The ticket becomes the claim's outstanding count (released when
             // the row group is decoded). While throttled the
             // pool is mostly parked (gated claims are no-op passes) and a
@@ -427,10 +508,16 @@ impl RowGroupInjector {
             return None;
         }
         if speculation.outstanding.fetch_add(1, Ordering::Relaxed) >= allowance {
-            speculation.outstanding.fetch_sub(1, Ordering::Relaxed);
+            // The reservation was visible for a moment and may have turned a
+            // peer away; giving it back goes through the same wake as any
+            // release.
+            speculation.release_claim(self.numa_node_idx);
             return None;
         }
-        Some(SpeculationTicket::Reserved(speculation))
+        Some(SpeculationTicket::Reserved {
+            gate: speculation,
+            node: self.numa_node_idx,
+        })
     }
 }
 
@@ -458,6 +545,37 @@ mod tests {
         let order = plain_scan_order(&table, &Projection::columns([]));
 
         assert_eq!(order, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn a_released_claim_wakes_a_worker() {
+        dispatch::memory::init_test_free_pool(0);
+        let (release, gate) = ClaimRelease::over_gate_holding(2);
+        let wakes_before = dispatch::waker::worker_waker().wake_count();
+
+        release.release();
+
+        assert_eq!(gate.outstanding_claims(), 1);
+        assert_eq!(
+            dispatch::waker::worker_waker().wake_count(),
+            wakes_before + 1
+        );
+    }
+
+    #[test]
+    fn cache_resident_row_groups_lead_a_top_n_order() {
+        let table = table_of(4);
+        table.row_groups[2]
+            .live_decompressed_pages
+            .store(1, Ordering::Relaxed);
+        let scan_order = ScanOrder {
+            column_idx: 0,
+            descending: false,
+        };
+
+        let order = steal_order(&table, &scan_order);
+
+        assert_eq!(order, vec![2, 0, 1, 3]);
     }
 
     #[test]
