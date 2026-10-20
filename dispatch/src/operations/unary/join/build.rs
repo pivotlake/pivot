@@ -1,9 +1,12 @@
 use crate::GatherBarrier;
+use crate::arrays::variant::unshred_batch_variants;
 use crate::memory::{MultiSlabBuffer, SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::unary::join::JoinBuildFilter;
 use crate::operations::unary::join::JoinTable;
-use crate::operations::unary::join::build_rows::{self, BuildRows};
+use crate::operations::unary::join::build_rows::{
+    self, BuildRows, WorkerPartitionRows, WorkerRowStore,
+};
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::key_bitset::{PendingKeyBitset, integer_scalar};
 use crate::operations::unary::join::keys::JoinKey;
@@ -33,8 +36,8 @@ pub(crate) fn partitions_for(worker_count: usize) -> usize {
 
 /// One build-side row, radix-partitioned by `hash`: the full-width key (for
 /// exact match rejection of hash collisions in the probe) and the row's id
-/// within this worker's stored batches, globalized with the worker's base at
-/// scatter time.
+/// within this worker's stored batches of its partition, globalized with the
+/// worker's base for that partition at scatter time.
 #[derive(Clone, Copy)]
 pub(crate) struct BuildTuple<K> {
     hash: u64,
@@ -45,11 +48,12 @@ pub(crate) struct BuildTuple<K> {
 pub(crate) type PartitionBuffers<K> = Vec<SlabVec<BuildTuple<K>>>;
 
 /// Everything one build worker publishes at the gather barrier: its
-/// partitioned tuples, the stored build rows those tuples' ids point into,
-/// whether any build key was null, and its filter-column extremes.
+/// partitioned tuples, the stored build rows those tuples' ids point into
+/// (partitioned the same way), whether any build key was null, and its
+/// filter-column extremes.
 pub(crate) struct BuildWorkerOutput<K: Copy> {
     tuples: PartitionBuffers<K>,
-    build_row_batches: Vec<RecordBatch>,
+    partition_rows: WorkerPartitionRows,
     saw_null_key: bool,
     /// One entry per build filter: this worker's key extremes over its own
     /// batches, computed at seal time on the worker that held them. The final
@@ -67,7 +71,7 @@ pub(crate) struct ColumnExtremes {
 
 impl<K: Copy + Send + 'static> NormalizationBatches for BuildWorkerOutput<K> {
     fn visit_batches_mut(&mut self, visit: &mut dyn FnMut(&mut RecordBatch)) {
-        for batch in &mut self.build_row_batches {
+        for batch in self.partition_rows.iter_mut().flatten() {
             visit(batch);
         }
     }
@@ -87,10 +91,16 @@ pub struct JoinBuildConsumer<
     /// A tuple's partition is its hash shifted down by this: the top
     /// `log2(partitions)` bits.
     partition_shift: u32,
-    /// This worker's build rows, stored as the batches they arrived in. No
-    /// bytes are copied and nothing leaves engine memory: the batches stay
-    /// the arrays the upstream operator produced.
-    build_row_batches: Vec<RecordBatch>,
+    /// This worker's build rows, copied out of the batches they arrived in
+    /// and into batches of its own per partition, so each arriving batch is
+    /// released once consumed.
+    rows: WorkerRowStore,
+    /// Scratch for one consumed batch: each row's hash, and the batch's row
+    /// positions ordered by partition with where each partition's run starts.
+    /// Kept between batches so a build does not allocate per batch.
+    hashes: Vec<u64>,
+    rows_by_partition: Vec<u32>,
+    partition_starts: Vec<usize>,
     slab_allocator: SlabAllocator,
     outputter: O,
     /// Whether this worker saw a null-keyed build row. Published with its
@@ -138,7 +148,10 @@ impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O>
             values: (0..partitions).map(|_| SlabVec::new()).collect(),
             // `partitions` is a power of two, so its trailing zeros are its log2.
             partition_shift: 64 - partitions.trailing_zeros(),
-            build_row_batches: Vec::new(),
+            rows: WorkerRowStore::new(partitions),
+            hashes: Vec::new(),
+            rows_by_partition: Vec::new(),
+            partition_starts: vec![0; partitions + 2],
             slab_allocator: SlabAllocator::new(false),
             outputter,
             saw_null_key: false,
@@ -150,7 +163,7 @@ impl<K: JoinKey, const TRACK_MATCHED_BUILD_ROWS: bool, O>
 /// The smallest (`largest` false) or largest (`largest` true) non-null value
 /// of `column` across `batches`, as a one-element array. `None` when every
 /// value is null or there are no rows.
-fn column_extreme(batches: &[RecordBatch], column: usize, largest: bool) -> Option<ArrayRef> {
+fn column_extreme(batches: &[&RecordBatch], column: usize, largest: bool) -> Option<ArrayRef> {
     let options = SortOptions {
         descending: largest,
         nulls_first: false,
@@ -196,43 +209,105 @@ where
 {
     type Outputter = O;
 
+    /// Hash every row of `batch`, order the rows by partition, and copy each
+    /// partition's rows into its store while generating their tuples.
+    ///
+    /// A null-keyed row can never match, so it gets no tuple. It is still
+    /// stored, where only an outer build's unmatched pass ever reaches it;
+    /// having no partition of its own, it is kept with partition 0's rows. A
+    /// mark join's misses also turn NULL once such a row exists, so seeing
+    /// one is remembered.
     fn consume(&mut self, batch: RecordBatch, _sender: &mut dyn Sender<Out>) -> unary::Result<()> {
         debug!("Consuming build");
-        for (first_row_id, stored) in build_rows::adopt(&mut self.build_row_batches, batch) {
-            let reader = K::make_reader(&stored, &self.key_columns, &self.hash_state);
-            for i in 0..stored.num_rows() {
-                // A null-keyed row can never match, so it gets no tuple. It
-                // stays stored, where only an outer build's unmatched pass
-                // ever reaches it. A mark join's misses also turn NULL once
-                // such a row exists, so remember having seen one.
-                if K::is_null(&reader, i) {
-                    self.saw_null_key = true;
-                    continue;
-                }
-                let key = K::read_stored(&reader, i);
+        // Variant columns are shredded per file, and a partition's rows
+        // accumulate across batches, so every batch takes the one layout
+        // all of them share.
+        let batch = unshred_batch_variants(batch)?;
+        let row_count = batch.num_rows();
+        if row_count == 0 {
+            return Ok(());
+        }
+        let partitions = self.values.len();
+        let null_key_bucket = partitions;
+        let reader = K::make_reader(&batch, &self.key_columns, &self.hash_state);
+
+        // Count the rows of each partition, hashing each row once; the null
+        // keyed rows count in a bucket of their own past the partitions.
+        let counts = &mut self.partition_starts;
+        counts.fill(0);
+        self.hashes.clear();
+        for i in 0..row_count {
+            let bucket = if K::is_null(&reader, i) {
+                self.saw_null_key = true;
+                self.hashes.push(0);
+                null_key_bucket
+            } else {
                 let hash = K::hash_row(&reader, i, &self.hash_state);
-                let partition = (hash >> self.partition_shift) as usize;
-                self.values[partition].push(
-                    &mut self.slab_allocator,
-                    BuildTuple {
-                        hash,
-                        key,
-                        row: first_row_id + i as u64,
-                    },
-                );
+                self.hashes.push(hash);
+                (hash >> self.partition_shift) as usize
+            };
+            counts[bucket + 1] += 1;
+        }
+        // Turn the counts into each bucket's start, then place every row at
+        // its bucket's cursor, so a bucket's rows stay in ascending order.
+        for bucket in 0..=null_key_bucket {
+            counts[bucket + 1] += counts[bucket];
+        }
+        let starts = counts;
+        self.rows_by_partition.resize(row_count, 0);
+        {
+            let mut cursors: Vec<usize> = starts.clone();
+            for i in 0..row_count {
+                let bucket = if K::is_null(&reader, i) {
+                    null_key_bucket
+                } else {
+                    (self.hashes[i] >> self.partition_shift) as usize
+                };
+                self.rows_by_partition[cursors[bucket]] = i as u32;
+                cursors[bucket] += 1;
             }
+        }
+
+        for partition in 0..partitions {
+            let rows = &self.rows_by_partition[starts[partition]..starts[partition + 1]];
+            if rows.is_empty() {
+                continue;
+            }
+            let hashes = &self.hashes;
+            let tuples = &mut self.values[partition];
+            let slab_allocator = &mut self.slab_allocator;
+            self.rows
+                .store(partition, &batch, rows, |run, first_row_id| {
+                    for (offset, &i) in run.iter().enumerate() {
+                        tuples.push(
+                            slab_allocator,
+                            BuildTuple {
+                                hash: hashes[i as usize],
+                                key: K::read_stored(&reader, i as usize),
+                                row: first_row_id + offset as u64,
+                            },
+                        );
+                    }
+                })?;
+        }
+        let null_keyed_rows =
+            &self.rows_by_partition[starts[null_key_bucket]..starts[null_key_bucket + 1]];
+        if !null_keyed_rows.is_empty() {
+            self.rows.store(0, &batch, null_keyed_rows, |_, _| {})?;
         }
         Ok(())
     }
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
         debug!("Running into outputter!");
+        let partition_rows = self.rows.finish()?;
+        let batches: Vec<&RecordBatch> = partition_rows.iter().flatten().collect();
         let filter_extremes = self
             .filter_columns
             .iter()
             .map(|&column| ColumnExtremes {
-                min: column_extreme(&self.build_row_batches, column, false),
-                max: column_extreme(&self.build_row_batches, column, true),
+                min: column_extreme(&batches, column, false),
+                max: column_extreme(&batches, column, true),
             })
             .collect();
         // The key columns stay with this worker for its key bitset pass;
@@ -241,7 +316,7 @@ where
             .filter_columns
             .iter()
             .map(|&column| {
-                self.build_row_batches
+                batches
                     .iter()
                     .map(|batch| batch.column(column).clone())
                     .collect()
@@ -253,7 +328,7 @@ where
         );
         let output = BuildWorkerOutput {
             tuples: self.values,
-            build_row_batches: self.build_row_batches,
+            partition_rows,
             saw_null_key: self.saw_null_key,
             filter_extremes,
         };
@@ -300,7 +375,8 @@ unsafe impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Send
 /// Scatters the gathered tuples of one hash partition into the shared table.
 pub struct PartitionScatterJob<K: Copy + Send> {
     /// This partition's tuples, one entry per build worker, paired with that
-    /// worker's row id base (added to each tuple's local row id).
+    /// worker's row id base for this partition (added to each tuple's local
+    /// row id).
     tuples: Vec<(u64, SlabVec<BuildTuple<K>>)>,
     table: JoinTable<K>,
     arena_offset: usize,
@@ -465,7 +541,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
     fn publish_filter_bounds(&self, worker_outputs: &[BuildWorkerOutput<K>]) {
         let total_rows: usize = worker_outputs
             .iter()
-            .flat_map(|output| output.build_row_batches.iter())
+            .flat_map(|output| output.partition_rows.iter().flatten())
             .map(|batch| batch.num_rows())
             .sum();
         let mut pending_key_bitsets = Vec::with_capacity(self.build_filters.len());
@@ -522,21 +598,24 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
 
     /// Merge the stored build rows and publish them on the shared table.
     /// GatherBarrier returns outputs in worker order, and the merge keeps
-    /// that order, so each worker-local tuple id gets the corresponding row
-    /// base during scatter. An empty merge means an empty build side, and
-    /// the probe then emits nothing. For a build whose side is outer, anti,
-    /// or semi this also allocates one matched flag per row id (gaps
-    /// included); null-keyed rows have no tuple and remain unmatched.
-    /// Returns the row id bases alongside the id space the merged rows
-    /// occupy, which sizes the row arena's width.
+    /// that order within each partition, so each worker-local tuple id gets
+    /// its worker's row base for its partition during scatter. An empty
+    /// merge means an empty build side, and the probe then emits nothing.
+    /// For a build whose side is outer, anti, or semi this also allocates
+    /// one matched flag per row id (gaps included); null-keyed rows have no
+    /// tuple and remain unmatched. Returns the row id bases, per worker and
+    /// partition, alongside the id space the merged rows occupy, which sizes
+    /// the row arena's width.
     fn publish_build_rows(
         &mut self,
         worker_outputs: &mut [BuildWorkerOutput<K>],
-    ) -> unary::Result<(Vec<u64>, usize)> {
+    ) -> unary::Result<(Vec<Vec<u64>>, usize)> {
         let (build_rows, row_bases) = BuildRows::new::<TRACK_MATCHED_BUILD_ROWS>(
             worker_outputs
                 .iter_mut()
-                .map(|output| std::mem::take(&mut output.build_row_batches)),
+                .map(|output| std::mem::take(&mut output.partition_rows))
+                .collect(),
+            self.partitions,
             &self.build_output_indices,
         )?;
         let row_id_space = build_rows::row_id_space(&build_rows.batches);
@@ -577,7 +656,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
     fn inject_partition_jobs(
         &self,
         worker_outputs: &mut [BuildWorkerOutput<K>],
-        row_bases: &[u64],
+        row_bases: &[Vec<u64>],
         partition_sizes: &[usize],
         directory_capacity: usize,
     ) {
@@ -587,8 +666,11 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
             let tuples: Vec<(u64, SlabVec<BuildTuple<K>>)> = worker_outputs
                 .iter_mut()
                 .zip(row_bases)
-                .map(|(output, &row_base)| {
-                    (row_base, std::mem::take(&mut output.tuples[partition]))
+                .map(|(output, worker_bases)| {
+                    (
+                        worker_bases[partition],
+                        std::mem::take(&mut output.tuples[partition]),
+                    )
                 })
                 .collect();
             self.injector.push(PartitionScatterJob {

@@ -74,6 +74,8 @@ const RUN_COPY_MIN_KEPT_SHARE: f64 = 0.875;
 pub struct BatchAccumulator {
     schema: SchemaRef,
     columns: Vec<Box<dyn ColumnAccumulator>>,
+    /// Rows the columns have room for; see [`capacity`](Self::capacity).
+    capacity: usize,
     len: usize,
     /// The positions a mask append gathers by when it keeps too few rows to
     /// copy in runs. Kept between appends so that a selective filter, whose
@@ -82,17 +84,31 @@ pub struct BatchAccumulator {
 }
 
 impl BatchAccumulator {
+    /// A coalescing accumulator: room for a full batch plus a whole input
+    /// batch landing on top of it.
     pub fn new(schema: SchemaRef, allocator: &mut SlabAllocator) -> Self {
+        Self::with_capacity(schema, COALESCING_CAPACITY, allocator)
+    }
+
+    /// An accumulator with room for exactly `capacity` rows, which must be at
+    /// least a full batch so that a caller filling it to capacity always has
+    /// one to take. A caller keeping many accumulators at once sizes them
+    /// this way, since every column reserves its full capacity up front.
+    pub fn with_capacity(
+        schema: SchemaRef,
+        capacity: usize,
+        allocator: &mut SlabAllocator,
+    ) -> Self {
+        assert!(capacity >= RECORD_BATCH_SIZE);
         let columns = schema
             .fields()
             .iter()
-            .map(|field| {
-                create_column_accumulator(field.data_type(), COALESCING_CAPACITY, allocator)
-            })
+            .map(|field| create_column_accumulator(field.data_type(), capacity, allocator))
             .collect();
         Self {
             schema,
             columns,
+            capacity,
             len: 0,
             gather_positions: Vec::new(),
         }
@@ -109,7 +125,7 @@ impl BatchAccumulator {
 
     /// Rows this accumulator can hold before it must be taken.
     pub fn capacity(&self) -> usize {
-        COALESCING_CAPACITY
+        self.capacity
     }
 
     /// The schema this accumulator coalesces into. A batch of a different schema
@@ -144,7 +160,7 @@ impl BatchAccumulator {
         indices: &[u32],
         allocator: &mut SlabAllocator,
     ) {
-        assert!(self.len + indices.len() <= COALESCING_CAPACITY);
+        assert!(self.len + indices.len() <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
             accumulator.append_from_indices(column, indices, self.len, allocator);
         }
@@ -204,7 +220,7 @@ impl BatchAccumulator {
         ids: EncodedRowIds<'_>,
         allocator: &mut SlabAllocator,
     ) {
-        assert!(self.len + ids.len() <= COALESCING_CAPACITY);
+        assert!(self.len + ids.len() <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(columns) {
             accumulator.append_from_batches(column, ids, shift, self.len, allocator);
         }
@@ -224,7 +240,7 @@ impl BatchAccumulator {
         len: usize,
         allocator: &mut SlabAllocator,
     ) {
-        assert!(self.len + len <= COALESCING_CAPACITY);
+        assert!(self.len + len <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
             accumulator.append_from_range(column, start, len, self.len, allocator);
         }
@@ -244,7 +260,7 @@ impl BatchAccumulator {
     ) -> Result<(), E> {
         let mut remaining = indices;
         while !remaining.is_empty() {
-            let room = COALESCING_CAPACITY - self.len;
+            let room = self.capacity - self.len;
             let (chunk, rest) = remaining.split_at(room.min(remaining.len()));
             self.append_batch_by_indices(batch, chunk, allocator);
             if self.has_full_batch() {
@@ -269,7 +285,7 @@ impl BatchAccumulator {
         allocator: &mut SlabAllocator,
         flush: &mut dyn FnMut(RecordBatch) -> Result<(), E>,
     ) -> Result<(), E> {
-        if batch.num_rows() <= COALESCING_CAPACITY - self.len {
+        if batch.num_rows() <= self.capacity - self.len {
             self.append_batch_by_mask(batch, mask, allocator);
             if self.has_full_batch() {
                 let full = self.take_batch(allocator)?;
@@ -279,7 +295,7 @@ impl BatchAccumulator {
         }
         let mut offset = 0;
         while offset < batch.num_rows() {
-            let len = (batch.num_rows() - offset).min(COALESCING_CAPACITY - self.len);
+            let len = (batch.num_rows() - offset).min(self.capacity - self.len);
             self.append_batch_by_mask(
                 &batch.slice(offset, len),
                 &mask.slice(offset, len),
