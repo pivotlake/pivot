@@ -8,7 +8,8 @@
 //!   arrives in one contiguous buffer or scattered across several (see
 //!   [`DictStorage`]).
 //! - `B: ArrayBuilder` — accumulates decoded values into an Arrow array.
-//! - `P: DecodePlain` — reads plain-encoded values from raw page bytes.
+//! - `P: DecodePlain` — reads plain-encoded values from raw page bytes, and
+//!   names the reader of the type's packed encoding.
 //!
 //! Concrete column decoders (e.g. `PrimitiveLeafDecoder`, `BytesViewDecoder`)
 //! are type aliases over `TypedLeafDecoder` with the appropriate type
@@ -18,7 +19,7 @@ use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::levels::decode_def_levels;
 use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::reading::decoding::leaf_decoders::{
-    ArrayBuilder, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
+    ArrayBuilder, DecodePacked, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
     LeafDecoder, Result,
 };
 use crate::thrift::general::Encoding;
@@ -33,11 +34,12 @@ use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-/// Which encoding strategy to use for a data page's values.
+/// Which encoding strategy to use for a data page's values: PLAIN, dictionary
+/// indices, or the column type's own packed encoding.
 pub enum ValueDecoder<P: DecodePlain> {
     Plain(P),
     Rle(RleDecoder),
-    Delta(P::Delta),
+    Packed(P::Packed),
 }
 
 /// Decode `n` values into `builder` (a dictionary page looks each index up in
@@ -54,7 +56,7 @@ fn decode_run<D, P>(
     match decoder {
         ValueDecoder::Plain(p) => p.read(builder, n),
         ValueDecoder::Rle(r) => r.read(builder, dict.expect("No dict available!"), n),
-        ValueDecoder::Delta(d) => d.read(builder, n),
+        ValueDecoder::Packed(d) => d.read(builder, n),
     }
 }
 
@@ -63,7 +65,7 @@ fn skip_run<P: DecodePlain>(decoder: &mut ValueDecoder<P>, n: usize) {
     match decoder {
         ValueDecoder::Plain(p) => p.skip(n),
         ValueDecoder::Rle(r) => r.skip(n),
-        ValueDecoder::Delta(d) => d.skip(n),
+        ValueDecoder::Packed(d) => d.skip(n),
     }
 }
 
@@ -94,7 +96,7 @@ impl DefLevels {
 /// remain in the page, and, for a nullable column, the page's definition
 /// levels (which logical rows are null).
 pub struct ReadPage<P: DecodePlain> {
-    /// Plain or RLE decoder for this page's values.
+    /// The decoder for this page's values, whichever encoding it carries.
     decoder: ValueDecoder<P>,
     /// Filter mask cursor; `None` when the full page is kept.
     running_filter_mask_opt: Option<RunningFilterMask>,
@@ -313,10 +315,10 @@ where
                     data, position, bit_width,
                 )))
             }
-            // The column type decides which delta encoding it can read, so a
-            // page carrying the other one falls through as unsupported.
-            e if e == P::Delta::ENCODING => P::Delta::new(data, position)
-                .map(ValueDecoder::Delta)
+            // The column type decides which packed encoding it can read, so a
+            // page carrying another one falls through as unsupported.
+            e if e == P::Packed::ENCODING => P::Packed::new(data, position)
+                .map(ValueDecoder::Packed)
                 .ok_or(Error::UnsupportedEncoding(e)),
             r => Err(Error::UnsupportedEncoding(r)),
         }

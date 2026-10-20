@@ -259,7 +259,7 @@ where
     T::Native: ReadLeBytes + FromDelta,
 {
     type Builder = PrimitiveBuilder<T>;
-    type Delta = DeltaDecoder<T>;
+    type Packed = DeltaDecoder<T>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {

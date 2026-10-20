@@ -9,7 +9,8 @@
 //! particular Parquet type:
 //!
 //! - [`ArrayBuilder`] — accumulates decoded values and produces an Arrow array.
-//! - [`DecodePlain`] — reads plain-encoded values from raw page bytes.
+//! - [`DecodePlain`] — reads plain-encoded values from raw page bytes, and
+//!   names the [`DecodePacked`] reader of the type's packed encoding.
 //! - [`Dict`] - queries a dictionary for RLE-dictionary pages, built via
 //!   [`DictFromBytes`] or [`DictFromVecBytes`] depending on the dictionary
 //!   page's buffer shape.
@@ -17,9 +18,13 @@
 //! Concrete leaf decoders are type aliases over `TypedLeafDecoder`:
 //! - [`primitive::PrimitiveLeafDecoder`] for fixed-width numeric types.
 //! - [`bytes_view::BytesViewDecoder`] for variable-length string / binary types.
+//! - [`boolean::BooleanLeafDecoder`] for booleans.
 
 mod absent;
 pub use absent::AbsentLeafDecoder;
+
+mod boolean;
+pub use boolean::BooleanLeafDecoder;
 
 pub(crate) mod bytes_view;
 pub use bytes_view::BytesViewDecoder;
@@ -152,12 +157,14 @@ pub use dispatch::arrays::ArrayBuilder;
 pub trait DecodePlain {
     type Builder: ArrayBuilder;
 
-    /// This column type's delta decoder: `DELTA_BINARY_PACKED` for the
-    /// integer and decimal columns, `DELTA_LENGTH_BYTE_ARRAY` for the byte-view
-    /// ones. Construction answers `None` when the page's own type rules the
-    /// encoding out (a float column, or a decimal stored as fixed-length
-    /// bytes), which reports it as unsupported rather than decoding nonsense.
-    type Delta: DecodeDelta<Builder = Self::Builder>;
+    /// This column type's packed decoder, the one encoding besides PLAIN and
+    /// the dictionary that a page of it may carry: `DELTA_BINARY_PACKED` for
+    /// the integer and decimal columns, `DELTA_LENGTH_BYTE_ARRAY` for the
+    /// byte-view ones, `RLE` for booleans. Construction answers `None` when
+    /// the page's own type rules the encoding out (a float column, or a
+    /// decimal stored as fixed-length bytes), which reports it as unsupported
+    /// rather than decoding nonsense.
+    type Packed: DecodePacked<Builder = Self::Builder>;
 
     /// Creates a decoder starting at `position` within `data`.
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self;
@@ -169,12 +176,13 @@ pub trait DecodePlain {
     fn skip(&mut self, size: usize);
 }
 
-/// Reads `DELTA_BINARY_PACKED` values from raw page bytes into an
-/// [`ArrayBuilder`], the delta-encoded counterpart of [`DecodePlain`].
-pub trait DecodeDelta: Sized {
+/// Reads values stored in a column type's packed encoding (packed deltas,
+/// packed lengths, or runs and packed bits) from raw page bytes into an
+/// [`ArrayBuilder`], the counterpart of [`DecodePlain`] for that encoding.
+pub trait DecodePacked: Sized {
     type Builder: ArrayBuilder;
 
-    /// The encoding this decoder reads. A column type has exactly one delta
+    /// The encoding this decoder reads. A column type has exactly one packed
     /// form, so naming it here is what lets the page dispatch pair them up and
     /// reject a page whose encoding does not match the column's type.
     const ENCODING: Encoding;
@@ -186,8 +194,8 @@ pub trait DecodeDelta: Sized {
     /// Decodes `size` values into `builder`.
     fn read(&mut self, builder: &mut Self::Builder, size: usize);
 
-    /// Advances past `size` values. The values are still decoded, because each
-    /// delta is relative to the one before it.
+    /// Advances past `size` values. A delta decoder still decodes them,
+    /// because each delta is relative to the one before it.
     fn skip(&mut self, size: usize);
 }
 

@@ -206,7 +206,7 @@ impl<T: DecimalCarrier, S: DecimalStorage> DecodePlain for DecimalPlainDecoder<T
     // A decimal stored as INT32/INT64 could be delta packed; the storage kinds
     // are read through `DecimalStorage`, which the delta decoder does not go
     // through yet, so such a page reports an unsupported encoding.
-    type Delta = DecimalDeltaDecoder<T, S>;
+    type Packed = DecimalDeltaDecoder<T, S>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {

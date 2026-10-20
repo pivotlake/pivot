@@ -32,7 +32,7 @@ use dispatch::arrays::ArrayBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
 use crate::reading::decoding::leaf_decoders::primitive::PrimitiveBuilder;
-use crate::reading::decoding::leaf_decoders::{DecimalStorage, DecodeDelta};
+use crate::reading::decoding::leaf_decoders::{DecimalStorage, DecodePacked};
 use crate::thrift::general::Encoding;
 
 /// Widest block layout accepted. Writers use four miniblocks of 32 values;
@@ -119,7 +119,7 @@ where
     phantom: PhantomData<T>,
 }
 
-impl<T: ArrowPrimitiveType> DecodeDelta for DeltaDecoder<T>
+impl<T: ArrowPrimitiveType> DecodePacked for DeltaDecoder<T>
 where
     T::Native: FromDelta,
 {
@@ -493,7 +493,7 @@ where
     phantom: PhantomData<S>,
 }
 
-impl<T: ArrowPrimitiveType, S: DecimalStorage> DecodeDelta for DecimalDeltaDecoder<T, S>
+impl<T: ArrowPrimitiveType, S: DecimalStorage> DecodePacked for DecimalDeltaDecoder<T, S>
 where
     T::Native: FromDelta,
 {

@@ -749,6 +749,59 @@ async fn insert_with_a_column_list_fills_only_the_named_columns(#[future] conn: 
     );
 }
 
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn boolean_column_round_trips_through_insert_and_select(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE flags_round_trip (id BIGINT, flag BOOLEAN)")
+        .await
+        .unwrap();
+
+    conn.simple_query("INSERT INTO flags_round_trip VALUES (1, true), (2, false), (3, NULL)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT id, flag FROM flags_round_trip ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("t".into())],
+            vec![Some("2".into()), Some("f".into())],
+            vec![Some("3".into()), None],
+        ]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn boolean_column_serves_as_a_predicate(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE flags_predicate (id BIGINT, flag BOOLEAN)")
+        .await
+        .unwrap();
+    conn.simple_query(
+        "INSERT INTO flags_predicate VALUES (1, true), (2, false), (3, NULL), (4, true)",
+    )
+    .await
+    .unwrap();
+
+    let set = select_rows(
+        &conn,
+        "SELECT id FROM flags_predicate WHERE flag ORDER BY id",
+    )
+    .await;
+    let unset = select_rows(&conn, "SELECT id FROM flags_predicate WHERE NOT flag").await;
+    let unknown = single_value(
+        &conn,
+        "SELECT COUNT(*) FROM flags_predicate WHERE flag IS NULL",
+    )
+    .await;
+
+    assert_eq!(set, vec![vec![Some("1".into())], vec![Some("4".into())]]);
+    assert_eq!(unset, vec![vec![Some("2".into())]]);
+    assert_eq!(unknown, "1");
+}
+
 /// (k BIGINT, id BIGINT) table whose `k` is 3, NULL, 1, 2 for ids 1..=4, so
 /// the id order of a query sorted by `k` shows where the NULL key landed.
 async fn create_null_key_table(client: &Client, table: &str) {

@@ -22,7 +22,7 @@ use dispatch::memory::{MultiBufferReader, ReaderPosition};
 use std::marker::PhantomData;
 
 use crate::reading::decoding::leaf_decoders::delta_binary_packed::DeltaDecoder;
-use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeDelta};
+use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodePacked};
 use crate::thrift::general::Encoding;
 use dispatch::arrays::ViewBuilder;
 
@@ -44,7 +44,7 @@ pub struct DeltaLengthPageDecoder<V: ByteViewType> {
     phantom: PhantomData<V>,
 }
 
-impl<V: ByteViewType> DecodeDelta for DeltaLengthPageDecoder<V> {
+impl<V: ByteViewType> DecodePacked for DeltaLengthPageDecoder<V> {
     type Builder = ViewBuilder<V>;
     const ENCODING: Encoding = Encoding::DELTA_LENGTH_BYTE_ARRAY;
 
@@ -191,7 +191,7 @@ impl<V: ByteViewType> DeltaLengthPageDecoder<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeDelta};
+    use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodePacked};
     use crate::writing::encoder::delta::encode_length_byte_array;
     use arrow_array::types::StringViewType;
     use arrow_array::{Array, StringViewArray};

@@ -261,7 +261,7 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
 
 impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
     type Builder = ViewBuilder<V>;
-    type Delta = DeltaLengthPageDecoder<V>;
+    type Packed = DeltaLengthPageDecoder<V>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {
