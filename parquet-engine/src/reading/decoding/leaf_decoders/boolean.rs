@@ -7,8 +7,8 @@
 //! so it decodes through the shared [`RleDecoder`] against a two-entry table
 //! of `false` and `true`.
 //!
-//! The public type alias [`BooleanLeafDecoder`] wires everything together into
-//! a ready-to-use [`TypedLeafDecoder`].
+//! [`BooleanLeaf`] names these as the column's [`LeafType`], and
+//! [`BooleanLeafDecoder`] is the ready-to-use [`TypedLeafDecoder`] over it.
 
 use std::ops::Index;
 
@@ -20,10 +20,9 @@ use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
 
 use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::reading::decoding::leaf_decoders::{
-    ArrayBuilder, DecodePacked, DecodePlain, Dict, DictFromBytes, DictFromVecBytes,
-    TypedLeafDecoder,
+    ArrayBuilder, DecodeEncoding, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, LeafType,
+    TypedLeafDecoder, Unsupported,
 };
-use crate::thrift::general::Encoding;
 
 /// [`DecodePlain`] implementation for booleans: one bit per value, least
 /// significant bit first.
@@ -72,7 +71,6 @@ impl BooleanPlainDecoder {
 
 impl DecodePlain for BooleanPlainDecoder {
     type Builder = BooleanBuilder;
-    type Packed = BooleanRleDecoder;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {
@@ -107,16 +105,15 @@ const BIT_VALUES: BooleanDict<[bool; 2]> = BooleanDict {
     len: 2,
 };
 
-/// [`DecodePacked`] implementation for an RLE boolean page: the values as an
-/// RLE/bit-packed stream of width 1, read through the dictionary decoder with
-/// [`BIT_VALUES`] standing in for the dictionary.
+/// [`DecodeEncoding`] implementation for an RLE boolean page: the values as
+/// an RLE/bit-packed stream of width 1, read through the dictionary decoder
+/// with [`BIT_VALUES`] standing in for the dictionary.
 pub struct BooleanRleDecoder {
     runs: RleDecoder,
 }
 
-impl DecodePacked for BooleanRleDecoder {
+impl DecodeEncoding for BooleanRleDecoder {
     type Builder = BooleanBuilder;
-    const ENCODING: Encoding = Encoding::RLE;
 
     fn new(data: Vec<Bytes>, mut position: ReaderPosition) -> Option<Self> {
         // The stream's byte length leads it. The page's value count already
@@ -191,19 +188,31 @@ impl DictFromVecBytes for BooleanDict<Vec<bool>> {
     }
 }
 
+/// The [`LeafType`] of a boolean column: its pages are PLAIN bits, runs, or
+/// dictionary indices.
+pub struct BooleanLeaf;
+
+impl LeafType for BooleanLeaf {
+    type Builder = BooleanBuilder;
+
+    type Plain = BooleanPlainDecoder;
+    type DeltaBinaryPacked = Unsupported<BooleanBuilder>;
+    type DeltaLengthByteArray = Unsupported<BooleanBuilder>;
+    type Rle = BooleanRleDecoder;
+
+    type ContiguousDict = BooleanDict<Vec<bool>>;
+    type ScatteredDict = BooleanDict<Vec<bool>>;
+}
+
 /// Ready-to-use column decoder for BOOLEAN leaves.
-pub type BooleanLeafDecoder = TypedLeafDecoder<
-    BooleanDict<Vec<bool>>,
-    BooleanDict<Vec<bool>>,
-    BooleanBuilder,
-    BooleanPlainDecoder,
->;
+pub type BooleanLeafDecoder = TypedLeafDecoder<BooleanLeaf>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::reading::decoding::leaf_decoders::LeafDecoder;
     use crate::test_utils::dummy_metadata;
+    use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
     use crate::types::filter_mask::FilterMask;
     use crate::types::metadata::RowSelection;

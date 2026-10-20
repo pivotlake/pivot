@@ -5,12 +5,14 @@
 //! [`ColumnDecoder`](super::column_decoder::ColumnDecoder) to decode each of a
 //! projected column's leaf column chunks independently. The concrete, generic
 //! implementation lives in [`TypedLeafDecoder`] (in the [`typed`] submodule),
-//! parameterised by three helper traits that together describe how to decode a
-//! particular Parquet type:
+//! parameterised by a [`LeafType`], which names the pieces that together
+//! describe how to decode a particular Parquet type:
 //!
 //! - [`ArrayBuilder`] — accumulates decoded values and produces an Arrow array.
-//! - [`DecodePlain`] — reads plain-encoded values from raw page bytes, and
-//!   names the [`DecodePacked`] reader of the type's packed encoding.
+//! - [`DecodePlain`] — reads plain-encoded values from raw page bytes.
+//! - [`DecodeEncoding`] — reads values stored in one of the other encodings
+//!   (`DELTA_BINARY_PACKED`, `DELTA_LENGTH_BYTE_ARRAY`, `RLE`); a leaf type
+//!   names one decoder per encoding it reads and [`Unsupported`] for the rest.
 //! - [`Dict`] - queries a dictionary for RLE-dictionary pages, built via
 //!   [`DictFromBytes`] or [`DictFromVecBytes`] depending on the dictionary
 //!   page's buffer shape.
@@ -30,10 +32,10 @@ pub(crate) mod bytes_view;
 pub use bytes_view::BytesViewDecoder;
 
 mod decimal;
-pub use decimal::{DecimalStorage, decimal_decoder};
+pub use decimal::decimal_decoder;
 
 pub(crate) mod delta_binary_packed;
-pub use delta_binary_packed::{DecimalDeltaDecoder, DeltaDecoder, FromDelta};
+pub use delta_binary_packed::{DeltaDecoder, DeltaPacking, FromDelta};
 
 mod levels;
 
@@ -51,6 +53,8 @@ use crate::types::page::DecompressedPage;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 use dispatch::memory::{ReaderPosition, SlabAllocator};
+use std::convert::Infallible;
+use std::marker::PhantomData;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -153,18 +157,37 @@ pub trait LeafDecoder {
 // GROUP BY output can share them; re-exported here for the parquet decoders.
 pub use dispatch::arrays::ArrayBuilder;
 
+/// How a leaf column of one type decodes: the builder its values collect in,
+/// a decoder for each encoding its data pages may carry, and the dictionary
+/// its dictionary page builds.
+///
+/// The format defines each encoding for some physical types only, so a leaf
+/// type names [`Unsupported`] for the encodings it never reads, and a page in
+/// one of those reports an unsupported encoding instead of decoding. PLAIN is
+/// the one encoding every type reads. A dictionary page's indices decode
+/// through the dictionary, in whichever of its two representations the page's
+/// buffer shape allowed (see [`DictFromBytes`] and [`DictFromVecBytes`]).
+pub trait LeafType {
+    type Builder: ArrayBuilder;
+
+    type Plain: DecodePlain<Builder = Self::Builder>;
+    type DeltaBinaryPacked: DecodeEncoding<Builder = Self::Builder>;
+    type DeltaLengthByteArray: DecodeEncoding<Builder = Self::Builder>;
+    type Rle: DecodeEncoding<Builder = Self::Builder>;
+
+    /// The dictionary built from a page held in one contiguous buffer.
+    type ContiguousDict: DictFromBytes<Builder = Self::Builder, Item = <Self::Builder as ArrayBuilder>::Element>;
+    /// The dictionary built from a page scattered across buffers.
+    type ScatteredDict: DictFromVecBytes<
+            Builder = Self::Builder,
+            Item = <Self::Builder as ArrayBuilder>::Element,
+            EqConstant = <Self::ContiguousDict as Dict>::EqConstant,
+        >;
+}
+
 /// Reads plain-encoded values from raw page bytes into an [`ArrayBuilder`].
 pub trait DecodePlain {
     type Builder: ArrayBuilder;
-
-    /// This column type's packed decoder, the one encoding besides PLAIN and
-    /// the dictionary that a page of it may carry: `DELTA_BINARY_PACKED` for
-    /// the integer and decimal columns, `DELTA_LENGTH_BYTE_ARRAY` for the
-    /// byte-view ones, `RLE` for booleans. Construction answers `None` when
-    /// the page's own type rules the encoding out (a float column, or a
-    /// decimal stored as fixed-length bytes), which reports it as unsupported
-    /// rather than decoding nonsense.
-    type Packed: DecodePacked<Builder = Self::Builder>;
 
     /// Creates a decoder starting at `position` within `data`.
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self;
@@ -176,19 +199,16 @@ pub trait DecodePlain {
     fn skip(&mut self, size: usize);
 }
 
-/// Reads values stored in a column type's packed encoding (packed deltas,
-/// packed lengths, or runs and packed bits) from raw page bytes into an
-/// [`ArrayBuilder`], the counterpart of [`DecodePlain`] for that encoding.
-pub trait DecodePacked: Sized {
+/// Reads values stored in one of the encodings besides PLAIN and the
+/// dictionary from raw page bytes into an [`ArrayBuilder`]. A [`LeafType`]
+/// names one implementation for each such encoding it reads.
+pub trait DecodeEncoding: Sized {
     type Builder: ArrayBuilder;
 
-    /// The encoding this decoder reads. A column type has exactly one packed
-    /// form, so naming it here is what lets the page dispatch pair them up and
-    /// reject a page whose encoding does not match the column's type.
-    const ENCODING: Encoding;
-
     /// Creates a decoder over a page starting at `position`, reading its
-    /// header. `None` when the encoding does not apply to this column type.
+    /// header. `None` when the leaf type does not read this encoding (see
+    /// [`Unsupported`]) or the header is not one the decoder accepts; either
+    /// way the page reports an unsupported encoding.
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Option<Self>;
 
     /// Decodes `size` values into `builder`.
@@ -197,6 +217,27 @@ pub trait DecodePacked: Sized {
     /// Advances past `size` values. A delta decoder still decodes them,
     /// because each delta is relative to the one before it.
     fn skip(&mut self, size: usize);
+}
+
+/// The decoder a [`LeafType`] names for an encoding it does not read. It has
+/// no values, so it is never constructed, and a page in that encoding is
+/// reported as unsupported.
+pub struct Unsupported<B>(Infallible, PhantomData<fn() -> B>);
+
+impl<B: ArrayBuilder> DecodeEncoding for Unsupported<B> {
+    type Builder = B;
+
+    fn new(_data: Vec<Bytes>, _position: ReaderPosition) -> Option<Self> {
+        None
+    }
+
+    fn read(&mut self, _builder: &mut B, _size: usize) {
+        match self.0 {}
+    }
+
+    fn skip(&mut self, _size: usize) {
+        match self.0 {}
+    }
 }
 
 /// Queries a dictionary for RLE-dictionary-encoded columns.
