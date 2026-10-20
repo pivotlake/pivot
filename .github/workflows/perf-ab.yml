@@ -273,6 +273,33 @@ jobs:
           ssh perf 'command -v ld.lld >/dev/null \
             || sudo DEBIAN_FRONTEND=noninteractive apt-get install -qy lld'
 
+      # Background daemons that preempt the pinned workers. The SSM agent is a
+      # Go program whose runtime keeps a thread per core and collects garbage
+      # in bursts across all of them, and irqbalance rescans and re-pins every
+      # interrupt every ten seconds; on a box whose cores are all taken by
+      # pinned workers, each burst lands on some worker and the whole query
+      # waits for it. Measured on the 48xl: with the agent running, hot
+      # queries of 4 ms ran at either 4.1 or 4.7 ms for minutes at a time, and
+      # at 4.1 ms throughout with it stopped; over five harness runs each, the
+      # worst same-binary pairwise hot score went from 1.020 to 1.013. The
+      # timers fire apt and unattended-upgrades at a random point in the first
+      # hours after a boot, which is when this box is running; they are
+      # stopped as a precaution, not from a measurement. The workflow talks to
+      # the box over ssh, not SSM. Automatic NUMA balancing was measured and
+      # left alone: five runs with it off against five with it on showed no
+      # difference. All settings are per boot; the box is stopped after the
+      # run, so the next start comes back with the AMI's defaults.
+      - name: Stop the box's background daemons for the run
+        run: |
+          set -euo pipefail
+          ssh perf 'sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer \
+              update-notifier-download.timer fwupd-refresh.timer motd-news.timer \
+              man-db.timer sysstat-collect.timer logrotate.timer \
+              systemd-tmpfiles-clean.timer unattended-upgrades.service \
+              snapd.service snapd.socket \
+              snap.amazon-ssm-agent.amazon-ssm-agent.service irqbalance.service \
+              2>/dev/null || true'
+
       - name: Sync both source trees to the box
         run: |
           set -euo pipefail
