@@ -88,6 +88,28 @@ checkout_side() {
 }
 
 # ---------------------------------------------------------------------------
+# The toolchain a checkout pins (rust-toolchain.toml) is not necessarily the
+# one the AMI was baked with. The rustup proxy installs a missing toolchain or
+# component on first use, and two sides building in parallel then race on the
+# same download files and both fail, so install what each checkout pins here,
+# serially, before any build starts. A toolchain already present is a no-op.
+# ---------------------------------------------------------------------------
+install_pinned_toolchain() {
+    local dir="$1" toml="$1/rust-toolchain.toml" channel components
+    [[ -f "$toml" ]] || return 0
+    channel="$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "$toml")"
+    [[ -n "$channel" ]] || return 0
+    mapfile -t components < <(sed -n 's/^components *= *\[\(.*\)\].*/\1/p' "$toml" \
+        | tr ',' '\n' | tr -d '" ' | sed '/^$/d')
+    local args=(toolchain install "$channel" --profile minimal --no-self-update)
+    for component in "${components[@]}"; do
+        args+=(--component "$component")
+    done
+    echo ">>> ensuring toolchain $channel (${components[*]}) for $dir"
+    rustup "${args[@]}" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
 # Dataset sync from S3, one directory per scale under $data_bucket. Meant to
 # run backgrounded so the builds overlap it; each finished scale is marked
 # with a .done sentinel that wait_for_scale blocks on. s5cmd parallelises far
