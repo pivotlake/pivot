@@ -14,7 +14,7 @@ use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 use planner::types::physical_arrow_type;
 
 use crate::columns::table_columns;
-use crate::deletes::{count_deleted_rows, read_deletion_vectors};
+use crate::deletes::{count_deleted_rows, read_deleted_positions};
 use crate::manifests::{DataFiles, FileDescriptor, ManifestList, read_manifests};
 use crate::store::{TableStore, read_vended_s3_credentials};
 use crate::{Error, Result};
@@ -98,7 +98,7 @@ impl LoadedTable {
     }
 
     /// Select files using metadata bounds, then fetch their row groups, with
-    /// the rows their deletion vectors delete marked on them. Manifest order,
+    /// the rows their delete files delete marked on them. Manifest order,
     /// then file-local row-group order, makes the same filters yield the same
     /// row-group positions for scanning and materialization.
     pub(crate) fn load_parquet(&self, filters: &[Expression]) -> Result<ParquetTable> {
@@ -117,10 +117,10 @@ impl LoadedTable {
             .map_err(invalid_partition_metadata)?;
         tracing::debug!(table = %self.name, manifests = selected.data.len(), files = files.len(), "selected Iceberg files");
         let delete_manifests = read_manifests(selected.deletes, &self.store, &self.dispatcher)?;
-        let deletion_vectors =
-            read_deletion_vectors(delete_manifests, &files, &self.store, &self.dispatcher)?;
+        let deleted_positions =
+            read_deleted_positions(delete_manifests, &files, &self.store, &self.dispatcher)?;
         let mut footers = self.read_footers(&files)?;
-        for (footer, deleted) in footers.iter_mut().zip(deletion_vectors) {
+        for (footer, deleted) in footers.iter_mut().zip(deleted_positions) {
             if let Some(deleted) = deleted {
                 footer.mark_deleted_rows(deleted);
             }
@@ -206,9 +206,10 @@ impl LoadedTable {
 
     /// The rows of the data files less the rows their deletion vectors
     /// delete, read from the manifests alone. Older writers may omit counts,
+    /// a position-delete file's rows are not countable without reading them,
     /// and a delete manifest may fail to read or hold a delete file that is
     /// not applied; planning then has no statistic and COUNT uses the
-    /// ordinary scan, which reports what is wrong.
+    /// ordinary scan, which applies the deletes or reports what is wrong.
     pub(crate) fn row_count(&self) -> Option<i64> {
         let rows = self.manifest_list.row_count()?;
         let delete_manifests = read_manifests(
@@ -217,7 +218,7 @@ impl LoadedTable {
             &self.dispatcher,
         )
         .ok()?;
-        let deleted = count_deleted_rows(delete_manifests).ok()?;
+        let deleted = count_deleted_rows(delete_manifests).ok()??;
         rows.checked_sub(i64::try_from(deleted).ok()?)
     }
 

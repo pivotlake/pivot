@@ -11,8 +11,8 @@ use dispatch::DataFlowDispatcher;
 use iceberg::expr::BoundPredicate;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, Literal, Manifest, ManifestContentType,
-    ManifestFile, ManifestList as IcebergManifestList, NestedField, PartitionSpec,
-    PartitionSpecRef, SchemaRef, TableMetadata,
+    ManifestEntry, ManifestFile, ManifestList as IcebergManifestList, ManifestStatus, NestedField,
+    PartitionSpec, PartitionSpecRef, SchemaRef, TableMetadata,
 };
 use iceberg::{ErrorKind, Result};
 use object_storage::load_objects;
@@ -158,30 +158,80 @@ impl ManifestList {
     }
 }
 
-/// Read and parse `manifests`, in the order given.
+/// Read and parse `manifests`, in the order given. A live entry that neither
+/// records a sequence number nor may inherit one is malformed.
 pub(crate) fn read_manifests<'a>(
     manifests: impl IntoIterator<Item = &'a ManifestFile>,
     store: &TableStore,
     dispatcher: &DataFlowDispatcher,
-) -> crate::Result<Vec<Manifest>> {
-    let objects = manifests
-        .into_iter()
+) -> crate::Result<Vec<LoadedManifest>> {
+    let listed: Vec<&ManifestFile> = manifests.into_iter().collect();
+    let objects = listed
+        .iter()
         .map(|manifest| {
             let length = manifest.manifest_length.max(0) as u64;
             store.data_file(&manifest.manifest_path, length)
         })
         .collect::<crate::Result<Vec<_>>>()?;
     let mut parsed = Vec::with_capacity(objects.len());
-    for object in load_objects(dispatcher, &objects)? {
-        let manifest = Manifest::parse_avro(&object.bytes).map_err(|source| {
-            Error::MalformedMetadataObject {
-                path: object.file.path.as_str().to_string(),
-                source: Box::new(source),
+    for (listed, object) in listed.into_iter().zip(load_objects(dispatcher, &objects)?) {
+        let malformed = |source| Error::MalformedMetadataObject {
+            path: object.file.path.as_str().to_string(),
+            source: Box::new(source),
+        };
+        let manifest = Manifest::parse_avro(&object.bytes).map_err(malformed)?;
+        let loaded = LoadedManifest {
+            listed: listed.clone(),
+            manifest,
+        };
+        for entry in loaded.live_entries() {
+            if entry.sequence_number().is_none() && !loaded.inherits_sequence_number(entry) {
+                return Err(malformed(iceberg::Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "existing entry `{}` records no sequence number",
+                        entry.file_path()
+                    ),
+                )));
             }
-        })?;
-        parsed.push(manifest);
+        }
+        parsed.push(loaded);
     }
     Ok(parsed)
+}
+
+/// A manifest read, with the manifest-list entry naming it, which the
+/// manifest's own entries inherit from: a file the manifest's commit added
+/// is written without a sequence number and takes the commit's.
+pub(crate) struct LoadedManifest {
+    pub listed: ManifestFile,
+    pub manifest: Manifest,
+}
+
+impl LoadedManifest {
+    /// The entries whose files are part of the snapshot.
+    pub fn live_entries(&self) -> impl Iterator<Item = &ManifestEntry> {
+        self.manifest
+            .entries()
+            .iter()
+            .filter(|entry| entry.is_alive())
+            .map(|entry| entry.as_ref())
+    }
+
+    /// The data sequence number of `entry`, one of this manifest's: the one
+    /// it records, or the commit's when it records none, which
+    /// [`read_manifests`] checked only an entry allowed to inherit does.
+    pub fn sequence_number(&self, entry: &ManifestEntry) -> i64 {
+        entry
+            .sequence_number()
+            .unwrap_or(self.listed.sequence_number)
+    }
+
+    /// Whether `entry` may leave its sequence number to be inherited: a file
+    /// this manifest's commit added, or any file of the first commit.
+    fn inherits_sequence_number(&self, entry: &ManifestEntry) -> bool {
+        entry.status() == ManifestStatus::Added || self.listed.sequence_number == 0
+    }
 }
 
 /// The manifests among `manifests` whose partition summaries may match the
@@ -249,17 +299,20 @@ fn read_partition_summaries(
     Ok(ranges)
 }
 
-/// Where a data file is and how long, which is all a footer read needs.
+/// Where a data file is and how long, which is all a footer read needs, and
+/// its data sequence number, which decides the delete files applying to it.
 pub(crate) struct FileDescriptor {
     pub path: String,
     pub length: u64,
+    pub sequence_number: i64,
 }
 
 impl FileDescriptor {
-    pub fn of(file: &DataFile) -> Self {
+    pub fn of(file: &LiveFile) -> Self {
         Self {
-            path: file.file_path().to_string(),
-            length: file.file_size_in_bytes(),
+            path: file.data.file_path().to_string(),
+            length: file.data.file_size_in_bytes(),
+            sequence_number: file.sequence_number,
         }
     }
 }
@@ -267,7 +320,7 @@ impl FileDescriptor {
 /// The data files that some of the snapshot's manifests list, in manifest
 /// order.
 pub(crate) struct DataFiles {
-    manifests: Vec<Manifest>,
+    manifests: Vec<LoadedManifest>,
     schema: SchemaRef,
     partition_specs: Vec<PartitionSpecRef>,
 }
@@ -286,11 +339,13 @@ impl DataFiles {
         let parsed = read_manifests(manifests, store, dispatcher)?;
         let mut manifests = Vec::with_capacity(parsed.len());
         for manifest in parsed {
-            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+            for entry in manifest.live_entries() {
                 let file = entry.data_file();
                 if file.content_type() != DataContentType::Data {
                     return Err(Error::DeleteFile {
                         file: file.file_path().to_string(),
+                        content: describe_content(file.content_type()),
+                        format: file.file_format().to_string(),
                     });
                 }
                 if file.file_format() != DataFileFormat::Parquet {
@@ -320,7 +375,7 @@ impl DataFiles {
             pruning::project_filters_per_spec(&self.schema, &self.partition_specs, &row_filters)?;
         let mut selected = Vec::new();
         for manifest in &self.manifests {
-            let partition_spec = &manifest.metadata().partition_spec;
+            let partition_spec = &manifest.manifest.metadata().partition_spec;
             let partition_filter = partition_filters.get(&partition_spec.spec_id());
             for file in list_live_files(manifest) {
                 if file.data.record_count() == 0 {
@@ -334,7 +389,7 @@ impl DataFiles {
                     .iter()
                     .all(|row_filter| pruning::may_match(row_filter, &column_bounds))
                 {
-                    selected.push(FileDescriptor::of(file.data));
+                    selected.push(FileDescriptor::of(&file));
                 }
             }
         }
@@ -351,17 +406,25 @@ impl DataFiles {
 pub(crate) struct LiveFile<'a> {
     pub manifest: &'a Manifest,
     pub data: &'a DataFile,
+    pub sequence_number: i64,
 }
 
-fn list_live_files(manifest: &Manifest) -> impl Iterator<Item = LiveFile<'_>> {
-    manifest
-        .entries()
-        .iter()
-        .filter(|entry| entry.is_alive())
-        .map(move |entry| LiveFile {
-            manifest,
-            data: entry.data_file(),
-        })
+fn list_live_files(loaded: &LoadedManifest) -> impl Iterator<Item = LiveFile<'_>> {
+    loaded.live_entries().map(move |entry| LiveFile {
+        manifest: &loaded.manifest,
+        data: entry.data_file(),
+        sequence_number: loaded.sequence_number(entry),
+    })
+}
+
+/// The kind of file a manifest entry's content type declares, for an error.
+pub(crate) fn describe_content(content: DataContentType) -> String {
+    match content {
+        DataContentType::Data => "a data file",
+        DataContentType::PositionDeletes => "position deletes",
+        DataContentType::EqualityDeletes => "equality deletes",
+    }
+    .to_string()
 }
 
 /// The partition values of `file`: a range for each field of

@@ -122,7 +122,14 @@ fn partitioned_by(schema: &SchemaRef, spec_id: i32, transform: IcebergTransform)
 /// specs are the ones the manifests were written under.
 fn data_files(current: &SchemaRef, manifests: &[Manifest]) -> DataFiles {
     DataFiles {
-        manifests: manifests.to_vec(),
+        manifests: manifests
+            .iter()
+            .enumerate()
+            .map(|(index, manifest)| LoadedManifest {
+                listed: manifest_entry(manifest.metadata().partition_spec.spec_id(), index, None),
+                manifest: manifest.clone(),
+            })
+            .collect(),
         schema: current.clone(),
         partition_specs: manifests
             .iter()
@@ -639,6 +646,48 @@ fn the_estimated_row_count_discounts_the_delete_manifests_row_totals() {
     assert_eq!(estimate(vec![data.clone(), deletes]), Some(5));
     assert_eq!(estimate(vec![data.clone(), too_many_deletes]), Some(0));
     assert_eq!(estimate(vec![data]), Some(9));
+}
+
+#[test]
+fn a_file_added_by_the_manifests_commit_takes_the_commits_sequence_number() {
+    let schema = schema(1, "id", PrimitiveType::Long);
+    let added = file("added.parquet").build().unwrap();
+    let existing = file("existing.parquet").build().unwrap();
+    let manifest = Manifest::new(
+        ManifestMetadata {
+            schema: schema.clone(),
+            schema_id: schema.schema_id(),
+            partition_spec: unpartitioned(&schema),
+            format_version: FormatVersion::V2,
+            content: ManifestContentType::Data,
+        },
+        vec![
+            ManifestEntry::builder()
+                .status(ManifestStatus::Added)
+                .data_file(added)
+                .build(),
+            ManifestEntry::builder()
+                .status(ManifestStatus::Existing)
+                .sequence_number(3)
+                .data_file(existing)
+                .build(),
+        ],
+    );
+    let mut listed = manifest_entry(0, 0, None);
+    listed.sequence_number = 7;
+    let loaded = LoadedManifest { listed, manifest };
+
+    let sequence_numbers: Vec<(String, i64)> = list_live_files(&loaded)
+        .map(|file| (file.data.file_path().to_string(), file.sequence_number))
+        .collect();
+
+    assert_eq!(
+        sequence_numbers,
+        [
+            ("added.parquet".to_string(), 7),
+            ("existing.parquet".to_string(), 3)
+        ]
+    );
 }
 
 #[test]

@@ -26,7 +26,9 @@
 //! ring ([`object_storage::load_objects`]), and deletion vectors as their
 //! blob's range of its Puffin file, so they pass through the compressed cache
 //! and the disk cache exactly as data does: a restarted server finds them on
-//! local disk. A filtered query reads only the manifests whose
+//! local disk. Position-delete files are Parquet, read by the engine like a
+//! data file, and the positions they list for the files a scan reads are
+//! marked on those files' row groups. A filtered query reads only the manifests whose
 //! partition summaries admit its predicates, and only the footers of the files
 //! whose partition values and column bounds do. Data files are Parquet, read
 //! by the same engine that reads every other datastore, with row-group
@@ -58,8 +60,8 @@
 //!
 //! A table is refused, with an error naming the reason, rather than served
 //! partially or wrongly: encryption, a snapshot that carries delete files
-//! other than deletion vectors (position-delete and equality-delete files are
-//! not applied), data files that are not Parquet, and a column whose Iceberg
+//! other than deletion vectors and Parquet position-delete files
+//! (equality-delete files are not applied), data files that are not Parquet, and a column whose Iceberg
 //! type has no Pivot type or whose initial default would require synthesizing
 //! values for older files.
 
@@ -171,11 +173,17 @@ pub enum Error {
         default: String,
     },
     #[error(
-        "delete file `{file}` is not a deletion vector; only deletion vectors are applied, so the table is not served"
+        "delete file `{file}` holds {content} in {format}; only deletion vectors and Parquet position-delete files are applied, so the table is not served"
     )]
-    DeleteFile { file: String },
+    DeleteFile {
+        file: String,
+        content: String,
+        format: String,
+    },
     #[error("the deletion vector for `{file}` is invalid: {message}")]
     DeletionVector { file: String, message: String },
+    #[error("the position-delete file `{file}` is invalid: {message}")]
+    PositionDeleteFile { file: String, message: String },
     #[error("table `{table}` data file `{file}` is {format}; only Parquet data files are read")]
     NonParquetFile {
         table: String,
