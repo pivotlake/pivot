@@ -58,8 +58,10 @@ pub use factory::*;
 
 use crate::data_flow::WorkStatus;
 use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO, ReadResponse};
+use crate::memory::Allocator;
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use thiserror::Error;
@@ -122,6 +124,8 @@ pub enum Error {
     Group(#[from] group::Error),
     #[error("{0}")]
     Io(#[from] crate::io::IORequesterError),
+    #[error("spilling to disk failed: {0}")]
+    Spill(#[from] std::io::Error),
     /// An error from an operator defined outside this crate (e.g. the Parquet
     /// reader, now in `catalog`). Such operators map their own error into this.
     #[error("{0}")]
@@ -227,6 +231,11 @@ pub trait Unary<I, O> {
     /// Wired through the wrapping [`UnaryOperator`] so a transform can ask the
     /// dataflow to abandon its upstream.
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+
+    /// See [`Operator::allocator`].
+    fn allocator(&self) -> Option<Rc<dyn Allocator>> {
         None
     }
 }
@@ -377,6 +386,10 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
 
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         self.unary.upstream_cancel_flag()
+    }
+
+    fn allocator(&self) -> Option<Rc<dyn Allocator>> {
+        self.unary.allocator()
     }
 }
 

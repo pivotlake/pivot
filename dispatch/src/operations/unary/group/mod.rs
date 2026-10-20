@@ -118,6 +118,7 @@ pub use values::{
 };
 
 use crate::gather_barrier::GatherBarrier;
+use crate::memory::Allocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
@@ -128,6 +129,7 @@ use arena::SharedArena;
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType};
 use crossbeam_deque::Injector;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -139,6 +141,8 @@ pub enum Error {
     Arrow(#[from] ArrowError),
     #[error("{0}")]
     Channel(#[from] crate::operations::channels::Error),
+    #[error("GROUP BY had rows evicted to disk, and reading them back is not supported yet")]
+    Evicted,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -329,6 +333,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
     }
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
+        if self.aggregated_table.has_evicted() {
+            return Err(Error::Evicted.into());
+        }
         let (tables, topk_bin_totals) = self.aggregated_table.flush();
         if let Some(totals) = topk_bin_totals {
             self.outputter.add_bin_totals(totals);
@@ -338,12 +345,16 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
         });
         Ok(Some(self.outputter))
     }
+
+    fn allocator(&self) -> Option<Rc<dyn Allocator>> {
+        Some(self.aggregated_table.allocator())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::init_test_free_pool;
+    use crate::memory::{InstantSpiller, init_test_free_pool};
     use crate::operations::unary::group::keys::{
         IntKeyExtractor, IntStrKeyExtractor, StringKeyExtractor,
     };
@@ -454,7 +465,24 @@ mod tests {
         radix: RadixConfig,
     ) -> CollectSender {
         init_test_free_pool(64);
-        let worker_count = worker_batches.len();
+        let groups = create_groups::<K, V>(
+            worker_batches.len(),
+            key_cols,
+            value_slots,
+            output_limit,
+            radix,
+        );
+        run_consumers(groups, worker_batches)
+    }
+
+    /// One `Group` per worker, sharing the state a `GroupFactory` would give them.
+    fn create_groups<K: KeyExtractor<Config: Default>, V: AggregationValue + ?Sized>(
+        worker_count: usize,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        output_limit: Option<GroupLimit>,
+        radix: RadixConfig,
+    ) -> Vec<Group<K, V>> {
         let key_arena = SharedArena::new(64);
         let value_arena = SharedArena::new(64);
         let state = RandomState::new();
@@ -464,7 +492,7 @@ mod tests {
         let topk_threshold = Arc::new(TopKThreshold::for_limit(output_limit));
         let shared_bin_totals = Arc::new(SharedBinTotals::new(1));
 
-        let groups: Vec<_> = (0..worker_count)
+        (0..worker_count)
             .map(|_| {
                 Group::<K, V>::new(
                     key_arena.clone(),
@@ -483,9 +511,52 @@ mod tests {
                     shared_bin_totals.clone(),
                 )
             })
-            .collect();
+            .collect()
+    }
 
-        run_consumers(groups, worker_batches)
+    /// One group over 200,000 distinct keys with a radix config small enough
+    /// to fill several scatter buffers.
+    fn group_with_full_scatter_buffers() -> Group<IntExtractor, CountValue> {
+        init_test_free_pool(64);
+        let small_radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+            ..RadixConfig::DEFAULT
+        };
+        let mut group =
+            create_groups::<IntExtractor, CountValue>(1, vec![0], count_slots(), None, small_radix)
+                .pop()
+                .unwrap();
+        let values: Vec<i32> = (0..200_000).collect();
+        group
+            .consume(batch_with_column(&values), &mut CollectSender::new())
+            .unwrap();
+        group
+    }
+
+    #[test]
+    fn output_is_unaffected_by_a_spill() {
+        let group = group_with_full_scatter_buffers();
+        let allocator = group.allocator().unwrap();
+
+        let spilled = allocator.spill(&mut InstantSpiller).unwrap();
+        let output = group.into_outputter();
+
+        assert!(spilled);
+        assert!(output.is_ok());
+    }
+
+    #[test]
+    fn output_fails_after_an_eviction() {
+        let group = group_with_full_scatter_buffers();
+        let allocator = group.allocator().unwrap();
+
+        allocator.spill(&mut InstantSpiller).unwrap();
+        let evicted = allocator.evict();
+        let output = group.into_outputter();
+
+        assert!(evicted.is_some());
+        assert!(matches!(output, Err(unary::Error::Group(Error::Evicted))));
     }
 
     #[test]

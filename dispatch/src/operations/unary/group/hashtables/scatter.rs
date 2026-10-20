@@ -9,11 +9,17 @@
 //! For a compiled value the layout is fully constant; for a dynamic value the
 //! stride comes from the query. Values are seeded directly in the destination
 //! row either way.
+//!
+//! Chunks are carved from a [`PartitionAllocator`], whose buffers each serve a
+//! range of partitions and can be spilled to disk while the rows in them stay
+//! readable, until the ring takes the buffer's memory back (see
+//! [`crate::memory::SpillBuffer`]).
 
 use super::hash_table::{PersistedKey, entry_layout};
-use crate::memory::{Slab, SlabAllocator};
+use crate::memory::{PartitionAllocator, SpillBuffer};
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// Copyable layout for strided scatter rows.
 ///
@@ -39,71 +45,134 @@ impl<V: AggregationValue + ?Sized> Clone for ScatterLayout<V> {
 }
 impl<V: AggregationValue + ?Sized> Copy for ScatterLayout<V> {}
 
+/// One chunk of rows.
+struct ScatterChunk {
+    /// The buffer the chunk was carved from, and where in it the chunk starts.
+    buffer: Arc<SpillBuffer>,
+    offset: usize,
+    /// Rows in the chunk once it stopped being filled. While the chunk is the
+    /// one being filled, the count lives in `StridedScatterRows::last_rows`.
+    rows: usize,
+}
+
 /// One partition's scatter rows, stored at the hash table entry layout.
 ///
 /// Serves every value: a compiled value's layout is fully constant, a dynamic
 /// value's stride comes from the query. The buffer stores only allocation
 /// state and the current chunk's fill; the caller supplies [`ScatterLayout`].
 pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
-    chunks: Vec<Slab>,
+    chunks: Vec<ScatterChunk>,
     /// Base address of the chunk being filled.
     ///
     /// The push loop hops between thousands of partition buffers in random
     /// order, so their headers are a cache-resident working set and every
     /// field the push touches costs a stalled access. The push therefore
-    /// reads only this base and `last_rows` (adjacent fields), addresses the
-    /// row as `base + last_rows * stride`, and writes back only the
-    /// incremented `last_rows`; fullness is a compare against the caller's
-    /// register-resident layout, not a stored end pointer.
+    /// reads only this base, `last_rows` and `current_chunk_capacity`
+    /// (adjacent fields), addresses the row as `base + last_rows * stride`,
+    /// and writes back only the incremented `last_rows`.
     current_chunk_base: *mut u8,
     /// Rows in the chunk being filled.
     last_rows: usize,
-    /// Rows in all full chunks; maintained only when a chunk fills.
+    /// Rows the chunk being filled holds when full. Zero while there is no
+    /// chunk to fill, so the next push allocates one.
+    current_chunk_capacity: usize,
+    /// Rows in every chunk no longer being filled.
     completed_rows: usize,
+    /// Chunks allocated so far; only the first is small.
+    allocated_chunks: usize,
     // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
     _phantom: PhantomData<(KP, *const V)>,
 }
 
-// SAFETY: cached row pointers refer to address-stable slabs owned by `chunks`.
+// SAFETY: the cached row pointer refers into a buffer owned by `chunks`, whose
+// bytes stay in memory while the chunk is being filled (see `grow`).
 unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for StridedScatterRows<KP, V> {}
 
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
     /// Target allocation size for each chunk.
     const CHUNK_BYTES: usize = 64 * 1024;
 
-    /// Rows the chunk at `index` holds when full.
+    /// Rows the next chunk holds when full.
     #[inline(always)]
-    fn chunk_capacity(layout: ScatterLayout<V>, index: usize) -> usize {
-        if index == 0 {
+    fn next_chunk_capacity(&self, layout: ScatterLayout<V>) -> usize {
+        if self.allocated_chunks == 0 {
             layout.first_chunk_rows
         } else {
             layout.full_chunk_rows
         }
     }
 
-    /// Allocates the next chunk and resets the row count.
-    #[cold]
-    /// The layout is copied by value to keep the caller's copy local.
-    fn grow(&mut self, layout: ScatterLayout<V>, allocator: &mut SlabAllocator) {
-        let rows = Self::chunk_capacity(layout, self.chunks.len());
-        let chunk = allocator.get_aligned_slab(rows * layout.stride, layout.align, false);
-        self.current_chunk_base = chunk.ptr;
-        self.completed_rows += self.last_rows;
-        self.last_rows = 0;
-        self.chunks.push(chunk);
+    /// Whether the last chunk in `chunks` is the one being filled.
+    fn is_filling_a_chunk(&self) -> bool {
+        self.current_chunk_capacity != 0
     }
 
-    /// Visits each chunk with its base address and populated row count.
+    /// Stops filling the current chunk, recording its row count.
+    pub fn finish_current_chunk(&mut self) {
+        if !self.is_filling_a_chunk() {
+            return;
+        }
+        let current = self.chunks.last_mut().expect("a chunk is being filled");
+        current.rows = self.last_rows;
+        self.completed_rows += self.last_rows;
+        self.last_rows = 0;
+        self.current_chunk_capacity = 0;
+    }
+
+    /// Allocates the next chunk and starts filling it.
+    #[cold]
+    /// The layout is copied by value to keep the caller's copy local.
+    fn grow(
+        &mut self,
+        layout: ScatterLayout<V>,
+        allocator: &mut PartitionAllocator,
+        partition: usize,
+    ) {
+        self.finish_current_chunk();
+        let rows = self.next_chunk_capacity(layout);
+        let chunk = allocator.allocate(partition, rows * layout.stride, layout.align);
+        // The pointer stays valid for as long as the chunk is being filled: the
+        // buffer goes to disk only after `finish_chunk_in` stopped the filling,
+        // and its memory is taken back only after it went to disk.
+        self.current_chunk_base = unsafe { chunk.buffer.ptr().add(chunk.offset) };
+        self.current_chunk_capacity = rows;
+        self.allocated_chunks += 1;
+        self.chunks.push(ScatterChunk {
+            buffer: chunk.buffer,
+            offset: chunk.offset,
+            rows: 0,
+        });
+    }
+
+    /// Visits each chunk with its base address and populated row count. The
+    /// chunk's bytes are pinned in memory for the duration of the visit.
     #[inline(always)]
-    fn for_each_chunk(&self, layout: ScatterLayout<V>, mut f: impl FnMut(*mut u8, usize)) {
+    fn for_each_chunk(&self, mut f: impl FnMut(*mut u8, usize)) {
         let chunk_count = self.chunks.len();
         for (index, chunk) in self.chunks.iter().enumerate() {
-            let rows = if index + 1 == chunk_count {
+            let rows = if index + 1 == chunk_count && self.is_filling_a_chunk() {
                 self.last_rows
             } else {
-                Self::chunk_capacity(layout, index)
+                chunk.rows
             };
-            f(chunk.ptr, rows);
+            let in_memory = chunk.buffer.pin().expect(
+                "scatter rows were evicted to disk, and reading them back is not supported yet",
+            );
+            f(unsafe { in_memory.ptr().add(chunk.offset) }, rows);
+        }
+    }
+
+    /// Stops filling the current chunk if it lies in `buffer`, which is about to
+    /// be written to disk, so that the copy on disk holds every row of every
+    /// chunk in it.
+    pub fn finish_chunk_in(&mut self, buffer: &Arc<SpillBuffer>) {
+        let filling_in_buffer = self.is_filling_a_chunk()
+            && Arc::ptr_eq(
+                &self.chunks.last().expect("a chunk is being filled").buffer,
+                buffer,
+            );
+        if filling_in_buffer {
+            self.finish_current_chunk();
         }
     }
 }
@@ -115,7 +184,9 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
             chunks: Vec::new(),
             current_chunk_base: std::ptr::null_mut(),
             last_rows: 0,
+            current_chunk_capacity: 0,
             completed_rows: 0,
+            allocated_chunks: 0,
             _phantom: PhantomData,
         }
     }
@@ -151,22 +222,21 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
         self.completed_rows + self.last_rows
     }
 
-    /// Appends a row and initializes its value in place.
+    /// Appends a row and initializes its value in place. `partition` is the
+    /// partition these rows belong to, which decides the buffer a new chunk
+    /// comes from.
     #[inline(always)]
     pub fn push_with(
         &mut self,
         layout: ScatterLayout<V>,
-        allocator: &mut SlabAllocator,
+        allocator: &mut PartitionAllocator,
+        partition: usize,
         hash: u64,
         key: KP,
         seed: impl FnOnce(&mut V),
     ) {
-        // The capacity compare uses the caller's layout, kept in registers,
-        // so an over-full check costs no buffer-header access.
-        if self.chunks.is_empty()
-            || self.last_rows == Self::chunk_capacity(layout, self.chunks.len() - 1)
-        {
-            self.grow(layout, allocator);
+        if self.last_rows == self.current_chunk_capacity {
+            self.grow(layout, allocator, partition);
         }
         // Field offsets come from the caller's shared layout snapshot.
         unsafe {
@@ -184,7 +254,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
     /// Visits every row in insertion order.
     #[inline(always)]
     pub fn for_each(&self, layout: ScatterLayout<V>, mut f: impl FnMut(u64, &KP, &V)) {
-        self.for_each_chunk(layout, |base, rows| {
+        self.for_each_chunk(|base, rows| {
             let mut row = base;
             for _ in 0..rows {
                 unsafe {
@@ -208,7 +278,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
         layout: ScatterLayout<V>,
         mut f: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>),
     ) {
-        self.for_each_chunk(layout, |base, rows| {
+        self.for_each_chunk(|base, rows| {
             let mut row = base;
             for i in 0..rows {
                 unsafe {

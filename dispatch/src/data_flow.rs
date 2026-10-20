@@ -21,13 +21,15 @@
 
 use crate::Identifier;
 use crate::io::{FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse};
-use crate::operations::{FinishStatus, Operator};
+use crate::memory::{Allocator, Spiller};
+use crate::operations::{FinishStatus, Operator, unary};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::waker::waker_set;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
@@ -50,6 +52,14 @@ struct OperatorNode {
     /// a late IO completion routed to one lands nowhere.
     operator: Option<Box<dyn Operator>>,
 
+    /// The operator's spillable memory, if it has any (see
+    /// [`Operator::allocator`]). Kept here, apart from the operator, so the
+    /// worker can spill from it and the ring can evict from it while the
+    /// operator is borrowed, and so it outlives the operator object if the
+    /// operator hands its memory on. Dropped with the operator when the node
+    /// retires.
+    allocator: Option<Rc<dyn Allocator>>,
+
     /// One-shot publication gates. Open gates are removed after an Acquire
     /// observation, leaving no atomic loads on this node's steady-state path.
     gates: Vec<Arc<AtomicBool>>,
@@ -61,6 +71,12 @@ impl OperatorNode {
     #[inline]
     fn is_finished(&self) -> bool {
         self.operator.is_none()
+    }
+
+    /// Drops the operator and its allocator, freeing what they held right away.
+    fn retire(&mut self) {
+        self.operator = None;
+        self.allocator = None;
     }
 
     /// Run `f` against this node's operator, or return `None` when the node has
@@ -155,6 +171,7 @@ impl OperatorGraph {
             .enumerate()
             .map(|(id, operator)| OperatorNode {
                 id,
+                allocator: operator.allocator(),
                 operator: Some(operator),
                 gates: gates.remove(&id).unwrap_or_default(),
             })
@@ -238,7 +255,7 @@ impl OperatorGraph {
                     // Retiring the node drops the operator, and with it the
                     // sender it holds, so a stage that watches the other end
                     // of that channel learns the stage is over.
-                    FinishStatus::Done => node.operator = None,
+                    FinishStatus::Done => node.retire(),
                     FinishStatus::Working => working = true,
                     FinishStatus::Pending => {}
                 }
@@ -292,7 +309,7 @@ impl OperatorGraph {
                 // that had not finished.
                 continue;
             }
-            self.operators[idx].operator = None;
+            self.operators[idx].retire();
             done[idx] = true;
             stack.extend(self.back_edges[idx].iter().copied());
         }
@@ -597,6 +614,39 @@ impl DataFlow {
         })
     }
 
+    /// The allocators of this dataflow's operators, first operator first. The
+    /// worker registers them with its memory context so the ring can take spilled
+    /// buffers back from them.
+    pub fn allocators(&self) -> impl Iterator<Item = &Rc<dyn Allocator>> {
+        self.graph
+            .operators
+            .iter()
+            .filter_map(|node| node.allocator.as_ref())
+    }
+
+    /// Ask the operators' allocators, last operator first, to spill one buffer to
+    /// `spiller`, stopping at the first that does. Returns whether any did. A
+    /// spill that fails cancels the dataflow.
+    pub fn spill(&mut self, spiller: &mut dyn Spiller) -> bool {
+        self.try_run_or(false, |d| {
+            for allocator in d
+                .graph
+                .operators
+                .iter()
+                .rev()
+                .filter_map(|node| node.allocator.as_ref())
+            {
+                let spilled = allocator
+                    .spill(spiller)
+                    .map_err(|error| crate::operations::Error::from(unary::Error::from(error)))?;
+                if spilled {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
     /// Attempt to steal work from peer workers, traversing root-to-leaf (upstream first
     /// so the original worker's downstream data stays hot).
     pub fn try_stealing_work(&mut self, requester: &mut IORequester) -> WorkStatus {
@@ -622,6 +672,8 @@ impl DataFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{HeldBuffers, WriteBuffer};
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
     /// A test operator that always reports it `Ran` and never finishes on its
@@ -721,6 +773,102 @@ mod tests {
         fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
             Ok(FinishStatus::Pending)
         }
+    }
+
+    /// Records being asked to spill, and spills a buffer when it holds one.
+    struct RecordingAllocator {
+        id: usize,
+        asked: Arc<Mutex<Vec<usize>>>,
+        held: Rc<HeldBuffers>,
+    }
+    impl Allocator for RecordingAllocator {
+        fn spill(&self, spiller: &mut dyn Spiller) -> std::io::Result<bool> {
+            self.asked.lock().unwrap().push(self.id);
+            self.held.spill(spiller)
+        }
+        fn evict(&self) -> Option<WriteBuffer> {
+            self.held.evict()
+        }
+    }
+
+    /// An operator whose memory is a [`RecordingAllocator`].
+    struct SpillingOperator {
+        allocator: Rc<RecordingAllocator>,
+    }
+    impl Operator for SpillingOperator {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
+            Ok(WorkStatus::Pending)
+        }
+        fn process_fs_write_response(
+            &mut self,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
+            Ok(FinishStatus::Pending)
+        }
+        fn allocator(&self) -> Option<Rc<dyn Allocator>> {
+            Some(self.allocator.clone())
+        }
+    }
+
+    /// A dataflow over the chain `0 -> 1 -> 2`, where only the operator at
+    /// `holder` holds a buffer.
+    fn spilling_chain(holder: usize, asked: Arc<Mutex<Vec<usize>>>) -> DataFlow {
+        crate::memory::init_test_free_pool(4);
+        let operators: Vec<Box<dyn Operator>> = (0..3)
+            .map(|id| {
+                Box::new(SpillingOperator {
+                    allocator: Rc::new(RecordingAllocator {
+                        id,
+                        asked: asked.clone(),
+                        held: HeldBuffers::holding(usize::from(id == holder)),
+                    }),
+                }) as Box<dyn Operator>
+            })
+            .collect();
+        let (err_tx, _err_rx) = mpsc::channel();
+        let (stats_tx, _stats_rx) = mpsc::channel();
+        DataFlow::new(
+            0,
+            Arc::new(AtomicBool::new(false)),
+            err_tx,
+            operators,
+            vec![(0, 1), (1, 2)],
+            HashMap::default(),
+            stats_tx,
+            false,
+        )
+    }
+
+    #[test]
+    fn spilling_asks_the_last_operator_first_and_stops_at_the_one_that_spills() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut flow = spilling_chain(1, asked.clone());
+
+        let spilled = flow.spill(&mut crate::memory::InstantSpiller);
+
+        assert!(spilled);
+        assert_eq!(*asked.lock().unwrap(), vec![2, 1]);
+    }
+
+    #[test]
+    fn a_finished_node_lets_go_of_its_allocator() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut flow = spilling_chain(2, asked);
+        let allocator = flow.allocators().last().cloned().unwrap();
+
+        flow.graph.operators[2].retire();
+
+        assert_eq!(Rc::strong_count(&allocator), 1);
+        assert_eq!(flow.allocators().count(), 2);
     }
 
     /// Build a linear chain `0 -> 1 -> ... -> n-1` of [`LiveOperator`]s, where

@@ -26,6 +26,9 @@ use std::sync::Arc;
 mod allocator;
 pub use allocator::SlabAllocator;
 
+mod partition_allocator;
+pub use partition_allocator::{BufferChunk, FullBuffer, PartitionAllocator};
+
 mod slab_buffer;
 pub use slab_buffer::SlabBuffer;
 

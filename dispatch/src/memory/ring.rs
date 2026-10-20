@@ -19,7 +19,7 @@
 use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::write_buffer::WriteBuffer;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::{io, ptr};
 
 /// Size of each slot in the ring (2 MB).
@@ -71,6 +71,16 @@ pub enum SlotUsage {
 /// dropped.
 pub struct Ring {
     pub slots: Vec<BufferSlot>,
+    /// Slots in each node's region. Slot `idx` belongs to region `idx / slots_per_region`.
+    slots_per_region: usize,
+    /// Per region, how many slots a [`WriteBuffer`] holds right now. This is the memory
+    /// operators have pinned: neither free nor cached, so nothing but the holder can give
+    /// it back.
+    pinned_counts: Box<[AtomicUsize]>,
+    /// Per region, how many of the pinned slots a spill has already written to disk (see
+    /// [`SpillBuffer`](super::SpillBuffer)). Their holder can give them back at any time,
+    /// so they do not count as memory pressure.
+    spilled_counts: Box<[AtomicUsize]>,
 }
 
 impl Debug for Ring {
@@ -85,10 +95,17 @@ impl Debug for Ring {
 }
 
 impl Ring {
-    /// Allocates the ring by `mmap`-ing a single contiguous region and splitting
-    /// it into [`BUFFER_SIZE`]-aligned slots. Returns an error if `mmap` fails.
+    /// A ring of `buffers` slots forming a single region.
     pub fn new(buffers: usize) -> io::Result<Self> {
+        Self::with_regions(1, buffers)
+    }
+
+    /// Allocates the ring as one contiguous `mmap` and splits it into
+    /// [`BUFFER_SIZE`]-aligned slots: `region_count` node regions of
+    /// `slots_per_region` slots each. Returns an error if `mmap` fails.
+    pub fn with_regions(region_count: usize, slots_per_region: usize) -> io::Result<Self> {
         const_assert_aligned();
+        let buffers = region_count * slots_per_region;
 
         let ptr = unsafe {
             libc::mmap(
@@ -134,7 +151,41 @@ impl Ring {
             })
             .collect();
 
-        Ok(Self { slots })
+        Ok(Self {
+            slots,
+            slots_per_region,
+            pinned_counts: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
+            spilled_counts: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
+        })
+    }
+
+    fn region_of(&self, idx: usize) -> usize {
+        idx / self.slots_per_region
+    }
+
+    /// Slots in each node's region.
+    pub fn region_slot_count(&self) -> usize {
+        self.slots_per_region
+    }
+
+    /// How many of `region`'s slots a [`WriteBuffer`] holds right now.
+    pub fn pinned_slots(&self, region: usize) -> usize {
+        self.pinned_counts[region].load(Ordering::Relaxed)
+    }
+
+    /// How many of `region`'s pinned slots hold bytes a spill already wrote to disk.
+    pub fn spilled_slots(&self, region: usize) -> usize {
+        self.spilled_counts[region].load(Ordering::Relaxed)
+    }
+
+    /// Records that the pinned slot `idx` has been written to disk.
+    pub fn mark_spilled(&self, idx: usize) {
+        self.spilled_counts[self.region_of(idx)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Undoes [`mark_spilled`](Self::mark_spilled) once the slot's spill buffer lets go of it.
+    pub fn unmark_spilled(&self, idx: usize) {
+        self.spilled_counts[self.region_of(idx)].fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Returns the total number of slots in the ring.
@@ -164,10 +215,13 @@ impl Ring {
         }
     }
 
-    /// Overwrites the `used` word for slot `idx` (writer flag + reader count).
+    /// Ends a [`WriteBuffer`]'s hold on slot `idx`, leaving the slot with `used`
+    /// readers (0 for a slot going back to the pool, 1 for one turning into a
+    /// [`ReadBuffer`]). The slot stops counting as pinned.
     #[inline(always)]
-    pub fn set_slot_used(&self, idx: usize, used: u32, ordering: Ordering) {
-        self.slots[idx].used.store(used, ordering)
+    pub fn release_write(&self, idx: usize, used: u32, ordering: Ordering) {
+        self.slots[idx].used.store(used, ordering);
+        self.pinned_counts[self.region_of(idx)].fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Records whether slot `idx` contains zeroed memory.
@@ -192,6 +246,7 @@ impl Ring {
             .compare_exchange(0, WRITING, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
+            self.pinned_counts[self.region_of(idx)].fetch_add(1, Ordering::Relaxed);
             return Some(WriteBuffer {
                 ptr: slot.buffer, // *mut u8 from the mmap
                 slot_idx: idx,

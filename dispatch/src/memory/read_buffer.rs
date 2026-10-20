@@ -83,7 +83,7 @@ impl From<WriteBuffer> for ReadBuffer {
         std::mem::forget(value);
         let ring = memory_ctx().ring();
         ring.set_slot_zeroed(slot_idx, false);
-        ring.set_slot_used(slot_idx, 1, Ordering::Release);
+        ring.release_write(slot_idx, 1, Ordering::Release);
         Self { ptr, slot_idx }
     }
 }

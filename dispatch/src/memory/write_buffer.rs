@@ -46,7 +46,7 @@ impl WriteBuffer {
         }
         memory_ctx()
             .ring()
-            .set_slot_used(self.slot_idx, 0, Ordering::Release);
+            .release_write(self.slot_idx, 0, Ordering::Release);
         memory_ctx().ring().set_slot_zeroed(self.slot_idx, true);
         memory_ctx().push_free_idx(self.slot_idx, true);
         mem::forget(self);
@@ -62,7 +62,7 @@ impl WriteBuffer {
         mem::forget(self);
         memory_ctx()
             .ring()
-            .set_slot_used(slot_idx, 0, Ordering::Release);
+            .release_write(slot_idx, 0, Ordering::Release);
     }
 }
 
@@ -101,7 +101,7 @@ impl Drop for WriteBuffer {
         memory_ctx().ring().set_slot_zeroed(self.slot_idx, false);
         memory_ctx()
             .ring()
-            .set_slot_used(self.slot_idx, 0, Ordering::Release);
+            .release_write(self.slot_idx, 0, Ordering::Release);
         memory_ctx().push_free_idx(self.slot_idx, false);
     }
 }

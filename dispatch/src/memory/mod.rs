@@ -57,9 +57,17 @@ pub use write_buffer::WriteBuffer;
 mod read_buffer;
 pub use read_buffer::ReadBuffer;
 
+mod spill;
+#[cfg(test)]
+pub(crate) use spill::tests::{HeldBuffers, InstantSpiller};
+pub use spill::{Allocator, FileSpiller, Pinned, SpillBuffer, Spiller};
+
 mod slab;
+pub use slab::{
+    BufferChunk, FullBuffer, MultiSlabBuffer, PartitionAllocator, Slab, SlabAllocator, SlabBuffer,
+    SlabVec,
+};
 pub(crate) use slab::{HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabTopK, slots_per_slab};
-pub use slab::{MultiSlabBuffer, Slab, SlabAllocator, SlabBuffer, SlabVec};
 
 mod reader;
 pub use reader::{MultiBufferReader, ReaderPosition};

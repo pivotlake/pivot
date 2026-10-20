@@ -45,6 +45,8 @@
 
 use crate::data_flow::WorkStatus;
 use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO, ReadResponse};
+use crate::memory::Allocator;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -147,6 +149,19 @@ pub trait Operator {
     /// The flag's *value* is the runtime trigger: `false` until the operator
     /// decides its upstream is no longer needed.
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+
+    /// The memory this operator holds that can be spilled to disk and, once on
+    /// disk, taken back by the ring; `None` (the default) for an operator that
+    /// holds no such memory.
+    ///
+    /// Asked once at build time. The node keeps the allocator until the operator
+    /// finishes, because the memory can outlive the operator object itself: a
+    /// pipeline breaker's consumer hands its rows to its outputter. Spilling and
+    /// eviction then go through the allocator, never through the operator, so
+    /// they can happen while the operator is running (see [`Allocator`]).
+    fn allocator(&self) -> Option<Rc<dyn Allocator>> {
         None
     }
 }

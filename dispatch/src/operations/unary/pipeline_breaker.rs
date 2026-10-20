@@ -17,10 +17,12 @@
 //! 3. **Complete** — The outputter has emitted everything.
 
 use crate::data_flow::WorkStatus;
+use crate::memory::Allocator;
 use crate::operations::channels::Sender;
 use crate::operations::{Unary, unary};
 use std::marker::PhantomData;
 use std::mem;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -53,6 +55,11 @@ pub trait Consumer<I, O> {
 
     /// See [`Operator::upstream_cancel_flag`](crate::operations::Operator::upstream_cancel_flag).
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+
+    /// See [`Operator::allocator`](crate::operations::Operator::allocator).
+    fn allocator(&self) -> Option<Rc<dyn Allocator>> {
         None
     }
 }
@@ -130,6 +137,13 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         match self {
             PipelineBreaker::Consuming(c) => c.upstream_cancel_flag(),
+            _ => None,
+        }
+    }
+
+    fn allocator(&self) -> Option<Rc<dyn Allocator>> {
+        match self {
+            PipelineBreaker::Consuming(c) => c.allocator(),
             _ => None,
         }
     }

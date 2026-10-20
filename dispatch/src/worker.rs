@@ -26,7 +26,7 @@ use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
-use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
+use crate::memory::{FileSpiller, MemoryContextFactory, Spiller, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
 use core_affinity::CoreId;
@@ -162,6 +162,16 @@ pub struct Worker {
     /// Last delegated-broadcast epoch this worker has fanned out (see
     /// [`WorkerWaker::finish_delegated_wake`]).
     last_seen_broadcast: u64,
+    /// Where this worker's operators write buffers they spill.
+    spiller: Box<dyn Spiller>,
+}
+
+/// Directory for spill files, overridable through `PIVOT_SPILL_DIR`.
+fn spill_directory() -> std::path::PathBuf {
+    crate::env::get_env_var_with_default(
+        "PIVOT_SPILL_DIR",
+        std::env::temp_dir().join("pivot-spill"),
+    )
 }
 
 impl Worker {
@@ -217,9 +227,12 @@ impl Worker {
                 // Give this worker thread a handle to the shared disk cache so
                 // `drop_cache()` can clear it; the requester takes ownership.
                 crate::io::disk_cache::install_worker_disk_cache(disk_cache.clone());
+                let spiller = FileSpiller::create(&spill_directory(), idx)
+                    .expect("creating the worker's spill file");
                 let worker = Self {
                     io: IORequester::new(disk_cache),
                     id: core.id,
+                    spiller: Box::new(spiller),
                     data_flows: HashMap::new(),
                     data_flow_queue: receiver,
                     did_work_last_iteration: false,
@@ -410,6 +423,26 @@ impl Worker {
         }
     }
 
+    /// Keep this node's ring under the spill threshold: while pinned memory is
+    /// over it, have one dataflow spill one buffer. One buffer per pass, since
+    /// the loop comes back here every iteration. Spilling only writes bytes to
+    /// disk; the memory itself is taken back when an allocation finds nothing
+    /// else to evict (see [`MemoryContext::evict`](crate::memory::MemoryContext::evict)).
+    ///
+    /// Dataflows spill only their own buffers, and only on the worker that runs
+    /// them, so this needs no coordination with other workers.
+    fn spill_if_over_threshold(&mut self) {
+        if !memory_ctx().over_spill_threshold() {
+            return;
+        }
+        for flow in self.data_flows.values_mut() {
+            if flow.spill(&mut *self.spiller) {
+                self.did_work_last_iteration = true;
+                return;
+            }
+        }
+    }
+
     /// Attempt to steal work from sibling workers' channels when this worker is idle.
     fn try_steal_work(&mut self) {
         for flow in self.data_flows.values_mut() {
@@ -521,6 +554,9 @@ impl Worker {
             match builder.build() {
                 Ok(data_flow) => {
                     LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
+                    for allocator in data_flow.allocators() {
+                        memory_ctx().register_allocator(allocator);
+                    }
                     self.data_flows.insert(data_flow.id(), data_flow);
                 }
                 Err(e) => {
@@ -552,6 +588,8 @@ impl Worker {
 
             self.process_io_completions()?;
             self.deliver_ready_reads();
+
+            self.spill_if_over_threshold();
 
             self.step_run_ready_cpu_work();
 

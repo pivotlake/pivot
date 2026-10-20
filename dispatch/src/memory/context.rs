@@ -4,9 +4,10 @@ use crate::memory::decompressed_cache::DecompressedCache;
 use crate::memory::fill_cursor::FillCursor;
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::status::{MemoryBlockStatus, read_block_status};
-use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
+use crate::memory::{Allocator, BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
 use crate::worker::WORKER_IDX;
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 thread_local! {
@@ -35,6 +36,13 @@ pub fn has_memory_context() -> bool {
     MEMORY_CTX_PTR.with(|p| !p.get().is_null())
 }
 
+/// Percentage of a node's ring slots that may be pinned before operators are asked to
+/// spill, overridable through `PIVOT_SPILL_PERCENT`.
+fn spill_threshold_percent() -> usize {
+    static PERCENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| crate::env::get_env_var_with_default("PIVOT_SPILL_PERCENT", 80))
+}
+
 pub struct MemoryContextFactory {
     ring: Arc<Ring>,
     compressed_cache: Arc<CompressedCache>,
@@ -60,7 +68,9 @@ impl MemoryContextFactory {
 
         let buffers = layout.total_slots();
         let topology = layout.topology();
-        let ring = Arc::new(Ring::new(buffers).unwrap());
+        let ring = Arc::new(
+            Ring::with_regions(topology.node_count, buffers / topology.node_count).unwrap(),
+        );
         let compressed_cache = Arc::new(CompressedCache::new(buffers));
         let decompressed_cache = Arc::new(DecompressedCache::new(buffers));
         let clock = Arc::new(Clock::with_regions(
@@ -105,6 +115,7 @@ impl MemoryContextFactory {
             decompressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
             layout: self.layout,
             node: self.node,
+            allocators: RefCell::new(Vec::new()),
         }
     }
 }
@@ -128,6 +139,10 @@ pub struct MemoryContext {
     layout: RingLayout,
     /// This worker's NUMA node, i.e. the ring region it allocates and evicts from.
     node: usize,
+    /// The allocators of the operators this worker runs, which it takes spilled buffers
+    /// back from once nothing else can be evicted (see [`evict`](Self::evict)). Held weakly,
+    /// so a finished operator's allocator simply drops out of the list.
+    allocators: RefCell<Vec<Weak<dyn Allocator>>>,
 }
 
 impl MemoryContext {
@@ -176,6 +191,47 @@ impl MemoryContext {
 
     pub fn ring(&self) -> &Ring {
         self.ring.as_ref()
+    }
+
+    /// The ring, for a holder that outlives this call or runs off the worker thread.
+    pub fn shared_ring(&self) -> Arc<Ring> {
+        self.ring.clone()
+    }
+
+    /// Whether this worker's node pins more memory than the spill threshold allows. Pinned
+    /// buffers whose bytes a spill already wrote to disk do not count: their holders give
+    /// them back the moment memory runs out.
+    pub fn over_spill_threshold(&self) -> bool {
+        let pinned = self.ring.pinned_slots(self.node);
+        let spilled = self.ring.spilled_slots(self.node);
+        // The two counts are read one after the other while other workers change them, so
+        // the spilled count may momentarily exceed the pinned count it is part of.
+        let pressing = pinned.saturating_sub(spilled);
+        pressing * 100 > self.ring.region_slot_count() * spill_threshold_percent()
+    }
+
+    /// Makes `allocator`'s spilled buffers available to this worker's eviction.
+    pub fn register_allocator(&self, allocator: &Rc<dyn Allocator>) {
+        self.allocators.borrow_mut().push(Rc::downgrade(allocator));
+    }
+
+    /// Takes a spilled buffer back from one of the registered allocators, if any has one
+    /// that is written and unpinned. The most recently registered allocator is asked first,
+    /// so within a dataflow the last operator gives up memory before the first.
+    fn take_spilled_buffer(&self) -> Option<WriteBuffer> {
+        let mut allocators = self.allocators.borrow_mut();
+        allocators.retain(|allocator| allocator.strong_count() > 0);
+        allocators
+            .iter()
+            .rev()
+            .filter_map(Weak::upgrade)
+            .find_map(|allocator| allocator.evict())
+    }
+
+    /// Whether neither cache holds a slot in this worker's region.
+    fn caches_hold_nothing_in_region(&self) -> bool {
+        self.clock.owned_in_region(Owner::Compressed, self.node) == 0
+            && self.clock.owned_in_region(Owner::Decompressed, self.node) == 0
     }
 
     /// This worker's compressed-cache fill cursor (the bump allocator missed reads
@@ -311,7 +367,16 @@ impl MemoryContext {
     /// of cached slots exceeds the target percentage, decompressed otherwise
     /// (see [`Clock::preferred_victim_tier`]) - advances that tier's hand, and
     /// routes the victim to its cache's reclaim.
+    ///
+    /// Buffers that operators spilled to disk are the last resort, taken only
+    /// when the caches have nothing to give: either they hold nothing in this
+    /// region, or a full sweep of them reclaimed nothing.
     pub(crate) fn evict(&self) -> WriteBuffer {
+        if self.caches_hold_nothing_in_region()
+            && let Some(buffer) = self.take_spilled_buffer()
+        {
+            return buffer;
+        }
         // Livelock guard. When a query's working set exceeds the ring, every
         // worker spins here finding nothing evictable (near-100% CPU, ~0 forward
         // progress, and the loop has no cancellation point). A healthy hand finds
@@ -347,6 +412,9 @@ impl MemoryContext {
         loop {
             iterations += 1;
             if panic_at.is_none() && iterations == warn_at {
+                if let Some(buffer) = self.take_spilled_buffer() {
+                    return buffer;
+                }
                 tracing::warn!(iterations, "evict: no memory left to evict, sleeping");
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 panic_at = Some(iterations + ring_len);
@@ -686,5 +754,50 @@ mod tests {
 
         // Assert
         assert_eq!(recovered_via_zeroed, Some(slot_idx));
+    }
+
+    #[test]
+    fn spill_threshold_ignores_buffers_already_on_disk() {
+        init_test_free_pool(128);
+        let ctx = memory_ctx();
+        let mut held: Vec<_> = (0..103).map(|_| ctx.get_write_buffer(false)).collect();
+        let over_before_spill = ctx.over_spill_threshold();
+
+        let spilled = crate::memory::SpillBuffer::new(held.pop().unwrap());
+        crate::memory::Spiller::push(&mut crate::memory::InstantSpiller, spilled.clone()).unwrap();
+
+        assert!(over_before_spill);
+        assert!(!ctx.over_spill_threshold());
+    }
+
+    #[test]
+    fn an_exhausted_ring_takes_a_spilled_buffer_back() {
+        init_test_free_pool(4);
+        let ctx = memory_ctx();
+        let held = crate::memory::HeldBuffers::holding(1);
+        ctx.register_allocator(&(held.clone() as Rc<dyn Allocator>));
+        held.spill(&mut crate::memory::InstantSpiller).unwrap();
+        let spilled_slot = held.spilled_slots()[0];
+        let _rest_of_the_pool: Vec<_> = (0..3).map(|_| ctx.get_write_buffer(false)).collect();
+
+        let buffer = ctx.get_write_buffer(false);
+
+        assert_eq!(buffer.slot_idx, spilled_slot);
+        assert!(held.spilled_slots().is_empty());
+        assert_eq!(ctx.ring().spilled_slots(0), 0);
+    }
+
+    #[test]
+    fn a_dropped_allocator_is_forgotten() {
+        init_test_free_pool(4);
+        let ctx = memory_ctx();
+        let held = crate::memory::HeldBuffers::holding(1);
+        ctx.register_allocator(&(held.clone() as Rc<dyn Allocator>));
+        held.spill(&mut crate::memory::InstantSpiller).unwrap();
+
+        drop(held);
+
+        assert!(ctx.take_spilled_buffer().is_none());
+        assert!(ctx.allocators.borrow().is_empty());
     }
 }
