@@ -19,7 +19,7 @@ use planner::catalog::{
 use planner::expression::{CompareType, Expression};
 
 use super::CatalogTable;
-use super::insert_sink::{UploadedFile, build_insert_spec};
+use iceberg_tables::sink::{UploadedFile, build_insert_spec};
 
 /// A catalog table resolved from one transaction: it captures the snapshot's own
 /// copy of the [`CatalogTable`] (schema, files, and their row groups), this
@@ -199,11 +199,12 @@ impl BoundTable for TableBinding {
         // id onto every written file; the shared injector hands each finished
         // file to the transaction's commit, which resolves the live table by
         // that id (surviving a concurrent rename).
-        Ok(build_insert_spec(
-            &self.table,
+        build_insert_spec(
+            &self.table.insert_target(),
             self.uploaded_files.clone(),
             input,
-        )?)
+        )
+        .map_err(|error| CatalogError::from(crate::Error::from(error)))
     }
 
     fn columns(&self) -> Vec<Column> {

@@ -23,17 +23,17 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, ManifestEntry,
-    ManifestFile, ManifestStatus, PartitionSpecRef, PrimitiveLiteral, PrimitiveType, SchemaRef,
-    Struct,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, Literal,
+    ManifestEntry, ManifestFile, ManifestStatus, PartitionSpecRef, PrimitiveLiteral, PrimitiveType,
+    SchemaRef, Struct,
 };
 use object_storage::FileRef;
 use parquet_engine::{FileStats, PartitionValues};
 use planner::catalog::Column;
 use planner::types::Type;
 
-use super::layout::TableLocation;
-use super::{Error, Result};
+use crate::layout::TableLocation;
+use crate::{Error, Result};
 
 /// String bounds are cut to this many code points: a bound only has to
 /// bracket the file's values, and a long string would otherwise be recorded
@@ -45,7 +45,7 @@ const STRING_BOUND_CODE_POINTS: usize = 16;
 /// or DELETED (retired), both of which must keep the numbers the file was
 /// committed with.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ManifestOrigin {
+pub struct ManifestOrigin {
     pub snapshot_id: i64,
     pub sequence_number: i64,
     pub file_sequence_number: i64,
@@ -65,17 +65,20 @@ pub struct DataFileEntry {
     /// null count. Written into the manifest, so a file that has none cannot
     /// be committed.
     pub stats: Option<Arc<FileStats>>,
-    pub(crate) origin: Option<ManifestOrigin>,
+    pub origin: Option<ManifestOrigin>,
 }
 
 /// What converting an entry needs to know about its table: the schema the
 /// field ids come from, the partition spec the tuple is laid out by, the
 /// declared columns' Pivot types, and where URIs are formed.
-pub(crate) struct EntryContext<'a> {
+pub struct EntryContext<'a> {
     pub schema: &'a SchemaRef,
     pub partition_spec: &'a PartitionSpecRef,
     pub columns: &'a [Column],
     pub location: &'a TableLocation,
+    /// The table's format version: a version 2 table has no row lineage,
+    /// so its entries record no first row id.
+    pub format_version: FormatVersion,
 }
 
 impl EntryContext<'_> {
@@ -97,7 +100,7 @@ impl EntryContext<'_> {
 /// `entry` as the manifest records it. Requires the entry's statistics: a
 /// manifest entry carries the file's row count, and a file without one
 /// cannot be committed.
-pub(crate) fn to_data_file(entry: &DataFileEntry, ctx: &EntryContext<'_>) -> Result<DataFile> {
+pub fn to_data_file(entry: &DataFileEntry, ctx: &EntryContext<'_>) -> Result<DataFile> {
     let stats = entry
         .stats
         .as_ref()
@@ -150,7 +153,10 @@ pub(crate) fn to_data_file(entry: &DataFileEntry, ctx: &EntryContext<'_>) -> Res
         .lower_bounds(lower_bounds)
         .upper_bounds(upper_bounds)
         .null_value_counts(null_value_counts)
-        .first_row_id(entry.origin.as_ref().and_then(|origin| origin.first_row_id));
+        .first_row_id(match ctx.format_version {
+            FormatVersion::V1 | FormatVersion::V2 => None,
+            FormatVersion::V3 => entry.origin.as_ref().and_then(|origin| origin.first_row_id),
+        });
     builder.build().map_err(|error| Error::InvalidDataFile {
         file: entry.file.path.to_string(),
         message: error.to_string(),
@@ -211,11 +217,27 @@ fn build_partition_struct(entry: &DataFileEntry, ctx: &EntryContext<'_>) -> Resu
     Ok(Struct::from_iter(values))
 }
 
+/// `entry` as it reads back from the manifest it is about to be written to:
+/// the same file, with its partition tuple and statistics rebuilt from their
+/// Iceberg form. A writer's own entry carries the scalars its files were
+/// encoded from, which live in the worker pool's memory and are bounded as
+/// written, not as a manifest records them; the table's state keeps the
+/// recorded form, owned by the heap, for as long as the file is live.
+pub fn normalized_entry(entry: &DataFileEntry, ctx: &EntryContext<'_>) -> Result<DataFileEntry> {
+    let data_file = to_data_file(entry, ctx)?;
+    Ok(DataFileEntry {
+        file: entry.file.clone(),
+        partition: read_partition_values(data_file.partition(), ctx)?,
+        stats: Some(Arc::new(read_stats(&data_file, ctx))),
+        origin: entry.origin.clone(),
+    })
+}
+
 /// `entry`, read from `manifest`, as the datastore holds it. Inherits what a
 /// manifest leaves implicit on its ADDED entries: the snapshot that added the
 /// file, its sequence numbers, and (`first_row_id` being the caller's
 /// running assignment) its first row id.
-pub(crate) fn from_manifest_entry(
+pub fn from_manifest_entry(
     entry: &ManifestEntry,
     manifest: &ManifestFile,
     first_row_id: Option<i64>,
@@ -509,7 +531,7 @@ fn truncate_upper(datum: Datum) -> Option<Datum> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iceberg::schema::build_schema;
+    use crate::schema::build_schema;
     use iceberg::spec::{FormatVersion, PartitionSpec, TableMetadataBuilder};
     use object_storage::{LocalStore, ObjectPath, ObjectStore};
 
@@ -537,8 +559,7 @@ mod tests {
             let location = TableLocation::new(store, ObjectPath::new("t")).unwrap();
             let schema = build_schema(&columns).unwrap();
             let partition_by: Vec<String> = partition_by.iter().map(|c| c.to_string()).collect();
-            let spec =
-                crate::iceberg::schema::build_partition_spec(&schema, &partition_by).unwrap();
+            let spec = crate::schema::build_partition_spec(&schema, &partition_by).unwrap();
             let metadata = TableMetadataBuilder::new(
                 schema,
                 spec,
@@ -566,6 +587,7 @@ mod tests {
                 partition_spec: &self.partition_spec,
                 columns: &self.columns,
                 location: &self.location,
+                format_version: FormatVersion::V3,
             }
         }
 

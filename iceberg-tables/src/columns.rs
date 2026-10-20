@@ -105,7 +105,7 @@ pub fn table_columns(
 /// The Pivot type an Iceberg type reads as, or `None` for one Pivot has no
 /// column type for (nested types, time, nanosecond timestamps, uuid, fixed,
 /// binary).
-pub(crate) fn to_pivot_type(iceberg_type: &IcebergType) -> Option<Type> {
+pub fn to_pivot_type(iceberg_type: &IcebergType) -> Option<Type> {
     let IcebergType::Primitive(primitive) = iceberg_type else {
         return None;
     };

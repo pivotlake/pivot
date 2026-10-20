@@ -16,18 +16,18 @@ use iceberg::spec::{
     PartitionSpecRef, SchemaRef,
 };
 
-use super::data_files::{DataFileEntry, EntryContext, from_manifest_entry, to_data_file};
-use super::{Error, Result};
-use datastore_iceberg::block_on;
+use crate::data_files::{DataFileEntry, EntryContext, from_manifest_entry, to_data_file};
+use crate::runtime::block_on;
+use crate::{Error, Result};
 
 /// A commit that would carry more manifests than this merges the smallest of
 /// them into one, so the number of manifests a reader fetches stays bounded
 /// however many appends the table has seen.
-pub(crate) const MIN_MANIFESTS_TO_MERGE: usize = 100;
+pub const MIN_MANIFESTS_TO_MERGE: usize = 100;
 
 /// A manifest the table's current snapshot names, with its live entries
 /// decoded: what a read serves files from and a commit rewrites from.
-pub(crate) struct LoadedManifest {
+pub struct LoadedManifest {
     pub file: ManifestFile,
     /// The ADDED and EXISTING entries, in manifest order, each stamped with
     /// where this manifest records it.
@@ -37,18 +37,19 @@ pub(crate) struct LoadedManifest {
 /// The current snapshot's manifests by path. Manifests are immutable, so an
 /// entry stays valid for as long as its path is named by some snapshot; a
 /// refresh fetches only the paths it does not hold.
-pub(crate) type ManifestCache = HashMap<String, Arc<LoadedManifest>>;
+pub type ManifestCache = HashMap<String, Arc<LoadedManifest>>;
 
 /// The data manifests a manifest list names, in list order. A delete manifest
 /// with live files is refused: row-level deletes are not applied, so a table
 /// carrying them would read wrongly.
-pub(crate) fn read_manifest_list(
+pub fn read_manifest_list(
     table: &str,
     path: &str,
     bytes: &[u8],
+    format_version: FormatVersion,
 ) -> Result<Vec<ManifestFile>> {
     let list =
-        IcebergManifestList::parse_with_version(bytes, FormatVersion::V3).map_err(|source| {
+        IcebergManifestList::parse_with_version(bytes, format_version).map_err(|source| {
             Error::MalformedMetadataObject {
                 table: table.to_string(),
                 path: path.to_string(),
@@ -75,7 +76,7 @@ pub(crate) fn read_manifest_list(
 /// everything the manifest leaves implicit filled in. First row ids are
 /// assigned the way the spec inherits them: an entry without one gets the
 /// manifest's, advanced by the row counts of the entries assigned before it.
-pub(crate) fn read_manifest(
+pub fn read_manifest(
     table: &str,
     file: &ManifestFile,
     bytes: &[u8],
@@ -121,13 +122,13 @@ pub(crate) fn read_manifest(
 }
 
 /// One entry a commit writes into a manifest, with the status it gets there.
-pub(crate) struct EntryWrite {
+pub struct EntryWrite {
     pub entry: DataFileEntry,
     pub status: ManifestStatus,
 }
 
 /// What a commit does with the current snapshot's manifests.
-pub(crate) struct ManifestPlan {
+pub struct ManifestPlan {
     /// Every live entry of the manifests a removal touched, as one manifest
     /// to write: the removed files DELETED, the rest EXISTING. `None` when
     /// nothing was removed.
@@ -144,7 +145,7 @@ pub(crate) struct ManifestPlan {
 /// Decide the manifests for a commit removing `removed` and adding `added`
 /// over the `current` manifests (in list order). Every removed entry must
 /// name the manifest it was read from, and that manifest must be current.
-pub(crate) fn plan_manifests(
+pub fn plan_manifests(
     current: &[Arc<LoadedManifest>],
     removed: &[DataFileEntry],
     added: Vec<DataFileEntry>,
@@ -226,18 +227,19 @@ pub(crate) fn plan_manifests(
 /// A manifest a commit wrote: its list entry (sequence numbers and first row
 /// id unassigned until the manifest list assigns them), its bytes, and the
 /// live entries it holds in order.
-pub(crate) struct WrittenManifest {
+pub struct WrittenManifest {
     pub file: ManifestFile,
     pub bytes: Vec<u8>,
     pub live_entries: Vec<DataFileEntry>,
 }
 
 /// Write the data manifest at `uri` holding `entries` for the snapshot
-/// `snapshot_id`. ADDED entries leave their sequence number for the manifest
-/// list to assign; EXISTING and DELETED ones keep the numbers they were
-/// committed with.
-pub(crate) fn write_manifest(
+/// `snapshot_id`, in the table's `format_version`. ADDED entries leave their
+/// sequence number for the manifest list to assign; EXISTING and DELETED
+/// ones keep the numbers they were committed with.
+pub fn write_manifest(
     uri: &str,
+    format_version: FormatVersion,
     snapshot_id: i64,
     schema: &SchemaRef,
     partition_spec: &PartitionSpecRef,
@@ -246,13 +248,16 @@ pub(crate) fn write_manifest(
 ) -> Result<WrittenManifest> {
     let file_io = FileIO::new_with_memory();
     let output = file_io.new_output(uri).map_err(Error::spec)?;
-    let mut writer = ManifestWriterBuilder::new(
+    let builder = ManifestWriterBuilder::new(
         output,
         Some(snapshot_id),
         schema.clone(),
         partition_spec.as_ref().clone(),
-    )
-    .build_v3_data();
+    );
+    let mut writer = match format_version {
+        FormatVersion::V3 => builder.build_v3_data(),
+        _ => builder.build_v2_data(),
+    };
     let mut live_entries = Vec::new();
     for EntryWrite { entry, status } in entries {
         let data_file = to_data_file(&entry, ctx)?;
@@ -306,50 +311,58 @@ pub(crate) fn write_manifest(
 
 /// A manifest list a commit wrote, with the first row id the list assigned
 /// to each manifest (in the order given) and the row id the table continues
-/// from.
-pub(crate) struct WrittenManifestList {
+/// from; neither for a table without row lineage.
+pub struct WrittenManifestList {
     pub bytes: Vec<u8>,
     pub first_row_ids: Vec<Option<u64>>,
-    pub next_row_id: u64,
+    pub next_row_id: Option<u64>,
 }
 
 /// Write the manifest list at `uri` for snapshot `snapshot_id` naming
-/// `manifests` in order. A manifest this commit wrote gets this commit's
-/// sequence number and the next free first row id, advanced by its rows; a
-/// carried manifest passes through unchanged.
-pub(crate) fn write_manifest_list(
+/// `manifests` in order, in the table's `format_version`. A manifest this
+/// commit wrote gets this commit's sequence number and, with row lineage
+/// (`first_row_id` given, format version 3), the next free first row id,
+/// advanced by its rows; a carried manifest passes through unchanged.
+pub fn write_manifest_list(
     uri: &str,
+    format_version: FormatVersion,
     snapshot_id: i64,
     parent_snapshot_id: Option<i64>,
     sequence_number: i64,
-    first_row_id: u64,
+    first_row_id: Option<u64>,
     manifests: Vec<ManifestFile>,
 ) -> Result<WrittenManifestList> {
     let file_io = FileIO::new_with_memory();
     let output = file_io.new_output(uri).map_err(Error::spec)?;
     let file_writer = block_on(output.writer()).map_err(Error::spec)?;
-    let mut writer = ManifestListWriter::v3(
-        file_writer,
-        snapshot_id,
-        parent_snapshot_id,
-        sequence_number,
-        Some(first_row_id),
-    );
+    let mut writer = match format_version {
+        FormatVersion::V3 => ManifestListWriter::v3(
+            file_writer,
+            snapshot_id,
+            parent_snapshot_id,
+            sequence_number,
+            first_row_id,
+        ),
+        _ => ManifestListWriter::v2(
+            file_writer,
+            snapshot_id,
+            parent_snapshot_id,
+            sequence_number,
+        ),
+    };
     let mut first_row_ids = Vec::with_capacity(manifests.len());
     for manifest in manifests {
-        let assigned = manifest.first_row_id.is_none().then(|| {
-            writer
-                .next_row_id()
-                .expect("a v3 manifest list writer tracks row ids")
-        });
+        let assigned = manifest
+            .first_row_id
+            .is_none()
+            .then(|| writer.next_row_id())
+            .flatten();
         writer
             .add_manifests(std::iter::once(manifest))
             .map_err(Error::spec)?;
         first_row_ids.push(assigned);
     }
-    let next_row_id = writer
-        .next_row_id()
-        .expect("a v3 manifest list writer tracks row ids");
+    let next_row_id = writer.next_row_id();
     block_on(writer.close()).map_err(Error::spec)?;
     let bytes = read_back(&file_io, uri)?;
     Ok(WrittenManifestList {
@@ -368,7 +381,7 @@ fn read_back(file_io: &FileIO, uri: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iceberg::data_files::ManifestOrigin;
+    use crate::data_files::ManifestOrigin;
     use object_storage::{FileRef, ObjectPath};
 
     fn entry(path: &str, manifest: &str) -> DataFileEntry {

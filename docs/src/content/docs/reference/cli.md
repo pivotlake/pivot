@@ -52,10 +52,13 @@ A local directory is created if it does not exist, in the table format
 `--table-format` names. Object-store credentials come from the
 [environment](#object-store-credentials).
 
-An Iceberg catalog is served read-only, and each catalog namespace appears
-as a schema. Table files are read from wherever the catalog says they are,
-using the credentials the catalog vends, or the
-[object-store variables](#object-store-credentials) when it vends none.
+An Iceberg catalog's tables are read and written through the catalog, and
+each catalog namespace appears as a schema. Table files are read from and
+written to wherever the catalog says they are, using the credentials the
+catalog vends, or the [object-store variables](#object-store-credentials)
+when it vends none. See [Writing to catalog
+tables](/docs/reference/server/datastores/#writing-to-catalog-tables) for what
+a write does and what is refused.
 
 :::caution[One process per local datastore]
 A local datastore can be open in only one process at a time. The process

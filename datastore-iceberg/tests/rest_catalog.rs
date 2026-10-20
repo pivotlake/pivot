@@ -764,6 +764,73 @@ impl Harness {
             Err(error) => error.to_string(),
         }
     }
+
+    /// Run a writing statement through to its commit: what an INSERT, a
+    /// CREATE TABLE or a DROP TABLE needs that a query does not. The commit
+    /// lands on the harness runtime, since it hops to the blocking pool.
+    fn execute(
+        &self,
+        catalog: &PivotCatalog,
+        planner: &mut Planner,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, String> {
+        let transaction = catalog.begin_transaction();
+        let batches = planner
+            .plan(sql, transaction.clone())
+            .map_err(|error| error.to_string())?
+            .compile(self.dispatcher(), transaction.as_ref())
+            .map_err(|error| error.to_string())?
+            .collect()
+            .map_err(|error| error.to_string())?;
+        self.block_on(transaction.commit())
+            .map_err(|error| error.to_string())?;
+        Ok(batches)
+    }
+
+    /// The live data files of `table`'s current snapshot as the catalog has
+    /// it, read through the writer's own file IO: each file's full location
+    /// with its record count and partition values.
+    fn live_data_files(&self, namespace: &NamespaceIdent, table: &str) -> Vec<DataFile> {
+        let loaded = self.load(namespace, table);
+        let metadata = loaded.metadata();
+        let Some(current) = metadata.current_snapshot() else {
+            return Vec::new();
+        };
+        let file_io = loaded.file_io();
+        self.block_on(async {
+            let list_bytes = file_io
+                .new_input(current.manifest_list())
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let list =
+                ManifestList::parse_with_version(&list_bytes, metadata.format_version()).unwrap();
+            let mut files = Vec::new();
+            for manifest_file in list.entries() {
+                let manifest_bytes = file_io
+                    .new_input(&manifest_file.manifest_path)
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap();
+                let manifest = Manifest::parse_avro(&manifest_bytes).unwrap();
+                files.extend(
+                    manifest
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.is_alive())
+                        .map(|entry| entry.data_file().clone()),
+                );
+            }
+            files
+        })
+    }
+
+    fn object_exists(&self, namespace: &NamespaceIdent, table: &str, location: &str) -> bool {
+        let loaded = self.load(namespace, table);
+        self.block_on(loaded.file_io().exists(location)).unwrap()
+    }
 }
 
 /// A store factory that opens nothing: what a load falls back to when the
@@ -3033,6 +3100,368 @@ fn a_timestamp_column_compared_with_a_timestamptz_constant_prunes_files() {
         1,
         "{paths:?}"
     );
+}
+
+#[test]
+fn an_insert_into_a_catalog_table_lands_as_an_append_snapshot() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("written", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let (catalog, mut planner) = harness.pivot();
+
+    let inserted = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO written.orders VALUES (2, 'bob', 2.0), (3, 'cy', 3.0)",
+        )
+        .unwrap();
+    let read_back = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM written.orders ORDER BY id",
+    );
+    harness.append(&namespace, "orders", orders(&[4], &["dee"], &[4.0]));
+    let after_another_writer = harness.query_until(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM written.orders ORDER BY id",
+        |batches| total_rows(batches) == 4,
+    );
+
+    assert_eq!(int64_column(&inserted, 0), [Some(2)]);
+    assert_eq!(int64_column(&read_back, 0), [Some(1), Some(2), Some(3)]);
+    assert_eq!(
+        int64_column(&after_another_writer, 0),
+        [Some(1), Some(2), Some(3), Some(4)]
+    );
+    let table = harness.load(&namespace, "orders");
+    let snapshots: Vec<_> = table.metadata().snapshots().collect();
+    assert_eq!(snapshots.len(), 3);
+    assert_eq!(snapshots[1].summary().operation, Operation::Append);
+    let files = harness.live_data_files(&namespace, "orders");
+    let pivot_file = files
+        .iter()
+        .find(|file| file.record_count() == 2)
+        .expect("the inserted rows are one file");
+    assert!(
+        pivot_file
+            .file_path()
+            .starts_with(&format!("{}/data/", table.metadata().location())),
+        "{}",
+        pivot_file.file_path()
+    );
+}
+
+#[test]
+fn an_insert_into_a_v3_table_assigns_row_ids() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.v3_namespace("lineage", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO lineage.orders VALUES (1, 'ann', 1.0), (2, 'bob', 2.0)",
+        )
+        .unwrap();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO lineage.orders VALUES (3, 'cy', 3.0)",
+        )
+        .unwrap();
+
+    let table = harness.load(&namespace, "orders");
+    let metadata = table.metadata();
+    assert_eq!(metadata.format_version(), FormatVersion::V3);
+    assert_eq!(metadata.next_row_id(), 3);
+    let current = metadata.current_snapshot().unwrap();
+    assert_eq!(current.first_row_id(), Some(2));
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM lineage.orders ORDER BY id",
+    );
+    assert_eq!(int64_column(&rows, 0), [Some(1), Some(2), Some(3)]);
+}
+
+#[test]
+fn an_insert_into_an_identity_partitioned_table_records_each_files_partition() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "bycustomer",
+        "orders",
+        orders_schema(),
+        2,
+        "customer",
+        Transform::Identity,
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO bycustomer.orders VALUES (1, 'ann', 1.0), (2, 'bob', 2.0), (3, 'ann', 3.0)",
+        )
+        .unwrap();
+    let anns = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM bycustomer.orders WHERE customer = 'ann' ORDER BY id",
+    );
+
+    assert_eq!(int64_column(&anns, 0), [Some(1), Some(3)]);
+    let mut partitions: Vec<String> = harness
+        .live_data_files(&namespace, "orders")
+        .iter()
+        .map(|file| format!("{:?}", file.partition()))
+        .collect();
+    partitions.sort();
+    assert_eq!(partitions.len(), 2);
+    assert!(
+        partitions[0].contains("ann") && partitions[1].contains("bob"),
+        "{partitions:?}"
+    );
+}
+
+#[test]
+fn an_insert_refuses_a_table_partitioned_by_a_transform() {
+    let Some(harness) = harness() else { return };
+    harness.partitioned_namespace(
+        "transformed",
+        "orders",
+        orders_schema(),
+        1,
+        "id_bucket",
+        Transform::Bucket(16),
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO transformed.orders VALUES (1, 'ann', 1.0)",
+        )
+        .unwrap_err();
+
+    assert!(error.contains("bucket[16]"), "{error}");
+    assert!(error.contains("identity"), "{error}");
+}
+
+#[test]
+fn a_commit_that_lost_the_race_is_rebuilt_on_the_winner() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("raced", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    let transaction = catalog.begin_transaction();
+    planner
+        .plan(
+            "INSERT INTO raced.orders VALUES (1, 'ann', 1.0)",
+            transaction.clone(),
+        )
+        .unwrap()
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    harness.append(&namespace, "orders", orders(&[2], &["bob"], &[2.0]));
+    harness.block_on(transaction.commit()).unwrap();
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM raced.orders ORDER BY id",
+    );
+    assert_eq!(int64_column(&rows, 0), [Some(1), Some(2)]);
+    assert_eq!(harness.live_data_files(&namespace, "orders").len(), 2);
+}
+
+#[test]
+fn a_rolled_back_insert_leaves_no_snapshot() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("undone", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    let transaction = catalog.begin_transaction();
+    planner
+        .plan(
+            "INSERT INTO undone.orders VALUES (1, 'ann', 1.0)",
+            transaction.clone(),
+        )
+        .unwrap()
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    transaction.rollback();
+
+    let table = harness.load(&namespace, "orders");
+    assert!(table.metadata().current_snapshot().is_none());
+    let rows = harness.query(&catalog, &mut planner, "SELECT id FROM undone.orders");
+    assert_eq!(total_rows(&rows), 0);
+}
+
+#[test]
+fn an_insert_with_a_null_in_a_required_column_fails() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("strict", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO strict.orders VALUES (NULL, 'ann', 1.0)",
+        )
+        .unwrap_err();
+
+    assert!(error.to_lowercase().contains("null"), "{error}");
+    let table = harness.load(&namespace, "orders");
+    assert!(table.metadata().current_snapshot().is_none());
+}
+
+#[test]
+fn create_table_registers_a_v3_table_with_pivots_logical_types() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("made", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE made.readings (tiny TINYINT, big BIGINT, name VARCHAR) WITH (partition_by = 'name', sort_by = 'big')",
+        )
+        .unwrap();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO made.readings VALUES (7, 70, 'a'), (8, 80, 'b')",
+        )
+        .unwrap();
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT tiny, big FROM made.readings WHERE name = 'b'",
+    );
+
+    let table = harness.load(&namespace, "readings");
+    let metadata = table.metadata();
+    assert_eq!(metadata.format_version(), FormatVersion::V3);
+    let names: Vec<&str> = metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(names, ["tiny", "big", "name"]);
+    let tiny_id = metadata.current_schema().field_id_by_name("tiny").unwrap();
+    assert_eq!(
+        metadata.properties()["pivot.logical-types"],
+        format!(r#"{{"{tiny_id}":"Int8"}}"#)
+    );
+    assert_eq!(
+        metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["name"]
+    );
+    assert_eq!(metadata.default_sort_order().fields.len(), 1);
+    assert_eq!(rows[0].column(0).data_type(), &arrow_schema::DataType::Int8);
+    assert_eq!(int64_column(&rows, 1), [Some(80)]);
+}
+
+#[test]
+fn create_table_refuses_a_duplicate_unless_asked_not_to() {
+    let Some(harness) = harness() else { return };
+    harness.namespace("twice", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    let duplicate = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE twice.orders (id BIGINT)",
+        )
+        .unwrap_err();
+    let tolerated = harness.execute(
+        &catalog,
+        &mut planner,
+        "CREATE TABLE IF NOT EXISTS twice.orders (id BIGINT)",
+    );
+
+    assert!(duplicate.contains("already exists"), "{duplicate}");
+    assert!(tolerated.is_ok(), "{tolerated:?}");
+}
+
+#[test]
+fn drop_table_unregisters_the_table_and_leaves_its_files() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("dropped", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let file = harness.live_data_files(&namespace, "orders")[0]
+        .file_path()
+        .to_string();
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(&catalog, &mut planner, "DROP TABLE dropped.orders")
+        .unwrap();
+
+    let gone = harness.block_on(
+        harness
+            .writer
+            .load_table(&TableIdent::new(namespace.clone(), "orders".to_string())),
+    );
+    assert!(gone.is_err(), "the catalog still lists the table");
+    let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM dropped.orders");
+    assert!(error.contains("orders"), "{error}");
+    // The harness opens its file IO through a table of the namespace, so
+    // the dropped table's file is looked for through a sibling.
+    harness.create_table(&namespace, "sibling", orders_schema());
+    assert!(harness.object_exists(&namespace, "sibling", &file));
+}
+
+#[test]
+fn an_insert_refuses_a_format_version_one_table() {
+    let Some(harness) = harness() else { return };
+    let namespace = NamespaceIdent::new("ancient".to_string());
+    harness
+        .block_on(harness.writer.create_namespace(&namespace, HashMap::new()))
+        .unwrap();
+    let creation = TableCreation::builder()
+        .name("orders".to_string())
+        .schema(orders_schema())
+        .properties(HashMap::from([(
+            "format-version".to_string(),
+            "1".to_string(),
+        )]))
+        .build();
+    harness
+        .block_on(harness.writer.create_table(&namespace, creation))
+        .unwrap();
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO ancient.orders VALUES (1, 'ann', 1.0)",
+        )
+        .unwrap_err();
+
+    assert!(error.contains("format version 1"), "{error}");
 }
 
 #[test]

@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use datastore_pivotlake::CompactionConfig;
 use datastore_pivotlake::test_support::{live_data_file_names, retained_snapshots};
-use iceberg::spec::{
-    FormatVersion, Manifest, ManifestList, ManifestStatus, Operation, TableMetadata,
-};
 use iceberg_support::{
     Database, collect_i64s, names_in, parquet_files_in, single_i64, write_int_parquet,
+};
+use iceberg_tables::iceberg::spec::{
+    FormatVersion, Manifest, ManifestList, ManifestStatus, Operation, TableMetadata,
 };
 use parquet::file::reader::{FileReader, SerializedFileReader};
 

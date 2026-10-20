@@ -4,43 +4,39 @@
 //! table with no catalog service. Readable by any Iceberg reader from the
 //! table's path.
 //!
-//! A table's live files, with their statistics and partition tuples, are
-//! held in memory from the current snapshot's manifests; their footers are
-//! read when a scan, a merge or a layout measurement first needs them and
+//! The table model, the commit and the directory's conditional write are the
+//! `iceberg-tables` crate's; this module adapts them to the format seam. A
+//! table's live files, with their statistics and partition tuples, are held
+//! in memory from the current snapshot's manifests; their footers are read
+//! when a scan, a merge or a layout measurement first needs them and
 //! remembered for the life of the version.
-
-pub(crate) mod commit;
-pub(crate) mod data_files;
-mod error;
-pub(crate) mod layout;
-pub(crate) mod load;
-pub(crate) mod manifest_writer;
-pub(crate) mod retention;
-pub(crate) mod schema;
-pub(crate) mod state;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use datastore_iceberg::TableStore;
 use dispatch::DataFlowDispatcher;
+use iceberg_tables::commit::{self, COMMIT_RETRIES, TableCreation};
+use iceberg_tables::data_files::DataFileEntry;
+use iceberg_tables::directory::metadata_location_version;
+use iceberg_tables::layout::{VERSION_HINT_FILE, parse_metadata_file_version};
+use iceberg_tables::reachability::reachable_objects;
+use iceberg_tables::retention::snapshot_retention;
+use iceberg_tables::{
+    DirectoryCatalog, TableLocation, TableState, TableStore, load, read_logical_types,
+    table_columns,
+};
 use object_storage::{ObjectPath, ObjectStore};
 use parquet_engine::{RowGroupMetadata, TableColumns};
 use planner::catalog::{Column, SchemaQualifiedTableName};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use self::commit::{COMMIT_RETRIES, TableCreation};
-use self::data_files::{DataFileEntry, EntryContext};
-pub(crate) use self::error::{Error, Result};
-use self::layout::{TableLocation, VERSION_HINT_FILE, parse_metadata_file_version};
-use self::manifest_writer::{read_manifest, read_manifest_list};
-use self::retention::snapshot_retention;
-use self::state::TableState;
 use crate::file_entry::{FileEntry, constant_partition};
 use crate::format::{Format, FormatTable, TableFormat};
 use crate::table::{TableFile, TableStorage};
+
+pub(crate) use iceberg_tables::{Error, Result};
 
 /// The Iceberg backend of one database.
 pub(crate) struct IcebergFormat {
@@ -74,11 +70,13 @@ impl Format for IcebergFormat {
         adopted: Vec<TableFile>,
     ) -> crate::Result<Arc<dyn FormatTable>> {
         let location = TableLocation::new(self.store.clone(), directory.clone())?;
+        let catalog = DirectoryCatalog::new(location.clone());
         let entries = adopted
             .iter()
             .map(|file| adopted_entry(file, &partition_by))
             .collect::<Result<Vec<_>>>()?;
         let state = commit::initialize_table(
+            &catalog,
             &location,
             &name.to_string(),
             id,
@@ -106,7 +104,8 @@ impl Format for IcebergFormat {
         _id: Uuid,
     ) -> crate::Result<Arc<dyn FormatTable>> {
         let location = TableLocation::new(self.store.clone(), directory.clone())?;
-        let state = load::load_table(&location, &name.to_string())?;
+        let catalog = DirectoryCatalog::new(location.clone());
+        let state = load::load_table(&catalog, &location, &name.to_string())?;
         Ok(Arc::new(IcebergTable::new(
             name.clone(),
             state,
@@ -162,6 +161,8 @@ struct IcebergTable {
     /// store's file locating.
     name: SchemaQualifiedTableName,
     state: Arc<TableState>,
+    /// The directory the versions are numbered in.
+    catalog: DirectoryCatalog,
     /// `state.entries` as the shared datastore reads them.
     entries: Vec<FileEntry>,
     /// Locates a data file by its full URI under the database's store, for
@@ -187,15 +188,12 @@ impl IcebergTable {
         let table_store =
             TableStore::over_datastore_store(&table_name, Arc::clone(state.location.store()))?;
         let metadata = &state.current.metadata;
-        let logical_types = datastore_iceberg::read_logical_types(metadata.properties())?;
-        let table_columns = datastore_iceberg::table_columns(
-            &table_name,
-            metadata.current_schema(),
-            &logical_types,
-        )?;
+        let logical_types = read_logical_types(metadata.properties())?;
+        let table_columns = table_columns(&table_name, metadata.current_schema(), &logical_types)?;
         let entries = state.entries.iter().map(to_file_entry).collect();
         Ok(Self {
             name,
+            catalog: DirectoryCatalog::new(state.location.clone()),
             state: Arc::new(state),
             entries,
             table_store,
@@ -291,8 +289,10 @@ fn uncommitted_entry(file: &TableFile) -> DataFileEntry {
 }
 
 impl FormatTable for IcebergTable {
+    /// The number of the metadata file this version was loaded from.
     fn version(&self) -> u64 {
-        self.state.current.version
+        metadata_location_version(&self.state.current.metadata_location)
+            .expect("a directory table's versions are the numbered files it wrote")
     }
 
     fn columns(&self) -> &[Column] {
@@ -342,7 +342,7 @@ impl FormatTable for IcebergTable {
                 .iter()
                 .map(|entry| {
                     let uri = self.state.location.uri_for(&entry.file.path)?;
-                    Ok(self.table_store.data_file(&uri, entry.file.size)?)
+                    self.table_store.data_file(&uri, entry.file.size)
                 })
                 .collect::<Result<Vec<_>>>()?;
             let loaded = parquet_engine::load_file_row_groups(
@@ -368,7 +368,8 @@ impl FormatTable for IcebergTable {
     /// One short listing from the version held; a newer version is read with
     /// the manifests already decoded carried over.
     fn refresh(&self) -> crate::Result<Option<Arc<dyn FormatTable>>> {
-        let Some(state) = load::refresh_table(&self.state, &self.name.to_string())? else {
+        let Some(state) = load::refresh_table(&self.catalog, &self.state, &self.name.to_string())?
+        else {
             return Ok(None);
         };
         Ok(Some(Arc::new(self.at_state(state)?)))
@@ -398,6 +399,7 @@ impl FormatTable for IcebergTable {
         let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
         let Some(state) = commit::commit_file_changes(
             &self.state,
+            &self.catalog,
             &removed_entries,
             added_entries,
             data_change,
@@ -437,10 +439,12 @@ impl FormatTable for IcebergTable {
         let mut refreshed: Option<IcebergTable> = None;
         for _ in 0..COMMIT_RETRIES {
             let table: &IcebergTable = refreshed.as_ref().unwrap_or(self);
-            if let Some(state) = commit::expire_snapshots(&table.state, now_ms)? {
+            if let Some(state) = commit::expire_snapshots(&table.state, &table.catalog, now_ms)? {
                 return Ok(Some(Arc::new(table.at_state(state)?)));
             }
-            let Some(state) = load::refresh_table(&table.state, &table.name.to_string())? else {
+            let Some(state) =
+                load::refresh_table(&table.catalog, &table.state, &table.name.to_string())?
+            else {
                 return Ok(None);
             };
             let next = table.at_state(state)?;
@@ -461,14 +465,18 @@ impl FormatTable for IcebergTable {
         now_ms: u64,
     ) -> crate::Result<()> {
         let location = &self.state.location;
-        if load::read_version_hint(location)?.is_none_or(|hinted| hinted < self.version()) {
-            commit::write_version_hint(location, self.version())?;
+        if self
+            .catalog
+            .read_version_hint()?
+            .is_none_or(|hinted| hinted < self.version())
+        {
+            self.catalog.write_version_hint(self.version())?;
         }
 
         let retention_ms =
             u64::try_from(self.deleted_file_retention()?.as_millis()).unwrap_or(u64::MAX);
         let cutoff = now_ms.saturating_sub(retention_ms);
-        let reachable = reachable_objects(self)?;
+        let reachable = reachable_objects(&self.state, &name.to_string())?;
 
         let mut deleted = 0u64;
         let mut first_error: Option<crate::Error> = None;
@@ -501,79 +509,4 @@ impl FormatTable for IcebergTable {
         }
         first_error.map_or(Ok(()), Err)
     }
-}
-
-/// What a table's retained snapshots and metadata log reach: the data files
-/// some retained snapshot names, and the metadata objects (manifests,
-/// manifest lists, metadata files) that are still part of the table.
-struct ReachableObjects {
-    data_paths: HashSet<ObjectPath>,
-    metadata_names: HashSet<String>,
-}
-
-/// Walk every retained snapshot of `table` from its manifest list down to
-/// its data files. The current snapshot's manifests are already decoded;
-/// older snapshots' are read, each once however many snapshots share it.
-fn reachable_objects(table: &IcebergTable) -> Result<ReachableObjects> {
-    let state = &table.state;
-    let metadata = &state.current.metadata;
-    let table_name = table.name.to_string();
-    let location = &state.location;
-    let ctx = EntryContext {
-        schema: metadata.current_schema(),
-        partition_spec: metadata.default_partition_spec(),
-        columns: &state.columns,
-        location,
-    };
-    let mut data_paths = HashSet::new();
-    let mut metadata_names = HashSet::new();
-    metadata_names.insert(object_name(&state.current.metadata_location));
-    for entry in metadata.metadata_log() {
-        metadata_names.insert(object_name(&entry.metadata_file));
-    }
-    let mut manifests_seen: HashSet<String> = HashSet::new();
-    for snapshot in metadata.snapshots() {
-        let list_uri = snapshot.manifest_list();
-        metadata_names.insert(object_name(list_uri));
-        let manifest_files = if Some(snapshot.snapshot_id()) == metadata.current_snapshot_id() {
-            state.manifest_list.clone()
-        } else {
-            let bytes = read_object(location, &table_name, list_uri)?;
-            read_manifest_list(&table_name, list_uri, &bytes)?
-        };
-        for file in manifest_files {
-            metadata_names.insert(object_name(&file.manifest_path));
-            if !manifests_seen.insert(file.manifest_path.clone()) {
-                continue;
-            }
-            let entries = match state.manifests.get(&file.manifest_path) {
-                Some(loaded) => loaded.entries.clone(),
-                None => {
-                    let bytes = read_object(location, &table_name, &file.manifest_path)?;
-                    read_manifest(&table_name, &file, &bytes, &ctx)?.entries
-                }
-            };
-            data_paths.extend(entries.into_iter().map(|entry| entry.file.path));
-        }
-    }
-    Ok(ReachableObjects {
-        data_paths,
-        metadata_names,
-    })
-}
-
-fn read_object(location: &TableLocation, table_name: &str, uri: &str) -> Result<Vec<u8>> {
-    let path = location.file_path_for_uri(uri)?;
-    location
-        .store()
-        .get(&location.data_file_key(&path))?
-        .ok_or_else(|| Error::MissingMetadataObject {
-            table: table_name.to_string(),
-            path: uri.to_string(),
-        })
-}
-
-/// The file name a metadata object's URI ends in.
-fn object_name(uri: &str) -> String {
-    uri.rsplit('/').next().unwrap_or(uri).to_string()
 }

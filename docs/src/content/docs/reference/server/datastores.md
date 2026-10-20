@@ -51,7 +51,7 @@ SQL refers to it. `kind` selects the implementation:
 | Kind | Description |
 | --- | --- |
 | `pivotlake` | Pivot's own read-write tables, stored as Iceberg or Delta Lake tables of Parquet files in a local directory or a bucket. Also accepted as `pivot`. See [Table formats](#table-formats). |
-| `iceberg` | The read-only tables of an Iceberg REST catalog (`uri`). |
+| `iceberg` | The tables of an Iceberg REST catalog (`uri`), read and written in place. |
 
 ### Default datastore
 
@@ -136,9 +136,11 @@ fails every commit.
 
 ### Iceberg datastores
 
-An `iceberg` datastore serves the tables of a REST catalog, read-only. The
-Iceberg tables Pivot writes itself belong to a `pivotlake` datastore in the
-`iceberg` [table format](#table-formats).
+An `iceberg` datastore serves the tables of a REST catalog: every table the
+catalog lists can be queried, and `INSERT`, `COPY`, `CREATE TABLE` and
+`DROP TABLE` go through the catalog. The Iceberg tables Pivot keeps in a
+directory of its own belong to a `pivotlake` datastore in the `iceberg`
+[table format](#table-formats).
 
 ```yaml
 datastores:
@@ -157,16 +159,38 @@ datastores:
 | `properties` | `{}` | Additional REST client properties, passed to the catalog client as written. |
 | `default` | `false` | Whether this is the [default datastore](#default-datastore). |
 
-Each catalog namespace appears as a schema, and the datastore is read-only.
-Table files are read from the locations the catalog reports, using the
-credentials the catalog vends, or the [storage secret](#storage-credentials)
-whose scope covers the file when it vends none.
+Each catalog namespace appears as a schema. Table files are read from and
+written to the locations the catalog reports, using the credentials the
+catalog vends, or the [storage secret](#storage-credentials) whose scope
+covers the file when it vends none.
 
 Format version 3 deletion vectors are supported. A table carrying any other
 kind of delete file is refused rather than read with the deleted rows present.
 
 If the catalog becomes unreachable, the datastore keeps serving the tables it
 last loaded and retries on the next [refresh](#refresh).
+
+#### Writing to catalog tables
+
+An `INSERT` or `COPY` writes its Parquet files under the table's data path
+(`write.data.path`, else `<location>/data/`) and commits them as one append
+snapshot through the catalog's `updateTable`, which admits the commit only if
+no other writer moved the table's `main` branch in the meantime; a commit that
+lost that race is rebuilt on the winner. The session reads its own writes at
+once, before the next refresh. `CREATE TABLE` registers a format-version-3
+table through the catalog, which assigns its location; it takes the same
+`partition_by` and `sort_by` options as a pivotlake table. `DROP TABLE`
+unregisters the table and leaves its files in place, as `DROP TABLE` without
+`PURGE` does in other engines.
+
+Pivot never compacts, expires snapshots of, or vacuums a catalog table: that
+is the catalog's own maintenance, and other engines may share the table.
+
+A write is refused, naming the reason, when the table's shape is one this
+writer cannot honour: a partition transform other than identity (`bucket`,
+`day`, `truncate`, …), a format version below 2, delete files or deletion
+vectors in the current snapshot, or a column type Pivot cannot represent. A
+`NULL` in a column the table declares required fails the statement.
 
 ## Storage credentials
 

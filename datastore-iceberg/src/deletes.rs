@@ -13,8 +13,8 @@ use object_storage::{FileSlice, load_file_slices};
 use roaring::RoaringTreemap;
 
 use crate::manifests::FileDescriptor;
-use crate::store::TableStore;
 use crate::{Error, Result};
+use iceberg_tables::TableStore;
 
 /// What a delete manifest entry records of a deletion vector: where its blob
 /// lies in its Puffin file, and how many rows it deletes.

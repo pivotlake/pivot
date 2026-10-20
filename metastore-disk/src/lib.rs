@@ -21,7 +21,7 @@
 //! (which is exactly serialising its section back out).
 //!
 //! `kind` selects the datastore implementation: `pivotlake` (also accepted as
-//! `pivot`), or `iceberg` for the read-only tables of an Iceberg REST catalog.
+//! `pivot`), or `iceberg` for the tables of an Iceberg REST catalog.
 //! A `pivotlake` datastore's storage backend is chosen from `location`: a
 //! plain path (or `file://`) opens a local store, an `s3://` URI opens an S3
 //! store, a `gs://` URI opens a Google Cloud Storage store. Its tables are
@@ -686,9 +686,10 @@ impl DatastoreConfig {
     }
 }
 
-/// An Iceberg datastore: the read-only tables of a REST catalog. The catalog
+/// An Iceberg datastore: the tables of a REST catalog, read and written
+/// through it. The catalog
 /// is authenticated to with the `iceberg` secret `secret` names, when it
-/// requires one, and the tables' files are read from the locations the
+/// requires one, and the tables' files are read from and written to the locations the
 /// catalog reports, with the credentials the catalog vends or those of the
 /// storage secret scoped to each location.
 #[derive(Clone, Debug, Deserialize, Serialize)]

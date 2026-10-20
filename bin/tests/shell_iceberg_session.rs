@@ -1,9 +1,9 @@
 //! `pivot open --kind iceberg`: the shell opens an Iceberg REST catalog (the
 //! `apache/iceberg-rest-fixture` image, storing its tables in the MinIO the
-//! object-storage harness starts, both in Docker) and serves its tables
-//! read-only, each namespace as a schema. The catalog test returns early when
-//! Docker is unreachable, so the suite stays green offline; the
-//! unreachable-catalog test needs nothing.
+//! object-storage harness starts, both in Docker) and serves its tables,
+//! each namespace as a schema, reading and writing them through the catalog.
+//! The catalog test returns early when Docker is unreachable, so the suite
+//! stays green offline; the unreachable-catalog test needs nothing.
 
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
@@ -47,7 +47,7 @@ fn an_unreachable_catalog_fails_the_open() {
 }
 
 #[test]
-fn the_shell_serves_a_catalog_table_read_only() {
+fn the_shell_reads_and_writes_a_catalog_table() {
     let Some(fixture) = start_fixture() else {
         return;
     };
@@ -61,20 +61,29 @@ fn the_shell_serves_a_catalog_table_read_only() {
         })
         .unwrap();
 
-    let select = runtime
+    let empty = runtime
         .block_on(instance.executor().execute(
             "SELECT id, name FROM demo.events".to_string(),
             ExecuteOptions::default(),
         ))
         .unwrap()
         .output;
-    let insert = runtime.block_on(instance.executor().execute(
-        "INSERT INTO demo.events VALUES (1, 'signup')".to_string(),
-        ExecuteOptions::default(),
-    ));
+    runtime
+        .block_on(instance.executor().execute(
+            "INSERT INTO demo.events VALUES (1, 'signup')".to_string(),
+            ExecuteOptions::default(),
+        ))
+        .unwrap();
+    let written = runtime
+        .block_on(instance.executor().execute(
+            "SELECT id, name FROM demo.events".to_string(),
+            ExecuteOptions::default(),
+        ))
+        .unwrap()
+        .output;
 
     assert_eq!(instance.location(), fixture.uri);
-    let StatementOutput::Rows { columns, batches } = select else {
+    let StatementOutput::Rows { columns, batches } = empty else {
         panic!("SELECT did not return rows from the catalog table");
     };
     let column_types = columns
@@ -89,7 +98,13 @@ fn the_shell_serves_a_catalog_table_read_only() {
         batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
         0
     );
-    assert!(insert.is_err(), "an INSERT into a catalog table succeeded");
+    let StatementOutput::Rows { batches, .. } = written else {
+        panic!("SELECT did not return rows after the INSERT");
+    };
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
+    );
 }
 
 fn iceberg_target(catalog_uri: String) -> ShellTarget {

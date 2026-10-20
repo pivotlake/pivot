@@ -1,28 +1,27 @@
-//! One managed table at one committed metadata version, as loaded from its
-//! metadata file: the base every commit from it is written on top of and the
-//! view every read of it serves.
+//! One table at one committed metadata version, as loaded from its metadata
+//! document: the base every commit from it is written on top of and the view
+//! every read of it serves.
 
 use std::sync::Arc;
 
 use iceberg::spec::{ManifestFile, TableMetadata};
 use planner::catalog::Column;
 
-use super::data_files::DataFileEntry;
-use super::layout::TableLocation;
-use super::manifest_writer::ManifestCache;
+use crate::data_files::DataFileEntry;
+use crate::layout::TableLocation;
+use crate::manifest_writer::{LoadedManifest, ManifestCache};
 
-/// A metadata file the table was loaded from: which numbered version it is,
-/// where it is, and what it says.
-pub(crate) struct CurrentMetadata {
-    pub version: u64,
-    /// The metadata file's URI, as the next version's metadata log records it.
+/// A metadata document the table was loaded from: where it is, as the next
+/// version's metadata log records it, and what it says.
+#[derive(Clone)]
+pub struct CurrentMetadata {
     pub metadata_location: String,
     pub metadata: Arc<TableMetadata>,
 }
 
 /// The table at one version: its metadata, its declared shape, the files its
 /// current snapshot holds, and the manifests they were read from.
-pub(crate) struct TableState {
+pub struct TableState {
     pub location: TableLocation,
     pub current: Arc<CurrentMetadata>,
     pub columns: Vec<Column>,
@@ -42,7 +41,7 @@ pub(crate) struct TableState {
 
 impl TableState {
     /// The loaded manifests in manifest-list order.
-    pub(crate) fn ordered_manifests(&self) -> Vec<Arc<super::manifest_writer::LoadedManifest>> {
+    pub fn ordered_manifests(&self) -> Vec<Arc<LoadedManifest>> {
         self.manifest_list
             .iter()
             .map(|file| {

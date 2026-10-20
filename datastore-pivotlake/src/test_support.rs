@@ -6,15 +6,15 @@ pub use object_storage::test_support::*;
 
 use std::sync::Arc;
 
+use iceberg_tables::commit::{COMMIT_RETRIES, commit_file_changes, now_unix_ms};
+use iceberg_tables::data_files::DataFileEntry;
+use iceberg_tables::directory::metadata_location_version;
+use iceberg_tables::layout::{VERSION_HINT_FILE, parse_hint, parse_metadata_file_version};
+use iceberg_tables::load::load_table;
+use iceberg_tables::{DirectoryCatalog, TableLocation};
 use object_storage::{FileRef, ObjectPath, ObjectStore, open_store};
 use parquet_engine::FileStats;
 
-use crate::iceberg::commit::{COMMIT_RETRIES, commit_file_changes, now_unix_ms};
-use crate::iceberg::data_files::DataFileEntry;
-use crate::iceberg::layout::{
-    TableLocation, VERSION_HINT_FILE, parse_hint, parse_metadata_file_version,
-};
-use crate::iceberg::load::load_table;
 use crate::{CatalogTable, Error, FileEntry, PartitionValues, Result};
 
 impl CatalogTable {
@@ -50,6 +50,20 @@ impl CatalogTable {
     ) -> Result<()> {
         self.commit_entries(removed, added, false)
     }
+}
+
+/// The Iceberg table at `table_directory` under the database at `root_uri`,
+/// as a process that opens it from its path sees it.
+fn open_directory_table(root_uri: &str, table_directory: &str) -> Result<DirectoryTable> {
+    let store: Arc<dyn ObjectStore> = open_store(root_uri)?.into();
+    let location = TableLocation::new(store, ObjectPath::new(table_directory))?;
+    let catalog = DirectoryCatalog::new(location.clone());
+    Ok(DirectoryTable { location, catalog })
+}
+
+struct DirectoryTable {
+    location: TableLocation,
+    catalog: DirectoryCatalog,
 }
 
 /// Commit `bytes` as a new data file `file_name` of the Iceberg table at
@@ -103,14 +117,14 @@ fn commit_from_outside(
     rows: i64,
     data_change: bool,
 ) -> Result<u64> {
-    let store: Arc<dyn ObjectStore> = open_store(root_uri)?.into();
-    let location = TableLocation::new(store, ObjectPath::new(table_directory))?;
+    let table = open_directory_table(root_uri, table_directory)?;
     let path = ObjectPath::new(file_name);
-    location
+    table
+        .location
         .store()
-        .put(&location.data_file_key(&path), bytes)?;
+        .put(&table.location.data_file_key(&path), bytes)?;
     for _ in 0..COMMIT_RETRIES {
-        let state = load_table(&location, table_directory)?;
+        let state = load_table(&table.catalog, &table.location, table_directory)?;
         let removed_entries: Vec<DataFileEntry> = removed
             .iter()
             .map(|name| {
@@ -141,19 +155,19 @@ fn commit_from_outside(
         };
         if let Some(committed) = commit_file_changes(
             &state,
+            &table.catalog,
             &removed_entries,
             vec![added],
             data_change,
             now_unix_ms(),
         )? {
-            return Ok(committed.current.version);
+            return Ok(metadata_location_version(
+                &committed.current.metadata_location,
+            )?);
         }
     }
-    Err(crate::iceberg::Error::CommitRetriesExhausted {
+    Err(iceberg_tables::Error::CommitRacesExhausted {
         attempts: COMMIT_RETRIES,
-        source: object_storage::StoreError::VersionConflict {
-            key: location.table_uri(),
-        },
     }
     .into())
 }
@@ -161,20 +175,19 @@ fn commit_from_outside(
 /// How many snapshots the current metadata of the Iceberg table at
 /// `table_directory` retains.
 pub fn retained_snapshots(root_uri: &str, table_directory: &str) -> Result<usize> {
-    let store: Arc<dyn ObjectStore> = open_store(root_uri)?.into();
-    let location = TableLocation::new(store, ObjectPath::new(table_directory))?;
-    let state = load_table(&location, table_directory)?;
+    let table = open_directory_table(root_uri, table_directory)?;
+    let state = load_table(&table.catalog, &table.location, table_directory)?;
     Ok(state.current.metadata.snapshots().len())
 }
 
 /// The metadata versions present under the Iceberg table at
 /// `table_directory`, in ascending order.
 pub fn metadata_versions(root_uri: &str, table_directory: &str) -> Result<Vec<u64>> {
-    let store: Arc<dyn ObjectStore> = open_store(root_uri)?.into();
-    let location = TableLocation::new(store, ObjectPath::new(table_directory))?;
-    let mut versions: Vec<u64> = location
+    let table = open_directory_table(root_uri, table_directory)?;
+    let mut versions: Vec<u64> = table
+        .location
         .store()
-        .list(&location.metadata_dir())?
+        .list(&table.location.metadata_dir())?
         .objects
         .iter()
         .filter_map(|object| parse_metadata_file_version(object.file.path.as_str()))
@@ -185,10 +198,10 @@ pub fn metadata_versions(root_uri: &str, table_directory: &str) -> Result<Vec<u6
 
 /// The version the Iceberg table's hint names.
 pub fn hinted_version(root_uri: &str, table_directory: &str) -> Result<Option<u64>> {
-    let store: Arc<dyn ObjectStore> = open_store(root_uri)?.into();
-    let location = TableLocation::new(store, ObjectPath::new(table_directory))?;
-    let key = location.metadata_key(VERSION_HINT_FILE);
-    Ok(location
+    let table = open_directory_table(root_uri, table_directory)?;
+    let key = table.location.metadata_key(VERSION_HINT_FILE);
+    Ok(table
+        .location
         .store()
         .get(&key)?
         .map(|bytes| parse_hint(&bytes))
@@ -198,9 +211,8 @@ pub fn hinted_version(root_uri: &str, table_directory: &str) -> Result<Option<u6
 /// The names of the live data files of the Iceberg table at
 /// `table_directory`, as its current version names them, sorted.
 pub fn live_data_file_names(root_uri: &str, table_directory: &str) -> Result<Vec<String>> {
-    let store: Arc<dyn ObjectStore> = open_store(root_uri)?.into();
-    let location = TableLocation::new(store, ObjectPath::new(table_directory))?;
-    let state = load_table(&location, table_directory)?;
+    let table = open_directory_table(root_uri, table_directory)?;
+    let state = load_table(&table.catalog, &table.location, table_directory)?;
     let mut names: Vec<String> = state
         .entries
         .iter()

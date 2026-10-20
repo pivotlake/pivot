@@ -10,11 +10,12 @@ use parquet_engine::{
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
-    BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
-    TableReference, TableRevision,
+    BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
+    TableRevision,
 };
 use planner::expression::Expression;
 
+use crate::TransactionWriter;
 use crate::table::LoadedTable;
 
 /// One reference to a table in a query. Filter pushdown finishes before the
@@ -29,6 +30,9 @@ pub(crate) struct IcebergTableBinding {
     filters: Vec<Expression>,
     /// Statistics, scanning, and late materialization reuse this binding's load.
     cached_pruned_parquet: Arc<Mutex<Option<Arc<ParquetTable>>>>,
+    /// The transaction's INSERT side, which an insert through this binding
+    /// stages its files on.
+    writer: Arc<TransactionWriter>,
 }
 
 impl std::fmt::Debug for IcebergTableBinding {
@@ -42,12 +46,17 @@ impl std::fmt::Debug for IcebergTableBinding {
 }
 
 impl IcebergTableBinding {
-    pub(crate) fn new(reference: TableReference, table: Arc<LoadedTable>) -> Self {
+    pub(crate) fn new(
+        reference: TableReference,
+        table: Arc<LoadedTable>,
+        writer: Arc<TransactionWriter>,
+    ) -> Self {
         Self {
             reference,
             table,
             filters: Vec::new(),
             cached_pruned_parquet: Arc::default(),
+            writer,
         }
     }
 
@@ -114,18 +123,16 @@ impl BoundTable for IcebergTableBinding {
         ))
     }
 
+    /// The table is loaded from the catalog afresh for the write (the
+    /// credentials the catalog vends now outlive the statement; those of the
+    /// query's index may not) and the files land on the transaction's queue
+    /// for its commit.
     fn compile_insert(
         &self,
-        _input: RecordBatchOperatorSpec,
+        input: RecordBatchOperatorSpec,
         _dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        Err(CatalogError::Other(
-            format!(
-                "table `{}` belongs to a REST catalog, which this datastore reads but does not write",
-                self.reference.table
-            )
-            .into(),
-        ))
+        self.writer.stage_insert(&self.table.name, input)
     }
 
     fn columns(&self) -> Vec<Column> {

@@ -1840,11 +1840,13 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "catalog",
+ "crossbeam-deque",
  "datastore-iceberg",
  "dispatch",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
+ "iceberg-tables",
  "object-storage",
  "parquet",
  "parquet-engine",
@@ -1860,6 +1862,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1879,12 +1882,11 @@ dependencies = [
  "core_affinity",
  "criterion",
  "crossbeam-deque",
- "datastore-iceberg",
  "datastore-pivotlake",
  "delta_kernel",
  "delta_kernel_default_engine",
  "dispatch",
- "iceberg",
+ "iceberg-tables",
  "object-storage",
  "parquet",
  "parquet-engine",
@@ -2981,6 +2983,26 @@ dependencies = [
  "serde",
  "typetag",
  "url",
+]
+
+[[package]]
+name = "iceberg-tables"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "crossbeam-deque",
+ "dispatch",
+ "iceberg",
+ "object-storage",
+ "parquet-engine",
+ "planner",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

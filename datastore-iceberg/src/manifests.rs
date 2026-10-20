@@ -6,7 +6,6 @@
 
 use crate::Error;
 use crate::pruning::{self, FieldRange};
-use crate::store::TableStore;
 use dispatch::DataFlowDispatcher;
 use iceberg::expr::BoundPredicate;
 use iceberg::spec::{
@@ -15,6 +14,7 @@ use iceberg::spec::{
     PartitionSpecRef, SchemaRef, TableMetadata,
 };
 use iceberg::{ErrorKind, Result};
+use iceberg_tables::TableStore;
 use object_storage::load_objects;
 use planner::expression::Expression;
 use std::collections::HashMap;
@@ -170,7 +170,7 @@ pub(crate) fn read_manifests<'a>(
             let length = manifest.manifest_length.max(0) as u64;
             store.data_file(&manifest.manifest_path, length)
         })
-        .collect::<crate::Result<Vec<_>>>()?;
+        .collect::<iceberg_tables::Result<Vec<_>>>()?;
     let mut parsed = Vec::with_capacity(objects.len());
     for object in load_objects(dispatcher, &objects)? {
         let manifest = Manifest::parse_avro(&object.bytes).map_err(|source| {

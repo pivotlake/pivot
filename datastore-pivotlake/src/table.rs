@@ -554,6 +554,30 @@ impl CatalogTable {
         self.storage.store.clone()
     }
 
+    /// Whether each column (in [`columns`](Self::columns) order) may be
+    /// written a NULL: every one, as this datastore declares every column
+    /// optional whatever the files written so far hold.
+    fn declared_nullability(&self) -> Vec<bool> {
+        vec![true; self.state.columns().len()]
+    }
+
+    /// What an INSERT into this table writes: files flat under the table's
+    /// directory, in the declared columns, with the field ids the format
+    /// assigns when it resolves columns by id.
+    pub(crate) fn insert_target(&self) -> iceberg_tables::sink::InsertTarget {
+        iceberg_tables::sink::InsertTarget {
+            store: self.store(),
+            directory: self.storage.location.clone(),
+            file_prefix: ObjectPath::new(""),
+            table_id: self.id(),
+            columns: self.columns(),
+            nullability: self.declared_nullability(),
+            field_ids: self.field_ids(),
+            partition_by: self.partition_by().to_vec(),
+            sort_by: self.sort_by().to_vec(),
+        }
+    }
+
     /// Re-encode `inputs`' rows into fresh target-sized files and return them,
     /// uploaded but not yet part of the table: the read half of a compaction,
     /// which [`compact_table_files`](crate::compact_table_files) then swaps in
@@ -613,8 +637,11 @@ impl CatalogTable {
         let (scan, output_schema) = match self.state.field_ids() {
             None => (scan, parquet.schema().clone()),
             Some(field_ids) => {
-                let schema =
-                    super::insert_sink::write_schema(self.state.columns(), Some(&field_ids));
+                let schema = iceberg_tables::sink::write_schema(
+                    self.state.columns(),
+                    &self.declared_nullability(),
+                    Some(&field_ids),
+                );
                 let projected = parquet_engine::writing::unshred_batches_spec(scan).project({
                     let schema = schema.clone();
                     move || {
@@ -639,9 +666,10 @@ impl CatalogTable {
             target_rows_per_group,
             max_output_file_size,
         );
-        let spec = super::insert_sink::upload_files_spec(
+        let spec = iceberg_tables::sink::upload_files_spec(
             self.store(),
             self.storage.location.clone(),
+            ObjectPath::new(""),
             self.id(),
             self.columns().into(),
             uploaded_files.clone(),
@@ -656,7 +684,7 @@ impl CatalogTable {
             match uploaded_files.steal() {
                 Steal::Success(uploaded) => {
                     // table_id is ignored: this table is the commit target.
-                    let super::insert_sink::UploadedFile {
+                    let iceberg_tables::sink::UploadedFile {
                         file,
                         partition,
                         row_groups,

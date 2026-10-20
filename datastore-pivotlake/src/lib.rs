@@ -43,7 +43,6 @@ mod delta;
 mod file_entry;
 mod format;
 mod iceberg;
-mod insert_sink;
 mod local_lock;
 mod manifest;
 mod table;
@@ -154,7 +153,7 @@ pub enum Error {
     #[error(transparent)]
     Delta(#[from] crate::delta::log::Error),
     #[error(transparent)]
-    Iceberg(#[from] crate::iceberg::Error),
+    Iceberg(#[from] iceberg_tables::Error),
     #[error(
         "the database at `{location}` keeps its tables as {recorded} tables and cannot be opened as a {requested} database; its format was fixed when it was created"
     )]
@@ -1239,11 +1238,11 @@ fn commit_table_drops(
 /// pool.
 fn commit_uploaded_files(
     datastore: &PivotlakeDatastore,
-    drained: Vec<insert_sink::UploadedFile>,
+    drained: Vec<iceberg_tables::sink::UploadedFile>,
 ) -> CatalogResult<()> {
     let mut files_by_table = HashMap::<Uuid, Vec<TableFile>>::new();
     for uploaded in drained {
-        let insert_sink::UploadedFile {
+        let iceberg_tables::sink::UploadedFile {
             table_id,
             file,
             partition,
@@ -1479,7 +1478,7 @@ struct PendingTableCreation {
 /// creations awaiting commit.
 pub struct PivotlakeTransaction {
     pub(crate) snapshot: Arc<PivotlakeSnapshot>,
-    pub(crate) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
+    pub(crate) uploaded_files: Arc<Injector<iceberg_tables::sink::UploadedFile>>,
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
     pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
     pending_table_drops: Arc<Injector<PendingTableDrop>>,

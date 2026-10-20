@@ -15,7 +15,7 @@ pub enum ShellTarget {
         location: String,
         table_format: Option<TableFormat>,
     },
-    /// The read-only tables of an Iceberg REST catalog.
+    /// The tables of an Iceberg REST catalog, read and written through it.
     Iceberg(IcebergCatalogConfig),
 }
 

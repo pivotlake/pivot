@@ -7,10 +7,10 @@ mod iceberg_support;
 use datastore_pivotlake::test_support::{
     commit_external_append, hinted_version, live_data_file_names, metadata_versions,
 };
-use iceberg::spec::{FormatVersion, Manifest, ManifestList};
 use iceberg_support::{
     Database, collect_i64s, collect_strings, names_in, parquet_files_in, single_i64,
 };
+use iceberg_tables::iceberg::spec::{FormatVersion, Manifest, ManifestList};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use planner::catalog::{BoundTable, SchemaQualifiedTableName};
 use planner::types::Type;

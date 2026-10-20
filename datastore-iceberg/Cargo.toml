@@ -12,6 +12,10 @@ catalog = { workspace = true }
 dispatch = { workspace = true }
 object-storage = { workspace = true }
 parquet-engine = { workspace = true }
+# The staged writes of a transaction: the sink pushes finished uploads onto an
+# injector the commit drains.
+crossbeam-deque = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 thiserror = { workspace = true }
@@ -33,6 +37,9 @@ roaring = { workspace = true }
 # vector's bitmap, until a release carries them.
 iceberg = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
 iceberg-catalog-rest = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
+# The Iceberg table model, store and column plumbing shared with the pivotlake
+# datastore.
+iceberg-tables = { workspace = true }
 # The REST client's reqwest carries no TLS backend of its own; a catalog behind
 # https needs one.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

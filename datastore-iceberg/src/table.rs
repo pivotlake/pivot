@@ -6,19 +6,18 @@ use std::sync::Arc;
 
 use arrow_schema::{Field, Schema};
 use dispatch::DataFlowDispatcher;
-use iceberg::spec::{ManifestFile, SchemaRef, TableMetadataRef, Transform};
+use iceberg::spec::{ManifestFile, TableMetadataRef};
 use iceberg::table::Table;
 use object_storage::ExternalStoreFactory;
 use parquet_engine::{FileRowGroups, ParquetTable, TableColumns, load_file_row_groups};
 use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 use planner::types::physical_arrow_type;
 
-use crate::columns::read_logical_types;
-use crate::columns::table_columns;
 use crate::deletes::{count_deleted_rows, read_deletion_vectors};
 use crate::manifests::{DataFiles, FileDescriptor, ManifestList, read_manifests};
-use crate::store::{TableStore, read_vended_s3_credentials};
 use crate::{Error, Result};
+use iceberg_tables::store::read_vended_s3_credentials;
+use iceberg_tables::{TableStore, identity_columns, read_logical_types, table_columns};
 
 pub(crate) struct LoadedTable {
     pub name: SchemaQualifiedTableName,
@@ -156,7 +155,7 @@ impl LoadedTable {
         let data_files = files
             .iter()
             .map(|file| self.store.data_file(&file.path, file.length))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<iceberg_tables::Result<Vec<_>>>()?;
         Ok(load_file_row_groups(
             &self.dispatcher,
             &data_files,
@@ -226,20 +225,6 @@ impl LoadedTable {
     }
 }
 
-/// The names of the columns `fields` (a partition spec's or a sort order's,
-/// as source field id and transform) take by identity, in field order. A
-/// transformed field (a bucket, a day) is not a column value, so it is left out.
-pub fn identity_columns<'a>(
-    schema: &SchemaRef,
-    fields: impl Iterator<Item = (i32, &'a Transform)>,
-) -> Vec<String> {
-    fields
-        .filter(|(_, transform)| **transform == Transform::Identity)
-        .filter_map(|(source_id, _)| schema.name_by_field_id(source_id))
-        .map(str::to_string)
-        .collect()
-}
-
 /// The store `table`'s files are read through: opened with the credentials
 /// the catalog vended for the table, or through `store_factory` when it
 /// vended none. Opened when the table is indexed rather than when a query loads
@@ -257,7 +242,12 @@ pub(crate) fn open_table_store(
             table: table_name.clone(),
         })?;
     let vended = read_vended_s3_credentials(&table_name, table.file_io().config().props())?;
-    TableStore::open(&table_name, metadata_location, store_factory, vended)
+    Ok(TableStore::open(
+        &table_name,
+        metadata_location,
+        store_factory,
+        vended,
+    )?)
 }
 
 /// The size of `table`'s current manifest list, or `None` when the table has
@@ -280,41 +270,4 @@ pub(crate) fn fetch_manifest_list_size(
             path: path.to_string(),
         })?;
     Ok(Some(size))
-}
-
-#[cfg(test)]
-mod tests {
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-
-    use super::*;
-
-    #[test]
-    fn only_identity_fields_are_columns_in_field_order() {
-        let schema: SchemaRef = Arc::new(
-            Schema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-                    NestedField::required(2, "region", Type::Primitive(PrimitiveType::String))
-                        .into(),
-                    NestedField::required(3, "day", Type::Primitive(PrimitiveType::Date)).into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-        let fields = [
-            (2, Transform::Identity),
-            (1, Transform::Bucket(16)),
-            (3, Transform::Day),
-            (1, Transform::Identity),
-        ];
-
-        let columns = identity_columns(
-            &schema,
-            fields
-                .iter()
-                .map(|(source_id, transform)| (*source_id, transform)),
-        );
-
-        assert_eq!(columns, ["region", "id"]);
-    }
 }

@@ -12,18 +12,18 @@ use iceberg::spec::{
 use planner::catalog::Column;
 use planner::types::Type;
 
-use super::{Error, Result};
+use crate::{Error, Result};
 
-pub(crate) use datastore_iceberg::LOGICAL_TYPES_PROPERTY;
+pub use crate::columns::LOGICAL_TYPES_PROPERTY;
 
 /// The Iceberg name-mapping property, written when a table adopts Parquet
 /// files that carry no field ids so readers resolve their columns by name.
-pub(crate) const NAME_MAPPING_PROPERTY: &str = "schema.name-mapping.default";
+pub const NAME_MAPPING_PROPERTY: &str = "schema.name-mapping.default";
 
 /// `columns` as an Iceberg schema: every field optional (the catalog carries
 /// no NOT NULL), field ids 1.. in column order, a variant column's two leaves
 /// numbered after every top-level column.
-pub(crate) fn build_schema(columns: &[Column]) -> Result<Schema> {
+pub fn build_schema(columns: &[Column]) -> Result<Schema> {
     let mut next_nested_id = i32::try_from(columns.len()).expect("a table has few columns") + 1;
     let mut fields = Vec::with_capacity(columns.len());
     for (position, column) in columns.iter().enumerate() {
@@ -59,7 +59,7 @@ pub(crate) fn build_schema(columns: &[Column]) -> Result<Schema> {
 
 /// The Iceberg primitive a Pivot column type is stored as, or `None` for a
 /// type with no Iceberg form (`Int128`, `Interval`; `Variant` is a struct).
-pub(crate) fn to_iceberg_primitive(pivot_type: &Type) -> Option<PrimitiveType> {
+pub fn to_iceberg_primitive(pivot_type: &Type) -> Option<PrimitiveType> {
     Some(match pivot_type {
         Type::Boolean => PrimitiveType::Boolean,
         Type::Int8 | Type::Int16 | Type::Int32 | Type::UInt8 | Type::UInt16 => PrimitiveType::Int,
@@ -114,7 +114,7 @@ fn needs_logical_type_record(pivot_type: &Type) -> bool {
 /// object from field id to Pivot type name, or `None` when every column's
 /// Iceberg type reads back as itself. Keyed by the ids the built schema
 /// carries, so it survives any reassignment the metadata builder applies.
-pub(crate) fn logical_types_property(schema: &Schema, columns: &[Column]) -> Option<String> {
+pub fn logical_types_property(schema: &Schema, columns: &[Column]) -> Option<String> {
     let recorded: BTreeMap<String, String> = columns
         .iter()
         .filter(|column| needs_logical_type_record(&column.col_type))
@@ -129,7 +129,7 @@ pub(crate) fn logical_types_property(schema: &Schema, columns: &[Column]) -> Opt
 
 /// An identity partition spec over `partition_by`, in order. Partition field
 /// ids start at 1000, the Iceberg convention; names are the columns' own.
-pub(crate) fn build_partition_spec(
+pub fn build_partition_spec(
     schema: &Schema,
     partition_by: &[String],
 ) -> Result<UnboundPartitionSpec> {
@@ -151,7 +151,7 @@ pub(crate) fn build_partition_spec(
 
 /// An ascending, nulls-first identity sort order over `sort_by`, in order;
 /// the unsorted order when there are no sort columns.
-pub(crate) fn build_sort_order(schema: &Schema, sort_by: &[String]) -> Result<SortOrder> {
+pub fn build_sort_order(schema: &Schema, sort_by: &[String]) -> Result<SortOrder> {
     if sort_by.is_empty() {
         return Ok(SortOrder::unsorted_order());
     }
@@ -177,7 +177,7 @@ pub(crate) fn build_sort_order(schema: &Schema, sort_by: &[String]) -> Result<So
 
 /// The [`NAME_MAPPING_PROPERTY`] value for `schema`: every top-level field
 /// resolvable by its name, for files written without field ids.
-pub(crate) fn name_mapping_property(schema: &Schema) -> String {
+pub fn name_mapping_property(schema: &Schema) -> String {
     let mapping: Vec<serde_json::Value> = schema
         .as_struct()
         .fields()
@@ -259,7 +259,7 @@ mod tests {
         let schema = build_schema(&columns).unwrap();
 
         let property = logical_types_property(&schema, &columns).unwrap();
-        let read = datastore_iceberg::read_logical_types(&HashMap::from([(
+        let read = crate::columns::read_logical_types(&HashMap::from([(
             LOGICAL_TYPES_PROPERTY.to_string(),
             property.clone(),
         )]))

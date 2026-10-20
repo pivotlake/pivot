@@ -11,26 +11,26 @@ use std::time::Duration;
 
 use iceberg::spec::TableMetadata;
 
-use super::{Error, Result};
+use crate::{Error, Result};
 
 /// The table property holding the retention window in milliseconds, under
 /// the name Iceberg's own expiry reads.
-pub(crate) const SNAPSHOT_RETENTION_PROPERTY: &str = "history.expire.max-snapshot-age-ms";
+pub const SNAPSHOT_RETENTION_PROPERTY: &str = "history.expire.max-snapshot-age-ms";
 /// The table property bounding how many previous metadata files the
 /// metadata log lists, which is also how many vacuum keeps.
-pub(crate) const PREVIOUS_VERSIONS_PROPERTY: &str = "write.metadata.previous-versions-max";
-pub(crate) const DEFAULT_PREVIOUS_VERSIONS: usize = 100;
+pub const PREVIOUS_VERSIONS_PROPERTY: &str = "write.metadata.previous-versions-max";
+pub const DEFAULT_PREVIOUS_VERSIONS: usize = 100;
 /// The retention window of a table that sets none: how long a reader may
 /// keep reading a snapshot after a later commit retired its files.
-pub(crate) const DEFAULT_SNAPSHOT_RETENTION: Duration = Duration::from_secs(4 * 60 * 60);
+pub const DEFAULT_SNAPSHOT_RETENTION: Duration = Duration::from_secs(4 * 60 * 60);
 /// A non-current snapshot expires once this many newer ones exist, whatever
 /// its age: each retained snapshot costs the metadata file about half a
 /// kilobyte on every commit, and a table committing every second would carry
 /// the whole window's worth.
-pub(crate) const MAX_RETAINED_SNAPSHOTS: usize = 1000;
+pub const MAX_RETAINED_SNAPSHOTS: usize = 1000;
 
 /// The table's retention window: its own property, or the default.
-pub(crate) fn snapshot_retention(metadata: &TableMetadata) -> Result<Duration> {
+pub fn snapshot_retention(metadata: &TableMetadata) -> Result<Duration> {
     match metadata.properties().get(SNAPSHOT_RETENTION_PROPERTY) {
         None => Ok(DEFAULT_SNAPSHOT_RETENTION),
         Some(raw) => {
@@ -48,7 +48,7 @@ pub(crate) fn snapshot_retention(metadata: &TableMetadata) -> Result<Duration> {
 /// whose successor is older than the retention window, and every one with
 /// [`MAX_RETAINED_SNAPSHOTS`] or more newer than it. The current snapshot
 /// never expires.
-pub(crate) fn expired_snapshot_ids(metadata: &TableMetadata, now_ms: i64) -> Result<Vec<i64>> {
+pub fn expired_snapshot_ids(metadata: &TableMetadata, now_ms: i64) -> Result<Vec<i64>> {
     let retention_ms = i64::try_from(snapshot_retention(metadata)?.as_millis()).unwrap_or(i64::MAX);
     let mut ordered: Vec<_> = metadata.snapshots().collect();
     ordered.sort_by_key(|snapshot| (snapshot.sequence_number(), snapshot.timestamp_ms()));
