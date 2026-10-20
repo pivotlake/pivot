@@ -10,20 +10,15 @@ use std::collections::BTreeMap;
 
 pub(crate) fn describe_table(table: &LoadedTable) -> Result<DatastoreTableMetadata> {
     let data_files = table.load_all_data_files()?;
-    let files: Vec<_> = data_files
-        .iter()
-        .map(|file| (file.manifest, file.data))
-        .collect();
+    let files: Vec<_> = data_files.iter().collect();
     let mut column_bytes = vec![(0u64, 0u64); table.columns().len()];
     let mut described = Vec::with_capacity(files.len());
     // Bound peak memory by processing and releasing one batch of parsed footers
     // at a time instead of loading every footer for the table into this query.
     for chunk in files.chunks(1024) {
-        let entries: Vec<_> = chunk
-            .iter()
-            .map(|(_, file)| FileDescriptor::of(file))
-            .collect();
-        for ((manifest, file), loaded) in chunk.iter().zip(table.read_footers(&entries)?) {
+        let entries: Vec<_> = chunk.iter().map(FileDescriptor::of).collect();
+        for (live, loaded) in chunk.iter().zip(table.read_footers(&entries)?) {
+            let (manifest, file) = (live.manifest, live.data);
             let mut uncompressed = 0u64;
             for group in &loaded.row_groups {
                 for (position, column) in group.columns.iter().enumerate() {
@@ -71,7 +66,7 @@ pub(crate) fn describe_table(table: &LoadedTable) -> Result<DatastoreTableMetada
         columns,
         sort_by: table.sort_by.clone(),
         partition_by: table.partition_by.clone(),
-        total_rows: files.iter().map(|(_, file)| file.record_count()).sum(),
+        total_rows: files.iter().map(|file| file.data.record_count()).sum(),
         bytes: described.iter().map(|file| file.bytes).sum(),
         bytes_uncompressed: described.iter().map(|file| file.bytes_uncompressed).sum(),
         files: described,

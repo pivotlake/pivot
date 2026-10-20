@@ -1049,30 +1049,47 @@ fn a_table_spark_compacted_after_its_deletion_vectors_reads_the_rewritten_file()
     assert_eq!(int64_column(&counted, 0), [Some(7)]);
 }
 
-/// Spark deletes from a table of format version 2 by position-delete file,
-/// which is not a deletion vector: the datastore refuses the scan and the
-/// count alike, naming the delete file, rather than reading the deleted row.
+/// Spark deletes from a table of format version 2 by position-delete file: a
+/// first delete spans two data files, a second deletes again from the first
+/// file, and a file appended after both is newer than every delete. The
+/// datastore leaves the deleted rows out of a scan, of the count and bounds,
+/// and of a late-materialized read, and reads the newer file whole.
 #[test]
-fn a_table_with_a_position_delete_file_is_refused() {
+fn rows_spark_deleted_by_position_delete_file_are_not_read() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("legacy", "orders", orders_schema());
-    harness.append(
-        &namespace,
-        "orders",
-        orders(&[1, 2, 3], &["ann", "bob", "cy"], &[1.0, 2.0, 3.0]),
-    );
+    let batch = |ids: Vec<i64>| {
+        let customers: Vec<String> = ids.iter().map(|id| format!("customer-{id}")).collect();
+        let customer_names: Vec<&str> = customers.iter().map(String::as_str).collect();
+        let amounts: Vec<f64> = ids.iter().map(|id| *id as f64).collect();
+        orders(&ids, &customer_names, &amounts)
+    };
+    harness.append_in_row_groups(&namespace, "orders", batch((1..=10).collect()), 4);
+    harness.append(&namespace, "orders", batch((11..=15).collect()));
     harness.spark_sql(
         "ALTER TABLE legacy.orders SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
-         DELETE FROM legacy.orders WHERE id = 2;",
+         DELETE FROM legacy.orders WHERE id IN (2, 5, 10, 12);
+         DELETE FROM legacy.orders WHERE id = 6;",
     );
+    harness.append(&namespace, "orders", batch((16..=17).collect()));
     let (catalog, mut planner) = harness.pivot();
 
-    let scanned = harness.try_query(
+    let scanned = harness.query(
         &catalog,
         &mut planner,
         "SELECT id FROM legacy.orders ORDER BY id",
     );
-    let counted = harness.try_query(&catalog, &mut planner, "SELECT COUNT(*) FROM legacy.orders");
+    let counted = harness.query(&catalog, &mut planner, "SELECT COUNT(*) FROM legacy.orders");
+    let bounded = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT MIN(id), MAX(id) FROM legacy.orders",
+    );
+    let limited = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT customer FROM legacy.orders LIMIT 3",
+    );
 
     assert_eq!(
         harness
@@ -1081,10 +1098,26 @@ fn a_table_with_a_position_delete_file_is_refused() {
             .format_version(),
         FormatVersion::V2
     );
-    for error in [scanned.unwrap_err(), counted.unwrap_err()] {
+    assert_eq!(
+        int64_column(&scanned, 0),
+        [1, 3, 4, 7, 8, 9, 11, 13, 14, 15, 16, 17].map(Some)
+    );
+    assert_eq!(int64_column(&counted, 0), [Some(12)]);
+    assert_eq!(int64_column(&bounded, 0), [Some(1)]);
+    assert_eq!(int64_column(&bounded, 1), [Some(17)]);
+    let limited = string_column(&limited, 0);
+    assert_eq!(limited.len(), 3);
+    for customer in limited.into_iter().flatten() {
         assert!(
-            error.contains("is not a deletion vector") && error.contains(".parquet"),
-            "{error}"
+            ![
+                "customer-2",
+                "customer-5",
+                "customer-6",
+                "customer-10",
+                "customer-12"
+            ]
+            .contains(&customer.as_str()),
+            "{customer} was deleted"
         );
     }
 }
