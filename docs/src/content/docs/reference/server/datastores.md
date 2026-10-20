@@ -50,8 +50,8 @@ SQL refers to it. `kind` selects the implementation:
 
 | Kind | Description |
 | --- | --- |
-| `pivotlake` | Pivot's own read-write tables, stored as Delta Lake tables of Parquet files in a local directory or a bucket. Also accepted as `pivot`. |
-| `iceberg` | The tables of an Iceberg REST catalog, read-only. |
+| `pivotlake` | Pivot's own read-write tables, stored as Iceberg or Delta Lake tables of Parquet files in a local directory or a bucket. Also accepted as `pivot`. See [Table formats](#table-formats). |
+| `iceberg` | The read-only tables of an Iceberg REST catalog (`uri`). |
 
 ### Default datastore
 
@@ -87,6 +87,7 @@ datastores:
 | Key | Default | Description |
 | --- | --- | --- |
 | `location` | Required | Where the datastore's tables are stored. See the table below. |
+| `table_format` | `iceberg` | The table format a database that does not exist yet at `location` is created in: `iceberg` or `delta` (also spelled `deltalake`). See [Table formats](#table-formats). |
 | `default` | `false` | Whether this is the [default datastore](#default-datastore). |
 | `compact` | `true` | Run background compaction. See [Compaction](#compaction). |
 | `compact_bytes` | `64m` | The target size of a compacted file. |
@@ -107,7 +108,37 @@ The storage backend is chosen from the location's scheme:
 A local directory is created if it does not exist, and only one process at a
 time can open it. A location with any other scheme is a startup error.
 
+#### Table formats
+
+A pivotlake database keeps every one of its tables in one table format,
+chosen when the database is created and recorded in its index,
+`_pivot_manifest.json` at the location's root. A database that does not
+exist yet is created in the format `table_format` names, `iceberg` unless it says
+`delta`; an existing database keeps the format it was created in, whatever
+`table_format` says, and naming the other one is a startup error. A database
+created before the index recorded a format is a Delta Lake database. Pivot
+needs no catalog service for either format: the index names the schemas and
+tables and maps each table to a directory named after its identity, and the
+table's own metadata lives in that directory.
+
+| Format | Table layout | Readable by |
+| --- | --- | --- |
+| `iceberg` | An Iceberg format-version-3 table: metadata under `<table>/metadata/` as `v<N>.metadata.json` files, one per commit, with their manifest lists and manifests. | Any Iceberg reader that opens a table by its path, such as DuckDB's `iceberg_scan('<location>/<table directory>')`: Pivot rewrites the `version-hint.text` such readers look for after every commit. Spark's `HadoopTables` path reader does not accept the zero-padded metadata file names; Spark reads these tables through a catalog. |
+| `delta` | A Delta Lake table: a `_delta_log` of commit files and checkpoints. | Any Delta Lake reader, such as DuckDB's `delta_scan`. |
+
+A commit to an Iceberg table creates the next numbered metadata file with a
+conditional write, and a commit to a Delta table appends the next log entry
+the same way, so writers in several processes can share one location:
+exactly one lands each version, and the others reload and retry. The store
+must support conditional writes (Amazon S3, Google Cloud Storage, MinIO, or
+a local filesystem); a location on an S3-compatible service without them
+fails every commit.
+
 ### Iceberg datastores
+
+An `iceberg` datastore serves the tables of a REST catalog, read-only. The
+Iceberg tables Pivot writes itself belong to a `pivotlake` datastore in the
+`iceberg` [table format](#table-formats).
 
 ```yaml
 datastores:
@@ -305,7 +336,8 @@ older than the table's retention window:
 | Files | Retention |
 | --- | --- |
 | Data files no longer referenced, including a dropped table's | 4 hours |
-| Log files made redundant by a checkpoint | 24 hours |
+| Iceberg snapshots, with their manifests and metadata files, superseded for longer than the window | 4 hours |
+| Delta log files made redundant by a checkpoint | 24 hours |
 
 A query that is still reading an older version of a table keeps working for
 as long as that version's files are retained.

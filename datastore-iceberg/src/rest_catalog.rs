@@ -68,10 +68,10 @@ pub(crate) fn build_rest_catalog(config: &IcebergCatalogConfig) -> Result<RestCa
 }
 
 /// Drive `future` to completion from a blocking thread: on the ambient
-/// multi-thread runtime when there is one, else on [`CATALOG_RUNTIME`]. A
+/// multi-thread runtime when there is one, else on `CATALOG_RUNTIME`. A
 /// single-thread ambient runtime (a current-thread test) cannot be blocked on
 /// from inside itself, so it is declined in favour of the crate's own.
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+pub fn block_on<F: Future>(future: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| handle.block_on(future))

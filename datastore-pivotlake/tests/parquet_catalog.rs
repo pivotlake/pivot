@@ -50,8 +50,12 @@ fn dispatcher() -> DataFlowDispatcher {
 /// guard next to the datastore makes its storage lifetime explicit.
 fn empty_datastore() -> (TempDir, Arc<PivotlakeDatastore>) {
     let database = TempDir::new().unwrap();
-    let datastore =
-        PivotlakeDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &database.path().to_string_lossy(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     (database, datastore)
 }
 
@@ -251,6 +255,7 @@ fn create_table_succeeds_with_valid_path() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
 }
@@ -277,6 +282,7 @@ fn create_table_is_durable_and_visible_only_after_commit() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_none()
     );
     assert!(durable_datastore_entries(database.path()).is_empty());
@@ -291,6 +297,7 @@ fn create_table_is_durable_and_visible_only_after_commit() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
     assert!(
@@ -326,6 +333,7 @@ fn rolling_back_create_table_discards_the_staged_creation() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_none()
     );
     assert!(!dir.path().join("_delta_log").exists());
@@ -391,6 +399,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
     assert!(current_parquet(&datastore, "t").row_groups().is_empty());
@@ -401,9 +410,13 @@ fn opening_an_unwritable_database_fails() {
     // Opening takes and records the datastore lock before loading catalog state,
     // so an unwritable root is rejected immediately.
     let bogus = "/definitely/not/a/real/path/for/datastore/tests";
-    let err = PivotlakeDatastore::open(bogus, &dispatcher())
-        .unwrap_err()
-        .to_string();
+    let err = PivotlakeDatastore::open_with_format(
+        bogus,
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap_err()
+    .to_string();
 
     let err_lower = err.to_lowercase();
     assert!(
@@ -515,7 +528,8 @@ fn pushdown_filter_always_returns_false() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     let pushed = table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
@@ -535,7 +549,8 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
 
     table
@@ -725,7 +740,8 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     first
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
@@ -739,7 +755,8 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     assert_eq!(row_group_count(&datastore, "t", &second), 3);
 }
 
@@ -757,7 +774,8 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_eq_filter(0, int_constant(999)))
         .unwrap();
@@ -778,7 +796,8 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -797,7 +816,8 @@ fn pushdown_filter_eq_returns_false() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     let pushed = table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -817,7 +837,8 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_neq_filter(0, int_constant(999)))
         .unwrap();
@@ -1659,7 +1680,8 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -1679,13 +1701,22 @@ fn reopened_database_restores_appended_files_from_manifest() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            &dispatcher(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
         let new_file = write_ids(data_dir.path(), "later.parquet", &[40]);
         append(&datastore, "t", &new_file);
     }
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     assert_eq!(current_parquet(&reopened, "t").row_groups().len(), 4);
 }
 
@@ -1696,8 +1727,12 @@ fn reopened_database_restores_sort_by() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            &dispatcher(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
         let mut request = create_request("t", data_dir.path(), columns);
         request
             .options
@@ -1705,7 +1740,12 @@ fn reopened_database_restores_sort_by() {
         create_table(&datastore, request).unwrap();
     }
 
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
 
     assert_eq!(
         reopened
@@ -1722,7 +1762,12 @@ fn reopened_database_restores_sort_by() {
 fn unlogged_leftover_file_is_invisible_after_swap() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
 
     // "Compact" the adopted file into merged.parquet but crash before deleting
@@ -1742,7 +1787,12 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
 
     drop(table);
     drop(datastore);
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let parquet = current_parquet(&reopened, "t");
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the committed merged file is read");
@@ -1801,7 +1851,8 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     assert_eq!(row_group_count(&datastore, "t", &table), 6);
 
     table
@@ -2106,7 +2157,8 @@ fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<PivotlakeDatastore>, Tab
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("docs"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     (database, datastore, binding)
 }
 

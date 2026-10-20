@@ -563,8 +563,12 @@ fn table_over(
     columns: Vec<Column>,
     sort_by: &[&str],
 ) -> (PivotCatalog, PathBuf) {
-    let datastore =
-        PivotlakeDatastore::open(&dir.to_string_lossy(), dispatch.dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &dir.to_string_lossy(),
+        dispatch.dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let catalog = PivotCatalog::new(
         HashMap::from([(
             DEFAULT_DATASTORE_NAME.to_string(),

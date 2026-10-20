@@ -10,8 +10,8 @@ use parquet_engine::{
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
-    BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
-    TableRevision,
+    BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
+    TableReference, TableRevision,
 };
 use planner::expression::Expression;
 
@@ -111,6 +111,20 @@ impl BoundTable for IcebergTableBinding {
             row_group_filter_from(dynamic_filters),
             scan_order,
             Arc::new(eq_predicates),
+        ))
+    }
+
+    fn compile_insert(
+        &self,
+        _input: RecordBatchOperatorSpec,
+        _dispatcher: &DataFlowDispatcher,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        Err(CatalogError::Other(
+            format!(
+                "table `{}` belongs to a REST catalog, which this datastore reads but does not write",
+                self.reference.table
+            )
+            .into(),
         ))
     }
 

@@ -250,7 +250,7 @@ fn read_partition_summaries(
 }
 
 /// Where a data file is and how long, which is all a footer read needs.
-pub(crate) struct FileDescriptor {
+pub struct FileDescriptor {
     pub path: String,
     pub length: u64,
 }

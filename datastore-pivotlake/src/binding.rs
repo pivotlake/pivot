@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
+use crate::file_entry::{ColumnStatFilter, PartitionEqFilter};
 use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
@@ -66,22 +66,25 @@ impl std::fmt::Debug for TableBinding {
 
 impl TableBinding {
     /// A binding over the snapshot's `table` copy, sharing the transaction's
-    /// `uploaded_files` injector, with no predicates pushed yet.
+    /// `uploaded_files` injector, with no predicates pushed yet. Reads the
+    /// footers the table does not hold yet, for the columns' nullability.
     pub(super) fn new(
         reference: TableReference,
         table: CatalogTable,
         uploaded_files: Arc<Injector<UploadedFile>>,
-    ) -> Self {
+    ) -> CatalogResult<Self> {
         let columns = table.columns();
-        let nullability = table.nullability();
-        Self {
+        let nullability = table
+            .nullability()
+            .map_err(|e| CatalogError::Other(Box::new(e)))?;
+        Ok(Self {
             reference,
             table,
             columns,
             nullability,
             predicates: Vec::new(),
             uploaded_files,
-        }
+        })
     }
 
     /// This table's row groups in the captured snapshot, partition-pruned by the

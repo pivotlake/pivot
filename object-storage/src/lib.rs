@@ -221,6 +221,16 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// through [`update`](Self::update) instead.
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
 
+    /// Create `key` with `data` only if no object exists at it yet, failing
+    /// with [`StoreError::VersionConflict`] otherwise. Of any number of writers
+    /// racing to create one key exactly one succeeds, which makes a key that
+    /// every writer derives the same way (the next numbered version of a
+    /// table's metadata) a commit point: landing it *is* winning the race.
+    /// A remote backend sends the create conditionally (`If-None-Match: *`,
+    /// `ifGenerationMatch=0`); a local one publishes the whole object under the
+    /// name atomically, so a concurrent reader never sees it half-written.
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
+
     /// Atomically read-modify-write the object at `key`, so no concurrent
     /// update through this method — from this or any other process — is ever
     /// lost: `apply` receives the current object (`None` if it does not exist)
@@ -257,6 +267,21 @@ pub trait ObjectStore: Debug + Send + Sync {
         &self,
         prefix: &ObjectPath,
         name_prefix: &str,
+    ) -> Result<DirectoryListing> {
+        self.list_from(prefix, name_prefix, "")
+    }
+
+    /// [`list_with_name_prefix`](Self::list_with_name_prefix), further narrowed
+    /// to children whose own name sorts strictly after `after_name` (byte
+    /// order, the order every backend lists in). A remote backend pushes the
+    /// cursor into the request (`start-after`, `startOffset`), so a directory
+    /// holding thousands of numbered objects is read from a known recent one
+    /// without paging through the rest. An empty `after_name` is no cursor.
+    fn list_from(
+        &self,
+        prefix: &ObjectPath,
+        name_prefix: &str,
+        after_name: &str,
     ) -> Result<DirectoryListing>;
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
@@ -508,6 +533,22 @@ pub(crate) fn object_key(prefix: &str, key: &ObjectPath) -> String {
         } else {
             format!("{prefix}/{}", key.as_str())
         }
+    }
+}
+
+/// The percent-encoded in-bucket key of the child `name` of the listing root
+/// `object_prefix` (an [`object_key`]), as a remote listing's `prefix` and
+/// cursor parameters spell it. `name` may be a partial name: the listing's
+/// name prefix, or the name a cursor starts after.
+pub(crate) fn encode_child_key(object_prefix: &str, name: &str) -> String {
+    if object_prefix.is_empty() {
+        percent_encode(name)
+    } else {
+        format!(
+            "{}%2F{}",
+            percent_encode(object_prefix),
+            percent_encode(name)
+        )
     }
 }
 

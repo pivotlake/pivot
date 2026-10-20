@@ -42,7 +42,7 @@ server:
 # It is the current database, so unqualified names such as `main.events` resolve
 # against it.
 datastores:
-  # `kind` selects the datastore implementation (only `pivot` today). The storage backend is
+  # `kind` selects the datastore implementation: `pivotlake` or `iceberg`. The storage backend is
   # inferred from `location`: a local path here, an S3 URI for `warm` below.
   default:
     kind: pivotlake

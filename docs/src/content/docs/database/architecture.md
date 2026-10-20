@@ -177,8 +177,8 @@ The catalog also exposes a read-only "virtual" [system tables datastore](/docs/r
 A datastore is a collection of schemas and tables exposed to Pivot through a common interface. Each configured datastore implementation handles table discovery, metadata, snapshots, and supported read and write operations for its underlying storage or table format.
 
 Pivot currently supports/exposes the following datastores:
-* Pivot - A collection of Delta Lake tables.
-* Iceberg - Tables stored using the Apache Iceberg table format.
+* Pivot - The tables Pivot writes itself, as Apache Iceberg tables (the default for a new database) or Delta Lake tables, with the catalog kept as files in the database's location.
+* Iceberg - The tables of an external Apache Iceberg REST catalog, read-only.
 * System - Internal tables exposing information about the running Pivot instance.
 
 A server can expose multiple datastores, with tables addressed as `datastore.schema.table`.
