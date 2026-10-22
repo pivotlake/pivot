@@ -8,6 +8,8 @@ use super::{FinishStatus, Operator};
 use crate::api::{BuildContext, OperatorFactory, OperatorGraphBuilder};
 use crate::data_flow::WorkStatus;
 use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO, ReadResponse};
+use crate::memory::Spiller;
+use crate::operations::Built;
 use crate::operations::channels::Sender;
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -22,10 +24,16 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A built [`Nullary`] and its optional evictor; see [`Built`].
+pub type BuiltNullary<N> = Built<N>;
+
 /// Factory for constructing a [`Nullary`] during the build step on a worker thread.
 pub trait NullaryFactory<O>: Send + 'static {
     type Nullary: Nullary<O>;
-    fn build_nullary(self) -> Self::Nullary;
+
+    /// Build the source, as [`Built::new`] or, when it keeps ring slots
+    /// outside the caches, [`Built::with_evictor`].
+    fn build_nullary(self) -> BuiltNullary<Self::Nullary>;
 }
 
 /// A source-like transform that receives no input and may emit items of type `O`.
@@ -60,6 +68,14 @@ pub trait Nullary<O> {
         _request: HttpUploadRequest,
     ) -> Result<()> {
         unreachable!()
+    }
+
+    /// Hand up to `count` of this source's sealed buffers to `spiller`, so
+    /// their memory can be given up once the writes land. See
+    /// [`Operator::spill`]. The default keeps nothing worth spilling and
+    /// spills nothing.
+    fn spill(&mut self, _spiller: &mut Spiller, _count: usize) -> Result<()> {
+        Ok(())
     }
 
     /// Try to finish. Called until it returns `true`.
@@ -112,6 +128,10 @@ impl<O, N: Nullary<O>> Operator for NullaryOperator<O, N> {
             .process_http_upload_response(&mut *self.sender, request)?)
     }
 
+    fn spill(&mut self, spiller: &mut Spiller, count: usize) -> super::Result<()> {
+        Ok(self.nullary.spill(spiller, count)?)
+    }
+
     fn try_finish(&mut self) -> super::Result<FinishStatus> {
         // A source has no outputter to drain: it's either done or still
         // producing (driven by `run_cpu_work`, which sets `did_work`), so it
@@ -145,10 +165,11 @@ impl<O: 'static, NF: NullaryFactory<O>> OperatorFactory<O> for NullaryOperatorFa
         sender: Box<dyn Sender<O>>,
         _context: &mut BuildContext,
     ) -> OperatorGraphBuilder {
-        OperatorGraphBuilder::root(Box::new(NullaryOperator::new(
-            self.nullary_factory.build_nullary(),
-            sender,
-        )))
+        let Built {
+            inner: nullary,
+            evictor,
+        } = self.nullary_factory.build_nullary();
+        OperatorGraphBuilder::root(Box::new(NullaryOperator::new(nullary, sender)), evictor)
     }
 }
 
@@ -160,8 +181,8 @@ pub struct NoOpNullaryFactory;
 impl<O: 'static> NullaryFactory<O> for NoOpNullaryFactory {
     type Nullary = NoOpNullary;
 
-    fn build_nullary(self) -> NoOpNullary {
-        NoOpNullary
+    fn build_nullary(self) -> BuiltNullary<NoOpNullary> {
+        Built::new(NoOpNullary)
     }
 }
 
@@ -207,11 +228,11 @@ where
 {
     type Nullary = OneShotNullary<O, F>;
 
-    fn build_nullary(self) -> Self::Nullary {
-        OneShotNullary {
+    fn build_nullary(self) -> BuiltNullary<Self::Nullary> {
+        Built::new(OneShotNullary {
             func: Some(self.func),
             _phantom: PhantomData,
-        }
+        })
     }
 }
 
@@ -306,5 +327,41 @@ mod tests {
 
         assert_eq!(operator.try_finish().unwrap(), FinishStatus::Done);
         assert!(items.borrow().is_empty());
+    }
+
+    /// Records how many buffers it was asked to spill.
+    struct SpillRecorder {
+        asked: Vec<usize>,
+    }
+
+    impl Nullary<i32> for SpillRecorder {
+        fn run(&mut self, _: &mut dyn Sender<i32>, _: &mut OperatorIO) -> Result<WorkStatus> {
+            Ok(WorkStatus::Pending)
+        }
+
+        fn finish(&mut self, _: &mut dyn Sender<i32>) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn spill(&mut self, _spiller: &mut Spiller, count: usize) -> Result<()> {
+            self.asked.push(count);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_spill_request_reaches_the_source() {
+        let items = std::rc::Rc::new(std::cell::RefCell::new(Vec::<i32>::new()));
+        let mut operator = NullaryOperator::new(
+            SpillRecorder { asked: Vec::new() },
+            Box::new(SharedCollectSender(items)),
+        );
+        let mut test_io = crate::io::TestOperatorIO::default();
+        let mut writes_in_flight = ahash::HashMap::default();
+        let mut spiller = Spiller::new(test_io.io(), &mut writes_in_flight);
+
+        Operator::spill(&mut operator, &mut spiller, 2).unwrap();
+
+        assert_eq!(operator.nullary.asked, [2]);
     }
 }

@@ -57,6 +57,16 @@ unsafe impl Send for Slab {}
 unsafe impl Sync for Slab {}
 
 impl Slab {
+    /// A slab over `size` bytes starting at `ptr`, which must lie inside
+    /// `buffer`. The slab keeps `buffer` alive for as long as it exists.
+    pub(crate) fn new(ptr: *mut u8, size: usize, buffer: Arc<WriteBuffer>) -> Self {
+        Self {
+            ptr,
+            size,
+            _buffer: buffer,
+        }
+    }
+
     /// Zeroes the slab's entire region.
     pub fn zero_out(&mut self) {
         unsafe {
@@ -81,6 +91,45 @@ impl Slab {
     /// [`as_slice`](Self::as_slice), with `&mut self` for the exclusivity.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+
+    /// Give up writing to this slab for good, so that handles to it can be
+    /// shared.
+    pub fn freeze(self) -> FrozenSlab {
+        FrozenSlab {
+            ptr: self.ptr,
+            size: self.size,
+            _buffer: self._buffer,
+        }
+    }
+}
+
+/// A slab that can no longer be written, so any number of handles to it may
+/// exist at once: cloning one is cheap and shares the same bytes. Every handle
+/// keeps the parent buffer alive, and the last one dropped releases it.
+#[derive(Clone)]
+pub struct FrozenSlab {
+    ptr: *const u8,
+    size: usize,
+    _buffer: Arc<WriteBuffer>,
+}
+
+unsafe impl Send for FrozenSlab {}
+
+unsafe impl Sync for FrozenSlab {}
+
+impl FrozenSlab {
+    /// Bytes this slab holds.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// The slab's region as bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the region is `size` bytes of live buffer memory, kept alive
+        // by the `Arc<WriteBuffer>` every handle holds, and nothing writes it
+        // any more: freezing consumed the only writable handle.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
     }
 }
 

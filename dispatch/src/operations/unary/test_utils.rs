@@ -2,7 +2,7 @@
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::Unary;
-use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
+use crate::operations::unary::pipeline_breaker::{Consumer, OutputStatus, Outputter};
 use crate::waker::install_test_worker_waker;
 use crate::worker::WORKER_IDX;
 use arrow_array::{Decimal128Array, Int32Array, Int64Array, RecordBatch, StringViewArray};
@@ -143,12 +143,12 @@ pub fn run_unary_to_completion<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I
     let mut io = test_io.io();
     for item in inputs {
         while !unary.ready_for_more_work() {
-            unary.run(&mut sender).unwrap();
+            unary.run(&mut sender, &mut io).unwrap();
         }
         unary.consume(item, &mut sender, &mut io).unwrap();
     }
     loop {
-        unary.run(&mut sender).unwrap();
+        unary.run(&mut sender, &mut io).unwrap();
         if unary.finish(&mut sender).unwrap() {
             break;
         }
@@ -167,14 +167,35 @@ pub fn run_consumers<C: Consumer<RecordBatch, RecordBatch>>(
     consumers: Vec<C>,
     worker_batches: Vec<Vec<RecordBatch>>,
 ) -> CollectSender<RecordBatch> {
+    run_consumers_with(consumers, worker_batches, 0, |_, _, _| {})
+}
+
+/// [`run_consumers`], with `before_output` run on every consumer after it
+/// has consumed and before it becomes an outputter, with the IO that
+/// consumer's outputter will use. The harness is one worker, so consumer `i`'s
+/// IO acts as operator `i` of dataflow `dataflow_id` to keep their spill files
+/// apart; whatever was spilled is removed at the end.
+pub fn run_consumers_with<C: Consumer<RecordBatch, RecordBatch>>(
+    consumers: Vec<C>,
+    worker_batches: Vec<Vec<RecordBatch>>,
+    dataflow_id: crate::Identifier,
+    mut before_output: impl FnMut(usize, &mut C, &mut crate::io::TestOperatorIO),
+) -> CollectSender<RecordBatch> {
     install_test_worker_waker();
     let mut dummy = CollectSender::new();
 
     let mut consumers = consumers;
-    for (consumer, batches) in consumers.iter_mut().zip(&worker_batches) {
+    // A run that panicked midway leaves its spill files behind; clear them so
+    // this run can create its own.
+    crate::memory::spill_directory::remove_worker_directory(dataflow_id, WORKER_IDX.get()).unwrap();
+    let mut worker_ios: Vec<_> = (0..consumers.len())
+        .map(|consumer| crate::io::TestOperatorIO::for_operator(dataflow_id, consumer))
+        .collect();
+    for (worker, (consumer, batches)) in consumers.iter_mut().zip(&worker_batches).enumerate() {
         for batch in batches {
             consumer.consume(batch.clone(), &mut dummy).unwrap();
         }
+        before_output(worker, consumer, &mut worker_ios[worker]);
     }
 
     let mut indexed_consumers: Vec<_> = consumers.into_iter().enumerate().collect();
@@ -187,7 +208,10 @@ pub fn run_consumers<C: Consumer<RecordBatch, RecordBatch>>(
         .into_iter()
         .filter_map(|(worker_index, consumer)| {
             WORKER_IDX.set(worker_index);
-            consumer.into_outputter().unwrap()
+            consumer
+                .into_outputter()
+                .unwrap()
+                .map(|outputter| (worker_index, outputter))
         })
         .collect();
     WORKER_IDX.set(0);
@@ -196,12 +220,21 @@ pub fn run_consumers<C: Consumer<RecordBatch, RecordBatch>>(
     let mut all_done = false;
     while !all_done {
         all_done = true;
-        for outputter in &mut outputters {
-            if !outputter.output(&mut sender).unwrap() {
-                all_done = false;
+        for (worker, outputter) in &mut outputters {
+            let io = &mut worker_ios[*worker];
+            match outputter.output(&mut sender, &mut io.io()).unwrap() {
+                OutputStatus::Done => {}
+                OutputStatus::Working => all_done = false,
+                OutputStatus::WaitingForIo => {
+                    all_done = false;
+                    io.deliver_completed_reads(|response| {
+                        outputter.process_read_response(response).unwrap()
+                    });
+                }
             }
         }
     }
+    crate::memory::spill_directory::remove_worker_directory(dataflow_id, WORKER_IDX.get()).unwrap();
     sender
 }
 

@@ -22,14 +22,18 @@
 //! `AVG(x)` to `sum(x) / count(x)`, so an average arrives as a `Sum` slot and a
 //! `Count` slot.
 
+use crate::api::BuildContext;
 use crate::cpu_features::multitarget_kernel;
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
     AggregationKind, AggregationSlot, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, Max, Min,
     Sum, U128Max, U128Min, U128Sum, WideCell, cast_value_column,
 };
-use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
+use crate::operations::unary::pipeline_breaker::{
+    Consumer, OutputStatus, Outputter, PipelineBreaker,
+};
 use crate::operations::unary::{self, UnaryFactory};
+use crate::operations::{Built, BuiltUnary};
 use crate::waker::waker_set;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -508,12 +512,12 @@ impl<A: IntCell + F64Cell + WideCell> UnaryFactory<RecordBatch, RecordBatch>
 {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Aggregate<A>>;
 
-    fn build_unary(mut self) -> Self::Unary {
-        PipelineBreaker::Consuming(Aggregate::new(
+    fn build_unary(mut self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(PipelineBreaker::Consuming(Aggregate::new(
             self.specs,
             self.sender,
             self.receiver.take(),
-        ))
+        )))
     }
 }
 
@@ -585,7 +589,11 @@ pub struct AggregateOutputter<A: IntCell> {
 }
 
 impl<A: IntCell + F64Cell + WideCell> Outputter<RecordBatch> for AggregateOutputter<A> {
-    fn output(&mut self, output: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
+    fn output(
+        &mut self,
+        output: &mut dyn Sender<RecordBatch>,
+        _io: &mut crate::io::OperatorIO,
+    ) -> unary::Result<OutputStatus> {
         loop {
             match self.rx.try_recv() {
                 Ok(worker_slots) => {
@@ -594,7 +602,7 @@ impl<A: IntCell + F64Cell + WideCell> Outputter<RecordBatch> for AggregateOutput
                     }
                 }
                 // Some siblings haven't finished yet; resume when re-driven.
-                Err(mpsc::TryRecvError::Empty) => return Ok(false),
+                Err(mpsc::TryRecvError::Empty) => return Ok(OutputStatus::Working),
                 // All senders dropped → every worker's slots are merged in.
                 Err(mpsc::TryRecvError::Disconnected) => {
                     let (fields, columns): (Vec<Field>, Vec<ArrayRef>) =
@@ -608,7 +616,7 @@ impl<A: IntCell + F64Cell + WideCell> Outputter<RecordBatch> for AggregateOutput
                             .unzip();
                     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
                     output.send(batch)?;
-                    return Ok(true);
+                    return Ok(OutputStatus::Done);
                 }
             }
         }

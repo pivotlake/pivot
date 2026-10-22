@@ -27,6 +27,8 @@ mod writer;
 
 use crate::types::columns::TableColumns;
 use crate::types::metadata::RowGroupMetadata;
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary};
 use dispatch::{
     DataFlowDispatcher, OperatorSpec, RecordBatchOperatorSpec, RootUnaryOperatorFactory,
     UnaryFactory, fan_in,
@@ -94,8 +96,8 @@ struct MetadataFetcherFactory {
 impl UnaryFactory<DataFile, FileRowGroups> for MetadataFetcherFactory {
     type Unary = FileRowGroupsFetcher;
 
-    fn build_unary(self) -> Self::Unary {
-        FileRowGroupsFetcher::new(self.table_columns)
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(FileRowGroupsFetcher::new(self.table_columns))
     }
 }
 

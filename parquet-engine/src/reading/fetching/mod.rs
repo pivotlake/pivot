@@ -46,12 +46,12 @@ impl dispatch::UnaryFactory<crate::types::metadata::QueryRowGroupMetadata, crate
 {
     type Unary = RowGroupFetcher;
 
-    fn build_unary(self) -> RowGroupFetcher {
-        RowGroupFetcher::new(
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<RowGroupFetcher> {
+        Built::new(RowGroupFetcher::new(
             self.projection,
             self.pending_row_groups,
             self.max_pending_row_groups,
-        )
+        ))
     }
 }
 mod fetcher;
@@ -59,4 +59,6 @@ pub use fetcher::pending_claim_bound;
 
 mod table_source;
 use crate::reading::fetching::fetcher::RowGroupFetcher;
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary};
 pub use table_source::RowGroupInjectorFactory;

@@ -9,7 +9,7 @@ use crate::operations::unary::join::key_bitset::{PendingKeyBitset, integer_scala
 use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::join::row_arena::{RowArena, RowId};
 use crate::operations::unary::{BatchesOutputter, InitializableOutputter, NormalizationBatches};
-use crate::operations::{Consumer, Outputter, unary};
+use crate::operations::{Consumer, OutputStatus, Outputter, unary};
 use crate::waker::worker_waker;
 use ahash::RandomState;
 use arrow::compute::{concat, sort_to_indices, take};
@@ -670,13 +670,17 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
 impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Outputter<()>
     for JoinBuilder<K, TRACK_MATCHED_BUILD_ROWS>
 {
-    fn output(&mut self, _sender: &mut dyn Sender<()>) -> unary::Result<bool> {
+    fn output(
+        &mut self,
+        _sender: &mut dyn Sender<()>,
+        _io: &mut crate::io::OperatorIO,
+    ) -> unary::Result<OutputStatus> {
         // Nothing to do until the final gather arrival has initialized the
         // table; the first thing after that is this worker's own key bitset
         // pass, which no other worker can do for it.
         if !self.applied_filter_arrays {
             if !self.jobs_injected.load(Ordering::Acquire) {
-                return Ok(false);
+                return Ok(OutputStatus::Working);
             }
             self.apply_filter_arrays();
         }
@@ -697,12 +701,12 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> Outputter<()>
                     {
                         worker_waker().notify();
                     }
-                    return Ok(true);
+                    return Ok(OutputStatus::Done);
                 }
             }
             Steal::Retry => {}
         }
 
-        Ok(false)
+        Ok(OutputStatus::Working)
     }
 }

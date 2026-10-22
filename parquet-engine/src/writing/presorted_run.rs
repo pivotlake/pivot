@@ -2,6 +2,8 @@
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_row::{OwnedRow, RowConverter, SortField};
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary};
 use dispatch::{Sender, Topology, Unary, UnaryFactory, UnaryResult};
 
 use super::partition_sorter::SortedPartitionRun;
@@ -57,8 +59,8 @@ impl PresortedRun {
 impl UnaryFactory<RecordBatch, SortedPartitionRun> for PresortedRun {
     type Unary = Self;
 
-    fn build_unary(self) -> Self {
-        self
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self> {
+        Built::new(self)
     }
 }
 
@@ -102,7 +104,8 @@ mod tests {
         let mut wrapper = PresortedRun::create_for_workers(None, &[], Topology::single_node(1))
             .pop()
             .unwrap()
-            .build_unary();
+            .build_unary(&mut BuildContext::new(0))
+            .inner;
         let mut sender = CollectSender::new();
 
         wrapper

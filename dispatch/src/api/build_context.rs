@@ -1,5 +1,6 @@
 //! Scratch state shared by the factories building one worker's operator graph.
 
+use crate::Identifier;
 use ahash::HashMap;
 use arrow_array::RecordBatch;
 use crossbeam_deque::Worker;
@@ -18,12 +19,30 @@ use std::rc::Rc;
 /// Created on the worker thread and dropped when the build ends, so it can hold
 /// the `Rc`-shared sending end of a work-stealing channel: neither `Send`, nor
 /// creatable before the build.
-#[derive(Default)]
+///
+/// It also carries the id of the dataflow being built. The id is decided before
+/// any operator is constructed, so an operator that has to register itself with
+/// per-worker state (for example to be found again by dataflow) can do so while
+/// it is being built, instead of waiting for the finished `DataFlow` to tell it.
 pub struct BuildContext {
+    dataflow_id: Identifier,
     cte_senders: HashMap<usize, Vec<Rc<Worker<RecordBatch>>>>,
 }
 
 impl BuildContext {
+    /// Start a build for the dataflow that will be known as `dataflow_id`.
+    pub fn new(dataflow_id: Identifier) -> Self {
+        Self {
+            dataflow_id,
+            cte_senders: HashMap::default(),
+        }
+    }
+
+    /// The id the `DataFlow` produced by this build will have.
+    pub fn dataflow_id(&self) -> Identifier {
+        self.dataflow_id
+    }
+
     /// Leave one scan site's sending end for CTE `id` to pick up.
     pub fn deposit_cte_sender(&mut self, id: usize, sender: Rc<Worker<RecordBatch>>) {
         self.cte_senders.entry(id).or_default().push(sender);

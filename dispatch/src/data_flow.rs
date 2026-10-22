@@ -20,18 +20,23 @@
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
 
 use crate::Identifier;
-use crate::io::{FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse};
+use crate::graph::Graph;
+use crate::io::{
+    FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse, WriteRequestId,
+};
+use crate::memory::{DataflowEvict, Evict, Spiller, memory_ctx, spill_directory};
 use crate::operations::{FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::waker::waker_set;
+use crate::worker::WORKER_IDX;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
-use std::{panic, result};
+use std::{mem, panic, result};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -112,26 +117,22 @@ pub enum WorkStatus {
     Ran,
 }
 
-/// Directed graph of operators with precomputed roots and leaves.
-///
-/// A node has zero or more downstream subscribers (`edges`) and zero or more
-/// upstream publishers (`back_edges`). Several subscribers means one stage's
-/// output is read in full by each of them, as a CTE's is. Supports two
-/// traversal orders:
-/// - **Backwards** (leaf-to-root): for running CPU work and collecting IO requests.
-/// - **Forwards** (root-to-leaf): for stealing and finishing.
+/// The dataflow's operators arranged as a [`Graph`]. Backwards (leaf-to-root)
+/// traversal runs CPU work and collects IO requests; forwards (root-to-leaf)
+/// traversal steals and finishes.
 struct OperatorGraph {
-    operators: Vec<OperatorNode>,
-    leafs: Vec<usize>,
-    roots: Vec<usize>,
-    /// Subscriber indices for each node; empty for a leaf.
-    edges: Vec<Vec<usize>>,
-    /// Publisher indices for each node.
-    back_edges: Vec<Vec<usize>>,
+    graph: Graph<OperatorNode>,
+    /// The dataflow this graph belongs to, which names its spill directory.
+    dataflow_id: Identifier,
+    /// Whether the dataflow registered its operators' evictors with the memory
+    /// context, so that a dropped operator's evictor has to be removed there.
+    evictors_registered: bool,
 }
 
 impl OperatorGraph {
     fn from_edges(
+        dataflow_id: Identifier,
+        evictors_registered: bool,
         operators: Vec<Box<dyn Operator>>,
         publisher_to_subscriber: Vec<(Identifier, Identifier)>,
         mut gates: HashMap<Identifier, Vec<Arc<AtomicBool>>>,
@@ -141,16 +142,7 @@ impl OperatorGraph {
             publisher_to_subscriber
         );
 
-        let n = operators.len();
-        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut back_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-        for (publisher, sub) in publisher_to_subscriber {
-            edges[publisher].push(sub);
-            back_edges[sub].push(publisher);
-        }
-
-        let operators: Vec<OperatorNode> = operators
+        let nodes: Vec<OperatorNode> = operators
             .into_iter()
             .enumerate()
             .map(|(id, operator)| OperatorNode {
@@ -160,16 +152,36 @@ impl OperatorGraph {
             })
             .collect();
 
-        let roots = (0..n).filter(|&i| back_edges[i].is_empty()).collect();
-        let leafs = (0..n).filter(|&i| edges[i].is_empty()).collect();
-
         Self {
-            operators,
-            roots,
-            leafs,
-            edges,
-            back_edges,
+            graph: Graph::from_edges(nodes, &publisher_to_subscriber),
+            dataflow_id,
+            evictors_registered,
         }
+    }
+
+    /// Drop the operator at `idx`, and with it everything it spilled to disk
+    /// and the evictor through which the memory context could reach it.
+    fn drop_operator(&mut self, idx: Identifier) {
+        self.graph.node_mut(idx).operator = None;
+        if self.evictors_registered {
+            memory_ctx().remove_operator_evictor(self.dataflow_id, idx);
+        }
+        if let Err(error) =
+            spill_directory::remove_operator_directory(self.dataflow_id, WORKER_IDX.get(), idx)
+        {
+            warn!(
+                "could not remove operator {idx}'s spill files of dataflow {}: {error}",
+                self.dataflow_id
+            );
+        }
+    }
+
+    fn nodes(&self) -> &[OperatorNode] {
+        self.graph.nodes()
+    }
+
+    fn node_mut(&mut self, idx: usize) -> &mut OperatorNode {
+        self.graph.node_mut(idx)
     }
 
     /// Walk leaf-to-root via back-edges, running the closure against every node
@@ -182,16 +194,9 @@ impl OperatorGraph {
         &mut self,
         mut f: F,
     ) -> Result<ControlFlow<T>> {
-        let mut stack: Vec<usize> = self.leafs.clone();
-        while let Some(idx) = stack.pop() {
-            if let Some(res) = self.operators[idx].run(&mut f)?
-                && matches!(res, ControlFlow::Break(..))
-            {
-                return Ok(res);
-            }
-            stack.extend(self.back_edges[idx].iter().copied());
-        }
-        Ok(ControlFlow::Continue(()))
+        self.graph.traverse_backwards(|_, node| {
+            Ok(node.run(&mut f)?.unwrap_or(ControlFlow::Continue(())))
+        })
     }
 
     /// The root-to-leaf twin of [`traverse_backwards`](Self::traverse_backwards).
@@ -202,16 +207,8 @@ impl OperatorGraph {
         &mut self,
         mut f: F,
     ) -> Result<ControlFlow<T>> {
-        let mut stack: Vec<usize> = self.roots.clone();
-        while let Some(idx) = stack.pop() {
-            if let Some(res) = self.operators[idx].run(&mut f)?
-                && matches!(res, ControlFlow::Break(..))
-            {
-                return Ok(res);
-            }
-            stack.extend(self.edges[idx].iter().copied());
-        }
-        Ok(ControlFlow::Continue(()))
+        self.graph
+            .traverse_forwards(|_, node| Ok(node.run(&mut f)?.unwrap_or(ControlFlow::Continue(()))))
     }
 
     /// Advance finishing from every root. A pending node blocks only what is
@@ -219,17 +216,19 @@ impl OperatorGraph {
     fn try_finish(&mut self) -> Result<FinishStatus> {
         let mut working = false;
 
-        let mut stack: Vec<usize> = self.roots.clone();
+        let mut stack: Vec<usize> = self.graph.roots().to_vec();
         while let Some(idx) = stack.pop() {
             // A converging node cannot finish before all of its publishers.
-            if self.back_edges[idx]
+            if self
+                .graph
+                .back_edges(idx)
                 .iter()
-                .any(|&publisher| !self.operators[publisher].is_finished())
+                .any(|&publisher| !self.graph.node(publisher).is_finished())
             {
                 continue;
             }
 
-            let node = &mut self.operators[idx];
+            let node = self.graph.node_mut(idx);
             if node.is_gated() {
                 continue;
             }
@@ -238,19 +237,19 @@ impl OperatorGraph {
                     // Retiring the node drops the operator, and with it the
                     // sender it holds, so a stage that watches the other end
                     // of that channel learns the stage is over.
-                    FinishStatus::Done => node.operator = None,
+                    FinishStatus::Done => self.drop_operator(idx),
                     FinishStatus::Working => working = true,
                     FinishStatus::Pending => {}
                 }
             }
 
-            if !node.is_finished() {
+            if !self.graph.node(idx).is_finished() {
                 continue;
             }
-            stack.extend(self.edges[idx].iter().copied());
+            stack.extend(self.graph.edges(idx).iter().copied());
         }
 
-        Ok(if self.operators.iter().all(OperatorNode::is_finished) {
+        Ok(if self.nodes().iter().all(OperatorNode::is_finished) {
             FinishStatus::Done
         } else if working {
             FinishStatus::Working
@@ -272,18 +271,23 @@ impl OperatorGraph {
     fn abandon_ancestors(&mut self, node: usize) {
         // The requester keeps running, but as far as its publishers are
         // concerned it is done reading.
-        let mut done: Vec<bool> = (0..self.operators.len())
-            .map(|idx| idx == node || self.operators[idx].is_finished())
+        let mut done: Vec<bool> = (0..self.nodes().len())
+            .map(|idx| idx == node || self.graph.node(idx).is_finished())
             .collect();
 
-        let mut stack: Vec<usize> = self.back_edges[node].clone();
+        let mut stack: Vec<usize> = self.graph.back_edges(node).to_vec();
         while let Some(idx) = stack.pop() {
             if done[idx] {
                 // Guards against re-visiting on a DAG and against re-abandoning
                 // across repeated calls; on a chain it simply never triggers.
                 continue;
             }
-            if !self.edges[idx].iter().all(|&subscriber| done[subscriber]) {
+            if !self
+                .graph
+                .edges(idx)
+                .iter()
+                .all(|&subscriber| done[subscriber])
+            {
                 // Still read by someone else, so it stays. A reader can't retire
                 // before the stage feeding it, so in practice a stage read in
                 // more than one place runs to completion rather than being freed
@@ -292,9 +296,9 @@ impl OperatorGraph {
                 // that had not finished.
                 continue;
             }
-            self.operators[idx].operator = None;
+            self.drop_operator(idx);
             done[idx] = true;
-            stack.extend(self.back_edges[idx].iter().copied());
+            stack.extend(self.graph.back_edges(idx).iter().copied());
         }
     }
 }
@@ -317,11 +321,11 @@ pub struct DataFlow {
     /// Collects this worker's execution stats for the dataflow. Inert unless the
     /// query opted in; driven by the worker through [`stats`](Self::stats).
     stats: StatsCollector,
-    /// Logical read-id counter shared by every node, borrowed into the
-    /// [`OperatorIO`] handed to operators. Responses route by
+    /// Request-id counter for reads and writes, shared by every node and
+    /// borrowed into the [`OperatorIO`] handed to operators. Responses route by
     /// `(dataflow, operator)` before the id, so one counter keeps identifiers
     /// unique everywhere an operator can observe them.
-    next_read_id: usize,
+    next_request_id: usize,
     /// Whether this dataflow is being profiled. While any profiled dataflow is
     /// live the worker runs *only* profiled dataflows (see
     /// [`crate::profiler`]), so a `perf` capture isn't polluted by other work
@@ -329,6 +333,10 @@ pub struct DataFlow {
     /// [`DataFlowDispatcher::with_profiling`](crate::DataFlowDispatcher::with_profiling)).
     #[cfg(feature = "perf")]
     profiled: bool,
+    /// Whether this dataflow's operators were registered with the memory
+    /// context as evictors (see [`DataflowEvict`]), and so must be unregistered
+    /// when it drops. False when no operator declared one.
+    registered_evictors: bool,
 }
 
 impl Debug for DataFlow {
@@ -338,11 +346,20 @@ impl Debug for DataFlow {
     }
 }
 
-#[cfg(feature = "perf")]
 impl Drop for DataFlow {
     fn drop(&mut self) {
+        if self.registered_evictors {
+            memory_ctx().unregister_dataflow_evictors(self.id);
+        }
+        if let Err(error) = spill_directory::remove_worker_directory(self.id, WORKER_IDX.get()) {
+            warn!(
+                "could not remove dataflow {}'s spill files: {error}",
+                self.id
+            );
+        }
         // Release this dataflow's hold on exclusive execution once it finishes
         // (or is cancelled/dropped), paired with the bump in `with_profiling`.
+        #[cfg(feature = "perf")]
         if self.profiled && crate::profiler::PROFILED_FLOWS.fetch_sub(1, Ordering::Relaxed) == 1 {
             // Exclusive mode just lifted. A worker that parked while holding only
             // non-profiled (paused) dataflows got no channel send to wake it, so
@@ -360,14 +377,34 @@ impl DataFlow {
         canceled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<Error>,
         operators: Vec<Box<dyn Operator>>,
+        evictors: Vec<Option<Box<dyn Evict>>>,
         publisher_to_subscriber: Vec<(Identifier, Identifier)>,
         gates: HashMap<Identifier, Vec<Arc<AtomicBool>>>,
         stats_tx: mpsc::Sender<DataFlowStats>,
         collect_stats: bool,
     ) -> Self {
-        let graph = OperatorGraph::from_edges(operators, publisher_to_subscriber, gates);
+        assert_eq!(
+            evictors.len(),
+            operators.len(),
+            "one evictor entry per operator"
+        );
+        // Operators that can give ring slots back are laid out for the memory
+        // context in the operator graph's shape, so it asks them in graph order.
+        let evictors = DataflowEvict::new(evictors, &publisher_to_subscriber);
+        let registered_evictors = !evictors.is_empty();
+        if registered_evictors {
+            memory_ctx().register_dataflow_evictors(id, evictors);
+        }
+
+        let graph = OperatorGraph::from_edges(
+            id,
+            registered_evictors,
+            operators,
+            publisher_to_subscriber,
+            gates,
+        );
         let upstream_cancellers = graph
-            .operators
+            .nodes()
             .iter()
             .enumerate()
             .filter_map(|(idx, node)| {
@@ -384,9 +421,10 @@ impl DataFlow {
             cancelled: canceled,
             err_tx,
             stats: StatsCollector::new(stats_tx, collect_stats),
-            next_read_id: 0,
+            next_request_id: 0,
             #[cfg(feature = "perf")]
             profiled: false,
+            registered_evictors,
         }
     }
     pub fn id(&self) -> Identifier {
@@ -538,10 +576,11 @@ impl DataFlow {
         self.try_run(|d| {
             let data_flow_id = d.id;
             let stats = &mut d.stats;
-            let next_read_id = &mut d.next_read_id;
-            let node = &mut d.graph.operators[node_id];
+            let next_request_id = &mut d.next_request_id;
+            let node = d.graph.node_mut(node_id);
             if let Some(operator) = node.operator.as_deref_mut() {
-                let mut io = OperatorIO::new(requester, data_flow_id, node.id, stats, next_read_id);
+                let mut io =
+                    OperatorIO::new(requester, data_flow_id, node.id, stats, next_request_id);
                 operator.process_read_response(&mut io, response)?;
             }
             Ok(())
@@ -549,10 +588,11 @@ impl DataFlow {
     }
 
     /// Notify the operator that requested it that one of its filesystem writes
-    /// has completed.
+    /// has completed. A spill write was issued by this dataflow rather than the
+    /// operator, so it is completed here: the buffer is now on disk.
     pub fn process_fs_write(&mut self, node_id: Identifier, request: FsWriteRequest) {
         self.try_run(|d| {
-            let node = &mut d.graph.operators[node_id];
+            let node = d.graph.node_mut(node_id);
             if let Some(operator) = node.operator.as_deref_mut() {
                 operator.process_fs_write_response(request)?;
             }
@@ -568,7 +608,7 @@ impl DataFlow {
         request: HttpUploadRequest,
     ) {
         self.try_run(|d| {
-            let node = &mut d.graph.operators[node_id];
+            let node = d.graph.node_mut(node_id);
             if let Some(operator) = node.operator.as_deref_mut() {
                 operator.process_http_upload_response(request)?;
             }
@@ -580,7 +620,7 @@ impl DataFlow {
     /// Returns [`WorkStatus::Ran`] if any operator did work.
     pub fn run_ready_cpu_work(&mut self, requester: &mut IORequester) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
-            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_read_id);
+            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
             d.graph
                 .traverse_backwards(|node_id, operator| {
                     io.set_operator_idx(node_id);
@@ -597,11 +637,38 @@ impl DataFlow {
         })
     }
 
+    /// Ask this dataflow's operators to spill up to `count` ring slots' worth of
+    /// buffers. Returns how many slots they started spilling, which is
+    /// less than `count` when the operators had less to give.
+    pub fn spill(
+        &mut self,
+        requester: &mut IORequester,
+        spill_writes_in_flight: &mut HashMap<WriteRequestId, Arc<AtomicUsize>>,
+        count: usize,
+    ) -> usize {
+        self.try_run_or(0, |d| {
+            let io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
+            let mut spiller = Spiller::new(io, spill_writes_in_flight);
+            // The walk stops once the count is met; only the count matters here.
+            let _: ControlFlow<()> = d.graph.traverse_backwards(|node_id, operator| {
+                spiller.set_operator_idx(node_id);
+                let remaining = count - spiller.buffers_spilled();
+                operator.spill(&mut spiller, remaining)?;
+                Ok(if spiller.buffers_spilled() >= count {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                })
+            })?;
+            Ok(spiller.buffers_spilled())
+        })
+    }
+
     /// Attempt to steal work from peer workers, traversing root-to-leaf (upstream first
     /// so the original worker's downstream data stays hot).
     pub fn try_stealing_work(&mut self, requester: &mut IORequester) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
-            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_read_id);
+            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
             d.graph
                 .traverse_forwards(|node_id, operator| {
                     io.set_operator_idx(node_id);
@@ -622,6 +689,7 @@ impl DataFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
     /// A test operator that always reports it `Ran` and never finishes on its
@@ -700,6 +768,72 @@ mod tests {
         }
     }
 
+    /// Spills up to `capacity` slots per request and records each count asked.
+    struct SpillingOperator {
+        capacity: usize,
+        asked: Arc<Mutex<Vec<usize>>>,
+    }
+    impl Operator for SpillingOperator {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
+            Ok(WorkStatus::Pending)
+        }
+        fn process_fs_write_response(
+            &mut self,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
+            Ok(FinishStatus::Pending)
+        }
+        fn spill(&mut self, spiller: &mut Spiller, count: usize) -> crate::operations::Result<()> {
+            self.asked.lock().unwrap().push(count);
+            spiller.count_buffers_spilled_without_writing(count.min(self.capacity));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn spill_asks_the_output_end_first_and_moves_upstream_until_met() {
+        let asked: Vec<Arc<Mutex<Vec<usize>>>> = (0..3).map(|_| Arc::default()).collect();
+        let operators: Vec<Box<dyn Operator>> = [10, 10, 3]
+            .into_iter()
+            .zip(&asked)
+            .map(|(capacity, asked)| {
+                Box::new(SpillingOperator {
+                    capacity,
+                    asked: asked.clone(),
+                }) as Box<dyn Operator>
+            })
+            .collect();
+        let (err_tx, _err_rx) = mpsc::channel();
+        let (stats_tx, _stats_rx) = mpsc::channel();
+        let mut flow = DataFlow::new(
+            0,
+            Arc::new(AtomicBool::new(false)),
+            err_tx,
+            operators,
+            vec![None, None, None],
+            vec![(0, 1), (1, 2)],
+            HashMap::default(),
+            stats_tx,
+            false,
+        );
+
+        let spilled = flow.spill(&mut IORequester::default(), &mut HashMap::default(), 5);
+
+        assert_eq!(spilled, 5);
+        assert_eq!(*asked[2].lock().unwrap(), [5]);
+        assert_eq!(*asked[1].lock().unwrap(), [2]);
+        assert!(asked[0].lock().unwrap().is_empty());
+    }
+
     struct CountingOperator(Arc<AtomicUsize>);
     impl Operator for CountingOperator {
         fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
@@ -731,13 +865,19 @@ mod tests {
             .collect();
         let publisher_to_subscriber: Vec<(Identifier, Identifier)> =
             (0..n - 1).map(|i| (i, i + 1)).collect();
-        OperatorGraph::from_edges(operators, publisher_to_subscriber, HashMap::default())
+        OperatorGraph::from_edges(
+            0,
+            false,
+            operators,
+            publisher_to_subscriber,
+            HashMap::default(),
+        )
     }
 
     /// An abandoned node has given up its operator; a node still holding a
     /// [`LiveOperator`] has not.
     fn is_abandoned(graph: &OperatorGraph, idx: usize) -> bool {
-        graph.operators[idx].is_finished()
+        graph.graph.node(idx).is_finished()
     }
 
     #[test]
@@ -747,7 +887,8 @@ mod tests {
             FinishStatus::Done,
             dropped.clone(),
         ))];
-        let mut graph = OperatorGraph::from_edges(operators, Vec::new(), HashMap::default());
+        let mut graph =
+            OperatorGraph::from_edges(0, false, operators, Vec::new(), HashMap::default());
 
         assert_eq!(graph.try_finish().unwrap(), FinishStatus::Done);
 
@@ -760,11 +901,12 @@ mod tests {
             Box::new(FinishOperator::new(FinishStatus::Pending)),
             Box::new(FinishOperator::new(FinishStatus::Done)),
         ];
-        let mut graph = OperatorGraph::from_edges(operators, Vec::new(), HashMap::default());
+        let mut graph =
+            OperatorGraph::from_edges(0, false, operators, Vec::new(), HashMap::default());
 
         assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
-        assert!(!graph.operators[0].is_finished());
-        assert!(graph.operators[1].is_finished());
+        assert!(!graph.graph.node(0).is_finished());
+        assert!(graph.graph.node(1).is_finished());
     }
 
     #[test]
@@ -780,6 +922,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             err_tx,
             vec![Box::new(CountingOperator(runs.clone()))],
+            vec![None],
             Vec::new(),
             gates,
             stats_tx,
@@ -799,7 +942,7 @@ mod tests {
             WorkStatus::Ran
         ));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
-        assert!(flow.graph.operators[0].gates.is_empty());
+        assert!(flow.graph.graph.node(0).gates.is_empty());
     }
 
     #[test]
@@ -810,7 +953,7 @@ mod tests {
         gates.insert(0, vec![first.clone(), second.clone()]);
         let operators: Vec<Box<dyn Operator>> =
             vec![Box::new(FinishOperator::new(FinishStatus::Done))];
-        let mut graph = OperatorGraph::from_edges(operators, Vec::new(), gates);
+        let mut graph = OperatorGraph::from_edges(0, false, operators, Vec::new(), gates);
 
         assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
         first.store(true, Ordering::Release);
@@ -841,8 +984,13 @@ mod tests {
         let operators: Vec<Box<dyn Operator>> = (0..3)
             .map(|_| Box::new(LiveOperator) as Box<dyn Operator>)
             .collect();
-        let mut graph =
-            OperatorGraph::from_edges(operators, vec![(0, 1), (0, 2)], HashMap::default());
+        let mut graph = OperatorGraph::from_edges(
+            0,
+            false,
+            operators,
+            vec![(0, 1), (0, 2)],
+            HashMap::default(),
+        );
 
         graph.abandon_ancestors(1);
 

@@ -22,6 +22,8 @@ use crate::reading::decoding::{DecodePlan, ScanEqualityPredicate, WorkerAllocato
 use crate::types::page::{DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
 use ahash::{HashMap, HashSet};
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary};
 use dispatch::{Sender, Unary, UnaryFactory};
 use row_group_pages::{PageContent, RowGroupPages};
 use std::sync::Arc;
@@ -50,14 +52,14 @@ pub struct RangeCutterFactory {
 impl UnaryFactory<DecompressedPage, DecodeRange> for RangeCutterFactory {
     type Unary = RangeCutter;
 
-    fn build_unary(self) -> Self::Unary {
-        RangeCutter::new(
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(RangeCutter::new(
             self.projection,
             self.eq_predicates,
             self.pending_row_groups,
             self.outstanding_row_groups,
             self.allocator,
-        )
+        ))
     }
 }
 

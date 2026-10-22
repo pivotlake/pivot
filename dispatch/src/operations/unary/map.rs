@@ -8,8 +8,10 @@
 //! The output type lives in the closure signature, which means every `send`
 //! downstream is monomorphized — no dyn dispatch.
 
+use crate::api::BuildContext;
 use crate::operations::channels::Sender;
 use crate::operations::unary::{self, Unary, UnaryFactory};
+use crate::operations::{Built, BuiltUnary};
 
 /// Factory wrapping the per-worker closure.
 pub struct MapFactory<F>(pub F);
@@ -22,8 +24,8 @@ where
 {
     type Unary = Map<F>;
 
-    fn build_unary(self) -> Self::Unary {
-        Map { func: self.0 }
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(Map { func: self.0 })
     }
 }
 
@@ -54,7 +56,9 @@ mod tests {
     #[test]
     fn maps_each_item_one_to_one() {
         // Setup
-        let map = MapFactory(|x: i32| x * 2).build_unary();
+        let map = MapFactory(|x: i32| x * 2)
+            .build_unary(&mut BuildContext::new(0))
+            .inner;
 
         // Execute
         let out = run_unary(map, vec![1, 2, 3]);
@@ -66,7 +70,9 @@ mod tests {
     #[test]
     fn output_type_can_differ_from_input() {
         // Setup: i32 → String.
-        let mut map = MapFactory(|x: i32| format!("v={x}")).build_unary();
+        let mut map = MapFactory(|x: i32| format!("v={x}"))
+            .build_unary(&mut BuildContext::new(0))
+            .inner;
 
         // Execute
         let mut collector: CollectSender<String> = CollectSender::new();
@@ -82,7 +88,9 @@ mod tests {
     #[test]
     fn empty_input_produces_empty_output() {
         // Setup
-        let map = MapFactory(|x: i32| x + 1).build_unary();
+        let map = MapFactory(|x: i32| x + 1)
+            .build_unary(&mut BuildContext::new(0))
+            .inner;
 
         // Execute
         let out = run_unary(map, Vec::<i32>::new());

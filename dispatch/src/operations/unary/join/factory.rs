@@ -1,3 +1,4 @@
+use crate::operations::{Built, BuiltUnary};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
@@ -331,15 +332,15 @@ where
     type Unary =
         PipelineBreaker<RecordBatch, Out, JoinBuildConsumer<K, TRACK_MATCHED_BUILD_ROWS, O>>;
 
-    fn build_unary(self) -> Self::Unary {
-        PipelineBreaker::Consuming(JoinBuildConsumer::new(
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(PipelineBreaker::Consuming(JoinBuildConsumer::new(
             self.key_columns,
             self.filter_columns,
             self.hash_state,
             self.outputter,
             self.filter_arrays,
             self.partitions,
-        ))
+        )))
     }
 }
 
@@ -371,15 +372,23 @@ impl<
 
     fn build_unary(
         self,
-    ) -> Probe<
-        K,
-        TRACK_MATCHED_BUILD_ROWS,
-        STOP_AFTER_FIRST_MATCH,
-        TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_ROWS,
-        EMIT_MARK_COLUMN,
+        _context: &mut BuildContext,
+    ) -> BuiltUnary<
+        Probe<
+            K,
+            TRACK_MATCHED_BUILD_ROWS,
+            STOP_AFTER_FIRST_MATCH,
+            TRACK_UNMATCHED_PROBE_ROWS,
+            DISCARD_MATCHED_ROWS,
+            EMIT_MARK_COLUMN,
+        >,
     > {
-        Probe::new(self.table, self.hash_state, self.spec, self.unmatched)
+        Built::new(Probe::new(
+            self.table,
+            self.hash_state,
+            self.spec,
+            self.unmatched,
+        ))
     }
 }
 
@@ -416,16 +425,23 @@ where
         context: &mut BuildContext,
     ) -> OperatorGraphBuilder {
         let (probe_tx, probe_rx) = self.probe_channel_factory.build();
-        let probe_graph = self
+        let probe_head = self
             .probe_head
             .build(Box::new(probe_tx), context)
-            .gated_by(self.build_ready)
-            .with(Box::new(UnaryOperator::new(
-                self.probe_factory.build_unary(),
+            .gated_by(self.build_ready);
+        let Built {
+            inner: probe,
+            evictor: probe_evictor,
+        } = self.probe_factory.build_unary(context);
+        let probe_graph = probe_head.with(
+            Box::new(UnaryOperator::new(
+                probe,
                 probe_rx,
                 sender,
                 self.probe_siblings_left,
-            )));
+            )),
+            probe_evictor,
+        );
 
         let build_graph = self.build_graph.build(Box::new(DiscardSender), context);
 

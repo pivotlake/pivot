@@ -21,6 +21,8 @@
 mod common;
 
 use common::dispatch;
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary, OutputStatus};
 use dispatch::{
     Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult, stealable,
     values_input,
@@ -58,12 +60,16 @@ struct SilentOutputter {
 }
 
 impl Outputter<i64> for SilentOutputter {
-    fn output(&mut self, _sender: &mut dyn Sender<i64>) -> UnaryResult<bool> {
+    fn output(
+        &mut self,
+        _sender: &mut dyn Sender<i64>,
+        _io: &mut dispatch::OperatorIO,
+    ) -> UnaryResult<OutputStatus> {
         if self.steps_left > 0 {
             self.steps_left -= 1;
-            return Ok(false);
+            return Ok(OutputStatus::Working);
         }
-        Ok(true)
+        Ok(OutputStatus::Done)
     }
 }
 
@@ -72,8 +78,8 @@ struct SilentBreakerFactory;
 impl UnaryFactory<i64, i64> for SilentBreakerFactory {
     type Unary = PipelineBreaker<i64, i64, SilentBreaker>;
 
-    fn build_unary(self) -> Self::Unary {
-        PipelineBreaker::Consuming(SilentBreaker)
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(PipelineBreaker::Consuming(SilentBreaker))
     }
 }
 

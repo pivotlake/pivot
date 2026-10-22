@@ -5,6 +5,8 @@ use crate::catalog::{BoundTable, Error as CatalogError};
 use crate::types::physical_arrow_type;
 use arrow_array::{ArrayRef, RecordBatch, new_null_array};
 use arrow_schema::{Field, Schema, SchemaRef};
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary};
 use dispatch::{
     ChannelInputSender, DataFlowDispatcher, RecordBatchOperatorSpec, Unary, UnaryError,
     UnaryFactory, UnaryResult, channel_input, stealable,
@@ -272,7 +274,7 @@ impl Unary<RecordBatch, RecordBatch> for ConformArrowBatch {
 impl UnaryFactory<RecordBatch, RecordBatch> for ConformArrowBatch {
     type Unary = Self;
 
-    fn build_unary(self) -> Self {
-        self
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self> {
+        Built::new(self)
     }
 }

@@ -5,6 +5,7 @@ use arrow_array::{
     StringViewArray,
 };
 use dispatch::Dispatch;
+use dispatch::{Built, BuiltNullary};
 
 use crate::common::*;
 use planner::Error as PlannerError;
@@ -1841,8 +1842,8 @@ struct NoRowsNullary {
 impl dispatch::NullaryFactory<RecordBatch> for NoRowsNullary {
     type Nullary = NoRowsNullary;
 
-    fn build_nullary(self) -> NoRowsNullary {
-        self
+    fn build_nullary(self) -> BuiltNullary<NoRowsNullary> {
+        Built::new(self)
     }
 }
 

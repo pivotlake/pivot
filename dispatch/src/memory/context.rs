@@ -1,13 +1,23 @@
+use crate::Identifier;
 use crate::memory::clock::{Clock, Owner, Sweep};
 use crate::memory::compressed_cache::CompressedCache;
 use crate::memory::decompressed_cache::DecompressedCache;
+use crate::memory::evict::DataflowEvict;
 use crate::memory::fill_cursor::FillCursor;
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::status::{MemoryBlockStatus, read_block_status};
 use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
 use crate::worker::WORKER_IDX;
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Share of a node's ring slots that eviction should always be able to take
+/// back without waiting on a write: slots that are free, or cached and so
+/// reclaimable by the CLOCK sweep. Once fewer than this remain, the rest being
+/// held by operators, the worker asks its operators to spill.
+const RECLAIMABLE_SLOTS_TARGET_PERCENT: usize = 20;
 
 thread_local! {
     static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = const { RefCell::new(None) };
@@ -42,6 +52,8 @@ pub struct MemoryContextFactory {
     clock: Arc<Clock>,
     dirty_pool_factory: PoolFactory,
     zeroed_pool_factory: PoolFactory,
+
+    buffers_spilled: Arc<[AtomicUsize]>,
     layout: RingLayout,
     node: usize,
 }
@@ -69,6 +81,9 @@ impl MemoryContextFactory {
         ));
         let zeroed_pool_factories = PoolFactory::create_for_layout(layout);
         let dirty_pool_factories = PoolFactory::create_for_layout(layout);
+        let buffers_spilled: Arc<[AtomicUsize]> = (0..topology.node_count)
+            .map(|_| AtomicUsize::new(0))
+            .collect();
 
         zeroed_pool_factories
             .into_iter()
@@ -81,6 +96,7 @@ impl MemoryContextFactory {
                 clock: clock.clone(),
                 dirty_pool_factory,
                 zeroed_pool_factory,
+                buffers_spilled: buffers_spilled.clone(),
                 layout,
                 node: topology.node_of_worker(worker),
             })
@@ -104,6 +120,8 @@ impl MemoryContextFactory {
             compressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
             decompressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
             layout: self.layout,
+            evictors: RefCell::new(HashMap::new()),
+            buffers_spilled: self.buffers_spilled,
             node: self.node,
         }
     }
@@ -126,6 +144,17 @@ pub struct MemoryContext {
     decompressed_fill_cursor: UnsafeCell<FillCursor>,
     /// How ring slots map to nodes and home workers (shared by all contexts).
     layout: RingLayout,
+    /// Each dataflow's operators that keep ring slots outside the caches and can
+    /// give them back, keyed by dataflow id. Consulted only after both caches
+    /// have swept their whole region without finding a slot nobody holds. A
+    /// `RefCell` because the context is reached through a shared reference; it
+    /// is per worker thread, so the borrow never contends.
+    evictors: RefCell<HashMap<Identifier, DataflowEvict>>,
+    /// Per node, the slots its operators have handed over for spilling and
+    /// still hold, whether the write is in flight or has landed. Shared by the
+    /// node's workers, so a slot one worker is already spilling is not asked
+    /// for again by another.
+    buffers_spilled: Arc<[AtomicUsize]>,
     /// This worker's NUMA node, i.e. the ring region it allocates and evicts from.
     node: usize,
 }
@@ -311,6 +340,11 @@ impl MemoryContext {
     /// of cached slots exceeds the target percentage, decompressed otherwise
     /// (see [`Clock::preferred_victim_tier`]) - advances that tier's hand, and
     /// routes the victim to its cache's reclaim.
+    ///
+    /// A tier that owns no slots in this region is not swept at all, and when
+    /// neither tier owns any the registered [`Evict`] operators are asked at
+    /// once. When both caches have swept their region and every slot they hold
+    /// is pinned, the operators are asked before the caches are swept again.
     pub(crate) fn evict(&self) -> WriteBuffer {
         // Livelock guard. When a query's working set exceeds the ring, every
         // worker spins here finding nothing evictable (near-100% CPU, ~0 forward
@@ -344,6 +378,11 @@ impl MemoryContext {
         let mut ticks_without_success: u64 = 0;
         let mut aged_this_revolution: u64 = 0;
         let mut sweeping_other_tier = false;
+        // How many times a tier's sweep ended with nothing to give. Once both
+        // tiers have, the caches hold nothing unpinned right now, and the
+        // operators keeping slots outside the caches are the only remaining
+        // source.
+        let mut tiers_exhausted: u32 = 0;
         loop {
             iterations += 1;
             if panic_at.is_none() && iterations == warn_at {
@@ -358,6 +397,20 @@ impl MemoryContext {
                 );
             }
 
+            // The owner counts are shared with peer workers, so a slot may be
+            // bound between reading them and sweeping. Skipping an empty tier is
+            // still safe: at worst such a slot waits one revolution to be found.
+            let compressed_cached = self.clock.owned_in_region(Owner::Compressed, self.node);
+            let decompressed_cached = self.clock.owned_in_region(Owner::Decompressed, self.node);
+            if compressed_cached == 0 && decompressed_cached == 0 {
+                // Nothing is cached in this region, so the caches have nothing to
+                // give back and only the operators can.
+                if let Some(buffer) = self.evict_from_dataflow_operators() {
+                    return buffer;
+                }
+                continue;
+            }
+
             let mut tier = self.clock.preferred_victim_tier(self.node);
             if sweeping_other_tier {
                 tier = match tier {
@@ -365,6 +418,12 @@ impl MemoryContext {
                     Owner::Decompressed => Owner::Compressed,
                 };
             }
+            // An empty tier has nothing to sweep; take from the other one.
+            tier = match tier {
+                Owner::Compressed if compressed_cached == 0 => Owner::Decompressed,
+                Owner::Decompressed if decompressed_cached == 0 => Owner::Compressed,
+                tier => tier,
+            };
 
             let step = self.clock.sweep(tier, self.node);
             let reclaimed = match step {
@@ -386,10 +445,100 @@ impl MemoryContext {
                 let nothing_left_to_drain = aged_this_revolution == 0;
                 if drained || nothing_left_to_drain {
                     sweeping_other_tier = !sweeping_other_tier;
+                    tiers_exhausted += 1;
+                    if tiers_exhausted >= 2
+                        && let Some(buffer) = self.evict_from_dataflow_operators()
+                    {
+                        return buffer;
+                    }
                 }
                 aged_this_revolution = 0;
             }
         }
+    }
+
+    /// How many slots this worker's operators should spill now: this worker's
+    /// share of the node's shortfall of reclaimable slots below the target (see
+    /// [`RECLAIMABLE_SLOTS_TARGET_PERCENT`]). The shortfall is split evenly
+    /// across the node's workers, rounded up, because every worker on the node
+    /// sees the same shortfall and would otherwise each ask for all of it.
+    ///
+    /// Reclaimable means free, owned by a cache, or spilled. Cached slots count
+    /// because the sweep can take them back at will, and spilled slots count
+    /// because eviction can take them once their write lands, so the slots
+    /// that are none of these are the ones operators still hold. The counts
+    /// are read at slightly different instants while peers allocate and
+    /// release, so the result is approximate by a few slots, which a watermark
+    /// tolerates.
+    pub fn slots_to_spill(&self) -> usize {
+        let free = self.dirty_pool.free_slots() + self.zeroed_pool.free_slots();
+        let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
+            + self.clock.owned_in_region(Owner::Decompressed, self.node);
+        let spilled = self.buffers_spilled[self.node].load(Ordering::Relaxed);
+        let target =
+            self.layout.node_slots(self.node).len() * RECLAIMABLE_SLOTS_TARGET_PERCENT / 100;
+        let reclaimable = free + cached + spilled;
+        if reclaimable >= target {
+            return 0;
+        }
+        (target - reclaimable).div_ceil(self.layout.topology().workers_per_node)
+    }
+
+    /// Count `count` more of this node's slots as spilled, so that
+    /// [`slots_to_spill`](Self::slots_to_spill) stops asking for them.
+    pub fn record_buffers_spilled(&self, count: usize) {
+        self.buffers_spilled[self.node].fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Note that `count` spilled slots have been released, so they are no
+    /// longer counted as spilled: once free, the pools count them instead.
+    pub fn record_spilled_buffers_released(&self, count: usize) {
+        let before = self.buffers_spilled[self.node].fetch_sub(count, Ordering::Relaxed);
+        assert!(
+            before >= count,
+            "released more spilled buffers than were spilled"
+        );
+    }
+
+    /// Make `evictors` reachable from this worker's eviction for as long as the
+    /// dataflow runs; its `DataFlow` unregisters them when it drops.
+    pub fn register_dataflow_evictors(&self, dataflow_id: Identifier, evictors: DataflowEvict) {
+        let replaced = self.evictors.borrow_mut().insert(dataflow_id, evictors);
+        assert!(
+            replaced.is_none(),
+            "dataflow {dataflow_id} registered its evictors twice"
+        );
+    }
+
+    /// Forget the evictor of one operator of `dataflow_id`, which has finished
+    /// and released whatever it kept.
+    pub fn remove_operator_evictor(&self, dataflow_id: Identifier, operator_idx: usize) {
+        self.evictors
+            .borrow_mut()
+            .get_mut(&dataflow_id)
+            .expect("an operator's evictor is removed from a dataflow that registered evictors")
+            .remove_operator(operator_idx);
+    }
+
+    /// Forget the evictors registered under `dataflow_id`.
+    pub fn unregister_dataflow_evictors(&self, dataflow_id: Identifier) {
+        let removed = self.evictors.borrow_mut().remove(&dataflow_id);
+        assert!(
+            removed.is_some(),
+            "dataflow {dataflow_id} never registered evictors"
+        );
+    }
+
+    /// Ask each registered dataflow's operators for a slot they can give up and
+    /// return the first one offered, or `None` when none has a slot to spare
+    /// right now. The borrow is held across the calls, which is fine because an
+    /// operator's `evict` only releases memory it already holds and never
+    /// reaches back into this registry.
+    fn evict_from_dataflow_operators(&self) -> Option<WriteBuffer> {
+        self.evictors
+            .borrow_mut()
+            .values_mut()
+            .find_map(DataflowEvict::evict)
     }
 }
 
@@ -473,6 +622,88 @@ mod tests {
     //! [`init_test_free_pool`], so there's no shared state and no lock.
 
     use super::*;
+    use crate::memory::evict::{Evict, HandOverEvictor};
+    use std::rc::Rc;
+
+    #[test]
+    fn evict_turns_to_dataflow_operators_once_the_caches_have_nothing() {
+        init_test_free_pool(1);
+        let held = memory_ctx().get_write_buffer(false);
+        let held_slot = held.slot_idx;
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let operator: Box<dyn Evict> = Box::new(HandOverEvictor {
+            label: "group",
+            log: log.clone(),
+            buffer: RefCell::new(Some(held)),
+        });
+        memory_ctx().register_dataflow_evictors(7, DataflowEvict::new(vec![Some(operator)], &[]));
+
+        let evicted = memory_ctx().evict();
+
+        assert_eq!(evicted.slot_idx, held_slot);
+        assert_eq!(*log.borrow(), ["group"]);
+        memory_ctx().unregister_dataflow_evictors(7);
+    }
+
+    #[test]
+    fn cached_slots_count_as_reclaimable_for_spilling() {
+        // 128 slots, so the target is 25 reclaimable; 10 free plus 15 cached.
+        init_test_free_pool(10);
+        for idx in 10..25 {
+            memory_ctx().clock().bind(idx, Owner::Compressed);
+        }
+
+        let shortfall = memory_ctx().slots_to_spill();
+
+        assert_eq!(shortfall, 0);
+    }
+
+    #[test]
+    fn slots_to_spill_is_the_shortfall_below_the_reclaimable_target_less_what_is_spilled() {
+        // 128 slots, so the target is 25 reclaimable; seed 10 free, nothing cached.
+        init_test_free_pool(10);
+
+        let shortfall = memory_ctx().slots_to_spill();
+        memory_ctx().record_buffers_spilled(shortfall);
+        let while_spilled = memory_ctx().slots_to_spill();
+        memory_ctx().record_spilled_buffers_released(shortfall);
+        let after_release = memory_ctx().slots_to_spill();
+
+        assert_eq!(shortfall, 15);
+        assert_eq!(while_spilled, 0);
+        assert_eq!(after_release, 15);
+    }
+
+    #[test]
+    fn slots_to_spill_is_this_workers_share_of_the_nodes_shortfall_rounded_up() {
+        // Four workers on one node of 128 slots; 10 free leaves a shortfall of 15.
+        WORKER_IDX.set(0);
+        crate::worker::NUM_WORKERS.set(4);
+        crate::waker::install_test_worker_waker();
+        let mut factories = MemoryContextFactory::create_many(4, 128);
+        // Building a context waits until every worker on the node has built one.
+        let siblings: Vec<_> = factories
+            .drain(1..)
+            .enumerate()
+            .map(|(i, factory)| {
+                std::thread::spawn(move || {
+                    WORKER_IDX.set(i + 1);
+                    drop(factory.create_memory_ctx());
+                })
+            })
+            .collect();
+        init_memory_context(factories.pop().unwrap().create_memory_ctx());
+        for sibling in siblings {
+            sibling.join().unwrap();
+        }
+        for i in 0..10 {
+            memory_ctx().push_free_idx(i, false);
+        }
+
+        let share = memory_ctx().slots_to_spill();
+
+        assert_eq!(share, 4);
+    }
 
     /// Install a context with no buffers seeded.
     fn fresh_ctx() {

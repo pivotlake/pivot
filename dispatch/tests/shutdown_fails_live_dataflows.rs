@@ -4,6 +4,8 @@
 
 mod common;
 
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary, OutputStatus};
 use dispatch::{
     Consumer, Dispatch, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult, stealable,
     values_input,
@@ -32,8 +34,12 @@ impl Consumer<i64, i64> for EndlessBreaker {
 struct EndlessOutputter;
 
 impl Outputter<i64> for EndlessOutputter {
-    fn output(&mut self, _sender: &mut dyn Sender<i64>) -> UnaryResult<bool> {
-        Ok(false)
+    fn output(
+        &mut self,
+        _sender: &mut dyn Sender<i64>,
+        _io: &mut dispatch::OperatorIO,
+    ) -> UnaryResult<OutputStatus> {
+        Ok(OutputStatus::Working)
     }
 }
 
@@ -42,8 +48,8 @@ struct EndlessBreakerFactory;
 impl UnaryFactory<i64, i64> for EndlessBreakerFactory {
     type Unary = PipelineBreaker<i64, i64, EndlessBreaker>;
 
-    fn build_unary(self) -> Self::Unary {
-        PipelineBreaker::Consuming(EndlessBreaker)
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(PipelineBreaker::Consuming(EndlessBreaker))
     }
 }
 

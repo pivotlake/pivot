@@ -1,7 +1,9 @@
 use crate::GatherBarrier;
+use crate::api::BuildContext;
 use crate::boundary_slot::BoundarySlot;
 use crate::operations::unary::factory::UnaryFactory;
 use crate::operations::unary::order_by_limit::{OrderBy, OrderByLimit};
+use crate::operations::{Built, BuiltUnary};
 use arrow_array::{ArrayRef, RecordBatch};
 use std::sync::{Arc, Mutex};
 
@@ -46,14 +48,14 @@ impl OrderByLimitFactory {
 impl UnaryFactory<RecordBatch, RecordBatch> for OrderByLimitFactory {
     type Unary = OrderByLimit;
 
-    fn build_unary(self) -> OrderByLimit {
-        OrderByLimit::new(
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<OrderByLimit> {
+        Built::new(OrderByLimit::new(
             self.order_by,
             self.limit,
             self.offset,
             self.gather,
             self.boundary_slot,
             self.key_window,
-        )
+        ))
     }
 }

@@ -17,6 +17,8 @@
 //! 3. **Complete** — The outputter has emitted everything.
 
 use crate::data_flow::WorkStatus;
+use crate::io::{OperatorIO, ReadResponse};
+use crate::memory::Spiller;
 use crate::operations::channels::Sender;
 use crate::operations::{Unary, unary};
 use std::marker::PhantomData;
@@ -55,15 +57,49 @@ pub trait Consumer<I, O> {
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         None
     }
+
+    /// See [`Unary::spill`]. The default spills nothing.
+    fn spill(&mut self, _spiller: &mut Spiller, _count: usize) -> unary::Result<()> {
+        Ok(())
+    }
+}
+
+/// What one call to [`Outputter::output`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStatus {
+    /// Every result has been emitted.
+    Done,
+    /// Made progress, or expects to on the next call.
+    Working,
+    /// Cannot make progress until reads it issued have landed, so the worker
+    /// may wait for IO rather than call again at once.
+    WaitingForIo,
 }
 
 /// Emits final results after the consuming phase is complete.
 ///
-/// [`output`](Outputter::output) is called repeatedly until it returns `true`,
-/// indicating all results have been emitted.
+/// [`output`](Outputter::output) is called repeatedly until it returns
+/// [`OutputStatus::Done`].
 pub trait Outputter<O> {
-    /// Emit the next batch of results. Returns `true` when done.
-    fn output(&mut self, sender: &mut dyn Sender<O>) -> unary::Result<bool>;
+    /// Emit the next batch of results, issuing through `io` whatever reads
+    /// the coming results need.
+    fn output(
+        &mut self,
+        sender: &mut dyn Sender<O>,
+        io: &mut OperatorIO,
+    ) -> unary::Result<OutputStatus>;
+
+    /// Handle a completed read this outputter issued through
+    /// [`output`](Self::output).
+    fn process_read_response(&mut self, _response: ReadResponse) -> unary::Result<()> {
+        unreachable!("an outputter that issues no reads receives no read responses")
+    }
+
+    /// See [`Unary::spill`]. An outputter still holds whatever it has not
+    /// emitted yet, so it may be asked too. The default spills nothing.
+    fn spill(&mut self, _spiller: &mut Spiller, _count: usize) -> unary::Result<()> {
+        Ok(())
+    }
 }
 
 /// A [`Unary`] implementation that breaks the pipeline into consume and output phases.
@@ -98,15 +134,33 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
         }
     }
 
-    fn run(&mut self, sender: &mut dyn Sender<O>) -> unary::Result<WorkStatus> {
+    fn run(
+        &mut self,
+        sender: &mut dyn Sender<O>,
+        io: &mut OperatorIO,
+    ) -> unary::Result<WorkStatus> {
         match self {
-            PipelineBreaker::Outputting(o, ..) => {
-                if o.output(sender)? {
-                    *self = PipelineBreaker::Complete
+            PipelineBreaker::Outputting(outputter, ..) => match outputter.output(sender, io)? {
+                OutputStatus::Done => {
+                    *self = PipelineBreaker::Complete;
+                    Ok(WorkStatus::Ran)
                 }
-                Ok(WorkStatus::Ran)
-            }
+                OutputStatus::Working => Ok(WorkStatus::Ran),
+                OutputStatus::WaitingForIo => Ok(WorkStatus::Pending),
+            },
             _ => Ok(WorkStatus::Pending),
+        }
+    }
+
+    fn process_read_response(
+        &mut self,
+        _sender: &mut dyn Sender<O>,
+        _io: &mut OperatorIO,
+        response: ReadResponse,
+    ) -> unary::Result<()> {
+        match self {
+            PipelineBreaker::Outputting(outputter, ..) => outputter.process_read_response(response),
+            _ => unreachable!("only the outputting phase issues reads"),
         }
     }
 
@@ -134,7 +188,15 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
         }
     }
 
-    fn finish(&mut self, sender: &mut dyn Sender<O>) -> unary::Result<bool> {
+    fn spill(&mut self, spiller: &mut Spiller, count: usize) -> unary::Result<()> {
+        match self {
+            PipelineBreaker::Consuming(consumer) => consumer.spill(spiller, count),
+            PipelineBreaker::Outputting(outputter, ..) => outputter.spill(spiller, count),
+            PipelineBreaker::Complete => Ok(()),
+        }
+    }
+
+    fn finish(&mut self, _sender: &mut dyn Sender<O>) -> unary::Result<bool> {
         if matches!(self, PipelineBreaker::Consuming(..)) {
             let consume = mem::replace(self, PipelineBreaker::Complete);
             match consume {
@@ -148,17 +210,76 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
             }
         }
 
+        // Outputting needs the operator's IO handle, which finishing does not
+        // have, so the outputter is driven through `run` from here on.
         match self {
-            PipelineBreaker::Outputting(o, ..) => {
-                if o.output(sender)? {
-                    *self = PipelineBreaker::Complete;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
+            PipelineBreaker::Outputting(..) => Ok(false),
             PipelineBreaker::Complete => Ok(true),
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::TestOperatorIO;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Records which phase was asked to spill, and how much.
+    struct Recording {
+        asked: Rc<RefCell<Vec<(&'static str, usize)>>>,
+    }
+
+    impl Consumer<(), ()> for Recording {
+        type Outputter = Recording;
+
+        fn consume(&mut self, _: (), _: &mut dyn Sender<()>) -> unary::Result<()> {
+            Ok(())
+        }
+
+        fn into_outputter(self) -> unary::Result<Option<Recording>> {
+            Ok(Some(self))
+        }
+
+        fn spill(&mut self, _spiller: &mut Spiller, count: usize) -> unary::Result<()> {
+            self.asked.borrow_mut().push(("consuming", count));
+            Ok(())
+        }
+    }
+
+    impl Outputter<()> for Recording {
+        /// Never done, so the breaker stays in its outputting phase.
+        fn output(
+            &mut self,
+            _: &mut dyn Sender<()>,
+            _: &mut OperatorIO,
+        ) -> unary::Result<OutputStatus> {
+            Ok(OutputStatus::Working)
+        }
+
+        fn spill(&mut self, _spiller: &mut Spiller, count: usize) -> unary::Result<()> {
+            self.asked.borrow_mut().push(("outputting", count));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_spill_request_reaches_whichever_phase_holds_the_rows() {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let mut breaker = PipelineBreaker::Consuming(Recording {
+            asked: asked.clone(),
+        });
+        let mut test_io = TestOperatorIO::default();
+        let mut writes_in_flight = ahash::HashMap::default();
+        let mut spiller = Spiller::new(test_io.io(), &mut writes_in_flight);
+        let mut sender = crate::operations::unary::test_utils::CollectSender::<()>::new();
+
+        breaker.spill(&mut spiller, 1).unwrap();
+        breaker.finish(&mut sender).unwrap();
+        breaker.spill(&mut spiller, 2).unwrap();
+
+        assert_eq!(*asked.borrow(), [("consuming", 1), ("outputting", 2)]);
     }
 }

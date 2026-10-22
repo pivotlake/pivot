@@ -97,6 +97,13 @@ impl TopKCutoff<'_> {
     }
 }
 
+/// Whether the top-k pruning lets the group hashing to `hash` into a merge:
+/// always, when no prunable top-k was pushed.
+#[inline(always)]
+pub(crate) fn topk_admits(cutoff: Option<TopKCutoff<'_>>, hash: u64) -> bool {
+    cutoff.is_none_or(|cutoff| cutoff.admits(hash))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

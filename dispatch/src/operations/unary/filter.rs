@@ -16,12 +16,14 @@
 //! input batch's survivors are gathered out of that batch and sent at once.
 
 use crate::RECORD_BATCH_SIZE;
+use crate::api::BuildContext;
 use crate::arrays::accumulator::BatchAccumulator;
 use crate::arrays::{collect_set_positions, take};
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::{Unary, UnaryFactory};
+use crate::operations::{Built, BuiltUnary};
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_buffer::{BooleanBuffer, Buffer};
 
@@ -100,14 +102,14 @@ where
 {
     type Unary = Filter<F>;
 
-    fn build_unary(self) -> Self::Unary {
-        Filter {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(Filter {
             func: self.0,
             delivery: self.1,
             allocator: SlabAllocator::new(false),
             accumulator: None,
             scratch: SelectionScratch::default(),
-        }
+        })
     }
 }
 
@@ -316,7 +318,9 @@ mod tests {
             + Send
             + 'static,
     {
-        FilterFactory(func, RowDelivery::Coalesced).build_unary()
+        FilterFactory(func, RowDelivery::Coalesced)
+            .build_unary(&mut BuildContext::new(0))
+            .inner
     }
 
     fn keep_first_row(
@@ -442,7 +446,9 @@ mod tests {
             |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
                 select_by_mask(scratch, b.num_rows(), |row| row != 0)
             };
-        let filter = FilterFactory(keep_but_the_first, RowDelivery::Immediate).build_unary();
+        let filter = FilterFactory(keep_but_the_first, RowDelivery::Immediate)
+            .build_unary(&mut BuildContext::new(0))
+            .inner;
 
         let out = run_unary_to_completion(filter, vec![batch(&[1, 2, 3]), batch(&[4, 5, 6])]);
 
@@ -554,7 +560,9 @@ mod tests {
     #[test]
     fn immediate_delivery_emits_per_input_batch() {
         init_test_free_pool(4);
-        let filter = FilterFactory(keep_first_row, RowDelivery::Immediate).build_unary();
+        let filter = FilterFactory(keep_first_row, RowDelivery::Immediate)
+            .build_unary(&mut BuildContext::new(0))
+            .inner;
 
         let out = run_unary_to_completion(filter, vec![batch(&[1, 2, 3]), batch(&[4, 5, 6])]);
 
@@ -581,7 +589,9 @@ mod tests {
         ]));
         let input = RecordBatch::try_new(schema, vec![col]).unwrap();
         let source_buffer = input.column(0).as_string_view().data_buffers()[0].as_ptr();
-        let filter = FilterFactory(keep_first_row, RowDelivery::Immediate).build_unary();
+        let filter = FilterFactory(keep_first_row, RowDelivery::Immediate)
+            .build_unary(&mut BuildContext::new(0))
+            .inner;
 
         let out = run_unary_to_completion(filter, vec![input]);
 
@@ -600,7 +610,9 @@ mod tests {
             Field::new("a", DataType::Int32, true),
             Field::new("b", DataType::Int32, true),
         ]);
-        let filter = FilterFactory(keep_first_row, RowDelivery::Immediate).build_unary();
+        let filter = FilterFactory(keep_first_row, RowDelivery::Immediate)
+            .build_unary(&mut BuildContext::new(0))
+            .inner;
 
         let out = run_unary_to_completion(filter, vec![one, two]);
 
@@ -613,7 +625,9 @@ mod tests {
     #[test]
     fn coalesced_delivery_emits_one_batch() {
         init_test_free_pool(4);
-        let filter = FilterFactory(keep_first_row, RowDelivery::Coalesced).build_unary();
+        let filter = FilterFactory(keep_first_row, RowDelivery::Coalesced)
+            .build_unary(&mut BuildContext::new(0))
+            .inner;
 
         let out = run_unary_to_completion(filter, vec![batch(&[1, 2, 3]), batch(&[4, 5, 6])]);
 

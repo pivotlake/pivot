@@ -25,6 +25,8 @@ pub struct SlabAllocator {
     /// Whether the bytes from `offset` onwards are still zero. Starts as the buffer's own
     /// `zeroed` flag and is cleared by a rewind, which hands out bytes already written.
     working_buffer_zeroed: bool,
+    /// Ring buffers this allocator has taken so far, the working one included.
+    buffers_taken: usize,
 }
 
 impl SlabAllocator {
@@ -36,7 +38,15 @@ impl SlabAllocator {
             working_buffer_zeroed: working_buffer.zeroed,
             working_buffer: Arc::new(working_buffer),
             offset: 0,
+            buffers_taken: 1,
         }
+    }
+
+    /// Ring memory handed out through this allocator, counted in whole buffers:
+    /// a slab pins its buffer for as long as it lives, so this is what the
+    /// slabs still alive can hold at most.
+    pub fn bytes_held(&self) -> usize {
+        self.buffers_taken * BUFFER_SIZE
     }
 
     /// Bytes remaining in the current working buffer.
@@ -73,6 +83,7 @@ impl SlabAllocator {
         let working_buffer = memory_ctx().get_write_buffer(zeroed);
         self.working_buffer_zeroed = working_buffer.zeroed;
         self.working_buffer = Arc::new(working_buffer);
+        self.buffers_taken += 1;
     }
 
     /// Restarts the bump pointer at the beginning of the working buffer when no slab carved

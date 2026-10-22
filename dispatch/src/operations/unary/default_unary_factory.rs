@@ -3,6 +3,8 @@
 //! Useful for unary transforms that need no per-worker configuration (e.g. the
 //! parquet indexer and decompressor, which are stateless or self-initializing).
 
+use crate::api::BuildContext;
+use crate::operations::{Built, BuiltUnary};
 use crate::operations::{Unary, UnaryFactory};
 use std::marker::PhantomData;
 
@@ -36,7 +38,7 @@ unsafe impl<U> Sync for DefaultUnaryFactory<U> {}
 impl<I, O, U: Unary<I, O> + 'static + Default> UnaryFactory<I, O> for DefaultUnaryFactory<U> {
     type Unary = U;
 
-    fn build_unary(self) -> Self::Unary {
-        U::default()
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(U::default())
     }
 }

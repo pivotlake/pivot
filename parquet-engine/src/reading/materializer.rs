@@ -13,7 +13,9 @@ use crate::reading::record_batch_metadata::{global_row_group, row_index};
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use ahash::HashMap;
 use arrow_array::{Array, RecordBatch, UInt32Array};
+use dispatch::BuildContext;
 use dispatch::Sender;
+use dispatch::{Built, BuiltUnary};
 use dispatch::{Unary, UnaryFactory};
 use std::mem;
 use std::sync::Arc;
@@ -39,8 +41,8 @@ impl MaterializerFactory {
 impl UnaryFactory<RecordBatch, QueryRowGroupMetadata> for MaterializerFactory {
     type Unary = Materializer;
 
-    fn build_unary(self) -> Materializer {
-        Materializer::new(self.table)
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Materializer> {
+        Built::new(Materializer::new(self.table))
     }
 }
 

@@ -11,6 +11,7 @@
 //! needs them for the downstream `Materialize`; any other zero-column scan (a
 //! row count) gets plain empty-schema rows.
 
+use dispatch::{Built, BuiltNullary};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchOptions, UInt32Array};
@@ -56,12 +57,12 @@ struct EmptyProjectionScanFactory {
 
 impl NullaryFactory<RecordBatch> for EmptyProjectionScanFactory {
     type Nullary = EmptyProjectionScan;
-    fn build_nullary(self) -> EmptyProjectionScan {
-        EmptyProjectionScan {
+    fn build_nullary(self) -> BuiltNullary<EmptyProjectionScan> {
+        Built::new(EmptyProjectionScan {
             row_groups: self.row_groups,
             filter: self.filter,
             add_row_group_metadata: self.add_row_group_metadata,
-        }
+        })
     }
 }
 
