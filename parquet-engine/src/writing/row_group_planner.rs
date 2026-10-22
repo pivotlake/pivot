@@ -4,6 +4,8 @@
 //! zero-copy, and each column job is routed to the NUMA node that contributes
 //! the most rows to its row group.
 
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
@@ -28,10 +30,10 @@ pub(super) fn factories(topology: Topology) -> Vec<RowGroupPlannerFactory> {
 impl UnaryFactory<ReadyFile, ColumnChunkJob> for RowGroupPlannerFactory {
     type Unary = RowGroupPlanner;
 
-    fn build_unary(self) -> Self::Unary {
-        RowGroupPlanner {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(RowGroupPlanner {
             node_count: self.node_count,
-        }
+        })
     }
 }
 

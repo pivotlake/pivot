@@ -154,6 +154,21 @@ impl FreePool {
         None
     }
 
+    /// How many free indices this worker's node holds right now, across every
+    /// same-node deque and the injectors of the node's workers. Peers keep
+    /// popping and pushing while this counts, so the answer describes the pool
+    /// at the instant it was read, which is all a memory-pressure check needs.
+    pub fn free_slots(&self) -> usize {
+        let queued: usize = self.stealers.iter().map(Stealer::len).sum();
+        let returning: usize = self
+            .layout
+            .topology()
+            .node_siblings(WORKER_IDX.get())
+            .map(|worker| self.injectors[worker].len())
+            .sum();
+        queued + returning
+    }
+
     /// Return a buffer index. If this worker is `idx`'s home worker, the index
     /// lands in the local deque; otherwise it lands in the home worker's
     /// injector, where the home worker can pick it up on its next `pop`. The

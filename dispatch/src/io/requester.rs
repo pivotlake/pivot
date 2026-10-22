@@ -196,6 +196,11 @@ pub struct IORequester {
     /// Remote reads, optionally served from the on-disk cache. Ring-less like the
     /// underlying `HttpEngine`: it borrows `backend` (and `next_id`) to submit.
     http: CachedHttpEngine,
+    /// Operations that have completed and not yet been taken (see
+    /// [`collect_completions`](Self::collect_completions)). Kept here rather
+    /// than returned, so that one caller can take only the completions it is
+    /// after and leave the rest for the worker's next pass.
+    completed: Vec<std::result::Result<Completion, FailedIO>>,
 }
 
 impl Default for IORequester {
@@ -221,6 +226,7 @@ impl IORequester {
             next_id: 0,
             http: CachedHttpEngine::with_default_config(disk_cache)
                 .expect("Unable to create http engine"),
+            completed: Vec::new(),
         }
     }
 
@@ -244,12 +250,28 @@ impl IORequester {
             next_id: 0,
             http: CachedHttpEngine::new(http_config, disk_cache)
                 .expect("Unable to create http engine"),
+            completed: Vec::new(),
         }
     }
 
     /// Build a requester with a specific HTTP client config and no disk cache.
     pub fn with_http_config(http_config: Arc<rustls::ClientConfig>) -> Self {
         Self::with_config(http_config, None)
+    }
+
+    /// [`request_read`](Self::request_read) with the cache lookups resolved
+    /// here, as [`OperatorIO`](crate::io::OperatorIO) resolves them before
+    /// borrowing the requester.
+    #[cfg(test)]
+    fn request_read_resolving(
+        &mut self,
+        data_flow_id: Identifier,
+        operator_idx: Identifier,
+        request: PendingReadRequest,
+        stats: &mut StatsCollector,
+    ) -> Result<()> {
+        let cache_lookups = resolve_read_through_cache(&request);
+        self.request_read(data_flow_id, operator_idx, request, cache_lookups, stats)
     }
 
     /// Route every local-file operation through `queue`, so a test controls
@@ -266,6 +288,7 @@ impl IORequester {
         data_flow_id: Identifier,
         operator_idx: Identifier,
         request: PendingReadRequest,
+        cache_lookups: Vec<Vec<CacheLookup>>,
         stats: &mut StatsCollector,
     ) -> Result<()> {
         let route = RequestRoute {
@@ -274,7 +297,7 @@ impl IORequester {
         };
         let mut fs_requests = Vec::new();
         let mut http_requests = Vec::new();
-        for request in self.register_and_create_io_reads(route, request) {
+        for request in self.register_and_create_io_reads(route, request, cache_lookups) {
             if !request.missing_extent().fill_owner() {
                 request.missing_extent().subscribe(WORKER_IDX.get());
                 self.piggybacked_reads.push(request);
@@ -363,13 +386,23 @@ impl IORequester {
         request: PendingWriteRequest,
         stats: &mut StatsCollector,
     ) -> Result<()> {
-        let PendingWriteRequest { open_file, data } = request;
+        let PendingWriteRequest {
+            id,
+            open_file,
+            offset,
+            data,
+        } = request;
         match open_file {
             OpenFile::Local(file) => {
                 let mut request = DataFlowRequest::new(
                     data_flow_id,
                     operator_idx,
-                    FsRequest::Write(FsWriteRequest { file, data }),
+                    FsRequest::Write(FsWriteRequest {
+                        id,
+                        file,
+                        offset,
+                        data,
+                    }),
                 );
                 stats.record_issued_disk(std::slice::from_mut(&mut request));
                 self.submit_fs_request_to_backend(request)
@@ -428,16 +461,12 @@ impl IORequester {
         &mut self,
         route: RequestRoute,
         request: PendingReadRequest,
+        cache_lookups: Vec<Vec<CacheLookup>>,
     ) -> Vec<IORead> {
         let mut locations = Vec::with_capacity(request.locations.len());
         let mut physical_reads = Vec::new();
 
-        for location in &request.locations {
-            let lookups = memory_ctx().compressed_cache().get(
-                &request.open_file,
-                location.offset,
-                location.len,
-            );
+        for (location, lookups) in request.locations.iter().zip(cache_lookups) {
             for lookup in &lookups {
                 if let Some(block) = lookup.missing() {
                     let id = self.next_physical_read_id;
@@ -631,7 +660,7 @@ impl IORequester {
                 let run = write.data.run_at(0);
                 self.backend.submit_write(
                     write.file.as_raw_fd(),
-                    0,
+                    write.offset,
                     run.as_ptr(),
                     run.len(),
                     self.next_id,
@@ -791,6 +820,34 @@ impl IORequester {
     /// the [`CachedHttpEngine`]'s cache-file reads / write-backs, and its HTTP
     /// sockets. We drain it once and route each completion to its owner.
     pub fn completions(&mut self) -> Result<Vec<std::result::Result<Completion, FailedIO>>> {
+        self.collect_completions()?;
+        Ok(self.take_completions())
+    }
+
+    /// Every completion collected so far, leaving none behind.
+    pub fn take_completions(&mut self) -> Vec<std::result::Result<Completion, FailedIO>> {
+        std::mem::take(&mut self.completed)
+    }
+
+    /// Only the collected completions that `wanted` accepts, leaving the rest
+    /// for [`take_completions`](Self::take_completions). For a caller that
+    /// must handle its own completions now and no others, such as eviction
+    /// waiting on writes from inside an operator's run.
+    pub fn extract_completions_if(
+        &mut self,
+        mut wanted: impl FnMut(&std::result::Result<Completion, FailedIO>) -> bool,
+    ) -> Vec<std::result::Result<Completion, FailedIO>> {
+        self.completed
+            .extract_if(.., |completion| wanted(completion))
+            .collect()
+    }
+
+    /// Reap the backend's finished operations into the kept completions (see
+    /// [`completions`](Self::completions) for what each one means), resolving
+    /// the requester's own bookkeeping on the way: the next run of a partly
+    /// written payload is submitted, cache fills are committed, and logical
+    /// reads whose last fill landed become ready.
+    pub fn collect_completions(&mut self) -> Result<()> {
         let raw = self.backend.completions()?;
 
         // HTTP socket CQEs drive the engine first: they may submit follow-up SQEs
@@ -830,7 +887,7 @@ impl IORequester {
                         let run = write.data.run_at(done);
                         self.backend.submit_write(
                             write.file.as_raw_fd(),
-                            done as u64,
+                            write.offset + done as u64,
                             run.as_ptr(),
                             run.len(),
                             self.next_id,
@@ -983,7 +1040,8 @@ impl IORequester {
             }
         }
 
-        Ok(out)
+        self.completed.append(&mut out);
+        Ok(())
     }
 
     /// Blocks until at least one pending read (disk or HTTP) makes progress. On
@@ -1017,6 +1075,22 @@ impl IORequester {
 /// The cache extent a queued filesystem operation registered, paired with the
 /// file it belongs to, so a failed batch can remove it again. Writes register
 /// nothing.
+/// Resolve each of `request`'s ranges through the compressed cache, one
+/// lookup list per range. This allocates cache slots for the ranges that are
+/// missing, and allocating can evict, so it runs before the requester is
+/// borrowed: eviction may need the requester to wait on spill writes.
+pub(crate) fn resolve_read_through_cache(request: &PendingReadRequest) -> Vec<Vec<CacheLookup>> {
+    request
+        .locations
+        .iter()
+        .map(|location| {
+            memory_ctx()
+                .compressed_cache()
+                .get(&request.open_file, location.offset, location.len)
+        })
+        .collect()
+}
+
 fn fs_cache_extent(request: &DataFlowRequest<FsRequest>) -> Option<(OpenFile, MissingExtent)> {
     request
         .request
@@ -1165,7 +1239,7 @@ mod tests {
 
         for block in 0..blocks {
             requester
-                .request_read(
+                .request_read_resolving(
                     1,
                     2,
                     PendingReadRequest {
@@ -1212,7 +1286,7 @@ mod tests {
         second.force_fs_queue(shared_queue);
 
         first
-            .request_read(
+            .request_read_resolving(
                 1,
                 2,
                 PendingReadRequest {
@@ -1224,7 +1298,7 @@ mod tests {
             )
             .unwrap();
         second
-            .request_read(
+            .request_read_resolving(
                 3,
                 4,
                 PendingReadRequest {
@@ -1275,7 +1349,7 @@ mod tests {
         let mut follower = IORequester::default();
 
         owner
-            .request_read(
+            .request_read_resolving(
                 1,
                 2,
                 pending_local_read(open_file.clone()),
@@ -1283,7 +1357,7 @@ mod tests {
             )
             .unwrap();
         follower
-            .request_read(3, 4, pending_local_read(open_file), &mut disabled_stats())
+            .request_read_resolving(3, 4, pending_local_read(open_file), &mut disabled_stats())
             .unwrap();
         let owner_has_physical_read = owner.has_file_pending();
         let follower_has_physical_read = follower.has_file_pending();
@@ -1315,7 +1389,7 @@ mod tests {
         let mut retry = IORequester::default();
 
         owner
-            .request_read(
+            .request_read_resolving(
                 1,
                 2,
                 pending_local_read(open_file.clone()),
@@ -1323,7 +1397,7 @@ mod tests {
             )
             .unwrap();
         follower
-            .request_read(
+            .request_read_resolving(
                 3,
                 4,
                 pending_local_read(open_file.clone()),
@@ -1341,7 +1415,7 @@ mod tests {
             })
         );
         retry
-            .request_read(5, 6, pending_local_read(open_file), &mut disabled_stats())
+            .request_read_resolving(5, 6, pending_local_read(open_file), &mut disabled_stats())
             .unwrap();
 
         assert!(owner_failure.is_err());
@@ -1364,14 +1438,14 @@ mod tests {
         let mut retry = IORequester::default();
         owner.backend.reject_reads();
 
-        let owner_result = owner.request_read(
+        let owner_result = owner.request_read_resolving(
             1,
             2,
             pending_local_read(open_file.clone()),
             &mut disabled_stats(),
         );
         retry
-            .request_read(3, 4, pending_local_read(open_file), &mut disabled_stats())
+            .request_read_resolving(3, 4, pending_local_read(open_file), &mut disabled_stats())
             .unwrap();
 
         assert!(owner_result.is_err());
@@ -1436,7 +1510,7 @@ mod tests {
         for part in [&b"parquet upload"[..], &b" bytes"[..]] {
             let mut run = allocator.get_slab_of_size(part.len(), false);
             run.as_mut_slice().copy_from_slice(part);
-            bytes.push(run);
+            bytes.push_slab(run);
         }
         Arc::new(bytes)
     }
@@ -1995,7 +2069,7 @@ mod tests {
         len: usize,
     ) -> std::result::Result<Vec<u8>, FailedIO> {
         requester
-            .request_read(
+            .request_read_resolving(
                 0,
                 0,
                 PendingReadRequest {
@@ -2307,8 +2381,9 @@ mod tests {
         route: RequestRoute,
         request: PendingReadRequest,
     ) -> Vec<DataFlowRequest<FsRequest>> {
+        let cache_lookups = resolve_read_through_cache(&request);
         requester
-            .register_and_create_io_reads(route, request)
+            .register_and_create_io_reads(route, request, cache_lookups)
             .into_iter()
             .map(|request| match request {
                 IORead::Fs(request) => request,

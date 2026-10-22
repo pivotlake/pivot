@@ -8,8 +8,10 @@
 
 use crate::file_slice_injector::FileSliceInjectorFactory;
 use crate::{DataFile, FileRef, ObjectPath};
+use dispatch::BuildContext;
 use dispatch::io::{FileRange, OperatorIO, ReadRequestId, ReadResponse};
 use dispatch::memory::memory_ctx;
+use dispatch::{Built, BuiltUnary};
 use dispatch::{
     DataFlowDispatcher, OperatorSpec, RootUnaryOperatorFactory, Sender, Unary, UnaryFactory,
 };
@@ -116,10 +118,10 @@ struct ObjectFetcherFactory;
 impl UnaryFactory<FileSlice, LoadedObject> for ObjectFetcherFactory {
     type Unary = ObjectFetcher;
 
-    fn build_unary(self) -> Self::Unary {
-        ObjectFetcher {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(ObjectFetcher {
             in_flight: HashMap::new(),
-        }
+        })
     }
 }
 

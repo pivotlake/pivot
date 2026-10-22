@@ -12,10 +12,12 @@ use crate::reading::range_cutter::DecodeRange;
 use crate::reading::record_batch_metadata::with_row_group;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_buffer::BooleanBuffer;
+use dispatch::BuildContext;
 use dispatch::Sender;
 use dispatch::WorkStatus;
 use dispatch::arrays::accumulator::BatchAccumulator;
 use dispatch::memory::SlabAllocator;
+use dispatch::{Built, BuiltUnary};
 use dispatch::{Unary, UnaryFactory};
 use row_group_decoder::DecodedBatch;
 use std::sync::{Arc, Mutex};
@@ -87,8 +89,12 @@ pub struct DecoderFactory {
 impl UnaryFactory<DecodeRange, RecordBatch> for DecoderFactory {
     type Unary = Decoder;
 
-    fn build_unary(self) -> Self::Unary {
-        Decoder::new(self.batch_size, self.add_row_group_metadata, self.allocator)
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(Decoder::new(
+            self.batch_size,
+            self.add_row_group_metadata,
+            self.allocator,
+        ))
     }
 }
 
@@ -297,7 +303,11 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
         self.active.is_none()
     }
 
-    fn run(&mut self, sender: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<WorkStatus> {
+    fn run(
+        &mut self,
+        sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut dispatch::OperatorIO,
+    ) -> dispatch::UnaryResult<WorkStatus> {
         if self.produce_batch(sender)? {
             Ok(WorkStatus::Ran)
         } else {

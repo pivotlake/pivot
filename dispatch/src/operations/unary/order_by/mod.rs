@@ -16,6 +16,8 @@ mod keys;
 
 pub use k_way_merge::{KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput};
 
+use crate::api::BuildContext;
+use crate::operations::{Built, BuiltUnary};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -30,7 +32,9 @@ use crate::operations::channels::{NodeIdOutput, Sender};
 use crate::operations::unary;
 use crate::operations::unary::factory::UnaryFactory;
 use crate::operations::unary::order_by_limit::OrderBy;
-use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
+use crate::operations::unary::pipeline_breaker::{
+    Consumer, OutputStatus, Outputter, PipelineBreaker,
+};
 use crate::operations::unary::{
     BatchesOutputter, CollectorFactory, InitializableOutputter, NormalizationBatches, Normalizer,
 };
@@ -314,8 +318,8 @@ where
 {
     type Unary = PipelineBreaker<RecordBatch, Out, OrderBySorter<O>>;
 
-    fn build_unary(self) -> Self::Unary {
-        PipelineBreaker::Consuming(OrderBySorter {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(PipelineBreaker::Consuming(OrderBySorter {
             order_by: self.order_by,
             node_id: self.node_id,
             local_worker_id: self.local_worker_id,
@@ -323,7 +327,7 @@ where
             completed_runs: Vec::new(),
             allocator: None,
             outputter: self.outputter,
-        })
+        }))
     }
 }
 
@@ -470,7 +474,11 @@ impl InitializableOutputter<WorkerRuns, RecordBatch> for RunMerger {
 }
 
 impl Outputter<RecordBatch> for RunMerger {
-    fn output(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
+    fn output(
+        &mut self,
+        sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut crate::io::OperatorIO,
+    ) -> unary::Result<OutputStatus> {
         if let Some(task) = self.shared.claim_task(self.node_id) {
             let allocator = self
                 .allocator
@@ -478,12 +486,12 @@ impl Outputter<RecordBatch> for RunMerger {
             self.shared.execute(task, allocator)?;
             // One slice per call keeps the worker responsive to the rest of
             // its dataflow.
-            return Ok(false);
+            return Ok(OutputStatus::Working);
         }
         if !self.shared.merges_complete.load(Ordering::Acquire) {
             // Other workers are still sorting or merging; their completions
             // will feed the queues.
-            return Ok(false);
+            return Ok(OutputStatus::Working);
         }
         if !self.shared.output_claimed.swap(true, Ordering::AcqRel) {
             let output = self
@@ -495,7 +503,7 @@ impl Outputter<RecordBatch> for RunMerger {
                 sender.send(batch.batch().clone())?;
             }
         }
-        Ok(true)
+        Ok(OutputStatus::Done)
     }
 }
 
@@ -512,10 +520,12 @@ mod tests {
     fn consumers(order_by: Vec<OrderBy>, worker_count: usize) -> Vec<OrderBySorter> {
         OrderByFactory::create_for_workers(order_by, Topology::single_node(worker_count))
             .into_iter()
-            .map(|factory| match factory.build_unary() {
-                PipelineBreaker::Consuming(sorter) => sorter,
-                _ => unreachable!("factories build consuming breakers"),
-            })
+            .map(
+                |factory| match factory.build_unary(&mut BuildContext::new(0)).inner {
+                    PipelineBreaker::Consuming(sorter) => sorter,
+                    _ => unreachable!("factories build consuming breakers"),
+                },
+            )
             .collect()
     }
 
@@ -573,10 +583,12 @@ mod tests {
         let mut consumers: Vec<_> =
             OrderByFactory::create_for_workers(ascending_by_key(), topology)
                 .into_iter()
-                .map(|factory| match factory.build_unary() {
-                    PipelineBreaker::Consuming(sorter) => sorter,
-                    _ => unreachable!("factories build consuming breakers"),
-                })
+                .map(
+                    |factory| match factory.build_unary(&mut BuildContext::new(0)).inner {
+                        PipelineBreaker::Consuming(sorter) => sorter,
+                        _ => unreachable!("factories build consuming breakers"),
+                    },
+                )
                 .collect();
         let mut ignored = CollectSender::new();
         consumers[0]
@@ -593,10 +605,12 @@ mod tests {
         }
         WORKER_IDX.set(0);
         let mut output = CollectSender::new();
+        let mut test_io = crate::io::TestOperatorIO::default();
         loop {
             let mut done = true;
             for outputter in &mut outputters {
-                done &= outputter.output(&mut output).unwrap();
+                done &=
+                    outputter.output(&mut output, &mut test_io.io()).unwrap() == OutputStatus::Done;
             }
             if done {
                 break;

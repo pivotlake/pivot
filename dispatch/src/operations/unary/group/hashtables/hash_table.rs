@@ -5,6 +5,7 @@
 use crate::memory::{BUFFER_SIZE, Slab, SlabAllocator};
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::TableReader;
+use crate::operations::unary::group::keys::StoredKey;
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
 use std::mem;
@@ -492,7 +493,38 @@ pub struct Prober<'t, K: PersistedKey, V: AggregationValue + ?Sized> {
     reader: TableReader<'t, K, V>,
 }
 
-impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
+impl<'t, K: PersistedKey, V: AggregationValue + ?Sized> Prober<'t, K, V> {
+    /// A probing handle over `table` for a loop specialized to `N` value
+    /// slots, or to the table's own runtime metadata when `N` is zero.
+    #[inline(always)]
+    pub fn new<const N: usize>(table: &'t mut HashTable<K, V>) -> Self {
+        if N == 0 {
+            table.prober()
+        } else {
+            table.prober_with_metadata(V::metadata_for_arity::<N>())
+        }
+    }
+
+    /// Merge a scatter row into the table, growing the table first if it is
+    /// full. The row carries its key persisted; `S` says how to resolve that
+    /// against `arena` into a live key.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn merge_scatter_row<S: StoredKey<Persisted = K>>(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        capacity: &mut usize,
+        arena: &SharedArena,
+        ctx: &V::SharedContext,
+        hash: u64,
+        key: &K,
+        stored: &V,
+    ) {
+        self.grow_if_full(allocator, capacity);
+        let live_key = S::resolve_persisted(arena, *key);
+        self.merge_from::<false, _>(hash, live_key, stored, ctx);
+    }
+
     /// Prefetches the initial slot and two following cache lines into L1.
     #[inline(always)]
     pub fn prefetch(&self, hash: u64) {

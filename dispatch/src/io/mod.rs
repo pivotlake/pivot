@@ -47,7 +47,7 @@ mod operator;
 pub use operator::TestOperatorIO;
 pub use operator::{
     FileRange, OperatorIO, PendingReadRequest, PendingWriteRequest, ReadData, ReadRequestId,
-    ReadResponse,
+    ReadResponse, WriteRequestId,
 };
 
 mod cached_http;
@@ -352,7 +352,13 @@ pub struct FsReadRequest {
 /// run at a time: holding it as runs is what keeps a file's bytes on the ring
 /// instead of in one heap allocation.
 pub struct FsWriteRequest {
+    /// The id [`OperatorIO::write`] handed the operator when it issued this
+    /// write, so the operator can match the completion to its own bookkeeping.
+    pub id: WriteRequestId,
     pub file: LocalFile,
+    /// Where in the file `data` goes. A file an operator produces is written
+    /// whole at zero; a spill file is appended to, one write after another.
+    pub offset: u64,
     pub data: Arc<FileBytes>,
 }
 

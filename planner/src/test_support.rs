@@ -13,6 +13,7 @@
 //! so linking it into `planner`'s own unit tests would pull a second copy of
 //! `planner` into the graph and the catalog types wouldn't unify.
 
+use dispatch::{Built, BuiltNullary};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -44,10 +45,10 @@ struct ReplayFactory {
 
 impl NullaryFactory<RecordBatch> for ReplayFactory {
     type Nullary = Replay;
-    fn build_nullary(self) -> Self::Nullary {
-        Replay {
+    fn build_nullary(self) -> BuiltNullary<Self::Nullary> {
+        Built::new(Replay {
             batch: Some(self.batch),
-        }
+        })
     }
 }
 

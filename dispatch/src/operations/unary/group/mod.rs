@@ -118,6 +118,7 @@ pub use values::{
 };
 
 use crate::gather_barrier::GatherBarrier;
+use crate::memory::{SharedPartitionEvictor, Spiller};
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
@@ -262,6 +263,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         radix: RadixConfig,
         topk_threshold: Arc<TopKThreshold>,
         shared_bin_totals: Arc<SharedBinTotals>,
+        evictor: SharedPartitionEvictor,
     ) -> Self {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
         let value_output_types: Arc<[DataType]> =
@@ -284,6 +286,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
             shared_context.worker(),
             radix,
             output::topk_pruning::prunable_topk_slot(output_limit, &value_slots),
+            evictor,
         );
         Self {
             key_cols,
@@ -328,6 +331,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
         Ok(())
     }
 
+    fn spill(&mut self, spiller: &mut Spiller, count: usize) -> unary::Result<()> {
+        for _ in 0..count {
+            if !self.aggregated_table.spill(spiller)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
         let (tables, topk_bin_totals) = self.aggregated_table.flush();
         if let Some(totals) = topk_bin_totals {
@@ -343,11 +355,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RECORD_BATCH_SIZE;
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::group::keys::{
         IntKeyExtractor, IntStrKeyExtractor, StringKeyExtractor,
     };
-    use crate::operations::unary::test_utils::{CollectSender, run_consumers};
+    use crate::operations::unary::test_utils::{CollectSender, run_consumers, run_consumers_with};
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -418,6 +431,40 @@ mod tests {
     }
 
     #[test]
+    fn rows_evicted_to_disk_are_read_back_for_the_merge() {
+        // Two workers, unique keys, so both switch to radix and scatter raw,
+        // filling buffers that seal once every partition has moved past them.
+        let worker_batches: Vec<Vec<RecordBatch>> = (0..2)
+            .map(|worker| {
+                let keys: Vec<i32> = (worker * 200_000..(worker + 1) * 200_000).collect();
+                keys.chunks(RECORD_BATCH_SIZE)
+                    .map(batch_with_column)
+                    .collect()
+            })
+            .collect();
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+            ..RadixConfig::DEFAULT
+        };
+
+        let (sender, evicted) = run_group_spilling::<IntExtractor, CountValue>(
+            worker_batches,
+            vec![0],
+            count_slots(),
+            None,
+            radix,
+            true,
+        );
+
+        assert!(
+            evicted > 0,
+            "no buffer was evicted, so nothing was read back"
+        );
+        assert_eq!(sender.total_rows(), 400_000);
+    }
+
+    #[test]
     fn batch_wider_than_record_batch_size() {
         // A single input batch wider than RECORD_BATCH_SIZE (8192) must be
         // consumed via windowing rather than overflowing the per-batch scratch.
@@ -453,6 +500,28 @@ mod tests {
         output_limit: Option<GroupLimit>,
         radix: RadixConfig,
     ) -> CollectSender {
+        run_group_spilling::<K, V>(
+            worker_batches,
+            key_cols,
+            value_slots,
+            output_limit,
+            radix,
+            false,
+        )
+        .0
+    }
+
+    /// [`run_group_full`], optionally spilling and evicting every sealed
+    /// scatter buffer between consuming and output. Also returns how many
+    /// buffers were evicted, so a test knows the merge really read from disk.
+    fn run_group_spilling<K: KeyExtractor<Config: Default>, V: AggregationValue + ?Sized>(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        output_limit: Option<GroupLimit>,
+        radix: RadixConfig,
+        spill_everything_before_output: bool,
+    ) -> (CollectSender, usize) {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
         let key_arena = SharedArena::new(64);
@@ -464,8 +533,16 @@ mod tests {
         let topk_threshold = Arc::new(TopKThreshold::for_limit(output_limit));
         let shared_bin_totals = Arc::new(SharedBinTotals::new(1));
 
-        let groups: Vec<_> = (0..worker_count)
+        let evictors: Vec<SharedPartitionEvictor> = (0..worker_count)
             .map(|_| {
+                std::rc::Rc::new(std::cell::RefCell::new(
+                    crate::memory::PartitionEvictor::new(),
+                ))
+            })
+            .collect();
+        let groups: Vec<_> = evictors
+            .iter()
+            .map(|evictor| {
                 Group::<K, V>::new(
                     key_arena.clone(),
                     value_arena.clone(),
@@ -481,11 +558,26 @@ mod tests {
                     radix,
                     topk_threshold.clone(),
                     shared_bin_totals.clone(),
+                    evictor.clone(),
                 )
             })
             .collect();
 
-        run_consumers(groups, worker_batches)
+        if !spill_everything_before_output {
+            return (run_consumers(groups, worker_batches), 0);
+        }
+        // Spill every sealed scatter buffer, wait for the writes, then evict
+        // every spilled buffer, so the merge has to read those rows back.
+        let mut evicted = 0;
+        let sender = run_consumers_with(groups, worker_batches, 9_000_040, |worker, group, io| {
+            group.spill(&mut io.spiller(), usize::MAX).unwrap();
+            io.finish_spill_writes();
+            while let Some(freed) = evictors[worker].borrow_mut().evict() {
+                drop(freed);
+                evicted += 1;
+            }
+        });
+        (sender, evicted)
     }
 
     #[test]
@@ -818,6 +910,9 @@ mod tests {
                     radix,
                     topk_threshold.clone(),
                     shared_bin_totals.clone(),
+                    std::rc::Rc::new(std::cell::RefCell::new(
+                        crate::memory::PartitionEvictor::new(),
+                    )),
                 )
             })
             .collect();

@@ -58,14 +58,24 @@ mod read_buffer;
 pub use read_buffer::ReadBuffer;
 
 mod slab;
+pub use slab::{FrozenSlab, MultiSlabBuffer, Slab, SlabAllocator, SlabBuffer, SlabVec, WeakSlab};
 pub(crate) use slab::{HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabTopK, slots_per_slab};
-pub use slab::{MultiSlabBuffer, Slab, SlabAllocator, SlabBuffer, SlabVec};
 
 mod reader;
 pub use reader::{MultiBufferReader, ReaderPosition};
 
 mod context;
 pub use context::{MemoryContextFactory, has_memory_context, init_memory_context, memory_ctx};
+
+pub mod evict;
+pub use evict::{DataflowEvict, Evict};
+
+mod spill;
+pub(crate) use spill::directory as spill_directory;
+pub use spill::{
+    Dynamic, Fixed, Layout, PARTITIONS, PartitionAllocator, PartitionContents, PartitionEvictor,
+    PartitionSlab, SharedPartitionEvictor, SpilledBuffer, SpilledSlab, Spiller,
+};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use context::init_test_free_pool;

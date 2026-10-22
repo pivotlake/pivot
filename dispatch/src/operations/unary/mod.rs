@@ -58,6 +58,7 @@ pub use factory::*;
 
 use crate::data_flow::WorkStatus;
 use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO, ReadResponse};
+use crate::memory::Spiller;
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -69,7 +70,7 @@ use super::{FinishStatus, Operator};
 use crate::waker::{waker_set, worker_waker};
 
 mod pipeline_breaker;
-pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
+pub use pipeline_breaker::{Consumer, OutputStatus, Outputter, PipelineBreaker};
 
 mod aggregate;
 pub use aggregate::AggregateFactory;
@@ -84,6 +85,7 @@ mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;
 
 mod copy_out;
+mod fake_operator;
 mod join;
 mod limit;
 mod normalizer;
@@ -181,7 +183,7 @@ pub trait Unary<I, O> {
     /// or the unary is not [ready](Self::ready_for_more_work) for more. Useful
     /// for operators that generate work independently of input (e.g. emitting
     /// buffered results, or advancing a held job by one step).
-    fn run(&mut self, _sender: &mut dyn Sender<O>) -> Result<WorkStatus> {
+    fn run(&mut self, _sender: &mut dyn Sender<O>, _io: &mut OperatorIO) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)
     }
 
@@ -229,6 +231,14 @@ pub trait Unary<I, O> {
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         None
     }
+
+    /// Hand up to `count` of this transform's sealed buffers to `spiller`, so
+    /// their memory can be given up once the writes land. See
+    /// [`Operator::spill`]. The default
+    /// keeps nothing worth spilling and spills nothing.
+    fn spill(&mut self, _spiller: &mut Spiller, _count: usize) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Wires a [`Unary`] transform to a receiver (input channel) and sender (output channel),
@@ -268,11 +278,11 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
         // A transform that is not taking input may still have work of its own
         // to advance, e.g. a job it steps through one batch per turn.
         if !self.unary.ready_for_more_work() {
-            return Ok(self.unary.run(&mut *self.sender)?);
+            return Ok(self.unary.run(&mut *self.sender, io)?);
         }
 
         let item = match self.receiver.try_recv() {
-            None => return Ok(self.unary.run(&mut *self.sender)?),
+            None => return Ok(self.unary.run(&mut *self.sender, io)?),
             Some(t) => t,
         };
 
@@ -378,6 +388,10 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         self.unary.upstream_cancel_flag()
     }
+
+    fn spill(&mut self, spiller: &mut Spiller, count: usize) -> super::Result<()> {
+        Ok(self.unary.spill(spiller, count)?)
+    }
 }
 
 #[cfg(test)]
@@ -402,7 +416,7 @@ mod tests {
             false
         }
 
-        fn run(&mut self, _: &mut dyn Sender<()>) -> Result<WorkStatus> {
+        fn run(&mut self, _: &mut dyn Sender<()>, _: &mut OperatorIO) -> Result<WorkStatus> {
             self.steps += 1;
             Ok(WorkStatus::Ran)
         }
@@ -427,5 +441,38 @@ mod tests {
         assert!(matches!(status, WorkStatus::Ran));
         assert_eq!(operator.unary.steps, 1);
         assert!(!operator.receiver.is_empty());
+    }
+
+    /// Records how many buffers it was asked to spill.
+    struct SpillRecorder {
+        asked: Vec<usize>,
+    }
+
+    impl Unary<(), ()> for SpillRecorder {
+        fn consume(&mut self, _: (), _: &mut dyn Sender<()>, _: &mut OperatorIO) -> Result<()> {
+            Ok(())
+        }
+
+        fn spill(&mut self, _spiller: &mut Spiller, count: usize) -> Result<()> {
+            self.asked.push(count);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_spill_request_reaches_the_transform() {
+        let (_input, receiver) = mpsc_channel::<()>();
+        let mut operator = UnaryOperator::new(
+            SpillRecorder { asked: Vec::new() },
+            receiver,
+            Box::new(CollectSender::<()>::new()),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        let mut test_io = TestOperatorIO::default();
+        let mut spiller = Spiller::new(test_io.io());
+
+        Operator::spill(&mut operator, &mut spiller, 3).unwrap();
+
+        assert_eq!(operator.unary.asked, [3]);
     }
 }

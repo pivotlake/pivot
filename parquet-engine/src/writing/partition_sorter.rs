@@ -10,6 +10,8 @@
 //! the input, a partition-clustered batch, and the independently owned output
 //! batches derived from them.
 
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
@@ -58,14 +60,14 @@ impl PartitionSorterFactory {
 impl UnaryFactory<RecordBatch, SortedPartitionRun> for PartitionSorterFactory {
     type Unary = PartitionSorter;
 
-    fn build_unary(self) -> PartitionSorter {
-        PartitionSorter {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<PartitionSorter> {
+        Built::new(PartitionSorter {
             partition_column_indices: self.partition_column_indices,
             order_by: self.order_by,
             source_node: self.source_node,
             partition_key_converter: None,
             allocator: None,
-        }
+        })
     }
 }
 
@@ -248,7 +250,8 @@ mod tests {
         )
         .pop()
         .unwrap()
-        .build_unary()
+        .build_unary(&mut BuildContext::new(0))
+        .inner
     }
 
     #[test]
@@ -330,7 +333,8 @@ mod tests {
         )
         .pop()
         .unwrap()
-        .build_unary();
+        .build_unary(&mut BuildContext::new(0))
+        .inner;
         let mut sender = CollectSender::new();
 
         partition_sorter

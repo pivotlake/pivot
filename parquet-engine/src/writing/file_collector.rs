@@ -14,6 +14,8 @@
 //! Ordered files are emitted as one local-merge request per participating node.
 //! Unordered files proceed directly to row-group planning without copying.
 
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -111,8 +113,8 @@ pub(super) fn factories(
 impl UnaryFactory<SortedPartitionRun, FileOrderInput> for FileCollectorFactory {
     type Unary = FileCollector;
 
-    fn build_unary(self) -> FileCollector {
-        FileCollector {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<FileCollector> {
+        Built::new(FileCollector {
             partition_column_names: self.partition_column_names,
             order_by: self.order_by,
             target_rows_per_group: self.target_rows_per_group,
@@ -121,7 +123,7 @@ impl UnaryFactory<SortedPartitionRun, FileOrderInput> for FileCollectorFactory {
             topology: self.topology,
             shared: self.shared,
             known_partitions: HashMap::new(),
-        }
+        })
     }
 }
 

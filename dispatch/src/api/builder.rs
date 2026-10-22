@@ -1,6 +1,7 @@
 use crate::Identifier;
 use crate::api::BuildContext;
 use crate::data_flow::DataFlow;
+use crate::memory::Evict;
 use crate::operations::Operator;
 use crate::stats::DataFlowStats;
 use ahash::HashMap;
@@ -30,6 +31,9 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// contain multiple roots while preserving the fluent pipeline's primary result path.
 pub struct OperatorGraphBuilder {
     operators: Vec<Box<dyn Operator>>,
+    /// One entry per operator: the evictor it registered while being built,
+    /// or `None` for an operator that keeps no ring slots of its own.
+    evictors: Vec<Option<Box<dyn Evict>>>,
     edges: Vec<(Identifier, Identifier)>,
     roots: Vec<Identifier>,
     gates: HashMap<Identifier, Vec<Arc<AtomicBool>>>,
@@ -44,9 +48,12 @@ pub struct OperatorGraphBuilder {
 
 impl OperatorGraphBuilder {
     /// Start a graph with one root, which is also its designated output.
-    pub fn root(operator: Box<dyn Operator>) -> Self {
+    /// `evictor` is what the operator's build returned alongside it, if anything
+    /// (see [`Built`](crate::operations::Built)).
+    pub fn root(operator: Box<dyn Operator>, evictor: Option<Box<dyn Evict>>) -> Self {
         Self {
             operators: vec![operator],
+            evictors: vec![evictor],
             edges: Vec::new(),
             roots: vec![0],
             gates: HashMap::default(),
@@ -55,11 +62,13 @@ impl OperatorGraphBuilder {
         }
     }
 
-    /// Append an operator to the graph's designated output path.
-    pub fn with(mut self, operator: Box<dyn Operator>) -> Self {
+    /// Append an operator to the graph's designated output path, with the
+    /// evictor its build returned alongside it, if any.
+    pub fn with(mut self, operator: Box<dyn Operator>, evictor: Option<Box<dyn Evict>>) -> Self {
         let next = self.operators.len();
         self.edges.push((self.output, next));
         self.operators.push(operator);
+        self.evictors.push(evictor);
         self.output = next;
         self
     }
@@ -89,6 +98,7 @@ impl OperatorGraphBuilder {
     pub fn with_side_graph(mut self, mut side: Self) -> Self {
         let offset = self.operators.len();
         self.operators.append(&mut side.operators);
+        self.evictors.append(&mut side.evictors);
         self.edges.extend(
             side.edges
                 .into_iter()
@@ -127,19 +137,22 @@ impl OperatorGraphBuilder {
         merged
     }
 
-    /// Convert this build-time graph into an executable `DataFlow`.
+    /// Convert this build-time graph into an executable `DataFlow` with the id
+    /// the build was started under (see [`BuildContext::dataflow_id`]).
     pub fn into_data_flow(
         self,
+        id: Identifier,
         cancelled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<crate::data_flow::Error>,
         stats_tx: mpsc::Sender<DataFlowStats>,
         collect_stats: bool,
     ) -> DataFlow {
         DataFlow::new(
-            next_dataflow_id(),
+            id,
             cancelled,
             err_tx,
             self.operators,
+            self.evictors,
             self.edges,
             self.gates,
             stats_tx,
@@ -201,7 +214,10 @@ impl DataFlowBuilder {
     /// Build the full operator graph and convert it into an executable `DataFlow`.
     /// Called on the worker thread.
     pub fn build(self) -> Result<DataFlow> {
-        let mut context = BuildContext::default();
+        // The id is chosen before any operator exists, so operators can learn it
+        // from the context while they are being built.
+        let dataflow_id = next_dataflow_id();
+        let mut context = BuildContext::new(dataflow_id);
         let graph = match catch_unwind(AssertUnwindSafe(|| (self.build)(&mut context))) {
             Ok(graph) => graph,
             Err(e) => {
@@ -229,6 +245,7 @@ impl DataFlowBuilder {
         };
 
         let data_flow = graph.into_data_flow(
+            dataflow_id,
             self.cancelled,
             self.err_tx,
             self.stats_tx,
@@ -267,7 +284,7 @@ mod tests {
     }
 
     fn root() -> OperatorGraphBuilder {
-        OperatorGraphBuilder::root(Box::new(InertOperator))
+        OperatorGraphBuilder::root(Box::new(InertOperator), None)
     }
 
     #[test]
@@ -277,11 +294,11 @@ mod tests {
 
         let inner_join = root()
             .gated_by(inner_gate.clone())
-            .with(Box::new(InertOperator))
+            .with(Box::new(InertOperator), None)
             .with_side_graph(root());
         let graph = inner_join
             .gated_by(outer_gate.clone())
-            .with(Box::new(InertOperator))
+            .with(Box::new(InertOperator), None)
             .with_side_graph(root());
 
         assert_eq!(graph.roots, vec![0, 2, 4]);

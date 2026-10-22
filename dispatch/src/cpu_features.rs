@@ -230,12 +230,21 @@ pub fn supports_icelake_kernels() -> bool {
 /// }
 /// ```
 ///
-/// All generic parameters must be inferred from arguments; free const
-/// parameters and different tier shapes need manual wrappers.
+/// Generic parameters are inferred from the arguments unless the declaration
+/// names the ones to pass through, as `::[N, S]` after the generic list, for
+/// const parameters and types that appear only behind an associated type:
+///
+/// ```ignore
+/// multitarget_kernel! {
+///     fn example[const N: usize, S: StoredKey]::[N, S](table: &mut Table<S::Persisted>)
+///     { ... }
+/// }
+/// ```
 macro_rules! multitarget_kernel {
     (
         $(#[$meta:meta])*
-        $vis:vis fn $name:ident $([$($gen:tt)*])? ( $($arg:ident : $argty:ty),* $(,)? )
+        $vis:vis fn $name:ident $([$($gen:tt)*])? $(:: [$($forwarded:tt)*])?
+        ( $($arg:ident : $argty:ty),* $(,)? )
         $(-> $ret:ty)? $(where [$($wh:tt)*])?
         $body:block
     ) => {
@@ -247,13 +256,13 @@ macro_rules! multitarget_kernel {
                 {
                     // SAFETY: each feature check covers every feature on its clone.
                     if $crate::cpu_features::supports_icelake_kernels() {
-                        return unsafe { [<$name _icelake>]($($arg),*) };
+                        return unsafe { [<$name _icelake>] $(::<$($forwarded)*>)? ($($arg),*) };
                     }
                     if $crate::cpu_features::supports_v4_kernels() {
-                        return unsafe { [<$name _v4>]($($arg),*) };
+                        return unsafe { [<$name _v4>] $(::<$($forwarded)*>)? ($($arg),*) };
                     }
                 }
-                [<$name _body>]($($arg),*)
+                [<$name _body>] $(::<$($forwarded)*>)? ($($arg),*)
             }
 
             /// Ice Lake target-feature clone.
@@ -261,8 +270,10 @@ macro_rules! multitarget_kernel {
             #[target_feature(
                 enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,avx512bitalg,avx512vpopcntdq,bmi1,bmi2,lzcnt,movbe,fma"
             )]
+            // A kernel takes the arguments its declaration lists, however many.
+            #[allow(clippy::too_many_arguments)]
             fn [<$name _icelake>] $(<$($gen)*>)? ( $($arg : $argty),* ) $(-> $ret)? $(where $($wh)*)? {
-                [<$name _body>]($($arg),*)
+                [<$name _body>] $(::<$($forwarded)*>)? ($($arg),*)
             }
 
             /// x86-64-v4 target-feature clone (Skylake-SP / Cascade Lake).
@@ -270,11 +281,15 @@ macro_rules! multitarget_kernel {
             #[target_feature(
                 enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,bmi1,bmi2,lzcnt,movbe,fma"
             )]
+            // A kernel takes the arguments its declaration lists, however many.
+            #[allow(clippy::too_many_arguments)]
             fn [<$name _v4>] $(<$($gen)*>)? ( $($arg : $argty),* ) $(-> $ret)? $(where $($wh)*)? {
-                [<$name _body>]($($arg),*)
+                [<$name _body>] $(::<$($forwarded)*>)? ($($arg),*)
             }
 
             #[inline(always)]
+            // A kernel takes the arguments its declaration lists, however many.
+            #[allow(clippy::too_many_arguments)]
             fn [<$name _body>] $(<$($gen)*>)? ( $($arg : $argty),* ) $(-> $ret)? $(where $($wh)*)?
             $body
         }

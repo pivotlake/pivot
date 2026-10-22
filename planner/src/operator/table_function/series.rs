@@ -13,6 +13,7 @@ use crate::catalog::{
 use crate::types::Type;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use dispatch::{Built, BuiltNullary};
 use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, Projection,
     RecordBatchOperatorSpec, Sender, WorkStatus,
@@ -242,8 +243,8 @@ struct SeriesSourceFactory {
 impl NullaryFactory<RecordBatch> for SeriesSourceFactory {
     type Nullary = SeriesSource;
 
-    fn build_nullary(self) -> SeriesSource {
-        SeriesSource {
+    fn build_nullary(self) -> BuiltNullary<SeriesSource> {
+        Built::new(SeriesSource {
             claimed: self.claimed,
             is_producer: None,
             schema: self.schema,
@@ -252,7 +253,7 @@ impl NullaryFactory<RecordBatch> for SeriesSourceFactory {
             step: self.step,
             inclusive: self.inclusive,
             done: false,
-        }
+        })
     }
 }
 

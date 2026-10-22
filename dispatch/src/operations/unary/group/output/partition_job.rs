@@ -8,7 +8,9 @@ use crate::operations::unary::group::hashtables::{
 };
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
 use crate::operations::unary::group::output::merge;
-use crate::operations::unary::group::output::topk_pruning::{TopKBounds, TopKThreshold};
+use crate::operations::unary::group::output::topk_pruning::{
+    TopKBounds, TopKCutoff, TopKThreshold,
+};
 use crate::operations::unary::group::{GroupLimit, Result};
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
@@ -54,6 +56,7 @@ pub(super) struct SharedMergeState<K: KeyExtractor, V: AggregationValue + ?Sized
     /// count (at most `RADIX_PARTITIONS`).
     pub(super) num_partitions: usize,
     pub(super) key_config: K::Config,
+
     /// The value's shared context, for the partition merge's entry fold + output.
     pub(super) shared_context: V::SharedContext,
     /// Declared output type per value column, in slot order; the output phase casts
@@ -63,9 +66,7 @@ pub(super) struct SharedMergeState<K: KeyExtractor, V: AggregationValue + ?Sized
     pub(super) count_only: bool,
     /// Top-k pruning state, present only when a prunable top-k was
     /// pushed: each partition's upper bound on any single group's final value,
-    /// and the per-bin bounds a job's
-    /// [`TopKCutoff`](crate::operations::unary::group::output::topk_pruning::TopKCutoff)
-    /// admits groups by.
+    /// and the per-bin bounds a job's [`TopKCutoff`] admits groups by.
     pub(super) partition_bounds: Option<Vec<u64>>,
     pub(super) topk_bounds: Option<TopKBounds>,
     /// Shared pushed-limit progress: the k-th best weight the top-k bounds
@@ -149,69 +150,80 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
-    /// Merge this partition's scatter buffers and in-place stacks into one result
-    /// table, then feed its rows into the worker's shared `acc` (building columns
-    /// into `allocator`). Accumulating across partition jobs, rather than emitting
-    /// one batch per job, keeps the radix path's many small partitions from each
-    /// producing a tiny `RecordBatch`.
-    ///
-    /// Whether it merged the partition or pruned it, the job then drops the
-    /// partition's scatter buckets on its node. Each job frees its own share
-    /// so the teardown runs on every worker instead of on the one that drops
-    /// the shared state last.
-    pub(super) fn run_into(
+    /// Whether this partition can be skipped: a plain pushed LIMIT already has
+    /// its rows, or no group in the partition can beat the top-k's k-th best.
+    pub(super) fn is_pruned(&self) -> bool {
+        let shared = &*self.shared;
+        if let Some(GroupLimit::First { limit }) = shared.output_limit
+            && shared.limit_progress.emitted_groups() >= limit
+        {
+            return true;
+        }
+        match &shared.partition_bounds {
+            // No group in this partition can beat the k-th best exact group some
+            // worker already holds, so merging it could not change the top-k.
+            Some(bounds) => bounds[self.index] < shared.limit_progress.kth_best(),
+            None => false,
+        }
+    }
+
+    /// Which hashes the top-k pruning still admits for this partition, if a
+    /// prunable top-k was pushed.
+    pub(super) fn cutoff(&self) -> Option<TopKCutoff<'_>> {
+        let shared = &*self.shared;
+        let bounds = shared.partition_bounds.as_ref()?;
+        debug_assert!(bounds.len() > self.index);
+        let bin_bounds = shared
+            .topk_bounds
+            .as_ref()
+            .expect("partition bounds only exist beside bin bounds");
+        bin_bounds.cutoff_for_partition(
+            self.index,
+            shared.num_partitions,
+            shared.limit_progress.kth_best(),
+        )
+    }
+
+    /// Feed the partition's result, complete now, into the worker's shared
+    /// `acc` (building columns into `allocator`). Accumulating across
+    /// partition jobs, rather than emitting one batch per job, keeps the radix
+    /// path's many small partitions from each producing a tiny `RecordBatch`.
+    /// Afterwards the partition's scatter buckets on this node are released.
+    pub(super) fn finish(
         self,
+        result: HashTable<K::Persisted, V>,
         acc: &mut Option<OutputAccumulator<K, V>>,
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
-        let outcome = self.merge_and_emit(acc, sender, allocator);
+        let outcome = self.emit(result, acc, sender, allocator);
+        self.release_buckets();
+        outcome
+    }
+
+    /// Let go of a pruned partition's scatter buckets without merging it.
+    pub(super) fn skip(self) {
+        self.release_buckets();
+    }
+
+    /// Drop the partition's scatter buckets on this node. Each job frees its
+    /// own share so the teardown runs on every worker instead of on the one
+    /// that drops the shared state last.
+    fn release_buckets(&self) {
         let (buffers, _) = &self.shared.sources[self.node];
         for worker_buffers in buffers {
             worker_buffers.release_partition(self.index, self.shared.num_partitions);
         }
-        outcome
     }
 
-    fn merge_and_emit(
+    fn emit(
         &self,
+        result_map: HashTable<K::Persisted, V>,
         acc: &mut Option<OutputAccumulator<K, V>>,
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
         let shared = &*self.shared;
-        // Any `limit` groups satisfy a plain (unordered) pushed LIMIT, so once
-        // that many are emitted the remaining partitions are unnecessary.
-        if let Some(GroupLimit::First { limit }) = shared.output_limit
-            && shared.limit_progress.emitted_groups() >= limit
-        {
-            return Ok(());
-        }
-        let mut cutoff = None;
-        if let Some(bounds) = &shared.partition_bounds {
-            let kth_best = shared.limit_progress.kth_best();
-            if bounds[self.index] < kth_best {
-                // No group in this partition can beat the k-th best exact group some
-                // worker already holds, so merging it could not change the top-k.
-                return Ok(());
-            }
-            let bin_bounds = shared
-                .topk_bounds
-                .as_ref()
-                .expect("partition bounds only exist beside bin bounds");
-            cutoff = bin_bounds.cutoff_for_partition(self.index, shared.num_partitions, kth_best);
-        }
-        let (buffers, tables) = &shared.sources[self.node];
-        let result_map = merge::merge_combined::<K::Stored, V>(
-            self.index,
-            buffers,
-            tables,
-            shared.partition_capacity,
-            shared.num_partitions,
-            &shared.key_arena,
-            &shared.shared_context,
-            cutoff,
-        );
         let result_map = match &shared.cross_node {
             None => result_map,
             Some(cells) => {

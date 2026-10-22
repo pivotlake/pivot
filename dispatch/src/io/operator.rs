@@ -6,8 +6,10 @@
 //! asks, through the [`OperatorIO`] handle dispatch wraps around each call.
 
 use super::OpenFile;
+use crate::io::requester::resolve_read_through_cache;
 use crate::memory::FileBytes;
 use bytes::Bytes;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Identifies one logical read within an operator node.
@@ -17,6 +19,32 @@ use std::sync::Arc;
 /// value directly as a key in their own in-flight maps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ReadRequestId(pub usize);
+
+/// Identifies one write issued through an [`OperatorIO`]. Handed back with the
+/// completed request, so an operator with several writes in flight can tell
+/// which one finished. Drawn from the same per-dataflow counter as read ids.
+///
+/// The top bit marks a spill write. Those are issued by the dataflow on an
+/// operator's behalf and completed by the dataflow, so an operator never sees
+/// one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WriteRequestId(pub usize);
+
+impl WriteRequestId {
+    const SPILL_BIT: usize = 1 << (usize::BITS - 1);
+
+    fn next(sequence: &mut usize, spill: bool) -> Self {
+        let id = *sequence;
+        *sequence += 1;
+        assert!(id & Self::SPILL_BIT == 0, "write request ids exhausted");
+        Self(if spill { id | Self::SPILL_BIT } else { id })
+    }
+
+    /// Whether this write is a spill, which the dataflow completes itself.
+    pub fn is_spill(self) -> bool {
+        self.0 & Self::SPILL_BIT != 0
+    }
+}
 
 /// One byte range requested from a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -92,7 +120,11 @@ pub struct PendingReadRequest {
 
 /// A logical write waiting for the worker to select its transport.
 pub struct PendingWriteRequest {
+    pub id: WriteRequestId,
     pub open_file: OpenFile,
+    /// Where in a local file `data` goes; a remote object is always written
+    /// whole.
+    pub offset: u64,
     pub data: Arc<FileBytes>,
 }
 
@@ -103,29 +135,32 @@ pub struct PendingWriteRequest {
 /// retains only its logical request identifiers and domain state, and never
 /// sees the requester's worker-lifecycle surface.
 pub struct OperatorIO<'a> {
-    requester: &'a mut crate::io::IORequester,
+    /// The worker's requester, borrowed for the length of each call rather
+    /// than held: an operator allocating ring memory mid-run may have to
+    /// evict, and eviction borrows the requester to wait on spill writes.
+    requester: &'a RefCell<crate::io::IORequester>,
     data_flow_id: crate::Identifier,
     operator_idx: crate::Identifier,
     stats: &'a mut crate::stats::StatsCollector,
-    /// The dataflow's logical read-id counter, owned by the flow so
-    /// identifiers stay unique across this handle's short lifetimes.
-    next_read_id: &'a mut usize,
+    /// The dataflow's request-id counter for reads and writes, owned by the
+    /// flow so identifiers stay unique across this handle's short lifetimes.
+    next_request_id: &'a mut usize,
 }
 
 impl<'a> OperatorIO<'a> {
     pub(crate) fn new(
-        requester: &'a mut crate::io::IORequester,
+        requester: &'a RefCell<crate::io::IORequester>,
         data_flow_id: crate::Identifier,
         operator_idx: crate::Identifier,
         stats: &'a mut crate::stats::StatsCollector,
-        next_read_id: &'a mut usize,
+        next_request_id: &'a mut usize,
     ) -> Self {
         Self {
             requester,
             data_flow_id,
             operator_idx,
             stats,
-            next_read_id,
+            next_request_id,
         }
     }
 
@@ -134,27 +169,79 @@ impl<'a> OperatorIO<'a> {
         open_file: OpenFile,
         locations: impl IntoIterator<Item = FileRange>,
     ) -> Result<ReadRequestId, crate::io::IORequesterError> {
-        let id = ReadRequestId(*self.next_read_id);
-        *self.next_read_id += 1;
+        let id = ReadRequestId(*self.next_request_id);
+        *self.next_request_id += 1;
         let request = PendingReadRequest {
             id,
             open_file,
             locations: locations.into_iter().collect(),
         };
-        self.requester
-            .request_read(self.data_flow_id, self.operator_idx, request, self.stats)?;
+        // Resolving may allocate cache slots, and so evict, before the borrow.
+        let cache_lookups = resolve_read_through_cache(&request);
+        self.requester.borrow_mut().request_read(
+            self.data_flow_id,
+            self.operator_idx,
+            request,
+            cache_lookups,
+            self.stats,
+        )?;
         Ok(id)
     }
 
-    /// Write `data` to a local file or remote object.
+    /// Write `data` to a local file or remote object. Returns the id the
+    /// completed write will carry back to the operator.
     pub fn write(
         &mut self,
         open_file: OpenFile,
         data: Arc<FileBytes>,
-    ) -> Result<(), crate::io::IORequesterError> {
-        let request = PendingWriteRequest { open_file, data };
-        self.requester
-            .request_write(self.data_flow_id, self.operator_idx, request, self.stats)
+    ) -> Result<WriteRequestId, crate::io::IORequesterError> {
+        let id = WriteRequestId::next(self.next_request_id, false);
+        let request = PendingWriteRequest {
+            id,
+            open_file,
+            offset: 0,
+            data,
+        };
+        self.requester.borrow_mut().request_write(
+            self.data_flow_id,
+            self.operator_idx,
+            request,
+            self.stats,
+        )?;
+        Ok(id)
+    }
+
+    /// Write spilled `data` to `open_file` at `offset`. Like
+    /// [`write`](Self::write), except the id is marked as a spill so the
+    /// worker completes it instead of the operator.
+    pub(crate) fn write_spill(
+        &mut self,
+        open_file: OpenFile,
+        offset: u64,
+        data: Arc<FileBytes>,
+    ) -> Result<WriteRequestId, crate::io::IORequesterError> {
+        let id = WriteRequestId::next(self.next_request_id, true);
+        let request = PendingWriteRequest {
+            id,
+            open_file,
+            offset,
+            data,
+        };
+        self.requester.borrow_mut().request_write(
+            self.data_flow_id,
+            self.operator_idx,
+            request,
+            self.stats,
+        )?;
+        Ok(id)
+    }
+
+    pub(crate) fn data_flow_id(&self) -> crate::Identifier {
+        self.data_flow_id
+    }
+
+    pub(crate) fn operator_idx(&self) -> crate::Identifier {
+        self.operator_idx
     }
 
     /// Point this handle at another operator of the same dataflow. A traversal
@@ -170,31 +257,91 @@ impl<'a> OperatorIO<'a> {
 /// can hand its operator a real handle without running a worker.
 #[cfg(any(test, feature = "test-util"))]
 pub struct TestOperatorIO {
-    requester: crate::io::IORequester,
+    requester: RefCell<crate::io::IORequester>,
     stats: crate::stats::StatsCollector,
-    next_read_id: usize,
+    next_request_id: usize,
+    data_flow_id: crate::Identifier,
+    operator_idx: crate::Identifier,
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl Default for TestOperatorIO {
     fn default() -> Self {
-        Self {
-            requester: crate::io::IORequester::default(),
-            stats: crate::stats::StatsCollector::disabled(),
-            next_read_id: 0,
-        }
+        Self::for_operator(0, 0)
     }
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl TestOperatorIO {
+    /// An IO owner whose requests belong to operator `operator_idx` of
+    /// dataflow `data_flow_id`, so that tests which touch per-operator state,
+    /// such as spill files, stay apart.
+    pub fn for_operator(data_flow_id: crate::Identifier, operator_idx: crate::Identifier) -> Self {
+        Self {
+            requester: RefCell::new(crate::io::IORequester::default()),
+            stats: crate::stats::StatsCollector::disabled(),
+            next_request_id: 0,
+            data_flow_id,
+            operator_idx,
+        }
+    }
+
     pub fn io(&mut self) -> OperatorIO<'_> {
         OperatorIO::new(
-            &mut self.requester,
-            0,
-            0,
+            &self.requester,
+            self.data_flow_id,
+            self.operator_idx,
             &mut self.stats,
-            &mut self.next_read_id,
+            &mut self.next_request_id,
         )
+    }
+
+    /// A spiller over this IO. Its writes are recorded with the memory
+    /// context, as the worker's are.
+    pub fn spiller(&mut self) -> crate::memory::Spiller<'_> {
+        crate::memory::Spiller::new(self.io())
+    }
+
+    /// Wait for every spill write in flight to land, counting each off its
+    /// buffer as the worker does.
+    pub fn finish_spill_writes(&mut self) {
+        let mut requester = self.requester.borrow_mut();
+        while crate::memory::memory_ctx().has_spill_writes_in_flight() {
+            requester.wait().unwrap();
+            requester.collect_completions().unwrap();
+            crate::memory::memory_ctx().complete_landed_spill_writes(&mut requester);
+        }
+    }
+
+    /// Wait for IO to complete and hand every finished logical read to
+    /// `deliver`, as the worker does for its operators.
+    pub fn deliver_completed_reads(&mut self, mut deliver: impl FnMut(ReadResponse)) {
+        let mut requester = self.requester.borrow_mut();
+        requester.wait().unwrap();
+        for completion in requester.completions().unwrap() {
+            assert!(completion.is_ok(), "a test's IO does not fail");
+        }
+        for ready in requester.take_ready_reads() {
+            deliver(ready.response);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spill_ids_are_told_apart_from_plain_ones() {
+        let mut sequence = 7;
+
+        let plain = WriteRequestId::next(&mut sequence, false);
+        let spill = WriteRequestId::next(&mut sequence, true);
+
+        assert!(!plain.is_spill());
+        assert!(spill.is_spill());
+        assert_eq!(plain, WriteRequestId(7));
+        assert_ne!(spill, WriteRequestId(8));
+        assert_eq!(sequence, 9);
     }
 }

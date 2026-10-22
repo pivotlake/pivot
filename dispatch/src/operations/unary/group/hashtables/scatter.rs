@@ -9,26 +9,37 @@
 //! For a compiled value the layout is fully constant; for a dynamic value the
 //! stride comes from the query. Values are seeded directly in the destination
 //! row either way.
+//!
+//! Rows are written through a [`PartitionAllocator`], which keeps every
+//! partition's rows in slabs that the partitions of a group share, and which
+//! can spill sealed buffers to disk. Once a worker is done consuming, the
+//! allocator is taken apart into each partition's [`PartitionRows`], which the
+//! merge reads.
 
 use super::hash_table::{PersistedKey, entry_layout};
-use crate::memory::{Slab, SlabAllocator};
+use crate::io::{FileRange, IORequesterError, OpenFile, ReadData};
+use crate::memory::{
+    Dynamic, PARTITIONS, PartitionAllocator, PartitionSlab, SpilledBuffer, SpilledSlab, Spiller,
+};
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
 
-/// Copyable layout for strided scatter rows.
+/// Target size of a partition's slabs once it has filled a few, and of the
+/// first one, which is kept small so a partition with a handful of rows wastes
+/// little.
+const SLAB_BYTES: usize = 64 * 1024;
+const FIRST_SLAB_BYTES: usize = SLAB_BYTES / 8;
+
+/// Copyable layout for scatter rows.
 ///
 /// The caller holds one layout value for all partitions. Keeping it out of
-/// each buffer makes partition headers smaller and keeps layout fields local in
-/// the scatter loop.
+/// each partition's state keeps the layout fields local in the scatter loop.
 pub struct ScatterLayout<V: AggregationValue + ?Sized> {
     hash_offset: usize,
     key_offset: usize,
     value_offset: usize,
     stride: usize,
     align: usize,
-    /// Row counts for the smaller first chunk and later full chunks.
-    first_chunk_rows: usize,
-    full_chunk_rows: usize,
     metadata: V::StorageMetadata,
 }
 
@@ -39,138 +50,95 @@ impl<V: AggregationValue + ?Sized> Clone for ScatterLayout<V> {
 }
 impl<V: AggregationValue + ?Sized> Copy for ScatterLayout<V> {}
 
-/// One partition's scatter rows, stored at the hash table entry layout.
-///
-/// Serves every value: a compiled value's layout is fully constant, a dynamic
-/// value's stride comes from the query. The buffer stores only allocation
-/// state and the current chunk's fill; the caller supplies [`ScatterLayout`].
-pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
-    chunks: Vec<Slab>,
-    /// Base address of the chunk being filled.
-    ///
-    /// The push loop hops between thousands of partition buffers in random
-    /// order, so their headers are a cache-resident working set and every
-    /// field the push touches costs a stalled access. The push therefore
-    /// reads only this base and `last_rows` (adjacent fields), addresses the
-    /// row as `base + last_rows * stride`, and writes back only the
-    /// incremented `last_rows`; fullness is a compare against the caller's
-    /// register-resident layout, not a stored end pointer.
-    current_chunk_base: *mut u8,
-    /// Rows in the chunk being filled.
-    last_rows: usize,
-    /// Rows in all full chunks; maintained only when a chunk fills.
-    completed_rows: usize,
-    // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
-    _phantom: PhantomData<(KP, *const V)>,
-}
-
-// SAFETY: cached row pointers refer to address-stable slabs owned by `chunks`.
-unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for StridedScatterRows<KP, V> {}
-
-impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
-    /// Target allocation size for each chunk.
-    const CHUNK_BYTES: usize = 64 * 1024;
-
-    /// Rows the chunk at `index` holds when full.
-    #[inline(always)]
-    fn chunk_capacity(layout: ScatterLayout<V>, index: usize) -> usize {
-        if index == 0 {
-            layout.first_chunk_rows
-        } else {
-            layout.full_chunk_rows
-        }
+impl<V: AggregationValue + ?Sized> ScatterLayout<V> {
+    /// Bytes from one row to the next.
+    pub fn stride(&self) -> usize {
+        self.stride
     }
 
-    /// Allocates the next chunk and resets the row count.
-    #[cold]
-    /// The layout is copied by value to keep the caller's copy local.
-    fn grow(&mut self, layout: ScatterLayout<V>, allocator: &mut SlabAllocator) {
-        let rows = Self::chunk_capacity(layout, self.chunks.len());
-        let chunk = allocator.get_aligned_slab(rows * layout.stride, layout.align, false);
-        self.current_chunk_base = chunk.ptr;
-        self.completed_rows += self.last_rows;
-        self.last_rows = 0;
-        self.chunks.push(chunk);
+    /// The alignment a row's address must have for its fields to be read in
+    /// place.
+    pub fn align(&self) -> usize {
+        self.align
     }
 
-    /// Visits each chunk with its base address and populated row count.
-    #[inline(always)]
-    fn for_each_chunk(&self, layout: ScatterLayout<V>, mut f: impl FnMut(*mut u8, usize)) {
-        let chunk_count = self.chunks.len();
-        for (index, chunk) in self.chunks.iter().enumerate() {
-            let rows = if index + 1 == chunk_count {
-                self.last_rows
-            } else {
-                Self::chunk_capacity(layout, index)
-            };
-            f(chunk.ptr, rows);
-        }
-    }
-}
-
-impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
-    /// Creates an empty, lazily allocated buffer.
-    pub fn new() -> Self {
-        Self {
-            chunks: Vec::new(),
-            current_chunk_base: std::ptr::null_mut(),
-            last_rows: 0,
-            completed_rows: 0,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Computes the row layout shared by every partition buffer.
+    /// The row layout shared by every partition.
     ///
     /// `N` is the specialized slot count of the surrounding
     /// [`dispatch_arity`](AggregationValue::dispatch_arity) body: a nonzero
     /// `N` derives the layout from that constant so it folds, while `N == 0`
     /// reads the runtime metadata off the shared context.
-    pub fn layout<const N: usize>(ctx: &V::SharedContext) -> ScatterLayout<V> {
+    pub fn new<KP: PersistedKey, const N: usize>(ctx: &V::SharedContext) -> Self {
         let metadata = if N == 0 {
             V::storage_metadata(ctx)
         } else {
             V::metadata_for_arity::<N>()
         };
         let layout = entry_layout::<KP, V>(metadata);
-        let full_chunk_rows = (Self::CHUNK_BYTES / layout.stride).max(1);
         ScatterLayout {
             hash_offset: layout.hash_offset,
             key_offset: layout.key_offset,
             value_offset: layout.value_offset,
             stride: layout.stride,
             align: layout.align,
-            first_chunk_rows: (full_chunk_rows / 8).max(1),
-            full_chunk_rows,
             metadata,
         }
     }
+}
 
-    /// Number of rows appended.
-    pub fn len(&self) -> usize {
-        self.completed_rows + self.last_rows
+/// Where a worker scatters rows while it consumes.
+pub struct ScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
+    allocator: PartitionAllocator<Dynamic>,
+    /// How many partitions rows are scattered into; the allocator can hold
+    /// [`PARTITIONS`], of which only the first this many are used.
+    partition_count: usize,
+    row_size: usize,
+    // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
+    _phantom: PhantomData<(KP, *const V)>,
+}
+
+impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
+    pub fn new(layout: ScatterLayout<V>, partition_count: usize) -> Self {
+        assert!(
+            partition_count <= PARTITIONS,
+            "{partition_count} scatter partitions, more than the {PARTITIONS} the allocator holds"
+        );
+        Self {
+            allocator: PartitionAllocator::new(Dynamic::new(
+                layout.stride,
+                layout.align,
+                FIRST_SLAB_BYTES,
+                SLAB_BYTES,
+            )),
+            partition_count,
+            row_size: layout.stride,
+            _phantom: PhantomData,
+        }
     }
 
-    /// Appends a row and initializes its value in place.
+    /// Spill the next sealed buffer, if there is one. See
+    /// [`PartitionAllocator::spill`].
+    pub fn spill(
+        &mut self,
+        spiller: &mut Spiller,
+    ) -> Result<Option<SpilledBuffer>, IORequesterError> {
+        self.allocator.spill(spiller)
+    }
+
+    /// Appends a row to `partition` and initializes its value in place.
     #[inline(always)]
     pub fn push_with(
         &mut self,
         layout: ScatterLayout<V>,
-        allocator: &mut SlabAllocator,
+        partition: usize,
         hash: u64,
         key: KP,
         seed: impl FnOnce(&mut V),
     ) {
-        // The capacity compare uses the caller's layout, kept in registers,
-        // so an over-full check costs no buffer-header access.
-        if self.chunks.is_empty()
-            || self.last_rows == Self::chunk_capacity(layout, self.chunks.len() - 1)
-        {
-            self.grow(layout, allocator);
-        }
-        // Field offsets come from the caller's shared layout snapshot.
+        let row = self.allocator.reserve(partition).as_mut_ptr();
+        // Field offsets come from the caller's shared layout snapshot, and the
+        // row is `stride` bytes aligned for its fields.
         unsafe {
-            let row = self.current_chunk_base.add(self.last_rows * layout.stride);
             *(row.add(layout.hash_offset) as *mut u64) = hash;
             (row.add(layout.key_offset) as *mut KP).write(key);
             seed(V::from_entry_mut(
@@ -178,15 +146,131 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
                 layout.metadata,
             ));
         }
-        self.last_rows += 1;
     }
 
-    /// Visits every row in insertion order.
+    /// Every partition's rows, in partition order, for the merge to read: the
+    /// rows still in the allocator, and the partition's spilled slabs as weak
+    /// handles (`spilled[partition]`), which the merge resolves when it gets
+    /// to the partition.
+    pub fn into_partition_rows(
+        self,
+        mut spilled: Vec<Vec<SpilledSlab>>,
+    ) -> Vec<PartitionRows<KP, V>> {
+        let row_size = self.row_size;
+        self.allocator
+            .into_partitions()
+            .into_iter()
+            .enumerate()
+            .take(self.partition_count)
+            .map(|(partition, contents)| {
+                PartitionRows::new(
+                    contents.slabs,
+                    std::mem::take(&mut spilled[partition]),
+                    contents.spill_file,
+                    row_size,
+                )
+            })
+            .collect()
+    }
+}
+
+/// The rows of one partition that exist only on disk: ranges of the
+/// partition's spill file, each holding whole rows back to back.
+#[derive(Clone)]
+pub struct OnDiskRows {
+    pub file: OpenFile,
+    pub ranges: Vec<FileRange>,
+}
+
+/// One partition's scatter rows, as the merge reads them: the slabs they were
+/// written into, each with how many rows it holds, and the file ranges of the
+/// rows that are only on disk, which the merge loads before it runs.
+pub struct PartitionRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
+    slabs: Vec<PartitionSlab>,
+    /// The partition's spilled slabs, not yet resolved into `slabs` or
+    /// `on_disk`; see [`resolve_spilled`](Self::resolve_spilled).
+    spilled: Vec<SpilledSlab>,
+    /// The file the partition's spilled rows went to, if it ever spilled.
+    spill_file: Option<OpenFile>,
+    on_disk: Option<OnDiskRows>,
+    /// Rows in memory and on disk together.
+    rows: usize,
+    row_size: usize,
+    _phantom: PhantomData<(KP, *const V)>,
+}
+
+// SAFETY: the slabs are frozen, so reading them from any thread is sound.
+unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for PartitionRows<KP, V> {}
+unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Sync for PartitionRows<KP, V> {}
+
+impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
+    fn new(
+        slabs: Vec<PartitionSlab>,
+        spilled: Vec<SpilledSlab>,
+        spill_file: Option<OpenFile>,
+        row_size: usize,
+    ) -> Self {
+        let rows_in_allocator: usize = slabs.iter().map(|slab| slab.rows).sum();
+        let bytes_spilled: usize = spilled.iter().map(|handle| handle.slab.size()).sum();
+        Self {
+            rows: rows_in_allocator + bytes_spilled / row_size,
+            slabs,
+            spilled,
+            spill_file,
+            on_disk: None,
+            row_size,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Settle where the partition's spilled rows are read from, now that the
+    /// merge is about to read them: a slab whose buffer is still resident is
+    /// read from memory, and holding the upgraded handle keeps it there until
+    /// these rows are dropped; a slab whose buffer was evicted is loaded from
+    /// the partition's file.
+    pub fn resolve_spilled(&mut self) {
+        let mut ranges = Vec::new();
+        for handle in self.spilled.drain(..) {
+            match handle.slab.upgrade() {
+                Some(slab) => self.slabs.push(PartitionSlab {
+                    rows: slab.size() / self.row_size,
+                    slab,
+                }),
+                None => ranges.push(FileRange::new(
+                    handle.file_offset as usize,
+                    handle.slab.size(),
+                )),
+            }
+        }
+        if !ranges.is_empty() {
+            self.on_disk = Some(OnDiskRows {
+                file: self
+                    .spill_file
+                    .clone()
+                    .expect("a partition with rows on disk has a spill file"),
+                ranges,
+            });
+        }
+    }
+
+    /// Number of rows in the partition, in memory and on disk together.
+    pub fn len(&self) -> usize {
+        self.rows
+    }
+
+    /// The rows that have to be loaded from disk before the partition can be
+    /// merged, if any.
+    pub fn on_disk(&self) -> Option<&OnDiskRows> {
+        self.on_disk.as_ref()
+    }
+
+    /// Visits every row in memory. Rows on disk are visited through
+    /// [`for_each_loaded`](Self::for_each_loaded) once they have been read.
     #[inline(always)]
     pub fn for_each(&self, layout: ScatterLayout<V>, mut f: impl FnMut(u64, &KP, &V)) {
-        self.for_each_chunk(layout, |base, rows| {
-            let mut row = base;
-            for _ in 0..rows {
+        for slab in &self.slabs {
+            let mut row = slab.slab.as_slice().as_ptr();
+            for _ in 0..slab.rows {
                 unsafe {
                     let hash = *(row.add(layout.hash_offset) as *const u64);
                     let key = &*(row.add(layout.key_offset) as *const KP);
@@ -198,7 +282,66 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
                     row = row.add(layout.stride);
                 }
             }
-        });
+        }
+    }
+
+    /// Visits every row in `loaded`, the data read back for this partition's
+    /// [`on_disk`](Self::on_disk) ranges. Each range holds whole rows, but the
+    /// read may hand a range back in several pieces, so a row that straddles
+    /// two pieces, or sits in a piece whose address is not aligned for a row,
+    /// is copied into `row_scratch` first. The scratch must hold one row and
+    /// be aligned for it.
+    pub fn for_each_loaded(
+        layout: ScatterLayout<V>,
+        loaded: &[ReadData],
+        row_scratch: &mut [u8],
+        mut f: impl FnMut(u64, &KP, &V),
+    ) {
+        assert!(row_scratch.len() >= layout.stride);
+        assert!((row_scratch.as_ptr() as usize).is_multiple_of(layout.align));
+        let mut visit = |row: *const u8| unsafe {
+            let hash = *(row.add(layout.hash_offset) as *const u64);
+            let key = &*(row.add(layout.key_offset) as *const KP);
+            f(
+                hash,
+                key,
+                V::from_entry(row.add(layout.value_offset), layout.metadata),
+            );
+        };
+        for range in loaded {
+            let mut pieces = range.bytes.iter().map(|piece| piece.as_ref()).peekable();
+            // Bytes of a row that began at the end of the previous piece.
+            let mut carried = 0;
+            while let Some(piece) = pieces.next() {
+                let mut rest = piece;
+                if carried > 0 {
+                    let needed = layout.stride - carried;
+                    row_scratch[carried..layout.stride].copy_from_slice(&rest[..needed]);
+                    visit(row_scratch.as_ptr());
+                    rest = &rest[needed..];
+                    carried = 0;
+                }
+                let whole_rows = rest.len() / layout.stride;
+                let aligned = (rest.as_ptr() as usize).is_multiple_of(layout.align);
+                for row in rest.chunks_exact(layout.stride).take(whole_rows) {
+                    if aligned {
+                        visit(row.as_ptr());
+                    } else {
+                        row_scratch[..layout.stride].copy_from_slice(row);
+                        visit(row_scratch.as_ptr());
+                    }
+                }
+                let tail = &rest[whole_rows * layout.stride..];
+                if !tail.is_empty() {
+                    assert!(
+                        pieces.peek().is_some(),
+                        "a range read back from a spill file holds whole rows"
+                    );
+                    row_scratch[..tail.len()].copy_from_slice(tail);
+                    carried = tail.len();
+                }
+            }
+        }
     }
 
     /// Visits rows and exposes a future row for software prefetching.
@@ -208,13 +351,13 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
         layout: ScatterLayout<V>,
         mut f: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>),
     ) {
-        self.for_each_chunk(layout, |base, rows| {
-            let mut row = base;
-            for i in 0..rows {
+        for slab in &self.slabs {
+            let mut row = slab.slab.as_slice().as_ptr();
+            for i in 0..slab.rows {
                 unsafe {
                     let hash = *(row.add(layout.hash_offset) as *const u64);
                     let key = &*(row.add(layout.key_offset) as *const KP);
-                    let ahead = (i + AHEAD < rows).then(|| {
+                    let ahead = (i + AHEAD < slab.rows).then(|| {
                         let ahead_row = row.add(AHEAD * layout.stride);
                         (
                             *(ahead_row.add(layout.hash_offset) as *const u64),
@@ -230,6 +373,68 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
                     row = row.add(layout.stride);
                 }
             }
-        });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::unary::group::values::{Compiled, CountSlot};
+    use bytes::Bytes;
+
+    type CountValue = Compiled<(CountSlot,), u8>;
+
+    /// Rows of `hash | key | count` as they would be read back from a spill
+    /// file: `rows` of them, cut into pieces at `cuts`.
+    fn rows_read_back(layout: ScatterLayout<CountValue>, rows: u64, cuts: &[usize]) -> ReadData {
+        let mut bytes = vec![0u8; layout.stride() * rows as usize];
+        for row in 0..rows {
+            let start = row as usize * layout.stride();
+            bytes[start + layout.hash_offset..start + layout.hash_offset + 8]
+                .copy_from_slice(&row.to_ne_bytes());
+            bytes[start + layout.key_offset..start + layout.key_offset + 4]
+                .copy_from_slice(&(row as i32 * 10).to_ne_bytes());
+        }
+        let mut pieces = Vec::new();
+        let mut from = 0;
+        for &cut in cuts {
+            pieces.push(Bytes::copy_from_slice(&bytes[from..cut]));
+            from = cut;
+        }
+        pieces.push(Bytes::copy_from_slice(&bytes[from..]));
+        ReadData {
+            offset: 0,
+            bytes: pieces,
+        }
+    }
+
+    #[test]
+    fn rows_read_back_in_pieces_are_visited_whole_and_in_order() {
+        let layout = ScatterLayout::<CountValue>::new::<i32, 0>(&());
+        // Cut inside the second row and exactly on the boundary after the third.
+        let loaded = [rows_read_back(
+            layout,
+            5,
+            &[layout.stride() + 3, 3 * layout.stride()],
+        )];
+        // Scratch aligned for any row: `u128` words cover every field type.
+        let mut scratch_words = vec![0u128; layout.stride().div_ceil(16)];
+        let row_scratch = unsafe {
+            std::slice::from_raw_parts_mut(
+                scratch_words.as_mut_ptr() as *mut u8,
+                scratch_words.len() * 16,
+            )
+        };
+        let mut seen = Vec::new();
+
+        PartitionRows::<i32, CountValue>::for_each_loaded(
+            layout,
+            &loaded,
+            row_scratch,
+            |hash, key, _| seen.push((hash, *key)),
+        );
+
+        assert_eq!(seen, [(0, 0), (1, 10), (2, 20), (3, 30), (4, 40)]);
     }
 }

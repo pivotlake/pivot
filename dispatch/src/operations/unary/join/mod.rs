@@ -280,12 +280,14 @@ pub(crate) struct JoinTable<K> {
 
 #[cfg(test)]
 mod tests {
+    use crate::operations::OutputStatus;
     use std::sync::Arc;
 
     use arrow_array::types::{Int32Type, Int64Type};
     use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
 
+    use crate::api::BuildContext;
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
     use crate::operations::unary::test_utils::CollectSender;
@@ -495,7 +497,7 @@ mod tests {
 
         let mut consumers: Vec<_> = builds
             .into_iter()
-            .map(|f| extract_consumer(f.build_unary()))
+            .map(|f| extract_consumer(f.build_unary(&mut BuildContext::new(0)).inner))
             .collect();
 
         let mut void = CollectSender::<()>::new();
@@ -515,10 +517,11 @@ mod tests {
             .collect();
         crate::worker::WORKER_IDX.set(0);
 
+        let mut build_io = crate::io::TestOperatorIO::default();
         loop {
             let mut all_done = true;
             for o in &mut outputters {
-                if !o.output(&mut void).unwrap() {
+                if o.output(&mut void, &mut build_io.io()).unwrap() != OutputStatus::Done {
                     all_done = false;
                 }
             }
@@ -527,7 +530,10 @@ mod tests {
             }
         }
 
-        let mut probers: Vec<_> = probes.into_iter().map(|p| p.build_unary()).collect();
+        let mut probers: Vec<_> = probes
+            .into_iter()
+            .map(|p| p.build_unary(&mut BuildContext::new(0)).inner)
+            .collect();
         let mut sender = CollectSender::new();
         let mut test_io = crate::io::TestOperatorIO::default();
         let mut io = test_io.io();
@@ -895,7 +901,8 @@ mod tests {
             },
             RowDelivery::Coalesced,
         )
-        .build_unary();
+        .build_unary(&mut BuildContext::new(0))
+        .inner;
         // Same-schema filler rows below the emit threshold first, so the
         // join's oversized batch lands on a part-full accumulator, as q20's
         // did.

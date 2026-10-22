@@ -16,15 +16,18 @@
 //! because a write can complete short in the middle of a run, so resuming means
 //! finding the run holding that byte and continuing from partway into it.
 
-use crate::memory::slab::Slab;
+use crate::memory::slab::{FrozenSlab, Slab};
 
-/// The bytes of one output file, as the runs they were produced in.
+/// The bytes of one output file, as the runs they were produced in. The runs
+/// are frozen: a file's bytes are never changed once they are in it, only
+/// written out, and freezing is what lets the same slab also be held
+/// elsewhere, as a spilled buffer's rows are.
 ///
 /// Every run is ring memory, so the last owner has to drop on a dispatch
 /// worker: releasing a slab reaches the worker's memory context.
 #[derive(Default)]
 pub struct FileBytes {
-    runs: Vec<Slab>,
+    runs: Vec<FrozenSlab>,
     len: usize,
 }
 
@@ -33,9 +36,15 @@ impl FileBytes {
         Self::default()
     }
 
-    /// Append `run` to the file. Its whole region counts, so a caller that
-    /// allocated a slab larger than it filled must not pass it here.
-    pub fn push(&mut self, run: Slab) {
+    /// Append `run` to the file, freezing it. Its whole region counts, so a
+    /// caller that allocated a slab larger than it filled must not pass it
+    /// here.
+    pub fn push_slab(&mut self, run: Slab) {
+        self.push_frozen_slab(run.freeze());
+    }
+
+    /// Append a run that is already frozen, which may also be held elsewhere.
+    pub fn push_frozen_slab(&mut self, run: FrozenSlab) {
         self.len += run.size();
         self.runs.push(run);
     }
@@ -57,7 +66,7 @@ impl FileBytes {
 
     /// The runs in order. Concatenated, they are the file.
     pub fn runs(&self) -> impl Iterator<Item = &[u8]> {
-        self.runs.iter().map(Slab::as_slice)
+        self.runs.iter().map(FrozenSlab::as_slice)
     }
 
     /// The bytes to write next once `offset` of them have been written: the
@@ -107,7 +116,7 @@ mod tests {
         for part in parts {
             let mut run = allocator.get_slab_of_size(part.len(), false);
             run.as_mut_slice().copy_from_slice(part);
-            file.push(run);
+            file.push_slab(run);
         }
         (file, allocator)
     }

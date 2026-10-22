@@ -147,7 +147,15 @@ jobs:
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
 
-      - run: ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
+      # A dispatch test runs a group-by that spills: its worker opens one file
+      # per partition, thousands of them, past the default soft limit of 1024
+      # open files. The server raises its own limit at startup; a test process
+      # does not, so the shell raises it here, to the hard limit.
+      - run: |
+          if [ "${{ matrix.check }}" = test ] && [ "${{ matrix.crate }}" = dispatch ]; then
+            ulimit -n "$(ulimit -Hn)"
+          fi
+          ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
 
   # Keep branch protection independent of the dynamic check×crate matrix. This
   # job runs after every matrix cell and exposes one stable required check.

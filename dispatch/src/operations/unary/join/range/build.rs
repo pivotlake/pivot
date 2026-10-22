@@ -12,6 +12,8 @@
 //!
 //! [`to_single_worker_mpsc`]: crate::operations::channels::to_single_worker_mpsc
 
+use crate::api::BuildContext;
+use crate::operations::{Built, BuiltUnary};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,15 +45,15 @@ where
 {
     type Unary = RangeBuild<T>;
 
-    fn build_unary(self) -> Self::Unary {
-        RangeBuild {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(RangeBuild {
             spec: self.spec,
             publisher: self.publisher,
             chunks: Vec::new(),
             saw_null_tail: false,
             table: self.table,
             build_ready: self.build_ready,
-        }
+        })
     }
 }
 
@@ -67,8 +69,8 @@ where
 {
     type Unary = RangeProbe<T>;
 
-    fn build_unary(self) -> Self::Unary {
-        RangeProbe::new(self.table, self.spec)
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(RangeProbe::new(self.table, self.spec))
     }
 }
 

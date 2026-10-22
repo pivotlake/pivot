@@ -69,12 +69,15 @@ impl OperatorFactory<RecordBatch> for CteScanFactory {
     ) -> OperatorGraphBuilder {
         let (tx, rx) = self.channel_factory.build();
         context.deposit_cte_sender(self.cte_index, tx);
-        OperatorGraphBuilder::root(Box::new(UnaryOperator::new(
-            Forward::default(),
-            rx,
-            sender,
-            self.siblings_left,
-        )))
+        OperatorGraphBuilder::root(
+            Box::new(UnaryOperator::new(
+                Forward::default(),
+                rx,
+                sender,
+                self.siblings_left,
+            )),
+            None,
+        )
         .awaiting_input(self.cte_index)
     }
 }
