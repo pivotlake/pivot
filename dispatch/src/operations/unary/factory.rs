@@ -13,16 +13,26 @@
 
 use crate::api::OperatorGraphBuilder;
 use crate::api::{BuildContext, OperatorFactory};
+use crate::operations::Built;
 use crate::operations::channels::ChannelFactory;
 use crate::operations::channels::{RootChannelFactory, Sender};
 use crate::operations::unary::{Unary, UnaryOperator};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+/// A built [`Unary`] and its optional evictor; see [`Built`].
+pub type BuiltUnary<U> = Built<U>;
+
 /// Creates a [`Unary`] transform instance. Consumed once per worker during the build step.
 pub trait UnaryFactory<I, O>: Send + 'static {
     type Unary: Unary<I, O>;
-    fn build_unary(self) -> Self::Unary;
+
+    /// Build the transform, as [`Built::new`] or, when it keeps ring slots
+    /// outside the caches, [`Built::with_evictor`]. `context` is the state of
+    /// the graph build this transform is part of; most transforms ignore it,
+    /// but one that needs to know which dataflow it belongs to, or to leave
+    /// something for another stage of the same build, reads it here.
+    fn build_unary(self, context: &mut BuildContext) -> BuiltUnary<Self::Unary>;
 }
 
 /// An [`OperatorFactory`] that chains a head factory with a unary stage.
@@ -81,12 +91,14 @@ impl<I: 'static, O: 'static, UF: UnaryFactory<I, O>, C: ChannelFactory<I>, OP: O
     ) -> OperatorGraphBuilder {
         let (tx, rx) = self.channel_factory.build();
         let chain = Box::new(self.head).build(Box::new(tx), context);
-        chain.with(Box::new(UnaryOperator::new(
-            self.unary_factory.build_unary(),
-            rx,
-            sender,
-            self.siblings_left,
-        )))
+        let Built {
+            inner: unary,
+            evictor,
+        } = self.unary_factory.build_unary(context);
+        chain.with(
+            Box::new(UnaryOperator::new(unary, rx, sender, self.siblings_left)),
+            evictor,
+        )
     }
 }
 
@@ -119,14 +131,16 @@ impl<I: 'static, O: 'static, UF: UnaryFactory<I, O>, C: RootChannelFactory<I>> O
     fn build(
         self: Box<Self>,
         sender: Box<dyn Sender<O>>,
-        _context: &mut BuildContext,
+        context: &mut BuildContext,
     ) -> OperatorGraphBuilder {
         let rx = self.channel_factory.build();
-        OperatorGraphBuilder::root(Box::new(UnaryOperator::new(
-            self.unary_factory.build_unary(),
-            rx,
-            sender,
-            self.siblings_left,
-        )))
+        let Built {
+            inner: unary,
+            evictor,
+        } = self.unary_factory.build_unary(context);
+        OperatorGraphBuilder::root(
+            Box::new(UnaryOperator::new(unary, rx, sender, self.siblings_left)),
+            evictor,
+        )
     }
 }

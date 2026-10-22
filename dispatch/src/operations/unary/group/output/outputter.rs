@@ -1,6 +1,7 @@
 //! The per-worker driver of the merge phase: builds the partition jobs once
 //! and runs whichever jobs this worker steals.
 
+use crate::io::{OperatorIO, ReadResponse};
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
@@ -12,18 +13,26 @@ use crate::operations::unary::group::hashtables::{
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
+use crate::operations::unary::group::output::merge::RunningPartitionMerge;
 use crate::operations::unary::group::output::partition_job::{PartitionJob, SharedMergeState};
 use crate::operations::unary::group::output::topk_pruning::{
     HashBinTotals, SharedBinTotals, TopKBounds, TopKThreshold,
 };
-use crate::operations::unary::pipeline_breaker::Outputter;
+use crate::operations::unary::pipeline_breaker::{OutputStatus, Outputter};
 use crate::worker::current_node;
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use crossbeam_deque::{Injector, Steal};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+
+/// How much memory a worker's running partition jobs may hold together: their
+/// partial result tables plus the rows still on their way from spill files.
+/// While under it, the worker starts the next job so its reads overlap the
+/// merging of the current ones.
+const RUNNING_JOBS_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// The fewest partitions the merge phase ever runs with. The merge routes each
 /// row by the top `log2(partitions)` bits of its hash, and a single partition
@@ -93,6 +102,9 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// worker only learns them from the first job it steals. A worker running only
     /// count-only `COUNT(DISTINCT)` jobs never builds one.
     output_accumulator: Option<OutputAccumulator<K, V>>,
+    /// Jobs this worker is running, in the order it took them. Each merges its
+    /// rows as they land and finishes once every read has.
+    running_merges: VecDeque<RunningPartitionMerge<K, V>>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
@@ -124,6 +136,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             zero_hash_pending: false,
             output_allocator: None,
             output_accumulator: None,
+            running_merges: VecDeque::new(),
         }
     }
 
@@ -386,23 +399,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
-    for GroupOutputter<K, V>
-{
-    fn output(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
-        if self.zero_hash_pending && self.count_only {
-            self.zero_hash_pending = false;
-            emit_count(1, sender).map_err(unary::Error::from)?;
-        }
-
-        // Claim a job, trying the own node's queue first (its sources are
-        // node-local), then other nodes' queues so a node that finished its
-        // share helps with the tail instead of idling. The plain-load
-        // `is_empty` pre-checks keep the drained-queue polls (every pass
-        // until the dataflow finishes) from pinning a crossbeam epoch each
-        // time.
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
+    /// Claim a job, trying the own node's queue first (its sources are
+    /// node-local), then other nodes' queues so a node that finished its
+    /// share helps with the tail instead of idling. The plain-load
+    /// `is_empty` pre-checks keep the drained-queue polls (every pass
+    /// until the dataflow finishes) from pinning a crossbeam epoch each
+    /// time.
+    fn steal_next_partition_job(&self) -> Steal<PartitionJob<K, V>> {
         let queue_count = self.injectors.len();
-        let mut steal = Steal::Empty;
         for offset in 0..queue_count {
             let queue = &self.injectors[(self.node + offset) % queue_count];
             if queue.is_empty() {
@@ -410,35 +415,120 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
             }
             match queue.steal() {
                 Steal::Empty => {}
-                s => {
-                    steal = s;
-                    break;
-                }
+                claimed => return claimed,
             }
         }
-        match steal {
-            Steal::Success(job) => {
-                let allocator = self
-                    .output_allocator
-                    .get_or_insert_with(|| SlabAllocator::new(false));
-                job.run_into(&mut self.output_accumulator, sender, allocator)
-                    .map_err(unary::Error::from)?;
-            }
-            Steal::Empty => {
-                if self.partition_jobs_injected.load(Ordering::Acquire) {
-                    // Queue drained: emit this worker's last partial batch.
-                    if let (Some(acc), Some(allocator)) = (
-                        self.output_accumulator.as_mut(),
-                        self.output_allocator.as_mut(),
-                    ) {
-                        acc.flush(allocator, sender).map_err(unary::Error::from)?;
-                    }
-                    return Ok(true);
-                }
-            }
-            Steal::Retry => {}
+        Steal::Empty
+    }
+
+    /// What the running jobs hold together, checked against
+    /// [`RUNNING_JOBS_MEMORY_BYTES`] before another is started.
+    fn running_jobs_memory_bytes(&self) -> usize {
+        self.running_merges
+            .iter()
+            .map(RunningPartitionMerge::memory_bytes)
+            .sum()
+    }
+
+    /// Finish `running`, every row of which has been merged.
+    fn finish_job(
+        &mut self,
+        running: RunningPartitionMerge<K, V>,
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<()> {
+        let RunningPartitionMerge { job, table, .. } = running;
+        let allocator = self
+            .output_allocator
+            .get_or_insert_with(|| SlabAllocator::new(false));
+        job.finish(table, &mut self.output_accumulator, sender, allocator)
+            .map_err(unary::Error::from)
+    }
+}
+
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
+    for GroupOutputter<K, V>
+{
+    /// One unit of merge work, chosen so that the worker is never idle while
+    /// disk reads are in flight: claim jobs and start their reads while the
+    /// running jobs hold less than [`RUNNING_JOBS_MEMORY_BYTES`], merging each
+    /// job's rows in memory as it is claimed; then finish a job whose reads
+    /// have all landed, their rows having been merged as they did. A job whose
+    /// rows need no disk is claimed one at a time, so workers keep sharing the
+    /// queue evenly; jobs that need the disk are claimed ahead so their reads
+    /// overlap the merging. A pruned partition is skipped before anything is
+    /// read for it.
+    fn output(
+        &mut self,
+        sender: &mut dyn Sender<RecordBatch>,
+        io: &mut OperatorIO,
+    ) -> unary::Result<OutputStatus> {
+        if self.zero_hash_pending && self.count_only {
+            self.zero_hash_pending = false;
+            emit_count(1, sender).map_err(unary::Error::from)?;
         }
 
-        Ok(false)
+        // With nothing running, a job is always started, however big: a
+        // partition larger than the budget must still be merged.
+        while self.running_merges.is_empty()
+            || self.running_jobs_memory_bytes() < RUNNING_JOBS_MEMORY_BYTES
+        {
+            let Steal::Success(job) = self.steal_next_partition_job() else {
+                break;
+            };
+            if job.is_pruned() {
+                job.skip();
+                continue;
+            }
+            let running = RunningPartitionMerge::start(job, io)?;
+            let reads_from_disk = !running.reads_in_flight.is_empty();
+            self.running_merges.push_back(running);
+            if !reads_from_disk {
+                break;
+            }
+        }
+
+        if let Some(complete) = self
+            .running_merges
+            .iter()
+            .position(|running| running.reads_in_flight.is_empty())
+        {
+            let running = self
+                .running_merges
+                .remove(complete)
+                .expect("the position was found in the running jobs just above");
+            self.finish_job(running, sender)?;
+            return Ok(OutputStatus::Working);
+        }
+        if !self.running_merges.is_empty() {
+            return Ok(OutputStatus::WaitingForIo);
+        }
+
+        // Nothing running: either the jobs are not out yet, or every queue
+        // drained. Release pairs with the Acquire load here: a worker that sees
+        // the flag also sees every job pushed before it was set.
+        let every_queue_drained = self.injectors.iter().all(|queue| queue.is_empty());
+        if every_queue_drained && self.partition_jobs_injected.load(Ordering::Acquire) {
+            // Queue drained: emit this worker's last partial batch.
+            if let (Some(acc), Some(allocator)) = (
+                self.output_accumulator.as_mut(),
+                self.output_allocator.as_mut(),
+            ) {
+                acc.flush(allocator, sender).map_err(unary::Error::from)?;
+            }
+            return Ok(OutputStatus::Done);
+        }
+        Ok(OutputStatus::Working)
+    }
+
+    fn process_read_response(&mut self, response: ReadResponse) -> unary::Result<()> {
+        let read = response.id();
+        let running = self
+            .running_merges
+            .iter_mut()
+            .find(|running| running.reads_in_flight.contains_key(&read))
+            .expect("a read response belongs to a running partition job");
+        running.reads_in_flight.remove(&read);
+        running.merge_read_rows(&response.into_locations());
+        Ok(())
     }
 }

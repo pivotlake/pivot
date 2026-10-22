@@ -78,6 +78,7 @@ mod api;
 mod boundary_slot;
 mod data_flow;
 mod functions;
+mod graph;
 mod numa;
 mod operations;
 #[cfg(feature = "perf")]
@@ -97,9 +98,11 @@ pub use gather_barrier::GatherBarrier;
 pub use io::TestOperatorIO;
 pub use io::{
     FileRange, FsRequest, HttpRequest, OperatorIO, ReadData, ReadRequestId, ReadResponse,
+    WriteRequestId,
 };
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
+pub use memory::Spiller;
 pub use memory::{MemoryBlockState, MemoryBlockStatus, block_size_bytes};
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use numa::{Topology, default_worker_count, dominant_node};
@@ -109,8 +112,8 @@ pub use operations::unary::filter::{
     RowDelivery, RowSelection, SelectionScratch, collect_selected_indices,
 };
 pub use operations::{
-    JoinBuildFilter, JoinKind, JoinResidualFn, JoinResidualSpec, JoinSpec, KeyBitset,
-    KeyBitsetSlot, RangeCompare, RangeJoinSpec,
+    Built, BuiltNullary, BuiltUnary, JoinBuildFilter, JoinKind, JoinResidualFn, JoinResidualSpec,
+    JoinSpec, KeyBitset, KeyBitsetSlot, RangeCompare, RangeJoinSpec,
 };
 #[cfg(feature = "perf")]
 pub use profiler::worker_tids;
@@ -143,8 +146,8 @@ pub use operations::{
     StrMin, StrRead, StringKeyExtractor, Sum, SumSlot, WideSum,
 };
 pub use operations::{
-    ChannelInputFull, ChannelInputSender, Consumer, DefaultUnaryFactory, MapFactory, Outputter,
-    PipelineBreaker, RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator,
+    ChannelInputFull, ChannelInputSender, Consumer, DefaultUnaryFactory, MapFactory, OutputStatus,
+    Outputter, PipelineBreaker, RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator,
     UnaryOperatorFactory,
 };
 

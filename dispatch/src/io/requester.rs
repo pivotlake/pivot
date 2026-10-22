@@ -363,13 +363,17 @@ impl IORequester {
         request: PendingWriteRequest,
         stats: &mut StatsCollector,
     ) -> Result<()> {
-        let PendingWriteRequest { open_file, data } = request;
+        let PendingWriteRequest {
+            id,
+            open_file,
+            data,
+        } = request;
         match open_file {
             OpenFile::Local(file) => {
                 let mut request = DataFlowRequest::new(
                     data_flow_id,
                     operator_idx,
-                    FsRequest::Write(FsWriteRequest { file, data }),
+                    FsRequest::Write(FsWriteRequest { id, file, data }),
                 );
                 stats.record_issued_disk(std::slice::from_mut(&mut request));
                 self.submit_fs_request_to_backend(request)
@@ -1449,7 +1453,7 @@ mod tests {
         for part in [&b"parquet upload"[..], &b" bytes"[..]] {
             let mut run = allocator.get_slab_of_size(part.len(), false);
             run.as_mut_slice().copy_from_slice(part);
-            bytes.push(run);
+            bytes.push_slab(run);
         }
         let data = Arc::new(bytes);
         let remote = Arc::new(

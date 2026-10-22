@@ -60,7 +60,11 @@ impl Unary<ColumnChunkJob, LeafChunkJob> for Shredder {
         self.advance(column, sender)
     }
 
-    fn run(&mut self, sender: &mut dyn Sender<LeafChunkJob>) -> UnaryResult<WorkStatus> {
+    fn run(
+        &mut self,
+        sender: &mut dyn Sender<LeafChunkJob>,
+        _io: &mut dispatch::OperatorIO,
+    ) -> UnaryResult<WorkStatus> {
         let Some(column) = self.held.take() else {
             return Ok(WorkStatus::Pending);
         };
@@ -312,7 +316,7 @@ mod tests {
         let mut turns = 1;
         while !shredder.ready_for_more_work() {
             assert!(shredder.has_pending_work());
-            shredder.run(sender).unwrap();
+            shredder.run(sender, &mut test_io.io()).unwrap();
             turns += 1;
         }
         turns

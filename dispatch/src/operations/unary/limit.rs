@@ -27,10 +27,14 @@
 //! receiver worker is guaranteed to hold at least `fetch` rows by the time
 //! `reached` latches, so it never has to block waiting on a straggler.
 
+use crate::api::BuildContext;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::factory::UnaryFactory;
-use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
+use crate::operations::unary::pipeline_breaker::{
+    Consumer, OutputStatus, Outputter, PipelineBreaker,
+};
+use crate::operations::{Built, BuiltUnary};
 use crate::waker::waker_set;
 use arrow_array::RecordBatch;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -183,13 +187,17 @@ pub struct LimitOutputter {
 }
 
 impl Outputter<RecordBatch> for LimitOutputter {
-    fn output(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
+    fn output(
+        &mut self,
+        sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut crate::io::OperatorIO,
+    ) -> unary::Result<OutputStatus> {
         match self.rx.try_recv() {
             Ok(batch) => {
                 self.batches.push(batch);
-                Ok(false)
+                Ok(OutputStatus::Working)
             }
-            Err(TryRecvError::Empty) => Ok(false),
+            Err(TryRecvError::Empty) => Ok(OutputStatus::Working),
             Err(TryRecvError::Disconnected) => {
                 // No ORDER BY, so any `limit` rows past `offset` satisfy the
                 // query. Emit them by slicing across the collected batches
@@ -211,7 +219,7 @@ impl Outputter<RecordBatch> for LimitOutputter {
                     skip = 0;
                     remaining -= len;
                 }
-                Ok(true)
+                Ok(OutputStatus::Done)
             }
         }
     }
@@ -254,15 +262,15 @@ impl LimitFactory {
 impl UnaryFactory<RecordBatch, RecordBatch> for LimitFactory {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Limit>;
 
-    fn build_unary(mut self) -> Self::Unary {
-        PipelineBreaker::Consuming(Limit::new(
+    fn build_unary(mut self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(PipelineBreaker::Consuming(Limit::new(
             self.limit,
             self.offset,
             self.rows_seen,
             self.reached,
             self.sender,
             self.receiver.take(),
-        ))
+        )))
     }
 }
 

@@ -11,6 +11,7 @@
 use crate::compile::Error;
 use arrow_array::{RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use dispatch::{Built, BuiltNullary};
 use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, RecordBatchOperatorSpec, Sender,
     WorkStatus,
@@ -67,12 +68,12 @@ struct ExplainNullaryFactory {
 impl NullaryFactory<RecordBatch> for ExplainNullaryFactory {
     type Nullary = ExplainDispatchOperator;
 
-    fn build_nullary(self) -> Self::Nullary {
-        ExplainDispatchOperator {
+    fn build_nullary(self) -> BuiltNullary<Self::Nullary> {
+        Built::new(ExplainDispatchOperator {
             emitted: self.emitted,
             plan_text: self.plan_text,
             ran: false,
-        }
+        })
     }
 }
 

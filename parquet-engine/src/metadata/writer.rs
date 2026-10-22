@@ -5,6 +5,8 @@
 
 use super::FileRowGroups;
 use arrow_array::RecordBatch;
+use dispatch::BuildContext;
+use dispatch::{Built, BuiltUnary};
 use dispatch::{Sender, Unary, UnaryFactory};
 use std::mem;
 
@@ -26,11 +28,11 @@ where
 {
     type Unary = FileRowGroupsSink<C>;
 
-    fn build_unary(self) -> FileRowGroupsSink<C> {
-        FileRowGroupsSink {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<FileRowGroupsSink<C>> {
+        Built::new(FileRowGroupsSink {
             files: vec![],
             stage: self.stage,
-        }
+        })
     }
 }
 

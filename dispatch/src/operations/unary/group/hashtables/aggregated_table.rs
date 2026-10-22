@@ -17,12 +17,14 @@
 //! ```
 
 use crate::RECORD_BATCH_SIZE;
-use crate::memory::SlabAllocator;
+use crate::io::IORequesterError;
+use crate::memory::{SharedPartitionEvictor, SlabAllocator, Spiller};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::HashTable;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, PersistedKey, StridedScatterRows,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, PartitionRows, PersistedKey,
+    ScatterLayout, ScatterRows,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::topk_pruning::{
@@ -85,7 +87,7 @@ impl RadixConfig {
 /// is a serial tail that grows with the worker count; released per partition,
 /// the teardown spreads over the jobs.
 pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
-    buckets: Vec<UnsafeCell<Option<StridedScatterRows<KP, V>>>>,
+    buckets: Vec<UnsafeCell<Option<PartitionRows<KP, V>>>>,
     /// Rows across every bucket, counted by the flushing worker so the merge
     /// coordinator sums one number per worker rather than walking the
     /// pool's buckets.
@@ -98,7 +100,7 @@ pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
 unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Sync for PartitionBuffers<KP, V> {}
 
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
-    pub fn new(buckets: Vec<StridedScatterRows<KP, V>>) -> Self {
+    pub fn new(buckets: Vec<PartitionRows<KP, V>>) -> Self {
         let total_rows = buckets.iter().map(|bucket| bucket.len()).sum();
         Self {
             buckets: buckets
@@ -130,11 +132,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
 
     /// Runs `f` over the rows of bucket `index`. A bucket is released only by
     /// the job that merged it, so a bucket being read is still held.
-    pub fn with_bucket<R>(
-        &self,
-        index: usize,
-        f: impl FnOnce(&StridedScatterRows<KP, V>) -> R,
-    ) -> R {
+    pub fn with_bucket<R>(&self, index: usize, f: impl FnOnce(&PartitionRows<KP, V>) -> R) -> R {
         // SAFETY: only the bucket's own partition job reaches this cell (see
         // the `Sync` impl), and it releases the bucket only after reading it.
         let bucket = unsafe { &*self.buckets[index].get() };
@@ -196,8 +194,12 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     allocator: SlabAllocator,
     /// Tables built before a radix transition.
     tables: Vec<HashTable<K::Persisted, V>>,
-    /// Per-partition buffers allocated on the first radix transition.
-    buffers: Option<Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>>,
+    /// Where rows are scattered after the radix transition.
+    buffers: Option<ScatterRows<<K as KeyExtractor>::Persisted, V>>,
+    /// Keeps the scatter buffers that were spilled, for the memory context to
+    /// free when it must. Shared with the memory context through the `Evict`
+    /// handle registered at build.
+    evictor: SharedPartitionEvictor,
     /// Distinct-count sketch used to size merge targets.
     hll: Hll,
     /// Index into the aggregation slots of the `ORDER BY <agg> DESC LIMIT k`
@@ -245,6 +247,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         worker_context: V::WorkerContext,
         radix_config: RadixConfig,
         topk_aggregation_slot: Option<usize>,
+        evictor: SharedPartitionEvictor,
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = HashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
@@ -256,6 +259,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             allocator,
             tables: vec![table],
             buffers: None,
+            evictor,
             hll: Hll::new(),
             topk_aggregation_slot,
             topk_bin_totals: None,
@@ -519,14 +523,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         almost_no_dedup
     }
 
-    /// Allocates the per-partition scatter buffers if not already present.
+    /// Allocates the scatter rows if not already present.
     fn create_scatter_buffers(&mut self) {
         if self.buffers.is_none() {
-            self.buffers = Some(
-                (0..self.radix_config.partitions)
-                    .map(|_| StridedScatterRows::new())
-                    .collect(),
-            );
+            let layout = ScatterLayout::<V>::new::<K::Persisted, 0>(&self.shared_context);
+            self.buffers = Some(ScatterRows::new(layout, self.radix_config.partitions));
         }
     }
 
@@ -546,7 +547,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let Self {
             key_arena,
             worker_context,
-            allocator,
             buffers,
             hll,
             hashes,
@@ -559,7 +559,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 buffers: buffers.as_mut().unwrap(),
                 key_arena,
                 worker_context,
-                allocator,
                 hll,
                 hashes,
                 shift,
@@ -586,7 +585,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let Self {
             tables,
             buffers,
-            allocator,
             hll,
             shared_context,
             topk_bin_totals,
@@ -597,8 +595,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             topk_aggregation_slot.map(|slot| (topk_bin_totals.as_mut().unwrap(), slot));
         let table = tables.last_mut().unwrap();
         let buffers = buffers.as_mut().unwrap();
-        let scatter_layout =
-            StridedScatterRows::<<K as KeyExtractor>::Persisted, V>::layout::<0>(shared_context);
+        let scatter_layout = ScatterLayout::<V>::new::<K::Persisted, 0>(shared_context);
         for entry in table.iter(0) {
             let hash = entry.hash;
             hll.add(hash);
@@ -607,11 +604,25 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             }
             let partition = (hash >> shift) as usize;
             // Entries are already deduplicated within this table.
-            buffers[partition].push_with(scatter_layout, allocator, hash, *entry.key, |stored| {
+            buffers.push_with(scatter_layout, partition, hash, *entry.key, |stored| {
                 stored.copy_from(entry.stored)
             });
         }
         table.clear();
+    }
+
+    /// Spill one sealed scatter buffer, if there is one, keeping it in the
+    /// evictor so the memory context can free it once its writes land.
+    /// Returns whether a buffer was spilled.
+    pub fn spill(&mut self, spiller: &mut Spiller) -> Result<bool, IORequesterError> {
+        let Some(buffers) = &mut self.buffers else {
+            return Ok(false);
+        };
+        let Some(spilled) = buffers.spill(spiller)? else {
+            return Ok(false);
+        };
+        self.evictor.borrow_mut().push(spilled);
+        Ok(true)
     }
 
     /// Finishes worker state for the merge phase, returning the worker's
@@ -650,9 +661,18 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         // `AggregatedTableOutput::raw_scatter_rows`). The bucket counts also
         // include the drained partials scattered before the fallback, which
         // only loosens the bounds further.
-        let raw_scatter_rows = match (&self.buffers, topk_bin_totals.is_some(), self.scatter_raw) {
-            (Some(buffers), true, true) => {
-                Some(buffers.iter().map(|bucket| bucket.len() as u64).collect())
+        // The spilled buffers still resident come back for the merge to read
+        // in memory, and the evicted rows as the file ranges to load them
+        // from. Nothing spills or is evicted while the merge runs, so the
+        // evictor is emptied here.
+        let spilled = self.evictor.borrow_mut().take_all();
+        let partition_rows = self
+            .buffers
+            .map(|buffers| buffers.into_partition_rows(spilled));
+        let raw_scatter_rows = match (&partition_rows, topk_bin_totals.is_some(), self.scatter_raw)
+        {
+            (Some(partitions), true, true) => {
+                Some(partitions.iter().map(|rows| rows.len() as u64).collect())
             }
             _ => None,
         };
@@ -661,7 +681,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let output = AggregatedTableOutput {
             node: crate::worker::current_node(),
             tables: self.tables,
-            buffers: self.buffers.map(PartitionBuffers::new),
+            buffers: partition_rows.map(PartitionBuffers::new),
             hll: self.hll,
             has_bin_totals: topk_bin_totals.is_some(),
             raw_scatter_rows,
@@ -840,10 +860,9 @@ fn probe_rows_body<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized
 
 /// State passed through arity dispatch for one scatter range.
 struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
-    buffers: &'a mut Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>,
+    buffers: &'a mut ScatterRows<<K as KeyExtractor>::Persisted, V>,
     key_arena: &'a mut WorkerArena,
     worker_context: &'a mut V::WorkerContext,
-    allocator: &'a mut SlabAllocator,
     hll: &'a mut Hll,
     hashes: &'a [u64; RECORD_BATCH_SIZE],
     shift: u32,
@@ -862,7 +881,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
             buffers,
             key_arena,
             worker_context,
-            allocator,
             hll,
             hashes,
             shift,
@@ -873,8 +891,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
             shared_context,
         } = self;
         // Every partition shares one row-layout snapshot.
-        let scatter_layout =
-            StridedScatterRows::<<K as KeyExtractor>::Persisted, V>::layout::<N>(shared_context);
+        let scatter_layout = ScatterLayout::<V>::new::<K::Persisted, N>(shared_context);
         // Indexing rather than iterating: `i` is the absolute row, used to
         // read the hash, the key, and the value columns in parallel.
         #[allow(clippy::needless_range_loop)]
@@ -884,7 +901,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
             let partition = (hash >> shift) as usize;
             let key = K::live_key(key_reader, i, key_arena).persist();
             // Seed directly into the destination row.
-            buffers[partition].push_with(scatter_layout, allocator, hash, key, |stored| {
+            buffers.push_with(scatter_layout, partition, hash, key, |stored| {
                 stored.seed(value_reader, i, worker_context)
             });
         }
@@ -893,15 +910,19 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::init_test_free_pool;
+    use crate::io::{Completion, IORequester, OperatorIO, WriteRequestId};
+    use crate::memory::{init_test_free_pool, spill_directory};
     use crate::operations::unary::group::keys::IntKeyExtractor;
     use crate::operations::unary::group::values::{
         AggregationKind, AggregationSlot, Compiled, CountSlot,
     };
+    use crate::stats::StatsCollector;
+    use crate::worker::WORKER_IDX;
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
     type CountValue = Compiled<(CountSlot,), u8>;
@@ -933,8 +954,14 @@ mod tests {
         }
     }
 
+    fn fresh_evictor() -> SharedPartitionEvictor {
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::memory::PartitionEvictor::new(),
+        ))
+    }
+
     fn scatter_row_count(output: &AggregatedTableOutput<IntExtractor, CountValue>) -> usize {
-        let layout = StridedScatterRows::<i32, CountValue>::layout::<0>(&());
+        let layout = ScatterLayout::<CountValue>::new::<i32, 0>(&());
         let buffers = output.buffers.as_ref().expect("worker switched");
         let mut rows = 0;
         for bucket in 0..buffers.bucket_count() {
@@ -956,6 +983,7 @@ mod tests {
             (),
             SMALL_RADIX,
             None,
+            fresh_evictor(),
         );
 
         // Unique keys make every post-switch fill 100% distinct, tripping the
@@ -981,6 +1009,7 @@ mod tests {
             (),
             SMALL_RADIX,
             None,
+            fresh_evictor(),
         );
 
         // Each key repeats twice back to back, so every fill dedups half its
@@ -1005,6 +1034,7 @@ mod tests {
             (),
             SMALL_RADIX,
             Some(0),
+            fresh_evictor(),
         );
 
         // Deduplicating fills drain into buffers; every drained partial and
@@ -1031,6 +1061,7 @@ mod tests {
             (),
             SMALL_RADIX,
             Some(0),
+            fresh_evictor(),
         );
 
         // Unique keys make every post-switch fill 100% distinct: the worker
@@ -1047,5 +1078,87 @@ mod tests {
         assert!(output.has_bin_totals);
         let bucket_rows: u64 = output.raw_scatter_rows.as_ref().unwrap().iter().sum();
         assert_eq!(bucket_rows as usize, scatter_row_count(&output));
+    }
+
+    /// What a `Spiller` borrows, under a dataflow id of the test's own so its
+    /// spill files clash with no other test's.
+    struct SpillerParts {
+        dataflow: usize,
+        requester: IORequester,
+        stats: StatsCollector,
+        next_request_id: usize,
+        writes_in_flight: ahash::HashMap<WriteRequestId, Arc<AtomicUsize>>,
+    }
+
+    impl SpillerParts {
+        fn new(dataflow: usize) -> Self {
+            Self {
+                dataflow,
+                requester: IORequester::default(),
+                stats: StatsCollector::disabled(),
+                next_request_id: 0,
+                writes_in_flight: ahash::HashMap::default(),
+            }
+        }
+
+        fn spiller(&mut self) -> Spiller<'_> {
+            let io = OperatorIO::new(
+                &mut self.requester,
+                self.dataflow,
+                0,
+                &mut self.stats,
+                &mut self.next_request_id,
+            );
+            Spiller::new(io, &mut self.writes_in_flight)
+        }
+
+        /// Complete every spill write issued so far, as the worker would.
+        fn finish_writes(&mut self) {
+            while !self.writes_in_flight.is_empty() {
+                self.requester.wait().unwrap();
+                for completion in self.requester.completions().unwrap() {
+                    if let Ok(Completion::FsWrite(write)) = completion {
+                        let count = self.writes_in_flight.remove(&write.request.id).unwrap();
+                        count.fetch_sub(1, Ordering::Release);
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for SpillerParts {
+        fn drop(&mut self) {
+            self.finish_writes();
+            spill_directory::remove_worker_directory(self.dataflow, WORKER_IDX.get()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_spilled_scatter_buffer_still_hands_its_rows_to_the_merge() {
+        init_test_free_pool(64);
+        let evictor = fresh_evictor();
+        let mut table = AggregatedTable::<IntExtractor, CountValue>::new(
+            ahash::RandomState::new(),
+            SharedArena::new(64),
+            (),
+            (),
+            SMALL_RADIX,
+            None,
+            evictor.clone(),
+        );
+        // Unique keys scatter raw, filling buffers until the earliest ones are
+        // sealed: every partition has moved past them.
+        let values: Vec<i32> = (0..400_000).collect();
+        consume_all(&mut table, &values);
+        let mut parts = SpillerParts::new(9_000_020);
+
+        let spilled = table.spill(&mut parts.spiller()).unwrap();
+        let (output, _totals) = table.flush();
+        parts.finish_writes();
+
+        assert!(spilled);
+        let in_place: usize = output.tables.iter().map(|table| table.len()).sum();
+        assert_eq!(in_place + scatter_row_count(&output), 400_000);
+        assert!(evictor.borrow_mut().evict().is_none());
     }
 }

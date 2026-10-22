@@ -22,16 +22,16 @@
 //! has no direct knowledge of other workers; synchronization is encapsulated in the
 //! operators.
 
-use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
+use crate::{Identifier, WriteRequestId};
+use ahash::HashMap;
 use core_affinity::CoreId;
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Live per-worker dataflows across the pool.
@@ -162,6 +162,10 @@ pub struct Worker {
     /// Last delegated-broadcast epoch this worker has fanned out (see
     /// [`WorkerWaker::finish_delegated_wake`]).
     last_seen_broadcast: u64,
+    /// Every spill write in flight on this worker, by its id, pointing at the
+    /// in-flight count of the spilled buffer it belongs to. A count that
+    /// reaches zero tells the buffer's owner the whole buffer is on disk.
+    spill_writes_in_flight: HashMap<WriteRequestId, Arc<AtomicUsize>>,
 }
 
 impl Worker {
@@ -220,7 +224,7 @@ impl Worker {
                 let worker = Self {
                     io: IORequester::new(disk_cache),
                     id: core.id,
-                    data_flows: HashMap::new(),
+                    data_flows: Default::default(),
                     data_flow_queue: receiver,
                     did_work_last_iteration: false,
                     should_exit,
@@ -229,6 +233,7 @@ impl Worker {
                     last_seen_ring_wake_count,
                     node_local_idx,
                     last_seen_broadcast,
+                    spill_writes_in_flight: Default::default(),
                 };
                 // Notifiers must be able to interrupt this worker's blocking
                 // IO wait, not just its thread park; register the ring's wake
@@ -284,6 +289,28 @@ impl Worker {
         }
     }
 
+    /// When this worker's node is short of reclaimable ring slots, ask the
+    /// dataflows' operators to spill this worker's share of the shortfall. The
+    /// memory comes back later, once the writes land, so this runs ahead of
+    /// exhaustion rather than at it. Runs before CPU work so the slots that
+    /// work will allocate are already on their way back.
+    fn maybe_spill(&mut self) {
+        let mut wanted = memory_ctx().slots_to_spill();
+        if wanted == 0 {
+            return;
+        }
+        for flow in self.data_flows.values_mut() {
+            let spilled = flow.spill(&mut self.io, &mut self.spill_writes_in_flight, wanted);
+            if spilled > 0 {
+                self.did_work_last_iteration = true;
+                wanted = wanted.saturating_sub(spilled);
+            }
+            if wanted == 0 {
+                return;
+            }
+        }
+    }
+
     /// Run one unit of CPU work from the first dataflow that has work ready.
     fn step_run_ready_cpu_work(&mut self) {
         // While a `perf` capture is in progress, run only the profiled dataflow
@@ -318,7 +345,15 @@ impl Worker {
                 Ok(Completion::FsWrite(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_disk_write_time(r.submitted_at);
-                        data_flow.process_fs_write(r.operator_idx, r.request);
+                        if r.request.id.is_spill() {
+                            let writes_in_flight = self
+                                .spill_writes_in_flight
+                                .remove(&r.request.id)
+                                .expect("a spill write that completed was recorded when issued");
+                            writes_in_flight.fetch_sub(1, Ordering::Release);
+                        } else {
+                            data_flow.process_fs_write(r.operator_idx, r.request);
+                        }
                     }
                 }
                 Ok(Completion::HttpGet(r, time)) => {
@@ -551,6 +586,8 @@ impl Worker {
             self.cancel_upstream_in_dataflows();
 
             self.process_io_completions()?;
+
+            self.maybe_spill();
 
             self.step_run_ready_cpu_work();
 

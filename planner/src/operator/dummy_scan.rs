@@ -8,6 +8,7 @@
 use crate::compile::Error;
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
+use dispatch::{Built, BuiltNullary};
 use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, RecordBatchOperatorSpec, Sender,
     WorkStatus,
@@ -55,10 +56,10 @@ impl DummyScanNullaryFactory {
 impl NullaryFactory<RecordBatch> for DummyScanNullaryFactory {
     type Nullary = DummyScanDispatchOperator;
 
-    fn build_nullary(self) -> Self::Nullary {
-        DummyScanDispatchOperator {
+    fn build_nullary(self) -> BuiltNullary<Self::Nullary> {
+        Built::new(DummyScanDispatchOperator {
             emitted: self.emitted,
-        }
+        })
     }
 }
 

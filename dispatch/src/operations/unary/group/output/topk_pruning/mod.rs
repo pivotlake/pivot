@@ -25,7 +25,7 @@ mod shared_bin_totals;
 mod threshold;
 
 pub use bin_totals::HashBinTotals;
-pub(crate) use bounds::{TopKBounds, TopKCutoff};
+pub(crate) use bounds::{TopKBounds, TopKCutoff, topk_admits};
 pub(crate) use shared_bin_totals::SharedBinTotals;
 pub use threshold::TopKThreshold;
 

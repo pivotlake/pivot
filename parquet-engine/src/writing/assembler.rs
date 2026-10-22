@@ -280,7 +280,7 @@ fn build_file(
     groups: Vec<AssembledRowGroup>,
 ) -> WriteResult<(FileBytes, FileMetaData)> {
     let mut out = FileBytes::new();
-    out.push(run_of(PARQUET_MAGIC)?);
+    out.push_slab(run_of(PARQUET_MAGIC)?);
 
     let mut row_groups = Vec::with_capacity(groups.len());
     let mut num_rows = 0i64;
@@ -351,7 +351,7 @@ fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<Colum
     let dictionary_page_offset = leaf.dictionary_page.map(|dict| {
         let offset = out.len() as i64;
         uncompressed += (dict.header_len + dict.uncompressed_size) as i64;
-        out.push(dict.bytes);
+        out.push_slab(dict.bytes);
         offset
     });
 
@@ -360,7 +360,7 @@ fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<Colum
     for page in leaf.data_pages {
         num_values += page.num_rows;
         uncompressed += (page.header_len + page.uncompressed_size) as i64;
-        out.push(page.bytes);
+        out.push_slab(page.bytes);
     }
     let compressed = out.len() as i64 - chunk_start;
 
@@ -471,7 +471,7 @@ fn write_footer(out: &mut FileBytes, file_meta: &FileMetaData) -> WriteResult<()
     file_meta.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut footer))?;
     footer.extend_from_slice(&(footer.len() as u32).to_le_bytes());
     footer.extend_from_slice(PARQUET_MAGIC);
-    out.push(run_of(&footer)?);
+    out.push_slab(run_of(&footer)?);
     Ok(())
 }
 

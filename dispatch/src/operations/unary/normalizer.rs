@@ -8,6 +8,8 @@
 //! a second pipeline breaker whose [`Collector`] initializes the original
 //! operation-specific outputter.
 
+use crate::api::BuildContext;
+use crate::operations::{Built, BuiltUnary};
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -20,7 +22,9 @@ use crossbeam_deque::{Injector, Steal};
 use crate::GatherBarrier;
 use crate::operations::channels::Sender;
 use crate::operations::unary::factory::UnaryFactory;
-use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
+use crate::operations::unary::pipeline_breaker::{
+    Consumer, OutputStatus, Outputter, PipelineBreaker,
+};
 use crate::operations::unary::{self, Unary};
 
 /// A worker-local result containing the record batches an operation will
@@ -175,20 +179,24 @@ impl<G: NormalizationBatches> BatchesOutputter<G, G> for Normalizer<G> {
 }
 
 impl<G: NormalizationBatches> Outputter<G> for Normalizer<G> {
-    fn output(&mut self, sender: &mut dyn Sender<G>) -> unary::Result<bool> {
+    fn output(
+        &mut self,
+        sender: &mut dyn Sender<G>,
+        _io: &mut crate::io::OperatorIO,
+    ) -> unary::Result<OutputStatus> {
         match self.shared.jobs.steal() {
             Steal::Success(job) => {
                 job.run()?;
-                return Ok(false);
+                return Ok(OutputStatus::Working);
             }
-            Steal::Retry => return Ok(false),
+            Steal::Retry => return Ok(OutputStatus::Working),
             Steal::Empty => {}
         }
 
         if !self.shared.jobs_injected.load(Ordering::Acquire)
             || self.shared.remaining.load(Ordering::Acquire) != 0
         {
-            return Ok(false);
+            return Ok(OutputStatus::Working);
         }
 
         if !self.shared.output_claimed.swap(true, Ordering::AcqRel) {
@@ -201,7 +209,7 @@ impl<G: NormalizationBatches> Outputter<G> for Normalizer<G> {
                 sender.send(group)?;
             }
         }
-        Ok(true)
+        Ok(OutputStatus::Done)
     }
 }
 
@@ -276,12 +284,12 @@ where
 {
     type Unary = PipelineBreaker<G, Out, Collector<G, O>>;
 
-    fn build_unary(self) -> Self::Unary {
-        PipelineBreaker::Consuming(Collector {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(PipelineBreaker::Consuming(Collector {
             groups: Vec::new(),
             outputter: self.outputter,
             is_collector_worker: self.is_collector_worker,
-        })
+        }))
     }
 }
 
@@ -336,10 +344,12 @@ mod tests {
         WORKER_IDX.set(0);
 
         let mut sender = CollectSender::new();
+        let mut test_io = crate::io::TestOperatorIO::default();
         loop {
             let mut done = true;
             for normalizer in &mut normalizers {
-                done &= normalizer.output(&mut sender).unwrap();
+                done &= normalizer.output(&mut sender, &mut test_io.io()).unwrap()
+                    == OutputStatus::Done;
             }
             if done {
                 return sender.items;

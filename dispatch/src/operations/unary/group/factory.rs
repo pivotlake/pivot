@@ -6,6 +6,8 @@
 //! to produce the actual [`Group`] operator.
 
 use crate::GatherBarrier;
+use crate::api::BuildContext;
+use crate::memory::{PartitionEvictor, SharedPartitionEvictor};
 use crate::numa::Topology;
 use crate::operations::UnaryFactory;
 use crate::operations::unary::group::arena::SharedArena;
@@ -16,9 +18,12 @@ use crate::operations::unary::group::hashtables::{
 use crate::operations::unary::group::output::topk_pruning::{SharedBinTotals, TopKThreshold};
 use crate::operations::unary::group::{AggregationSlot, Group, GroupLimit, PartitionJob};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
+use crate::operations::{Built, BuiltUnary};
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use crossbeam_deque::Injector;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -109,8 +114,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
 {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>>;
 
-    fn build_unary(self) -> PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>> {
-        PipelineBreaker::Consuming(Group::new(
+    fn build_unary(
+        self,
+        _context: &mut BuildContext,
+    ) -> BuiltUnary<PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>>> {
+        // The group-by and the memory context share the evictor: the group-by
+        // pushes spilled scatter buffers into it, the memory context frees
+        // them from it when it runs short of slots.
+        let evictor: SharedPartitionEvictor = Rc::new(RefCell::new(PartitionEvictor::new()));
+        let group = Group::new(
             self.key_arena,
             self.value_arena,
             self.hash_state,
@@ -125,6 +137,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
             self.radix,
             self.topk_threshold,
             self.shared_bin_totals,
-        ))
+            evictor.clone(),
+        );
+        Built::with_evictor(PipelineBreaker::Consuming(group), Box::new(evictor))
     }
 }

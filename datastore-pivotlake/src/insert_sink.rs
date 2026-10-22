@@ -1,5 +1,6 @@
 //! Worker-side data-file upload and row counting for SQL INSERT.
 
+use dispatch::{Built, BuiltUnary};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use arrow_array::{Int64Array, RecordBatch};
 
 use arrow_schema::{DataType, Field, Schema};
 use crossbeam_deque::Injector;
+use dispatch::BuildContext;
 use dispatch::io::{
     FsWriteRequest, HttpUploadRequest, LocalFile, OpenFile, OperatorIO, RemoteFile,
 };
@@ -226,11 +228,11 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
 
     /// Building the operator is the dataflow starting, so `on_start` runs
     /// here: before any file can land.
-    fn build_unary(self) -> Self::Unary {
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
         if let Some(on_start) = self.on_start {
             on_start();
         }
-        Upload {
+        Built::new(Upload {
             store: self.store,
             location: self.location,
             declared_columns: self.declared_columns,
@@ -238,7 +240,7 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
             rows: self.rows,
             remaining_workers: self.remaining_workers,
             in_flight: HashMap::new(),
-        }
+        })
     }
 }
 

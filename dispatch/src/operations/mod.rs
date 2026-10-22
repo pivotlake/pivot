@@ -45,6 +45,7 @@
 
 use crate::data_flow::WorkStatus;
 use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO, ReadResponse};
+use crate::memory::{Evict, Spiller};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -77,6 +78,33 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// What a factory's build step hands back: the transform itself, and the
+/// evictor through which the memory context may reclaim ring slots the
+/// transform keeps outside the caches, if it keeps any. The factory that wraps
+/// the transform into an operator attaches the evictor to that operator's node
+/// in the graph, so eviction can follow the graph's shape.
+pub struct Built<T> {
+    pub inner: T,
+    pub evictor: Option<Box<dyn Evict>>,
+}
+
+impl<T> Built<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            evictor: None,
+        }
+    }
+
+    /// A transform whose `evictor` can give ring slots back on request.
+    pub fn with_evictor(inner: T, evictor: Box<dyn Evict>) -> Self {
+        Self {
+            inner,
+            evictor: Some(evictor),
+        }
+    }
+}
 
 /// Outcome of an operator's [`try_finish`](Operator::try_finish).
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -148,5 +176,13 @@ pub trait Operator {
     /// decides its upstream is no longer needed.
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         None
+    }
+
+    /// Spill up to `count` of this operator's resident buffers, so
+    /// their memory can be given up once the writes land. The operator may hand
+    /// over fewer when it has less than that to spare. Most operators keep
+    /// nothing worth spilling and leave the default, which spills nothing.
+    fn spill(&mut self, _spiller: &mut Spiller, _count: usize) -> Result<()> {
+        Ok(())
     }
 }
