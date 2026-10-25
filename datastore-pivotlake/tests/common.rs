@@ -326,9 +326,12 @@ pub fn write_parquet_files(
         })
         .collect();
 
-    let datastore =
-        datastore_pivotlake::PivotlakeDatastore::open(&database_root.to_string_lossy(), dispatch)
-            .unwrap();
+    let datastore = datastore_pivotlake::PivotlakeDatastore::open_with_format(
+        &database_root.to_string_lossy(),
+        dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let creation = datastore.clone().begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {

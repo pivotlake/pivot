@@ -115,6 +115,7 @@ fn refresh_succeeds_after_the_first_token_expires() {
         Arc::new(NoStoreFactory),
         dispatch.dispatcher(),
         Duration::from_secs(3600),
+        None,
     )
     .expect("open the datastore");
 

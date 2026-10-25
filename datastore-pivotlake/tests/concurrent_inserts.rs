@@ -32,8 +32,12 @@ fn dispatcher() -> DataFlowDispatcher {
 /// version number counts the commits made since.
 fn open_datastore_with_empty_table() -> (TempDir, Arc<PivotlakeDatastore>) {
     let database = TempDir::new().unwrap();
-    let datastore =
-        PivotlakeDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &database.path().to_string_lossy(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(CreateTableRequest {

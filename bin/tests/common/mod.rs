@@ -229,9 +229,12 @@ pub fn server_port() -> u16 {
         let data_dir = TempDir::new().unwrap();
         DATA_DIR.set(data_dir.path().to_path_buf()).unwrap();
         start_server(256, move |dispatch| {
-            let datastore: Arc<dyn Datastore> =
-                PivotlakeDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
-                    .unwrap();
+            let datastore: Arc<dyn Datastore> = PivotlakeDatastore::open_with_format(
+                &data_dir.path().to_string_lossy(),
+                dispatch.dispatcher(),
+                Some(datastore_pivotlake::TableFormat::Delta),
+            )
+            .unwrap();
             let catalog = Arc::new(
                 PivotCatalog::new(
                     HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),

@@ -1839,16 +1839,17 @@ name = "datastore-iceberg"
 version = "0.1.1"
 dependencies = [
  "arrow-array",
- "arrow-cast",
  "arrow-schema",
  "async-trait",
  "catalog",
  "crossbeam-deque",
+ "datastore-iceberg",
  "dispatch",
  "futures",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
+ "iceberg-tables",
  "object-storage",
  "parquet",
  "parquet-engine",
@@ -1856,10 +1857,13 @@ dependencies = [
  "reqwest 0.12.28",
  "roaring",
  "serde_json",
+ "table-compaction",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "url",
  "uuid",
@@ -1886,6 +1890,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "dispatch",
+ "iceberg-tables",
  "object-storage",
  "parquet",
  "parquet-engine",
@@ -1895,6 +1900,7 @@ dependencies = [
  "planner",
  "serde",
  "serde_json",
+ "table-compaction",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2982,6 +2988,28 @@ dependencies = [
  "serde",
  "typetag",
  "url",
+]
+
+[[package]]
+name = "iceberg-tables"
+version = "0.1.1"
+dependencies = [
+ "arrow-array",
+ "arrow-cast",
+ "arrow-schema",
+ "crossbeam-deque",
+ "dispatch",
+ "iceberg",
+ "object-storage",
+ "parquet-engine",
+ "planner",
+ "roaring",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5915,6 +5943,25 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "table-compaction"
+version = "0.1.1"
+dependencies = [
+ "arrow-array",
+ "arrow-cast",
+ "arrow-ord",
+ "arrow-schema",
+ "crossbeam-deque",
+ "dispatch",
+ "object-storage",
+ "parquet-engine",
+ "planner",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

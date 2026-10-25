@@ -41,6 +41,9 @@ pub(crate) fn http_readahead() -> usize {
 pub const PARQUET_FIELD_ID_METADATA_KEY: &str = "PARQUET:field_id";
 
 mod external;
+/// One data file as a table's metadata tracks it, and the file-level pruning
+/// a query's pushed predicates do before any footer is read.
+pub mod file_entry;
 pub use external::bind_read_parquet;
 
 pub(crate) mod reading;

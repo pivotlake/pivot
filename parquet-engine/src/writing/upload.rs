@@ -28,13 +28,16 @@ use crate::RowGroupMetadata;
 
 /// Upload assembled Parquet files over the ring and push every completion onto
 /// `uploaded_files`. INSERT and compaction prepare files through different front
-/// halves of the write pipeline and share this storage-facing tail.
-/// `on_start` runs once, when the dataflow is built and before any file can
-/// land: an INSERT stages the pending insert its transaction commits there;
-/// compaction, which commits its files itself, has nothing to run.
+/// halves of the write pipeline and share this storage-facing tail. Files are
+/// written under `file_prefix` below `directory`, and reported by their path
+/// relative to `directory`. `on_start` runs once, when the dataflow is built
+/// and before any file can land: an INSERT stages the pending insert its
+/// transaction commits there; compaction, which commits its files itself, has
+/// nothing to run.
 pub fn upload_files_spec<OF>(
     store: Arc<dyn ObjectStore>,
-    location: ObjectPath,
+    directory: ObjectPath,
+    file_prefix: ObjectPath,
     declared_columns: Arc<[Column]>,
     uploaded_files: Arc<Injector<UploadedFile>>,
     on_start: Option<Box<dyn FnOnce() + Send>>,
@@ -55,16 +58,15 @@ where
     let uploads = encoded.chain(
         stealable::<AssembledFile>(topology).into_iter().collect(),
         (0..workers)
-            .map(|_| {
-                UploadFactory::new(
-                    store.clone(),
-                    location.clone(),
-                    declared_columns.clone(),
-                    uploaded_files.clone(),
-                    on_start.take(),
-                    rows.clone(),
-                    remaining_workers.clone(),
-                )
+            .map(|_| UploadFactory {
+                store: store.clone(),
+                directory: directory.clone(),
+                file_prefix: file_prefix.clone(),
+                declared_columns: declared_columns.clone(),
+                uploaded_files: uploaded_files.clone(),
+                on_start: on_start.take(),
+                rows: rows.clone(),
+                remaining_workers: remaining_workers.clone(),
             })
             .collect(),
     );
@@ -73,9 +75,9 @@ where
 
 /// One finished upload waiting to be committed, drained from `uploaded_files` by
 /// whoever owns it (a statement's transaction, or compaction): the file's
-/// path under the directory it was written to, with its size, the partition
-/// values its rows share (`None` for an unpartitioned write), and the row
-/// groups its footer records.
+/// path relative to the directory it was written under, with its size, the
+/// partition values its rows share (`None` for an unpartitioned write), and
+/// the row groups its footer records.
 pub struct UploadedFile {
     pub file: FileRef,
     pub partition: Option<crate::PartitionValues>,
@@ -84,7 +86,8 @@ pub struct UploadedFile {
 
 pub(super) struct UploadFactory {
     store: Arc<dyn ObjectStore>,
-    location: ObjectPath,
+    directory: ObjectPath,
+    file_prefix: ObjectPath,
     /// The table's declared column types, reconciled with each uploaded file's
     /// footer when its row groups are built.
     declared_columns: Arc<[Column]>,
@@ -101,28 +104,6 @@ pub(super) struct UploadFactory {
     remaining_workers: Arc<AtomicUsize>,
 }
 
-impl UploadFactory {
-    pub fn new(
-        store: Arc<dyn ObjectStore>,
-        location: ObjectPath,
-        declared_columns: Arc<[Column]>,
-        uploaded_files: Arc<Injector<UploadedFile>>,
-        on_start: Option<Box<dyn FnOnce() + Send>>,
-        rows: Arc<AtomicUsize>,
-        remaining_workers: Arc<AtomicUsize>,
-    ) -> Self {
-        Self {
-            store,
-            location,
-            declared_columns,
-            uploaded_files,
-            on_start,
-            rows,
-            remaining_workers,
-        }
-    }
-}
-
 impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
     type Unary = Upload;
 
@@ -134,7 +115,8 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
         }
         Upload {
             store: self.store,
-            location: self.location,
+            directory: self.directory,
+            file_prefix: self.file_prefix,
             declared_columns: self.declared_columns,
             uploaded_files: self.uploaded_files,
             rows: self.rows,
@@ -155,7 +137,10 @@ struct PendingUpload {
 
 pub(super) struct Upload {
     store: Arc<dyn ObjectStore>,
-    location: ObjectPath,
+    /// The directory every reported path is relative to.
+    directory: ObjectPath,
+    /// Where under `directory` the files are written.
+    file_prefix: ObjectPath,
     /// The table's declared column types, reconciled with each uploaded file's
     /// footer when its row groups are built (see [`UploadFactory`]).
     declared_columns: Arc<[Column]>,
@@ -221,8 +206,10 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
         _sender: &mut dyn Sender<RecordBatch>,
         io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
-        let key = self.location.resolve(&path);
+        let path = self
+            .file_prefix
+            .join(&format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
+        let key = self.directory.resolve(&path);
         let data = Arc::new(encoded.bytes);
         // The write/upload request below shares this `Arc`, so its address keys
         // the in-flight entry a later completion resolves against.

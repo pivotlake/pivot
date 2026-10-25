@@ -364,6 +364,7 @@ fn collect_compared_fields<'a>(predicate: &'a BoundPredicate, fields: &mut Vec<&
 }
 
 /// What metadata says about the values of one field in one object.
+#[derive(Clone)]
 pub(crate) struct FieldRange {
     pub field_id: i32,
     /// Every non-null value is at least this. `None` where unknown.

@@ -20,7 +20,9 @@ use arrow_array::types::{ArrowPrimitiveType, Float64Type, Int64Type};
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{Datastore, PivotCatalog};
-use datastore_iceberg::{IcebergCatalogConfig, IcebergDatastore};
+use datastore_iceberg::{
+    CompactionConfig, DEFAULT_LAYOUT_CLIQUE_SIZE, IcebergCatalogConfig, IcebergDatastore,
+};
 use dispatch::{DataFlowDispatcher, Dispatch};
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
@@ -666,6 +668,16 @@ impl Harness {
         self.pivot_with(HashMap::new(), Arc::new(AmbientExternalStoreFactory))
     }
 
+    /// A Pivot catalog over the fixture whose datastore runs compaction
+    /// rounds as `compaction` says.
+    fn pivot_with_compaction(&self, compaction: CompactionConfig) -> (TestCatalog, Planner) {
+        self.pivot_configured(
+            HashMap::new(),
+            Arc::new(AmbientExternalStoreFactory),
+            Some(compaction),
+        )
+    }
+
     /// A Pivot catalog over the fixture, with `properties` passed to the REST
     /// client and `store_factory` opening the roots no credentials were
     /// vended for.
@@ -674,14 +686,28 @@ impl Harness {
         properties: HashMap<String, String>,
         store_factory: Arc<dyn ExternalStoreFactory>,
     ) -> (TestCatalog, Planner) {
+        self.pivot_configured(properties, store_factory, None)
+    }
+
+    fn pivot_configured(
+        &self,
+        properties: HashMap<String, String>,
+        store_factory: Arc<dyn ExternalStoreFactory>,
+        compaction: Option<CompactionConfig>,
+    ) -> (TestCatalog, Planner) {
         let config = IcebergCatalogConfig {
             uri: self.catalog_uri.clone(),
             properties,
             ..IcebergCatalogConfig::default()
         };
-        let datastore =
-            IcebergDatastore::open(&config, store_factory, self.dispatcher(), REFRESH_INTERVAL)
-                .expect("open the iceberg datastore");
+        let datastore = IcebergDatastore::open(
+            &config,
+            store_factory,
+            self.dispatcher(),
+            REFRESH_INTERVAL,
+            compaction,
+        )
+        .expect("open the iceberg datastore");
         let catalog = PivotCatalog::new(
             HashMap::from([(DATASTORE.to_string(), datastore as Arc<dyn Datastore>)]),
             DATASTORE.to_string(),
@@ -768,9 +794,9 @@ impl Harness {
         }
     }
 
-    /// Run a writing statement through to its commit: what an INSERT needs
-    /// that a query does not. The commit lands on the harness runtime, since
-    /// it hops to the blocking pool.
+    /// Run a writing statement through to its commit: what an INSERT, a
+    /// CREATE TABLE or a DROP TABLE needs that a query does not. The commit
+    /// lands on the harness runtime, since it hops to the blocking pool.
     fn execute(
         &self,
         catalog: &PivotCatalog,
@@ -863,6 +889,11 @@ impl Harness {
             .collect();
         ids.sort();
         ids
+    }
+
+    fn object_exists(&self, namespace: &NamespaceIdent, table: &str, location: &str) -> bool {
+        let loaded = self.load(namespace, table);
+        self.block_on(loaded.file_io().exists(location)).unwrap()
     }
 }
 
@@ -1891,7 +1922,7 @@ fn late_materialization_preserves_row_indexes_across_files_and_row_groups() {
             .iter()
             .filter(|path| path.ends_with(".parquet"))
             .count(),
-        5,
+        3,
         "{reads:?}"
     );
 }
@@ -2357,6 +2388,131 @@ fn a_compacted_table_reads_only_the_rewritten_file() {
     assert_eq!(int64_column(&after, 1), [Some(10)]);
 }
 
+/// `COMPACT TABLE ... FINAL` on a catalog table merges its small files into
+/// one and retires them in one `replace` snapshot the catalog's own loader
+/// reads, the rows as they were; the session reads the compacted table at
+/// once.
+#[test]
+fn a_compact_statement_merges_a_catalog_tables_small_files_in_one_replace_snapshot() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("compact", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    for (id, customer) in [(1, "ann"), (2, "bob"), (3, "cy")] {
+        harness
+            .execute(
+                &catalog,
+                &mut planner,
+                &format!("INSERT INTO compact.orders VALUES ({id}, '{customer}', {id}.0)"),
+            )
+            .unwrap();
+    }
+    let name = SchemaQualifiedTableName::new("compact", "orders");
+    let before = harness.live_data_files(&namespace, "orders").len();
+
+    let passes = harness
+        .block_on(catalog.begin_transaction().compact(DATASTORE, &name, true))
+        .unwrap();
+    let read_back = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT count(*), CAST(sum(id) AS BIGINT) FROM compact.orders",
+    );
+
+    assert_eq!(before, 3);
+    assert!(passes >= 1);
+    let files = harness.live_data_files(&namespace, "orders");
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].record_count(), 3);
+    let table = harness.load(&namespace, "orders");
+    let summary = table.metadata().current_snapshot().unwrap().summary();
+    assert_eq!(summary.operation, Operation::Replace);
+    assert_eq!(int64_column(&read_back, 0), [Some(3)]);
+    assert_eq!(int64_column(&read_back, 1), [Some(6)]);
+}
+
+/// A datastore configured to compact merges a catalog table's small files
+/// in its own rounds, once enough of them pile up, with no statement.
+#[test]
+fn configured_compaction_rounds_merge_a_catalog_tables_small_files() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("rounds", "orders", orders_schema());
+    for id in 1..=5 {
+        let customer = format!("customer-{id}");
+        harness.append(
+            &namespace,
+            "orders",
+            orders(&[id], &[customer.as_str()], &[id as f64]),
+        );
+    }
+    let (catalog, mut planner) = harness.pivot_with_compaction(CompactionConfig {
+        target_bytes: 1024 * 1024,
+        merge_target_bytes: u64::MAX,
+        min_files: 5,
+        max_concurrent_merges: 1,
+        layout_clique_size: DEFAULT_LAYOUT_CLIQUE_SIZE,
+        poll_interval: Duration::from_millis(200),
+    });
+
+    let deadline = Instant::now() + REFRESH_TIMEOUT;
+    while harness.live_data_files(&namespace, "orders").len() != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the round did not merge the files"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let read_back = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT count(*), CAST(sum(id) AS BIGINT) FROM rounds.orders",
+    );
+
+    let table = harness.load(&namespace, "orders");
+    let summary = table.metadata().current_snapshot().unwrap().summary();
+    assert_eq!(summary.operation, Operation::Replace);
+    assert_eq!(int64_column(&read_back, 0), [Some(5)]);
+    assert_eq!(int64_column(&read_back, 1), [Some(15)]);
+}
+
+/// A table whose current snapshot holds a live deletion vector is not
+/// rewritten: a merge would read the deleted rows back in. `COMPACT` says
+/// so instead.
+#[test]
+fn a_table_with_live_delete_files_is_not_compacted() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.v3_namespace("deleted", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2, 3], &["ann", "bob", "cy"], &[1.0, 2.0, 3.0]),
+    );
+    harness.append(&namespace, "orders", orders(&[4], &["di"], &[4.0]));
+    harness.spark_sql(
+        "ALTER TABLE deleted.orders SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
+         DELETE FROM deleted.orders WHERE id = 2;",
+    );
+    let (catalog, _planner) = harness.pivot();
+    let name = SchemaQualifiedTableName::new("deleted", "orders");
+    let files_before: Vec<String> = harness
+        .live_data_files(&namespace, "orders")
+        .iter()
+        .map(|file| file.file_path().to_string())
+        .collect();
+
+    let error = harness
+        .block_on(catalog.begin_transaction().compact(DATASTORE, &name, true))
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("has delete files"), "{error}");
+    let files_after: Vec<String> = harness
+        .live_data_files(&namespace, "orders")
+        .iter()
+        .map(|file| file.file_path().to_string())
+        .collect();
+    assert_eq!(files_after, files_before);
+}
+
 #[test]
 fn a_bucket_partition_prunes_files_by_the_constants_bucket() {
     let Some(harness) = harness() else { return };
@@ -2584,7 +2740,7 @@ fn separate_bindings_keep_their_own_filters() {
 }
 
 #[test]
-fn overlapping_bindings_reload_metadata_and_keep_independent_row_group_filters() {
+fn overlapping_bindings_share_one_load_and_keep_independent_row_group_filters() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("overlapping", "orders", orders_schema());
     for ids in [[1, 2], [3, 4]] {
@@ -2620,7 +2776,7 @@ fn overlapping_bindings_reload_metadata_and_keep_independent_row_group_filters()
             .iter()
             .filter(|path| path.ends_with(".parquet"))
             .count(),
-        4,
+        2,
         "{reads:?}"
     );
     assert_eq!(
@@ -3133,6 +3289,113 @@ fn a_timestamp_column_compared_with_a_timestamptz_constant_prunes_files() {
         1,
         "{paths:?}"
     );
+}
+
+#[test]
+fn create_table_registers_a_v3_table_with_pivots_logical_types() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("made", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE made.readings (tiny TINYINT, big BIGINT, name VARCHAR) WITH (partition_by = 'name', sort_by = 'big')",
+        )
+        .unwrap();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO made.readings VALUES (7, 70, 'a'), (8, 80, 'b')",
+        )
+        .unwrap();
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT tiny, big FROM made.readings WHERE name = 'b'",
+    );
+
+    let table = harness.load(&namespace, "readings");
+    let metadata = table.metadata();
+    assert_eq!(metadata.format_version(), FormatVersion::V3);
+    let names: Vec<&str> = metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(names, ["tiny", "big", "name"]);
+    let tiny_id = metadata.current_schema().field_id_by_name("tiny").unwrap();
+    assert_eq!(
+        metadata.properties()["pivot.logical-types"],
+        format!(r#"{{"{tiny_id}":"Int8"}}"#)
+    );
+    assert_eq!(
+        metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["name"]
+    );
+    assert_eq!(metadata.default_sort_order().fields.len(), 1);
+    assert_eq!(rows[0].column(0).data_type(), &arrow_schema::DataType::Int8);
+    assert_eq!(int64_column(&rows, 1), [Some(80)]);
+}
+
+#[test]
+fn create_table_refuses_a_duplicate_unless_asked_not_to() {
+    let Some(harness) = harness() else { return };
+    harness.namespace("twice", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    let duplicate = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE twice.orders (id BIGINT)",
+        )
+        .unwrap_err();
+    let tolerated = harness.execute(
+        &catalog,
+        &mut planner,
+        "CREATE TABLE IF NOT EXISTS twice.orders (id BIGINT)",
+    );
+
+    assert!(duplicate.contains("already exists"), "{duplicate}");
+    assert!(tolerated.is_ok(), "{tolerated:?}");
+}
+
+#[test]
+fn drop_table_unregisters_the_table_and_leaves_its_files() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("dropped", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let file = harness.live_data_files(&namespace, "orders")[0]
+        .file_path()
+        .to_string();
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(&catalog, &mut planner, "DROP TABLE dropped.orders")
+        .unwrap();
+
+    let gone = harness.block_on(
+        harness
+            .writer
+            .load_table(&TableIdent::new(namespace.clone(), "orders".to_string())),
+    );
+    assert!(gone.is_err(), "the catalog still lists the table");
+    let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM dropped.orders");
+    assert!(error.contains("orders"), "{error}");
+    // The harness opens its file IO through a table of the namespace, so
+    // the dropped table's file is looked for through a sibling.
+    harness.create_table(&namespace, "sibling", orders_schema());
+    assert!(harness.object_exists(&namespace, "sibling", &file));
 }
 
 #[test]

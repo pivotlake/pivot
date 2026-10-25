@@ -1,22 +1,15 @@
 //! Pivot's database-level table index, stored as `_pivot_manifest.json`.
 //!
-//! This manifest answers only which tables exist and where their roots are.
-//! Each table's schema, version, and active files come from its Delta log.
+//! This manifest answers only which tables exist, where their roots are, and
+//! which table format the database keeps them in. Each table's schema,
+//! version, and active files come from its own metadata in that format.
 
 use planner::catalog::SchemaQualifiedTableName;
-use planner::expression::CompareType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use uuid::Uuid as TableId;
 
-use arrow_array::{ArrayRef, Scalar};
-pub use parquet_engine::{
-    FileStats, PartitionValues, pivot_scalar, scalar_equal, scalar_values_equal,
-    scalar_values_from_row,
-};
-
-use crate::FileRef;
+use crate::format::TableFormat;
 use object_storage::{ObjectPath, ObjectStore};
 
 /// Key of the [`CatalogManifest`] document within the database's object store.
@@ -43,106 +36,6 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// One file at the Delta log level: its store identity ([`FileRef`]), the
-/// optional partition tuple a partitioned INSERT stamps on it, and its Parquet
-/// statistics. Each optional field is `None` when the file carries no such
-/// metadata (an unpartitioned table, or a file whose footer stats were not
-/// read).
-#[derive(Clone)]
-pub struct DeltaFileEntry {
-    pub file: FileRef,
-    pub partition: Option<PartitionValues>,
-    /// The file's Parquet statistics, persisted into the Delta `Add` action's
-    /// `stats`. `None` for a file we did not write (adopted at CREATE) or reloaded
-    /// from the log, where the stats are not re-committed.
-    pub stats: Option<Arc<FileStats>>,
-}
-
-impl DeltaFileEntry {
-    /// An entry with no partition/sort metadata (unpartitioned + unsorted table,
-    /// or a writer that doesn't record it).
-    pub fn new(file: FileRef) -> Self {
-        Self {
-            file,
-            partition: None,
-            stats: None,
-        }
-    }
-
-    /// Whether this file *can* hold a row matching every partition filter — a
-    /// soft test, so it never wrongly drops a file. A filter on a non-partition
-    /// column, an entry with no recorded tuple, or a tuple missing the column all
-    /// keep the entry (absence of a value is not proof of a mismatch). Only a
-    /// recorded partition value that differs from the filter's excludes it.
-    /// Both sides are Pivot-native typed scalars.
-    pub fn maybe_matches_partition(
-        &self,
-        partition_by: &[String],
-        filters: &[PartitionEqFilter],
-    ) -> bool {
-        let Some(tuple) = self.partition.as_ref() else {
-            return true;
-        };
-        filters.iter().all(|filter| {
-            !partition_by.iter().any(|c| c == &filter.column)
-                || match tuple.get(&filter.column) {
-                    Some(value) => scalar_equal(value, &filter.value).unwrap_or(true),
-                    None => true,
-                }
-        })
-    }
-
-    /// Whether this file *can* hold a row matching every stat filter — a soft
-    /// test (like [`maybe_matches_partition`](Self::maybe_matches_partition)), so
-    /// it never wrongly drops a file. A file with no recorded stats, or a filter
-    /// on a column the stats don't bound, keeps the file. Only a min/max range
-    /// that proves no row can match excludes it. Skips a whole file (all its row
-    /// groups) before the finer row-group stats pruning looks inside it.
-    pub fn maybe_matches_stats(&self, filters: &[ColumnStatFilter]) -> bool {
-        let Some(stats) = self.stats.as_ref() else {
-            return true;
-        };
-        filters.iter().all(|filter| {
-            let (Some(min), Some(max)) = (
-                stats.min_values.get(&filter.column),
-                stats.max_values.get(&filter.column),
-            ) else {
-                return true;
-            };
-            !parquet_engine::bounds_eliminate(
-                &Scalar::new(min.clone()),
-                &Scalar::new(max.clone()),
-                filter.compare_type,
-                &filter.value,
-            )
-            .unwrap_or(false)
-        })
-    }
-}
-
-/// A `partition column = constant` predicate the query pushed down, with the
-/// constant retained as Pivot's typed Arrow scalar.
-/// [`DeltaFileEntry::maybe_matches_partition`] uses it to skip a file whose
-/// recorded partition value can't match *before* its footer is fetched — the
-/// HTTP a stats prune can't save, since stats live in the footer.
-#[derive(Clone, Debug)]
-pub struct PartitionEqFilter {
-    pub column: String,
-    pub value: Scalar<ArrayRef>,
-}
-
-/// A `column <cmp> constant` range predicate the query pushed down, retained as
-/// Pivot's typed Arrow scalar. [`DeltaFileEntry::maybe_matches_stats`] uses it to
-/// skip a whole file whose Parquet stats prove no row can match, before the finer
-/// row-group pruning descends into the file. Plain top-level columns only: a
-/// variant path's stats live in a shredded leaf, pruned per row group.
-#[derive(Clone, Debug)]
-pub struct ColumnStatFilter {
-    pub column: String,
-    pub compare_type: CompareType,
-    pub value: Scalar<ArrayRef>,
-}
 
 /// The schema an entry belongs to when the document omits the field: the
 /// default schema, which every datastore defines.
@@ -183,8 +76,8 @@ impl CatalogManifestSchemaEntry {
 /// A dropped table's tombstone: the identity and storage location the table
 /// held, kept so vacuum can delete the storage once the retention window has
 /// passed (a query that bound the table before the drop may still be reading
-/// its files). `retention_ms` is the table's own `deletedFileRetentionDuration`,
-/// captured at drop time because the Delta log it lived in is itself part of
+/// its files). `retention_ms` is the table's own deleted-file retention,
+/// captured at drop time because the metadata it lived in is itself part of
 /// the storage awaiting deletion.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct DroppedTableEntry {
@@ -194,12 +87,17 @@ pub(crate) struct DroppedTableEntry {
     pub(crate) retention_ms: u64,
 }
 
-/// The database manifest: the index of which schemas and tables exist and where
-/// each table's data lives. A monotonically increasing `version` records how
-/// many times it has changed.
+/// The database manifest: the index of which schemas and tables exist, where
+/// each table's data lives, and the format every table is kept in. A
+/// monotonically increasing `version` records how many times it has changed.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CatalogManifest {
     pub(crate) version: u64,
+    /// The format every table of this database is kept in. Absent from the
+    /// document of a database created before the field existed, which is
+    /// Delta Lake; always written for a database created since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) table_format: Option<TableFormat>,
     /// Every schema the database defines, always including the default one,
     /// each naming the tables inside it.
     #[serde(default = "default_schemas")]
@@ -218,10 +116,12 @@ pub struct CatalogManifest {
 }
 
 impl Default for CatalogManifest {
-    /// A brand-new database: no tables, and the default schema alone.
+    /// A brand-new database as a document that records no format reads: no
+    /// tables, and the default schema alone.
     fn default() -> Self {
         Self {
             version: 0,
+            table_format: None,
             schemas: default_schemas(),
             table_locations: HashMap::new(),
             dropped_tables: Vec::new(),
@@ -232,10 +132,22 @@ impl Default for CatalogManifest {
 impl CatalogManifest {
     /// Load the database manifest, or an empty one if the database is brand new.
     pub fn load(store: &dyn ObjectStore) -> Result<Self> {
+        Ok(Self::load_existing(store)?.unwrap_or_default())
+    }
+
+    /// Load the database manifest, or `None` if the database has none yet.
+    pub(crate) fn load_existing(store: &dyn ObjectStore) -> Result<Option<Self>> {
         match store.get(&ObjectPath::new(MANIFEST_KEY))? {
-            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            None => Ok(Self::default()),
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            None => Ok(None),
         }
+    }
+
+    /// The format this database keeps its tables in: the recorded one, or
+    /// Delta Lake for a document written before the field existed.
+    pub(crate) fn table_format(&self) -> TableFormat {
+        self.table_format
+            .unwrap_or(TableFormat::RECORDED_BY_OMISSION)
     }
 
     /// Read-modify-write the database manifest as one atomic update: `mutate`
@@ -244,34 +156,46 @@ impl CatalogManifest {
     /// update — the store serializes the whole cycle behind a file lock (local)
     /// or retries it under a version-conditional swap (remote), so `mutate` may
     /// run more than once, each time on a fresh document.
-    pub(crate) fn update<T>(
+    pub(crate) fn update<T, E: From<Error>>(
         store: &dyn ObjectStore,
-        mut mutate: impl FnMut(&mut CatalogManifest) -> Result<T>,
-    ) -> Result<T> {
+        mut mutate: impl FnMut(&mut CatalogManifest) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
         let mut outcome = None;
-        store.update(&ObjectPath::new(MANIFEST_KEY), &mut |current| {
-            let loaded = match current {
-                Some(bytes) => serde_json::from_slice(&bytes).map_err(Error::Json),
-                None => Ok(Self::default()),
-            };
-            let result = loaded.and_then(|mut manifest| {
-                let value = mutate(&mut manifest)?;
-                let bytes = serde_json::to_vec(&manifest)?;
-                Ok((value, bytes))
-            });
-            match result {
-                Ok((value, bytes)) => {
-                    outcome = Some(Ok(value));
-                    Some(bytes)
+        store
+            .update(&ObjectPath::new(MANIFEST_KEY), &mut |current| {
+                let loaded = match current {
+                    Some(bytes) => {
+                        serde_json::from_slice(&bytes).map_err(|error| E::from(Error::Json(error)))
+                    }
+                    None => Ok(Self::default()),
+                };
+                let result = loaded.and_then(|mut manifest| {
+                    let value = mutate(&mut manifest)?;
+                    let bytes = serde_json::to_vec(&manifest)
+                        .map_err(|error| E::from(Error::Json(error)))?;
+                    Ok((value, bytes))
+                });
+                match result {
+                    Ok((value, bytes)) => {
+                        outcome = Some(Ok(value));
+                        Some(bytes)
+                    }
+                    // A failed mutation writes nothing; the error surfaces below.
+                    Err(error) => {
+                        outcome = Some(Err(error));
+                        None
+                    }
                 }
-                // A failed mutation writes nothing; the error surfaces below.
-                Err(error) => {
-                    outcome = Some(Err(error));
-                    None
-                }
-            }
-        })?;
+            })
+            .map_err(|error| E::from(Error::Store(error)))?;
         outcome.expect("the store ran the update closure at least once")
+    }
+
+    /// Whether this document has never been written: what a database that is
+    /// being created looks like, as opposed to one written before the format
+    /// field existed.
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.version == 0
     }
 
     /// Register a table inside its schema under `id`, replacing whatever that
@@ -402,90 +326,6 @@ impl CatalogManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, Datum, Int64Array, RecordBatch, StringArray, StringViewArray};
-    use arrow_schema::{DataType, Field, Schema};
-
-    fn scalar<T: Array + 'static>(array: T) -> Scalar<ArrayRef> {
-        Scalar::new(Arc::new(array))
-    }
-
-    fn manifest_entry(partition: HashMap<String, Scalar<ArrayRef>>) -> DeltaFileEntry {
-        DeltaFileEntry {
-            file: FileRef {
-                path: ObjectPath::new("part.parquet"),
-                size: 1,
-            },
-            partition: Some(partition),
-            stats: None,
-        }
-    }
-
-    #[test]
-    fn record_batch_row_becomes_typed_scalar_values() {
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("service", DataType::Utf8, false),
-                Field::new("shard", DataType::Int64, false),
-            ])),
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b"])),
-                Arc::new(Int64Array::from(vec![10, 20])),
-            ],
-        )
-        .unwrap();
-
-        let value =
-            scalar_values_from_row(&batch, &["service".to_string(), "shard".to_string()], 1)
-                .unwrap();
-
-        let service = value.get("service").unwrap().get().0;
-        assert_eq!(service.data_type(), &DataType::Utf8View);
-        assert_eq!(
-            service
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .unwrap()
-                .value(0),
-            "b"
-        );
-        let shard = value.get("shard").unwrap().get().0;
-        assert_eq!(
-            shard
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0),
-            20
-        );
-    }
-
-    #[test]
-    fn partition_pruning_compares_typed_scalars_softly() {
-        let entry = manifest_entry(HashMap::from([(
-            "service".to_string(),
-            scalar(StringViewArray::from(vec!["api"])),
-        )]));
-        let partition_by = ["service".to_string()];
-        let filter = |value| PartitionEqFilter {
-            column: "service".to_string(),
-            value: scalar(StringViewArray::from(vec![value])),
-        };
-
-        assert!(entry.maybe_matches_partition(&partition_by, &[filter("api")]));
-        assert!(!entry.maybe_matches_partition(&partition_by, &[filter("worker")]));
-
-        // A mismatched physical type or absent field is unknown, so pruning
-        // keeps the file instead of risking a false negative.
-        let mismatched = PartitionEqFilter {
-            column: "service".to_string(),
-            value: scalar(Int64Array::from(vec![1])),
-        };
-        assert!(entry.maybe_matches_partition(&partition_by, &[mismatched]));
-        assert!(
-            manifest_entry(HashMap::new())
-                .maybe_matches_partition(&partition_by, &[filter("worker")])
-        );
-    }
 
     #[test]
     fn update_creates_the_manifest_and_mutates_it_in_place() {
@@ -494,7 +334,7 @@ mod tests {
 
         CatalogManifest::update(&store, |manifest| {
             manifest.add_schema("logs".to_string());
-            Ok(())
+            Ok::<(), Error>(())
         })
         .unwrap();
 
@@ -518,22 +358,31 @@ mod tests {
     }
 
     #[test]
-    fn scalar_value_map_equality_is_independent_of_insertion_order() {
-        let left = HashMap::from([
-            (
-                "service".to_string(),
-                scalar(StringViewArray::from(vec!["api"])),
-            ),
-            ("shard".to_string(), scalar(Int64Array::from(vec![3]))),
-        ]);
-        let right = HashMap::from([
-            ("shard".to_string(), scalar(Int64Array::from(vec![3]))),
-            (
-                "service".to_string(),
-                scalar(StringViewArray::from(vec!["api"])),
-            ),
-        ]);
+    fn a_document_without_a_format_is_a_delta_database_and_stays_so_when_rewritten() {
+        let manifest: CatalogManifest =
+            serde_json::from_str(r#"{"version":3,"schemas":[{"name":"main","table_ids":{}}]}"#)
+                .unwrap();
 
-        assert!(scalar_values_equal(&left, &right));
+        let rewritten = serde_json::to_string(&manifest).unwrap();
+
+        assert_eq!(manifest.table_format(), TableFormat::Delta);
+        assert!(!rewritten.contains("table_format"), "{rewritten}");
+    }
+
+    #[test]
+    fn a_recorded_format_round_trips_and_accepts_the_deltalake_alias() {
+        let iceberg: CatalogManifest =
+            serde_json::from_str(r#"{"version":0,"table_format":"iceberg"}"#).unwrap();
+        let aliased: CatalogManifest =
+            serde_json::from_str(r#"{"version":0,"table_format":"deltalake"}"#).unwrap();
+
+        let rewritten = serde_json::to_string(&iceberg).unwrap();
+
+        assert_eq!(iceberg.table_format(), TableFormat::Iceberg);
+        assert_eq!(aliased.table_format(), TableFormat::Delta);
+        assert!(
+            rewritten.contains(r#""table_format":"iceberg""#),
+            "{rewritten}"
+        );
     }
 }

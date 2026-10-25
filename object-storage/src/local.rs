@@ -6,11 +6,43 @@ use super::{
     StoreConnection, StoreError,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The local-filesystem backend: keys are paths under `root`.
 #[derive(Debug)]
 pub struct LocalStore {
     root: PathBuf,
+}
+
+/// Distinguishes the temp files one process has in flight, so two writes of
+/// one key never share a staging file.
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A staging path beside `target` that no other writer, in this process or
+/// another, is using: dot-prefixed so a listing by name prefix never sees it,
+/// and unique by process id and an in-process counter.
+fn unique_temp_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    target.with_file_name(format!(".{name}.{}-{counter}.tmp", std::process::id()))
+}
+
+/// Write `data` to a fresh staging file beside `target`, creating the parent
+/// directory, and hand back the staging path to publish by rename or link.
+fn stage_bytes(target: &Path, key: &ObjectPath, data: &[u8]) -> Result<PathBuf> {
+    let io_error = |source| StoreError::Io {
+        key: key.to_string(),
+        source,
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    let staged = unique_temp_path(target);
+    std::fs::write(&staged, data).map_err(io_error)?;
+    Ok(staged)
 }
 
 impl LocalStore {
@@ -78,23 +110,40 @@ impl ObjectStore for LocalStore {
 
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let path = self.path_for(key);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+        // Write a staging file and rename over the target, so a concurrent
+        // reader sees the old or new file whole — never a half-written one.
+        let staged = stage_bytes(&path, key, data)?;
+        std::fs::rename(&staged, &path).map_err(|source| {
+            let _ = std::fs::remove_file(&staged);
+            StoreError::Io {
                 key: key.to_string(),
                 source,
-            })?;
-        }
-        // Write a sibling temp file and rename over the target, so a concurrent
-        // reader sees the old or new file whole — never a half-written one.
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, data).map_err(|source| StoreError::Io {
-            key: key.to_string(),
-            source,
-        })?;
-        std::fs::rename(&tmp, &path).map_err(|source| StoreError::Io {
-            key: key.to_string(),
-            source,
+            }
         })
+    }
+
+    /// Publish by hard link instead of rename: linking a new name to the
+    /// staged inode fails with `AlreadyExists` when the name is taken, which is
+    /// the atomic "create only if absent" the filesystem offers, and the name
+    /// appears with the whole object behind it. The staging file is removed
+    /// whether the link landed or not.
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
+        let path = self.path_for(key);
+        let staged = stage_bytes(&path, key, data)?;
+        let linked = std::fs::hard_link(&staged, &path);
+        let _ = std::fs::remove_file(&staged);
+        match linked {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(StoreError::VersionConflict {
+                    key: key.to_string(),
+                })
+            }
+            Err(source) => Err(StoreError::Io {
+                key: key.to_string(),
+                source,
+            }),
+        }
     }
 
     /// Read-modify-write under an exclusive advisory lock, so two writers —
@@ -147,10 +196,11 @@ impl ObjectStore for LocalStore {
         }
     }
 
-    fn list_with_name_prefix(
+    fn list_from(
         &self,
         prefix: &ObjectPath,
         name_prefix: &str,
+        after_name: &str,
     ) -> Result<DirectoryListing> {
         let dir = self.path_for(prefix);
         let entries = match std::fs::read_dir(&dir) {
@@ -176,7 +226,7 @@ impl ObjectStore for LocalStore {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if !name.starts_with(name_prefix) {
+            if !name.starts_with(name_prefix) || name.as_str() <= after_name {
                 continue;
             }
             let file_type = entry.file_type().map_err(|source| StoreError::Io {
@@ -289,6 +339,96 @@ mod tests {
         store.update(&p("k"), &mut |_| None).unwrap();
 
         assert_eq!(store.get(&p("k")).unwrap().unwrap(), b"kept");
+    }
+
+    #[test]
+    fn put_if_absent_creates_once_then_conflicts_and_keeps_the_first_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path()).unwrap();
+
+        store.put_if_absent(&p("t/v1"), b"first").unwrap();
+        let second = store.put_if_absent(&p("t/v1"), b"second");
+
+        assert!(matches!(second, Err(StoreError::VersionConflict { .. })));
+        assert_eq!(store.get(&p("t/v1")).unwrap().unwrap(), b"first");
+    }
+
+    #[test]
+    fn put_if_absent_leaves_no_staging_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path()).unwrap();
+        store.put_if_absent(&p("k"), b"1").unwrap();
+
+        let _ = store.put_if_absent(&p("k"), b"2");
+
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["k"]);
+    }
+
+    #[test]
+    fn racing_creates_of_one_key_admit_exactly_one_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(LocalStore::new(dir.path()).unwrap());
+
+        let outcomes: Vec<_> = (0..16u8)
+            .map(|writer| {
+                let store = store.clone();
+                std::thread::spawn(move || store.put_if_absent(&p("v"), &[writer]))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(winners, 1);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Ok(()) | Err(StoreError::VersionConflict { .. })))
+        );
+    }
+
+    #[test]
+    fn concurrent_puts_of_one_key_all_succeed_and_leave_one_whole_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(LocalStore::new(dir.path()).unwrap());
+
+        let handles: Vec<_> = (0..8u8)
+            .map(|writer| {
+                let store = store.clone();
+                std::thread::spawn(move || store.put(&p("k"), &[writer; 64]))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let bytes = store.get(&p("k")).unwrap().unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+    }
+
+    #[test]
+    fn list_from_returns_only_names_after_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path()).unwrap();
+        for name in ["v01", "v02", "v03", "w01"] {
+            store.put(&p(&format!("d/{name}")), b"x").unwrap();
+        }
+
+        let listed = store.list_from(&p("d"), "v", "v02").unwrap();
+
+        let mut names: Vec<_> = listed
+            .objects
+            .iter()
+            .map(|object| object.file.path.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["v03"]);
     }
 
     #[test]

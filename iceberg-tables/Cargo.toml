@@ -1,0 +1,36 @@
+[package]
+name = "iceberg-tables"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Reading and writing Iceberg tables with Pivot's own Parquet engine and object stores: a table's metadata, manifests and snapshots, the Parquet upload sink that writes its data files, and the seam through which a new table version is published, to a directory or to a catalog service."
+
+[dependencies]
+planner = { workspace = true }
+dispatch = { workspace = true }
+object-storage = { workspace = true }
+parquet-engine = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+# Casting a column to the Arrow type its partition transform takes.
+arrow-cast = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# The spec crate's manifest writers are async; they are driven to completion
+# on the ambient runtime or on one of this crate's own.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+crossbeam-deque = { workspace = true }
+roaring = { workspace = true }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+# The Iceberg spec types: table metadata, schemas, manifests, snapshots.
+# Pinned to our fork's branch off the 0.11.x release branch, the first with
+# the format version 3 deletion-vector work, plus the commits making its
+# `delete_vector` module public (apache/iceberg-rust#3461) and letting an
+# engine that builds its own snapshots construct a `TableCommit`, until a
+# release carries them.
+iceberg = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,24 @@
+[package]
+name = "table-compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Background compaction of a table's Parquet files, whichever datastore and table format holds it: the small-file and layout planners, the actor that runs their merges, and the merge dataflow."
+
+[dependencies]
+dispatch = { workspace = true }
+object-storage = { workspace = true }
+parquet-engine = { workspace = true }
+planner = { workspace = true }
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-schema = { workspace = true }
+crossbeam-deque = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# The actor runs rounds and commands on the ambient runtime and drives each
+# merge dataflow from a blocking thread.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["v4"] }

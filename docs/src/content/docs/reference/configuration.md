@@ -68,6 +68,7 @@ datastores:
     kind: pivotlake
     location: /var/lib/pivot/datastores/<name>
     default: true               # on exactly one datastore
+    # table_format: iceberg     # or delta; applies when the database is created
     # compact: true
     # compact_bytes: 64m
     # compact_merge_bytes: <1.3 x compact_bytes>

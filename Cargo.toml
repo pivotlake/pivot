@@ -6,12 +6,14 @@ members = [
     "catalog",
     "datastore-iceberg",
     "datastore-pivotlake",
+    "iceberg-tables",
     "dispatch",
     "duckdb-planner",
     "metastore-disk",
     "parquet-engine",
     "planner",
     "object-storage",
+    "table-compaction",
 ]
 # arrow-rs (vendored submodule) and perfy are workspaces of their own; they
 # resolve and lock independently.
@@ -29,12 +31,14 @@ publish = false
 catalog = { path = "catalog" }
 datastore-iceberg = { path = "datastore-iceberg" }
 datastore-pivotlake = { path = "datastore-pivotlake" }
+iceberg-tables = { path = "iceberg-tables" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore-disk = { path = "metastore-disk" }
 parquet-engine = { path = "parquet-engine" }
 planner = { path = "planner" }
 object-storage = { path = "object-storage" }
+table-compaction = { path = "table-compaction" }
 
 # The vendored arrow-rs fork (git submodule). `parquet` is the strict,
 # spec-compliant reader used only as a test oracle by crates with their own
