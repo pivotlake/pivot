@@ -153,7 +153,8 @@ required, including when serving one local directory. Exactly one datastore must
 becomes the current database (the target of unqualified table names). Every
 datastore is attached as a database of its own name, so a query reads any other
 one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
-implementation (`pivotlake` or `iceberg`); the storage backend is inferred from `location` (a plain
+implementation (`pivotlake` or `iceberg`); a pivotlake datastore's `table_format` (`iceberg`, the default, or
+`delta`) is the table format a new database is created in; the storage backend is inferred from `location` (a plain
 path is local, an `s3://` URI is S3, a `gs://` URI is Google Cloud Storage).
 Compaction is configured per datastore with `compact`. `compact_bytes` targets
 the compaction output size; files strictly below half that size are small-file
@@ -196,7 +197,7 @@ Pivot holds `.pivot.lock` in that directory until shutdown and reports the
 owning PID if another process tries to open it.
 
 `datastore_refresh_interval` sets how often each datastore brings itself up
-to date with the store: new Delta versions, new files' footers, and, for shared
+to date with the store: new table versions, new files' footers, and, for shared
 remote stores, tables committed by other processes. It bounds how stale a query's view of externally committed data can
 be; this process's own INSERT and compaction publish their commits immediately.
 

@@ -91,7 +91,12 @@ fn create_events(
             .put(&ObjectPath::new(format!("events/{name}")), &pq(values))
             .unwrap();
     }
-    let datastore = PivotlakeDatastore::open(&b.root, d).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &b.root,
+        d,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(adopting_request("events", "events"))
@@ -161,7 +166,12 @@ mod bodies {
         b.store
             .put(&ObjectPath::new("events/p1.parquet"), &pq(&[1, 2, 3]))
             .unwrap();
-        let datastore = PivotlakeDatastore::open(&b.root, &d).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            &b.root,
+            &d,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -188,7 +198,12 @@ mod bodies {
             .unwrap();
         let absolute = b.store.absolute_key(&ObjectPath::new("outside")).unwrap();
         assert!(absolute.is_absolute(), "the store yields an absolute key");
-        let datastore = PivotlakeDatastore::open(&b.root, &d).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            &b.root,
+            &d,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -209,7 +224,12 @@ mod bodies {
         let d = dispatch_with_buffers(2, 32);
         drop(create_events(&d, b, &[("p1.parquet", &[1, 2, 3])]));
 
-        let reopened = PivotlakeDatastore::open(&b.root, &d).unwrap();
+        let reopened = PivotlakeDatastore::open_with_format(
+            &b.root,
+            &d,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
 
         assert_eq!(scan(&d, &reopened, "events"), vec![1, 2, 3]);
     }

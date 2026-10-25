@@ -50,8 +50,8 @@ SQL refers to it. `kind` selects the implementation:
 
 | Kind | Description |
 | --- | --- |
-| `pivotlake` | Pivot's own read-write tables, stored as Delta Lake tables of Parquet files in a local directory or a bucket. Also accepted as `pivot`. |
-| `iceberg` | The tables of an Iceberg REST catalog, read and appended to with `INSERT`. |
+| `pivotlake` | Pivot's own read-write tables, stored as Iceberg or Delta Lake tables of Parquet files in a local directory or a bucket. Also accepted as `pivot`. See [Table formats](#table-formats). |
+| `iceberg` | The tables of an Iceberg REST catalog (`uri`), read and written in place. |
 
 ### Default datastore
 
@@ -87,6 +87,7 @@ datastores:
 | Key | Default | Description |
 | --- | --- | --- |
 | `location` | Required | Where the datastore's tables are stored. See the table below. |
+| `table_format` | `iceberg` | The table format a database that does not exist yet at `location` is created in: `iceberg` or `delta` (also spelled `deltalake`). See [Table formats](#table-formats). |
 | `default` | `false` | Whether this is the [default datastore](#default-datastore). |
 | `compact` | `true` | Run background compaction. See [Compaction](#compaction). |
 | `compact_bytes` | `64m` | The target size of a compacted file. |
@@ -107,7 +108,39 @@ The storage backend is chosen from the location's scheme:
 A local directory is created if it does not exist, and only one process at a
 time can open it. A location with any other scheme is a startup error.
 
+#### Table formats
+
+A pivotlake database keeps every one of its tables in one table format,
+chosen when the database is created and recorded in its index,
+`_pivot_manifest.json` at the location's root. A database that does not
+exist yet is created in the format `table_format` names, `iceberg` unless it says
+`delta`; an existing database keeps the format it was created in, whatever
+`table_format` says, and naming the other one is a startup error. A database
+created before the index recorded a format is a Delta Lake database. Pivot
+needs no catalog service for either format: the index names the schemas and
+tables and maps each table to a directory named after its identity, and the
+table's own metadata lives in that directory.
+
+| Format | Table layout | Readable by |
+| --- | --- | --- |
+| `iceberg` | An Iceberg format-version-3 table: metadata under `<table>/metadata/` as `v<N>.metadata.json` files, one per commit, with their manifest lists and manifests. | Any Iceberg reader that opens a table by its path, such as DuckDB's `iceberg_scan('<location>/<table directory>')`: Pivot rewrites the `version-hint.text` such readers look for after every commit. Spark's `HadoopTables` path reader does not accept the zero-padded metadata file names; Spark reads these tables through a catalog. |
+| `delta` | A Delta Lake table: a `_delta_log` of commit files and checkpoints. | Any Delta Lake reader, such as DuckDB's `delta_scan`. |
+
+A commit to an Iceberg table creates the next numbered metadata file with a
+conditional write, and a commit to a Delta table appends the next log entry
+the same way, so writers in several processes can share one location:
+exactly one lands each version, and the others reload and retry. The store
+must support conditional writes (Amazon S3, Google Cloud Storage, MinIO, or
+a local filesystem); a location on an S3-compatible service without them
+fails every commit.
+
 ### Iceberg datastores
+
+An `iceberg` datastore serves the tables of a REST catalog: every table the
+catalog lists can be queried, and `INSERT`, `COPY`, `CREATE TABLE` and
+`DROP TABLE` go through the catalog. The Iceberg tables Pivot keeps in a
+directory of its own belong to a `pivotlake` datastore in the `iceberg`
+[table format](#table-formats).
 
 ```yaml
 datastores:
@@ -126,28 +159,46 @@ datastores:
 | `properties` | `{}` | Additional REST client properties, passed to the catalog client as written. |
 | `default` | `false` | Whether this is the [default datastore](#default-datastore). |
 
-Each catalog namespace appears as a schema. Table files are read from the
-locations the catalog reports, using the credentials the catalog vends, or the
-[storage secret](#storage-credentials) whose scope covers the file when it
-vends none. Vended credentials are renewed at every [refresh](#refresh), in
-place, so a statement that runs longer than they last keeps reading and
-writing; when the catalog says when they expire, a refresh runs early enough to
-renew them first.
-
-`INSERT` and `COPY` append to a catalog table: the rows are written as Parquet
-files under the table's data path, partitioned as the table's partition spec
-says (a transform such as `day(ts)` or `bucket(16, id)` is computed per row),
-and committed as one append snapshot through the catalog. A table is created
-and dropped through the catalog itself, and maintained by it: compaction,
-snapshot expiry and vacuum are the catalog's, not Pivot's. An `INSERT` into a
-format version 1 table is refused; a `NULL` in a column the table declares
-`required` fails the statement.
+Each catalog namespace appears as a schema. Table files are read from and
+written to the locations the catalog reports, using the credentials the
+catalog vends, or the [storage secret](#storage-credentials) whose scope
+covers the file when it vends none. Vended credentials are renewed at every
+[refresh](#refresh), in place, so a statement that runs longer than they last
+keeps reading and writing; when the catalog says when they expire, a refresh
+runs early enough to renew them first.
 
 Format version 3 deletion vectors are supported. A table carrying any other
 kind of delete file is refused rather than read with the deleted rows present.
 
 If the catalog becomes unreachable, the datastore keeps serving the tables it
 last loaded and retries on the next [refresh](#refresh).
+
+#### Writing to catalog tables
+
+An `INSERT` or `COPY` writes its Parquet files under the table's data path
+(`write.data.path`, else `<location>/data/`), cut by the table's partition
+spec: a transform of a column (`day(ts)`, `bucket(16, id)`, `truncate(4, s)`)
+is computed per row, and each file's partition values are recorded in the
+manifest, so every engine prunes by them. The files are committed as one
+append snapshot through the catalog's `updateTable`, which admits the commit
+only if no other writer moved the table's `main` branch in the meantime; a
+commit that lost that race is rebuilt on the winner. The session reads its own writes at
+once, before the next refresh. `CREATE TABLE` registers a format-version-3
+table through the catalog, which assigns its location; it takes the same
+`partition_by` and `sort_by` options as a pivotlake table. `DROP TABLE`
+unregisters the table and leaves its files in place, as `DROP TABLE` without
+`PURGE` does in other engines.
+
+Pivot never compacts, expires snapshots of, or vacuums a catalog table: that
+is the catalog's own maintenance, and other engines may share the table.
+
+A write is refused, naming the reason, when the table's shape is one this
+writer cannot honour: a partition field whose key it cannot compute (a source
+that is not a top-level column, a field named like a column, or a transform
+the Iceberg library cannot evaluate for the column's type), a format version
+below 2, delete files or deletion vectors in the current snapshot, or a
+column type Pivot cannot represent. A `NULL` in a column the table declares
+required fails the statement.
 
 ## Storage credentials
 
@@ -269,8 +320,7 @@ the user the server runs as.
 ## Maintenance
 
 A server keeps each pivotlake datastore up to date and tidy with three background
-tasks. Iceberg datastores are only refreshed; their tables are maintained by
-the catalog.
+tasks. Iceberg datastores are only refreshed.
 
 | Task | Runs | Setting |
 | --- | --- | --- |
@@ -283,9 +333,7 @@ the catalog.
 Every refresh interval, each datastore reloads the tables it holds and the
 files each table has committed. Commits made by this server are visible
 immediately. Commits made by another process to a shared datastore, or tables
-added to an Iceberg catalog, become visible at the next refresh. A refresh of
-an Iceberg catalog also renews the storage credentials the catalog vends, and
-runs sooner than the interval when they would otherwise expire first.
+added to an Iceberg catalog, become visible at the next refresh.
 
 ### Compaction
 
@@ -320,7 +368,8 @@ older than the table's retention window:
 | Files | Retention |
 | --- | --- |
 | Data files no longer referenced, including a dropped table's | 4 hours |
-| Log files made redundant by a checkpoint | 24 hours |
+| Iceberg snapshots, with their manifests and metadata files, superseded for longer than the window | 4 hours |
+| Delta log files made redundant by a checkpoint | 24 hours |
 
 A query that is still reading an older version of a table keeps working for
 as long as that version's files are retained.

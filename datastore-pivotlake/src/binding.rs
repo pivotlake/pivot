@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
 use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
@@ -16,9 +15,10 @@ use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use planner::expression::{CompareType, Expression};
+use planner::expression::Expression;
 
-use super::insert_sink::build_insert_spec;
+use iceberg_tables::sink::build_insert_spec;
+
 use super::{CatalogTable, CommitAction, PendingInsert};
 
 /// A catalog table resolved from one transaction: it captures the snapshot's own
@@ -43,9 +43,12 @@ pub struct TableBinding {
     /// Per-column footer-derived nullability, in `columns` order (see
     /// [`CatalogTable::nullability`](super::table::CatalogTable)).
     nullability: Vec<bool>,
-    /// Single-column predicates pushed down for this binding (recorded here
-    /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
-    /// `compile`); applied as a filter when the scan is compiled.
+    /// The filters pushed down for this binding (recorded here because the
+    /// `BoundTable` trait gives no channel from `pushdown_filter` to
+    /// `compile`): the format prunes files by them when the scan is compiled.
+    filters: Vec<Expression>,
+    /// The single-column predicates among `filters`, which prune row groups
+    /// and dictionaries once the row-group metadata exists.
     predicates: Vec<PushedPredicate>,
     /// The transaction's staging queue, shared (`Arc`) with the
     /// [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
@@ -67,70 +70,36 @@ impl std::fmt::Debug for TableBinding {
 
 impl TableBinding {
     /// A binding over the snapshot's `table` copy, sharing the transaction's
-    /// staging queue, with no predicates pushed yet.
+    /// staging queue, with no predicates pushed yet. Reads the footers the
+    /// table does not hold yet, for the columns' nullability.
     pub(super) fn new(
         reference: TableReference,
         table: CatalogTable,
         commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
-    ) -> Self {
+    ) -> CatalogResult<Self> {
         let columns = table.columns();
-        let nullability = table.nullability();
-        Self {
+        let nullability = table
+            .nullability()
+            .map_err(|e| CatalogError::Other(Box::new(e)))?;
+        Ok(Self {
             reference,
             table,
             columns,
             nullability,
+            filters: Vec::new(),
             predicates: Vec::new(),
             commit_actions,
-        }
+        })
     }
 
-    /// This table's row groups in the captured snapshot, partition-pruned by the
-    /// pushed equality predicates. Pure in-memory; the snapshot copy is
-    /// immutable, so a scan and its late materialize (same filters) build
-    /// identical views addressing the same global row-group indices.
+    /// This table's row groups in the captured snapshot, less the files the
+    /// pushed filters rule out. The snapshot copy is immutable, so a scan and
+    /// its late materialize (same filters) build identical views addressing
+    /// the same global row-group indices.
     fn resolve_files(&self) -> CatalogResult<Arc<ParquetTable>> {
-        let partition_filters: Vec<PartitionEqFilter> =
-            self.partition_filter_candidates().collect();
-        let stat_filters: Vec<ColumnStatFilter> = self.stat_filter_candidates().collect();
         self.table
-            .build_scan_view(&partition_filters, &stat_filters)
+            .scan(&self.filters)
             .map_err(|e| CatalogError::Other(Box::new(e)))
-    }
-
-    /// This binding's pushed equality predicates as partition-filter candidates:
-    /// the column name and the typed scalar. The catalog intersects these with
-    /// the table's partition columns, so yielding every equality predicate (not
-    /// just ones on partition columns, which the binding can't tell apart) is fine;
-    /// a non-partition column prunes no files.
-    fn partition_filter_candidates(&self) -> impl Iterator<Item = PartitionEqFilter> + '_ {
-        self.predicates
-            .iter()
-            .filter(|p| matches!(p.compare_type, CompareType::Equal))
-            .filter_map(|p| {
-                Some(PartitionEqFilter {
-                    column: self.columns.get(p.column_idx)?.name.clone(),
-                    value: p.value.clone(),
-                })
-            })
-    }
-
-    /// This binding's pushed predicates as file-level stat-filter candidates: a
-    /// plain top-level column comparison (no variant path) paired with its typed
-    /// constant. Variant paths are excluded — their stats live in a shredded leaf,
-    /// pruned per row group, not in the file's column stats. A column the file's
-    /// stats don't bound simply prunes no files.
-    fn stat_filter_candidates(&self) -> impl Iterator<Item = ColumnStatFilter> + '_ {
-        self.predicates
-            .iter()
-            .filter(|p| p.path.is_empty())
-            .filter_map(|p| {
-                Some(ColumnStatFilter {
-                    column: self.columns.get(p.column_idx)?.name.clone(),
-                    compare_type: p.compare_type,
-                    value: p.value.clone(),
-                })
-            })
     }
 }
 
@@ -199,7 +168,8 @@ impl BoundTable for TableBinding {
         // transaction's commit, which resolves the live table by its durable id
         // (surviving a concurrent rename).
         let uploaded_files = Arc::new(Injector::new());
-        let spec = build_insert_spec(&self.table, uploaded_files.clone(), input)?;
+        let spec = build_insert_spec(&self.table.insert_target(), uploaded_files.clone(), input)
+            .map_err(|error| CatalogError::from(crate::Error::from(error)))?;
         self.commit_actions.push(Box::new(PendingInsert {
             table_id: self.table.id(),
             uploaded_files,
@@ -245,6 +215,7 @@ impl BoundTable for TableBinding {
         // so this is purely an optimization and never affects correctness.
         self.predicates
             .extend(PushedPredicate::from_filter(&filter));
+        self.filters.push(filter);
 
         Ok(false)
     }

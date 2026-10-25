@@ -8,19 +8,21 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use iceberg_tables::Table as LoadedTable;
+use iceberg_tables::sink::build_insert_spec;
 use parquet_engine::{
     ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
-    BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
-    TableRevision,
+    BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, SchemaQualifiedTableName,
+    TableReference, TableRevision,
 };
 use planner::expression::Expression;
 
-use crate::CommitAction;
-use crate::table::LoadedTable;
-use crate::write::{PendingInsert, build_insert_spec, write_target};
+use crate::table::revision;
+use crate::write::{PendingInsert, WriteTarget, writable_target};
+use crate::{CommitAction, Error, IcebergDatastore};
 
 /// One reference to a table in a query. Filter pushdown finishes before the
 /// binding is cloned for materialization, and clones share the pruned scan
@@ -28,13 +30,17 @@ use crate::write::{PendingInsert, build_insert_spec, write_target};
 #[derive(Clone)]
 pub(crate) struct IcebergTableBinding {
     reference: TableReference,
+    /// The table's name in the datastore, which an insert is staged under.
+    name: SchemaQualifiedTableName,
     table: Arc<LoadedTable>,
     /// The filters pushed into this scan. Manifests and data files are pruned
     /// by them, row groups and dictionaries by the comparisons among them.
     filters: Vec<Expression>,
     /// Statistics, scanning, and late materialization reuse this binding's load.
     cached_pruned_parquet: Arc<Mutex<Option<Arc<ParquetTable>>>>,
-    /// The transaction's staging queue the INSERT's commit action lands on.
+    /// The datastore whose catalog an INSERT's commit lands through, and the
+    /// transaction's staging queue the INSERT's commit action lands on.
+    datastore: Arc<IcebergDatastore>,
     commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
 }
 
@@ -42,7 +48,7 @@ impl std::fmt::Debug for IcebergTableBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcebergTableBinding")
             .field("reference", &self.reference)
-            .field("metadata_location", &self.table.metadata_location)
+            .field("metadata_location", &self.table.metadata_location())
             .field("filters", &self.filters)
             .finish()
     }
@@ -52,13 +58,16 @@ impl IcebergTableBinding {
     pub(crate) fn new(
         reference: TableReference,
         table: Arc<LoadedTable>,
+        datastore: Arc<IcebergDatastore>,
         commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
     ) -> Self {
         Self {
+            name: SchemaQualifiedTableName::new(reference.schema.clone(), reference.table.clone()),
             reference,
             table,
             filters: Vec::new(),
             cached_pruned_parquet: Arc::default(),
+            datastore,
             commit_actions,
         }
     }
@@ -71,7 +80,7 @@ impl IcebergTableBinding {
         if let Some(table) = cached.as_ref() {
             return Ok(table.clone());
         }
-        let parquet = self.table.load_parquet(&self.filters)?;
+        let parquet = self.table.scan(&self.filters).map_err(crate::Error::from)?;
         let predicates: Vec<PushedPredicate> = self
             .filters
             .iter()
@@ -94,7 +103,7 @@ impl BoundTable for IcebergTableBinding {
     }
 
     fn table_revision(&self) -> TableRevision {
-        self.table.revision()
+        revision(&self.table)
     }
 
     fn supports_late_materialization(&self) -> bool {
@@ -127,20 +136,28 @@ impl BoundTable for IcebergTableBinding {
     }
 
     /// The write takes the table's shape and store from the snapshot this
-    /// query bound; the store's vended keys are renewed by the refresh, under
-    /// a write that outlives them. The files land on a queue of this
-    /// statement's own as the dataflow runs; the append staged here hands that
-    /// queue to the transaction's commit.
+    /// query bound, checked to be one this writer can honour; the store's
+    /// vended keys are renewed by the refresh, under a write that outlives
+    /// them. The files land on a queue of this statement's own as the dataflow
+    /// runs; the append staged here hands that queue to the transaction's
+    /// commit.
     fn compile_insert(
         &self,
         input: RecordBatchOperatorSpec,
         _dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        let target = Arc::new(write_target(&self.table)?);
+        let (insert_target, location) =
+            writable_target(&self.name, self.table.metadata(), self.table.store())?;
         let uploaded_files = Arc::new(Injector::new());
-        let spec = build_insert_spec(&target, uploaded_files.clone(), input)?;
+        let spec = build_insert_spec(&insert_target, uploaded_files.clone(), input)
+            .map_err(Error::from)?;
         self.commit_actions.push(Box::new(PendingInsert {
-            target,
+            target: Arc::new(WriteTarget {
+                name: self.name.clone(),
+                catalog: self.datastore.rest_table_catalog(&self.name),
+                store: self.table.store().clone(),
+                location,
+            }),
             uploaded_files,
         }));
         Ok(spec)
@@ -151,7 +168,7 @@ impl BoundTable for IcebergTableBinding {
     }
 
     fn nullability(&self) -> Vec<bool> {
-        self.table.nullability()
+        self.table.declared_nullability()
     }
 
     fn clone_box(&self) -> Box<dyn BoundTable> {

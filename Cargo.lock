@@ -1837,16 +1837,17 @@ name = "datastore-iceberg"
 version = "0.1.1"
 dependencies = [
  "arrow-array",
- "arrow-cast",
  "arrow-schema",
  "async-trait",
  "catalog",
  "crossbeam-deque",
+ "datastore-iceberg",
  "dispatch",
  "futures",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
+ "iceberg-tables",
  "object-storage",
  "parquet",
  "parquet-engine",
@@ -1854,13 +1855,14 @@ dependencies = [
  "reqwest 0.12.28",
  "roaring",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -1884,6 +1886,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "dispatch",
+ "iceberg-tables",
  "object-storage",
  "parquet",
  "parquet-engine",
@@ -2980,6 +2983,28 @@ dependencies = [
  "serde",
  "typetag",
  "url",
+]
+
+[[package]]
+name = "iceberg-tables"
+version = "0.1.1"
+dependencies = [
+ "arrow-array",
+ "arrow-cast",
+ "arrow-schema",
+ "crossbeam-deque",
+ "dispatch",
+ "iceberg",
+ "object-storage",
+ "parquet-engine",
+ "planner",
+ "roaring",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

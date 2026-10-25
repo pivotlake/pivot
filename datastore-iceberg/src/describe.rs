@@ -1,18 +1,28 @@
 //! System catalog metadata. Footer reads are batched to bound retained metadata.
 
 use crate::Result;
-use crate::manifests::FileDescriptor;
-use crate::table::LoadedTable;
 use catalog::datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, DatastoreTableMetadata};
 use iceberg::spec::{DataFile, Datum, Literal, PrimitiveType, Schema, Type};
+use iceberg_tables::{FileDescriptor, Table as LoadedTable};
+use planner::catalog::SchemaQualifiedTableName;
 use serde_json::{Value, value::RawValue};
 use std::collections::BTreeMap;
 
-pub(crate) fn describe_table(table: &LoadedTable) -> Result<DatastoreTableMetadata> {
-    let data_files = table.load_all_data_files()?;
-    let files: Vec<_> = data_files
+pub(crate) fn describe_table(
+    name: &SchemaQualifiedTableName,
+    table: &LoadedTable,
+) -> Result<DatastoreTableMetadata> {
+    let manifests = table.decoded_manifests()?;
+    let files: Vec<_> = manifests
         .iter()
-        .map(|file| (file.manifest, file.data))
+        .flat_map(|manifest| {
+            manifest
+                .manifest
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_alive())
+                .map(move |entry| (manifest.manifest.as_ref(), entry.data_file()))
+        })
         .collect();
     let mut column_bytes = vec![(0u64, 0u64); table.columns().len()];
     let mut described = Vec::with_capacity(files.len());
@@ -42,7 +52,7 @@ pub(crate) fn describe_table(table: &LoadedTable) -> Result<DatastoreTableMetada
                     .partition_spec()
                     .partition_to_path(file.partition(), manifest.metadata().schema.clone())
                     .replace('/', ","),
-                min_max_stats: format_min_max_stats(table.metadata.current_schema(), file)
+                min_max_stats: format_min_max_stats(table.metadata().current_schema(), file)
                     .map_err(Box::new)?,
             });
         }
@@ -60,17 +70,17 @@ pub(crate) fn describe_table(table: &LoadedTable) -> Result<DatastoreTableMetada
                 position,
                 bytes,
                 bytes_uncompressed,
-                is_partition_key: table.partition_by.contains(&column.name),
-                is_sort_key: table.sort_by.contains(&column.name),
+                is_partition_key: table.partition_by().contains(&column.name),
+                is_sort_key: table.sort_by().contains(&column.name),
             }
         })
         .collect();
     Ok(DatastoreTableMetadata {
-        name: table.name.clone(),
-        id: table.uuid.clone(),
+        name: name.clone(),
+        id: table.uuid().to_string(),
         columns,
-        sort_by: table.sort_by.clone(),
-        partition_by: table.partition_by.clone(),
+        sort_by: table.sort_by().to_vec(),
+        partition_by: table.partition_by().to_vec(),
         total_rows: files.iter().map(|(_, file)| file.record_count()).sum(),
         bytes: described.iter().map(|file| file.bytes).sum(),
         bytes_uncompressed: described.iter().map(|file| file.bytes_uncompressed).sum(),

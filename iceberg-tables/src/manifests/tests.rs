@@ -122,7 +122,7 @@ fn partitioned_by(schema: &SchemaRef, spec_id: i32, transform: IcebergTransform)
 /// specs are the ones the manifests were written under.
 fn data_files(current: &SchemaRef, manifests: &[Manifest]) -> DataFiles {
     DataFiles {
-        manifests: manifests.to_vec(),
+        manifests: manifests.iter().cloned().map(Arc::new).collect(),
         schema: current.clone(),
         partition_specs: manifests
             .iter()

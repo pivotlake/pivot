@@ -9,7 +9,7 @@ in an interactive SQL shell, or runs the PostgreSQL-compatible server.
 ## Usage
 
 ```sh
-pivot open [--kind pivotlake] [--memory <SIZE>] [--workers <COUNT>] <DIRECTORY | URI>
+pivot open [--kind pivotlake] [--table-format <FORMAT>] [--memory <SIZE>] [--workers <COUNT>] <DIRECTORY | URI>
 pivot open --kind iceberg [--warehouse <WAREHOUSE>] [--memory <SIZE>] [--workers <COUNT>] <CATALOG_URI>
 pivot server --config <FILE>
 pivot --help
@@ -33,6 +33,7 @@ Opens a single datastore and starts the [SQL shell](#sql-shell) over it.
 | --- | --- |
 | `<DATASTORE_LOCATION>` | **Required.** Where the datastore is: a local directory or object-store URI for `--kind pivotlake`, or the REST catalog's `http(s)` base URI for `--kind iceberg`. See [Datastore locations](#datastore-locations). |
 | `--kind <KIND>` | The datastore implementation, `pivotlake` (also accepted as `pivot`) or `iceberg`.<br />**Default:** `pivotlake` |
+| `--table-format <FORMAT>` | The [table format](/docs/reference/server/datastores/#table-formats) a pivotlake database that does not exist yet is created in, `iceberg` or `delta` (also spelled `deltalake`). An existing database keeps the format it was created in. Only valid with `--kind pivotlake`.<br />**Default:** `iceberg` |
 | `--warehouse <WAREHOUSE>` | The warehouse to serve, for an Iceberg catalog that serves several. Only valid with `--kind iceberg`. |
 | `--memory <SIZE>` | The buffer-pool budget, as a size such as `8g` or a share of memory such as `50%`. See [Memory budget](#memory-budget).<br />**Default:** `80%` |
 | `--workers <COUNT>` | The number of worker threads that execute queries. Must be at least 1.<br />**Default:** the number of available cores |
@@ -47,14 +48,17 @@ Opens a single datastore and starts the [SQL shell](#sql-shell) over it.
 | Google Cloud Storage | `pivotlake` | `gs://bucket/prefix` |
 | Iceberg REST catalog | `iceberg` | `https://catalog.example.com/api` |
 
-A local directory is created if it does not exist. Object-store credentials
-come from the [environment](#object-store-credentials).
+A local directory is created if it does not exist, in the table format
+`--table-format` names. Object-store credentials come from the
+[environment](#object-store-credentials).
 
-An Iceberg catalog's tables are read and appended to with `INSERT`; tables
-are created and dropped through the catalog itself. Each catalog namespace
-appears as a schema. Table files are read from and written to wherever the
-catalog says they are, using the credentials the catalog vends, or the
-[object-store variables](#object-store-credentials) when it vends none.
+An Iceberg catalog's tables are read and written through the catalog, and
+each catalog namespace appears as a schema. Table files are read from and
+written to wherever the catalog says they are, using the credentials the
+catalog vends, or the [object-store variables](#object-store-credentials)
+when it vends none. See [Writing to catalog
+tables](/docs/reference/server/datastores/#writing-to-catalog-tables) for what
+a write does and what is refused.
 
 :::caution[One process per local datastore]
 A local datastore can be open in only one process at a time. The process

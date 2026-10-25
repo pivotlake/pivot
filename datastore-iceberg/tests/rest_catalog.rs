@@ -768,9 +768,9 @@ impl Harness {
         }
     }
 
-    /// Run a writing statement through to its commit: what an INSERT needs
-    /// that a query does not. The commit lands on the harness runtime, since
-    /// it hops to the blocking pool.
+    /// Run a writing statement through to its commit: what an INSERT, a
+    /// CREATE TABLE or a DROP TABLE needs that a query does not. The commit
+    /// lands on the harness runtime, since it hops to the blocking pool.
     fn execute(
         &self,
         catalog: &PivotCatalog,
@@ -863,6 +863,11 @@ impl Harness {
             .collect();
         ids.sort();
         ids
+    }
+
+    fn object_exists(&self, namespace: &NamespaceIdent, table: &str, location: &str) -> bool {
+        let loaded = self.load(namespace, table);
+        self.block_on(loaded.file_io().exists(location)).unwrap()
     }
 }
 
@@ -1891,7 +1896,7 @@ fn late_materialization_preserves_row_indexes_across_files_and_row_groups() {
             .iter()
             .filter(|path| path.ends_with(".parquet"))
             .count(),
-        5,
+        3,
         "{reads:?}"
     );
 }
@@ -2584,7 +2589,7 @@ fn separate_bindings_keep_their_own_filters() {
 }
 
 #[test]
-fn overlapping_bindings_reload_metadata_and_keep_independent_row_group_filters() {
+fn overlapping_bindings_share_one_load_and_keep_independent_row_group_filters() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("overlapping", "orders", orders_schema());
     for ids in [[1, 2], [3, 4]] {
@@ -2620,7 +2625,7 @@ fn overlapping_bindings_reload_metadata_and_keep_independent_row_group_filters()
             .iter()
             .filter(|path| path.ends_with(".parquet"))
             .count(),
-        4,
+        2,
         "{reads:?}"
     );
     assert_eq!(
@@ -3133,6 +3138,113 @@ fn a_timestamp_column_compared_with_a_timestamptz_constant_prunes_files() {
         1,
         "{paths:?}"
     );
+}
+
+#[test]
+fn create_table_registers_a_v3_table_with_pivots_logical_types() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("made", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE made.readings (tiny TINYINT, big BIGINT, name VARCHAR) WITH (partition_by = 'name', sort_by = 'big')",
+        )
+        .unwrap();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO made.readings VALUES (7, 70, 'a'), (8, 80, 'b')",
+        )
+        .unwrap();
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT tiny, big FROM made.readings WHERE name = 'b'",
+    );
+
+    let table = harness.load(&namespace, "readings");
+    let metadata = table.metadata();
+    assert_eq!(metadata.format_version(), FormatVersion::V3);
+    let names: Vec<&str> = metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(names, ["tiny", "big", "name"]);
+    let tiny_id = metadata.current_schema().field_id_by_name("tiny").unwrap();
+    assert_eq!(
+        metadata.properties()["pivot.logical-types"],
+        format!(r#"{{"{tiny_id}":"Int8"}}"#)
+    );
+    assert_eq!(
+        metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["name"]
+    );
+    assert_eq!(metadata.default_sort_order().fields.len(), 1);
+    assert_eq!(rows[0].column(0).data_type(), &arrow_schema::DataType::Int8);
+    assert_eq!(int64_column(&rows, 1), [Some(80)]);
+}
+
+#[test]
+fn create_table_refuses_a_duplicate_unless_asked_not_to() {
+    let Some(harness) = harness() else { return };
+    harness.namespace("twice", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    let duplicate = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE twice.orders (id BIGINT)",
+        )
+        .unwrap_err();
+    let tolerated = harness.execute(
+        &catalog,
+        &mut planner,
+        "CREATE TABLE IF NOT EXISTS twice.orders (id BIGINT)",
+    );
+
+    assert!(duplicate.contains("already exists"), "{duplicate}");
+    assert!(tolerated.is_ok(), "{tolerated:?}");
+}
+
+#[test]
+fn drop_table_unregisters_the_table_and_leaves_its_files() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("dropped", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let file = harness.live_data_files(&namespace, "orders")[0]
+        .file_path()
+        .to_string();
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(&catalog, &mut planner, "DROP TABLE dropped.orders")
+        .unwrap();
+
+    let gone = harness.block_on(
+        harness
+            .writer
+            .load_table(&TableIdent::new(namespace.clone(), "orders".to_string())),
+    );
+    assert!(gone.is_err(), "the catalog still lists the table");
+    let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM dropped.orders");
+    assert!(error.contains("orders"), "{error}");
+    // The harness opens its file IO through a table of the namespace, so
+    // the dropped table's file is looked for through a sibling.
+    harness.create_table(&namespace, "sibling", orders_schema());
+    assert!(harness.object_exists(&namespace, "sibling", &file));
 }
 
 #[test]

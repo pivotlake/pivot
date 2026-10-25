@@ -8,7 +8,7 @@ use tracing_subscriber::fmt::MakeWriter;
 pub const DEFAULT_FILTER: &str = "info";
 
 /// Targets whose `INFO` output is noise for anyone reading the log.
-const QUIET_TARGETS: &str = "delta_kernel=warn,delta_kernel_default_engine=warn";
+const QUIET_TARGETS: &str = "delta_kernel=warn,delta_kernel_default_engine=warn,iceberg=warn";
 
 /// The config's `log` is not a `tracing` filter.
 #[derive(Debug, thiserror::Error)]
