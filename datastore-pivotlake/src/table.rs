@@ -855,7 +855,7 @@ impl CatalogTable {
             target_rows_per_group,
             max_output_file_size,
         );
-        let spec = super::insert_sink::upload_files_spec(
+        let spec = parquet_engine::writing::upload::upload_files_spec(
             self.store(),
             self.location.clone(),
             self.declared_columns(),
@@ -870,7 +870,7 @@ impl CatalogTable {
         loop {
             match uploaded_files.steal() {
                 Steal::Success(uploaded) => {
-                    let super::insert_sink::UploadedFile {
+                    let parquet_engine::writing::upload::UploadedFile {
                         file,
                         partition,
                         row_groups,

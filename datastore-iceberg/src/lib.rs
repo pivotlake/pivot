@@ -1,5 +1,5 @@
-//! A read-only [`catalog::datastore::Datastore`] over the tables of an Iceberg
-//! REST catalog.
+//! A [`catalog::datastore::Datastore`] over the tables of an Iceberg REST
+//! catalog: it reads them, and appends to them with `INSERT`.
 //!
 //! The catalog is the only source of table identity: namespaces are the
 //! datastore's schemas (single-level namespaces only, as a Pivot schema is one
@@ -58,6 +58,22 @@
 //! is in. The managed catalogs keep a table in one bucket; a table split
 //! across buckets is refused rather than read through the wrong store.
 //!
+//! # Writing
+//!
+//! An `INSERT` writes Parquet files under the table's data path through the
+//! store the catalog vended credentials for, partitioned the way the table's
+//! partition spec says (a transform of a column, a day or a bucket, is
+//! computed per row and recorded as the file's partition value), with each
+//! column under its Iceberg field id. The transaction's commit records the
+//! files in a manifest of their own, writes a manifest list naming it ahead
+//! of the current snapshot's manifests, and asks the catalog to add the
+//! snapshot and move `main` onto it, on the condition that `main` has not
+//! moved since the commit was built; when it has, the commit is built again
+//! on the winner. The table at the landed version replaces the index's entry
+//! at once, so the next query sees the rows before the background refresh
+//! does. Tables are created and dropped through the catalog itself, and
+//! maintained by it: nothing here compacts, expires or vacuums.
+//!
 //! # What is refused
 //!
 //! A table is refused, with an error naming the reason, rather than served
@@ -65,7 +81,10 @@
 //! other than deletion vectors (position-delete and equality-delete files are
 //! not applied), data files that are not Parquet, and a column whose Iceberg
 //! type has no Pivot type or whose initial default would require synthesizing
-//! values for older files.
+//! values for older files. An `INSERT` is refused into a format version 1
+//! table (its manifests carry no sequence numbers), and into a table whose
+//! partition spec names a field after a column or a transform its source
+//! column's type does not take.
 
 mod binding;
 mod columns;
@@ -77,13 +96,16 @@ mod pruning;
 mod rest_catalog;
 mod store;
 mod table;
+mod write;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
+use crossbeam_deque::{Injector, Steal};
 use dispatch::DataFlowDispatcher;
 use iceberg::table::Table;
 use iceberg::{Catalog, ErrorKind};
@@ -220,6 +242,51 @@ pub enum Error {
     Store(#[from] object_storage::StoreError),
     #[error("reading table metadata over the pool: {0}")]
     Load(#[from] dispatch::DataFlowError),
+    #[error("Iceberg metadata: {0}")]
+    Metadata(Box<iceberg::Error>),
+    #[error(
+        "table `{table}` is Iceberg format version {version}; only format versions 2 and 3 are written"
+    )]
+    UnsupportedFormatVersion { table: String, version: u8 },
+    #[error(
+        "table `{table}` partition field `{field}` has no source among the table's columns, so its files cannot be partitioned"
+    )]
+    UnsupportedPartitionSource { table: String, field: String },
+    #[error(
+        "table `{table}` partition field `{field}` is named like a column, so its key could not be told from the column's values"
+    )]
+    PartitionFieldNamedLikeColumn { table: String, field: String },
+    #[error(
+        "table `{table}` partition field `{field}` applies `{transform}`, which cannot be computed for its source column: {message}"
+    )]
+    UnsupportedPartitionTransform {
+        table: String,
+        field: String,
+        transform: String,
+        message: String,
+    },
+    #[error(
+        "table `{table}` changed its partition spec while the insert ran; its files were written for the previous spec"
+    )]
+    PartitionSpecChanged { table: String },
+    #[error("committing to table `{table}` lost the race to another writer {attempts} times")]
+    CommitRacesExhausted { table: String, attempts: usize },
+    #[error("a commit write failed {attempts} times: {source}")]
+    CommitRetriesExhausted {
+        attempts: usize,
+        #[source]
+        source: object_storage::StoreError,
+    },
+    #[error("data file `{file}` has no statistics to record")]
+    MissingFileStats { file: String },
+    #[error("data file `{file}` cannot be recorded: {message}")]
+    InvalidDataFile { file: String, message: String },
+}
+
+impl Error {
+    fn metadata(error: iceberg::Error) -> Self {
+        Error::Metadata(Box::new(error))
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -267,7 +334,7 @@ pub struct IcebergDatastore {
 /// The datastore's index, built from one answer of the catalog and shaped as
 /// the catalog is: its schemas (the catalog's top-level namespaces), each
 /// holding its tables by name.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DatastoreIndex {
     schemas: HashMap<String, SchemaEntry>,
 }
@@ -287,6 +354,43 @@ impl DatastoreIndex {
             .flat_map(|schema| schema.tables.values())
             .filter_map(|entry| entry.as_ref().ok()?.store.keys_expire_at())
             .min()
+    }
+
+    /// The table `name` as `entry` has it, unless this index already holds a
+    /// later version of it; whether anything changed.
+    fn with_entry_if_newer(&mut self, name: &SchemaQualifiedTableName, entry: TableEntry) -> bool {
+        let tables = &mut self.schemas.entry(name.schema.clone()).or_default().tables;
+        if let Some(Ok(held)) = tables.get(&name.table)
+            && held.version() > entry.version()
+        {
+            return false;
+        }
+        tables.insert(name.table.clone(), Ok(entry));
+        true
+    }
+
+    /// This index (the catalog's latest answer) with every table `held`
+    /// has a later version of taken from `held` instead: a commit of this
+    /// process that landed after the answer was fetched is not undone by it.
+    fn merged_with(mut self, held: &DatastoreIndex) -> Self {
+        for (schema, held_schema) in &held.schemas {
+            let Some(fetched_schema) = self.schemas.get_mut(schema) else {
+                continue;
+            };
+            for (table, held_entry) in &held_schema.tables {
+                let (Ok(held_entry), Some(Ok(fetched_entry))) =
+                    (held_entry, fetched_schema.tables.get(table))
+                else {
+                    continue;
+                };
+                if held_entry.version() > fetched_entry.version() {
+                    fetched_schema
+                        .tables
+                        .insert(table.clone(), Ok(held_entry.clone()));
+                }
+            }
+        }
+        self
     }
 }
 
@@ -319,7 +423,7 @@ fn wait_before_refresh(
 /// indexed (it would not load, or its manifest list could not be sized) is
 /// entered with the reason, so a query over it reports that reason rather
 /// than "no such table".
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SchemaEntry {
     tables: HashMap<String, Result<TableEntry, String>>,
 }
@@ -328,6 +432,7 @@ struct SchemaEntry {
 /// what a load needs that the response does not say: the store its files are
 /// read through, signing with the credentials the catalog vended, and the
 /// size of the current snapshot's manifest list.
+#[derive(Clone)]
 struct TableEntry {
     table: Table,
     store: TableStore,
@@ -339,6 +444,14 @@ struct TableEntry {
 }
 
 impl TableEntry {
+    /// Where this entry's version stands among the table's: later commits
+    /// have higher sequence numbers, and a metadata change without a commit
+    /// a later update time.
+    fn version(&self) -> (i64, i64) {
+        let metadata = self.table.metadata();
+        (metadata.last_sequence_number(), metadata.last_updated_ms())
+    }
+
     fn manifest_list_path(&self) -> Option<&str> {
         self.table
             .metadata()
@@ -384,12 +497,44 @@ impl IcebergDatastore {
 
     /// Ask the catalog, through a client built for the occasion, for
     /// everything it holds and replace the index with the answer. A failure
-    /// leaves the index as it was.
+    /// leaves the index as it was. A table this process committed to while
+    /// the answer was in flight keeps the committed version, which is later
+    /// than the answer's.
     pub fn refresh(&self) -> Result<()> {
-        let catalog = build_rest_catalog(&self.config)?;
-        let fetched = self.fetch_index(&catalog)?;
-        *self.index.write().unwrap() = Arc::new(fetched);
+        let fetched = self.fetch_index(&self.catalog_client()?)?;
+        let mut index = self.index.write().unwrap();
+        *index = Arc::new(fetched.merged_with(&index));
         Ok(())
+    }
+
+    /// A client for the catalog, built for one use: a client exchanges an
+    /// OAuth2 credential for a token on its first request and never renews
+    /// it, so none is kept.
+    pub(crate) fn catalog_client(&self) -> Result<RestCatalog> {
+        build_rest_catalog(&self.config)
+    }
+
+    /// Publish `table`, at the version a commit of this process just landed,
+    /// into the index with the store the commit wrote through, so the next
+    /// query sees the version before the background refresh does. An entry
+    /// already later than it (another refresh got there first) stands.
+    pub(crate) fn publish_table(
+        &self,
+        name: &SchemaQualifiedTableName,
+        table: Table,
+        store: TableStore,
+        manifest_list_size: u64,
+    ) {
+        let entry = TableEntry {
+            table,
+            store,
+            manifest_list_size: Some(manifest_list_size),
+        };
+        let mut index = self.index.write().unwrap();
+        let mut updated = (**index).clone();
+        if updated.with_entry_if_newer(name, entry) {
+            *index = Arc::new(updated);
+        }
     }
 
     /// The index as `catalog` would have it now: a schema per top-level
@@ -538,6 +683,8 @@ impl Datastore for IcebergDatastore {
             datastore: self,
             index,
             loaded_tables: Mutex::new(HashMap::new()),
+            commit_actions: Arc::new(Injector::new()),
+            committed: AtomicBool::new(false),
         })
     }
 
@@ -593,16 +740,43 @@ impl Datastore for IcebergDatastore {
     }
 }
 
+/// One durable effect a statement staged on its transaction: the files an
+/// INSERT uploaded. The transaction's commit applies its actions in the
+/// order the statements ran; a failure stops the commit and the effects
+/// applied before it stay. Blocking catalog and store I/O, so
+/// [`IcebergTransaction::commit`] applies them on the blocking pool.
+pub(crate) trait CommitAction: Send {
+    fn apply(self: Box<Self>, datastore: &IcebergDatastore) -> Result<()>;
+}
+
+/// Everything `injector` holds, in the order it was pushed.
+pub(crate) fn drain_injector<T>(injector: &Injector<T>) -> Vec<T> {
+    let mut items = Vec::new();
+    loop {
+        match injector.steal() {
+            Steal::Success(item) => items.push(item),
+            Steal::Retry => continue,
+            Steal::Empty => return items,
+        }
+    }
+}
+
 /// One query's view of the catalog: the index as it was when the query began,
 /// which every schema check and bind of the query resolves against, so a
 /// refresh landing mid-query moves nothing under it. A table is loaded the
 /// first time the query touches it and kept for the query's lifetime, so a
 /// plan's scan and its late materialize see the same load, and a table the
-/// query names twice is loaded once.
+/// query names twice is loaded once. The writes its statements stage wait
+/// on `staged` for its commit.
 pub struct IcebergTransaction {
     datastore: Arc<IcebergDatastore>,
     index: Arc<DatastoreIndex>,
     loaded_tables: Mutex<HashMap<SchemaQualifiedTableName, Option<Arc<LoadedTable>>>>,
+    commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
+    /// Whether commit has run. A second commit is refused, and the drop
+    /// safety net discards the staged writes of a transaction its owner
+    /// never resolved.
+    committed: AtomicBool,
 }
 
 impl std::fmt::Debug for IcebergTransaction {
@@ -648,7 +822,11 @@ impl DatastoreTransaction for IcebergTransaction {
             schema: name.schema.clone(),
             table: name.table.clone(),
         };
-        Ok(Some(Box::new(IcebergTableBinding::new(reference, table))))
+        Ok(Some(Box::new(IcebergTableBinding::new(
+            reference,
+            table,
+            Arc::clone(&self.commit_actions),
+        ))))
     }
 
     fn table_revision(
@@ -669,6 +847,53 @@ impl DatastoreTransaction for IcebergTransaction {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(described)
+    }
+
+    async fn commit(&self) -> CatalogResult<()> {
+        // Marked at entry, not on success: the swap refuses a second commit,
+        // and a failed commit has already drained the staged state, so the
+        // drop net must not "roll back" what is no longer staged.
+        if self.committed.swap(true, Ordering::AcqRel) {
+            return Err(CatalogError::Other("transaction already committed".into()));
+        }
+        // A read-only transaction staged nothing: an in-memory no-op, run
+        // inline rather than pay a blocking-pool round trip.
+        if self.commit_actions.is_empty() {
+            return Ok(());
+        }
+        let datastore = Arc::clone(&self.datastore);
+        let commit_actions = drain_injector(&self.commit_actions);
+        tokio::task::spawn_blocking(move || -> CatalogResult<()> {
+            for action in commit_actions {
+                action.apply(&datastore)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| CatalogError::Other(format!("commit thread panicked: {error}").into()))?
+    }
+
+    fn rollback(&self) {
+        drain_injector(&self.commit_actions);
+    }
+}
+
+/// The safety net behind the explicit resolution points: a transaction
+/// dropped with staged writes and neither commit nor rollback run discards
+/// them here, so no owner mistake can leave them in limbo. Reaching this is
+/// a bug in the owner, hence the warning; read-only transactions drop
+/// silently.
+impl Drop for IcebergTransaction {
+    fn drop(&mut self) {
+        if self.committed.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.commit_actions.is_empty() {
+            tracing::warn!(
+                "transaction dropped with staged writes and no resolution; rolling back"
+            );
+            DatastoreTransaction::rollback(self);
+        }
     }
 }
 

@@ -65,6 +65,7 @@ mod shredding;
 mod stats;
 pub use stats::aggregate_file_stats;
 mod types;
+pub mod upload;
 
 pub use types::AssembledFile;
 
@@ -85,19 +86,53 @@ use types::{
     LocalMergeResult, ReadyFile,
 };
 
+/// How an INSERT's rows are split into files: by the values of the
+/// `key_columns`, in `key_columns` order. A file holds rows of one key, and
+/// its partition values are the key column values its rows share, by column
+/// name. The last `derived_key_columns` of the batch columns exist only to
+/// key the partition (a value computed from a row's columns ahead of the
+/// encoder, as a table format partitioned by a transform of a column needs):
+/// they are read for the key and the partition values, and are not written
+/// to the file.
+#[derive(Clone, Debug, Default)]
+pub struct Partitioning {
+    pub key_columns: Arc<[String]>,
+    pub derived_key_columns: usize,
+}
+
+impl Partitioning {
+    /// Files keyed by the values of the named table columns, every one of
+    /// them written.
+    pub fn by_columns(columns: &[String]) -> Self {
+        Self {
+            key_columns: columns.into(),
+            derived_key_columns: 0,
+        }
+    }
+}
+
 /// Appends Parquet construction to an existing record-batch dataflow.
 ///
 /// The retained-memory target cuts each partition's INSERT rows into output
 /// files. Callers first restore shredded variants with
-/// [`unshred_batches_spec`].
+/// [`unshred_batches_spec`]. `schema` is the batch schema, the derived key
+/// columns of `partitioning` last; the files are written without them.
 pub fn encode_record_batches_spec(
     spec: RecordBatchOperatorSpec,
     schema: SchemaRef,
-    partition_column_names: Arc<[String]>,
+    partitioning: Partitioning,
     sort_column_names: Arc<[String]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
+    let Partitioning {
+        key_columns: partition_column_names,
+        derived_key_columns,
+    } = partitioning;
+    assert!(
+        derived_key_columns <= schema.fields().len(),
+        "the derived key columns are among the batch columns"
+    );
     let partition_column_indices: Vec<usize> = partition_column_names
         .iter()
         .map(|name| {
@@ -128,6 +163,7 @@ pub fn encode_record_batches_spec(
                 .collect(),
             file_collector::factories(
                 partition_column_names,
+                derived_key_columns,
                 order_by.into(),
                 target_rows_per_group,
                 target_in_memory_bytes_per_file,
@@ -173,6 +209,7 @@ pub fn encode_compaction_batches_spec(
                 .collect(),
             file_collector::factories(
                 partition_column_names,
+                0,
                 order_by.into(),
                 target_rows_per_group,
                 usize::MAX,

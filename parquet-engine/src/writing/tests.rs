@@ -11,6 +11,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{
     ArrayRef, BinaryViewArray, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -26,7 +27,8 @@ use parquet_variant_compute::{
 use parquet_variant_json::VariantToJson;
 
 use super::{
-    AssembledFile, encode_compaction_batches_spec, encode_record_batches_spec, unshred_batches_spec,
+    AssembledFile, Partitioning, encode_compaction_batches_spec, encode_record_batches_spec,
+    unshred_batches_spec,
 };
 
 /// A 64 MiB file-cache ring, as the other in-crate write tests use.
@@ -145,12 +147,50 @@ fn write_grouped<T: IntoBatch>(
     let files: Vec<Vec<u8>> = encode_record_batches_spec(
         spec,
         schema,
-        partition_column_names,
+        Partitioning::by_columns(&partition_column_names),
         sort_column_names,
         rows_per_group,
         usize::MAX,
     )
     .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .execute()
+    .collect()
+    .unwrap();
+    dispatch.exit();
+    files
+}
+
+/// Writes one file per value of the batches' last column, which keys the
+/// partition without being written, and returns each file's bytes with the
+/// partition values the pipeline reported for it.
+fn write_by_derived_key<T: IntoBatch>(
+    items: Vec<T>,
+    key_column: &str,
+) -> Vec<(Vec<u8>, Option<crate::PartitionValues>)> {
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
+    let batches: Vec<RecordBatch> = items
+        .into_iter()
+        .map(|item| item.into_batch().unwrap())
+        .collect();
+    let schema = batches[0].schema();
+    let spec = unshred_batches_spec(values_input(dispatch.dispatcher(), batches).record_batches());
+    let files = encode_record_batches_spec(
+        spec,
+        schema,
+        Partitioning {
+            key_columns: Arc::from([key_column.to_string()]),
+            derived_key_columns: 1,
+        },
+        Arc::from([]),
+        1_024,
+        usize::MAX,
+    )
+    .map_each(|file: AssembledFile| {
+        (
+            file.bytes.runs().flatten().copied().collect::<Vec<u8>>(),
+            file.partition,
+        )
+    })
     .execute()
     .collect()
     .unwrap();
@@ -816,7 +856,7 @@ fn a_stream_past_the_file_target_cuts_several_sorted_files() {
     let files: Vec<Vec<u8>> = encode_record_batches_spec(
         spec,
         schema,
-        Arc::from([]),
+        Partitioning::default(),
         Arc::from(["key".to_string()]),
         500,
         8 * 1024,
@@ -879,6 +919,42 @@ fn a_partitioned_sorted_write_cuts_one_sorted_file_per_partition() {
         assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
         assert_eq!(keys.len(), 1_000);
     }
+}
+
+/// A key column that only derives the partition splits the files and names
+/// their partition values, and is not in the files themselves.
+#[test]
+fn a_derived_key_column_partitions_the_files_without_being_written() {
+    let ids: Vec<i64> = (0..100).collect();
+    let days: Vec<i32> = (0..100).map(|i| i % 2).collect();
+    let files = write_by_derived_key(
+        vec![ColumnsItem(vec![
+            ("id", Arc::new(Int64Array::from(ids)) as ArrayRef),
+            ("day", Arc::new(arrow_array::Int32Array::from(days))),
+        ])],
+        "day",
+    );
+
+    assert_eq!(files.len(), 2);
+    let mut keyed_days: Vec<i32> = Vec::new();
+    for (bytes, partition) in &files {
+        let batch = read_back(bytes);
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["id"]
+        );
+        assert_eq!(batch.num_rows(), 50);
+        let partition = partition.as_ref().unwrap();
+        let (day, _) = arrow_array::Datum::get(&partition["day"]);
+        keyed_days.push(day.as_primitive::<arrow_array::types::Int32Type>().value(0));
+    }
+    keyed_days.sort();
+    assert_eq!(keyed_days, [0, 1]);
 }
 
 /// A string sort key orders a file's rows too, through the general sort path

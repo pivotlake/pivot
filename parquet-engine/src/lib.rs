@@ -33,6 +33,13 @@ pub(crate) fn http_readahead() -> usize {
     *VALUE.get_or_init(|| dispatch::env::get_env_var_with_default("PIVOT_HTTP_READAHEAD", 64))
 }
 
+/// The arrow field-metadata key under which a field declares the Parquet field
+/// id its schema element is written with. The spelling arrow-rs and every other
+/// Parquet writer use, so a schema built for one writer carries over to this
+/// one. A table format that resolves columns by id (Iceberg) stamps it on
+/// every field it writes.
+pub const PARQUET_FIELD_ID_METADATA_KEY: &str = "PARQUET:field_id";
+
 mod external;
 pub use external::bind_read_parquet;
 

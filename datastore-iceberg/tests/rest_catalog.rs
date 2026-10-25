@@ -2,8 +2,9 @@
 //! `apache/iceberg-rest-fixture` image, storing its tables in the MinIO the
 //! object-storage harness starts, both in Docker. Tables are written through
 //! the iceberg crate's own writer and read back through a Pivot catalog and
-//! planner, exactly as a query would. Every test skips when Docker is not
-//! reachable, like the other object-store tests.
+//! planner, exactly as a query would; what a Pivot `INSERT` writes is read
+//! back through the iceberg crate's own scan. Every test skips when Docker is
+//! not reachable, like the other object-store tests.
 
 mod support;
 use support::ReadLog;
@@ -21,7 +22,9 @@ use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{Datastore, PivotCatalog};
 use datastore_iceberg::{IcebergCatalogConfig, IcebergDatastore};
 use dispatch::{DataFlowDispatcher, Dispatch};
+use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{
     DataFile, DataFileFormat, Datum, FormatVersion, Literal, Manifest, ManifestContentType,
     ManifestList, ManifestListWriter, ManifestWriterBuilder, NestedField, NestedFieldRef,
@@ -763,6 +766,103 @@ impl Harness {
             Ok(_) => panic!("`{sql}` planned, but should have failed"),
             Err(error) => error.to_string(),
         }
+    }
+
+    /// Run a writing statement through to its commit: what an INSERT needs
+    /// that a query does not. The commit lands on the harness runtime, since
+    /// it hops to the blocking pool.
+    fn execute(
+        &self,
+        catalog: &PivotCatalog,
+        planner: &mut Planner,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, String> {
+        let transaction = catalog.begin_transaction();
+        let batches = planner
+            .plan(sql, transaction.clone())
+            .map_err(|error| error.to_string())?
+            .compile(self.dispatcher(), transaction.as_ref())
+            .map_err(|error| error.to_string())?
+            .collect()
+            .map_err(|error| error.to_string())?;
+        self.block_on(transaction.commit())
+            .map_err(|error| error.to_string())?;
+        Ok(batches)
+    }
+
+    /// The live data files of `table`'s current snapshot as the catalog has
+    /// it, read through the writer's own file IO: each file's full location
+    /// with its record count and partition values.
+    fn live_data_files(&self, namespace: &NamespaceIdent, table: &str) -> Vec<DataFile> {
+        let loaded = self.load(namespace, table);
+        let metadata = loaded.metadata();
+        let Some(current) = metadata.current_snapshot() else {
+            return Vec::new();
+        };
+        let file_io = loaded.file_io();
+        self.block_on(async {
+            let list_bytes = file_io
+                .new_input(current.manifest_list())
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let list =
+                ManifestList::parse_with_version(&list_bytes, metadata.format_version()).unwrap();
+            let mut files = Vec::new();
+            for manifest_file in list.entries() {
+                let manifest_bytes = file_io
+                    .new_input(&manifest_file.manifest_path)
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap();
+                let manifest = Manifest::parse_avro(&manifest_bytes).unwrap();
+                files.extend(
+                    manifest
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.is_alive())
+                        .map(|entry| entry.data_file().clone()),
+                );
+            }
+            files
+        })
+    }
+
+    /// The `id`s the iceberg crate's own scan of `table` reads under
+    /// `predicate`: planned from the manifests and read through the writer's
+    /// file IO, so what this datastore recorded about each file is read back
+    /// by the reference reader every other engine trusts.
+    fn scan_ids(&self, namespace: &NamespaceIdent, table: &str, predicate: Predicate) -> Vec<i64> {
+        let loaded = self.load(namespace, table);
+        let batches: Vec<RecordBatch> = self.block_on(async {
+            loaded
+                .scan()
+                .with_filter(predicate)
+                .select(["id"])
+                .build()
+                .unwrap()
+                .to_arrow()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap()
+        });
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        ids.sort();
+        ids
     }
 }
 
@@ -3060,4 +3160,396 @@ fn a_string_range_reads_only_the_files_it_can_match() {
         1,
         "{paths:?}"
     );
+}
+
+#[test]
+fn an_insert_into_a_catalog_table_lands_as_an_append_snapshot() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("written", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let (catalog, mut planner) = harness.pivot();
+
+    let inserted = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO written.orders VALUES (2, 'bob', 2.0), (3, 'cy', 3.0)",
+        )
+        .unwrap();
+    let read_back = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM written.orders ORDER BY id",
+    );
+    harness.append(&namespace, "orders", orders(&[4], &["dee"], &[4.0]));
+    let after_another_writer = harness.query_until(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM written.orders ORDER BY id",
+        |batches| total_rows(batches) == 4,
+    );
+
+    assert_eq!(int64_column(&inserted, 0), [Some(2)]);
+    assert_eq!(int64_column(&read_back, 0), [Some(1), Some(2), Some(3)]);
+    assert_eq!(
+        int64_column(&after_another_writer, 0),
+        [Some(1), Some(2), Some(3), Some(4)]
+    );
+    let table = harness.load(&namespace, "orders");
+    let mut snapshots: Vec<_> = table.metadata().snapshots().collect();
+    snapshots.sort_by_key(|snapshot| snapshot.sequence_number());
+    assert_eq!(snapshots.len(), 3);
+    let pivot_snapshot = snapshots[1].summary();
+    assert_eq!(pivot_snapshot.operation, Operation::Append);
+    assert_eq!(pivot_snapshot.additional_properties["total-records"], "3");
+    assert_eq!(
+        pivot_snapshot.additional_properties["total-data-files"],
+        "2"
+    );
+    assert_eq!(pivot_snapshot.additional_properties["added-records"], "2");
+    let files = harness.live_data_files(&namespace, "orders");
+    let pivot_file = files
+        .iter()
+        .find(|file| file.record_count() == 2)
+        .expect("the inserted rows are one file");
+    assert!(
+        pivot_file
+            .file_path()
+            .starts_with(&format!("{}/data/", table.metadata().location())),
+        "{}",
+        pivot_file.file_path()
+    );
+    assert_eq!(pivot_file.lower_bounds()[&1], Datum::long(2));
+    assert_eq!(pivot_file.upper_bounds()[&1], Datum::long(3));
+    assert_eq!(
+        harness.scan_ids(
+            &namespace,
+            "orders",
+            Reference::new("id").greater_than_or_equal_to(Datum::long(2))
+        ),
+        [2, 3, 4]
+    );
+}
+
+#[test]
+fn an_insert_into_a_v3_table_assigns_row_ids() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.v3_namespace("lineage", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO lineage.orders VALUES (1, 'ann', 1.0), (2, 'bob', 2.0)",
+        )
+        .unwrap();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO lineage.orders VALUES (3, 'cy', 3.0)",
+        )
+        .unwrap();
+
+    let table = harness.load(&namespace, "orders");
+    let metadata = table.metadata();
+    assert_eq!(metadata.format_version(), FormatVersion::V3);
+    assert_eq!(metadata.next_row_id(), 3);
+    let current = metadata.current_snapshot().unwrap();
+    assert_eq!(current.first_row_id(), Some(2));
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM lineage.orders ORDER BY id",
+    );
+    assert_eq!(int64_column(&rows, 0), [Some(1), Some(2), Some(3)]);
+    assert_eq!(
+        harness.scan_ids(&namespace, "orders", Predicate::AlwaysTrue),
+        [1, 2, 3]
+    );
+}
+
+#[test]
+fn an_insert_into_an_identity_partitioned_table_records_each_files_partition() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "bycustomer",
+        "orders",
+        orders_schema(),
+        2,
+        "customer",
+        Transform::Identity,
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO bycustomer.orders VALUES (1, 'ann', 1.0), (2, 'bob', 2.0), (3, 'ann', 3.0)",
+        )
+        .unwrap();
+    let anns = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM bycustomer.orders WHERE customer = 'ann' ORDER BY id",
+    );
+
+    assert_eq!(int64_column(&anns, 0), [Some(1), Some(3)]);
+    let mut partitions: Vec<(String, u64)> = harness
+        .live_data_files(&namespace, "orders")
+        .iter()
+        .map(|file| {
+            let Some(Some(Literal::Primitive(PrimitiveLiteral::String(customer)))) =
+                file.partition().fields().first()
+            else {
+                panic!("a string partition value: {:?}", file.partition());
+            };
+            (customer.clone(), file.record_count())
+        })
+        .collect();
+    partitions.sort();
+    assert_eq!(partitions, [("ann".to_string(), 2), ("bob".to_string(), 1)]);
+    assert_eq!(
+        harness.scan_ids(
+            &namespace,
+            "orders",
+            Reference::new("customer").equal_to(Datum::string("bob"))
+        ),
+        [2]
+    );
+}
+
+/// A day partition is a value no column holds: it is computed from the
+/// timestamp per row, the files are cut by it, and it is recorded as each
+/// file's partition value, so a reader pruning by day finds the right files.
+#[test]
+fn an_insert_into_a_table_partitioned_by_day_cuts_one_file_per_day() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "byday",
+        "events",
+        events_schema(),
+        2,
+        "at_day",
+        Transform::Day,
+    );
+    let (catalog, mut planner) = harness.pivot();
+    let day_micros = 86_400_000_000i64;
+    let jan_first_2024 = 19_723i32;
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO byday.events VALUES \
+             (1, TIMESTAMP '2024-01-01 10:00:00'), \
+             (2, TIMESTAMP '2024-01-02 01:00:00'), \
+             (3, TIMESTAMP '2024-01-01 23:59:59')",
+        )
+        .unwrap();
+    let second_day = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM byday.events WHERE \"at\" >= TIMESTAMP '2024-01-02' ORDER BY id",
+    );
+
+    assert_eq!(int64_column(&second_day, 0), [Some(2)]);
+    let mut partitions: Vec<(i32, u64)> = harness
+        .live_data_files(&namespace, "events")
+        .iter()
+        .map(|file| {
+            let Some(Some(Literal::Primitive(PrimitiveLiteral::Int(day)))) =
+                file.partition().fields().first()
+            else {
+                panic!("a day partition value: {:?}", file.partition());
+            };
+            (*day, file.record_count())
+        })
+        .collect();
+    partitions.sort();
+    assert_eq!(partitions, [(jan_first_2024, 2), (jan_first_2024 + 1, 1)]);
+    let table = harness.load(&namespace, "events");
+    let data_file = harness.live_data_files(&namespace, "events");
+    assert!(
+        data_file
+            .iter()
+            .all(|file| !file.file_path().contains("at_day=")
+                || file.file_path().starts_with(table.metadata().location())),
+        "{data_file:?}"
+    );
+    assert_eq!(
+        harness.scan_ids(
+            &namespace,
+            "events",
+            Reference::new("at").greater_than_or_equal_to(Datum::timestamp_micros(
+                i64::from(jan_first_2024 + 1) * day_micros
+            )),
+        ),
+        [2]
+    );
+}
+
+/// A bucket partition hashes each row's id; the files are cut by bucket and
+/// record it, so a reader pruning an equality by bucket finds the file.
+#[test]
+fn an_insert_into_a_table_partitioned_by_bucket_records_each_files_bucket() {
+    let Some(harness) = harness() else { return };
+    let transform = Transform::Bucket(16);
+    let namespace = harness.partitioned_namespace(
+        "bybucket",
+        "orders",
+        orders_schema(),
+        1,
+        "id_bucket",
+        transform,
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO bybucket.orders VALUES (1, 'ann', 1.0), (2, 'bob', 2.0), (3, 'cy', 3.0), (4, 'dee', 4.0)",
+        )
+        .unwrap();
+    let third = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT customer FROM bybucket.orders WHERE id = 3",
+    );
+
+    assert_eq!(string_column(&third, 0), [Some("cy".to_string())]);
+    let mut expected_buckets: Vec<i32> = (1..=4).map(|id| bucket_of(&transform, id)).collect();
+    expected_buckets.sort();
+    expected_buckets.dedup();
+    let mut buckets: Vec<i32> = harness
+        .live_data_files(&namespace, "orders")
+        .iter()
+        .map(|file| {
+            let Some(Some(Literal::Primitive(PrimitiveLiteral::Int(bucket)))) =
+                file.partition().fields().first()
+            else {
+                panic!("a bucket partition value: {:?}", file.partition());
+            };
+            *bucket
+        })
+        .collect();
+    buckets.sort();
+    assert_eq!(buckets, expected_buckets);
+    assert_eq!(
+        harness.scan_ids(
+            &namespace,
+            "orders",
+            Reference::new("id").equal_to(Datum::long(3))
+        ),
+        [3]
+    );
+}
+
+#[test]
+fn a_commit_that_lost_the_race_is_rebuilt_on_the_winner() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("raced", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    let transaction = catalog.begin_transaction();
+    planner
+        .plan(
+            "INSERT INTO raced.orders VALUES (1, 'ann', 1.0)",
+            transaction.clone(),
+        )
+        .unwrap()
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    harness.append(&namespace, "orders", orders(&[2], &["bob"], &[2.0]));
+    harness.block_on(transaction.commit()).unwrap();
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM raced.orders ORDER BY id",
+    );
+    assert_eq!(int64_column(&rows, 0), [Some(1), Some(2)]);
+    assert_eq!(harness.live_data_files(&namespace, "orders").len(), 2);
+    let table = harness.load(&namespace, "orders");
+    assert_eq!(table.metadata().snapshots().count(), 2);
+}
+
+#[test]
+fn a_rolled_back_insert_leaves_no_snapshot() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("undone", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    let transaction = catalog.begin_transaction();
+    planner
+        .plan(
+            "INSERT INTO undone.orders VALUES (1, 'ann', 1.0)",
+            transaction.clone(),
+        )
+        .unwrap()
+        .compile(harness.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    transaction.rollback();
+
+    let table = harness.load(&namespace, "orders");
+    assert!(table.metadata().current_snapshot().is_none());
+    let rows = harness.query(&catalog, &mut planner, "SELECT id FROM undone.orders");
+    assert_eq!(total_rows(&rows), 0);
+}
+
+#[test]
+fn an_insert_with_a_null_in_a_required_column_fails() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("strict", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO strict.orders VALUES (NULL, 'ann', 1.0)",
+        )
+        .unwrap_err();
+
+    assert!(error.to_lowercase().contains("null"), "{error}");
+    let table = harness.load(&namespace, "orders");
+    assert!(table.metadata().current_snapshot().is_none());
+}
+
+#[test]
+fn an_insert_refuses_a_format_version_one_table() {
+    let Some(harness) = harness() else { return };
+    let namespace = NamespaceIdent::new("ancient".to_string());
+    harness
+        .block_on(harness.writer.create_namespace(&namespace, HashMap::new()))
+        .unwrap();
+    let creation = TableCreation::builder()
+        .name("orders".to_string())
+        .schema(orders_schema())
+        .properties(HashMap::from([(
+            "format-version".to_string(),
+            "1".to_string(),
+        )]))
+        .build();
+    harness
+        .block_on(harness.writer.create_table(&namespace, creation))
+        .unwrap();
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO ancient.orders VALUES (1, 'ann', 1.0)",
+        )
+        .unwrap_err();
+
+    assert!(error.contains("format version 1"), "{error}");
 }

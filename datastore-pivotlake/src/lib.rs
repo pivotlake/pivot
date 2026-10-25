@@ -1158,7 +1158,7 @@ impl CommitAction for PendingInsert {
         let files: Vec<TableFile> = drain_injector(&self.uploaded_files)
             .into_iter()
             .map(|uploaded| {
-                let insert_sink::UploadedFile {
+                let parquet_engine::writing::upload::UploadedFile {
                     file,
                     partition,
                     row_groups,
@@ -1371,7 +1371,7 @@ pub(crate) struct PendingTableCreation {
 /// the commit resolves the live table regardless of a rename.
 pub(crate) struct PendingInsert {
     pub(crate) table_id: Uuid,
-    pub(crate) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
+    pub(crate) uploaded_files: Arc<Injector<parquet_engine::writing::upload::UploadedFile>>,
 }
 
 /// The [`DatastoreTransaction`] a [`PivotlakeDatastore`] opens: one query's frozen

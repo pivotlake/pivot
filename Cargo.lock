@@ -1837,10 +1837,13 @@ name = "datastore-iceberg"
 version = "0.1.1"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "arrow-schema",
  "async-trait",
  "catalog",
+ "crossbeam-deque",
  "dispatch",
+ "futures",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
@@ -1857,6 +1860,7 @@ dependencies = [
  "tracing",
  "ureq",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4177,6 +4181,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zstd",
 ]
 

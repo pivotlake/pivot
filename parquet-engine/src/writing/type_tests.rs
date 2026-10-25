@@ -163,14 +163,18 @@ fn write_cases(dispatch: &Dispatch, cases: &[Case]) -> Vec<u8> {
     let spec = values_input(dispatch.dispatcher(), vec![batch]).record_batches();
     // A file's bytes live in ring memory the assembling worker owns, so they are
     // copied out there rather than followed to this thread.
-    let mut files: Vec<Vec<u8>> =
-        encode_record_batches_spec(spec, schema, Arc::from([]), Arc::from([]), ROWS, usize::MAX)
-            .map_each(|file: AssembledFile| {
-                file.bytes.runs().flatten().copied().collect::<Vec<u8>>()
-            })
-            .execute()
-            .collect()
-            .unwrap();
+    let mut files: Vec<Vec<u8>> = encode_record_batches_spec(
+        spec,
+        schema,
+        super::Partitioning::default(),
+        Arc::from([]),
+        ROWS,
+        usize::MAX,
+    )
+    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .execute()
+    .collect()
+    .unwrap();
     assert_eq!(files.len(), 1, "the rows fit one file");
     files.pop().unwrap()
 }

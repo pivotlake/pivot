@@ -37,6 +37,11 @@ pub(crate) struct LoadedTable {
 }
 
 impl LoadedTable {
+    /// The store the table's files are read and written through.
+    pub(crate) fn store(&self) -> &TableStore {
+        &self.store
+    }
+
     /// Load the schema and manifest list, validating unsupported snapshot features
     /// before pruning can hide them. Manifests and data footers remain lazy.
     pub(crate) fn load(
@@ -232,7 +237,7 @@ impl LoadedTable {
 /// The names of the columns `fields` (a partition spec's or a sort order's,
 /// as source field id and transform) take by identity, in field order. A
 /// transformed field (a bucket, a day) is not a column value, so it is left out.
-fn identity_columns<'a>(
+pub(crate) fn identity_columns<'a>(
     schema: &SchemaRef,
     fields: impl Iterator<Item = (i32, &'a Transform)>,
 ) -> Vec<String> {
