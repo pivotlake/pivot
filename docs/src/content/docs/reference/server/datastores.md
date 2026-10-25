@@ -51,7 +51,7 @@ SQL refers to it. `kind` selects the implementation:
 | Kind | Description |
 | --- | --- |
 | `pivotlake` | Pivot's own read-write tables, stored as Delta Lake tables of Parquet files in a local directory or a bucket. Also accepted as `pivot`. |
-| `iceberg` | The tables of an Iceberg REST catalog, read-only. |
+| `iceberg` | The tables of an Iceberg REST catalog, read and appended to with `INSERT`. |
 
 ### Default datastore
 
@@ -126,13 +126,22 @@ datastores:
 | `properties` | `{}` | Additional REST client properties, passed to the catalog client as written. |
 | `default` | `false` | Whether this is the [default datastore](#default-datastore). |
 
-Each catalog namespace appears as a schema, and the datastore is read-only.
-Table files are read from the locations the catalog reports, using the
-credentials the catalog vends, or the [storage secret](#storage-credentials)
-whose scope covers the file when it vends none. Vended credentials are renewed
-at every [refresh](#refresh), in place, so a query that runs longer than they
-last keeps reading; when the catalog says when they expire, a refresh runs
-early enough to renew them first.
+Each catalog namespace appears as a schema. Table files are read from the
+locations the catalog reports, using the credentials the catalog vends, or the
+[storage secret](#storage-credentials) whose scope covers the file when it
+vends none. Vended credentials are renewed at every [refresh](#refresh), in
+place, so a statement that runs longer than they last keeps reading and
+writing; when the catalog says when they expire, a refresh runs early enough to
+renew them first.
+
+`INSERT` and `COPY` append to a catalog table: the rows are written as Parquet
+files under the table's data path, partitioned as the table's partition spec
+says (a transform such as `day(ts)` or `bucket(16, id)` is computed per row),
+and committed as one append snapshot through the catalog. A table is created
+and dropped through the catalog itself, and maintained by it: compaction,
+snapshot expiry and vacuum are the catalog's, not Pivot's. An `INSERT` into a
+format version 1 table is refused; a `NULL` in a column the table declares
+`required` fails the statement.
 
 Format version 3 deletion vectors are supported. A table carrying any other
 kind of delete file is refused rather than read with the deleted rows present.
@@ -260,7 +269,8 @@ the user the server runs as.
 ## Maintenance
 
 A server keeps each pivotlake datastore up to date and tidy with three background
-tasks. Iceberg datastores are only refreshed.
+tasks. Iceberg datastores are only refreshed; their tables are maintained by
+the catalog.
 
 | Task | Runs | Setting |
 | --- | --- | --- |

@@ -50,9 +50,10 @@ Opens a single datastore and starts the [SQL shell](#sql-shell) over it.
 A local directory is created if it does not exist. Object-store credentials
 come from the [environment](#object-store-credentials).
 
-An Iceberg catalog is served read-only, and each catalog namespace appears
-as a schema. Table files are read from wherever the catalog says they are,
-using the credentials the catalog vends, or the
+An Iceberg catalog's tables are read and appended to with `INSERT`; tables
+are created and dropped through the catalog itself. Each catalog namespace
+appears as a schema. Table files are read from and written to wherever the
+catalog says they are, using the credentials the catalog vends, or the
 [object-store variables](#object-store-credentials) when it vends none.
 
 :::caution[One process per local datastore]
