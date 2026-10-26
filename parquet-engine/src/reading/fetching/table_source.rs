@@ -28,15 +28,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{RowGroupFilter, ScanOrder};
 
-/// The NUMA node a row group is assigned to, by a hash of its stable identity
-/// (its file and its index within that file). Deterministic across queries so
-/// assignment is sticky for as long as the file stays open, and uniform enough
-/// to split any table's row groups evenly across nodes.
+/// The NUMA node a row group is assigned to, from its stable identity (its
+/// file and its index within that file), so assignment is sticky for as long
+/// as the file stays open. A file's row groups are dealt round-robin from a
+/// per-file starting node: neighbouring row groups were written together and
+/// are close in size, so every node gets an even share of each file's rows.
+/// A node holding more than its share keeps its cores decoding after the
+/// other nodes ran dry, since a row group's ranges never leave its node.
 fn affinity_node(row_group: &RowGroupMetadata, node_count: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     row_group.open_file.hash(&mut hasher);
-    row_group.file_row_group_idx.hash(&mut hasher);
-    (hasher.finish() % node_count as u64) as usize
+    let first_node = hasher.finish() % node_count as u64;
+    ((first_node + row_group.file_row_group_idx as u64) % node_count as u64) as usize
 }
 
 use crate::types::table::scalar_lt;
@@ -506,5 +509,24 @@ mod tests {
         let order = plain_scan_order(&table, &Projection::columns([0]));
 
         assert_eq!(order, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn neighbouring_row_groups_of_a_file_land_on_different_nodes() {
+        let row_groups: Vec<RowGroupMetadata> = (0..4)
+            .map(|file_row_group_idx| RowGroupMetadata {
+                file_row_group_idx,
+                ..(*sized_row_group(1)).clone()
+            })
+            .collect();
+
+        let nodes: Vec<usize> = row_groups
+            .iter()
+            .map(|row_group| affinity_node(row_group, 2))
+            .collect();
+
+        assert_eq!(nodes[0], nodes[2]);
+        assert_eq!(nodes[1], nodes[3]);
+        assert_ne!(nodes[0], nodes[1]);
     }
 }
