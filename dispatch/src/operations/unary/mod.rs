@@ -118,9 +118,12 @@ pub use order_by_limit::{OrderBy, OrderByLimitFactory};
 /// translation caches of every core the process runs on: with the whole pool
 /// doing it at once, the query's first moments go to those flushes. Writing
 /// the values is a plain copy into memory the allocator already holds.
+///
+/// The value goes through [`std::hint::black_box`]: an allocation followed by
+/// a fill the compiler can see is zero is folded back into a zeroed one.
 pub(crate) fn filled_scratch<T: Clone>(len: usize, value: T) -> Vec<T> {
     let mut scratch = Vec::with_capacity(len);
-    scratch.resize(len, value);
+    scratch.resize(len, std::hint::black_box(value));
     scratch
 }
 
