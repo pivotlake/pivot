@@ -112,6 +112,7 @@ pub trait LeafDecoder {
         header: DictionaryPageHeader,
         data: Vec<Bytes>,
         allocator: &mut SlabAllocator,
+        cache_key: Option<BlockKey>,
     ) -> BuiltDictionary;
 
     /// Reads through a dictionary built for this leaf.
@@ -277,12 +278,22 @@ pub trait Dict: Send + Sync + 'static {
 pub trait DictFromBytes: Dict {
     /// Builds the dictionary from one buffer of raw page bytes containing
     /// `size` entries.
-    fn new_from_bytes(data: Bytes, size: usize, allocator: &mut SlabAllocator) -> Self;
+    fn new_from_bytes(
+        data: Bytes,
+        size: usize,
+        allocator: &mut SlabAllocator,
+        cached_page: Option<CachedPage>,
+    ) -> Self;
 }
 
 /// A [`Dict`] buildable from a dictionary page scattered across buffers.
 pub trait DictFromVecBytes: Dict {
     /// Builds the dictionary from scattered raw page bytes containing `size`
     /// entries in total.
-    fn new_from_vec_bytes(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self;
+    fn new_from_vec_bytes(
+        data: Vec<Bytes>,
+        size: usize,
+        allocator: &mut SlabAllocator,
+        cached_page: Option<CachedPage>,
+    ) -> Self;
 }

@@ -29,7 +29,7 @@ use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 use dispatch::arrays::ValidityBuilder;
-use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
+use dispatch::memory::{BlockKey, MultiBufferReader, ReaderPosition, SlabAllocator};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -219,12 +219,17 @@ enum DictStorage<DC, DS> {
 }
 
 impl<DC: DictFromBytes, DS: DictFromVecBytes> DictStorage<DC, DS> {
-    fn build(mut data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self {
+    fn build(
+        mut data: Vec<Bytes>,
+        size: usize,
+        allocator: &mut SlabAllocator,
+        cached_page: Option<CachedPage>,
+    ) -> Self {
         if data.len() == 1 {
             let bytes = data.pop().expect("data holds one buffer");
-            Self::Contiguous(DC::new_from_bytes(bytes, size, allocator))
+            Self::Contiguous(DC::new_from_bytes(bytes, size, allocator, cached_page))
         } else {
-            Self::Scattered(DS::new_from_vec_bytes(data, size, allocator))
+            Self::Scattered(DS::new_from_vec_bytes(data, size, allocator, cached_page))
         }
     }
 }
@@ -457,6 +462,7 @@ where
         header: DictionaryPageHeader,
         data: Vec<Bytes>,
         allocator: &mut SlabAllocator,
+        cache_key: Option<BlockKey>,
     ) -> BuiltDictionary {
         let size = header.num_values as usize;
         if let Some(needle) = self.eq_const.as_ref()
@@ -464,7 +470,8 @@ where
         {
             return BuiltDictionary::Pruned;
         }
-        let storage: DictStorage<DC, DS> = DictStorage::build(data, size, allocator);
+        let cached_page = cache_key.map(|key| CachedPage { key, values: size });
+        let storage: DictStorage<DC, DS> = DictStorage::build(data, size, allocator, cached_page);
         BuiltDictionary::Built(Arc::new(storage))
     }
 
@@ -644,7 +651,7 @@ mod tests {
         let header = PageHeader::for_dict_page(entries.len() as i32)
             .dictionary_page_header
             .unwrap();
-        dec.build_dictionary(header, vec![Bytes::from(encode_i32s(entries))], alloc)
+        dec.build_dictionary(header, vec![Bytes::from(encode_i32s(entries))], alloc, None)
     }
 
     fn load_dictionary(dec: &mut Dec, entries: &[i32], alloc: &mut SlabAllocator) {

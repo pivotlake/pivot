@@ -90,7 +90,7 @@ mod tests {
             .dictionary_page_header
             .unwrap();
         let data = vec![Bytes::from(encode_plain_strings(entries))];
-        match dec.build_dictionary(header, data, allocator) {
+        match dec.build_dictionary(header, data, allocator, None) {
             BuiltDictionary::Built(dictionary) => dec.adopt_dictionary(dictionary),
             BuiltDictionary::Pruned => panic!("no constant is set"),
         }

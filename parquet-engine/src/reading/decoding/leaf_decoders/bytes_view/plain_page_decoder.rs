@@ -166,7 +166,7 @@ const VIEWS_KEY_BIT: usize = 1 << 62;
 /// filter on the rows an earlier condition kept, or never, for a length or
 /// emptiness test. Being relative to the page, the views stay valid however
 /// the page is laid out in the cache.
-struct PageViews {
+pub(crate) struct PageViews {
     /// The views' bytes as the cache holds them, split anywhere across slots.
     pieces: Vec<Bytes>,
     /// The piece holding the next view, and that view's offset in it.
@@ -182,7 +182,7 @@ struct PageViews {
 impl PageViews {
     /// The next value's view.
     #[inline(always)]
-    fn next_view(&mut self) -> u128 {
+    pub(crate) fn next_view(&mut self) -> u128 {
         let piece = &self.pieces[self.piece];
         if self.offset + 16 <= piece.len() {
             // SAFETY: the 16 bytes at `offset` lie inside `piece`.
@@ -231,7 +231,7 @@ impl PageViews {
     /// The page buffer holding the byte at `page_offset`, and the offset of
     /// that byte within it.
     #[inline(always)]
-    fn locate(&mut self, page_offset: usize) -> (usize, usize) {
+    pub(crate) fn locate(&mut self, page_offset: usize) -> (usize, usize) {
         while self.buffer + 1 < self.buffer_starts.len()
             && self.buffer_starts[self.buffer + 1] <= page_offset
         {
@@ -277,7 +277,7 @@ fn page_relative_views(
 
 /// The cached views of `page`, taken from its data and filed in the
 /// decompressed cache when they are not there yet.
-fn cached_page_views(
+pub(crate) fn cached_page_views(
     data: &[Bytes],
     position: ReaderPosition,
     page: &CachedPage,

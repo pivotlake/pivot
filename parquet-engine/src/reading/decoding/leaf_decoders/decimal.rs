@@ -35,7 +35,7 @@ use crate::types::metadata::ColumnChunkMeta;
 use crate::types::page::DecompressedPage;
 use dispatch::arrays::PrimitiveBuilder;
 use dispatch::memory::{
-    MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer,
+    BlockKey, MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer,
 };
 
 /// How a decimal column's unscaled integer is stored on disk. Each storage
@@ -314,7 +314,12 @@ where
 impl<T: DecimalCarrier, S: DecimalStorage> DictFromBytes
     for DecimalDict<T, S, SlabBuffer<T::Native>>
 {
-    fn new_from_bytes(data: Bytes, size: usize, allocator: &mut SlabAllocator) -> Self {
+    fn new_from_bytes(
+        data: Bytes,
+        size: usize,
+        allocator: &mut SlabAllocator,
+        _cached_page: Option<CachedPage>,
+    ) -> Self {
         let mut entries: SlabBuffer<T::Native> = allocator.create_slab_buffer(size, false);
         let mut position = ReaderPosition::default();
         let mut len = 0;
@@ -330,7 +335,12 @@ impl<T: DecimalCarrier, S: DecimalStorage> DictFromBytes
 impl<T: DecimalCarrier, S: DecimalStorage> DictFromVecBytes
     for DecimalDict<T, S, MultiSlabBuffer<T::Native>>
 {
-    fn new_from_vec_bytes(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self {
+    fn new_from_vec_bytes(
+        data: Vec<Bytes>,
+        size: usize,
+        allocator: &mut SlabAllocator,
+        _cached_page: Option<CachedPage>,
+    ) -> Self {
         let mut entries: MultiSlabBuffer<T::Native> =
             allocator.create_multi_slab_buffer(size, false);
         let mut position = ReaderPosition::default();
@@ -392,8 +402,10 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
         header: DictionaryPageHeader,
         data: Vec<Bytes>,
         allocator: &mut SlabAllocator,
+        cache_key: Option<BlockKey>,
     ) -> BuiltDictionary {
-        self.inner.build_dictionary(header, data, allocator)
+        self.inner
+            .build_dictionary(header, data, allocator, cache_key)
     }
 
     fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {

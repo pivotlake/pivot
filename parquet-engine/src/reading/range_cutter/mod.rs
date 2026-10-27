@@ -189,14 +189,18 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
         let open = self.open.get_mut(&row_group_index).unwrap();
         let column = page.column_idx;
         match page.data {
-            DecompressedPageType::Dict { header, data } => {
+            DecompressedPageType::Dict {
+                header,
+                data,
+                cache_key,
+            } => {
                 // Built once here, for every decoder of the row group to
                 // read through; a dictionary excluding the pushed-down
                 // constant prunes the row group before any range is cut.
                 let leaf = &open.leaf_decoders[column];
                 let built = self
                     .allocator
-                    .with(|allocator| leaf.build_dictionary(header, data, allocator));
+                    .with(|allocator| leaf.build_dictionary(header, data, allocator, cache_key));
                 match built {
                     BuiltDictionary::Pruned => {
                         // Seen by every page of this row group still in
@@ -295,6 +299,7 @@ mod tests {
             data: DecompressedPageType::Dict {
                 header: header.dictionary_page_header.unwrap(),
                 data: vec![Bytes::from(encode_i32s(entries))],
+                cache_key: None,
             },
         }
     }

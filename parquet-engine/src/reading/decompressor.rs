@@ -166,6 +166,7 @@ impl Decompressor {
             DecompressedPageType::Dict {
                 header: page.header.dictionary_page_header.unwrap(),
                 data,
+                cache_key: Some(key),
             }
         } else {
             DecompressedPageType::Data(DataPage {
@@ -496,7 +497,7 @@ mod tests {
         let out = run_unary(Decompressor::default(), vec![page]);
 
         assert_eq!(out.len(), 1);
-        let DecompressedPageType::Dict { header, data } = &out[0].data else {
+        let DecompressedPageType::Dict { header, data, .. } = &out[0].data else {
             panic!("expected Dict");
         };
         assert_eq!(header.num_values, 50);

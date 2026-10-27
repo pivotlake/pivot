@@ -110,6 +110,10 @@ impl DataPage {
 pub enum DecompressedPageType {
     /// Dictionary page — defines the value dictionary for the column chunk.
     Dict {
+        /// The page's key in the decompressed cache, which the dictionary
+        /// built from it files its views under; `None` for a page that does
+        /// not come from a file.
+        cache_key: Option<BlockKey>,
         header: DictionaryPageHeader,
         data: Vec<Bytes>,
     },

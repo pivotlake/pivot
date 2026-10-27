@@ -10,7 +10,7 @@ use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use bytes::Bytes;
 use dispatch::arrays::{SlabColumn, ValidityBuilder};
-use dispatch::memory::SlabAllocator;
+use dispatch::memory::{BlockKey, SlabAllocator};
 
 /// Emits an all-NULL array of `data_type` for whatever row count is asked of
 /// it, carved from the batch's slabs like every other decoder's output. The
@@ -39,6 +39,7 @@ impl LeafDecoder for AbsentLeafDecoder {
         _header: DictionaryPageHeader,
         _data: Vec<Bytes>,
         _allocator: &mut SlabAllocator,
+        _cache_key: Option<BlockKey>,
     ) -> BuiltDictionary {
         unreachable!("an absent leaf has no dictionary page")
     }

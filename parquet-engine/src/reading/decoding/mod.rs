@@ -505,6 +505,7 @@ pub(crate) mod tests {
             idx: 0,
             first_row: 0,
             data: DecompressedPageType::Dict {
+                cache_key: None,
                 header: header.dictionary_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
             },

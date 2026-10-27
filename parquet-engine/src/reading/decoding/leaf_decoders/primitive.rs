@@ -27,7 +27,7 @@ use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::page::DecompressedPage;
 use bytes::Bytes;
 use dispatch::memory::{
-    MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer,
+    BlockKey, MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer,
 };
 
 /// Reads a single value from a [`MultiBufferReader`] in little-endian byte
@@ -360,7 +360,12 @@ impl<T: ArrowPrimitiveType> DictFromBytes for PrimitiveDict<T, SlabBuffer<T::Nat
 where
     T::Native: ReadLeBytes,
 {
-    fn new_from_bytes(data: Bytes, size: usize, allocator: &mut SlabAllocator) -> Self {
+    fn new_from_bytes(
+        data: Bytes,
+        size: usize,
+        allocator: &mut SlabAllocator,
+        _cached_page: Option<CachedPage>,
+    ) -> Self {
         let mut entries = allocator.create_slab_buffer(size, false);
         let mut position = ReaderPosition::default();
         let mut len = 0;
@@ -377,7 +382,12 @@ impl<T: ArrowPrimitiveType> DictFromVecBytes for PrimitiveDict<T, MultiSlabBuffe
 where
     T::Native: ReadLeBytes,
 {
-    fn new_from_vec_bytes(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self {
+    fn new_from_vec_bytes(
+        data: Vec<Bytes>,
+        size: usize,
+        allocator: &mut SlabAllocator,
+        _cached_page: Option<CachedPage>,
+    ) -> Self {
         let mut entries = allocator.create_multi_slab_buffer(size, false);
         let mut position = ReaderPosition::default();
         let mut len = 0;
@@ -445,8 +455,10 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
         header: DictionaryPageHeader,
         data: Vec<Bytes>,
         allocator: &mut SlabAllocator,
+        cache_key: Option<BlockKey>,
     ) -> BuiltDictionary {
-        self.inner.build_dictionary(header, data, allocator)
+        self.inner
+            .build_dictionary(header, data, allocator, cache_key)
     }
 
     fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {
@@ -637,7 +649,7 @@ mod tests {
         let header = PageHeader::for_dict_page(num_values as i32)
             .dictionary_page_header
             .unwrap();
-        match dec.build_dictionary(header, vec![Bytes::from(data)], allocator) {
+        match dec.build_dictionary(header, vec![Bytes::from(data)], allocator, None) {
             BuiltDictionary::Built(dictionary) => dec.adopt_dictionary(dictionary),
             BuiltDictionary::Pruned => panic!("no constant is set"),
         }

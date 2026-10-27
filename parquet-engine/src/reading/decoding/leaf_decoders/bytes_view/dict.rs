@@ -7,9 +7,9 @@
 //! resolved to a view in O(1).
 
 use crate::reading::decoding::leaf_decoders::bytes_view::plain_page_decoder::{
-    WALK_PREFETCH_BYTES, prefetch_line, read_u32_le_at, view_at,
+    WALK_PREFETCH_BYTES, cached_page_views, prefetch_line, read_u32_le_at, view_at,
 };
-use crate::reading::decoding::leaf_decoders::{Dict, DictFromBytes, DictFromVecBytes};
+use crate::reading::decoding::leaf_decoders::{CachedPage, Dict, DictFromBytes, DictFromVecBytes};
 use arrow_array::builder::make_view;
 use arrow_array::types::ByteViewType;
 use arrow_array::{
@@ -18,6 +18,7 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, Buffer, ScalarBuffer};
 use bytes::Bytes;
 use dispatch::arrays::ViewBuilder;
+use dispatch::env::MAX_INLINE_STRING_VIEW;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
 use std::marker::PhantomData;
 
@@ -255,14 +256,71 @@ impl<V: ByteViewType> Dict for ViewDict<V> {
 // to handle. A single buffer can't straddle, so entries parse on the fast
 // path throughout.
 impl<V: ByteViewType> DictFromBytes for ViewDict<V> {
-    fn new_from_bytes(data: Bytes, size: usize, _allocator: &mut SlabAllocator) -> Self {
-        DictFactory::new(vec![data], size).create_dict()
+    fn new_from_bytes(
+        data: Bytes,
+        size: usize,
+        _allocator: &mut SlabAllocator,
+        cached_page: Option<CachedPage>,
+    ) -> Self {
+        Self::build(vec![data], size, cached_page)
     }
 }
 
 impl<V: ByteViewType> DictFromVecBytes for ViewDict<V> {
-    fn new_from_vec_bytes(data: Vec<Bytes>, size: usize, _allocator: &mut SlabAllocator) -> Self {
-        DictFactory::new(data, size).create_dict()
+    fn new_from_vec_bytes(
+        data: Vec<Bytes>,
+        size: usize,
+        _allocator: &mut SlabAllocator,
+        cached_page: Option<CachedPage>,
+    ) -> Self {
+        Self::build(data, size, cached_page)
+    }
+}
+
+impl<V: ByteViewType> ViewDict<V> {
+    /// The dictionary of `size` plain-encoded entries in `data`: from the
+    /// entries' views cached beside the page when the page has them, taken
+    /// the first time it is built, so a row group opened again copies views
+    /// instead of walking every entry; from the entries otherwise.
+    fn build(data: Vec<Bytes>, size: usize, cached_page: Option<CachedPage>) -> Self {
+        let Some(mut views) =
+            cached_page.and_then(|page| cached_page_views(&data, ReaderPosition::default(), &page))
+        else {
+            return DictFactory::new(data, size).create_dict();
+        };
+        let mut buffers: Vec<Buffer> = data.iter().map(|b| Buffer::from(b.clone())).collect();
+        let mut entries = Vec::with_capacity(size);
+        for _ in 0..size {
+            let view = views.next_view();
+            let len = view as u32;
+            if len as usize <= MAX_INLINE_STRING_VIEW {
+                entries.push(view);
+                continue;
+            }
+            let (buffer, offset) = views.locate((view >> 96) as u32 as usize);
+            if offset + len as usize <= data[buffer].len() {
+                entries.push(
+                    (view & u64::MAX as u128)
+                        | ((buffer as u128) << 64)
+                        | ((offset as u32 as u128) << 96),
+                );
+            } else {
+                // An entry split between two buffers gets a buffer of its
+                // own, as the walk gives it.
+                let mut position = ReaderPosition {
+                    buffer_index: buffer,
+                    offset,
+                };
+                let bytes = MultiBufferReader::new(&data, &mut position).read_bytes(len as usize);
+                entries.push(make_view(bytes.as_ref(), buffers.len() as u32, 0));
+                buffers.push(Buffer::from(bytes));
+            }
+        }
+        ViewDict {
+            data: buffers,
+            views: entries,
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -294,6 +352,48 @@ mod tests {
         assert_eq!(dict.get_str(0), "aa");
         assert_eq!(dict.get_str(1), "bb");
         assert_eq!(dict.get_str(2), "cc");
+    }
+
+    #[test]
+    fn a_dictionary_built_again_from_cached_views_has_the_same_entries() {
+        use dispatch::io::{LocalFile, OpenFile};
+        use dispatch::memory::{BlockKey, init_test_free_pool};
+        init_test_free_pool(8);
+        let all = encode_plain(&["aa", "a value long enough to need a buffer", "bb", "cc"]);
+        let data = vec![
+            Bytes::from(all[..30].to_vec()),
+            Bytes::from(all[30..].to_vec()),
+        ];
+        let file = LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap();
+        let page = CachedPage {
+            key: BlockKey {
+                open_file: OpenFile::Local(file),
+                offset: 4096,
+                len: all.len(),
+            },
+            values: 4,
+        };
+        let mut allocator = SlabAllocator::new(true);
+        let first = ViewDict::<StringViewType>::new_from_vec_bytes(
+            data.clone(),
+            4,
+            &mut allocator,
+            Some(page.clone()),
+        );
+
+        let again =
+            ViewDict::<StringViewType>::new_from_vec_bytes(data, 4, &mut allocator, Some(page));
+
+        let entries = |dict: &ViewDict<StringViewType>| {
+            (0..4)
+                .map(|i| dict.get_str(i).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(entries(&again), entries(&first));
+        assert_eq!(
+            entries(&again),
+            ["aa", "a value long enough to need a buffer", "bb", "cc"]
+        );
     }
 
     #[test]
