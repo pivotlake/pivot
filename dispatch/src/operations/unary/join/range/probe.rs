@@ -22,6 +22,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
+use crate::operations::unary::filled_scratch;
 use crate::operations::unary::join::keys::filter_null_keys;
 use crate::operations::unary::join::range::{RangeCompare, RangeJoinSpec, RangeTable, SortedChunk};
 
@@ -196,7 +197,7 @@ impl JoinedBatchBuilder {
                 &mut allocator,
             ),
             allocator,
-            repeated_probe_row_indices: vec![0; RECORD_BATCH_SIZE],
+            repeated_probe_row_indices: filled_scratch(RECORD_BATCH_SIZE, 0),
         }
     }
 

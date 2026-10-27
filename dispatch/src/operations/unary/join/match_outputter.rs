@@ -11,6 +11,7 @@ use crate::arrays::accumulator::BatchAccumulator;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
+use crate::operations::unary::filled_scratch;
 use crate::operations::unary::join::JoinCell;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::residual_filter::ResidualFilter;
@@ -113,10 +114,10 @@ impl<R: RowId> ProbeMatchOutputter<R> {
             }),
             allocator,
             build_rows,
-            probe_indices: vec![0; RECORD_BATCH_SIZE],
-            build_indices: vec![R::from_row_id(0); RECORD_BATCH_SIZE],
+            probe_indices: filled_scratch(RECORD_BATCH_SIZE, 0),
+            build_indices: filled_scratch(RECORD_BATCH_SIZE, R::from_row_id(0)),
             matched: 0,
-            kept_build_rows: vec![0; RECORD_BATCH_SIZE],
+            kept_build_rows: filled_scratch(RECORD_BATCH_SIZE, 0),
             has_residual: residual_filters.is_some(),
             residual_filters,
             missed_probe_rows: Vec::new(),
