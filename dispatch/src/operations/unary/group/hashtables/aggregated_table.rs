@@ -18,6 +18,7 @@
 
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::SlabAllocator;
+use crate::operations::unary::filled_scratch;
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::HashTable;
@@ -263,7 +264,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             scatter_raw: false,
             rows_since_clear: 0,
             radix_config,
-            hashes: vec![0u64; RECORD_BATCH_SIZE]
+            hashes: filled_scratch(RECORD_BATCH_SIZE, 0u64)
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
