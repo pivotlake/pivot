@@ -471,19 +471,19 @@ impl WorkerWaker {
     pub fn park_after_spin(&self, last_seen: u64, local_idx: usize) -> u64 {
         let slot = &self.slots[local_idx];
         slot.parked.store(true, Ordering::SeqCst);
-        self.parked_workers.fetch_add(1, Ordering::SeqCst);
+        self.count_parked(slot);
         let claimed = self.end_spin(local_idx);
         if claimed || self.wake_count.load(Ordering::SeqCst) != last_seen {
             // Withdraw the slot unless a notifier already claimed it and
-            // decremented `parked_workers`.
+            // counted it unparked.
             if slot.parked.swap(false, Ordering::SeqCst) {
-                self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+                self.count_unparked(slot);
             }
             return self.wake_count.load(Ordering::SeqCst);
         }
         park();
         if slot.parked.swap(false, Ordering::SeqCst) {
-            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            self.count_unparked(slot);
         }
         self.wake_count.load(Ordering::SeqCst)
     }
@@ -804,6 +804,29 @@ mod tests {
         assert!(!woke);
         waker.notify_including_idle();
         parked.join().unwrap();
+    }
+
+    #[test]
+    fn notify_one_wakes_a_worker_that_parked_after_spinning_with_a_dataflow() {
+        let waker = Arc::new(WorkerWaker::new(1));
+        waker.set_holds_dataflow(0, true);
+        let last_seen = waker.wake_count();
+        let parked = {
+            let waker = waker.clone();
+            thread::spawn(move || {
+                waker.register(0);
+                waker.begin_spin(0);
+                waker.park_after_spin(last_seen, 0)
+            })
+        };
+        await_parked(&waker, 1);
+
+        let woke = waker.notify_one();
+
+        assert!(woke);
+        parked.join().unwrap();
+        assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
+        assert_eq!(waker.parked_dataflow_workers.load(Ordering::SeqCst), 0);
     }
 
     #[test]
