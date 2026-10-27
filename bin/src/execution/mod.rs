@@ -10,6 +10,7 @@
 mod copy;
 mod dataflow;
 mod planning;
+mod ready_dataflows;
 mod types;
 
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use dataflow::{
 };
 use planner::operator::TransactionStatement;
 use planning::{PlanCache, PlannerPool, plan_query};
+use ready_dataflows::ReadyDataflows;
 
 pub use copy::CopyIngest;
 pub use types::{
@@ -37,6 +39,7 @@ pub struct Executor {
     catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
     plan_cache: Arc<PlanCache>,
+    ready_dataflows: Arc<ReadyDataflows>,
     planner_pool: Arc<PlannerPool>,
 }
 
@@ -50,6 +53,7 @@ impl Executor {
             catalog,
             dispatcher,
             plan_cache: Arc::new(PlanCache::default()),
+            ready_dataflows: Arc::new(ReadyDataflows::default()),
         })
     }
 
@@ -124,6 +128,26 @@ impl Executor {
             StatementKind::Query => Ok(Some(result_columns(&plan)?)),
             _ => Ok(None),
         }
+    }
+
+    /// Compiles the dataflow for the next run of `plan` off the query's
+    /// path, on a blocking thread, and keeps it for that run.
+    ///
+    /// The plan compiled moments ago, so a failure now would come back the
+    /// same way when the next run compiles it itself; that run reports it,
+    /// and nothing is kept here.
+    fn prepare_next_run(&self, plan: Arc<planner::Plan>) {
+        let catalog = self.catalog.clone();
+        let dispatcher = self.dispatcher.clone();
+        let ready_dataflows = self.ready_dataflows.clone();
+        tokio::task::spawn_blocking(move || {
+            let transaction = catalog.begin_transaction();
+            let compiled = plan.compile(&dispatcher, transaction.as_ref());
+            transaction.rollback();
+            if let Ok(spec) = compiled {
+                ready_dataflows.store(plan, spec);
+            }
+        });
     }
 
     async fn execute_in_transaction<T>(
@@ -228,10 +252,20 @@ impl Executor {
         #[cfg(feature = "perf")]
         let dispatcher = dispatcher.with_profiling(options.profile);
 
+        // A profiled run compiles on its own, marked, dispatcher.
+        let ready = if options.profile {
+            None
+        } else {
+            self.ready_dataflows.take(&plan)
+        };
         let started = Instant::now();
         let compile_transaction = transaction;
+        let compiled_plan = plan.clone();
         let handle = tokio::task::spawn_blocking(move || -> Result<StatementHandle<T>> {
-            let spec = plan.compile(&dispatcher, compile_transaction.as_ref())?;
+            let spec = match ready {
+                Some(spec) => spec,
+                None => compiled_plan.compile(&dispatcher, compile_transaction.as_ref())?,
+            };
             Ok(match (statement_kind, options.collect_stats) {
                 (StatementKind::Insert, true) => {
                     let output = spec.map(|| affected_rows_from_record_batch);
@@ -250,6 +284,9 @@ impl Executor {
         let compile_time = started.elapsed();
 
         let (results, flow, execute_time) = collect_handle(handle).await?;
+        if statement_kind == StatementKind::Query && plan.is_cacheable() {
+            self.prepare_next_run(plan);
+        }
         let output = match (statement_kind, results) {
             (StatementKind::Query, StatementResults::Batches(batches)) => {
                 StatementOutput::Rows { columns, batches }

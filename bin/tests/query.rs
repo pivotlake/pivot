@@ -112,6 +112,45 @@ async fn create_table_and_query(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn a_query_run_again_returns_the_same_rows(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_repeat", dir.path()).await;
+    let sql = "SELECT name FROM people_repeat WHERE id >= 2 ORDER BY name";
+    let first = select_rows(&conn, sql).await;
+
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        runs.push(select_rows(&conn, sql).await);
+    }
+
+    assert_eq!(
+        first,
+        vec![vec![Some("bob".into())], vec![Some("carol".into())]]
+    );
+    assert!(runs.iter().all(|rows| rows == &first));
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_run_again_sees_rows_inserted_since(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_repeat_insert", dir.path()).await;
+    let sql = "SELECT count(*) FROM people_repeat_insert";
+    single_value(&conn, sql).await;
+    single_value(&conn, sql).await;
+
+    conn.simple_query("INSERT INTO people_repeat_insert VALUES (4, 'dave')")
+        .await
+        .unwrap();
+    let count = single_value(&conn, sql).await;
+
+    assert_eq!(count, "4");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn create_table_if_not_exists_is_a_noop_on_an_existing_table(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     create_people_table(&conn, "people_if_not_exists", dir.path()).await;
