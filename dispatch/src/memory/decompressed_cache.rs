@@ -432,6 +432,11 @@ impl DecompressedCache {
         }
     }
 
+    /// Whether blocks are cached at all (see `PIVOT_DECOMPRESSED_CACHE`).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Look up a block. On a hit, pins each of its extents' slots with
     /// `try_read`, refreshes the clock, and returns one zero-copy `Bytes` view
     /// per extent. Misses (returning `None`, releasing any pins taken) if the

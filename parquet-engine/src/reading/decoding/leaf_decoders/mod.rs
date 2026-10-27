@@ -45,7 +45,7 @@ use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::page::DecompressedPage;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
-use dispatch::memory::{ReaderPosition, SlabAllocator};
+use dispatch::memory::{BlockKey, ReaderPosition, SlabAllocator};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -148,6 +148,15 @@ pub trait LeafDecoder {
 // GROUP BY output can share them; re-exported here for the parquet decoders.
 pub use dispatch::arrays::ArrayBuilder;
 
+/// A page as the decompressed cache knows it: its key there, under which a
+/// plain decoder may also file what it derives from the page, and how many
+/// values (NULLs excluded) the page holds.
+#[derive(Clone)]
+pub struct CachedPage {
+    pub key: BlockKey,
+    pub values: usize,
+}
+
 /// Reads plain-encoded values from raw page bytes into an [`ArrayBuilder`].
 pub trait DecodePlain {
     type Builder: ArrayBuilder;
@@ -159,8 +168,10 @@ pub trait DecodePlain {
     /// bytes), which reports it as unsupported rather than decoding nonsense.
     type Delta: DecodeDelta<Builder = Self::Builder>;
 
-    /// Creates a decoder starting at `position` within `data`.
-    fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self;
+    /// Creates a decoder starting at `position` within `data`. `cached_page`
+    /// is set for a page of a file, which the decoder may use to keep what it
+    /// derives from the page in the decompressed cache.
+    fn new(data: Vec<Bytes>, position: ReaderPosition, cached_page: Option<CachedPage>) -> Self;
 
     /// Decodes `size` values into `builder`.
     fn read(&mut self, builder: &mut Self::Builder, size: usize);

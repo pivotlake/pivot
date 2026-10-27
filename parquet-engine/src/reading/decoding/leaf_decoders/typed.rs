@@ -18,8 +18,8 @@ use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::levels::decode_def_levels;
 use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::reading::decoding::leaf_decoders::{
-    ArrayBuilder, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
-    LeafDecoder, Result,
+    ArrayBuilder, CachedPage, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes,
+    Error, LeafDecoder, Result,
 };
 use crate::thrift::general::Encoding;
 use crate::thrift::headers::DataPageHeader;
@@ -298,9 +298,10 @@ where
         header: DataPageHeader,
         data: Vec<Bytes>,
         mut position: ReaderPosition,
+        cached_page: Option<CachedPage>,
     ) -> Result<ValueDecoder<P>> {
         match header.encoding {
-            Encoding::PLAIN => Ok(ValueDecoder::Plain(P::new(data, position))),
+            Encoding::PLAIN => Ok(ValueDecoder::Plain(P::new(data, position, cached_page))),
             Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
                 if self.dict.is_none() {
                     return Err(Error::NoPagesReady);
@@ -365,8 +366,16 @@ where
             None
         };
 
+        // The page stores a value for every row its definition levels mark
+        // present, and for every row when it has none.
+        let cached_page = page.cache_key.map(|key| CachedPage {
+            key,
+            values: def_levels.as_ref().map_or(num_values, |levels| {
+                levels.present.iter().filter(|&&present| present).count()
+            }),
+        });
         self.read_page = Some(ReadPage {
-            decoder: self.create_decoder(page.header, page.data, position)?,
+            decoder: self.create_decoder(page.header, page.data, position, cached_page)?,
             running_filter_mask_opt: page.filter_mask.map(RunningFilterMask::new),
             remaining: kept,
             def_levels,
@@ -588,6 +597,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
                 filter_mask: None,
+                cache_key: None,
             }),
         }
     }
@@ -609,6 +619,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
                 filter_mask: Some(mask),
+                cache_key: None,
             }),
         }
     }
@@ -702,6 +713,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(vec![2u8, 3, 0x00, 0x00])],
                 filter_mask: None,
+                cache_key: None,
             }),
         };
         dec.insert_page(page);
@@ -883,6 +895,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(vec![2u8, 3, 0x24, 0x24])],
                 filter_mask: None,
+                cache_key: None,
             }),
         };
         dec.insert_page(rle_page);
@@ -908,6 +921,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(vec![2u8, 3, 0x24, 0x24])],
                 filter_mask: None,
+                cache_key: None,
             }),
         }
     }
@@ -957,6 +971,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(vec![2u8, 3, 0x24, 0x24])],
                 filter_mask: None,
+                cache_key: None,
             }),
         };
         dec.insert_page(rle_page);

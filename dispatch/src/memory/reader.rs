@@ -109,7 +109,7 @@ impl<'a, 'b> MultiBufferReader<'a, 'b> {
     /// Read `s.len()` bytes into the provided slice, crossing buffer
     /// boundaries if needed.
     #[inline(always)]
-    fn read_into_unfixed_slice(&mut self, s: &mut [u8]) {
+    pub fn read_into_unfixed_slice(&mut self, s: &mut [u8]) {
         let copy_from_cur = std::cmp::min(self.remaining_in_cur(), s.len());
         unsafe {
             copy_nonoverlapping(self.current_slice().as_ptr(), s.as_mut_ptr(), copy_from_cur)

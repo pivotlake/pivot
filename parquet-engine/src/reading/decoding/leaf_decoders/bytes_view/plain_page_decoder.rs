@@ -7,16 +7,18 @@
 //! the length prefix or the string body straddles a buffer boundary.
 
 use super::super::ArrayBuilder;
-use crate::reading::decoding::leaf_decoders::DecodePlain;
 use crate::reading::decoding::leaf_decoders::bytes_view::delta_length_page_decoder::DeltaLengthPageDecoder;
+use crate::reading::decoding::leaf_decoders::{CachedPage, DecodePlain};
 use arrow_array::builder::make_view;
 use arrow_array::types::ByteViewType;
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use dispatch::arrays::ViewBuilder;
 use dispatch::env::MAX_INLINE_STRING_VIEW;
-use dispatch::memory::{MultiBufferReader, ReaderPosition};
+use dispatch::memory::{BlockKey, MultiBufferReader, ReaderPosition, memory_ctx};
 use std::marker::PhantomData;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use thiserror::Error;
 
 /// How far ahead of the walk each string's prefetch reaches. Each string's
@@ -138,10 +140,226 @@ pub struct PlainPageDecoder<V: ByteViewType> {
     /// Arrow `Buffer` wrappers over `data`, registered as view blocks.
     buffers: Vec<Buffer>,
     position: ReaderPosition,
+    /// The page's views, when the decompressed cache holds them: values are
+    /// then copied from these instead of walked out of the page.
+    views: Option<PageViews>,
     phantom: PhantomData<V>,
 }
 
+/// Marks a views block's key in the decompressed cache: the page's own key
+/// with this bit set in its offset. No file offset reaches it, so a views
+/// block never collides with a page, and a walk over a column chunk's byte
+/// range never meets one.
+const VIEWS_KEY_BIT: usize = 1 << 62;
+
+/// A plain string page's values as Arrow byte views, one 16-byte view per
+/// value in page order: a short value's view as Arrow inlines it, a long
+/// value's with its buffer index unset and its offset counted from the
+/// page's first byte.
+///
+/// Reading a plain page means walking its length prefixes, each one found
+/// only by reading the value before it, and that walk touches every byte of
+/// every value whether the query looks at them or not. The views are taken
+/// once, the first time the page is decoded, and kept in the decompressed
+/// cache beside the page. A later read copies a view per value, and a
+/// value's bytes are touched only by what actually reads them, such as a
+/// filter on the rows an earlier condition kept, or never, for a length or
+/// emptiness test. Being relative to the page, the views stay valid however
+/// the page is laid out in the cache.
+struct PageViews {
+    /// The views' bytes as the cache holds them, split anywhere across slots.
+    pieces: Vec<Bytes>,
+    /// The piece holding the next view, and that view's offset in it.
+    piece: usize,
+    offset: usize,
+    /// Where each of the page's buffers starts within the page.
+    buffer_starts: Vec<usize>,
+    /// The page buffer the last long value was found in; values come in page
+    /// order, so the search for the next one starts here.
+    buffer: usize,
+}
+
+impl PageViews {
+    /// The next value's view.
+    #[inline(always)]
+    fn next_view(&mut self) -> u128 {
+        let piece = &self.pieces[self.piece];
+        if self.offset + 16 <= piece.len() {
+            // SAFETY: the 16 bytes at `offset` lie inside `piece`.
+            let view = unsafe {
+                u128::from_le_bytes(std::ptr::read_unaligned(
+                    piece.as_ptr().add(self.offset) as *const [u8; 16]
+                ))
+            };
+            self.offset += 16;
+            if self.offset == piece.len() {
+                self.piece += 1;
+                self.offset = 0;
+            }
+            return view;
+        }
+        let mut bytes = [0u8; 16];
+        let mut filled = 0;
+        while filled < 16 {
+            let piece = &self.pieces[self.piece];
+            let take = (piece.len() - self.offset).min(16 - filled);
+            bytes[filled..filled + take].copy_from_slice(&piece[self.offset..self.offset + take]);
+            filled += take;
+            self.offset += take;
+            if self.offset == piece.len() {
+                self.piece += 1;
+                self.offset = 0;
+            }
+        }
+        u128::from_le_bytes(bytes)
+    }
+
+    /// Steps past `count` views.
+    fn skip(&mut self, count: usize) {
+        let mut remaining = count * 16;
+        while remaining > 0 {
+            let take = (self.pieces[self.piece].len() - self.offset).min(remaining);
+            remaining -= take;
+            self.offset += take;
+            if self.offset == self.pieces[self.piece].len() {
+                self.piece += 1;
+                self.offset = 0;
+            }
+        }
+    }
+
+    /// The page buffer holding the byte at `page_offset`, and the offset of
+    /// that byte within it.
+    #[inline(always)]
+    fn locate(&mut self, page_offset: usize) -> (usize, usize) {
+        while self.buffer + 1 < self.buffer_starts.len()
+            && self.buffer_starts[self.buffer + 1] <= page_offset
+        {
+            self.buffer += 1;
+        }
+        while self.buffer_starts[self.buffer] > page_offset {
+            self.buffer -= 1;
+        }
+        (self.buffer, page_offset - self.buffer_starts[self.buffer])
+    }
+}
+
+/// The views of the `values` plain-encoded values starting at `position`, in
+/// [`PageViews`]' page-relative form, as little-endian bytes.
+fn page_relative_views(
+    data: &[Bytes],
+    buffer_starts: &[usize],
+    mut position: ReaderPosition,
+    values: usize,
+) -> Vec<u8> {
+    let mut views = Vec::with_capacity(values * 16);
+    let mut reader = MultiBufferReader::new(data, &mut position);
+    for _ in 0..values {
+        let len = reader.read_u32_le();
+        let start = reader.position();
+        let page_offset = buffer_starts[start.buffer_index] + start.offset;
+        let view = if len as usize > MAX_INLINE_STRING_VIEW {
+            let mut prefix = [0u8; 4];
+            reader.read_into_unfixed_slice(&mut prefix);
+            reader.skip(len as usize - 4);
+            (len as u128)
+                | ((u32::from_le_bytes(prefix) as u128) << 32)
+                | ((page_offset as u32 as u128) << 96)
+        } else {
+            let mut bytes = [0u8; MAX_INLINE_STRING_VIEW];
+            reader.read_into_unfixed_slice(&mut bytes[..len as usize]);
+            make_view(&bytes[..len as usize], 0, 0)
+        };
+        views.extend_from_slice(&view.to_le_bytes());
+    }
+    views
+}
+
+/// The cached views of `page`, taken from its data and filed in the
+/// decompressed cache when they are not there yet.
+fn cached_page_views(
+    data: &[Bytes],
+    position: ReaderPosition,
+    page: &CachedPage,
+) -> Option<PageViews> {
+    let cache = memory_ctx().decompressed_cache();
+    if !cache.is_enabled() || page.values == 0 {
+        return None;
+    }
+    let mut buffer_starts = Vec::with_capacity(data.len());
+    let mut start = 0;
+    for buffer in data {
+        buffer_starts.push(start);
+        start += buffer.len();
+    }
+    let key = BlockKey {
+        open_file: page.key.open_file.clone(),
+        offset: page.key.offset | VIEWS_KEY_BIT,
+        len: page.key.len,
+    };
+    let pieces = match cache.get(&key) {
+        Some(pieces) => pieces,
+        None => {
+            let views = page_relative_views(data, &buffer_starts, position, page.values);
+            let mut reservation = cache.reserve(&key, views.len());
+            let mut copied = 0;
+            for slice in reservation.as_mut_slices() {
+                let len = slice.len().min(views.len() - copied);
+                slice[..len].copy_from_slice(&views[copied..copied + len]);
+                copied += len;
+            }
+            cache.insert(key, Vec::new(), reservation, Arc::new(AtomicUsize::new(0)))
+        }
+    };
+    Some(PageViews {
+        pieces,
+        piece: 0,
+        offset: 0,
+        buffer_starts,
+        buffer: 0,
+    })
+}
+
 impl<V: ByteViewType> PlainPageDecoder<V> {
+    /// Appends the next `size` values from the page's cached views: a short
+    /// value's view as it is, a long one's pointed at the page buffer that
+    /// holds it, registered as a block of `output` the first time this call
+    /// needs it. A long value split between two buffers is copied into a
+    /// block of its own, as the walk does.
+    fn read_views(&mut self, output: &mut ViewBuilder<V>, size: usize) {
+        let views = self.views.as_mut().expect("read_views needs cached views");
+        let mut blocks: Vec<Option<u32>> = vec![None; self.data.len()];
+        for _ in 0..size {
+            let view = views.next_view();
+            let len = view as u32;
+            if len as usize <= MAX_INLINE_STRING_VIEW {
+                // SAFETY: the view was built from this page's value bytes.
+                unsafe { output.append_raw_view_unchecked(&view) };
+                continue;
+            }
+            let (buffer, offset) = views.locate((view >> 96) as u32 as usize);
+            if offset + len as usize <= self.data[buffer].len() {
+                let block = *blocks[buffer]
+                    .get_or_insert_with(|| output.append_block(self.buffers[buffer].clone()));
+                let view = (view & u64::MAX as u128)
+                    | ((block as u128) << 64)
+                    | ((offset as u32 as u128) << 96);
+                // SAFETY: the value's `len` bytes lie at `offset` in the block.
+                unsafe { output.append_raw_view_unchecked(&view) };
+            } else {
+                let mut position = ReaderPosition {
+                    buffer_index: buffer,
+                    offset,
+                };
+                let bytes =
+                    MultiBufferReader::new(&self.data, &mut position).read_bytes(len as usize);
+                let id = output.append_block(Buffer::from(bytes));
+                // SAFETY: the block holds exactly the value's `len` bytes.
+                unsafe { output.append_view_unchecked(id, 0, len) };
+            }
+        }
+    }
+
     /// Reads a string of `len` bytes that spans a buffer boundary, creates a
     /// new data block for it, and appends the view.
     #[inline(always)]
@@ -263,16 +481,22 @@ impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
     type Builder = ViewBuilder<V>;
     type Delta = DeltaLengthPageDecoder<V>;
 
-    fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
+    fn new(data: Vec<Bytes>, position: ReaderPosition, cached_page: Option<CachedPage>) -> Self {
+        let views = cached_page.and_then(|page| cached_page_views(&data, position, &page));
         Self {
             buffers: data.iter().map(|b| Buffer::from(b.clone())).collect(),
             data,
             position,
+            views,
             phantom: PhantomData,
         }
     }
 
     fn read(&mut self, builder: &mut Self::Builder, size: usize) {
+        if self.views.is_some() {
+            self.read_views(builder, size);
+            return;
+        }
         let target_size = builder.len() + size;
         while builder.len() < target_size {
             if self.position.offset >= self.data[self.position.buffer_index].len() {
@@ -295,6 +519,10 @@ impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
     }
 
     fn skip(&mut self, mut size: usize) {
+        if let Some(views) = self.views.as_mut() {
+            views.skip(size);
+            return;
+        }
         while size > 0 {
             if self.position.offset >= self.data[self.position.buffer_index].len() {
                 self.position.buffer_index += 1;
@@ -385,7 +613,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let data = make_data(vec![encode_plain(&["hi", "bye", "ok"])]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
         let mut out = ViewBuilder::with_capacity(&mut allocator, 3);
 
         dec.read(&mut out, 3);
@@ -398,7 +626,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let data = make_data(vec![encode_plain(&["a", "b", "c"])]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
 
         let mut out = ViewBuilder::with_capacity(&mut allocator, 3);
         dec.read(&mut out, 2);
@@ -417,7 +645,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let all = encode_plain(&["ab", "hello"]);
         let data = make_data(vec![all[..12].to_vec(), all[12..].to_vec()]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
         let mut out = ViewBuilder::with_capacity(&mut allocator, 2);
 
         dec.read(&mut out, 2);
@@ -433,7 +661,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let all = encode_plain(&["ab", "cd"]);
         let data = make_data(vec![all[..8].to_vec(), all[8..].to_vec()]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
         let mut out = ViewBuilder::with_capacity(&mut allocator, 2);
 
         dec.read(&mut out, 2);
@@ -447,7 +675,7 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let data = make_data(vec![encode_plain(&["ab"]), encode_plain(&["cd"])]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
         let mut out = ViewBuilder::with_capacity(&mut allocator, 2);
 
         dec.read(&mut out, 2);
@@ -465,7 +693,7 @@ mod tests {
         // Split at 12: "hello" body straddles buffer boundary (ReadStr path).
         let all = encode_plain(&["ab", "hello", "v1", "v2", "v3", "v4"]);
         let data = make_data(vec![all[..12].to_vec(), all[12..].to_vec()]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
 
         // Skip "ab" and "hello"
         DecodePlain::skip(&mut dec, 2);
@@ -486,7 +714,7 @@ mod tests {
         //   Buffer 0 = "ab"(6) + 2 bytes of "cd" length = 8 bytes
         let all = encode_plain(&["ab", "cd", "v1", "v2", "v3", "v4"]);
         let data = make_data(vec![all[..8].to_vec(), all[8..].to_vec()]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
 
         // Skip "ab" and "cd"
         DecodePlain::skip(&mut dec, 2);
@@ -510,7 +738,7 @@ mod tests {
         // Bug: read_from_current_buffer(builder, 4) reads 4 from next buffer → 7 total.
         let all = encode_plain(&["a", "b", "hello", "c", "d", "e", "f"]);
         let data = make_data(vec![all[..15].to_vec(), all[15..].to_vec()]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
         let mut out = ViewBuilder::with_capacity(&mut allocator, 4);
 
         dec.read(&mut out, 4);
@@ -528,7 +756,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let all = encode_plain(&["x", "y", "hello"]);
         let data = make_data(vec![all[..15].to_vec(), all[15..].to_vec()]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
         let mut out = ViewBuilder::with_capacity(&mut allocator, 3);
 
         dec.read(&mut out, 3);
@@ -554,7 +782,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let long = "a value longer than twelve bytes";
         let data = make_data(vec![encode_plain(&[long; 6])]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
         let mut out = ViewBuilder::with_capacity(&mut allocator, 6);
 
         for _ in 0..6 {
@@ -571,11 +799,78 @@ mod tests {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
         let data = make_data(vec![encode_plain(&["short", "values", "only"])]);
-        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut dec = PlainPageDecoder::new(data, ReaderPosition::default(), None);
         let mut out = ViewBuilder::with_capacity(&mut allocator, 3);
 
         dec.read(&mut out, 3);
 
         assert_eq!(data_buffer_count(out), 0);
+    }
+
+    fn cached_page(offset: usize, values: usize) -> CachedPage {
+        CachedPage {
+            key: BlockKey {
+                open_file: crate::test_utils::dummy_row_group().open_file.clone(),
+                offset,
+                len: 100,
+            },
+            values,
+        }
+    }
+
+    const MIXED: [&str; 5] = [
+        "hi",
+        "a value long enough to live outside its view",
+        "",
+        "another value well past the inline size",
+        "end",
+    ];
+
+    /// The second decoder of the page finds the views the first one cached,
+    /// over a page split across buffers mid-value.
+    #[test]
+    fn a_page_read_again_decodes_the_same_values() {
+        init_test_free_pool(8);
+        let mut allocator = SlabAllocator::new(true);
+        let all = encode_plain(&MIXED);
+        let data = make_data(vec![all[..30].to_vec(), all[30..].to_vec()]);
+        let mut first = PlainPageDecoder::new(
+            data.clone(),
+            ReaderPosition::default(),
+            Some(cached_page(4096, MIXED.len())),
+        );
+        let mut first_out = ViewBuilder::with_capacity(&mut allocator, MIXED.len());
+        first.read(&mut first_out, MIXED.len());
+        let mut second = PlainPageDecoder::new(
+            data,
+            ReaderPosition::default(),
+            Some(cached_page(4096, MIXED.len())),
+        );
+        let mut second_out = ViewBuilder::with_capacity(&mut allocator, MIXED.len());
+
+        second.read(&mut second_out, MIXED.len());
+
+        assert_eq!(extract(first_out), MIXED);
+        assert_eq!(extract(second_out), MIXED);
+    }
+
+    #[test]
+    fn a_cached_page_skips_and_reads_in_runs() {
+        init_test_free_pool(8);
+        let mut allocator = SlabAllocator::new(true);
+        let data = make_data(vec![encode_plain(&MIXED)]);
+        let mut dec = PlainPageDecoder::new(
+            data,
+            ReaderPosition::default(),
+            Some(cached_page(8192, MIXED.len())),
+        );
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 3);
+
+        dec.skip(1);
+        dec.read(&mut out, 2);
+        dec.skip(1);
+        dec.read(&mut out, 1);
+
+        assert_eq!(extract(out), vec![MIXED[1], MIXED[2], MIXED[4]]);
     }
 }

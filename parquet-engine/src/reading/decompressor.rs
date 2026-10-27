@@ -79,6 +79,13 @@ impl Decompressor {
         // carries its bytes here directly - no cache lookup needed, and none of the
         // races one would otherwise have to reason about between that resolution
         // and now.
+        // The page's identity in the decompressed cache, also carried to the
+        // decoder so it can find what it derived from the page earlier.
+        let key = BlockKey {
+            open_file: page.row_group.get_metadata().open_file.clone(),
+            offset: page.file_offset,
+            len: page.span,
+        };
         let data = if let Some(decompressed) = page.decompressed.take() {
             decompressed
         } else if page.codec == CompressionCodec::UNCOMPRESSED {
@@ -96,11 +103,6 @@ impl Decompressor {
             // The decompressed bytes depend only on the compressed input, not on the
             // per-query filter mask, so a cache hit reuses them across queries; the
             // mask is attached to the `DataPage` below either way.
-            let key = BlockKey {
-                open_file: page.row_group.get_metadata().open_file.clone(),
-                offset: page.file_offset,
-                len: page.span,
-            };
             match memory_ctx().decompressed_cache().get(&key) {
                 Some(cached) => cached,
                 // An empty page decompresses to no bytes, and the decoders
@@ -148,7 +150,7 @@ impl Decompressor {
                         });
                     }
                     memory_ctx().decompressed_cache().insert(
-                        key,
+                        key.clone(),
                         serialize_header(&page.header),
                         reservation,
                         page.row_group
@@ -170,6 +172,7 @@ impl Decompressor {
                 header: page.header.data_page_header.unwrap(),
                 data,
                 filter_mask: page.filter_mask,
+                cache_key: Some(key),
             })
         };
 

@@ -20,6 +20,7 @@ use crate::types::filter_mask::FilterMask;
 use crate::types::metadata::QueryRowGroupMetadata;
 use bytes::Bytes;
 use dispatch::WorkerIdOutput;
+use dispatch::memory::BlockKey;
 use std::fmt::{Debug, Formatter};
 
 /// A page read from disk whose payload is still compressed.
@@ -79,6 +80,11 @@ pub struct DataPage {
     pub data: Vec<Bytes>,
     /// Row-level filter mask; when present, only `true` runs are decoded.
     pub filter_mask: Option<FilterMask>,
+    /// The page's key in the decompressed cache, which a decoder can also
+    /// file what it derives from the page under (see
+    /// [`PlainPageDecoder`](crate::reading::decoding::leaf_decoders::bytes_view::plain_page_decoder::PlainPageDecoder)).
+    /// `None` for a page that does not come from a file.
+    pub cache_key: Option<BlockKey>,
 }
 
 impl DataPage {

@@ -27,8 +27,8 @@ use bytes::Bytes;
 use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::primitive::ElemPtr;
 use crate::reading::decoding::leaf_decoders::{
-    DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, FromDelta,
-    LeafDecoder, Result, TypedLeafDecoder,
+    CachedPage, DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
+    FromDelta, LeafDecoder, Result, TypedLeafDecoder,
 };
 use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::metadata::ColumnChunkMeta;
@@ -208,7 +208,7 @@ impl<T: DecimalCarrier, S: DecimalStorage> DecodePlain for DecimalPlainDecoder<T
     // through yet, so such a page reports an unsupported encoding.
     type Delta = DecimalDeltaDecoder<T, S>;
 
-    fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
+    fn new(data: Vec<Bytes>, position: ReaderPosition, _cached_page: Option<CachedPage>) -> Self {
         Self {
             data,
             position,

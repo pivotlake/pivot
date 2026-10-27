@@ -339,6 +339,7 @@ mod tests {
             header: header.data_page_header.unwrap(),
             data: Vec::new(),
             filter_mask: None,
+            cache_key: None,
         })
     }
 

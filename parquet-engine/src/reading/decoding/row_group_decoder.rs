@@ -305,6 +305,7 @@ impl RowGroupDecoder {
                     header: data.header.clone(),
                     data: data.data.clone(),
                     filter_mask,
+                    cache_key: data.cache_key.clone(),
                 })
             }
             PageContent::Skipped(header) => DecompressedPageType::SkippedData {
