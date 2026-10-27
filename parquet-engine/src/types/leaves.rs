@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ahash::HashMap;
 use arrow_array::{Array, ArrayRef, BinaryViewArray, Datum, StructArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
-use arrow_schema::{DataType, Field, FieldRef, Fields};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use dispatch::{Projection, VariantExtract};
 
 use crate::RowGroupMetadata;
@@ -21,6 +21,41 @@ pub fn leaf_fields(fields: &Fields) -> Vec<FieldRef> {
         push_leaf_fields(field, &mut leaves);
     }
     leaves
+}
+
+/// How many schemas a thread keeps the leaves of.
+const LEAF_FIELDS_CACHE: usize = 8;
+
+thread_local! {
+    /// The leaves of the schemas this thread read lately, by schema.
+    static LEAF_FIELDS: std::cell::RefCell<Vec<(std::sync::Weak<Schema>, Arc<[FieldRef]>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The leaves of `schema` (see [`leaf_fields`]), computed once per schema on
+/// each thread.
+///
+/// A scan opens a row group on every worker at once, and every file's row
+/// groups share the file's schema. Listing a wide schema's leaves afresh for
+/// each clones every leaf's field, a count every worker then bumps at the
+/// same moment on the same lines. The entry keeps a weak reference, so a
+/// schema it names is never freed and its address never names another.
+pub fn leaf_fields_of(schema: &SchemaRef) -> Arc<[FieldRef]> {
+    LEAF_FIELDS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((_, leaves)) = cache
+            .iter()
+            .find(|(cached, _)| std::ptr::eq(cached.as_ptr(), Arc::as_ptr(schema)))
+        {
+            return leaves.clone();
+        }
+        let leaves: Arc<[FieldRef]> = leaf_fields(schema.fields()).into();
+        if cache.len() == LEAF_FIELDS_CACHE {
+            cache.remove(0);
+        }
+        cache.push((Arc::downgrade(schema), leaves.clone()));
+        leaves
+    })
 }
 
 fn push_leaf_fields(field: &FieldRef, leaves: &mut Vec<FieldRef>) {

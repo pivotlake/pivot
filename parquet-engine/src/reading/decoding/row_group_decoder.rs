@@ -13,7 +13,7 @@ use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
 use crate::reading::record_batch_metadata::with_row_index;
 use crate::types::filter_mask::FilterMask;
-use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
+use crate::types::leaves::{leaf_fields_of, plan_leaves, resolve_output_reads};
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
@@ -66,8 +66,9 @@ impl DecodePlan {
         // Expand projected columns into this file's leaves. Variant layouts can
         // differ between files, so each row group resolves them independently,
         // and the fetcher resolved them the same way.
-        let fields = row_group_metadata.get_metadata().schema.fields();
-        let leaves = leaf_fields(fields);
+        let schema = &row_group_metadata.get_metadata().schema;
+        let fields = schema.fields();
+        let leaves = leaf_fields_of(schema);
         let reads = resolve_output_reads(fields, row_group_metadata, projection);
         let plan = plan_leaves(&reads);
 

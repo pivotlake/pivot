@@ -15,7 +15,7 @@ use planner::types::{Type, UTC_TIMEZONE, physical_arrow_type};
 
 use super::row_group_stats::row_group_eliminated;
 use super::types::leaves::{
-    first_leaf, leaf_fields, variant_shredded_leaves, variant_value_leaf_is_semantically_null,
+    first_leaf, leaf_fields_of, variant_shredded_leaves, variant_value_leaf_is_semantically_null,
 };
 use super::types::metadata::RowGroupMetadata;
 use super::types::table::ParquetTable;
@@ -135,7 +135,7 @@ impl PushedPredicate {
             .as_type
             .as_ref()
             .expect("a variant path predicate has a cast target");
-        if leaf_fields(fields)[leaves.typed_leaf].data_type() != target {
+        if leaf_fields_of(&rg.schema)[leaves.typed_leaf].data_type() != target {
             return None;
         }
         let terminal = leaves.value_leaves.len().saturating_sub(1);
