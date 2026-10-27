@@ -93,6 +93,12 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// worker only learns them from the first job it steals. A worker running only
     /// count-only `COUNT(DISTINCT)` jobs never builds one.
     output_accumulator: Option<OutputAccumulator<K, V>>,
+    /// The merge state of the jobs this worker ran. Every worker that ran a
+    /// job holds it, so the merge sources (every worker's tables and scatter
+    /// buffers) are freed when the last outputter is torn down, after the
+    /// query has its result, rather than by whichever job happens to finish
+    /// last while every other worker waits on it.
+    merge_state: Option<Arc<SharedMergeState<K, V>>>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
@@ -124,6 +130,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             zero_hash_pending: false,
             output_allocator: None,
             output_accumulator: None,
+            merge_state: None,
         }
     }
 
@@ -418,6 +425,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
         }
         match steal {
             Steal::Success(job) => {
+                self.merge_state.get_or_insert_with(|| job.shared.clone());
                 let allocator = self
                     .output_allocator
                     .get_or_insert_with(|| SlabAllocator::new(false));
