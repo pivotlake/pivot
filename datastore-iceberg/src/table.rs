@@ -243,15 +243,18 @@ fn identity_columns<'a>(
         .collect()
 }
 
-/// The store `table`'s files are read through: opened with the credentials
-/// the catalog vended for the table, or through `store_factory` when it
+/// The store `table`'s files are read through: signing with the credentials
+/// the catalog vended for the table, or opened through `store_factory` when it
 /// vended none. Opened when the table is indexed rather than when a query loads
-/// it, since opening a store may ask the bucket for its region; and opened
-/// again at every refresh, so vended credentials never outlive their session.
+/// it, since opening a store may ask the bucket for its region. At a refresh,
+/// `previous` is the store the last index held: keys vended again for it renew
+/// it in place, so a query still reading through it carries on with keys that
+/// have not expired.
 pub(crate) fn open_table_store(
     name: &SchemaQualifiedTableName,
     table: &Table,
     store_factory: &dyn ExternalStoreFactory,
+    previous: Option<&TableStore>,
 ) -> Result<TableStore> {
     let table_name = name.to_string();
     let metadata_location = table
@@ -260,7 +263,13 @@ pub(crate) fn open_table_store(
             table: table_name.clone(),
         })?;
     let vended = read_vended_s3_credentials(&table_name, table.file_io().config().props())?;
-    TableStore::open(&table_name, metadata_location, store_factory, vended)
+    TableStore::open_or_renew(
+        previous,
+        &table_name,
+        metadata_location,
+        store_factory,
+        vended,
+    )
 }
 
 /// The size of `table`'s current manifest list, or `None` when the table has

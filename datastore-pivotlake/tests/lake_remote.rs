@@ -2,7 +2,7 @@
 //! that honours byte-range requests, then read it through the datastore pipeline,
 //! footer and column chunks both via the io_uring ring, and check the rows come
 //! back. Plain HTTP (not TLS) so the worker's default requester needs no injected
-//! trust; the S3 auth layer (presigned URLs) is orthogonal and exercised
+//! trust; the S3 auth layer (signed requests) is orthogonal and exercised
 //! against a live endpoint, not here.
 
 mod common;

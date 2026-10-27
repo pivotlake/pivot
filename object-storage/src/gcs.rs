@@ -31,6 +31,7 @@ use super::{
     parse_iso8601_millis, percent_encode,
 };
 use base64::Engine;
+use dispatch::io::RequestAuth;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -601,11 +602,29 @@ impl GcsStore {
             return Ok(DataFileLocation::Remote { url, auth: None });
         }
         self.auth.header()?;
-        let auth = self.auth.clone();
         Ok(DataFileLocation::Remote {
             url,
-            auth: Some(Arc::new(move || auth.current())),
+            auth: Some(Arc::new(BearerToken(Arc::clone(&self.auth)))),
         })
+    }
+}
+
+/// The token the store last minted, as each request's `Authorization` header.
+/// Never mints: the store primes the cell before it hands a location out, and
+/// a request before any mint is an error rather than an unauthenticated one.
+struct BearerToken(Arc<GcsAuth>);
+
+impl RequestAuth for BearerToken {
+    fn authenticate(
+        &self,
+        _method: &str,
+        _request_target: &str,
+    ) -> std::io::Result<Vec<(String, String)>> {
+        let header = self
+            .0
+            .current()
+            .ok_or_else(|| std::io::Error::other("no GCS token has been minted for this store"))?;
+        Ok(vec![("Authorization".to_string(), header.to_string())])
     }
 }
 

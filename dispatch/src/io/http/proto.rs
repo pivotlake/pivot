@@ -25,9 +25,10 @@ pub enum ProtoError {
 }
 
 /// Build a whole-object upload request. Always a `PUT` (the only upload method
-/// pivot uses).
-pub fn build_upload(host: &str, target: &str, len: usize, auth: Option<&str>) -> Vec<u8> {
-    let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
+/// pivot uses). `auth` holds the headers that authenticate the request, none
+/// for a URL that needs no header.
+pub fn build_upload(host: &str, target: &str, len: usize, auth: &[(String, String)]) -> Vec<u8> {
+    let auth = format_header_lines(auth);
     format!(
         "PUT {target} HTTP/1.1\r\n\
          Host: {host}\r\n\
@@ -45,18 +46,18 @@ pub fn build_upload(host: &str, target: &str, len: usize, auth: Option<&str>) ->
 ///
 /// `Connection: keep-alive` so the connection can be returned to the pool, and
 /// `Accept-Encoding: identity` so the body length matches the requested range
-/// exactly (no transfer/content encoding to undo). `auth`, when present, is the
-/// `Authorization` header value (e.g. `Bearer <token>`) for a store that
-/// authenticates each request rather than signing the URL.
+/// exactly (no transfer/content encoding to undo). `auth` holds the headers
+/// that authenticate the request (a bearer token, a signature), none for a URL
+/// that needs no header.
 pub fn build_range_get(
     host: &str,
     target: &str,
     offset: u64,
     len: usize,
-    auth: Option<&str>,
+    auth: &[(String, String)],
 ) -> Vec<u8> {
     let end = offset + len as u64 - 1;
-    let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
+    let auth = format_header_lines(auth);
     format!(
         "GET {target} HTTP/1.1\r\n\
          Host: {host}\r\n\
@@ -68,6 +69,14 @@ pub fn build_range_get(
          \r\n"
     )
     .into_bytes()
+}
+
+/// `headers` as request lines, each terminated, ready to splice into a head.
+fn format_header_lines(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect()
 }
 
 /// A parsed (and validated `206`) response head.
@@ -159,7 +168,7 @@ mod tests {
 
     #[test]
     fn range_get_has_expected_request_line_and_headers() {
-        let req = build_range_get("example.com", "/data.parquet", 4096, 8192, None);
+        let req = build_range_get("example.com", "/data.parquet", 4096, 8192, &[]);
         let text = String::from_utf8(req).unwrap();
         assert!(text.starts_with("GET /data.parquet HTTP/1.1\r\n"));
         assert!(text.contains("Host: example.com\r\n"));
@@ -170,10 +179,20 @@ mod tests {
     }
 
     #[test]
-    fn range_get_emits_authorization_when_present() {
-        let req = build_range_get("example.com", "/data.parquet", 0, 1, Some("Bearer tok"));
+    fn range_get_emits_every_authenticating_header() {
+        let auth = [
+            (
+                "Authorization".to_string(),
+                "AWS4-HMAC-SHA256 sig".to_string(),
+            ),
+            ("x-amz-date".to_string(), "20260101T000000Z".to_string()),
+        ];
+
+        let req = build_range_get("example.com", "/data.parquet", 0, 1, &auth);
+
         let text = String::from_utf8(req).unwrap();
-        assert!(text.contains("Authorization: Bearer tok\r\n"));
+        assert!(text.contains("Authorization: AWS4-HMAC-SHA256 sig\r\n"));
+        assert!(text.contains("x-amz-date: 20260101T000000Z\r\n"));
     }
 
     #[test]

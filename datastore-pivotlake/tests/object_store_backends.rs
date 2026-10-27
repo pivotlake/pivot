@@ -262,7 +262,7 @@ mod bodies {
     }
 
     /// A stored object reads back through `source` — the read source the ring is
-    /// handed (a presigned S3 URL, a GCS media URL, or a local path).
+    /// handed (an S3 object URL, a GCS media URL, or a local path).
     pub fn source_reads_object_back(b: &Backend) {
         b.store
             .put(&ObjectPath::new("s/o.bin"), b"payload")
