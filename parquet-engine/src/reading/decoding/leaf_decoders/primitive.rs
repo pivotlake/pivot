@@ -20,8 +20,8 @@ use arrow_buffer::ArrowNativeType;
 
 use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::{
-    DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, LeafDecoder,
-    Result, TypedLeafDecoder,
+    CachedPage, DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta,
+    LeafDecoder, Result, TypedLeafDecoder,
 };
 use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::page::DecompressedPage;
@@ -261,7 +261,7 @@ where
     type Builder = PrimitiveBuilder<T>;
     type Delta = DeltaDecoder<T>;
 
-    fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
+    fn new(data: Vec<Bytes>, position: ReaderPosition, _cached_page: Option<CachedPage>) -> Self {
         Self {
             data,
             position,
@@ -601,6 +601,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
                 filter_mask: None,
+                cache_key: None,
             }),
         }
     }
@@ -622,6 +623,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: buffers.into_iter().map(Bytes::from).collect(),
                 filter_mask: None,
+                cache_key: None,
             }),
         }
     }
@@ -838,6 +840,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
                 filter_mask: Some(filter_mask),
+                cache_key: None,
             }),
         }
     }

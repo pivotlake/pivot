@@ -76,6 +76,7 @@ mod tests {
                 header: header.data_page_header.unwrap(),
                 data: vec![Bytes::from(data)],
                 filter_mask: None,
+                cache_key: None,
             }),
         }
     }
