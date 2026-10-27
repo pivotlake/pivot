@@ -74,10 +74,10 @@ pub use substring::Substring;
 pub use suffix::Suffix;
 pub use variant_get::{JsonPath, VariantGet};
 
-use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
+use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
 use crate::types::{self, Type};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
+use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar, make_array};
 use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, OrderByNullType};
 use std::fmt::{self, Display};
 use thiserror::Error;
@@ -366,8 +366,14 @@ impl Expression {
             Expression::Compare(c) => c.compile(),
             Expression::Constant(c) => {
                 let scalar = c.clone();
-                Ok(stateless_expr(move |_batch: &RecordBatch| {
-                    ExprResult::Scalar(scalar.clone())
+                Ok(Box::new(move || {
+                    // Every batch's evaluation clones and drops the scalar, an
+                    // `Arc` count. Each worker evaluates a copy of its own, or
+                    // the count sits on one line every worker in the pool
+                    // writes for every batch.
+                    let scalar = Scalar::new(make_array(scalar.get().0.to_data()));
+                    Box::new(move |_batch: &RecordBatch| ExprResult::Scalar(scalar.clone()))
+                        as ExprEvalFn
                 }))
             }
             Expression::Function(f) => f.compile(),
