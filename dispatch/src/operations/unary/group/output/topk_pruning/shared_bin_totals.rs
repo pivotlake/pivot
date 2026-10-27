@@ -11,14 +11,15 @@ use crossbeam_deque::{Injector, Steal};
 /// alone it would be `workers x HASH_BINS` adds on one thread, the serial
 /// tail of every large top-k query on a big machine. Instead each node keeps
 /// a lock-free queue of arrays waiting to be summed. An arriving worker
-/// takes one array an earlier arrival left in its node's queue, merges it
-/// into its own, and queues that. Nothing ever waits, and no worker merges
-/// more than one array: a worker that arrives while another is mid-merge
-/// finds the queue empty and just queues its own. Arrivals that were spread
-/// out chain into a single array; only arrivals that overlapped leave extra
-/// ones behind, so the final arrival's sum stays small. Per-node queues keep
-/// every merge in node-local memory; the final sum is the one step that
-/// reads across nodes.
+/// merges into its own every array earlier arrivals left in its node's
+/// queue, then queues the result. Nothing ever waits: workers arriving
+/// together each take a different array and merge in parallel, the queue
+/// drains as a tree, and the final arrival's sum is left with the few
+/// arrays queued after the last steal. Workers finish consuming within a
+/// fraction of a millisecond of each other, so a worker taking only one
+/// array would leave half of them for that serial final sum. Per-node
+/// queues keep every merge in node-local memory; the final sum is the one
+/// step that reads across nodes.
 pub(crate) struct SharedBinTotals {
     /// Per node: arrays waiting to be merged into the pool-wide sum.
     pending: Vec<Injector<HashBinTotals>>,
@@ -31,16 +32,13 @@ impl SharedBinTotals {
         }
     }
 
-    /// Adds one worker's totals: merges in one array left by an earlier
-    /// arrival, if there is one, then queues the result.
+    /// Adds one worker's totals: merges in every array earlier arrivals
+    /// left queued, then queues the result.
     pub(crate) fn add(&self, node: usize, mut totals: HashBinTotals) {
         let pending = &self.pending[node];
         loop {
             match pending.steal() {
-                Steal::Success(other) => {
-                    totals.merge(&other);
-                    break;
-                }
+                Steal::Success(other) => totals.merge(&other),
                 Steal::Retry => continue,
                 Steal::Empty => break,
             }
