@@ -15,18 +15,16 @@
 //! the `k` already found.
 //!
 //! [`prunable_topk`] decides whether a pushed limit qualifies. The
-//! per-worker [`HashBinTotals`] are summed through [`SharedBinTotals`] into
+//! per-worker [`HashBinTotals`] are summed through the pool-wide worker summaries into
 //! [`TopKBounds`], which merge jobs check against the [`TopKThreshold`] to
 //! form the [`TopKCutoff`] their scans apply.
 
 mod bin_totals;
 mod bounds;
-mod shared_bin_totals;
 mod threshold;
 
 pub use bin_totals::HashBinTotals;
 pub(crate) use bounds::{TopKBounds, TopKCutoff};
-pub(crate) use shared_bin_totals::SharedBinTotals;
 pub use threshold::TopKThreshold;
 
 use crate::operations::unary::group::GroupLimit;

@@ -99,7 +99,8 @@ mod keys;
 mod output;
 mod values;
 
-use output::topk_pruning::{SharedBinTotals, TopKThreshold};
+use output::SharedSummaries;
+use output::topk_pruning::TopKThreshold;
 pub use output::{GroupOutputter, PartitionJob};
 
 pub use factory::GroupFactory;
@@ -261,7 +262,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
         topk_threshold: Arc<TopKThreshold>,
-        shared_bin_totals: Arc<SharedBinTotals>,
+        shared_summaries: Arc<SharedSummaries>,
     ) -> Self {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
         let value_output_types: Arc<[DataType]> =
@@ -300,7 +301,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
                 output_limit,
                 count_only,
                 topk_threshold,
-                shared_bin_totals,
+                shared_summaries,
             ),
             gather,
             aggregated_table,
@@ -329,10 +330,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
     }
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
-        let (tables, topk_bin_totals) = self.aggregated_table.flush();
-        if let Some(totals) = topk_bin_totals {
-            self.outputter.add_bin_totals(totals);
-        }
+        let (tables, summary) = self.aggregated_table.flush();
+        self.outputter.add_summary(summary);
         self.gather.arrive(tables, |values| {
             self.outputter.create_partition_jobs(values)
         });
@@ -462,7 +461,7 @@ mod tests {
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(worker_count));
         let topk_threshold = Arc::new(TopKThreshold::for_limit(output_limit));
-        let shared_bin_totals = Arc::new(SharedBinTotals::new(1));
+        let shared_summaries = Arc::new(SharedSummaries::new(1));
 
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
@@ -480,7 +479,7 @@ mod tests {
                     partition_jobs_injected.clone(),
                     radix,
                     topk_threshold.clone(),
-                    shared_bin_totals.clone(),
+                    shared_summaries.clone(),
                 )
             })
             .collect();
@@ -800,7 +799,7 @@ mod tests {
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(worker_count));
         let topk_threshold = Arc::new(TopKThreshold::for_limit(None));
-        let shared_bin_totals = Arc::new(SharedBinTotals::new(1));
+        let shared_summaries = Arc::new(SharedSummaries::new(1));
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
                 Group::<RowKeyExtractor, V>::new(
@@ -817,7 +816,7 @@ mod tests {
                     partition_jobs_injected.clone(),
                     radix,
                     topk_threshold.clone(),
-                    shared_bin_totals.clone(),
+                    shared_summaries.clone(),
                 )
             })
             .collect();

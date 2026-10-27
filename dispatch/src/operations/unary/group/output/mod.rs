@@ -12,6 +12,8 @@ mod merge;
 mod outputter;
 mod partition_job;
 pub(super) mod topk_pruning;
+pub(super) mod worker_summary;
 
 pub use outputter::GroupOutputter;
 pub use partition_job::PartitionJob;
+pub(crate) use worker_summary::{SharedSummaries, WorkerSummary};

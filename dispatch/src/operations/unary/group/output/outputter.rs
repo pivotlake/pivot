@@ -10,13 +10,13 @@ use crate::operations::unary::group::hashtables::{
     AggregatedTableOutput, AggregationValue, DEFAULT_CAPACITY, HashTable, KeyExtractor,
     MAX_LOAD_FACTOR, PartitionBuffers, entry_stride,
 };
-use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
 use crate::operations::unary::group::output::merge::{self, SubPartitionScratch};
 use crate::operations::unary::group::output::partition_job::{PartitionJob, SharedMergeState};
 use crate::operations::unary::group::output::topk_pruning::{
-    HashBinTotals, SeedCandidate, SharedBinTotals, TopKBounds, TopKThreshold, seed_threshold,
+    SeedCandidate, TopKBounds, TopKThreshold, seed_threshold,
 };
+use crate::operations::unary::group::output::worker_summary::{SharedSummaries, WorkerSummary};
 use crate::operations::unary::pipeline_breaker::Outputter;
 use crate::worker::current_node;
 use arrow_array::RecordBatch;
@@ -75,7 +75,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     topk_threshold: Arc<TopKThreshold>,
     /// Pool-wide bin totals every worker adds its own into on arrival; the
     /// final gather arrival takes the sum.
-    shared_bin_totals: Arc<SharedBinTotals>,
+    shared_summaries: Arc<SharedSummaries>,
     /// The final gather arrival saw the hash-only extractor's out-of-band zero
     /// hash and must emit its extra count row once.
     zero_hash_pending: bool,
@@ -111,7 +111,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         output_limit: Option<GroupLimit>,
         count_only: bool,
         topk_threshold: Arc<TopKThreshold>,
-        shared_bin_totals: Arc<SharedBinTotals>,
+        shared_summaries: Arc<SharedSummaries>,
     ) -> Self {
         Self {
             key_arena,
@@ -124,7 +124,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             output_limit,
             count_only,
             topk_threshold,
-            shared_bin_totals,
+            shared_summaries,
             zero_hash_pending: false,
             output_allocator: None,
             output_accumulator: None,
@@ -132,10 +132,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         }
     }
 
-    /// Adds this worker's top-k bin totals to the pool-wide sum. Called before
-    /// the worker arrives at the gather barrier.
-    pub(crate) fn add_bin_totals(&self, totals: HashBinTotals) {
-        self.shared_bin_totals.add(self.node, totals);
+    /// Adds this worker's merge-sizing summary to the pool-wide sum. Called
+    /// before the worker arrives at the gather barrier.
+    pub(crate) fn add_summary(&self, summary: WorkerSummary) {
+        self.shared_summaries.add(self.node, summary);
     }
 
     /// Combine every worker's gathered tables, size the merge from the merged
@@ -150,52 +150,30 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             (0..node_count).map(|_| Vec::new()).collect();
         let mut buffers_by_node: Vec<Vec<PartitionBuffers<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
-        let mut hll = Hll::new();
-        // A worker only folds its keys into the sketch once it switches to
-        // radix; a worker that stayed in-place (`buffers.is_none()`) is absent
-        // from the merged HLL. Add its exact distinct count (each table tracks
-        // its own `len`, no scan) so the estimate below isn't skewed low when
-        // some workers switched and others didn't. Counting a key here that a
-        // switched worker also holds over-counts, which only over-sizes the
-        // merge targets (safe); under-counting is what forces mid-merge resizes.
-        let mut non_switched_groups = 0usize;
-        // Bounds are only valid if every worker holding groups folded its
-        // bin totals; a worker that skipped (too small, see the flush) makes them
-        // undercount and disables pruning.
-        let mut every_group_binned = true;
-        // Pool-wide raw-scattered row count per scatter bucket, from the
-        // workers that fell back to raw scatter; widens the bounds below.
-        let mut raw_bucket_rows: Option<Vec<u64>> = None;
         // Every worker's heaviest partials, to seed the threshold below.
         let mut seed_candidates: Vec<SeedCandidate<K::Persisted>> = Vec::new();
         for out in outputs {
-            let table_entries: usize = out.tables.iter().map(|t| t.len()).sum();
             seed_candidates.extend(out.topk_seed_candidates);
-            if out.buffers.is_none() {
-                non_switched_groups += table_entries;
-            }
-            every_group_binned &=
-                out.has_bin_totals || (table_entries == 0 && out.buffers.is_none());
-            if let Some(rows) = &out.raw_scatter_rows {
-                let sum = raw_bucket_rows.get_or_insert_with(|| vec![0; rows.len()]);
-                for (bucket, count) in sum.iter_mut().zip(rows) {
-                    *bucket += count;
-                }
-            }
             tables_by_node[out.node].extend(out.tables);
             if let Some(b) = out.buffers {
                 buffers_by_node[out.node].push(b);
             }
-            hll.merge(&out.hll);
             self.zero_hash_pending |= out.zero_hash_seen;
         }
+        // The workers' sketches, bin totals and raw-scatter counts, summed on
+        // their way in (see `SharedSummaries`).
+        let summary = self
+            .shared_summaries
+            .take_sum()
+            .expect("every worker adds its summary before arriving at the gather");
         let any_switched = buffers_by_node.iter().any(|b| !b.is_empty());
         let total_in_place: usize = tables_by_node.iter().flatten().map(|t| t.len()).sum();
         // Estimate the global distinct count: the HLL covers switched
         // workers, and a non-switched worker's exact per-table count stands
         // in for its keys (over-counting keys a switched worker also holds,
-        // which is safe).
-        let estimate = hll.estimate() + non_switched_groups;
+        // which only over-sizes the merge targets; under-counting is what
+        // forces mid-merge resizes).
+        let estimate = summary.hll.estimate() + summary.non_switched_groups;
         let (num_partitions, partition_capacity) = if !any_switched {
             // How many entries we want in each table for a partition job
             const TARGET_SCANNED_ENTRIES_PER_JOB: usize = 16 * 1024;
@@ -294,11 +272,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // that lets later jobs skip themselves.
         // Tests prune unconditionally so the skip path stays exercised at
         // test-sized group counts.
-        let topk_bounds = (every_group_binned
+        // Bounds are only valid if every worker holding groups folded its
+        // bin totals; one that skipped (too small, see the flush) makes them
+        // undercount.
+        let topk_bounds = (summary.every_group_binned
             && (cfg!(test) || estimate >= MIN_TOPK_PRUNE_ESTIMATE))
             .then(|| {
-                self.shared_bin_totals.take_sum().map(|mut totals| {
-                    if let Some(bucket_rows) = &raw_bucket_rows {
+                summary.bin_totals.map(|mut totals| {
+                    if let Some(bucket_rows) = &summary.raw_scatter_rows {
                         totals.add_raw_bucket_rows(bucket_rows);
                     }
                     TopKBounds::build(totals)

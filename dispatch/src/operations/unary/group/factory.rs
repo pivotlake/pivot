@@ -13,7 +13,8 @@ use crate::operations::unary::group::hashtables::RadixConfig;
 use crate::operations::unary::group::hashtables::{
     AggregatedTableOutput, AggregationValue, KeyExtractor,
 };
-use crate::operations::unary::group::output::topk_pruning::{SharedBinTotals, TopKThreshold};
+use crate::operations::unary::group::output::SharedSummaries;
+use crate::operations::unary::group::output::topk_pruning::TopKThreshold;
 use crate::operations::unary::group::{AggregationSlot, Group, GroupLimit, PartitionJob};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use ahash::RandomState;
@@ -49,7 +50,7 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// the merge phase to skip partitions that cannot reach it.
     topk_threshold: Arc<TopKThreshold>,
     /// Pool-wide bin totals every worker adds its own into at the gather barrier.
-    shared_bin_totals: Arc<SharedBinTotals>,
+    shared_summaries: Arc<SharedSummaries>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
@@ -77,7 +78,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(topology.total_workers()));
         let topk_threshold = Arc::new(TopKThreshold::for_limit(output_limit));
-        let shared_bin_totals = Arc::new(SharedBinTotals::new(topology.node_count));
+        let shared_summaries = Arc::new(SharedSummaries::new(topology.node_count));
         let radix = RadixConfig {
             partitions: crate::operations::unary::group::get_scatter_bucket_count_for_worker(
                 topology.total_workers(),
@@ -99,7 +100,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             gather: gather.clone(),
             radix,
             topk_threshold: topk_threshold.clone(),
-            shared_bin_totals: shared_bin_totals.clone(),
+            shared_summaries: shared_summaries.clone(),
         })
     }
 }
@@ -124,7 +125,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
             self.partition_jobs_injected,
             self.radix,
             self.topk_threshold,
-            self.shared_bin_totals,
+            self.shared_summaries,
         ))
     }
 }

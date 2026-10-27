@@ -25,6 +25,7 @@ use crate::operations::unary::group::hashtables::{
     AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, PersistedKey, StridedScatterRows,
 };
 use crate::operations::unary::group::hll::Hll;
+use crate::operations::unary::group::output::WorkerSummary;
 use crate::operations::unary::group::output::topk_pruning::{
     HashBinTotals, MAX_SEEDED_LIMIT, MIN_BINNED_ENTRIES, PrunableTopK, SeedCandidate,
     SeedCandidates, TopKWeight,
@@ -164,22 +165,6 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     pub tables: Vec<HashTable<K::Persisted, V>>,
     /// Per-partition scatter buffers, present only after a radix transition.
     pub buffers: Option<PartitionBuffers<K::Persisted, V>>,
-    /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
-    pub hll: Hll,
-    /// Whether this worker built top-k hash-bin totals (returned beside this output
-    /// by [`AggregatedTable::flush`] and added into the pool-wide totals
-    /// before the gather).
-    pub has_bin_totals: bool,
-    /// With bin totals and a raw-scatter fallback: this worker's raw row
-    /// count per scatter bucket. Raw rows are not in the totals, and at
-    /// worst one group absorbed a whole bucket of them, so the merge adds a
-    /// bucket's count to the bound of every bin the bucket covers.
-    ///
-    /// This is most definitely a hack and a patch. It keeps the bounds valid
-    /// without touching the per-row scatter path, at the price of loosening
-    /// them by a whole bucket's rows. It will not be relevant once raw rows
-    /// are summed into the totals properly.
-    pub raw_scatter_rows: Option<Vec<u64>>,
     /// With bin totals: this worker's heaviest partials of the pushed top-k's
     /// ordering aggregate, which seed the merge's threshold (see
     /// [`SeedCandidates`]). Empty without bin totals or past
@@ -632,48 +617,54 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     }
 
     /// Finishes worker state for the merge phase, returning the worker's
-    /// top-k bin totals beside the output so the caller can fold them into the
-    /// pool's shared accumulators before arriving at the gather barrier.
-    pub fn flush(mut self) -> (AggregatedTableOutput<K, V>, Option<HashBinTotals>) {
-        if self.switched_to_radix {
-            // Add pre-transition groups to the scatter-side estimate.
-            for table in &self.tables {
-                for entry in table.iter(0) {
-                    self.hll.add(entry.hash);
-                }
-            }
-        }
-        // Fold the entries still sitting in the in-place tables into the
-        // top-k bin totals (drained entries were folded as they scattered). A
-        // worker this small skips the totals (and thereby turns pruning off)
-        // rather than pay the allocation on a query too small to prune.
+    /// merge-sizing summary beside the output so the caller can fold it into
+    /// the pool's shared sum before arriving at the gather barrier.
+    pub fn flush(mut self) -> (AggregatedTableOutput<K, V>, WorkerSummary) {
+        // One pass over the entries still sitting in the in-place tables: a
+        // switched worker adds its pre-transition groups to the scatter-side
+        // estimate, and a pushed top-k folds them into the bin totals
+        // (drained entries were folded as they scattered). A worker this
+        // small skips the totals (and thereby turns pruning off) rather than
+        // pay the allocation on a query too small to prune.
         let table_entries: usize = self.tables.iter().map(|t| t.len()).sum();
         let allocator = &mut self.allocator;
         let taken_totals = self.topk_bin_totals.take();
-        let topk_seed = &mut self.topk_seed;
-        let topk_bin_totals = self.topk_aggregation_slot.and_then(|slot| {
+        let mut totals = self.topk_aggregation_slot.and_then(|slot| {
             if taken_totals.is_none() && table_entries < MIN_BINNED_ENTRIES {
                 return None;
             }
-            let mut totals = taken_totals.unwrap_or_else(|| HashBinTotals::new(allocator));
+            Some((
+                taken_totals.unwrap_or_else(|| HashBinTotals::new(allocator)),
+                slot,
+            ))
+        });
+        let topk_seed = &mut self.topk_seed;
+        let hll = &mut self.hll;
+        let sketch_entries = self.switched_to_radix;
+        if sketch_entries || totals.is_some() {
             for table in &self.tables {
                 for entry in table.iter(0) {
-                    let weight = entry.stored.sort_key(slot).saturating_weight();
-                    totals.add(entry.hash, weight);
-                    if let Some(seed) = topk_seed.as_mut() {
-                        seed.offer(entry.hash, *entry.key, weight);
+                    if sketch_entries {
+                        hll.add(entry.hash);
+                    }
+                    if let Some((totals, slot)) = &mut totals {
+                        let weight = entry.stored.sort_key(*slot).saturating_weight();
+                        totals.add(entry.hash, weight);
+                        if let Some(seed) = topk_seed.as_mut() {
+                            seed.offer(entry.hash, *entry.key, weight);
+                        }
                     }
                 }
             }
-            Some(totals)
-        });
+        }
+        let topk_bin_totals = totals.map(|(totals, _)| totals);
         let topk_seed_candidates = match (topk_bin_totals.is_some(), self.topk_seed.take()) {
             (true, Some(seed)) => seed.into_candidates(),
             _ => Vec::new(),
         };
         // Raw-scattered rows never reached the totals. Report each bucket's
         // row count so the merge can widen its bounds by them (a hack, see
-        // `AggregatedTableOutput::raw_scatter_rows`). The bucket counts also
+        // [`HashBinTotals::add_raw_bucket_rows`]). The bucket counts also
         // include the drained partials scattered before the fallback, which
         // only loosens the bounds further.
         let raw_scatter_rows = match (&self.buffers, topk_bin_totals.is_some(), self.scatter_raw) {
@@ -684,17 +675,28 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         };
         self.key_arena.flush();
         self.worker_context.flush();
+        let summary = WorkerSummary {
+            hll: self.hll,
+            // A worker that stayed in place is absent from the sketch; its
+            // exact table count stands in for its keys.
+            non_switched_groups: if self.buffers.is_none() {
+                table_entries
+            } else {
+                0
+            },
+            every_group_binned: topk_bin_totals.is_some()
+                || (table_entries == 0 && self.buffers.is_none()),
+            bin_totals: topk_bin_totals,
+            raw_scatter_rows,
+        };
         let output = AggregatedTableOutput {
             node: crate::worker::current_node(),
             tables: self.tables,
             buffers: self.buffers.map(PartitionBuffers::new),
-            hll: self.hll,
-            has_bin_totals: topk_bin_totals.is_some(),
-            raw_scatter_rows,
             topk_seed_candidates,
             zero_hash_seen: self.zero_hash_seen,
         };
-        (output, topk_bin_totals)
+        (output, summary)
     }
 }
 
@@ -1039,11 +1041,13 @@ mod tests {
         // equals the row count and the merge's bounds stay valid.
         let values: Vec<i32> = (0..6000).flat_map(|k| [k, k]).collect();
         consume_all(&mut table, &values);
-        let (output, totals) = table.flush();
+        let (output, summary) = table.flush();
 
         assert!(output.buffers.is_some(), "fills drain into buffers");
-        let totals = totals.expect("drained fills keep the bin totals fed");
-        assert!(output.has_bin_totals);
+        let totals = summary
+            .bin_totals
+            .expect("drained fills keep the bin totals fed");
+        assert!(summary.every_group_binned);
         let mass: u64 = totals.into_bin_totals().iter().sum();
         assert_eq!(mass, 12000, "every partial is binned exactly once");
     }
@@ -1066,13 +1070,16 @@ mod tests {
         // widen its bounds with.
         let values: Vec<i32> = (0..6000).collect();
         consume_all(&mut table, &values);
-        let (output, totals) = table.flush();
+        let (output, summary) = table.flush();
 
         assert!(output.buffers.is_some(), "fallback allocates buffers");
         assert!(scatter_row_count(&output) > 1000, "tail rows scatter raw");
-        assert!(totals.is_some(), "drained fills keep the bin totals");
-        assert!(output.has_bin_totals);
-        let bucket_rows: u64 = output.raw_scatter_rows.as_ref().unwrap().iter().sum();
+        assert!(
+            summary.bin_totals.is_some(),
+            "drained fills keep the bin totals"
+        );
+        assert!(summary.every_group_binned);
+        let bucket_rows: u64 = summary.raw_scatter_rows.as_ref().unwrap().iter().sum();
         assert_eq!(bucket_rows as usize, scatter_row_count(&output));
     }
 }
