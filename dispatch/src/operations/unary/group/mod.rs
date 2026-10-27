@@ -283,7 +283,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
             shared_context.clone(),
             shared_context.worker(),
             radix,
-            output::topk_pruning::prunable_topk_slot(output_limit, &value_slots),
+            output::topk_pruning::prunable_topk(output_limit, &value_slots),
         );
         Self {
             key_cols,

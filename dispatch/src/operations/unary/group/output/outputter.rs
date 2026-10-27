@@ -14,7 +14,7 @@ use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
 use crate::operations::unary::group::output::partition_job::{PartitionJob, SharedMergeState};
 use crate::operations::unary::group::output::topk_pruning::{
-    HashBinTotals, SharedBinTotals, TopKBounds, TopKThreshold,
+    HashBinTotals, SeedCandidate, SharedBinTotals, TopKBounds, TopKThreshold, seed_threshold,
 };
 use crate::operations::unary::pipeline_breaker::Outputter;
 use crate::worker::current_node;
@@ -161,8 +161,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // Pool-wide raw-scattered row count per scatter bucket, from the
         // workers that fell back to raw scatter; widens the bounds below.
         let mut raw_bucket_rows: Option<Vec<u64>> = None;
+        // Every worker's heaviest partials, to seed the threshold below.
+        let mut seed_candidates: Vec<SeedCandidate<K::Persisted>> = Vec::new();
         for out in outputs {
             let table_entries: usize = out.tables.iter().map(|t| t.len()).sum();
+            seed_candidates.extend(out.topk_seed_candidates);
             if out.buffers.is_none() {
                 non_switched_groups += table_entries;
             }
@@ -300,6 +303,18 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         let partition_bounds = topk_bounds
             .as_ref()
             .map(|bounds| bounds.partition_bounds(num_partitions));
+        // Seed the threshold from the partials the workers already hold, so
+        // the first wave of jobs prunes like every later one instead of
+        // merging whole partitions before any exact group is known.
+        if partition_bounds.is_some()
+            && let Some(GroupLimit::TopK { limit, .. }) = self.output_limit
+        {
+            self.topk_threshold.seed(seed_threshold::<K::Stored>(
+                seed_candidates,
+                limit,
+                &self.key_arena,
+            ));
+        }
         // With bounds, lead with the heaviest partitions: the first wave fills
         // the top-k heaps and raises the threshold later jobs skip against.
         // Only the head is sorted; the tail keeps ascending partition order,

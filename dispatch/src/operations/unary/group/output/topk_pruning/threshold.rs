@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// Offers are gated on a relaxed load of the current minimum, so after the
 /// first `cap` groups almost every offer is one uncontended atomic read.
 pub struct TopKThreshold {
-    /// The k-th best weight once `cap` groups have been offered; 0 before,
-    /// which no bound is below, so nothing is skipped prematurely.
+    /// The k-th best weight once `cap` groups have been offered, or the seed
+    /// if that is larger; 0 before either, which no bound is below, so
+    /// nothing is skipped prematurely. Only ever raised.
     kth_best: AtomicU64,
     /// Min-heap of the `cap` largest weights offered so far.
     top: Mutex<BinaryHeap<Reverse<u64>>>,
@@ -71,17 +72,25 @@ impl TopKThreshold {
             top.push(Reverse(weight));
             if top.len() == self.cap {
                 self.kth_best
-                    .store(top.peek().unwrap().0, Ordering::Relaxed);
+                    .fetch_max(top.peek().unwrap().0, Ordering::Relaxed);
             }
         } else if self.cap > 0 && weight > top.peek().unwrap().0 {
             *top.peek_mut().unwrap() = Reverse(weight);
             self.kth_best
-                .store(top.peek().unwrap().0, Ordering::Relaxed);
+                .fetch_max(top.peek().unwrap().0, Ordering::Relaxed);
         }
     }
 
-    /// The current lower bound on the k-th best group value (0 until `cap`
-    /// groups have been offered).
+    /// Raises the threshold to a value `cap` distinct groups are already
+    /// known to reach, before any partition merges (see
+    /// [`SeedCandidates`](super::SeedCandidates)). Exact offers only ever
+    /// raise it further.
+    pub fn seed(&self, weight: u64) {
+        self.kth_best.fetch_max(weight, Ordering::Relaxed);
+    }
+
+    /// The current lower bound on the k-th best group value: the larger of
+    /// the seed and the k-th best exact weight offered (0 before either).
     #[inline]
     pub fn kth_best(&self) -> u64 {
         self.kth_best.load(Ordering::Relaxed)

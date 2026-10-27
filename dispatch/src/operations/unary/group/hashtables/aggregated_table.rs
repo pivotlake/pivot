@@ -26,7 +26,8 @@ use crate::operations::unary::group::hashtables::{
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::topk_pruning::{
-    HashBinTotals, MIN_BINNED_ENTRIES, TopKWeight,
+    HashBinTotals, MAX_SEEDED_LIMIT, MIN_BINNED_ENTRIES, PrunableTopK, SeedCandidate,
+    SeedCandidates, TopKWeight,
 };
 use crate::operations::unary::group::values::{AggregationSlot, ArityBody, WorkerContext};
 use ahash::RandomState;
@@ -179,6 +180,11 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     /// them by a whole bucket's rows. It will not be relevant once raw rows
     /// are summed into the totals properly.
     pub raw_scatter_rows: Option<Vec<u64>>,
+    /// With bin totals: this worker's heaviest partials of the pushed top-k's
+    /// ordering aggregate, which seed the merge's threshold (see
+    /// [`SeedCandidates`]). Empty without bin totals or past
+    /// [`MAX_SEEDED_LIMIT`].
+    pub topk_seed_candidates: Vec<SeedCandidate<K::Persisted>>,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
     /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
     pub zero_hash_seen: bool,
@@ -204,7 +210,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// aggregate of a pushed-down top-k, whose partial values are summed into
     /// the top-k hash-bin totals. Present only when that aggregate is a COUNT
     /// form: its partials are nonnegative and additive, so bin sums stay valid
-    /// upper bounds (see [`prunable_topk_slot`](crate::operations::unary::group::output::topk_pruning::prunable_topk_slot)). `None` builds
+    /// upper bounds (see [`prunable_topk`](crate::operations::unary::group::output::topk_pruning::prunable_topk)). `None` builds
     /// no totals, including for a pushed top-k on any other aggregate.
     /// Kept across the raw-scatter fallback: raw rows are not folded (each
     /// would cost a totals update), the flush reports their count per
@@ -214,6 +220,9 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Every partial the merge will see feeds it: drained table entries as
     /// they scatter, surviving table entries at flush.
     topk_bin_totals: Option<HashBinTotals>,
+    /// The heaviest of those partials, offered beside every totals update,
+    /// to seed the merge's threshold. Absent past [`MAX_SEEDED_LIMIT`].
+    topk_seed: Option<SeedCandidates<K::Persisted>>,
     /// Whether this worker has entered radix mode.
     switched_to_radix: bool,
     /// Whether rows bypass the in-place table and scatter raw, set once a
@@ -244,7 +253,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         shared_context: V::SharedContext,
         worker_context: V::WorkerContext,
         radix_config: RadixConfig,
-        topk_aggregation_slot: Option<usize>,
+        topk_pruning: Option<PrunableTopK>,
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = HashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
@@ -257,8 +266,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             tables: vec![table],
             buffers: None,
             hll: Hll::new(),
-            topk_aggregation_slot,
+            topk_aggregation_slot: topk_pruning.map(|topk| topk.slot),
             topk_bin_totals: None,
+            topk_seed: topk_pruning
+                .filter(|topk| topk.limit <= MAX_SEEDED_LIMIT)
+                .map(|topk| SeedCandidates::new(topk.limit)),
             switched_to_radix: false,
             scatter_raw: false,
             rows_since_clear: 0,
@@ -591,6 +603,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             shared_context,
             topk_bin_totals,
             topk_aggregation_slot,
+            topk_seed,
             ..
         } = self;
         let mut totals =
@@ -603,7 +616,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             let hash = entry.hash;
             hll.add(hash);
             if let Some((totals, slot)) = &mut totals {
-                totals.add(hash, entry.stored.sort_key(*slot).saturating_weight());
+                let weight = entry.stored.sort_key(*slot).saturating_weight();
+                totals.add(hash, weight);
+                if let Some(seed) = topk_seed.as_mut() {
+                    seed.offer(hash, *entry.key, weight);
+                }
             }
             let partition = (hash >> shift) as usize;
             // Entries are already deduplicated within this table.
@@ -633,6 +650,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let table_entries: usize = self.tables.iter().map(|t| t.len()).sum();
         let allocator = &mut self.allocator;
         let taken_totals = self.topk_bin_totals.take();
+        let topk_seed = &mut self.topk_seed;
         let topk_bin_totals = self.topk_aggregation_slot.and_then(|slot| {
             if taken_totals.is_none() && table_entries < MIN_BINNED_ENTRIES {
                 return None;
@@ -640,11 +658,19 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             let mut totals = taken_totals.unwrap_or_else(|| HashBinTotals::new(allocator));
             for table in &self.tables {
                 for entry in table.iter(0) {
-                    totals.add(entry.hash, entry.stored.sort_key(slot).saturating_weight());
+                    let weight = entry.stored.sort_key(slot).saturating_weight();
+                    totals.add(entry.hash, weight);
+                    if let Some(seed) = topk_seed.as_mut() {
+                        seed.offer(entry.hash, *entry.key, weight);
+                    }
                 }
             }
             Some(totals)
         });
+        let topk_seed_candidates = match (topk_bin_totals.is_some(), self.topk_seed.take()) {
+            (true, Some(seed)) => seed.into_candidates(),
+            _ => Vec::new(),
+        };
         // Raw-scattered rows never reached the totals. Report each bucket's
         // row count so the merge can widen its bounds by them (a hack, see
         // `AggregatedTableOutput::raw_scatter_rows`). The bucket counts also
@@ -665,6 +691,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             hll: self.hll,
             has_bin_totals: topk_bin_totals.is_some(),
             raw_scatter_rows,
+            topk_seed_candidates,
             zero_hash_seen: self.zero_hash_seen,
         };
         (output, topk_bin_totals)
@@ -1004,7 +1031,7 @@ mod tests {
             (),
             (),
             SMALL_RADIX,
-            Some(0),
+            Some(PrunableTopK { slot: 0, limit: 10 }),
         );
 
         // Deduplicating fills drain into buffers; every drained partial and
@@ -1030,7 +1057,7 @@ mod tests {
             (),
             (),
             SMALL_RADIX,
-            Some(0),
+            Some(PrunableTopK { slot: 0, limit: 10 }),
         );
 
         // Unique keys make every post-switch fill 100% distinct: the worker
