@@ -7,8 +7,10 @@ use crate::operations::unary::group::hashtables::{
     AggregationValue, HashTable, KeyExtractor, PartitionBuffers,
 };
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
-use crate::operations::unary::group::output::merge;
-use crate::operations::unary::group::output::topk_pruning::{TopKBounds, TopKThreshold};
+use crate::operations::unary::group::output::merge::{self, SubPartitionScratch};
+use crate::operations::unary::group::output::topk_pruning::{
+    TopKBounds, TopKCutoff, TopKThreshold,
+};
 use crate::operations::unary::group::{GroupLimit, Result};
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
@@ -53,6 +55,10 @@ pub(super) struct SharedMergeState<K: KeyExtractor, V: AggregationValue + ?Sized
     /// When a worker switched to radix it never exceeds the scatter bucket
     /// count (at most `RADIX_PARTITIONS`).
     pub(super) num_partitions: usize,
+    /// Power-of-two count of cache-resident sub-partitions each direct
+    /// merge job splits its partition into, 1 to merge it whole (see
+    /// [`merge::sub_partition_count`]).
+    pub(super) sub_partitions: usize,
     pub(super) key_config: K::Config,
     /// The value's shared context, for the partition merge's entry fold + output.
     pub(super) shared_context: V::SharedContext,
@@ -164,8 +170,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         acc: &mut Option<OutputAccumulator<K, V>>,
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
+        scratch: &mut Option<SubPartitionScratch<K::Persisted, V>>,
     ) -> Result<()> {
-        let outcome = self.merge_and_emit(acc, sender, allocator);
+        let outcome = self.merge_and_emit(acc, sender, allocator, scratch);
         let (buffers, _) = &self.shared.sources[self.node];
         for worker_buffers in buffers {
             worker_buffers.release_partition(self.index, self.shared.num_partitions);
@@ -173,11 +180,84 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         outcome
     }
 
+    /// The worker's output accumulator, created on its first job.
+    fn accumulator<'a>(
+        &self,
+        acc: &'a mut Option<OutputAccumulator<K, V>>,
+        allocator: &mut SlabAllocator,
+    ) -> &'a mut OutputAccumulator<K, V> {
+        let shared = &*self.shared;
+        acc.get_or_insert_with(|| {
+            OutputAccumulator::new(
+                allocator,
+                shared.output_limit,
+                shared.key_arena.clone(),
+                shared.output_buffers.clone(),
+                shared.key_config.clone(),
+                shared.shared_context.clone(),
+                shared.value_output_types.clone(),
+                shared.limit_progress.clone(),
+                shared.partition_bounds.is_some(),
+            )
+        })
+    }
+
+    /// Merges the partition in cache-resident sub-partitions, emitting each
+    /// merged table while it is still in cache.
+    fn merge_sub_partitioned_and_emit(
+        &self,
+        cutoff: Option<TopKCutoff<'_>>,
+        acc: &mut Option<OutputAccumulator<K, V>>,
+        sender: &mut dyn Sender<RecordBatch>,
+        allocator: &mut SlabAllocator,
+        scratch: &mut Option<SubPartitionScratch<K::Persisted, V>>,
+    ) -> Result<()> {
+        let shared = &*self.shared;
+        let (buffers, tables) = &shared.sources[self.node];
+        let scratch = scratch.get_or_insert_with(SubPartitionScratch::new);
+        let mut merge = |sink: &mut dyn FnMut(&HashTable<K::Persisted, V>) -> Result<()>| {
+            merge::merge_sub_partitions::<K::Stored, V>(
+                self.index,
+                buffers,
+                tables,
+                shared.partition_capacity,
+                shared.num_partitions,
+                shared.sub_partitions,
+                &shared.key_arena,
+                &shared.shared_context,
+                cutoff,
+                scratch,
+                sink,
+            )
+        };
+        // Global COUNT(DISTINCT) needs only the partition's distinct-key
+        // count, summed over its sub-partitions.
+        if shared.count_only {
+            let mut distinct_keys = 0;
+            merge(&mut |table| {
+                distinct_keys += table.len();
+                Ok(())
+            })?;
+            if distinct_keys == 0 {
+                return Ok(());
+            }
+            return emit_count(distinct_keys, sender);
+        }
+        let acc = self.accumulator(acc, allocator);
+        merge(&mut |table| {
+            if table.len() == 0 {
+                return Ok(());
+            }
+            acc.extend_from_table(table, allocator, &mut *sender)
+        })
+    }
+
     fn merge_and_emit(
         &self,
         acc: &mut Option<OutputAccumulator<K, V>>,
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
+        scratch: &mut Option<SubPartitionScratch<K::Persisted, V>>,
     ) -> Result<()> {
         let shared = &*self.shared;
         // Any `limit` groups satisfy a plain (unordered) pushed LIMIT, so once
@@ -200,6 +280,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
                 .as_ref()
                 .expect("partition bounds only exist beside bin bounds");
             cutoff = bin_bounds.cutoff_for_partition(self.index, shared.num_partitions, kth_best);
+        }
+        // A partition whose target would fall out of cache is merged in
+        // sub-partitions. Only on a direct merge: a hierarchical one sends
+        // each node's table through the cross-node rendezvous whole.
+        if shared.sub_partitions > 1 && shared.cross_node.is_none() {
+            return self.merge_sub_partitioned_and_emit(cutoff, acc, sender, allocator, scratch);
         }
         let (buffers, tables) = &shared.sources[self.node];
         let result_map = merge::merge_combined::<K::Stored, V>(
@@ -242,19 +328,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         if shared.count_only {
             return emit_count(result_map.len(), sender);
         }
-        let acc = acc.get_or_insert_with(|| {
-            OutputAccumulator::new(
-                allocator,
-                shared.output_limit,
-                shared.key_arena.clone(),
-                shared.output_buffers.clone(),
-                shared.key_config.clone(),
-                shared.shared_context.clone(),
-                shared.value_output_types.clone(),
-                shared.limit_progress.clone(),
-                shared.partition_bounds.is_some(),
-            )
-        });
-        acc.extend_from_table(result_map, allocator, &mut *sender)
+        self.accumulator(acc, allocator)
+            .extend_from_table(&result_map, allocator, &mut *sender)
     }
 }

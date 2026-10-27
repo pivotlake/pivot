@@ -12,6 +12,7 @@ use crate::operations::unary::group::hashtables::{
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
+use crate::operations::unary::group::output::merge::{self, SubPartitionScratch};
 use crate::operations::unary::group::output::partition_job::{PartitionJob, SharedMergeState};
 use crate::operations::unary::group::output::topk_pruning::{
     HashBinTotals, SeedCandidate, SharedBinTotals, TopKBounds, TopKThreshold, seed_threshold,
@@ -93,6 +94,9 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// worker only learns them from the first job it steals. A worker running only
     /// count-only `COUNT(DISTINCT)` jobs never builds one.
     output_accumulator: Option<OutputAccumulator<K, V>>,
+    /// Per-worker buffers of the sub-partitioned merge, created by the first
+    /// job that splits its partition and refilled by every later one.
+    sub_partition_scratch: Option<SubPartitionScratch<K::Persisted, V>>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
@@ -124,6 +128,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             zero_hash_pending: false,
             output_allocator: None,
             output_accumulator: None,
+            sub_partition_scratch: None,
         }
     }
 
@@ -345,6 +350,16 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 tables_by_node.into_iter().flatten().collect(),
             )]
         };
+        // A direct merge whose partition targets would fall out of cache
+        // splits each job into cache-resident sub-partitions.
+        let sub_partitions = if hierarchical {
+            1
+        } else {
+            merge::sub_partition_count(
+                partition_capacity,
+                entry_stride::<K::Persisted, V>(&self.shared_context),
+            )
+        };
         let shared = Arc::new(SharedMergeState {
             sources,
             cross_node: hierarchical
@@ -353,6 +368,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             output_buffers,
             partition_capacity,
             num_partitions,
+            sub_partitions,
             key_config: self.key_config.clone(),
             shared_context: self.shared_context.clone(),
             value_output_types: self.value_output_types.clone(),
@@ -436,8 +452,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
                 let allocator = self
                     .output_allocator
                     .get_or_insert_with(|| SlabAllocator::new(false));
-                job.run_into(&mut self.output_accumulator, sender, allocator)
-                    .map_err(unary::Error::from)?;
+                job.run_into(
+                    &mut self.output_accumulator,
+                    sender,
+                    allocator,
+                    &mut self.sub_partition_scratch,
+                )
+                .map_err(unary::Error::from)?;
             }
             Steal::Empty => {
                 if self.partition_jobs_injected.load(Ordering::Acquire) {

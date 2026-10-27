@@ -60,6 +60,9 @@ pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     last_rows: usize,
     /// Rows in all full chunks; maintained only when a chunk fills.
     completed_rows: usize,
+    /// Index of the chunk being filled. Chunks past it were filled before a
+    /// [`reset`](Self::reset) and are reused, in order, before any is allocated.
+    current_chunk: usize,
     // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
     _phantom: PhantomData<(KP, *const V)>,
 }
@@ -81,30 +84,51 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
         }
     }
 
-    /// Allocates the next chunk and resets the row count.
+    /// Moves on to the next chunk, reusing one left by an earlier fill or
+    /// allocating it, and resets the row count.
     #[cold]
     /// The layout is copied by value to keep the caller's copy local.
     fn grow(&mut self, layout: ScatterLayout<V>, allocator: &mut SlabAllocator) {
-        let rows = Self::chunk_capacity(layout, self.chunks.len());
-        let chunk = allocator.get_aligned_slab(rows * layout.stride, layout.align, false);
-        self.current_chunk_base = chunk.ptr;
+        let next = if self.chunks.is_empty() {
+            0
+        } else {
+            self.current_chunk + 1
+        };
+        if next == self.chunks.len() {
+            let rows = Self::chunk_capacity(layout, next);
+            self.chunks
+                .push(allocator.get_aligned_slab(rows * layout.stride, layout.align, false));
+        }
+        self.current_chunk_base = self.chunks[next].ptr;
+        self.current_chunk = next;
         self.completed_rows += self.last_rows;
         self.last_rows = 0;
-        self.chunks.push(chunk);
     }
 
-    /// Visits each chunk with its base address and populated row count.
+    /// Visits each filled chunk with its base address and populated row count.
     #[inline(always)]
     fn for_each_chunk(&self, layout: ScatterLayout<V>, mut f: impl FnMut(*mut u8, usize)) {
-        let chunk_count = self.chunks.len();
-        for (index, chunk) in self.chunks.iter().enumerate() {
-            let rows = if index + 1 == chunk_count {
+        if self.chunks.is_empty() {
+            return;
+        }
+        for index in 0..=self.current_chunk {
+            let rows = if index == self.current_chunk {
                 self.last_rows
             } else {
                 Self::chunk_capacity(layout, index)
             };
-            f(chunk.ptr, rows);
+            f(self.chunks[index].ptr, rows);
         }
+    }
+
+    /// Empties the buffer, keeping its chunks for the next fill.
+    pub fn reset(&mut self) {
+        if let Some(first) = self.chunks.first() {
+            self.current_chunk_base = first.ptr;
+        }
+        self.current_chunk = 0;
+        self.last_rows = 0;
+        self.completed_rows = 0;
     }
 }
 
@@ -116,6 +140,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
             current_chunk_base: std::ptr::null_mut(),
             last_rows: 0,
             completed_rows: 0,
+            current_chunk: 0,
             _phantom: PhantomData,
         }
     }
@@ -164,7 +189,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
         // The capacity compare uses the caller's layout, kept in registers,
         // so an over-full check costs no buffer-header access.
         if self.chunks.is_empty()
-            || self.last_rows == Self::chunk_capacity(layout, self.chunks.len() - 1)
+            || self.last_rows == Self::chunk_capacity(layout, self.current_chunk)
         {
             self.grow(layout, allocator);
         }

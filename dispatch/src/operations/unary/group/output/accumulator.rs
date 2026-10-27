@@ -213,7 +213,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
         /// selects the CPU tier at runtime.
         pub(crate) fn extend_from_table(
             &mut self,
-            table: HashTable<K::Persisted, V>,
+            table: &HashTable<K::Persisted, V>,
             allocator: &mut SlabAllocator,
             sender: &mut dyn Sender<RecordBatch>,
         ) -> Result<()> {
@@ -233,7 +233,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
                     offer_all::<K, V, _>(
                         heap,
                         *slot,
-                        &table,
+                        table,
                         allocator,
                         shared_context,
                         owned_copy_context,
@@ -245,7 +245,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
                     offer_all::<K, V, _>(
                         heap,
                         *slot,
-                        &table,
+                        table,
                         allocator,
                         shared_context,
                         owned_copy_context,
