@@ -129,7 +129,10 @@ datastores:
 Each catalog namespace appears as a schema, and the datastore is read-only.
 Table files are read from the locations the catalog reports, using the
 credentials the catalog vends, or the [storage secret](#storage-credentials)
-whose scope covers the file when it vends none.
+whose scope covers the file when it vends none. Vended credentials are renewed
+at every [refresh](#refresh), in place, so a query that runs longer than they
+last keeps reading; when the catalog says when they expire, a refresh runs
+early enough to renew them first.
 
 Format version 3 deletion vectors are supported. A table carrying any other
 kind of delete file is refused rather than read with the deleted rows present.
@@ -270,7 +273,9 @@ tasks. Iceberg datastores are only refreshed.
 Every refresh interval, each datastore reloads the tables it holds and the
 files each table has committed. Commits made by this server are visible
 immediately. Commits made by another process to a shared datastore, or tables
-added to an Iceberg catalog, become visible at the next refresh.
+added to an Iceberg catalog, become visible at the next refresh. A refresh of
+an Iceberg catalog also renews the storage credentials the catalog vends, and
+runs sooner than the interval when they would otherwise expire first.
 
 ### Compaction
 

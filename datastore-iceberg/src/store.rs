@@ -8,9 +8,15 @@
 //! another root is refused: the managed catalogs keep a table in one bucket,
 //! and a table deliberately split across buckets is not served rather than
 //! read through the wrong store.
+//!
+//! Vended credentials are a session's: short-lived. A later load of the table
+//! that vends keys for the same root, region and endpoint renews the keys of
+//! the store already open rather than opening another, so a query holding the
+//! store signs its next request with the new keys.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use iceberg::io::{
     CLIENT_REGION, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
@@ -21,6 +27,17 @@ use object_storage::{
 };
 
 use crate::{Error, Result};
+
+/// The table property a catalog sets to say when the session keys it vended
+/// stop working, as Unix milliseconds.
+const S3_SESSION_TOKEN_EXPIRES_AT_MS: &str = "s3.session-token-expires-at-ms";
+
+/// The S3 credentials a catalog vended for a table, with when they stop
+/// working when the catalog said.
+pub(crate) struct VendedCredentials {
+    pub credentials: S3Credentials,
+    pub expires_at: Option<SystemTime>,
+}
 
 /// The store one table's files are read through, with the root it was opened
 /// on. Every read goes through it so that a file is located by its key under
@@ -33,6 +50,21 @@ pub(crate) struct TableStore {
     /// [`split_location`] names it.
     root: String,
     store: Arc<dyn ObjectStore>,
+    /// This store as the S3 store the catalog's vended keys opened, when they
+    /// did: what a later load's keys renew.
+    vended: Option<VendedStore>,
+}
+
+/// The S3 store a table's vended keys opened, with what they were vended for:
+/// the keys of a later load that match on both renew this store rather than
+/// open another.
+#[derive(Clone)]
+struct VendedStore {
+    store: Arc<S3Store>,
+    region: Option<String>,
+    endpoint: Option<String>,
+    /// When the keys the store signs with stop working, when the catalog said.
+    expires_at: Option<SystemTime>,
 }
 
 impl TableStore {
@@ -43,20 +75,72 @@ impl TableStore {
         table: &str,
         metadata_location: &str,
         factory: &dyn ExternalStoreFactory,
-        vended: Option<S3Credentials>,
+        vended: Option<VendedCredentials>,
     ) -> Result<Self> {
         let (root, _) = split_location(metadata_location)?;
-        let store: Arc<dyn ObjectStore> = match vended {
-            Some(credentials) if StoreScheme::of(&root)? == StoreScheme::S3 => {
-                Arc::new(S3Store::with_credentials(&root, credentials)?)
+        let (store, vended): (Arc<dyn ObjectStore>, _) = match vended {
+            Some(vended) if StoreScheme::of(&root)? == StoreScheme::S3 => {
+                let region = vended.credentials.region.clone();
+                let endpoint = vended.credentials.endpoint.clone();
+                let store = Arc::new(S3Store::with_credentials(&root, vended.credentials)?);
+                (
+                    Arc::clone(&store) as Arc<dyn ObjectStore>,
+                    Some(VendedStore {
+                        store,
+                        region,
+                        endpoint,
+                        expires_at: vended.expires_at,
+                    }),
+                )
             }
-            _ => factory.open(&root)?,
+            _ => (factory.open(&root)?, None),
         };
         Ok(Self {
             table: table.to_string(),
             root,
             store,
+            vended,
         })
+    }
+
+    /// The store `table`'s files live in, as [`open`](Self::open) gives it,
+    /// except that when `previous` is the store an earlier load opened with
+    /// vended keys for the same root, region and endpoint, `vended`'s keys
+    /// renew it in place and it is the store returned: a query holding
+    /// `previous` signs its next request with the new keys.
+    pub(crate) fn open_or_renew(
+        previous: Option<&TableStore>,
+        table: &str,
+        metadata_location: &str,
+        factory: &dyn ExternalStoreFactory,
+        vended: Option<VendedCredentials>,
+    ) -> Result<Self> {
+        let (root, _) = split_location(metadata_location)?;
+        let renewable = previous
+            .filter(|previous| previous.root == root)
+            .and_then(|previous| previous.vended.as_ref().map(|store| (previous, store)));
+        match (renewable, vended) {
+            (Some((previous, held)), Some(vended))
+                if held.region == vended.credentials.region
+                    && held.endpoint == vended.credentials.endpoint =>
+            {
+                held.store.renew_keys(vended.credentials.keys)?;
+                Ok(Self {
+                    vended: Some(VendedStore {
+                        expires_at: vended.expires_at,
+                        ..held.clone()
+                    }),
+                    ..previous.clone()
+                })
+            }
+            (_, vended) => Self::open(table, metadata_location, factory, vended),
+        }
+    }
+
+    /// When the keys this store signs with stop working: what the catalog said
+    /// when it vended them, `None` when it vended none or said nothing.
+    pub(crate) fn keys_expire_at(&self) -> Option<SystemTime> {
+        self.vended.as_ref().and_then(|vended| vended.expires_at)
     }
 
     /// The file at `location`, of `size` bytes, located for reading. Its
@@ -103,19 +187,44 @@ impl TableStore {
 
 /// The S3 credentials a catalog vended for a table, read from the table's
 /// storage properties: the `s3.*` keys the load-table response carried, as
-/// the client merged them. `None` when the catalog vended nothing. A key
-/// without its pair is an error rather than a silent fall back to the
-/// process's credentials, which would read the table as someone else.
+/// the client merged them, and when they expire when the catalog said. `None`
+/// when the catalog vended nothing. A key without its pair is an error rather
+/// than a silent fall back to the process's credentials, which would read the
+/// table as someone else; an expiry that does not parse is an error rather
+/// than keys renewed too late.
 pub(crate) fn read_vended_s3_credentials(
     table: &str,
     properties: &HashMap<String, String>,
-) -> Result<Option<S3Credentials>> {
+) -> Result<Option<VendedCredentials>> {
     let access_key = properties.get(S3_ACCESS_KEY_ID);
     let secret_key = properties.get(S3_SECRET_ACCESS_KEY);
-    match (access_key, secret_key) {
-        // The REST spec names the region `client.region`; `s3.region` is the
-        // older spelling. The first wins, as it does in the client library.
-        (Some(access_key), Some(secret_key)) => Ok(Some(S3Credentials {
+    let (access_key, secret_key) = match (access_key, secret_key) {
+        (Some(access_key), Some(secret_key)) => (access_key, secret_key),
+        (None, None) => return Ok(None),
+        _ => {
+            return Err(Error::IncompleteVendedCredentials {
+                table: table.to_string(),
+            });
+        }
+    };
+    let expires_at = match properties.get(S3_SESSION_TOKEN_EXPIRES_AT_MS) {
+        Some(millis) => Some(
+            millis
+                .parse::<u64>()
+                .ok()
+                .map(|millis| SystemTime::UNIX_EPOCH + Duration::from_millis(millis))
+                .ok_or_else(|| Error::MalformedVendedExpiry {
+                    table: table.to_string(),
+                    value: millis.clone(),
+                })?,
+        ),
+        None => None,
+    };
+    Ok(Some(VendedCredentials {
+        credentials: S3Credentials {
+            // The REST spec names the region `client.region`; `s3.region` is
+            // the older spelling. The first wins, as it does in the client
+            // library.
             region: properties
                 .get(CLIENT_REGION)
                 .or_else(|| properties.get(S3_REGION))
@@ -126,12 +235,9 @@ pub(crate) fn read_vended_s3_credentials(
                 session_token: properties.get(S3_SESSION_TOKEN).cloned(),
             },
             endpoint: properties.get(S3_ENDPOINT).cloned(),
-        })),
-        (None, None) => Ok(None),
-        _ => Err(Error::IncompleteVendedCredentials {
-            table: table.to_string(),
-        }),
-    }
+        },
+        expires_at,
+    }))
 }
 
 /// Split a file location into the root the store is opened on and the key of
@@ -171,7 +277,7 @@ fn split_location(location: &str) -> Result<(String, ObjectPath)> {
 
 #[cfg(test)]
 mod tests {
-    use object_storage::{DataFileLocation, LocalStore};
+    use object_storage::{DataFileLocation, LocalStore, StoreConnection, StoreError};
 
     use super::*;
 
@@ -182,7 +288,100 @@ mod tests {
             table: "db.t".to_string(),
             root: "s3://lake".to_string(),
             store: Arc::new(LocalStore::new(std::env::temp_dir()).unwrap()),
+            vended: None,
         }
+    }
+
+    /// A factory that opens nothing, for a table whose every store the catalog
+    /// vends keys for.
+    #[derive(Debug)]
+    struct NoStoreFactory;
+
+    impl ExternalStoreFactory for NoStoreFactory {
+        fn open(&self, root_uri: &str) -> object_storage::Result<Arc<dyn ObjectStore>> {
+            Err(StoreError::Config(format!(
+                "nothing vended for `{root_uri}`"
+            )))
+        }
+    }
+
+    /// Keys vended for the `lake` bucket at a fixed endpoint and region, so
+    /// opening the store asks nothing of the network.
+    fn vended_keys(access_key: &str, endpoint: &str) -> VendedCredentials {
+        VendedCredentials {
+            credentials: S3Credentials {
+                region: Some("eu-west-1".to_string()),
+                keys: S3Keys {
+                    access_key: access_key.to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: Some(format!("{access_key}-token")),
+                },
+                endpoint: Some(endpoint.to_string()),
+            },
+            expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
+        }
+    }
+
+    fn access_key_of(store: &TableStore) -> String {
+        match store.store.connection() {
+            StoreConnection::S3 {
+                credentials: Some(credentials),
+                ..
+            } => credentials.keys.access_key,
+            _ => panic!("not a signing S3 store"),
+        }
+    }
+
+    #[test]
+    fn a_later_loads_keys_renew_the_store_a_query_holds() {
+        let first = TableStore::open(
+            "db.t",
+            "s3://lake/db/t/metadata/v1.metadata.json",
+            &NoStoreFactory,
+            Some(vended_keys("first", "http://objects.example")),
+        )
+        .unwrap();
+        let held = first.clone();
+
+        let renewed = TableStore::open_or_renew(
+            Some(&first),
+            "db.t",
+            "s3://lake/db/t/metadata/v2.metadata.json",
+            &NoStoreFactory,
+            Some(vended_keys("second", "http://objects.example")),
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&renewed.store, &held.store));
+        assert_eq!(access_key_of(&held), "second");
+        assert_eq!(
+            renewed.keys_expire_at(),
+            vended_keys("second", "").expires_at
+        );
+    }
+
+    #[test]
+    fn keys_vended_for_another_endpoint_open_a_store_of_their_own() {
+        let first = TableStore::open(
+            "db.t",
+            "s3://lake/db/t/metadata/v1.metadata.json",
+            &NoStoreFactory,
+            Some(vended_keys("first", "http://objects.example")),
+        )
+        .unwrap();
+
+        let reopened = TableStore::open_or_renew(
+            Some(&first),
+            "db.t",
+            "s3://lake/db/t/metadata/v2.metadata.json",
+            &NoStoreFactory,
+            Some(vended_keys("second", "http://elsewhere.example")),
+        )
+        .unwrap();
+
+        assert!(!Arc::ptr_eq(&reopened.store, &first.store));
+        assert_eq!(access_key_of(&first), "first");
+        assert_eq!(access_key_of(&reopened), "second");
     }
 
     #[test]
@@ -273,10 +472,11 @@ mod tests {
             ),
         ]);
 
-        let credentials = read_vended_s3_credentials("db.t", &properties)
+        let vended = read_vended_s3_credentials("db.t", &properties)
             .unwrap()
             .expect("both keys were vended");
 
+        let credentials = vended.credentials;
         assert_eq!(credentials.keys.access_key, "access");
         assert_eq!(credentials.keys.secret_key, "secret");
         assert_eq!(credentials.keys.session_token.as_deref(), Some("token"));
@@ -284,6 +484,49 @@ mod tests {
         assert_eq!(
             credentials.endpoint.as_deref(),
             Some("http://objects.example")
+        );
+        assert_eq!(vended.expires_at, None);
+    }
+
+    #[test]
+    fn the_keys_expiry_is_read_as_unix_milliseconds() {
+        let properties = HashMap::from([
+            ("s3.access-key-id".to_string(), "access".to_string()),
+            ("s3.secret-access-key".to_string(), "secret".to_string()),
+            (
+                "s3.session-token-expires-at-ms".to_string(),
+                "1800000000123".to_string(),
+            ),
+        ]);
+
+        let vended = read_vended_s3_credentials("db.t", &properties)
+            .unwrap()
+            .expect("both keys were vended");
+
+        assert_eq!(
+            vended.expires_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_800_000_000_123))
+        );
+    }
+
+    #[test]
+    fn an_expiry_that_is_not_a_timestamp_is_refused() {
+        let properties = HashMap::from([
+            ("s3.access-key-id".to_string(), "access".to_string()),
+            ("s3.secret-access-key".to_string(), "secret".to_string()),
+            (
+                "s3.session-token-expires-at-ms".to_string(),
+                "tomorrow".to_string(),
+            ),
+        ]);
+
+        let error = read_vended_s3_credentials("db.t", &properties)
+            .err()
+            .expect("an expiry that is not a timestamp is refused");
+
+        assert!(
+            matches!(&error, Error::MalformedVendedExpiry { value, .. } if value == "tomorrow"),
+            "{error}"
         );
     }
 
@@ -296,11 +539,11 @@ mod tests {
             ("s3.region".to_string(), "eu-west-1".to_string()),
         ]);
 
-        let credentials = read_vended_s3_credentials("db.t", &properties)
+        let vended = read_vended_s3_credentials("db.t", &properties)
             .unwrap()
             .expect("both keys were vended");
 
-        assert_eq!(credentials.region.as_deref(), Some("us-east-1"));
+        assert_eq!(vended.credentials.region.as_deref(), Some("us-east-1"));
     }
 
     #[test]

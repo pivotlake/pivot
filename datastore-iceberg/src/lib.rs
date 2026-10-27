@@ -43,12 +43,16 @@
 //! Every table load asks the catalog to vend storage credentials
 //! (`X-Iceberg-Access-Delegation: vended-credentials`). A catalog that does
 //! answers with S3 keys in the table's storage properties, and the table's
-//! store is opened with them; those keys are usually an STS session's,
-//! short-lived, and scoped to the table, so the store is opened again at every
-//! refresh from the keys the catalog vended then. A catalog that vends nothing
-//! leaves the store to the factory the datastore was opened with, the
-//! process's own credential policy. Only the flat `s3.*` form is read; the
-//! per-prefix `storage-credentials` list is not.
+//! store signs its requests with them. Those keys are usually an STS
+//! session's, short-lived, and scoped to the table, so every refresh loads
+//! the table again and renews the keys of its store in place: a query that
+//! outlives the keys it started with signs its next request with the new
+//! ones. When the catalog says when the keys expire
+//! (`s3.session-token-expires-at-ms`), the refresh runs early enough to renew
+//! them first. A catalog that vends nothing leaves the store to the factory
+//! the datastore was opened with, the process's own credential policy. Only
+//! the flat `s3.*` form is read; the per-prefix `storage-credentials` list is
+//! not.
 //!
 //! A table's files are read through one store, the bucket its metadata file
 //! is in. The managed catalogs keep a table in one bucket; a table split
@@ -76,7 +80,7 @@ mod table;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
@@ -208,6 +212,10 @@ pub enum Error {
     },
     #[error("table `{table}` was vended an S3 access key without its secret key, or the reverse")]
     IncompleteVendedCredentials { table: String },
+    #[error(
+        "table `{table}` was vended keys whose expiry `{value}` is not a Unix millisecond timestamp"
+    )]
+    MalformedVendedExpiry { table: String, value: String },
     #[error(transparent)]
     Store(#[from] object_storage::StoreError),
     #[error("reading table metadata over the pool: {0}")]
@@ -270,6 +278,41 @@ impl DatastoreIndex {
     fn table_entry(&self, name: &SchemaQualifiedTableName) -> Option<&Result<TableEntry, String>> {
         self.schemas.get(&name.schema)?.tables.get(&name.table)
     }
+
+    /// The soonest any table's vended keys stop working, when some catalog
+    /// said when its keys expire.
+    fn earliest_key_expiry(&self) -> Option<SystemTime> {
+        self.schemas
+            .values()
+            .flat_map(|schema| schema.tables.values())
+            .filter_map(|entry| entry.as_ref().ok()?.store.keys_expire_at())
+            .min()
+    }
+}
+
+/// How long before vended keys expire the refresh that renews them runs: long
+/// enough for a refresh over many tables to reach every one of them first.
+const KEY_RENEWAL_LEAD: Duration = Duration::from_secs(5 * 60);
+
+/// The least a refresh waits for the next, so keys vended for less than the
+/// renewal lead do not make the refresh spin.
+const MIN_REFRESH_DELAY: Duration = Duration::from_secs(10);
+
+/// How long the refresh waits before running again: `interval`, or less when
+/// some table's vended keys expire sooner than that allows renewing them.
+fn wait_before_refresh(
+    interval: Duration,
+    earliest_key_expiry: Option<SystemTime>,
+    now: SystemTime,
+) -> Duration {
+    let Some(expires_at) = earliest_key_expiry else {
+        return interval;
+    };
+    let until_renewal = expires_at
+        .duration_since(now)
+        .unwrap_or_default()
+        .saturating_sub(KEY_RENEWAL_LEAD);
+    until_renewal.max(MIN_REFRESH_DELAY).min(interval)
 }
 
 /// One schema's tables. A table the catalog listed but that could not be
@@ -283,8 +326,8 @@ struct SchemaEntry {
 
 /// One table's entry in the index: the table as the catalog returned it, with
 /// what a load needs that the response does not say: the store its files are
-/// read through, opened with the credentials the catalog vended, and the size
-/// of the current snapshot's manifest list.
+/// read through, signing with the credentials the catalog vended, and the
+/// size of the current snapshot's manifest list.
 struct TableEntry {
     table: Table,
     store: TableStore,
@@ -402,8 +445,9 @@ impl IcebergDatastore {
         Ok(index)
     }
 
-    /// `table`'s entry: with its store, opened now from the credentials the
-    /// catalog just vended, and its manifest list's size, the one `previous`
+    /// `table`'s entry: with its store, `previous`'s renewed with the
+    /// credentials the catalog just vended when they are for the same place,
+    /// else opened now; and its manifest list's size, the one `previous`
     /// learned when the snapshot is the one it entered, else asked of the
     /// store now.
     fn build_table_entry(
@@ -412,14 +456,19 @@ impl IcebergDatastore {
         table: Table,
         previous: Option<&Result<TableEntry, String>>,
     ) -> Result<TableEntry> {
-        let store = open_table_store(name, &table, &*self.store_factory)?;
+        let previous = previous.and_then(|previous| previous.as_ref().ok());
+        let store = open_table_store(
+            name,
+            &table,
+            &*self.store_factory,
+            previous.map(|previous| &previous.store),
+        )?;
         let path = table
             .metadata()
             .current_snapshot()
             .map(|snapshot| snapshot.manifest_list());
-        let unchanged = previous
-            .and_then(|previous| previous.as_ref().ok())
-            .filter(|previous| path.is_some() && previous.manifest_list_path() == path);
+        let unchanged =
+            previous.filter(|previous| path.is_some() && previous.manifest_list_path() == path);
         let manifest_list_size = match unchanged {
             Some(previous) => previous.manifest_list_size,
             None => fetch_manifest_list_size(name, &table, &store)?,
@@ -502,20 +551,24 @@ impl Datastore for IcebergDatastore {
         self.catalog_uri.clone()
     }
 
-    /// Refresh the index every `refresh_interval`, on the ambient runtime. A
-    /// refresh that fails is logged and the index kept, so an
-    /// unreachable catalog degrades to stale tables rather than none.
+    /// Refresh the index every `refresh_interval`, on the ambient runtime, and
+    /// sooner when some table's vended keys would expire before the next
+    /// refresh could renew them. A refresh that fails is logged and the index
+    /// kept, so an unreachable catalog degrades to stale tables rather than
+    /// none.
     fn start(self: Arc<Self>) {
         let datastore = Arc::clone(&self);
         let interval = self.refresh_interval;
         let task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The catalog was just fetched at open, so skip the interval's
-            // immediate first tick and refresh one full interval from now.
-            tick.tick().await;
             loop {
-                tick.tick().await;
+                // The catalog was fetched at open, and by the refresh before
+                // this one, so the wait starts from now.
+                let delay = wait_before_refresh(
+                    interval,
+                    datastore.index().earliest_key_expiry(),
+                    SystemTime::now(),
+                );
+                tokio::time::sleep(delay).await;
                 // The refresh blocks on catalog calls, so it runs off the
                 // reactor.
                 let datastore = Arc::clone(&datastore);
@@ -616,5 +669,49 @@ impl DatastoreTransaction for IcebergTransaction {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(described)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INTERVAL: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn the_refresh_waits_the_interval_when_no_keys_expire() {
+        let delay = wait_before_refresh(INTERVAL, None, SystemTime::UNIX_EPOCH);
+
+        assert_eq!(delay, INTERVAL);
+    }
+
+    #[test]
+    fn the_refresh_runs_early_to_renew_keys_before_they_expire() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let interval = Duration::from_secs(3_600);
+        let expires_at = now + KEY_RENEWAL_LEAD + Duration::from_secs(20);
+
+        let delay = wait_before_refresh(interval, Some(expires_at), now);
+
+        assert_eq!(delay, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn keys_expiring_within_the_lead_do_not_make_the_refresh_spin() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+        let delay = wait_before_refresh(INTERVAL, Some(now + Duration::from_secs(1)), now);
+
+        assert_eq!(delay, MIN_REFRESH_DELAY);
+    }
+
+    #[test]
+    fn a_short_interval_is_never_stretched_by_the_minimum() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let interval = Duration::from_millis(500);
+
+        let delay = wait_before_refresh(interval, Some(now), now);
+
+        assert_eq!(delay, interval);
     }
 }

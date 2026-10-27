@@ -254,14 +254,7 @@ mod blocking_engine {
     /// Issue the range GET on `conn` and read its body into `read.dest`, returning
     /// the connection for re-pooling on success.
     fn do_read(mut conn: Conn, read: &RemoteRead) -> Result<Conn> {
-        let auth = read.remote.auth_header();
-        let request = proto::build_range_get(
-            read.remote.host_header(),
-            read.remote.request_target(),
-            read.offset,
-            read.len,
-            auth.as_deref(),
-        );
+        let request = RemoteRequest::Read(read.clone()).request_head()?;
         conn.write_all(&request)?;
         conn.flush()?;
 
@@ -340,7 +333,7 @@ mod blocking_engine {
     }
 
     fn do_upload(mut conn: Conn, upload: &RemoteUpload) -> Result<Option<Conn>> {
-        let request = RemoteRequest::Upload(upload.clone()).request_head();
+        let request = RemoteRequest::Upload(upload.clone()).request_head()?;
         conn.write_all(&request)?;
         for run in upload.data.runs() {
             conn.write_all(run)?;
@@ -626,13 +619,16 @@ mod uring_engine {
     }
 
     impl HttpExchange {
-        fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Self {
+        /// Bind `request` to `conn`, with its head built (and so authenticated)
+        /// for this attempt; a head that cannot be authenticated fails the
+        /// attempt before anything is sent.
+        fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Result<Self> {
             let (dest, expected_body_len) = match &request {
                 RemoteRequest::Read(read) => (read.dest, read.expected_body_len()),
                 RemoteRequest::Upload(_) => (std::ptr::null_mut(), 0),
             };
-            let request_bytes = request.request_head();
-            Self {
+            let request_bytes = request.request_head()?;
+            Ok(Self {
                 conn,
                 id,
                 dest,
@@ -650,7 +646,7 @@ mod uring_engine {
                 recv_in_dest: false,
                 conn_reusable: true,
                 state,
-            }
+            })
         }
 
         /// Finish this exchange and return only its reusable connection. Every
@@ -986,13 +982,13 @@ mod uring_engine {
             if let Some(conn) = self.pool.get_mut(&key).and_then(Vec::pop) {
                 // Reuse a pooled keep-alive connection. The new exchange owns it
                 // until the response completes or the connection fails.
-                let exchange = HttpExchange::new(conn, id, request, State::Sending);
+                let exchange = HttpExchange::new(conn, id, request, State::Sending)?;
                 let idx = self.alloc_slot(exchange);
                 self.active += 1;
                 self.pump(ring, idx)
             } else {
                 let conn = self.new_conn(key, &request)?;
-                let exchange = HttpExchange::new(conn, id, request, State::Connecting);
+                let exchange = HttpExchange::new(conn, id, request, State::Connecting)?;
                 let idx = self.alloc_slot(exchange);
                 self.active += 1;
                 self.start_connect(ring, idx)
@@ -1109,14 +1105,17 @@ mod uring_engine {
             drop(conn); // close the failed socket before reconnecting
 
             if is_retryable(&err) && retries < MAX_HTTP_RETRIES {
-                match self.new_conn(key, &request) {
-                    Ok(conn) => {
-                        let mut fresh = HttpExchange::new(conn, id, request, State::Connecting);
+                let fresh = self
+                    .new_conn(key, &request)
+                    .and_then(|conn| HttpExchange::new(conn, id, request, State::Connecting));
+                match fresh {
+                    Ok(mut fresh) => {
                         fresh.retries = retries + 1;
                         let new_idx = self.alloc_slot(fresh);
                         return self.start_connect(ring, new_idx);
                     }
-                    // Couldn't even build the socket — treat as a terminal failure.
+                    // Couldn't even build the socket or authenticate the
+                    // request — treat as a terminal failure.
                     Err(e) => {
                         self.active -= 1;
                         self.failed.push((id, e));

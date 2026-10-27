@@ -109,24 +109,25 @@ impl RemoteRequest {
         }
     }
 
-    pub fn request_head(&self) -> Vec<u8> {
+    /// The request head, with the headers that authenticate this attempt. Built
+    /// per attempt, so a retry is authenticated afresh.
+    pub fn request_head(&self) -> Result<Vec<u8>> {
         let remote = self.remote();
-        let auth = remote.auth_header();
-        match self {
+        Ok(match self {
             Self::Read(read) => proto::build_range_get(
                 remote.host_header(),
                 remote.request_target(),
                 read.offset,
                 read.len,
-                auth.as_deref(),
+                &remote.authenticate("GET")?,
             ),
             Self::Upload(upload) => proto::build_upload(
                 remote.host_header(),
                 remote.request_target(),
                 upload.data.len(),
-                auth.as_deref(),
+                &remote.authenticate("PUT")?,
             ),
-        }
+        })
     }
 }
 
