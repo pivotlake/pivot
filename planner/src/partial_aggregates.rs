@@ -60,16 +60,16 @@ const DENSE_DIVISOR: u64 = 4;
 const MERGE_SHARE_TO_KEEP: u128 = 70;
 /// Remembered partials are forgotten once a merge of them takes at least
 /// this share, in percent, of the time the shape took to aggregate afresh.
-const MERGE_SHARE_TO_FORGET: u128 = 100;
+pub(crate) const MERGE_SHARE_TO_FORGET: u128 = 100;
 const ROW_GROUP_KEY_NAME: &str = "row_group";
 
 /// One aggregate shape over one table revision.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PartialsKey {
-    table: String,
-    version: String,
-    /// The plan from the aggregate down, rendered.
-    shape: String,
+    pub(crate) table: String,
+    pub(crate) version: String,
+    /// The plan from the remembered node down, rendered.
+    pub(crate) shape: String,
 }
 
 /// What the cache remembers of a shape.
@@ -107,7 +107,7 @@ impl RememberedPartials {
 
 /// Whether a merge taking `merge` is worth keeping against aggregating afresh
 /// in `fresh`: it must take under `share_percent` of that.
-fn merge_pays_off(merge: Duration, fresh: Duration, share_percent: u128) -> bool {
+pub(crate) fn merge_pays_off(merge: Duration, fresh: Duration, share_percent: u128) -> bool {
     merge.as_nanos() * 100 < fresh.as_nanos() * share_percent
 }
 
@@ -205,9 +205,12 @@ pub(crate) fn try_compile_memoized(
     if !is_decomposable(aggregate) {
         return Ok(None);
     }
-    let Some(shape) = ScanShape::recognize(child) else {
+    let Some(shape) = ScanShape::recognize(child, None) else {
         return Ok(None);
     };
+    if shape.input.emit_row_group_metadata {
+        return Ok(None);
+    }
     let revision = shape.input.table.table_revision();
     let key = PartialsKey {
         table: revision.identity,
@@ -242,6 +245,7 @@ pub(crate) fn try_compile_memoized(
             let gathering = Arc::new(Gathering::start(
                 key,
                 shape.input.table.estimate_row_count(),
+                None,
             ));
             let rewrite = Rewrite::plan(aggregate, child)?;
             let partials = rewrite.compile_gathering(dispatcher, slots, &shape)?;
@@ -330,33 +334,44 @@ fn is_groupable_distinct_argument(argument: &Type) -> bool {
     )
 }
 
-/// The plan under a memoizable aggregate: a plain scan, under at most a
-/// filter and a projection, each reading columns deterministically.
-struct ScanShape<'a> {
-    input: &'a Input,
+/// The plan under a memoizable node: a plain scan, under at most a filter
+/// and then projections, each reading columns deterministically.
+pub(crate) struct ScanShape<'a> {
+    pub(crate) input: &'a Input,
     /// The scan's output nullability, one per emitted column.
-    scan_nullability: Vec<bool>,
-    filter: Option<&'a Filter>,
-    projection: Option<&'a Projection>,
+    pub(crate) scan_nullability: Vec<bool>,
+    pub(crate) filter: Option<&'a Filter>,
+    /// Innermost first.
+    pub(crate) projections: Vec<&'a Projection>,
 }
 
 impl<'a> ScanShape<'a> {
-    fn recognize(child: &'a PlanNode) -> Option<Self> {
-        let (projection, below_projection) = match &child.operator {
-            Operator::Projection(projection) => (Some(projection), child.inputs.first()?),
-            _ => (None, child),
-        };
-        if let Some(projection) = projection
-            && !projection
+    /// The shape under `child`, when it is one. The scan may consume dynamic
+    /// filters only from the slot `dynamic_filter_slot` names, the one the
+    /// node above publishes, which a run over remembered rows has no use for.
+    /// The table has to tag rows with their row group when asked, as a
+    /// gathering run asks.
+    pub(crate) fn recognize(
+        child: &'a PlanNode,
+        dynamic_filter_slot: Option<usize>,
+    ) -> Option<Self> {
+        let mut projections = Vec::new();
+        let mut node = child;
+        while let Operator::Projection(projection) = &node.operator {
+            if !projection
                 .projections
                 .iter()
                 .all(Expression::is_deterministic_over_columns)
-        {
-            return None;
+            {
+                return None;
+            }
+            projections.push(projection);
+            node = node.inputs.first()?;
         }
-        let (filter, scan_node) = match &below_projection.operator {
-            Operator::Filter(filter) => (Some(filter), below_projection.inputs.first()?),
-            _ => (None, below_projection),
+        projections.reverse();
+        let (filter, scan_node) = match &node.operator {
+            Operator::Filter(filter) => (Some(filter), node.inputs.first()?),
+            _ => (None, node),
         };
         if let Some(filter) = filter
             && !filter
@@ -369,11 +384,15 @@ impl<'a> ScanShape<'a> {
         let Operator::Input(input) = &scan_node.operator else {
             return None;
         };
+        let dynamic_filters_allowed = input
+            .dynamic_filters
+            .iter()
+            .all(|filter| Some(filter.slot_id) == dynamic_filter_slot);
         if !scan_node.inputs.is_empty()
-            || !input.dynamic_filters.is_empty()
+            || !dynamic_filters_allowed
             || !input.key_bitset_filters.is_empty()
             || input.join_filter_info.is_some()
-            || input.emit_row_group_metadata
+            || !input.table.supports_late_materialization()
         {
             return None;
         }
@@ -381,8 +400,28 @@ impl<'a> ScanShape<'a> {
             input,
             scan_nullability: scan_node.output_nullability(),
             filter,
-            projection,
+            projections,
         })
+    }
+
+    /// The scan compiled on its own, tagging each row with its row group and
+    /// consuming no dynamic filter.
+    pub(crate) fn compile_tagged_scan(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        slots: &mut RuntimeFilterSlots,
+    ) -> Result<RecordBatchOperatorSpec, Error> {
+        let input = self.input;
+        let scan = Input {
+            table: input.table.clone_box(),
+            columns: input.columns.clone(),
+            dynamic_filters: Vec::new(),
+            key_bitset_filters: Vec::new(),
+            duckdb_table_binding_index: input.duckdb_table_binding_index,
+            join_filter_info: None,
+            emit_row_group_metadata: true,
+        };
+        scan.compile(dispatcher, slots)
     }
 }
 
@@ -511,30 +550,22 @@ impl Rewrite {
         slots: &mut RuntimeFilterSlots,
         shape: &ScanShape<'_>,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let input = shape.input;
-        let scan = Input {
-            table: input.table.clone_box(),
-            columns: input.columns.clone(),
-            dynamic_filters: Vec::new(),
-            key_bitset_filters: Vec::new(),
-            duckdb_table_binding_index: input.duckdb_table_binding_index,
-            join_filter_info: None,
-            emit_row_group_metadata: true,
-        };
         let scan_width = shape.scan_nullability.len();
-        let mut spec = scan
-            .compile(dispatcher, slots)?
+        let mut spec = shape
+            .compile_tagged_scan(dispatcher, slots)?
             .project(move || move |batch: RecordBatch| with_plain_row_group(batch, scan_width));
         if let Some(filter) = shape.filter {
             spec = filter.compile(spec)?;
         }
-        if let Some(projection) = shape.projection {
+        let mut row_group_position = scan_width;
+        for projection in &shape.projections {
             let mut projections = projection.projections.clone();
             projections.push(Expression::Ref(Ref {
-                column_idx: scan_width,
+                column_idx: row_group_position,
                 return_type: Type::Int32,
                 name: Some(ROW_GROUP_KEY_NAME.to_string()),
             }));
+            row_group_position = projections.len() - 1;
             spec = Projection { projections }.compile(spec)?;
         }
         self.gathering
@@ -750,7 +781,7 @@ fn cast_columns(batch: RecordBatch, targets: &[(usize, DataType)]) -> RecordBatc
 /// belongs to a query's buffers. A view column's values are gathered into
 /// fresh buffers: copying its views alone would keep the page buffers they
 /// point into alive, and those belong to the workers' memory.
-fn copied(batch: &RecordBatch) -> RecordBatch {
+pub(crate) fn copied(batch: &RecordBatch) -> RecordBatch {
     let columns: Vec<ArrayRef> = batch
         .columns()
         .iter()
@@ -768,13 +799,17 @@ fn copied(batch: &RecordBatch) -> RecordBatch {
     RecordBatch::try_new(batch.schema(), columns).expect("a copy keeps the batch's shape")
 }
 
+/// A pass over gathered partials before they are filed, boiling down what
+/// the workers kept separately.
+pub(crate) type Condense = Box<dyn Fn(Vec<RecordBatch>) -> Vec<RecordBatch> + Send + Sync>;
+
 /// One shape's gathering run while it is under way: its partials as they
 /// are copied, and the moments that tell whether merging them pays off.
-struct Gathering {
+pub(crate) struct Gathering {
     key: PartialsKey,
     started: Instant,
     /// Nanoseconds from the start to the first partial emitted, which is
-    /// about how long the shape takes to aggregate afresh; `u64::MAX` until
+    /// about how long the shape takes to compute afresh; `u64::MAX` until
     /// one is.
     first_partial_nanos: AtomicU64,
     /// Rows the partials may hold before they are too many to keep, when the
@@ -784,10 +819,15 @@ struct Gathering {
     batches: Mutex<Vec<RecordBatch>>,
     /// Set once the partials grew past the row limit and were let go.
     abandoned: AtomicBool,
+    condense: Option<Condense>,
 }
 
 impl Gathering {
-    fn start(key: PartialsKey, scan_rows: Option<u64>) -> Self {
+    pub(crate) fn start(
+        key: PartialsKey,
+        scan_rows: Option<u64>,
+        condense: Option<Condense>,
+    ) -> Self {
         Self {
             key,
             started: Instant::now(),
@@ -796,6 +836,7 @@ impl Gathering {
             rows: AtomicU64::new(0),
             batches: Mutex::new(Vec::new()),
             abandoned: AtomicBool::new(false),
+            condense,
         }
     }
 
@@ -818,7 +859,7 @@ impl Gathering {
     }
 
     /// Files what the run found with the cache, once its merge is done.
-    fn file(&self) {
+    pub(crate) fn file(&self) {
         let elapsed = self.started.elapsed();
         let first_partial = self.first_partial_nanos.load(Ordering::Acquire);
         let fresh = if first_partial == u64::MAX {
@@ -828,7 +869,12 @@ impl Gathering {
         };
         let merge = elapsed.saturating_sub(fresh);
         let batches = std::mem::take(&mut *self.batches.lock().unwrap());
-        let kept = (!self.abandoned.load(Ordering::Acquire)).then_some(batches);
+        let kept = (!self.abandoned.load(Ordering::Acquire))
+            .then_some(batches)
+            .map(|batches| match &self.condense {
+                Some(condense) => condense(batches),
+                None => batches,
+            });
         PartialAggregateCache::global().insert(self.key.clone(), judged(kept, fresh, merge));
     }
 }
@@ -844,8 +890,8 @@ fn judged(kept: Option<Vec<RecordBatch>>, fresh: Duration, merge: Duration) -> R
     }
 }
 
-struct PartialsTapFactory {
-    gathering: Arc<Gathering>,
+pub(crate) struct PartialsTapFactory {
+    pub(crate) gathering: Arc<Gathering>,
 }
 
 impl UnaryFactory<RecordBatch, RecordBatch> for PartialsTapFactory {
@@ -858,9 +904,8 @@ impl UnaryFactory<RecordBatch, RecordBatch> for PartialsTapFactory {
     }
 }
 
-/// Passes the gathering aggregate's batches through, noting each with the
-/// run.
-struct PartialsTap {
+/// Passes the gathered partials through, noting each batch with the run.
+pub(crate) struct PartialsTap {
     gathering: Arc<Gathering>,
 }
 
@@ -879,7 +924,7 @@ impl Unary<RecordBatch, RecordBatch> for PartialsTap {
 
 /// Watches a merge to its end across every worker: the last worker to finish
 /// runs what the watch was given.
-struct MergeWatch {
+pub(crate) struct MergeWatch {
     workers_left: AtomicUsize,
     when_done: Box<dyn Fn() + Send + Sync>,
 }
@@ -887,7 +932,7 @@ struct MergeWatch {
 impl MergeWatch {
     /// One watching pass-through per worker, running `when_done` once all of
     /// them have finished.
-    fn over_workers(
+    pub(crate) fn over_workers(
         workers: usize,
         when_done: impl Fn() + Send + Sync + 'static,
     ) -> impl Iterator<Item = MergeWatchFactory> {
@@ -901,7 +946,7 @@ impl MergeWatch {
     }
 }
 
-struct MergeWatchFactory {
+pub(crate) struct MergeWatchFactory {
     watch: Arc<MergeWatch>,
 }
 
@@ -913,7 +958,7 @@ impl UnaryFactory<RecordBatch, RecordBatch> for MergeWatchFactory {
     }
 }
 
-struct MergeWatcher {
+pub(crate) struct MergeWatcher {
     watch: Arc<MergeWatch>,
 }
 
@@ -998,7 +1043,7 @@ mod tests {
 
     #[test]
     fn a_gathering_lets_its_partials_go_once_they_outgrow_the_row_limit() {
-        let gathering = Gathering::start(key("a"), Some(2 * DENSE_DIVISOR));
+        let gathering = Gathering::start(key("a"), Some(2 * DENSE_DIVISOR), None);
 
         gathering.note(&one_row_batch(1));
         gathering.note(&one_row_batch(2));

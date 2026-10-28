@@ -329,6 +329,12 @@ impl PlanNode {
             return Ok(spec);
         }
 
+        // Likewise a top-N over a plain scan ranks each row group's remembered
+        // top rows instead of scanning.
+        if let Some(spec) = crate::partial_top_n::try_compile_memoized(self, dispatcher, slots)? {
+            return Ok(spec);
+        }
+
         // EXPLAIN renders its (already-optimized) child plan as text and emits
         // that. The child is formatted here, not compiled, so the explained
         // query never runs. This must happen before the input-compile loop below.

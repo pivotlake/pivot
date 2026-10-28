@@ -143,6 +143,7 @@ pub mod dynamic_filter;
 pub mod expression;
 pub mod operator;
 pub mod partial_aggregates;
+pub mod partial_top_n;
 pub mod plan;
 #[cfg(test)]
 mod test_support;
