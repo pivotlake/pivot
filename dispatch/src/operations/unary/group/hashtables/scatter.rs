@@ -75,7 +75,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
     #[inline(always)]
     fn chunk_capacity(layout: ScatterLayout<V>, index: usize) -> usize {
         if index == 0 {
-            layout.first_chunk_rows
+            layout.full_chunk_rows
         } else {
             layout.full_chunk_rows
         }
