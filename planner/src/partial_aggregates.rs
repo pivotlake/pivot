@@ -14,8 +14,10 @@
 //! whose partials are not much smaller than its input (a group per row, as
 //! with a unique key) is remembered as dense and left alone from then on.
 //!
-//! Only decomposable aggregates qualify: `COUNT`, `SUM`, `MIN`, `MAX` and
-//! `FIRST`, whose merge is a sum, an extreme or any value of the partials.
+//! Only decomposable aggregates qualify: `COUNT`, `SUM`, `MIN` and `MAX`,
+//! whose merge is a sum or an extreme of the partials, and one
+//! `COUNT(DISTINCT x)`, whose partials are each row group's distinct `x` per
+//! group and whose merge counts them distinctly again.
 //! The scan below must be a plain one (no join-produced filters), under at
 //! most a filter and a projection reading columns deterministically, so a
 //! partial means the same thing on every run. The table revision is part of
@@ -24,7 +26,7 @@
 
 use crate::Operator;
 use crate::compile::{Error, RuntimeFilterSlots};
-use crate::expression::{AggregateFunc, Cast, Expression, NumericAggregate, Ref};
+use crate::expression::{AggregateFunc, Cast, CountStar, Expression, NumericAggregate, Ref};
 use crate::operator::{Aggregate, Filter, Input, Projection};
 use crate::plan::PlanNode;
 use crate::types::{Type, physical_arrow_type};
@@ -214,14 +216,26 @@ pub(crate) fn try_compile_memoized(
     }
 }
 
-/// Whether every aggregate merges from per-row-group partials by a sum or
-/// an extreme over an argument the gathering can read, and every group key
-/// reads deterministically.
+/// Whether every aggregate merges from per-row-group partials, and every
+/// group key reads deterministically. A count, sum or extreme merges by a
+/// sum or an extreme over an argument the gathering can read; one
+/// `COUNT(DISTINCT x)` merges by counting `x` distinctly again over the rows
+/// each row group deduplicated, so `x` must be groupable.
 fn is_decomposable(aggregate: &Aggregate) -> bool {
     let groups_deterministic = aggregate
         .groups
         .iter()
         .all(Expression::is_deterministic_over_columns);
+    let distinct_count = aggregate
+        .expressions
+        .iter()
+        .filter(|expression| {
+            matches!(
+                expression,
+                Expression::AggregateFunc(AggregateFunc::CountDistinct(_))
+            )
+        })
+        .count();
     let aggregates_decomposable = aggregate.expressions.iter().all(|expression| {
         let Expression::AggregateFunc(function) = expression else {
             return false;
@@ -237,12 +251,40 @@ fn is_decomposable(aggregate: &Aggregate) -> bool {
                         .result_type()
                         .is_ok_and(|argument| is_gatherable_argument(&argument))
             }
-            AggregateFunc::First(_) | AggregateFunc::Avg(_) | AggregateFunc::CountDistinct(_) => {
-                false
+            AggregateFunc::CountDistinct(a) => {
+                a.argument.is_deterministic_over_columns()
+                    && a.argument
+                        .result_type()
+                        .is_ok_and(|argument| is_groupable_distinct_argument(&argument))
             }
+            AggregateFunc::First(_) | AggregateFunc::Avg(_) => false,
         }
     });
-    groups_deterministic && aggregates_decomposable && !aggregate.expressions.is_empty()
+    groups_deterministic
+        && aggregates_decomposable
+        && distinct_count <= 1
+        && !aggregate.expressions.is_empty()
+}
+
+/// Whether `argument`, the column a `COUNT(DISTINCT)` counts, can be a group
+/// key of the gathering aggregate.
+fn is_groupable_distinct_argument(argument: &Type) -> bool {
+    matches!(
+        argument,
+        Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::Decimal { .. }
+            | Type::Utf8
+            | Type::Date
+            | Type::Timestamp
+            | Type::TimestampTz
+    )
 }
 
 /// The plan under a memoizable aggregate: a plain scan, under at most a
@@ -332,19 +374,50 @@ impl Rewrite {
         let key_count = aggregate.groups.len();
         let mut gathering_groups = aggregate.groups.clone();
         gathering_groups.push(row_group_key);
+        // A `COUNT(DISTINCT x)` makes `x` a key of the gathering, so each row
+        // group's partial holds its distinct `x` per group, and the merge
+        // counts `x` distinctly over them, right after the row group column.
+        let distinct_column = key_count + 1;
+        for expression in &aggregate.expressions {
+            if let Expression::AggregateFunc(AggregateFunc::CountDistinct(a)) = expression {
+                gathering_groups.push((*a.argument).clone());
+            }
+        }
         let mut gathering_expressions = Vec::with_capacity(aggregate.expressions.len());
         let mut merging_expressions = Vec::with_capacity(aggregate.expressions.len());
         let mut restore = Vec::new();
+        let mut partial_column = gathering_groups.len();
         for (position, expression) in aggregate.expressions.iter().enumerate() {
             let Expression::AggregateFunc(function) = expression else {
                 return Err(Error::UnsupportedAggregateExpression(expression.clone()));
             };
-            let pair = AggregatePair::of(function, key_count + 1 + position)?;
+            if let AggregateFunc::CountDistinct(a) = function {
+                merging_expressions.push(Expression::AggregateFunc(AggregateFunc::CountDistinct(
+                    partial_of(
+                        distinct_column,
+                        a.argument.result_type()?,
+                        a.return_type.clone(),
+                    ),
+                )));
+                continue;
+            }
+            let pair = AggregatePair::of(function, partial_column)?;
+            partial_column += 1;
             gathering_expressions.push(Expression::AggregateFunc(pair.gathering));
             merging_expressions.push(Expression::AggregateFunc(pair.merging));
             if let Some(declared) = pair.restore {
                 restore.push((key_count + position, declared));
             }
+        }
+        if gathering_expressions.is_empty() {
+            // A shape counting distinct values alone: its partials are the
+            // key rows themselves, and the gathering just has to emit them.
+            gathering_expressions.push(Expression::AggregateFunc(AggregateFunc::CountStar(
+                CountStar {
+                    params: Vec::new(),
+                    return_type: Type::Int64,
+                },
+            )));
         }
         let gathering = Aggregate {
             groups: gathering_groups,
