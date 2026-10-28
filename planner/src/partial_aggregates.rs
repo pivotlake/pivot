@@ -9,10 +9,16 @@
 //!
 //! A shape is remembered from its second run on. The first run only notes
 //! having met it, so a query run once pays nothing. The second run groups
-//! by the row group as an extra key, files each row's partial with the
-//! cache as the query finishes, and merges them for its own answer. A shape
-//! whose partials are not much smaller than its input (a group per row, as
-//! with a unique key) is remembered as dense and left alone from then on.
+//! by the row group as an extra key, copies each row's partial as the
+//! query finishes, and merges them for its own answer. That run also times
+//! its two halves: the time to the first partial is about what the shape
+//! costs to aggregate afresh, and the rest is what merging the partials
+//! costs. The partials are kept only when the merge is clearly the cheaper
+//! of the two; otherwise the shape is remembered as dense and left alone
+//! from then on, as it is when its partials hold too many rows to copy at
+//! all (a group per row, as with a unique key). A remembered shape whose
+//! merge later takes as long as aggregating afresh is forgotten the same
+//! way.
 //!
 //! Only decomposable aggregates qualify: `COUNT`, `SUM`, `MIN` and `MAX`,
 //! whose merge is a sum or an extreme of the partials, and one
@@ -40,14 +46,21 @@ use dispatch::{
     values_input,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const DEFAULT_BUDGET_BYTES: usize = 2 << 30;
 const BUDGET_VARIABLE: &str = "PIVOT_PARTIAL_AGGREGATE_CACHE_BYTES";
-/// Partials are kept when they hold fewer rows than this share of the scan's
-/// rows: one in four.
+/// Partials are copied only while they hold fewer rows than this share of
+/// the scan's rows, one in four: a merge over more cannot pay off.
 const DENSE_DIVISOR: u64 = 4;
+/// Partials are kept when their merge took under this share, in percent, of
+/// the time the shape took to aggregate afresh.
+const MERGE_SHARE_TO_KEEP: u128 = 70;
+/// Remembered partials are forgotten once a merge of them takes at least
+/// this share, in percent, of the time the shape took to aggregate afresh.
+const MERGE_SHARE_TO_FORGET: u128 = 100;
 const ROW_GROUP_KEY_NAME: &str = "row_group";
 
 /// One aggregate shape over one table revision.
@@ -64,22 +77,38 @@ pub struct PartialsKey {
 pub enum RememberedPartials {
     /// Met once, and not yet worth gathering.
     Met,
-    /// Its partials hold too many rows to pay for merging them.
+    /// Merging its partials does not pay off.
     Dense,
+    Partials(Arc<Partials>),
+}
+
+/// A shape's remembered partials.
+pub struct Partials {
     /// The per-row-group partials: group keys, the row group, then one
     /// column per aggregate.
-    Partials(Arc<Vec<RecordBatch>>),
+    pub batches: Vec<RecordBatch>,
+    /// How long the shape took to aggregate afresh: the time a merge of the
+    /// partials has to beat.
+    pub fresh: Duration,
 }
 
 impl RememberedPartials {
     fn bytes(&self) -> usize {
         match self {
-            RememberedPartials::Partials(batches) => {
-                batches.iter().map(RecordBatch::get_array_memory_size).sum()
-            }
+            RememberedPartials::Partials(partials) => partials
+                .batches
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .sum(),
             RememberedPartials::Met | RememberedPartials::Dense => size_of::<Self>(),
         }
     }
+}
+
+/// Whether a merge taking `merge` is worth keeping against aggregating afresh
+/// in `fresh`: it must take under `share_percent` of that.
+fn merge_pays_off(merge: Duration, fresh: Duration, share_percent: u128) -> bool {
+    merge.as_nanos() * 100 < fresh.as_nanos() * share_percent
 }
 
 struct Entries {
@@ -192,26 +221,40 @@ pub(crate) fn try_compile_memoized(
         }
         Some(RememberedPartials::Dense) => Ok(None),
         Some(RememberedPartials::Partials(partials)) => {
-            let source = values_input(dispatcher, partials.iter().cloned())
+            let started = Instant::now();
+            let source = values_input(dispatcher, partials.batches.iter().cloned())
                 .map_each(|batch: RecordBatch| batch)
                 .record_batches();
             let rewrite = Rewrite::plan(aggregate, child)?;
-            Ok(Some(rewrite.compile_merge(source)?))
+            let merged = rewrite.compile_merge(source)?;
+            let fresh = partials.fresh;
+            let forget_a_slow_merge = move || {
+                if !merge_pays_off(started.elapsed(), fresh, MERGE_SHARE_TO_FORGET) {
+                    cache.insert(key.clone(), RememberedPartials::Dense);
+                }
+            };
+            Ok(Some(merged.with_unary(MergeWatch::over_workers(
+                dispatcher.worker_count(),
+                forget_a_slow_merge,
+            ))))
         }
         Some(RememberedPartials::Met) => {
+            let gathering = Arc::new(Gathering::start(
+                key,
+                shape.input.table.estimate_row_count(),
+            ));
             let rewrite = Rewrite::plan(aggregate, child)?;
             let partials = rewrite.compile_gathering(dispatcher, slots, &shape)?;
-            let pending = Arc::new(PendingPartials {
-                key,
-                scan_rows: shape.input.table.estimate_row_count(),
-                batches: Mutex::new(Vec::new()),
-                workers_left: AtomicUsize::new(dispatcher.worker_count()),
-            });
             let tapped =
                 partials.with_unary((0..dispatcher.worker_count()).map(|_| PartialsTapFactory {
-                    pending: pending.clone(),
+                    gathering: gathering.clone(),
                 }));
-            Ok(Some(rewrite.compile_merge(tapped)?))
+            let merged = rewrite.compile_merge(tapped)?;
+            let file_the_partials = move || gathering.file();
+            Ok(Some(merged.with_unary(MergeWatch::over_workers(
+                dispatcher.worker_count(),
+                file_the_partials,
+            ))))
         }
     }
 }
@@ -725,35 +768,84 @@ fn copied(batch: &RecordBatch) -> RecordBatch {
     RecordBatch::try_new(batch.schema(), columns).expect("a copy keeps the batch's shape")
 }
 
-/// The partials of one shape while its gathering run is under way, filed
-/// with the cache by the last worker to finish.
-struct PendingPartials {
+/// One shape's gathering run while it is under way: its partials as they
+/// are copied, and the moments that tell whether merging them pays off.
+struct Gathering {
     key: PartialsKey,
-    /// The scan's row count, when the table can tell: partials holding a
-    /// large share of it are not worth keeping.
-    scan_rows: Option<u64>,
+    started: Instant,
+    /// Nanoseconds from the start to the first partial emitted, which is
+    /// about how long the shape takes to aggregate afresh; `u64::MAX` until
+    /// one is.
+    first_partial_nanos: AtomicU64,
+    /// Rows the partials may hold before they are too many to keep, when the
+    /// table can tell its row count.
+    row_limit: Option<u64>,
+    rows: AtomicU64,
     batches: Mutex<Vec<RecordBatch>>,
-    workers_left: AtomicUsize,
+    /// Set once the partials grew past the row limit and were let go.
+    abandoned: AtomicBool,
 }
 
-impl PendingPartials {
-    fn file(&self) {
-        let batches = std::mem::take(&mut *self.batches.lock().unwrap());
-        let rows: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
-        let dense = self
-            .scan_rows
-            .is_some_and(|scan_rows| rows * DENSE_DIVISOR > scan_rows);
-        let remembered = if dense {
-            RememberedPartials::Dense
+impl Gathering {
+    fn start(key: PartialsKey, scan_rows: Option<u64>) -> Self {
+        Self {
+            key,
+            started: Instant::now(),
+            first_partial_nanos: AtomicU64::new(u64::MAX),
+            row_limit: scan_rows.map(|rows| rows / DENSE_DIVISOR),
+            rows: AtomicU64::new(0),
+            batches: Mutex::new(Vec::new()),
+            abandoned: AtomicBool::new(false),
+        }
+    }
+
+    /// Takes note of a batch of partials: the moment the first arrived, and
+    /// a copy of it while the partials are few enough to keep.
+    fn note(&self, batch: &RecordBatch) {
+        self.first_partial_nanos
+            .fetch_min(self.started.elapsed().as_nanos() as u64, Ordering::AcqRel);
+        if self.abandoned.load(Ordering::Acquire) {
+            return;
+        }
+        let rows = batch.num_rows() as u64;
+        let rows_so_far = self.rows.fetch_add(rows, Ordering::AcqRel) + rows;
+        if self.row_limit.is_some_and(|limit| rows_so_far > limit) {
+            self.abandoned.store(true, Ordering::Release);
+            self.batches.lock().unwrap().clear();
         } else {
-            RememberedPartials::Partials(Arc::new(batches))
+            self.batches.lock().unwrap().push(copied(batch));
+        }
+    }
+
+    /// Files what the run found with the cache, once its merge is done.
+    fn file(&self) {
+        let elapsed = self.started.elapsed();
+        let first_partial = self.first_partial_nanos.load(Ordering::Acquire);
+        let fresh = if first_partial == u64::MAX {
+            elapsed
+        } else {
+            Duration::from_nanos(first_partial)
         };
-        PartialAggregateCache::global().insert(self.key.clone(), remembered);
+        let merge = elapsed.saturating_sub(fresh);
+        let batches = std::mem::take(&mut *self.batches.lock().unwrap());
+        let kept = (!self.abandoned.load(Ordering::Acquire)).then_some(batches);
+        PartialAggregateCache::global().insert(self.key.clone(), judged(kept, fresh, merge));
+    }
+}
+
+/// What a gathering run leaves behind: its partials, when it kept them and
+/// their merge took clearly less than aggregating afresh, else a dense mark.
+fn judged(kept: Option<Vec<RecordBatch>>, fresh: Duration, merge: Duration) -> RememberedPartials {
+    match kept {
+        Some(batches) if merge_pays_off(merge, fresh, MERGE_SHARE_TO_KEEP) => {
+            RememberedPartials::Partials(Arc::new(Partials { batches, fresh }))
+        }
+        _ => RememberedPartials::Dense,
     }
 }
 
 struct PartialsTapFactory {
-    pending: Arc<PendingPartials>,
+    gathering: Arc<Gathering>,
 }
 
 impl UnaryFactory<RecordBatch, RecordBatch> for PartialsTapFactory {
@@ -761,15 +853,15 @@ impl UnaryFactory<RecordBatch, RecordBatch> for PartialsTapFactory {
 
     fn build_unary(self) -> Self::Unary {
         PartialsTap {
-            pending: self.pending,
+            gathering: self.gathering,
         }
     }
 }
 
-/// Passes the gathering aggregate's batches through, keeping a copy of each
-/// for the cache.
+/// Passes the gathering aggregate's batches through, noting each with the
+/// run.
 struct PartialsTap {
-    pending: Arc<PendingPartials>,
+    gathering: Arc<Gathering>,
 }
 
 impl Unary<RecordBatch, RecordBatch> for PartialsTap {
@@ -779,14 +871,66 @@ impl Unary<RecordBatch, RecordBatch> for PartialsTap {
         sender: &mut dyn Sender<RecordBatch>,
         _io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        self.pending.batches.lock().unwrap().push(copied(&batch));
+        self.gathering.note(&batch);
+        sender.send(batch)?;
+        Ok(())
+    }
+}
+
+/// Watches a merge to its end across every worker: the last worker to finish
+/// runs what the watch was given.
+struct MergeWatch {
+    workers_left: AtomicUsize,
+    when_done: Box<dyn Fn() + Send + Sync>,
+}
+
+impl MergeWatch {
+    /// One watching pass-through per worker, running `when_done` once all of
+    /// them have finished.
+    fn over_workers(
+        workers: usize,
+        when_done: impl Fn() + Send + Sync + 'static,
+    ) -> impl Iterator<Item = MergeWatchFactory> {
+        let watch = Arc::new(MergeWatch {
+            workers_left: AtomicUsize::new(workers),
+            when_done: Box::new(when_done),
+        });
+        (0..workers).map(move |_| MergeWatchFactory {
+            watch: watch.clone(),
+        })
+    }
+}
+
+struct MergeWatchFactory {
+    watch: Arc<MergeWatch>,
+}
+
+impl UnaryFactory<RecordBatch, RecordBatch> for MergeWatchFactory {
+    type Unary = MergeWatcher;
+
+    fn build_unary(self) -> Self::Unary {
+        MergeWatcher { watch: self.watch }
+    }
+}
+
+struct MergeWatcher {
+    watch: Arc<MergeWatch>,
+}
+
+impl Unary<RecordBatch, RecordBatch> for MergeWatcher {
+    fn consume(
+        &mut self,
+        batch: RecordBatch,
+        sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut OperatorIO,
+    ) -> dispatch::UnaryResult<()> {
         sender.send(batch)?;
         Ok(())
     }
 
     fn finish(&mut self, _sender: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<bool> {
-        if self.pending.workers_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.pending.file();
+        if self.watch.workers_left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            (self.watch.when_done)();
         }
         Ok(true)
     }
@@ -820,21 +964,50 @@ mod tests {
 
         cache.insert(first.clone(), RememberedPartials::Met);
         let met = matches!(cache.get(&first), Some(RememberedPartials::Met));
-        cache.insert(
-            first.clone(),
-            RememberedPartials::Partials(Arc::new(vec![one_row_batch(1)])),
-        );
+        cache.insert(first.clone(), remembered_partials(one_row_batch(1)));
         let remembered = matches!(cache.get(&first), Some(RememberedPartials::Partials(_)));
-        cache.insert(
-            key("b"),
-            RememberedPartials::Partials(Arc::new(vec![one_row_batch(2)])),
-        );
+        cache.insert(key("b"), remembered_partials(one_row_batch(2)));
         let evicted = cache.get(&first).is_none();
 
         assert!(met);
         assert!(remembered);
         assert!(evicted);
         assert_eq!(cache.len(), 1);
+    }
+
+    fn remembered_partials(batch: RecordBatch) -> RememberedPartials {
+        RememberedPartials::Partials(Arc::new(Partials {
+            batches: vec![batch],
+            fresh: Duration::from_millis(1),
+        }))
+    }
+
+    #[test]
+    fn a_gathering_keeps_its_partials_only_when_their_merge_was_clearly_the_cheaper_half() {
+        let fresh = Duration::from_millis(100);
+        let kept = || Some(vec![one_row_batch(1)]);
+
+        let quick_merge = judged(kept(), fresh, Duration::from_millis(30));
+        let slow_merge = judged(kept(), fresh, Duration::from_millis(90));
+        let let_go = judged(None, fresh, Duration::from_millis(1));
+
+        assert!(matches!(quick_merge, RememberedPartials::Partials(_)));
+        assert!(matches!(slow_merge, RememberedPartials::Dense));
+        assert!(matches!(let_go, RememberedPartials::Dense));
+    }
+
+    #[test]
+    fn a_gathering_lets_its_partials_go_once_they_outgrow_the_row_limit() {
+        let gathering = Gathering::start(key("a"), Some(2 * DENSE_DIVISOR));
+
+        gathering.note(&one_row_batch(1));
+        gathering.note(&one_row_batch(2));
+        let kept_before_the_limit = gathering.batches.lock().unwrap().len();
+        gathering.note(&one_row_batch(3));
+
+        assert_eq!(kept_before_the_limit, 2);
+        assert!(gathering.abandoned.load(Ordering::Acquire));
+        assert!(gathering.batches.lock().unwrap().is_empty());
     }
 
     #[test]
