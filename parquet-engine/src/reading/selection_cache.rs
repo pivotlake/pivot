@@ -12,8 +12,12 @@
 //! of kept rows costs a decoder a stop and a restart, so a predicate most
 //! rows pass would read slower by selection than whole. Such a predicate is
 //! remembered as dense, and a scan meeting it again neither reads by it nor
-//! gathers it again. `PIVOT_SELECTION_CACHE_BYTES` bounds the cache (`0`
-//! turns it off); past the bound the oldest selections go.
+//! gathers it again.
+//!
+//! Gathering costs the scan that does it, so a predicate is gathered only
+//! from its second scan of a row group on: the first scan just notes having
+//! met it, and a predicate run once never pays. `PIVOT_SELECTION_CACHE_BYTES`
+//! bounds the cache (`0` turns it off); past the bound the oldest entries go.
 
 use dispatch::io::OpenFile;
 use std::collections::{HashMap, VecDeque};
@@ -46,6 +50,8 @@ impl SelectionKey {
 /// What the cache remembers of a predicate on a row group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Remembered {
+    /// Met once, and not yet worth gathering.
+    Met,
     /// The rows passing it, sorted ascending: few enough to read by.
     Rows(Arc<[u32]>),
     /// Too many rows pass it for reading by selection to pay.
@@ -56,7 +62,7 @@ impl Remembered {
     fn bytes(&self) -> usize {
         match self {
             Remembered::Rows(rows) => rows.len() * size_of::<u32>(),
-            Remembered::Dense => size_of::<Self>(),
+            Remembered::Met | Remembered::Dense => size_of::<Self>(),
         }
     }
 }
@@ -234,6 +240,21 @@ mod tests {
             after_last_rows,
             Some(Remembered::Rows(Arc::from([1u32, 400, 500])))
         );
+    }
+
+    #[test]
+    fn a_met_predicate_is_replaced_by_its_gathered_rows() {
+        let key = key(9);
+        let cache = SelectionCache::with_budget(1 << 10);
+
+        cache.insert(key.clone(), Remembered::Met);
+        let met = cache.get(&key);
+        cache.insert(key.clone(), Remembered::Rows(Arc::from([2u32])));
+        let gathered = cache.get(&key);
+
+        assert_eq!(met, Some(Remembered::Met));
+        assert_eq!(gathered, Some(Remembered::Rows(Arc::from([2u32]))));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

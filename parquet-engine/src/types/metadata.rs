@@ -323,12 +323,13 @@ impl QueryRowGroupMetadata {
 
     /// Metadata for scanning row group `index` under `predicates`, the
     /// scan's predicates in order. A predicate the selection cache has
-    /// nothing for is gathered while the row group is read whole. Once every
-    /// predicate is remembered, the rows passing all of the sparse ones are
-    /// read and nothing else, and `None` says no row does; a dense predicate
-    /// neither narrows the read nor is gathered again. A row group the table
-    /// format deleted rows of is read whole and gathers nothing: deletions
-    /// apply to whole rows read, and a selection would stand in for them.
+    /// nothing for is noted as met and read whole; one met before is gathered
+    /// while the row group is read whole. Once every predicate's rows are
+    /// known, the rows passing all of the sparse ones are read and nothing
+    /// else, and `None` says no row does; a dense predicate neither narrows
+    /// the read nor is gathered again. A row group the table format deleted
+    /// rows of is read whole and gathers nothing: deletions apply to whole
+    /// rows read, and a selection would stand in for them.
     pub fn for_scan(
         table: &ParquetTable,
         index: usize,
@@ -350,14 +351,24 @@ impl QueryRowGroupMetadata {
             })
             .collect();
         let remembered: Vec<Option<Remembered>> = keys.iter().map(|key| cache.get(key)).collect();
-        if remembered.iter().any(Option::is_none) {
+        let unknown =
+            |remembered: &Option<Remembered>| matches!(remembered, None | Some(Remembered::Met));
+        if remembered.iter().any(unknown) {
             let collectors: Vec<SelectionCollector> = keys
                 .into_iter()
                 .zip(&remembered)
                 .enumerate()
-                .filter(|(_, (_, remembered))| remembered.is_none())
-                .map(|(predicate_index, (key, _))| {
-                    SelectionCollector::new(predicate_index, key, row_group.num_rows as u32)
+                .filter(|(_, (_, remembered))| unknown(remembered))
+                .filter_map(|(predicate_index, (key, remembered))| match remembered {
+                    None => {
+                        cache.insert(key, Remembered::Met);
+                        None
+                    }
+                    Some(_) => Some(SelectionCollector::new(
+                        predicate_index,
+                        key,
+                        row_group.num_rows as u32,
+                    )),
                 })
                 .collect();
             return Some(Self {
@@ -369,7 +380,7 @@ impl QueryRowGroupMetadata {
             .into_iter()
             .filter_map(|remembered| match remembered {
                 Some(Remembered::Rows(rows)) => Some(rows),
-                Some(Remembered::Dense) | None => None,
+                Some(Remembered::Dense) | Some(Remembered::Met) | None => None,
             });
         let Some(first) = sparse.next() else {
             return Some(Self::new(table, index, RowSelection::All));

@@ -627,6 +627,8 @@ pub(crate) mod tests {
         let table = make_test_table(i32_schema(&["a"]), 640);
         let predicate = ScanPredicate::from_filter(&column_greater_than(0, 636)).unwrap();
         let predicates = std::slice::from_ref(&predicate);
+        QueryRowGroupMetadata::for_scan(&table, 0, predicates)
+            .expect("a row group whose predicate was never met is read whole");
         let metadata = QueryRowGroupMetadata::for_scan(&table, 0, predicates).unwrap();
 
         let out = decode_under_predicate(&table, row_number_pages(&metadata, 640, 64), &predicate);
@@ -646,6 +648,8 @@ pub(crate) mod tests {
         let table = make_test_table(i32_schema(&["a"]), 64);
         let predicate = ScanPredicate::from_filter(&column_greater_than(0, 31)).unwrap();
         let predicates = std::slice::from_ref(&predicate);
+        QueryRowGroupMetadata::for_scan(&table, 0, predicates)
+            .expect("a row group whose predicate was never met is read whole");
         let metadata = QueryRowGroupMetadata::for_scan(&table, 0, predicates).unwrap();
 
         let out = decode_under_predicate(&table, row_number_pages(&metadata, 64, 16), &predicate);
@@ -663,6 +667,8 @@ pub(crate) mod tests {
         let table = make_test_table(i32_schema(&["a"]), 6);
         let predicate = ScanPredicate::from_filter(&column_greater_than(0, 10)).unwrap();
         let predicates = std::slice::from_ref(&predicate);
+        QueryRowGroupMetadata::for_scan(&table, 0, predicates)
+            .expect("a row group whose predicate was never met is read whole");
         let metadata = QueryRowGroupMetadata::for_scan(&table, 0, predicates).unwrap();
 
         let out = decode_under_predicate(&table, row_number_pages(&metadata, 6, 3), &predicate);
