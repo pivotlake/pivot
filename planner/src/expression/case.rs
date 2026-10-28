@@ -73,8 +73,30 @@ impl Case {
 
 #[cfg(test)]
 mod tests {
+    use crate::expression::{Case, CaseCheck, Expression, Ref};
     use crate::test_support::*;
+    use crate::types::Type;
     use rstest::rstest;
+
+    #[test]
+    fn a_case_choosing_between_columns_is_deterministic_over_them() {
+        let column = |column_idx| {
+            Box::new(Expression::Ref(Ref {
+                column_idx,
+                return_type: Type::Int64,
+                name: None,
+            }))
+        };
+        let case = Expression::Case(Case {
+            checks: vec![CaseCheck {
+                when: column(0),
+                then: column(1),
+            }],
+            else_expr: column(2),
+        });
+
+        assert!(case.is_deterministic_over_columns());
+    }
 
     #[rstest]
     fn two_arm_case_in_projection(mut testing_planner: TestingPlanner) {

@@ -181,7 +181,13 @@ impl Expression {
             Expression::Not(not) => not.input.is_deterministic_over_columns(),
             Expression::IsNull(is_null) => is_null.input.is_deterministic_over_columns(),
             Expression::Cast(cast) => cast.source().is_deterministic_over_columns(),
-            Expression::Case(_) | Expression::AggregateFunc(_) | Expression::MaybeError(_) => false,
+            Expression::Case(case) => {
+                case.checks.iter().all(|check| {
+                    check.when.is_deterministic_over_columns()
+                        && check.then.is_deterministic_over_columns()
+                }) && case.else_expr.is_deterministic_over_columns()
+            }
+            Expression::AggregateFunc(_) | Expression::MaybeError(_) => false,
         }
     }
 
