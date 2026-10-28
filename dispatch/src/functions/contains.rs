@@ -119,6 +119,27 @@ mod tests {
     }
 
     #[test]
+    fn views_covering_a_sliver_of_a_large_buffer_are_searched_right() {
+        use arrow_array::builder::make_view;
+        use arrow_buffer::{Buffer, ScalarBuffer};
+        let mut bytes = vec![b'x'; 1 << 16];
+        bytes[100..106].copy_from_slice(b"needle");
+        bytes[50_000..50_006].copy_from_slice(b"needle");
+        let views = [(90, 110), (200, 220), (49_990, 50_010), (104, 124)]
+            .map(|(start, end)| make_view(&bytes[start..end], 0, start as u32));
+        let array = StringViewArray::new(
+            ScalarBuffer::from(views.to_vec()),
+            vec![Buffer::from(bytes)],
+            None,
+        );
+
+        let result = Contains::new("needle").run(&array);
+
+        let found: Vec<bool> = (0..result.len()).map(|i| result.value(i)).collect();
+        assert_eq!(found, vec![true, false, true, false]);
+    }
+
+    #[test]
     fn empty_array() {
         let result = run("needle", &[]);
 

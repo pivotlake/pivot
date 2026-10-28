@@ -10,11 +10,22 @@
 //! `memchr::memmem::Finder` *once* per underlying physical buffer, which both
 //! avoids repeating work and lets the vectorized search run over long inputs.
 //! Each row then costs a binary search over the recorded offsets.
+//!
+//! An array whose views cover only a sliver of a buffer, as the survivors of
+//! a selection do, is the exception: searching the whole allocation would
+//! cost far more than the rows ask for, so such a buffer is searched within
+//! the views only, and what was found serves that array alone.
 
+use crate::env::MAX_INLINE_STRING_VIEW;
+use arrow::array::ByteView;
 use arrow_array::StringViewArray;
 use arrow_buffer::Bytes;
 use memchr::memmem::Finder;
 use std::sync::{Arc, Weak};
+
+/// A buffer is searched within its views only when they cover less than this
+/// share of its allocation: one byte in eight.
+const SPARSE_DIVISOR: usize = 8;
 
 /// Cached needle-match offsets for a single underlying data buffer.
 ///
@@ -29,6 +40,10 @@ struct BufferFindOffsets {
     buffer: Weak<Bytes>,
     /// Sorted byte offsets within the buffer where the needle starts.
     offsets: Vec<usize>,
+    /// Whether only the bytes one array's views point at were searched, so
+    /// the offsets answer for that array alone and the next array searches
+    /// the buffer afresh.
+    partial: bool,
 }
 
 /// Stand-in for a buffer that was never scanned, so resolution needs no
@@ -37,6 +52,7 @@ static EMPTY_BUFFER: BufferFindOffsets = BufferFindOffsets {
     base_ptr: 0,
     buffer: Weak::new(),
     offsets: Vec::new(),
+    partial: false,
 };
 
 impl BufferFindOffsets {
@@ -121,16 +137,29 @@ impl NeedleSearcher {
         &self.finder
     }
 
-    /// Run the finder over every data buffer of `col` not searched already.
+    /// Run the finder over every data buffer of `col` not searched already:
+    /// across the whole allocation of a buffer the views cover well, within
+    /// the views alone of one they barely cover.
     #[inline]
     pub(crate) fn scan_buffers(&mut self, col: &StringViewArray) {
         // Remove any buffers that aren't valid - it's critical to this to ensure we don't take
         // a new buffer and accidentally think it's one we already ran on (we compare pointers to
-        // see if buffers have already been run on)
-        self.buffers_with_offsets.retain_mut(|f| f.is_valid());
-        for buffer in col.data_buffers() {
+        // see if buffers have already been run on). A search within one array's views served
+        // that array only.
+        self.buffers_with_offsets
+            .retain_mut(|f| f.is_valid() && !f.partial);
+        let data_buffers = col.data_buffers();
+        let mut referenced_bytes = vec![0usize; data_buffers.len()];
+        for &view in col.views().iter() {
+            let len = view as u32 as usize;
+            if len > MAX_INLINE_STRING_VIEW {
+                referenced_bytes[ByteView::from(view).buffer_index as usize] += len;
+            }
+        }
+        for (index, buffer) in data_buffers.iter().enumerate() {
             // Get the underlying allocation (not the slice view)
-            let base_ptr = buffer.bytes().as_ptr() as usize;
+            let allocation = buffer.bytes();
+            let base_ptr = allocation.as_ptr() as usize;
 
             if self
                 .buffers_with_offsets
@@ -141,12 +170,51 @@ impl NeedleSearcher {
                 continue;
             }
 
+            let partial = referenced_bytes[index] * SPARSE_DIVISOR < allocation.len();
+            let offsets = if partial {
+                self.find_within_views(col, index, buffer.ptr_offset())
+            } else {
+                self.finder.find_iter(&allocation[..]).collect()
+            };
             self.buffers_with_offsets.push(BufferFindOffsets {
                 base_ptr,
-                buffer: Arc::downgrade(buffer.bytes()),
-                offsets: self.finder.find_iter(&buffer.bytes()[..]).collect(),
+                buffer: Arc::downgrade(allocation),
+                offsets,
+                partial,
             })
         }
+    }
+
+    /// The needle's offsets within the allocation of `col`'s data buffer
+    /// `buffer_index`, searching only the bytes its views point at, sorted
+    /// ascending; `base_offset` is where the buffer starts in its allocation.
+    fn find_within_views(
+        &self,
+        col: &StringViewArray,
+        buffer_index: usize,
+        base_offset: usize,
+    ) -> Vec<usize> {
+        let allocation = &col.data_buffers()[buffer_index].bytes()[..];
+        let mut offsets = Vec::new();
+        for &view in col.views().iter() {
+            let len = view as u32 as usize;
+            if len <= MAX_INLINE_STRING_VIEW {
+                continue;
+            }
+            let view = ByteView::from(view);
+            if view.buffer_index as usize != buffer_index {
+                continue;
+            }
+            let start = view.offset as usize + base_offset;
+            offsets.extend(
+                self.finder
+                    .find_iter(&allocation[start..start + len])
+                    .map(|at| start + at),
+            );
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets
     }
 
     /// Resolve each of `col`'s data buffers to the offsets found in it,
