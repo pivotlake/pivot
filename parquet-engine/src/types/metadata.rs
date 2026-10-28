@@ -8,6 +8,7 @@
 //! the byte-level layout of an individual column chunk needed by the
 //! decompressor to locate pages on disk.
 
+use crate::reading::{Remembered, ScanPredicate, SelectionCache, SelectionCollector, SelectionKey};
 use crate::thrift::general::CompressionCodec;
 use crate::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Scalar};
@@ -301,6 +302,11 @@ pub struct QueryRowGroupMetadata {
     /// the decompressor skips the remaining, not-yet-touched pages instead of
     /// decompressing them only to be discarded.
     pruned: Arc<AtomicBool>,
+    /// One per scan predicate the selection cache has nothing for, gathering
+    /// which rows pass it while the row group decodes whole; empty when the
+    /// row group gathers nothing. Shared by every range of the row group, on
+    /// whichever workers they decode.
+    collectors: Arc<[SelectionCollector]>,
 }
 
 impl QueryRowGroupMetadata {
@@ -311,12 +317,79 @@ impl QueryRowGroupMetadata {
             selection,
             row_group_index: index,
             pruned: Arc::new(AtomicBool::new(false)),
+            collectors: Vec::new().into(),
         }
+    }
+
+    /// Metadata for scanning row group `index` under `predicates`, the
+    /// scan's predicates in order. A predicate the selection cache has
+    /// nothing for is gathered while the row group is read whole. Once every
+    /// predicate is remembered, the rows passing all of the sparse ones are
+    /// read and nothing else, and `None` says no row does; a dense predicate
+    /// neither narrows the read nor is gathered again. A row group the table
+    /// format deleted rows of is read whole and gathers nothing: deletions
+    /// apply to whole rows read, and a selection would stand in for them.
+    pub fn for_scan(
+        table: &ParquetTable,
+        index: usize,
+        predicates: &[ScanPredicate],
+    ) -> Option<Self> {
+        let cache = SelectionCache::global();
+        let row_group = table.row_groups[index].as_ref();
+        if predicates.is_empty() || !cache.is_enabled() || row_group.deleted_rows.is_some() {
+            return Some(Self::new(table, index, RowSelection::All));
+        }
+        let keys: Vec<SelectionKey> = predicates
+            .iter()
+            .map(|predicate| {
+                SelectionKey::new(
+                    row_group.open_file.clone(),
+                    row_group.file_row_group_idx,
+                    predicate.fingerprint(row_group),
+                )
+            })
+            .collect();
+        let remembered: Vec<Option<Remembered>> = keys.iter().map(|key| cache.get(key)).collect();
+        if remembered.iter().any(Option::is_none) {
+            let collectors: Vec<SelectionCollector> = keys
+                .into_iter()
+                .zip(&remembered)
+                .enumerate()
+                .filter(|(_, (_, remembered))| remembered.is_none())
+                .map(|(predicate_index, (key, _))| {
+                    SelectionCollector::new(predicate_index, key, row_group.num_rows as u32)
+                })
+                .collect();
+            return Some(Self {
+                collectors: collectors.into(),
+                ..Self::new(table, index, RowSelection::All)
+            });
+        }
+        let mut sparse = remembered
+            .into_iter()
+            .filter_map(|remembered| match remembered {
+                Some(Remembered::Rows(rows)) => Some(rows),
+                Some(Remembered::Dense) | None => None,
+            });
+        let Some(first) = sparse.next() else {
+            return Some(Self::new(table, index, RowSelection::All));
+        };
+        let passing_all = sparse.fold(first, |rows, other| intersect_sorted(&rows, &other));
+        if passing_all.is_empty() {
+            return None;
+        }
+        Some(Self::new(table, index, RowSelection::Indices(passing_all)))
     }
 
     /// The rows read through this metadata.
     pub fn selection(&self) -> &RowSelection {
         &self.selection
+    }
+
+    /// The gatherers of the rows passing each predicate the selection cache
+    /// is still to learn for this row group.
+    pub fn selection_collectors(&self) -> &[SelectionCollector] {
+        &self.collectors
     }
 
     /// Whether this row group has been pruned (no row can match a pushed-down
@@ -349,9 +422,37 @@ impl QueryRowGroupMetadata {
     }
 }
 
+/// The rows in both of two ascending row lists.
+fn intersect_sorted(left: &[u32], right: &[u32]) -> Arc<[u32]> {
+    let mut both = Vec::with_capacity(left.len().min(right.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                both.push(left[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    both.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intersecting_sorted_rows_keeps_the_rows_in_both() {
+        let left = [1u32, 3, 5, 8];
+        let right = [0u32, 3, 4, 8, 9];
+
+        let both = intersect_sorted(&left, &right);
+
+        assert_eq!(both.as_ref(), &[3u32, 8]);
+    }
 
     #[test]
     fn a_row_group_straddling_a_treemap_block_sees_its_rows_from_both_sides() {

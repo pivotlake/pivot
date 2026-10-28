@@ -10,6 +10,7 @@
 
 use crate::reading::range_cutter::DecodeRange;
 use crate::reading::record_batch_metadata::with_row_group;
+use crate::reading::scan_predicate::CompiledScanPredicate;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_buffer::BooleanBuffer;
 use dispatch::Sender;
@@ -82,13 +83,21 @@ pub struct DecoderFactory {
     pub add_row_group_metadata: bool,
     /// The worker's allocator for decoded batches.
     pub allocator: Arc<WorkerAllocator>,
+    /// The scan's predicates, evaluated on the batches of a row group that
+    /// gathers which rows pass them for the selection cache.
+    pub predicates: Arc<Vec<CompiledScanPredicate>>,
 }
 
 impl UnaryFactory<DecodeRange, RecordBatch> for DecoderFactory {
     type Unary = Decoder;
 
     fn build_unary(self) -> Self::Unary {
-        Decoder::new(self.batch_size, self.add_row_group_metadata, self.allocator)
+        Decoder::new(
+            self.batch_size,
+            self.add_row_group_metadata,
+            self.allocator,
+            self.predicates,
+        )
     }
 }
 
@@ -120,6 +129,8 @@ pub struct Decoder {
     /// Accumulates the live rows of partially deleted batches until a full
     /// batch of them is ready, all of one row group: a batch carries one.
     live_row_accumulator: Option<LiveRowAccumulator>,
+    /// The scan's predicates, for the row groups gathering selections.
+    predicates: Arc<Vec<CompiledScanPredicate>>,
 }
 
 /// The live rows held back, all of row group `group`.
@@ -133,6 +144,7 @@ impl Decoder {
         batch_size: usize,
         add_row_group_metadata: bool,
         allocator: Arc<WorkerAllocator>,
+        predicates: Arc<Vec<CompiledScanPredicate>>,
     ) -> Self {
         Self {
             batch_size,
@@ -141,6 +153,7 @@ impl Decoder {
             idle: Vec::new(),
             add_row_group_metadata,
             live_row_accumulator: None,
+            predicates,
         }
     }
 
@@ -262,7 +275,11 @@ impl Decoder {
             Some(live_rows) => self.hold_live_rows(&batch, &live_rows, group, sender)?,
             None => {
                 self.flush_live_rows(sender)?;
-                self.send(batch, group, sender)?;
+                // A batch the scan's predicates left no row of carries
+                // nothing downstream.
+                if batch.num_rows() > 0 {
+                    self.send(batch, group, sender)?;
+                }
             }
         }
         Ok(true)
@@ -284,8 +301,13 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
             .position(|idle| idle.row_group_index() == row_group_index)
         {
             Some(pos) => self.idle.swap_remove(pos),
-            None => RowGroupDecoder::new(&range, self.batch_size, self.add_row_group_metadata)
-                .map_err(crate::op_err)?,
+            None => RowGroupDecoder::new(
+                &range,
+                self.batch_size,
+                self.add_row_group_metadata,
+                &self.predicates,
+            )
+            .map_err(crate::op_err)?,
         };
         decoder.attach(range).map_err(crate::op_err)?;
         self.active = Some(decoder);
@@ -322,6 +344,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::reading::range_cutter::RangeCutter;
     use crate::reading::record_batch_metadata::row_index;
+    use crate::reading::scan_predicate::{ScanPredicate, tests::column_greater_than};
     use crate::test_utils::deleted_rows;
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
@@ -551,7 +574,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn new_decoder(batch_size: usize) -> Decoder {
-        Decoder::new(batch_size, false, Arc::new(WorkerAllocator::new()))
+        Decoder::new(
+            batch_size,
+            false,
+            Arc::new(WorkerAllocator::new()),
+            Arc::new(Vec::new()),
+        )
     }
 
     /// Cuts `pages` into ranges.
@@ -568,6 +596,77 @@ pub(crate) mod tests {
     ) -> Vec<RecordBatch> {
         let ranges = run_unary_to_completion(new_cutter(table, eq_predicates), pages);
         run_unary_to_completion(new_decoder(batch_size), ranges)
+    }
+
+    /// Cuts `pages` into ranges and decodes them on one worker under the
+    /// scan `predicate`.
+    fn decode_under_predicate(
+        table: &Arc<ParquetTable>,
+        pages: Vec<DecompressedPage>,
+        predicate: &ScanPredicate,
+    ) -> Vec<RecordBatch> {
+        let compiled = predicate
+            .compile_for(&Projection::all_from_schema(table.schema()))
+            .unwrap();
+        let decoder = Decoder::new(
+            1024,
+            false,
+            Arc::new(WorkerAllocator::new()),
+            Arc::new(vec![compiled]),
+        );
+        let ranges = run_unary_to_completion(new_cutter(table, Vec::new()), pages);
+        run_unary_to_completion(decoder, ranges)
+    }
+
+    #[test]
+    fn a_row_group_decoded_under_a_sparse_predicate_emits_the_passing_rows_and_remembers_them() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 640);
+        let predicate = ScanPredicate::from_filter(&column_greater_than(0, 636)).unwrap();
+        let predicates = std::slice::from_ref(&predicate);
+        let metadata = QueryRowGroupMetadata::for_scan(&table, 0, predicates).unwrap();
+
+        let out = decode_under_predicate(&table, row_number_pages(&metadata, 640, 64), &predicate);
+        let remembered = QueryRowGroupMetadata::for_scan(&table, 0, predicates).unwrap();
+
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 0)).collect();
+        assert_eq!(rows, vec![637, 638, 639]);
+        assert_eq!(
+            remembered.selection(),
+            &RowSelection::Indices(Arc::from([637u32, 638, 639]))
+        );
+    }
+
+    #[test]
+    fn a_row_group_decoded_under_a_dense_predicate_is_read_whole_next_time() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 64);
+        let predicate = ScanPredicate::from_filter(&column_greater_than(0, 31)).unwrap();
+        let predicates = std::slice::from_ref(&predicate);
+        let metadata = QueryRowGroupMetadata::for_scan(&table, 0, predicates).unwrap();
+
+        let out = decode_under_predicate(&table, row_number_pages(&metadata, 64, 16), &predicate);
+        let again = QueryRowGroupMetadata::for_scan(&table, 0, predicates).unwrap();
+
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 0)).collect();
+        assert_eq!(rows, (32..64).collect::<Vec<i32>>());
+        assert_eq!(again.selection(), &RowSelection::All);
+        assert!(again.selection_collectors().is_empty());
+    }
+
+    #[test]
+    fn a_row_group_no_row_of_passes_is_not_scanned_again() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 6);
+        let predicate = ScanPredicate::from_filter(&column_greater_than(0, 10)).unwrap();
+        let predicates = std::slice::from_ref(&predicate);
+        let metadata = QueryRowGroupMetadata::for_scan(&table, 0, predicates).unwrap();
+
+        let out = decode_under_predicate(&table, row_number_pages(&metadata, 6, 3), &predicate);
+        let again = QueryRowGroupMetadata::for_scan(&table, 0, predicates);
+
+        assert!(out.iter().all(|batch| batch.num_rows() == 0));
+        assert!(again.is_none());
     }
 
     /// The rows of a row group as `i32`s equal to their row number, in
@@ -782,7 +881,12 @@ pub(crate) mod tests {
 
         let ranges = run_unary_to_completion(new_cutter(&table, Vec::new()), vec![page]);
         let out = run_unary_to_completion(
-            Decoder::new(2, true, Arc::new(WorkerAllocator::new())),
+            Decoder::new(
+                2,
+                true,
+                Arc::new(WorkerAllocator::new()),
+                Arc::new(Vec::new()),
+            ),
             ranges,
         );
 
@@ -804,7 +908,12 @@ pub(crate) mod tests {
 
         let ranges = run_unary_to_completion(new_cutter(&table, Vec::new()), vec![page]);
         let out = run_unary_to_completion(
-            Decoder::new(2, true, Arc::new(WorkerAllocator::new())),
+            Decoder::new(
+                2,
+                true,
+                Arc::new(WorkerAllocator::new()),
+                Arc::new(Vec::new()),
+            ),
             ranges,
         );
 

@@ -9,8 +9,8 @@ use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, ScanPredicate, equality_predicates, materialize, prune_parquet,
+    row_group_filter_from, scan_order_from, table_input_with_predicates,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
@@ -47,6 +47,9 @@ pub struct TableBinding {
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
+    /// The pushed filter conjuncts the scan evaluates itself, remembering
+    /// per row group which rows pass for the next scan to read those only.
+    scan_predicates: Vec<ScanPredicate>,
     /// The row groups a scan of this binding reads (see
     /// [`scan_view`](Self::scan_view)), built on first use. The snapshot and,
     /// once planning is over, the predicates are fixed, so every compile of
@@ -85,6 +88,7 @@ impl TableBinding {
             columns,
             nullability,
             predicates: Vec::new(),
+            scan_predicates: Vec::new(),
             scan_view: OnceLock::new(),
             uploaded_files,
         }
@@ -193,7 +197,7 @@ impl BoundTable for TableBinding {
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_predicates(
             dispatcher,
             &parquet,
             projection,
@@ -201,6 +205,7 @@ impl BoundTable for TableBinding {
             row_group_filter_from(dynamic_filters),
             scan_order,
             Arc::new(eq_predicates),
+            Arc::new(self.scan_predicates.clone()),
         ))
     }
 
@@ -257,6 +262,8 @@ impl BoundTable for TableBinding {
         // so this is purely an optimization and never affects correctness.
         self.predicates
             .extend(PushedPredicate::from_filter(&filter));
+        self.scan_predicates
+            .extend(ScanPredicate::from_filter(&filter));
         // The view was pruned by the predicates pushed before this one.
         self.scan_view = OnceLock::new();
 

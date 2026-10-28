@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::RowGroupFilter;
 use crate::reading::empty_projection_scan::empty_projection_scan;
+use crate::reading::scan_predicate::{CompiledScanPredicate, ScanPredicate};
 use crate::types::metadata::QueryRowGroupMetadata;
 use arrow_array::RecordBatch;
 use dispatch::{
@@ -34,6 +35,7 @@ pub(crate) fn read_parquet<OF>(
     batch_size: usize,
     add_row_group_metadata: bool,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    scan_predicates: Arc<Vec<CompiledScanPredicate>>,
     pending_row_groups: Vec<Arc<AtomicUsize>>,
     outstanding_row_groups: Arc<AtomicUsize>,
 ) -> RecordBatchOperatorSpec
@@ -89,6 +91,7 @@ where
                     batch_size,
                     add_row_group_metadata,
                     allocator,
+                    predicates: scan_predicates.clone(),
                 })
                 .collect(),
         );
@@ -153,6 +156,43 @@ pub fn table_input_with_filter_and_eq_predicates(
     scan_order: Option<ScanOrder>,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 ) -> RecordBatchOperatorSpec {
+    table_input_with_predicates(
+        dispatcher,
+        table,
+        projection,
+        add_row_group_metadata,
+        filter,
+        scan_order,
+        eq_predicates,
+        Arc::new(Vec::new()),
+    )
+}
+
+/// Like [`table_input_with_filter_and_eq_predicates`], with the filter
+/// conjuncts over the table's columns the scan evaluates itself: a row group
+/// whose rows passing them the selection cache remembers reads those rows
+/// only, and one it does not gathers them for the next scan. A conjunct
+/// reading a column the projection does not emit as itself is left to the
+/// filter above the scan.
+pub fn table_input_with_predicates(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<ParquetTable>,
+    projection: Projection,
+    add_row_group_metadata: bool,
+    filter: Option<RowGroupFilter>,
+    scan_order: Option<ScanOrder>,
+    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    scan_predicates: Arc<Vec<ScanPredicate>>,
+) -> RecordBatchOperatorSpec {
+    let (scan_predicates, compiled_predicates): (Vec<ScanPredicate>, Vec<CompiledScanPredicate>) =
+        scan_predicates
+            .iter()
+            .filter_map(|predicate| {
+                predicate
+                    .compile_for(&projection)
+                    .map(|compiled| (predicate.clone(), compiled))
+            })
+            .unzip();
     let n = dispatcher.worker_count();
     // A projection with no data columns can't go through the column-driven page
     // pipeline (it would fetch nothing and emit no rows), so route it to a source
@@ -175,6 +215,7 @@ pub fn table_input_with_filter_and_eq_predicates(
         scan_order,
         outstanding_row_groups.clone(),
         dispatcher.topology().node_count,
+        &scan_predicates,
     );
     let siblings = Arc::new(AtomicUsize::new(n));
     let pending_row_groups = pending_row_group_counters(n);
@@ -203,6 +244,7 @@ pub fn table_input_with_filter_and_eq_predicates(
         RECORD_BATCH_SIZE,
         add_row_group_metadata,
         eq_predicates,
+        Arc::new(compiled_predicates),
         pending_row_groups,
         outstanding_row_groups,
     )
@@ -263,6 +305,7 @@ pub fn materialize(
         projection,
         RECORD_BATCH_SIZE,
         false,
+        Arc::new(Vec::new()),
         Arc::new(Vec::new()),
         pending_row_groups,
         // The materializer path claims by explicit row-group requests, not the

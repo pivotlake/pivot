@@ -35,7 +35,14 @@ mod record_batch_metadata;
 
 mod empty_projection_scan;
 
+pub(crate) mod scan_predicate;
+pub use scan_predicate::{CompiledScanPredicate, ScanPredicate};
+
+pub(crate) mod selection_cache;
+pub use selection_cache::{Remembered, SelectionCache, SelectionCollector, SelectionKey};
+
 mod scan;
 pub use scan::{
     materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    table_input_with_predicates,
 };

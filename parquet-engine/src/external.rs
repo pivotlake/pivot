@@ -17,8 +17,8 @@ use planner::expression::Expression;
 use planner::types::{Type, type_from_physical};
 
 use crate::{
-    ParquetTable, PushedPredicate, is_variant_field, materialize, prune_parquet,
-    table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, ScanPredicate, is_variant_field, materialize, prune_parquet,
+    table_input_with_predicates,
 };
 use object_storage::{
     DataFile, ExternalStoreFactory, FileRef, ObjectPath, ObjectStore, StoreScheme, local_path,
@@ -71,6 +71,9 @@ struct ExternalParquetTable {
     columns: Vec<Column>,
     parquet: Arc<ParquetTable>,
     predicates: Vec<PushedPredicate>,
+    /// The pushed filter conjuncts the scan evaluates itself, remembering
+    /// per row group which rows pass.
+    scan_predicates: Vec<ScanPredicate>,
 }
 
 impl BoundTable for ExternalParquetTable {
@@ -106,7 +109,7 @@ impl BoundTable for ExternalParquetTable {
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         let equality_predicates = crate::equality_predicates(&self.predicates);
         let parquet = Arc::new(prune_parquet(&self.parquet, &self.predicates));
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_predicates(
             dispatcher,
             &parquet,
             projection,
@@ -114,6 +117,7 @@ impl BoundTable for ExternalParquetTable {
             crate::row_group_filter_from(dynamic_filters),
             None,
             Arc::new(equality_predicates),
+            Arc::new(self.scan_predicates.clone()),
         ))
     }
 
@@ -148,8 +152,11 @@ impl BoundTable for ExternalParquetTable {
     fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
         self.predicates
             .extend(PushedPredicate::from_filter(&filter));
-        // Statistics and dictionaries may skip work, but the SQL filter stays
-        // above the scan and remains responsible for query correctness.
+        self.scan_predicates
+            .extend(ScanPredicate::from_filter(&filter));
+        // Statistics, dictionaries and remembered selections may skip work,
+        // but the SQL filter stays above the scan and remains responsible for
+        // query correctness.
         Ok(false)
     }
 
@@ -179,6 +186,7 @@ fn bind_external_table(
         columns,
         parquet: Arc::new(parquet),
         predicates: Vec::new(),
+        scan_predicates: Vec::new(),
     })
 }
 

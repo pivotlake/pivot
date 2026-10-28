@@ -11,16 +11,18 @@ use crate::reading::decoding::ScanEqualityPredicate;
 use crate::reading::decoding::column_decoder::{ColumnDecoder, Error, Result, create_leaf_decoder};
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
-use crate::reading::record_batch_metadata::with_row_index;
+use crate::reading::record_batch_metadata::{with_row_index, with_row_positions};
+use crate::reading::scan_predicate::{CompiledScanPredicate, passing_rows};
 use crate::types::filter_mask::FilterMask;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
-use arrow_array::{ArrayRef, RecordBatch, Scalar};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, Scalar, UInt32Array};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{FieldRef, Fields, Schema, SchemaRef};
 use dispatch::memory::SlabAllocator;
+use planner::compile::ExprEvalFn;
 use std::cmp::min;
 use std::ops::Range;
 use std::sync::Arc;
@@ -173,6 +175,9 @@ pub struct RowGroupDecoder {
     /// by their position inside the row group, so every row has to stay in
     /// place.
     filter_batches: bool,
+    /// This worker's evaluators of the scan's predicates, in the scan's
+    /// order; built only for a row group gathering selections.
+    predicate_evaluators: Vec<ExprEvalFn>,
 }
 
 impl RowGroupDecoder {
@@ -183,6 +188,7 @@ impl RowGroupDecoder {
         range: &DecodeRange,
         batch_size: usize,
         add_row_group_metadata: bool,
+        predicates: &[CompiledScanPredicate],
     ) -> Result<Self> {
         let metadata = range.metadata().clone();
         let plan = range.plan().clone();
@@ -194,6 +200,14 @@ impl RowGroupDecoder {
                 decoder.adopt_dictionary(dictionary.clone());
             }
         }
+        let predicate_evaluators = if metadata.selection_collectors().is_empty() {
+            Vec::new()
+        } else {
+            predicates
+                .iter()
+                .map(CompiledScanPredicate::evaluator)
+                .collect()
+        };
         Ok(Self {
             next_page: vec![0; plan.leaf_count()],
             leaf_decoders,
@@ -207,7 +221,46 @@ impl RowGroupDecoder {
             add_row_group_metadata,
             filter_batches,
             metadata,
+            predicate_evaluators,
         })
+    }
+
+    /// Gathers, for the selection cache, which rows of `batch` pass each
+    /// scan predicate the row group is still learning; `batch` holds the
+    /// row group's rows from the `first_row`th on. The batch comes back
+    /// without the rows failing any of them when `drop_failing` is set, or
+    /// whole, when its rows must keep their places.
+    fn gather_selections(
+        &mut self,
+        batch: RecordBatch,
+        first_row: usize,
+        drop_failing: bool,
+    ) -> RecordBatch {
+        let Self {
+            metadata,
+            predicate_evaluators,
+            ..
+        } = self;
+        let collectors = metadata.selection_collectors();
+        if collectors.is_empty() {
+            return batch;
+        }
+        let rows = batch.num_rows();
+        let mut passing_all = BooleanBuffer::new_set(rows);
+        for collector in collectors {
+            let evaluator = &mut predicate_evaluators[collector.predicate_index()];
+            let passing = passing_rows(evaluator(&batch), rows);
+            collector.record(
+                rows as u32,
+                passing.set_indices().map(|row| (first_row + row) as u32),
+            );
+            passing_all = &passing_all & &passing;
+        }
+        if !drop_failing || passing_all.count_set_bits() == rows {
+            return batch;
+        }
+        arrow_select::filter::filter_record_batch(&batch, &BooleanArray::new(passing_all, None))
+            .expect("the mask is built to the batch's row count")
     }
 
     pub fn row_group_index(&self) -> usize {
@@ -387,6 +440,15 @@ impl RowGroupDecoder {
                 let live = live.slice(live.len() - (self.end_row - first_row), available);
                 (live.count_set_bits() < available).then_some(live)
             });
+            // A row group learning which rows pass the scan's predicates
+            // tests them here, where the batch's place in the row group is
+            // known. Rows that fail leave now unless each row's place must
+            // survive to be stamped on it below.
+            let record_batch = if live_rows.is_none() {
+                self.gather_selections(record_batch, first_row, !self.add_row_group_metadata)
+            } else {
+                record_batch
+            };
             // Give each column carrying a pushed-down equality constant a
             // chance to drop rows that provably fail it, before the batch
             // travels any further. Dictionary encoded string columns filter it
@@ -400,10 +462,21 @@ impl RowGroupDecoder {
             } else {
                 record_batch
             };
-            let batch = if self.add_row_group_metadata {
-                with_row_index(record_batch, first_row)
-            } else {
+            let batch = if !self.add_row_group_metadata {
                 record_batch
+            } else {
+                match self.metadata.selection() {
+                    RowSelection::All => with_row_index(record_batch, first_row),
+                    // A selection's batch holds its rows from the
+                    // `first_row`th on; each one's place in the row group is
+                    // the selection's.
+                    RowSelection::Indices(selected) => with_row_positions(
+                        record_batch,
+                        UInt32Array::from_iter_values(
+                            selected[first_row..first_row + available].iter().copied(),
+                        ),
+                    ),
+                }
             };
             Ok(Some(DecodedBatch { batch, live_rows }))
         } else {

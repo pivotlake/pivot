@@ -15,7 +15,8 @@
 //! and decoded entirely on the claiming node; only its cached bytes end up
 //! remote for a later query).
 
-use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata, RowSelection};
+use crate::reading::ScanPredicate;
+use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
 use crate::types::projection::Projection;
 use crate::types::table::ParquetTable;
 use arrow_array::{ArrayRef, Scalar};
@@ -203,7 +204,8 @@ impl RowGroupInjectorFactory {
     /// groups are pushed in that key's order so the most-promising are claimed
     /// first and the boundary prunes the rest; otherwise decompressed-cache-covered
     /// row groups go first, largest-first within a tie (see
-    /// [`plain_scan_order`]).
+    /// [`plain_scan_order`]). A row group the selection cache knows no row
+    /// of passes the scan's `predicates` is not queued at all.
     pub fn new(
         table: &Arc<ParquetTable>,
         projection: Projection,
@@ -211,6 +213,7 @@ impl RowGroupInjectorFactory {
         scan_order: Option<ScanOrder>,
         outstanding_row_groups: Arc<AtomicUsize>,
         node_count: usize,
+        predicates: &[ScanPredicate],
     ) -> Self {
         let row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>> =
             Arc::new((0..node_count).map(|_| Injector::new()).collect());
@@ -220,7 +223,7 @@ impl RowGroupInjectorFactory {
         };
         let row_groups: Vec<QueryRowGroupMetadata> = order
             .iter()
-            .map(|&idx| QueryRowGroupMetadata::new(table, idx, RowSelection::All))
+            .filter_map(|&idx| QueryRowGroupMetadata::for_scan(table, idx, predicates))
             .collect();
         let speculation = scan_order.map(|_| {
             Arc::new(SpeculationGate {
