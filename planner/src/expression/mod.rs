@@ -146,6 +146,45 @@ pub enum Expression {
 }
 
 impl Expression {
+    /// Whether the expression reads columns and constants only, through
+    /// operations that give the same answer every time they run, so its value
+    /// on a row can be remembered and reused.
+    pub fn is_deterministic_over_columns(&self) -> bool {
+        match self {
+            Expression::Ref(_) | Expression::Constant(_) => true,
+            Expression::Compare(compare) => {
+                compare.left.is_deterministic_over_columns()
+                    && compare.right.is_deterministic_over_columns()
+            }
+            Expression::Between(between) => {
+                between.input.is_deterministic_over_columns()
+                    && between.lower.is_deterministic_over_columns()
+                    && between.upper.is_deterministic_over_columns()
+            }
+            Expression::Function(Function::DropCache)
+            | Expression::Function(Function::VariantGet(_)) => false,
+            Expression::Function(function) => {
+                let mut deterministic = true;
+                function.for_each_argument(&mut |argument| {
+                    deterministic &= argument.is_deterministic_over_columns();
+                });
+                deterministic
+            }
+            Expression::InList(list) => {
+                list.input.is_deterministic_over_columns()
+                    && list.values.iter().all(Self::is_deterministic_over_columns)
+            }
+            Expression::Conjunction(conjunction) => conjunction
+                .children
+                .iter()
+                .all(Self::is_deterministic_over_columns),
+            Expression::Not(not) => not.input.is_deterministic_over_columns(),
+            Expression::IsNull(is_null) => is_null.input.is_deterministic_over_columns(),
+            Expression::Cast(cast) => cast.source().is_deterministic_over_columns(),
+            Expression::Case(_) | Expression::AggregateFunc(_) | Expression::MaybeError(_) => false,
+        }
+    }
+
     /// Rough count of the vectorized kernels evaluating this expression runs
     /// per batch - a cost proxy for deciding whether shrinking a batch before
     /// evaluating it pays for the row gather (see the `Filter` operator).

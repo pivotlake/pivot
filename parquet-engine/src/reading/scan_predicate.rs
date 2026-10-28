@@ -13,7 +13,7 @@ use arrow_array::cast::AsArray;
 use arrow_buffer::BooleanBuffer;
 use dispatch::Projection;
 use planner::compile::{ExprEvalFn, ExprFn, ExprResult};
-use planner::expression::{Expression, Function};
+use planner::expression::Expression;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// A filter conjunct over a scan's own columns whose result per row group
@@ -36,7 +36,7 @@ impl ScanPredicate {
     /// The conjunct as a scan predicate, when it reads at least one column
     /// and nothing but columns through deterministic operations.
     pub fn from_filter(filter: &Expression) -> Option<Self> {
-        if !is_deterministic_over_columns(filter) {
+        if !filter.is_deterministic_over_columns() {
             return None;
         }
         let mut columns = Vec::new();
@@ -129,44 +129,6 @@ pub fn passing_rows(result: ExprResult, rows: usize) -> BooleanBuffer {
                 BooleanBuffer::new_unset(rows)
             }
         }
-    }
-}
-
-/// Whether `expression` reads columns and constants only, through operations
-/// that give the same answer every time they run.
-fn is_deterministic_over_columns(expression: &Expression) -> bool {
-    match expression {
-        Expression::Ref(_) | Expression::Constant(_) => true,
-        Expression::Compare(compare) => {
-            is_deterministic_over_columns(&compare.left)
-                && is_deterministic_over_columns(&compare.right)
-        }
-        Expression::Between(between) => {
-            is_deterministic_over_columns(&between.input)
-                && is_deterministic_over_columns(&between.lower)
-                && is_deterministic_over_columns(&between.upper)
-        }
-        Expression::Function(Function::DropCache)
-        | Expression::Function(Function::VariantGet(_)) => false,
-        Expression::Function(function) => {
-            let mut deterministic = true;
-            function.for_each_argument(&mut |argument| {
-                deterministic &= is_deterministic_over_columns(argument);
-            });
-            deterministic
-        }
-        Expression::InList(list) => {
-            is_deterministic_over_columns(&list.input)
-                && list.values.iter().all(is_deterministic_over_columns)
-        }
-        Expression::Conjunction(conjunction) => conjunction
-            .children
-            .iter()
-            .all(is_deterministic_over_columns),
-        Expression::Not(not) => is_deterministic_over_columns(&not.input),
-        Expression::IsNull(is_null) => is_deterministic_over_columns(&is_null.input),
-        Expression::Cast(cast) => is_deterministic_over_columns(cast.source()),
-        Expression::Case(_) | Expression::AggregateFunc(_) | Expression::MaybeError(_) => false,
     }
 }
 

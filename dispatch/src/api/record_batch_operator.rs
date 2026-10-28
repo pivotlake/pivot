@@ -314,6 +314,16 @@ impl RecordBatchOperatorSpec {
 
     /// Append a unary (one-in, one-out) stage to the dataflow.
     ///
+    /// Chains one [`UnaryFactory`] per worker onto the stream, for a stage
+    /// another crate defines: it sees every batch and gets a finish pass once
+    /// its worker's input is exhausted.
+    pub fn with_unary<UF: UnaryFactory<RecordBatch, RecordBatch>>(
+        self,
+        unary_factories: impl IntoIterator<Item = UF>,
+    ) -> Self {
+        self.unary(unary_factories)
+    }
+
     /// Takes an iterator of [`UnaryFactory`] instances (one per worker) and wraps
     /// each existing factory with a [`UnaryOperatorFactory`].
     fn unary<UF: UnaryFactory<RecordBatch, RecordBatch>>(

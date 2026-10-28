@@ -319,6 +319,16 @@ impl PlanNode {
             return Ok(spec);
         }
 
+        // An aggregate over a plain scan whose per-row-group partials are
+        // remembered merges them instead of scanning; met for the second time,
+        // it gathers them as it runs. Also before the child scan is compiled:
+        // on a hit no scan happens at all.
+        if let Some(spec) =
+            crate::partial_aggregates::try_compile_memoized(self, dispatcher, slots)?
+        {
+            return Ok(spec);
+        }
+
         // EXPLAIN renders its (already-optimized) child plan as text and emits
         // that. The child is formatted here, not compiled, so the explained
         // query never runs. This must happen before the input-compile loop below.
