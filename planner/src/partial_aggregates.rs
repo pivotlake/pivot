@@ -12,13 +12,13 @@
 //! by the row group as an extra key, copies each row's partial as the
 //! query finishes, and merges them for its own answer. That run also times
 //! its two halves: the time to the first partial is about what the shape
-//! costs to aggregate afresh, and the rest is what merging the partials
-//! costs. The partials are kept only when the merge is clearly the cheaper
-//! of the two; otherwise the shape is remembered as dense and left alone
+//! costs to aggregate afresh, and the rest is what emitting and merging the
+//! partials costs. The partials are let go when that rest is far longer
+//! than the first half, and the shape remembered as dense and left alone
 //! from then on, as it is when its partials hold too many rows to copy at
-//! all (a group per row, as with a unique key). A remembered shape whose
-//! merge later takes as long as aggregating afresh is forgotten the same
-//! way.
+//! all (a group per row, as with a unique key). The first run over
+//! remembered partials then proves them: a shape whose merge takes as long
+//! as aggregating afresh is forgotten the same way.
 //!
 //! Only decomposable aggregates qualify: `COUNT`, `SUM`, `MIN` and `MAX`,
 //! whose merge is a sum or an extreme of the partials, and one
@@ -55,9 +55,12 @@ const BUDGET_VARIABLE: &str = "PIVOT_PARTIAL_AGGREGATE_CACHE_BYTES";
 /// Partials are copied only while they hold fewer rows than this share of
 /// the scan's rows, one in four: a merge over more cannot pay off.
 const DENSE_DIVISOR: u64 = 4;
-/// Partials are kept when their merge took under this share, in percent, of
-/// the time the shape took to aggregate afresh.
-const MERGE_SHARE_TO_KEEP: u128 = 70;
+/// Partials are kept when the rest of their gathering run, from the first
+/// partial to the end of the merge, took under this share, in percent, of
+/// the time to the first partial. That rest covers the partials' emission
+/// as well as their merge, so the bound is a loose one; a merge run then
+/// proves the keep.
+const MERGE_SHARE_TO_KEEP: u128 = 200;
 /// Remembered partials are forgotten once a merge of them takes at least
 /// this share, in percent, of the time the shape took to aggregate afresh.
 pub(crate) const MERGE_SHARE_TO_FORGET: u128 = 100;
@@ -954,12 +957,38 @@ impl UnaryFactory<RecordBatch, RecordBatch> for MergeWatchFactory {
     type Unary = MergeWatcher;
 
     fn build_unary(self) -> Self::Unary {
-        MergeWatcher { watch: self.watch }
+        MergeWatcher {
+            watch: self.watch,
+            counted: false,
+        }
     }
 }
 
+/// One worker's share of a [`MergeWatch`]. It counts itself done when it
+/// finishes, or when it is dropped unfinished: a limit above the merge may
+/// abandon the merge's tail once it has its rows, and the watch must still
+/// run what it was given.
 pub(crate) struct MergeWatcher {
     watch: Arc<MergeWatch>,
+    counted: bool,
+}
+
+impl MergeWatcher {
+    fn count_done(&mut self) {
+        if self.counted {
+            return;
+        }
+        self.counted = true;
+        if self.watch.workers_left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            (self.watch.when_done)();
+        }
+    }
+}
+
+impl Drop for MergeWatcher {
+    fn drop(&mut self) {
+        self.count_done();
+    }
 }
 
 impl Unary<RecordBatch, RecordBatch> for MergeWatcher {
@@ -974,9 +1003,7 @@ impl Unary<RecordBatch, RecordBatch> for MergeWatcher {
     }
 
     fn finish(&mut self, _sender: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<bool> {
-        if self.watch.workers_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            (self.watch.when_done)();
-        }
+        self.count_done();
         Ok(true)
     }
 }
@@ -1028,12 +1055,12 @@ mod tests {
     }
 
     #[test]
-    fn a_gathering_keeps_its_partials_only_when_their_merge_was_clearly_the_cheaper_half() {
+    fn a_gathering_keeps_its_partials_unless_their_merge_took_twice_the_first_half() {
         let fresh = Duration::from_millis(100);
         let kept = || Some(vec![one_row_batch(1)]);
 
-        let quick_merge = judged(kept(), fresh, Duration::from_millis(30));
-        let slow_merge = judged(kept(), fresh, Duration::from_millis(90));
+        let quick_merge = judged(kept(), fresh, Duration::from_millis(150));
+        let slow_merge = judged(kept(), fresh, Duration::from_millis(250));
         let let_go = judged(None, fresh, Duration::from_millis(1));
 
         assert!(matches!(quick_merge, RememberedPartials::Partials(_)));
