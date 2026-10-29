@@ -32,6 +32,7 @@
 
 use crate::Operator;
 use crate::compile::{Error, RuntimeFilterSlots};
+use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{AggregateFunc, Cast, CountStar, Expression, NumericAggregate, Ref};
 use crate::operator::{Aggregate, Filter, Input, Projection};
 use crate::plan::PlanNode;
@@ -63,7 +64,10 @@ const DENSE_DIVISOR: u64 = 4;
 const MERGE_SHARE_TO_KEEP: u128 = 200;
 /// Remembered partials are forgotten once a merge of them takes at least
 /// this share, in percent, of the time the shape took to aggregate afresh.
-pub(crate) const MERGE_SHARE_TO_FORGET: u128 = 100;
+/// That time was measured on the gathering run, whose extra key makes it
+/// run somewhat longer than the shape does on its own, so the share stays
+/// under the whole.
+pub(crate) const MERGE_SHARE_TO_FORGET: u128 = 75;
 const ROW_GROUP_KEY_NAME: &str = "row_group";
 
 /// One aggregate shape over one table revision.
@@ -227,15 +231,28 @@ pub(crate) fn try_compile_memoized(
         }
         Some(RememberedPartials::Dense) => Ok(None),
         Some(RememberedPartials::Partials(partials)) => {
-            let started = Instant::now();
+            let clock = Arc::new(RunClock::new());
             let source = values_input(dispatcher, partials.batches.iter().cloned())
                 .map_each(|batch: RecordBatch| batch)
-                .record_batches();
+                .record_batches()
+                .with_unary(BeginTapFactory::over_workers(
+                    dispatcher.worker_count(),
+                    &clock,
+                ));
             let rewrite = Rewrite::plan(aggregate, child)?;
             let merged = rewrite.compile_merge(source)?;
             let fresh = partials.fresh;
             let forget_a_slow_merge = move || {
-                if !merge_pays_off(started.elapsed(), fresh, MERGE_SHARE_TO_FORGET) {
+                let merge = clock.since_began();
+                let pays_off = merge_pays_off(merge, fresh, MERGE_SHARE_TO_FORGET);
+                tracing::debug!(
+                    shape = %key.shape,
+                    fresh_ms = fresh.as_secs_f64() * 1e3,
+                    merge_ms = merge.as_secs_f64() * 1e3,
+                    kept = pays_off,
+                    "partials merged"
+                );
+                if !pays_off {
                     cache.insert(key.clone(), RememberedPartials::Dense);
                 }
             };
@@ -249,9 +266,11 @@ pub(crate) fn try_compile_memoized(
                 key,
                 shape.input.table.estimate_row_count(),
                 None,
+                FreshSpan::ToFirstPartials,
             ));
             let rewrite = Rewrite::plan(aggregate, child)?;
-            let partials = rewrite.compile_gathering(dispatcher, slots, &shape)?;
+            let partials =
+                rewrite.compile_gathering(dispatcher, slots, &shape, gathering.clock())?;
             let tapped =
                 partials.with_unary((0..dispatcher.worker_count()).map(|_| PartialsTapFactory {
                     gathering: gathering.clone(),
@@ -408,17 +427,26 @@ impl<'a> ScanShape<'a> {
     }
 
     /// The scan compiled on its own, tagging each row with its row group and
-    /// consuming no dynamic filter.
+    /// consuming the dynamic filters its node publishes, if any.
     pub(crate) fn compile_tagged_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
         slots: &mut RuntimeFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let input = self.input;
+        let dynamic_filters = input
+            .dynamic_filters
+            .iter()
+            .map(|filter| DynamicFilter {
+                slot_id: filter.slot_id,
+                column_idx: filter.column_idx,
+                compare_type: filter.compare_type,
+            })
+            .collect();
         let scan = Input {
             table: input.table.clone_box(),
             columns: input.columns.clone(),
-            dynamic_filters: Vec::new(),
+            dynamic_filters,
             key_bitset_filters: Vec::new(),
             duckdb_table_binding_index: input.duckdb_table_binding_index,
             join_filter_info: None,
@@ -552,10 +580,15 @@ impl Rewrite {
         dispatcher: &DataFlowDispatcher,
         slots: &mut RuntimeFilterSlots,
         shape: &ScanShape<'_>,
+        clock: &Arc<RunClock>,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let scan_width = shape.scan_nullability.len();
         let mut spec = shape
             .compile_tagged_scan(dispatcher, slots)?
+            .with_unary(BeginTapFactory::over_workers(
+                dispatcher.worker_count(),
+                clock,
+            ))
             .project(move || move |batch: RecordBatch| with_plain_row_group(batch, scan_width));
         if let Some(filter) = shape.filter {
             spec = filter.compile(spec)?;
@@ -802,19 +835,124 @@ pub(crate) fn copied(batch: &RecordBatch) -> RecordBatch {
     RecordBatch::try_new(batch.schema(), columns).expect("a copy keeps the batch's shape")
 }
 
+/// The clock of one run of a remembered shape. It is set when the run is
+/// compiled, which may be well before the run starts, so it marks the moment
+/// the run's first batch moves and measures from there.
+pub(crate) struct RunClock {
+    compiled: Instant,
+    /// Nanoseconds from `compiled` to the first batch moving; `u64::MAX`
+    /// until one has.
+    began_nanos: AtomicU64,
+}
+
+impl RunClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            compiled: Instant::now(),
+            began_nanos: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// Nanoseconds since the run was compiled.
+    fn mark(&self) -> u64 {
+        self.compiled.elapsed().as_nanos() as u64
+    }
+
+    fn note_began(&self) {
+        self.began_nanos.fetch_min(self.mark(), Ordering::AcqRel);
+    }
+
+    /// Nanoseconds from compile to the run beginning, or to now when no
+    /// batch has moved yet.
+    fn began(&self) -> u64 {
+        let began = self.began_nanos.load(Ordering::Acquire);
+        if began == u64::MAX {
+            self.mark()
+        } else {
+            began
+        }
+    }
+
+    /// How long the run has been going.
+    pub(crate) fn since_began(&self) -> Duration {
+        Duration::from_nanos(self.mark().saturating_sub(self.began()))
+    }
+}
+
+/// Marks a run's clock as the first batch passes, one per worker.
+pub(crate) struct BeginTapFactory {
+    clock: Arc<RunClock>,
+}
+
+impl BeginTapFactory {
+    pub(crate) fn over_workers(
+        workers: usize,
+        clock: &Arc<RunClock>,
+    ) -> impl Iterator<Item = BeginTapFactory> {
+        let clock = clock.clone();
+        (0..workers).map(move |_| BeginTapFactory {
+            clock: clock.clone(),
+        })
+    }
+}
+
+impl UnaryFactory<RecordBatch, RecordBatch> for BeginTapFactory {
+    type Unary = BeginTap;
+
+    fn build_unary(self) -> Self::Unary {
+        BeginTap {
+            clock: self.clock,
+            began: false,
+        }
+    }
+}
+
+pub(crate) struct BeginTap {
+    clock: Arc<RunClock>,
+    began: bool,
+}
+
+impl Unary<RecordBatch, RecordBatch> for BeginTap {
+    fn consume(
+        &mut self,
+        batch: RecordBatch,
+        sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut OperatorIO,
+    ) -> dispatch::UnaryResult<()> {
+        if !self.began {
+            self.began = true;
+            self.clock.note_began();
+        }
+        sender.send(batch)?;
+        Ok(())
+    }
+}
+
 /// A pass over gathered partials before they are filed, boiling down what
 /// the workers kept separately.
 pub(crate) type Condense = Box<dyn Fn(Vec<RecordBatch>) -> Vec<RecordBatch> + Send + Sync>;
+
+/// Which part of a gathering run stands for the shape's fresh cost.
+#[derive(Clone, Copy)]
+pub(crate) enum FreshSpan {
+    /// Up to the partials beginning to flow: the rest of the run is their
+    /// merge, measured as such.
+    ToFirstPartials,
+    /// The whole run: its partials are few and ranked in no time, so the run
+    /// is as long as the shape takes afresh.
+    WholeRun,
+}
 
 /// One shape's gathering run while it is under way: its partials as they
 /// are copied, and the moments that tell whether merging them pays off.
 pub(crate) struct Gathering {
     key: PartialsKey,
-    started: Instant,
-    /// Nanoseconds from the start to the first partial emitted, which is
-    /// about how long the shape takes to compute afresh; `u64::MAX` until
-    /// one is.
-    first_partial_nanos: AtomicU64,
+    clock: Arc<RunClock>,
+    fresh_span: FreshSpan,
+    /// The clock's mark at the latest moment a worker emitted its first
+    /// partial: when the last of them was through computing, so about how
+    /// long the shape takes to compute afresh; `0` until one has.
+    partials_began_nanos: AtomicU64,
     /// Rows the partials may hold before they are too many to keep, when the
     /// table can tell its row count.
     row_limit: Option<u64>,
@@ -830,11 +968,13 @@ impl Gathering {
         key: PartialsKey,
         scan_rows: Option<u64>,
         condense: Option<Condense>,
+        fresh_span: FreshSpan,
     ) -> Self {
         Self {
             key,
-            started: Instant::now(),
-            first_partial_nanos: AtomicU64::new(u64::MAX),
+            clock: Arc::new(RunClock::new()),
+            fresh_span,
+            partials_began_nanos: AtomicU64::new(0),
             row_limit: scan_rows.map(|rows| rows / DENSE_DIVISOR),
             rows: AtomicU64::new(0),
             batches: Mutex::new(Vec::new()),
@@ -843,11 +983,22 @@ impl Gathering {
         }
     }
 
-    /// Takes note of a batch of partials: the moment the first arrived, and
-    /// a copy of it while the partials are few enough to keep.
+    /// The run's clock, for the taps that mark its start.
+    pub(crate) fn clock(&self) -> &Arc<RunClock> {
+        &self.clock
+    }
+
+    /// Takes note of a worker emitting its first partial: the latest of these
+    /// moments is when the shape was through computing.
+    fn note_first_partial(&self) {
+        self.partials_began_nanos
+            .fetch_max(self.clock.mark(), Ordering::AcqRel);
+    }
+
+    /// Takes note of a batch of partials: a copy of it, while the partials
+    /// are few enough to keep. The copy is made outside the lock, so the
+    /// workers copy side by side.
     fn note(&self, batch: &RecordBatch) {
-        self.first_partial_nanos
-            .fetch_min(self.started.elapsed().as_nanos() as u64, Ordering::AcqRel);
         if self.abandoned.load(Ordering::Acquire) {
             return;
         }
@@ -856,21 +1007,25 @@ impl Gathering {
         if self.row_limit.is_some_and(|limit| rows_so_far > limit) {
             self.abandoned.store(true, Ordering::Release);
             self.batches.lock().unwrap().clear();
-        } else {
-            self.batches.lock().unwrap().push(copied(batch));
+            return;
+        }
+        let copy = copied(batch);
+        if !self.abandoned.load(Ordering::Acquire) {
+            self.batches.lock().unwrap().push(copy);
         }
     }
 
     /// Files what the run found with the cache, once its merge is done.
     pub(crate) fn file(&self) {
-        let elapsed = self.started.elapsed();
-        let first_partial = self.first_partial_nanos.load(Ordering::Acquire);
-        let fresh = if first_partial == u64::MAX {
-            elapsed
-        } else {
-            Duration::from_nanos(first_partial)
+        let now = self.clock.mark();
+        let began = self.clock.began();
+        let partials_began = self.partials_began_nanos.load(Ordering::Acquire);
+        let through_computing = match self.fresh_span {
+            FreshSpan::ToFirstPartials if partials_began != 0 => partials_began,
+            FreshSpan::ToFirstPartials | FreshSpan::WholeRun => now,
         };
-        let merge = elapsed.saturating_sub(fresh);
+        let fresh = Duration::from_nanos(through_computing.saturating_sub(began));
+        let merge = Duration::from_nanos(now.saturating_sub(through_computing));
         let batches = std::mem::take(&mut *self.batches.lock().unwrap());
         let kept = (!self.abandoned.load(Ordering::Acquire))
             .then_some(batches)
@@ -878,7 +1033,16 @@ impl Gathering {
                 Some(condense) => condense(batches),
                 None => batches,
             });
-        PartialAggregateCache::global().insert(self.key.clone(), judged(kept, fresh, merge));
+        let remembered = judged(kept, fresh, merge);
+        tracing::debug!(
+            shape = %self.key.shape,
+            fresh_ms = fresh.as_secs_f64() * 1e3,
+            merge_ms = merge.as_secs_f64() * 1e3,
+            rows = self.rows.load(Ordering::Acquire),
+            kept = matches!(remembered, RememberedPartials::Partials(_)),
+            "partials gathered"
+        );
+        PartialAggregateCache::global().insert(self.key.clone(), remembered);
     }
 }
 
@@ -903,6 +1067,7 @@ impl UnaryFactory<RecordBatch, RecordBatch> for PartialsTapFactory {
     fn build_unary(self) -> Self::Unary {
         PartialsTap {
             gathering: self.gathering,
+            emitted_before: false,
         }
     }
 }
@@ -910,6 +1075,7 @@ impl UnaryFactory<RecordBatch, RecordBatch> for PartialsTapFactory {
 /// Passes the gathered partials through, noting each batch with the run.
 pub(crate) struct PartialsTap {
     gathering: Arc<Gathering>,
+    emitted_before: bool,
 }
 
 impl Unary<RecordBatch, RecordBatch> for PartialsTap {
@@ -919,6 +1085,10 @@ impl Unary<RecordBatch, RecordBatch> for PartialsTap {
         sender: &mut dyn Sender<RecordBatch>,
         _io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
+        if !self.emitted_before {
+            self.emitted_before = true;
+            self.gathering.note_first_partial();
+        }
         self.gathering.note(&batch);
         sender.send(batch)?;
         Ok(())
@@ -1070,7 +1240,12 @@ mod tests {
 
     #[test]
     fn a_gathering_lets_its_partials_go_once_they_outgrow_the_row_limit() {
-        let gathering = Gathering::start(key("a"), Some(2 * DENSE_DIVISOR), None);
+        let gathering = Gathering::start(
+            key("a"),
+            Some(2 * DENSE_DIVISOR),
+            None,
+            FreshSpan::ToFirstPartials,
+        );
 
         gathering.note(&one_row_batch(1));
         gathering.note(&one_row_batch(2));

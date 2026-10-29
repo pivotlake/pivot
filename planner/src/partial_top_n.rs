@@ -18,8 +18,9 @@ use crate::compile::{Error, RuntimeFilterSlots};
 use crate::expression::Expression;
 use crate::operator::{OrderByDirection, TopN};
 use crate::partial_aggregates::{
-    Gathering, MERGE_SHARE_TO_FORGET, MergeWatch, PartialAggregateCache, PartialsKey,
-    PartialsTapFactory, RememberedPartials, ScanShape, merge_pays_off,
+    BeginTapFactory, FreshSpan, Gathering, MERGE_SHARE_TO_FORGET, MergeWatch,
+    PartialAggregateCache, PartialsKey, PartialsTapFactory, RememberedPartials, RunClock,
+    ScanShape, merge_pays_off,
 };
 use crate::plan::PlanNode;
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
@@ -28,12 +29,11 @@ use arrow_array::types::{Int32Type, UInt32Type};
 use arrow_array::{RecordBatch, RunArray};
 use arrow_schema::SortOptions;
 use dispatch::{
-    DataFlowDispatcher, OperatorIO, OrderBy, RecordBatchOperatorSpec, Sender, Unary, UnaryFactory,
-    trailing_metadata_columns, values_input,
+    BoundarySlot, DataFlowDispatcher, OperatorIO, OrderBy, RecordBatchOperatorSpec, Sender, Unary,
+    UnaryFactory, trailing_metadata_columns, values_input,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// A top-N keeping more rows than this per row group is left to the scan.
 const ROWS_PER_GROUP_LIMIT: usize = 1 << 12;
@@ -80,14 +80,24 @@ pub(crate) fn try_compile_memoized(
         }
         Some(RememberedPartials::Dense) => Ok(None),
         Some(RememberedPartials::Partials(partials)) => {
-            let started = Instant::now();
+            let clock = Arc::new(RunClock::new());
             let source = values_input(dispatcher, partials.batches.iter().cloned())
                 .map_each(|batch: RecordBatch| batch)
-                .record_batches();
-            let ranked = ranking.rank(source, &shape);
+                .record_batches()
+                .with_unary(BeginTapFactory::over_workers(workers, &clock));
+            let ranked = ranking.rank(source, &shape, None);
             let fresh = partials.fresh;
             let forget_a_slow_ranking = move || {
-                if !merge_pays_off(started.elapsed(), fresh, MERGE_SHARE_TO_FORGET) {
+                let ranking_took = clock.since_began();
+                let pays_off = merge_pays_off(ranking_took, fresh, MERGE_SHARE_TO_FORGET);
+                tracing::debug!(
+                    shape = %key.shape,
+                    fresh_ms = fresh.as_secs_f64() * 1e3,
+                    ranking_ms = ranking_took.as_secs_f64() * 1e3,
+                    kept = pays_off,
+                    "top rows ranked"
+                );
+                if !pays_off {
                     cache.insert(key.clone(), RememberedPartials::Dense);
                 }
             };
@@ -104,8 +114,19 @@ pub(crate) fn try_compile_memoized(
                 Some(Box::new(move |batches| {
                     condensing.top_rows_per_row_group(batches)
                 })),
+                FreshSpan::WholeRun,
             ));
-            let mut spec = shape.compile_tagged_scan(dispatcher, slots)?;
+            // The gathering's own ranking publishes its boundary like the
+            // top-N would, so the scan prunes the row groups it can; a row
+            // group pruned away holds no top rows for the shape, and leaves
+            // none behind.
+            let boundary = top_n
+                .produces_dynamic_filter
+                .as_ref()
+                .map(|filter| slots.boundary_slot(filter.slot_id));
+            let mut spec = shape
+                .compile_tagged_scan(dispatcher, slots)?
+                .with_unary(BeginTapFactory::over_workers(workers, gathering.clock()));
             if let Some(filter) = shape.filter {
                 spec = filter.compile(spec)?;
             }
@@ -118,7 +139,7 @@ pub(crate) fn try_compile_memoized(
             let tapped = per_row_group.with_unary((0..workers).map(|_| PartialsTapFactory {
                 gathering: gathering.clone(),
             }));
-            let ranked = ranking.rank(tapped, &shape);
+            let ranked = ranking.rank(tapped, &shape, boundary);
             let file_the_rows = move || gathering.file();
             Ok(Some(ranked.with_unary(MergeWatch::over_workers(
                 workers,
@@ -170,19 +191,22 @@ impl Ranking {
         self.limit + self.offset
     }
 
-    /// `input` ranked as the top-N would be, and then, when the shape's own
-    /// scan carried no row-group tags, with the tags dropped again.
+    /// `input` ranked as the top-N would be, publishing its running boundary
+    /// into `boundary` when a scan below consumes it, and then, when the
+    /// shape's own scan carried no row-group tags, with the tags dropped
+    /// again.
     fn rank(
         &self,
         input: RecordBatchOperatorSpec,
         shape: &ScanShape<'_>,
+        boundary: Option<Arc<BoundarySlot>>,
     ) -> RecordBatchOperatorSpec {
         let orders = self
             .orders
             .iter()
             .map(|(column, options)| OrderBy::new(*column, options.descending, options.nulls_first))
             .collect();
-        let ranked = input.order_by_limit_offset(orders, self.limit, self.offset, None);
+        let ranked = input.order_by_limit_offset(orders, self.limit, self.offset, boundary);
         if shape.input.emit_row_group_metadata {
             ranked
         } else {
@@ -291,16 +315,32 @@ impl UnaryFactory<RecordBatch, RecordBatch> for RowGroupTopFactory {
     }
 }
 
-/// Keeps, per row group, the top rows of the tagged batches one worker sees,
-/// and emits them once its input is drained.
+/// Keeps, per row group, the top rows of the tagged batches one worker sees.
+/// A row group's rows are emitted as soon as the worker moves on to another
+/// row group, so the ranking after it can tighten its boundary while the
+/// scan is still going; rows of a row group met again are emitted again, and
+/// the ranking takes the union. Whatever is left is emitted once the input
+/// is drained.
 struct RowGroupTop {
     ranking: Ranking,
     kept: HashMap<u32, RecordBatch>,
 }
 
 impl RowGroupTop {
-    fn note(&mut self, batch: &RecordBatch) {
+    /// Folds `batch` into the kept rows and hands back the top rows of the
+    /// row groups the worker has moved on from.
+    fn note(&mut self, batch: &RecordBatch) -> Vec<RecordBatch> {
+        let mut done = Vec::new();
         for (row_group, slice) in row_group_slices(batch) {
+            let left_behind: Vec<u32> = self
+                .kept
+                .keys()
+                .filter(|&&kept| kept != row_group)
+                .copied()
+                .collect();
+            for kept in left_behind {
+                done.push(self.kept.remove(&kept).expect("a listed row group is kept"));
+            }
             let candidates = match self.kept.remove(&row_group) {
                 Some(kept) => concat_batches(&batch.schema(), [&kept, &slice])
                     .expect("a worker's kept rows share the batch's schema"),
@@ -309,6 +349,7 @@ impl RowGroupTop {
             self.kept
                 .insert(row_group, self.ranking.top_rows(&candidates));
         }
+        done
     }
 }
 
@@ -316,10 +357,12 @@ impl Unary<RecordBatch, RecordBatch> for RowGroupTop {
     fn consume(
         &mut self,
         batch: RecordBatch,
-        _sender: &mut dyn Sender<RecordBatch>,
+        sender: &mut dyn Sender<RecordBatch>,
         _io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        self.note(&batch);
+        for done in self.note(&batch) {
+            sender.send(done)?;
+        }
         Ok(())
     }
 
@@ -391,10 +434,11 @@ mod tests {
             kept: HashMap::new(),
         };
 
-        top.note(&tagged(&[9, 1, 5, 7], &[3, 4], &[0, 1]));
-        top.note(&tagged(&[4, 2], &[2], &[1]));
+        let mut emitted = top.note(&tagged(&[9, 1, 5, 7], &[3, 4], &[0, 1]));
+        emitted.extend(top.note(&tagged(&[4, 2], &[2], &[1])));
 
-        assert_eq!(values(&top.kept[&0]), vec![1, 5]);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(values(&emitted[0]), vec![1, 5]);
         assert_eq!(values(&top.kept[&1]), vec![2, 4]);
     }
 

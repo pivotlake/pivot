@@ -22,6 +22,7 @@ parquet-variant-compute = { workspace = true }
 parquet-variant-json = { workspace = true }
 duckdb-planner = { workspace = true }
 dispatch = { workspace = true }
+tracing = { workspace = true }
 # `Catalog::commit_transaction` is async (publishing an INSERT's files does
 # blocking store I/O, offloaded to the blocking pool); `async-trait` keeps the
 # trait object-safe.
