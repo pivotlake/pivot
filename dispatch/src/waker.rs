@@ -682,6 +682,12 @@ pub fn waker_set() -> &'static WakerSet {
     unsafe { &*WAKER_SET.get() }
 }
 
+/// True when a [`WakerSet`] is installed on the current thread, so code that
+/// may run off a worker can tell before it reaches for [`waker_set`].
+pub fn has_waker_set() -> bool {
+    WAKER_SET.with(|set| !set.get().is_null())
+}
+
 /// Return the node-local waker installed on the current worker thread.
 ///
 /// Like [`crate::memory::memory_ctx`], this assumes worker startup or test setup

@@ -42,10 +42,11 @@ struct OperatorNode {
     /// The node's operator, or `None` once it has finished (or been abandoned).
     /// A finished operator releases its downstream sender at that moment,
     /// which is how a stage's completion becomes observable to whoever holds
-    /// the other end, and moves to the graph's retired list: what else it
-    /// held (hash tables, buffered rows) is freed only when the dataflow is
-    /// torn down, after the worker has reported it, so a large free never
-    /// holds up the query's result. An abandoned operator is dropped outright.
+    /// the other end, and its free is deferred to the worker: what else it
+    /// held (hash tables, buffered rows) is freed once the worker has
+    /// reported the dataflow, so a large free never holds up the query's
+    /// result, or sooner if the worker runs out of memory to evict. An
+    /// abandoned operator is dropped outright.
     ///
     /// Retiring the node in place, rather than restructuring the graph, keeps
     /// every edge index stable: traversals skip a retired node and move on, and
@@ -130,9 +131,6 @@ struct OperatorGraph {
     edges: Vec<Vec<usize>>,
     /// Publisher indices for each node.
     back_edges: Vec<Vec<usize>>,
-    /// Finished operators, senders already released, kept until the graph
-    /// drops so their state is freed after the dataflow has been reported.
-    retired: Vec<Box<dyn Operator>>,
 }
 
 impl OperatorGraph {
@@ -174,7 +172,6 @@ impl OperatorGraph {
             leafs,
             edges,
             back_edges,
-            retired: Vec::new(),
         }
     }
 
@@ -248,8 +245,8 @@ impl OperatorGraph {
                 match operator.try_finish()? {
                     // Retiring the node releases the operator's sender, so a
                     // stage that watches the other end of that channel learns
-                    // the stage is over; the operator itself is kept for the
-                    // graph's drop, since freeing a large table here would
+                    // the stage is over; the operator's own free is left to
+                    // the worker, since freeing a large table here would
                     // stall this worker's remaining stages behind it.
                     FinishStatus::Done => {
                         let mut operator = node
@@ -257,7 +254,7 @@ impl OperatorGraph {
                             .take()
                             .expect("a node that just finished still holds its operator");
                         operator.release_output();
-                        self.retired.push(operator);
+                        crate::memory::defer_free(Box::new(operator));
                         retired_any = true;
                     }
                     FinishStatus::Working => working = true,
@@ -776,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_node_releases_its_output_and_keeps_its_operator_for_the_graph_drop() {
+    fn a_finished_node_releases_its_output_and_leaves_its_operator_s_free_to_the_worker() {
         let released = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
         let operators: Vec<Box<dyn Operator>> = vec![Box::new(FinishOperator::signalling(
@@ -790,9 +787,12 @@ mod tests {
         let released_at_finish = released.load(Ordering::Acquire);
         let dropped_at_finish = dropped.load(Ordering::Acquire);
         drop(graph);
+        let dropped_with_graph = dropped.load(Ordering::Acquire);
+        crate::memory::free_deferred();
 
         assert!(released_at_finish);
         assert!(!dropped_at_finish);
+        assert!(!dropped_with_graph);
         assert!(dropped.load(Ordering::Acquire));
     }
 

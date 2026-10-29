@@ -6,12 +6,52 @@ use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::status::{MemoryBlockStatus, read_block_status};
 use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
 use crate::worker::WORKER_IDX;
+use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 thread_local! {
     static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = const { RefCell::new(None) };
     static MEMORY_CTX_PTR: Cell<*const MemoryContext> = const { Cell::new(std::ptr::null()) };
+    /// State this thread has finished with but not freed yet, so a large free
+    /// does not hold up what the thread is doing; freed when the thread asks,
+    /// or when its evictor finds no memory left and needs what the state
+    /// holds.
+    static DEFERRED_FREES: RefCell<Vec<Box<dyn Any>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Keeps `state` to be freed on this thread later, by [`free_deferred`], or
+/// sooner, when the thread runs out of memory to evict.
+pub fn defer_free(state: Box<dyn Any>) {
+    DEFERRED_FREES.with_borrow_mut(|deferred| deferred.push(state));
+}
+
+/// Frees the state this thread deferred, and tells whether there was any.
+pub fn free_deferred() -> bool {
+    let deferred = DEFERRED_FREES.take();
+    let any = !deferred.is_empty();
+    drop(deferred);
+    any
+}
+
+/// Bumped by an evictor that found nothing to evict even after freeing its
+/// own deferred state: every worker frees its deferred state on seeing a new
+/// epoch, since what they hold may be the slots that evictor is after.
+static PRESSURE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The current memory-pressure epoch; a worker that sees it change frees
+/// its deferred state.
+pub fn pressure_epoch() -> u64 {
+    PRESSURE_EPOCH.load(Ordering::Acquire)
+}
+
+/// Asks every worker to free its deferred state, waking the parked ones.
+fn ask_workers_to_free_deferred() {
+    PRESSURE_EPOCH.fetch_add(1, Ordering::AcqRel);
+    if crate::waker::has_waker_set() {
+        crate::waker::waker_set().notify_all();
+    }
 }
 
 pub fn init_memory_context(ctx: MemoryContext) {
@@ -306,6 +346,19 @@ impl MemoryContext {
         }
     }
 
+    /// A buffer from the free pools, when one is there whose slot is not
+    /// contended; indices set aside for contention go back to the pools.
+    fn pop_pooled_buffer(&self) -> Option<WriteBuffer> {
+        let mut contended = ContendedIndices::new(self);
+        while let Some(idx) = self.pop_free_idx(false) {
+            match self.ring().try_write(idx) {
+                Some(buffer) => return Some(buffer),
+                None => contended.set_aside(idx),
+            }
+        }
+        contended.pop_writable()
+    }
+
     /// Evict a ring slot via the shared CLOCK and return it writable. Each
     /// iteration re-picks which tier to take from - compressed while its share
     /// of cached slots exceeds the target percentage, decompressed otherwise
@@ -344,9 +397,36 @@ impl MemoryContext {
         let mut ticks_without_success: u64 = 0;
         let mut aged_this_revolution: u64 = 0;
         let mut sweeping_other_tier = false;
+        // State finished with but not freed yet, on this worker and then on
+        // every other, may hold the slots this sweep is after: each is freed
+        // in turn and the sweep started over, before the ring is concluded
+        // exhausted.
+        let mut relief_step = 0u8;
         loop {
             iterations += 1;
             if panic_at.is_none() && iterations == warn_at {
+                let mut relieved = false;
+                while !relieved && relief_step < 2 {
+                    relieved = if relief_step == 0 {
+                        free_deferred()
+                    } else {
+                        ask_workers_to_free_deferred();
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        true
+                    };
+                    relief_step += 1;
+                }
+                if relieved {
+                    // What was freed went back to the pools, not to the
+                    // clock's tiers, so look there before sweeping again.
+                    if let Some(buffer) = self.pop_pooled_buffer() {
+                        return buffer;
+                    }
+                    iterations = 0;
+                    ticks_without_success = 0;
+                    aged_this_revolution = 0;
+                    continue;
+                }
                 tracing::warn!(iterations, "evict: no memory left to evict, sleeping");
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 panic_at = Some(iterations + ring_len);
@@ -473,10 +553,34 @@ mod tests {
     //! [`init_test_free_pool`], so there's no shared state and no lock.
 
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Install a context with no buffers seeded.
     fn fresh_ctx() {
         init_test_free_pool(0);
+    }
+
+    struct Flag(Arc<AtomicBool>);
+
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn deferred_state_is_freed_when_the_thread_asks_and_counted_once() {
+        let freed = Arc::new(AtomicBool::new(false));
+        defer_free(Box::new(Flag(freed.clone())));
+        let freed_on_deferral = freed.load(Ordering::Acquire);
+
+        let had_deferred = free_deferred();
+        let had_more = free_deferred();
+
+        assert!(!freed_on_deferral);
+        assert!(had_deferred);
+        assert!(freed.load(Ordering::Acquire));
+        assert!(!had_more);
     }
 
     #[test]

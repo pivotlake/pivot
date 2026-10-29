@@ -220,6 +220,9 @@ pub struct Worker {
     /// [`WorkerWaker::begin_spin`]). Set on the idle pass that publishes it
     /// and cleared once it works again, is claimed by a send, or parks.
     spin_published: bool,
+    /// The memory-pressure epoch this worker last answered by freeing its
+    /// deferred state (see [`crate::memory::pressure_epoch`]).
+    pressure_epoch_seen: u64,
 }
 
 impl Worker {
@@ -289,6 +292,7 @@ impl Worker {
                     node_local_idx,
                     last_seen_broadcast,
                     spin_published: false,
+                    pressure_epoch_seen: crate::memory::pressure_epoch(),
                 };
                 // Notifiers must be able to interrupt this worker's blocking
                 // IO wait, not just its thread park; register the ring's wake
@@ -414,6 +418,17 @@ impl Worker {
         }
     }
 
+    /// Frees this worker's deferred state once per memory-pressure epoch: an
+    /// evictor somewhere found nothing left to evict, and what finished
+    /// operators here still hold may be the slots it needs.
+    fn free_deferred_under_pressure(&mut self) {
+        let epoch = crate::memory::pressure_epoch();
+        if epoch != self.pressure_epoch_seen {
+            self.pressure_epoch_seen = epoch;
+            crate::memory::free_deferred();
+        }
+    }
+
     /// Check each dataflow for completion and remove finished ones.
     fn try_finishing_dataflows(&mut self) {
         let mut to_remove = Vec::new();
@@ -432,10 +447,12 @@ impl Worker {
             debug!("Finished data flow {:?}", id);
             if let Some(mut flow) = self.data_flows.remove(&id) {
                 // Report first: it closes this worker's stats channel, which
-                // lets the query's collector return while the drop below,
-                // which frees every retired operator's state, still runs.
+                // lets the query's collector return while the frees below,
+                // of the flow and of every finished operator's state, still
+                // run.
                 flow.stats().report();
                 drop(flow);
+                crate::memory::free_deferred();
                 self.release_live_dataflow();
             }
         }
@@ -454,6 +471,7 @@ impl Worker {
             flow.fail_for_shutdown();
             flow.stats().report();
             drop(flow);
+            crate::memory::free_deferred();
             self.release_live_dataflow();
         }
     }
@@ -594,6 +612,7 @@ impl Worker {
         });
         for id in cancelled {
             self.io.cancel_dataflow(id);
+            crate::memory::free_deferred();
             self.release_live_dataflow();
         }
     }
@@ -647,6 +666,8 @@ impl Worker {
                 return Ok(());
             }
             self.did_work_last_iteration = false;
+
+            self.free_deferred_under_pressure();
 
             self.try_receiving_new_dataflow();
 
