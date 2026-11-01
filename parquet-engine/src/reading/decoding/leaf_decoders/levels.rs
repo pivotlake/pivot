@@ -6,28 +6,141 @@
 //! `bit_width`-bit values: one level for a directly-nullable column, but more
 //! under nesting (e.g. a variant's shredded `typed_value` leaves), where a row
 //! can be null at several depths.
+//!
+//! The result is the page's [`Presence`], one bit per row. For a column with
+//! one level the stream is the presence bitmap itself, stored as runs the way
+//! an RLE boolean page stores its values, so it is read by that page's decoder:
+//! a repeated run becomes a bit fill and a bit-packed run a byte copy. Nested
+//! levels are extracted one at a time and compared to the maximum.
 
-use dispatch::memory::MultiBufferReader;
+use bytes::Bytes;
+use dispatch::arrays::{BitSink, append_bits, set_run};
+use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
-/// Decode the RLE/bit-packed hybrid definition levels of a page.
+use super::boolean::BooleanRleDecoder;
+
+/// Which rows of a page hold a value, one bit per row, `1` for present.
+pub struct Presence {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+impl Presence {
+    fn with_capacity(rows: usize) -> Self {
+        Self {
+            bytes: vec![0; rows.div_ceil(8)],
+            len: 0,
+        }
+    }
+
+    /// The bitmap's bytes, least significant bit first.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn is_present(&self, row: usize) -> bool {
+        (self.bytes[row / 8] >> (row % 8)) & 1 == 1
+    }
+
+    /// How many rows from `row` on share its presence, at most `max`: found
+    /// a 64-bit word at a time, by counting the trailing bits that match.
+    pub fn run_from(&self, row: usize, max: usize) -> usize {
+        let present = self.is_present(row);
+        let end = (row + max).min(self.len);
+        let mut at = row;
+        while at < end {
+            let byte = at / 8;
+            let bit = at % 8;
+            let take = (self.bytes.len() - byte).min(8);
+            let mut word = [0u8; 8];
+            word[..take].copy_from_slice(&self.bytes[byte..byte + take]);
+            // Bits equal to the run's value become zero, so the run's length
+            // in this word is the count of trailing zeros, bounded by the bits
+            // the word really holds.
+            let mut word = u64::from_le_bytes(word) >> bit;
+            if present {
+                word = !word;
+            }
+            let available = take * 8 - bit;
+            let run = (word.trailing_zeros() as usize).min(available);
+            at += run;
+            if run < available {
+                break;
+            }
+        }
+        at.min(end) - row
+    }
+
+    fn count_present(&self) -> usize {
+        self.bytes
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum()
+    }
+}
+
+impl BitSink for Presence {
+    #[inline]
+    fn append_bits(&mut self, src: &[u8], src_bit: usize, count: usize) {
+        append_bits(&mut self.bytes, self.len, src, src_bit, count);
+        self.len += count;
+    }
+
+    #[inline]
+    fn append_run(&mut self, value: bool, count: usize) {
+        if value {
+            set_run(&mut self.bytes, self.len, count);
+        }
+        self.len += count;
+    }
+}
+
+/// Decodes the definition levels at `position` in a page: the 4-byte length
+/// prefix and the RLE/bit-packed hybrid stream after it, `num_values` levels
+/// long. Leaves `position` at the values that follow the levels, which the
+/// length places whatever padding the stream ends with.
 ///
-/// Reads `byte_len` bytes from `reader` (the data after the 4-byte length
-/// prefix); `max_def_level` fixes the level `bit_width` and the present
-/// threshold. Returns `None` when every row is present (no nulls), so the
-/// caller takes the fast, non-null decode path without materialising a mask;
-/// otherwise `Some(present)` where `present[i]` means row `i` holds a value. The
-/// mask is allocated lazily on the first null, so a page without nulls allocates
-/// nothing.
+/// Returns `None` when every row is present, so the caller takes the fast,
+/// non-null decode path without a presence bitmap.
 pub fn decode_def_levels(
+    data: &[Bytes],
+    position: &mut ReaderPosition,
+    num_values: usize,
+    max_def_level: i16,
+) -> Option<Presence> {
+    let levels_start = *position;
+    let byte_len = MultiBufferReader::new(data, position).read_u32_le() as usize;
+    let mut presence = Presence::with_capacity(num_values);
+    if max_def_level == 1 {
+        BooleanRleDecoder::read_from(data.to_vec(), levels_start)
+            .read_bits(&mut presence, num_values);
+    } else {
+        let mut reader = MultiBufferReader::new(data, position);
+        decode_nested_levels(
+            &mut reader,
+            num_values,
+            byte_len,
+            max_def_level,
+            &mut presence,
+        );
+    }
+    *position = levels_start;
+    MultiBufferReader::new(data, position).skip(4 + byte_len);
+    (presence.count_present() < num_values).then_some(presence)
+}
+
+/// Decodes `num_values` levels of more than one bit each, present where a
+/// level equals `max_def_level`, into `presence`.
+fn decode_nested_levels(
     reader: &mut MultiBufferReader,
     num_values: usize,
     byte_len: usize,
     max_def_level: i16,
-) -> Option<Vec<bool>> {
+    presence: &mut Presence,
+) {
     let bit_width = bit_width_for(max_def_level);
     let max = max_def_level as u32;
     let mut bytes_read = 0usize;
-    let mut present: Option<Vec<bool>> = None;
     let mut len = 0usize;
 
     while len < num_values && bytes_read < byte_len {
@@ -37,7 +150,8 @@ pub fn decode_def_levels(
             // RLE run: `count` copies of one `bit_width`-bit level.
             let count = ((header >> 1) as usize).min(num_values - len);
             let value = read_le(reader, bit_width.div_ceil(8) as usize, &mut bytes_read);
-            append_presence_run(&mut present, &mut len, num_values, value == max, count);
+            presence.append_run(value == max, count);
+            len += count;
         } else {
             // Bit-packed run: (header >> 1) groups of 8 `bit_width`-bit levels,
             // little-endian within the run.
@@ -52,19 +166,12 @@ pub fn decode_def_levels(
                 acc >>= bit_width;
                 acc_bits -= bit_width;
                 if len < num_values {
-                    append_presence_run(&mut present, &mut len, num_values, value == max, 1);
+                    presence.append_run(value == max, 1);
+                    len += 1;
                 }
             }
         }
     }
-
-    // Ensure we consumed exactly byte_len bytes from the section.
-    while bytes_read < byte_len {
-        reader.read_u8();
-        bytes_read += 1;
-    }
-
-    present
 }
 
 /// Bits needed to encode the levels `0..=max_def_level`.
@@ -82,28 +189,6 @@ fn read_le(reader: &mut MultiBufferReader, nbytes: usize, bytes_read: &mut usize
         *bytes_read += 1;
     }
     value
-}
-
-/// Append a run of `n` rows that are all present (`true`) or all null
-/// (`false`) to the lazily-built present mask, advancing `len`. The mask stays
-/// `None` while every row seen is present; the first null materialises it and
-/// backfills the present rows so far.
-fn append_presence_run(
-    present: &mut Option<Vec<bool>>,
-    len: &mut usize,
-    num_values: usize,
-    value: bool,
-    n: usize,
-) {
-    if !value && present.is_none() {
-        let mut mask = Vec::with_capacity(num_values);
-        mask.extend(std::iter::repeat_n(true, *len));
-        *present = Some(mask);
-    }
-    if let Some(mask) = present {
-        mask.extend(std::iter::repeat_n(value, n));
-    }
-    *len += n;
 }
 
 /// Reads an unsigned LEB128 (varint) from `reader`, incrementing
@@ -125,8 +210,6 @@ fn read_varint_tracked(reader: &mut MultiBufferReader, bytes_read: &mut usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use dispatch::memory::ReaderPosition;
 
     fn varint(out: &mut Vec<u8>, mut v: u32) {
         loop {
@@ -174,11 +257,23 @@ mod tests {
         out
     }
 
-    fn decode(bytes: &[u8], num_values: usize, max_def_level: i16) -> Option<Vec<bool>> {
-        let data = vec![Bytes::copy_from_slice(bytes)];
-        let mut pos = ReaderPosition::default();
-        let mut reader = MultiBufferReader::new(&data, &mut pos);
-        decode_def_levels(&mut reader, num_values, bytes.len(), max_def_level)
+    /// Decodes a levels section made of `stream`, and checks the cursor lands
+    /// on the bytes after it.
+    fn decode(stream: &[u8], num_values: usize, max_def_level: i16) -> Option<Vec<bool>> {
+        let mut page = (stream.len() as u32).to_le_bytes().to_vec();
+        page.extend_from_slice(stream);
+        page.extend_from_slice(b"values");
+        let data = vec![Bytes::from(page)];
+        let mut position = ReaderPosition::default();
+
+        let presence = decode_def_levels(&data, &mut position, num_values, max_def_level);
+
+        assert_eq!(position.offset, 4 + stream.len());
+        presence.map(|presence| {
+            (0..num_values)
+                .map(|row| presence.is_present(row))
+                .collect()
+        })
     }
 
     #[test]
@@ -257,9 +352,32 @@ mod tests {
     }
 
     #[test]
-    fn first_null_backfills_earlier_present_rows() {
+    fn a_null_after_present_rows_keeps_them_present() {
         let bytes = rle(&[1, 1, 1, 0]);
 
         assert_eq!(decode(&bytes, 4, 1), Some(vec![true, true, true, false]));
+    }
+
+    #[test]
+    fn runs_are_found_across_word_boundaries() {
+        // 70 present rows, 3 nulls, 20 present rows: runs that start mid-byte
+        // and span more than one 64-bit word.
+        let mut levels = vec![1u8; 70];
+        levels.extend([0, 0, 0]);
+        levels.extend([1; 20]);
+        let mut page = (rle(&levels).len() as u32).to_le_bytes().to_vec();
+        page.extend(rle(&levels));
+        let data = vec![Bytes::from(page)];
+        let mut position = ReaderPosition::default();
+
+        let presence = decode_def_levels(&data, &mut position, 93, 1).unwrap();
+
+        assert_eq!(presence.run_from(0, 1000), 70);
+        assert_eq!(presence.run_from(5, 1000), 65);
+        assert_eq!(presence.run_from(5, 10), 10);
+        assert_eq!(presence.run_from(70, 1000), 3);
+        assert_eq!(presence.run_from(72, 1000), 1);
+        assert_eq!(presence.run_from(73, 1000), 20);
+        assert_eq!(presence.run_from(92, 1000), 1);
     }
 }
