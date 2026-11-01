@@ -74,20 +74,10 @@ fn skip_run<L: LeafType>(decoder: &mut ValueDecoder<L>, n: usize) {
 }
 
 /// A nullable page's definition levels as the page's presence bitmap, one
-/// bit per logical row, consumed run-wise via a cursor.
+/// bit per logical row, with a cursor at the next row to read.
 struct DefLevels {
     presence: Presence,
     pos: usize,
-}
-
-impl DefLevels {
-    /// The next run of equal present/null rows, capped at `max`.
-    fn next_run(&mut self, max: usize) -> (bool, usize) {
-        let present = self.presence.is_present(self.pos);
-        let run = self.presence.run_from(self.pos, max);
-        self.pos += run;
-        (present, run)
-    }
 }
 
 /// State for the page currently being read.
@@ -134,17 +124,17 @@ impl<L: LeafType> ReadPage<L> {
         self.remaining -= builder.len() - current_len;
     }
 
-    /// Like [`read_into`](Self::read_into) but for a page with nulls: each
-    /// logical row is decoded as a value (present) or appended as a null, per
-    /// the page's definition levels, and a validity bit is pushed for each
-    /// kept row. The value stream holds only the present values.
+    /// Like [`read_into`](Self::read_into) but for a page with nulls, whose
+    /// value stream holds only the present rows' values. Each run of kept
+    /// rows decodes its present values in one call, densely, and the builder
+    /// then spreads them to their rows with the default under each null (see
+    /// [`ArrayBuilder::expand_present`]); its validity is the page's presence
+    /// over the run.
     ///
-    /// A filter mask (from a pushed-down predicate) and definition levels are
-    /// combined: filter runs partition the rows into kept/skipped, and within
-    /// each, definition-level runs partition them into present/null. Skipped
-    /// rows still advance the value stream past their present values; only
-    /// kept rows reach the builder and validity. `remaining` and `size` count
-    /// *kept* rows (`DataPage::rows()` is the kept count when filtered).
+    /// A filter mask (from a pushed-down predicate) partitions the rows into
+    /// kept/skipped runs; a skipped run still advances the value stream past
+    /// its present values. `remaining` and `size` count *kept* rows
+    /// (`DataPage::rows()` is the kept count when filtered).
     pub fn read_into_nullable<D>(
         &mut self,
         dict: Option<&D>,
@@ -156,6 +146,10 @@ impl<L: LeafType> ReadPage<L> {
     {
         let start_len = builder.len();
         let mut kept_left = size.min(self.remaining);
+        let def = self
+            .def_levels
+            .as_mut()
+            .expect("nullable page has def levels");
         while kept_left > 0 {
             // A filter run covers kept rows (capped at `kept_left`) or a full
             // skipped run; the whole page is kept when there's no mask.
@@ -163,37 +157,20 @@ impl<L: LeafType> ReadPage<L> {
                 Some(m) => m.next_run(kept_left),
                 None => (true, kept_left),
             };
-            let def = self
-                .def_levels
-                .as_mut()
-                .expect("nullable page has def levels");
-            let run_start = def.pos;
-            let mut run_left = run;
-            while run_left > 0 {
-                let (present, n) = def.next_run(run_left);
-                match (keep, present) {
-                    // A kept value decodes; a kept null gets a zeroed slot
-                    // that `validity` masks off. The slot must hold a valid
-                    // element (zero is an empty inline view / zero primitive):
-                    // branchless kernels read masked slots before applying
-                    // validity, and byte-view arrays require every view to be
-                    // safe to interpret.
-                    (true, true) => decode_run(&mut self.decoder, builder, dict, n),
-                    (true, false) => {
-                        builder.push(&<L::Builder as ArrayBuilder>::Element::default(), n)
-                    }
-                    // Skipped present rows still consume their values; skipped
-                    // nulls have no value in the stream.
-                    (false, true) => skip_run(&mut self.decoder, n),
-                    (false, false) => {}
-                }
-                run_left -= n;
-            }
+            let present = def.presence.count_present_in(def.pos, run);
             if keep {
-                // The kept rows' validity is the page's presence over them.
-                validity.append_bits(def.presence.bytes(), run_start, run);
+                if present > 0 {
+                    decode_run(&mut self.decoder, builder, dict, present);
+                }
+                if present < run {
+                    builder.expand_present(run, def.presence.bytes(), def.pos);
+                }
+                validity.append_bits(def.presence.bytes(), def.pos, run);
                 kept_left -= run;
+            } else if present > 0 {
+                skip_run(&mut self.decoder, present);
             }
+            def.pos += run;
         }
         self.remaining -= builder.len() - start_len;
     }

@@ -89,6 +89,11 @@ impl ArrayBuilder for BooleanBuilder {
         &mut self.staged
     }
 
+    fn expand_present(&mut self, rows: usize, presence: &[u8], first_bit: usize) {
+        self.pack_staged();
+        self.bits.expand_present(rows, presence, first_bit);
+    }
+
     fn into_array(mut self, null_buffer: Option<Buffer>) -> ArrayRef {
         self.pack_staged();
         let len = self.bits.len();

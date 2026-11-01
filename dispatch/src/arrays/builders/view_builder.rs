@@ -16,6 +16,7 @@ use arrow_array::{ArrayRef, GenericByteViewArray, builder::make_view};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 
 use super::ArrayBuilder;
+use super::bitmap_builder::{count_set, expand_present};
 use crate::memory::{SlabAllocator, SlabBuffer};
 
 /// Accumulates 128-bit views and their backing data blocks, then finalises
@@ -112,6 +113,15 @@ impl<V: ByteViewType> ArrayBuilder for ViewBuilder<V> {
         let start = self.len;
         self.len += count;
         unsafe { std::slice::from_raw_parts_mut(self.views.ptr_at_index(start), count) }
+    }
+
+    fn expand_present(&mut self, rows: usize, presence: &[u8], first_bit: usize) {
+        let start = self.len - count_set(presence, first_bit, rows);
+        self.len = start + rows;
+        // A zero view is an empty inline value, which is what a null slot
+        // must hold for the array to be safe to interpret.
+        let slots = unsafe { std::slice::from_raw_parts_mut(self.views.ptr_at_index(start), rows) };
+        expand_present(slots, presence, first_bit, 0);
     }
 
     fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef {
