@@ -14,7 +14,7 @@
 //! levels are extracted one at a time and compared to the maximum.
 
 use bytes::Bytes;
-use dispatch::arrays::{BitSink, append_bits, set_run};
+use dispatch::arrays::{BitSink, append_bits, count_set, set_run};
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
 use super::boolean::BooleanRleDecoder;
@@ -38,37 +38,14 @@ impl Presence {
         &self.bytes
     }
 
+    #[cfg(test)]
     pub fn is_present(&self, row: usize) -> bool {
         (self.bytes[row / 8] >> (row % 8)) & 1 == 1
     }
 
-    /// How many rows from `row` on share its presence, at most `max`: found
-    /// a 64-bit word at a time, by counting the trailing bits that match.
-    pub fn run_from(&self, row: usize, max: usize) -> usize {
-        let present = self.is_present(row);
-        let end = (row + max).min(self.len);
-        let mut at = row;
-        while at < end {
-            let byte = at / 8;
-            let bit = at % 8;
-            let take = (self.bytes.len() - byte).min(8);
-            let mut word = [0u8; 8];
-            word[..take].copy_from_slice(&self.bytes[byte..byte + take]);
-            // Bits equal to the run's value become zero, so the run's length
-            // in this word is the count of trailing zeros, bounded by the bits
-            // the word really holds.
-            let mut word = u64::from_le_bytes(word) >> bit;
-            if present {
-                word = !word;
-            }
-            let available = take * 8 - bit;
-            let run = (word.trailing_zeros() as usize).min(available);
-            at += run;
-            if run < available {
-                break;
-            }
-        }
-        at.min(end) - row
+    /// How many of the `count` rows from `row` on hold a value.
+    pub fn count_present_in(&self, row: usize, count: usize) -> usize {
+        count_set(&self.bytes, row, count)
     }
 
     fn count_present(&self) -> usize {
@@ -359,9 +336,8 @@ mod tests {
     }
 
     #[test]
-    fn runs_are_found_across_word_boundaries() {
-        // 70 present rows, 3 nulls, 20 present rows: runs that start mid-byte
-        // and span more than one 64-bit word.
+    fn counts_the_present_rows_of_any_range() {
+        // 70 present rows, 3 nulls, 20 present rows.
         let mut levels = vec![1u8; 70];
         levels.extend([0, 0, 0]);
         levels.extend([1; 20]);
@@ -372,12 +348,9 @@ mod tests {
 
         let presence = decode_def_levels(&data, &mut position, 93, 1).unwrap();
 
-        assert_eq!(presence.run_from(0, 1000), 70);
-        assert_eq!(presence.run_from(5, 1000), 65);
-        assert_eq!(presence.run_from(5, 10), 10);
-        assert_eq!(presence.run_from(70, 1000), 3);
-        assert_eq!(presence.run_from(72, 1000), 1);
-        assert_eq!(presence.run_from(73, 1000), 20);
-        assert_eq!(presence.run_from(92, 1000), 1);
+        assert_eq!(presence.count_present_in(0, 93), 90);
+        assert_eq!(presence.count_present_in(68, 7), 4);
+        assert_eq!(presence.count_present_in(70, 3), 0);
+        assert_eq!(presence.count_present_in(5, 10), 10);
     }
 }

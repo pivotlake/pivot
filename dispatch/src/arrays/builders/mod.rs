@@ -14,7 +14,10 @@ mod view_builder;
 
 use arrow_array::ArrayRef;
 use arrow_buffer::Buffer;
-pub use bitmap_builder::{BitSink, BitmapBuilder, append_bits, set_bit, set_run};
+pub use bitmap_builder::{
+    BitSink, BitmapBuilder, append_bits, bit_at, count_set, expand_present, set_bit, set_run,
+    write_bit,
+};
 pub use boolean_builder::BooleanBuilder;
 pub use primitive_builder::PrimitiveBuilder;
 pub use view_builder::ViewBuilder;
@@ -48,6 +51,14 @@ pub trait ArrayBuilder {
     /// Returns a mutable slice of `count` uninitialised slots at the end of
     /// the buffer, advancing the length. Callers must fill every slot.
     fn spare_mut(&mut self, count: usize) -> &mut [Self::Element];
+
+    /// The last elements were appended densely for `rows` rows, of which
+    /// `presence` marks the present ones (row 0 at bit `first_bit`) and so
+    /// says how many there are: moves each to its row and writes
+    /// `Element::default()` under the null rows, growing the builder by the
+    /// null count. That is how a nullable page decodes: its present values in
+    /// one call, then this.
+    fn expand_present(&mut self, rows: usize, presence: &[u8], first_bit: usize);
 
     /// Consumes the builder and returns the finished Arrow array.
     fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef;

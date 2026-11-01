@@ -5,6 +5,7 @@ use arrow_array::{ArrayRef, PrimitiveArray};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 
 use super::ArrayBuilder;
+use super::bitmap_builder::{count_set, expand_present};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 
@@ -37,6 +38,17 @@ impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
     #[inline]
     fn spare_mut(&mut self, count: usize) -> &mut [T::Native] {
         self.col.spare_mut(count)
+    }
+
+    fn expand_present(&mut self, rows: usize, presence: &[u8], first_bit: usize) {
+        let start = self.col.len - count_set(presence, first_bit, rows);
+        self.col.len = start + rows;
+        // SAFETY: the column holds its capacity, which the caller never
+        // exceeds; the slots past the dense values are uninitialised and
+        // every one is written before the length covers it.
+        let slots =
+            unsafe { std::slice::from_raw_parts_mut(self.col.values.ptr_at_index(start), rows) };
+        expand_present(slots, presence, first_bit, T::Native::default());
     }
 
     fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef {

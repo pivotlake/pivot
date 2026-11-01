@@ -37,7 +37,7 @@ use crate::arrays::accumulator::{DataBlock, INLINE_VIEW_LEN, copy_value};
 use crate::memory::SlabAllocator;
 pub use builders::{
     ArrayBuilder, BitSink, BitmapBuilder, BooleanBuilder, PrimitiveBuilder, ValidityBuilder,
-    ViewBuilder, append_bits, set_bit, set_run,
+    ViewBuilder, append_bits, bit_at, count_set, expand_present, set_bit, set_run, write_bit,
 };
 pub use int_bits::IntBits;
 pub use slab_column::SlabColumn;

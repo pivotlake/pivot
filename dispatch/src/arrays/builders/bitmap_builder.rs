@@ -66,6 +66,44 @@ impl BitmapBuilder {
         self.len += count;
     }
 
+    /// The last `count_set(presence, first_bit, rows)` bits were appended
+    /// densely for `rows` rows, of which `presence` marks the present ones
+    /// (row 0 at bit `first_bit`): moves each to its row and clears the null
+    /// rows, growing the bitmap to `rows` past where the dense bits began.
+    /// Rows are walked from the last, 64 at a time: a word of output bits is
+    /// gathered from the dense bits (a row's bit is the word's first dense
+    /// bit plus the count of present rows before it) and written whole, so
+    /// no source bit is overwritten before it is read.
+    pub fn expand_present(&mut self, rows: usize, presence: &[u8], first_bit: usize) {
+        let present = count_set(presence, first_bit, rows);
+        let start = self.len - present;
+        let bytes = self.bytes_mut();
+        let mut src = present;
+        let mut row = rows;
+        while row > 0 {
+            let take = row.min(64);
+            let out = row - take;
+            let word = bits_word(presence, first_bit + out, take);
+            let in_word = word.count_ones() as usize;
+            let base = src - in_word;
+            let dense = if in_word == 0 {
+                0
+            } else {
+                bits_word(bytes, start + base, in_word)
+            };
+            let mut gathered = 0u64;
+            for i in 0..take {
+                let before = (word & ((1u64 << i) - 1)).count_ones();
+                let bit = (dense >> before) & ((word >> i) & 1);
+                gathered |= bit << i;
+            }
+            write_bits_word(bytes, start + out, take, gathered);
+            src = base;
+            row = out;
+        }
+        self.len = start + rows;
+    }
+
     /// Hand the bitmap to Arrow as a zero-copy slab-backed [`Buffer`].
     pub fn into_buffer(self) -> Buffer {
         self.bits.into_buffer(self.len.div_ceil(8))
@@ -164,6 +202,117 @@ pub fn set_bit(dst: &mut [u8], bit: usize, value: bool) {
     dst[bit / 8] |= (value as u8) << (bit % 8);
 }
 
+/// Sets bit `bit` of `dst` to `value`, whatever it was.
+#[inline(always)]
+pub fn write_bit(dst: &mut [u8], bit: usize, value: bool) {
+    let mask = 1u8 << (bit % 8);
+    let byte = &mut dst[bit / 8];
+    *byte = (*byte & !mask) | ((value as u8) << (bit % 8));
+}
+
+/// Bit `bit` of `bytes`.
+#[inline(always)]
+pub fn bit_at(bytes: &[u8], bit: usize) -> bool {
+    (bytes[bit / 8] >> (bit % 8)) & 1 == 1
+}
+
+/// How many of the `count` bits of `bytes` from bit `first` on are set.
+pub fn count_set(bytes: &[u8], first: usize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let end = first + count;
+    let first_byte = first / 8;
+    let last_byte = (end - 1) / 8;
+    let head = 0xffu8 << (first % 8);
+    let tail = low_mask(end - last_byte * 8);
+    if first_byte == last_byte {
+        return (bytes[first_byte] & head & tail).count_ones() as usize;
+    }
+    (bytes[first_byte] & head).count_ones() as usize
+        + bytes[first_byte + 1..last_byte]
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum::<usize>()
+        + (bytes[last_byte] & tail).count_ones() as usize
+}
+
+/// The `count_set(presence, first_bit, slots.len())` values at the front of
+/// `slots` were written densely for `slots.len()` rows, of which `presence`
+/// marks the present ones (row 0 at bit `first_bit`): moves each to its row
+/// and writes `default` under the null rows. Rows are walked from the last,
+/// so a value always moves to a slot at or past its own and is never
+/// overwritten before it is read.
+///
+/// The walk takes the presence 64 rows at a time and chooses the value or
+/// the default without a branch, since which rows are null is not
+/// predictable. The source index is carried from row to row: computing it
+/// per row from a popcount measured slower than the one-cycle dependency.
+pub fn expand_present<T: Copy>(slots: &mut [T], presence: &[u8], first_bit: usize, default: T) {
+    let rows = slots.len();
+    let present = count_set(presence, first_bit, rows);
+    if present == 0 {
+        slots.fill(default);
+        return;
+    }
+    let mut src = present;
+    let mut row = rows;
+    while row > 0 {
+        let take = row.min(64);
+        let out = row - take;
+        let word = bits_word(presence, first_bit + out, take);
+        for i in (0..take).rev() {
+            let is_present = (word >> i) & 1 == 1;
+            src -= is_present as usize;
+            // A null row reads slot 0, which holds a value since `present`
+            // is at least one, and discards it.
+            let read_at = if is_present { src } else { 0 };
+            // SAFETY: `read_at < present <= rows` and `out + i < rows`.
+            unsafe {
+                let value = *slots.get_unchecked(read_at);
+                *slots.get_unchecked_mut(out + i) = if is_present { value } else { default };
+            }
+        }
+        row = out;
+    }
+}
+
+/// Writes the low `count` bits of `word`, `count` at most 64, over the bits
+/// of `bytes` from bit `first` on.
+#[inline(always)]
+fn write_bits_word(bytes: &mut [u8], first: usize, count: usize, word: u64) {
+    let first_byte = first / 8;
+    let last_byte = (first + count - 1) / 8;
+    let touched = last_byte + 1 - first_byte;
+    let mut buffer = [0u8; 16];
+    buffer[..touched].copy_from_slice(&bytes[first_byte..=last_byte]);
+    let shift = first % 8;
+    let mask = if count == 64 {
+        u128::MAX >> 64
+    } else {
+        (1u128 << count) - 1
+    } << shift;
+    let current = u128::from_le_bytes(buffer);
+    let updated = (current & !mask) | (((word as u128) << shift) & mask);
+    bytes[first_byte..=last_byte].copy_from_slice(&updated.to_le_bytes()[..touched]);
+}
+
+/// The `count` bits of `bytes` from bit `first` on, `count` at most 64, in
+/// the low bits of a word.
+#[inline(always)]
+fn bits_word(bytes: &[u8], first: usize, count: usize) -> u64 {
+    let first_byte = first / 8;
+    let last_byte = (first + count - 1) / 8;
+    let mut buffer = [0u8; 16];
+    buffer[..last_byte + 1 - first_byte].copy_from_slice(&bytes[first_byte..=last_byte]);
+    let word = (u128::from_le_bytes(buffer) >> (first % 8)) as u64;
+    if count == 64 {
+        word
+    } else {
+        word & ((1u64 << count) - 1)
+    }
+}
+
 /// A byte whose low `n` bits are set, `n` at most 8.
 #[inline(always)]
 fn low_mask(n: usize) -> u8 {
@@ -239,6 +388,50 @@ mod tests {
         let got = validity(&runs);
 
         assert_eq!(got, (0..11).map(|i| i % 2 == 0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn counts_set_bits_over_any_range() {
+        let bytes = pack(&(0..40).map(|i| i % 3 == 0).collect::<Vec<_>>());
+
+        assert_eq!(count_set(&bytes, 0, 40), 14);
+        assert_eq!(count_set(&bytes, 3, 4), 2);
+        assert_eq!(count_set(&bytes, 5, 20), 7);
+        assert_eq!(count_set(&bytes, 7, 0), 0);
+        assert_eq!(count_set(&bytes, 39, 1), 1);
+    }
+
+    #[test]
+    fn expands_dense_values_over_their_rows() {
+        let presence = pack(&[
+            true, true, false, true, false, false, true, true, true, false,
+        ]);
+        let mut slots = [10, 20, 30, 40, 50, 60, 0, 0, 0, 0];
+
+        expand_present(&mut slots, &presence, 0, -1);
+
+        assert_eq!(slots, [10, 20, -1, 30, -1, -1, 40, 50, 60, -1]);
+    }
+
+    #[test]
+    fn expands_dense_bits_over_their_rows() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let presence = pack(&[
+            false, true, true, false, true, true, true, false, false, true,
+        ]);
+        let mut builder = BitmapBuilder::with_capacity(&mut allocator, 13);
+        builder.append_run(true, 3);
+        // The six present rows' values, dense: 1 0 1 1 0 1.
+        builder.append_bits(&[0b101101], 0, 6);
+
+        builder.expand_present(10, &presence, 0);
+
+        let mut want = vec![true, true, true];
+        want.extend([
+            false, true, false, false, true, true, false, false, false, true,
+        ]);
+        assert_eq!(bits_of(builder), want);
     }
 
     #[test]
