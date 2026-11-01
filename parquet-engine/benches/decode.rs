@@ -176,6 +176,14 @@ fn i64_col(rng: &mut Rng, n: usize, base: i64, span: usize) -> ArrayRef {
     Arc::new(v)
 }
 
+/// An `i64` column with a null in about one row in ten.
+fn nullable_i64_col(rng: &mut Rng, n: usize, base: i64, span: usize) -> ArrayRef {
+    let v: Int64Array = (0..n)
+        .map(|_| (!rng.chance(0.1)).then(|| base + rng.below(span) as i64))
+        .collect();
+    Arc::new(v)
+}
+
 /// A flag that is true for about half the rows, with no run structure.
 fn bool_col(rng: &mut Rng, n: usize) -> ArrayRef {
     Arc::new(BooleanArray::from_iter(
@@ -205,7 +213,8 @@ fn nullable_bool_col(rng: &mut Rng, n: usize) -> ArrayRef {
 /// Write a SNAPPY + dictionary Parquet file (one column per decode shape) into
 /// `dir`, `rows` total across `ROW_GROUP_ROWS`-sized row groups. The schema
 /// column order: 0=url, 1=search_phrase, 2=event_time, 3=scattered_key,
-/// 4=sorted_key, 5=flag, 6=flag_runs, 7=flag_nullable, 8=flag_packed.
+/// 4=sorted_key, 5=flag, 6=flag_runs, 7=flag_nullable, 8=flag_packed,
+/// 9=event_time_nullable.
 fn write_parquet(dir: &TempDir, rows: usize) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("url", DataType::Utf8View, false),
@@ -217,6 +226,7 @@ fn write_parquet(dir: &TempDir, rows: usize) {
         Field::new("flag_runs", DataType::Boolean, false),
         Field::new("flag_nullable", DataType::Boolean, true),
         Field::new("flag_packed", DataType::Boolean, false),
+        Field::new("event_time_nullable", DataType::Int64, true),
     ]));
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
@@ -273,6 +283,7 @@ fn write_parquet(dir: &TempDir, rows: usize) {
                 bool_runs_col(&mut rng, n, 64),
                 nullable_bool_col(&mut rng, n),
                 bool_col(&mut rng, n),
+                nullable_i64_col(&mut rng, n, 1_700_000_000_000, 86_400_000),
             ],
         )
         .unwrap();
@@ -328,6 +339,8 @@ fn bench_decode(c: &mut Criterion, dispatch: &Dispatch, table: &Arc<ParquetTable
     scenario("decode/flag_runs", Projection::columns([6]));
     scenario("decode/flag_nullable", Projection::columns([7]));
     scenario("decode/flag_packed", Projection::columns([8]));
+    // The nullable path on an eight-byte column, next to `event_time`.
+    scenario("decode/event_time_nullable", Projection::columns([9]));
     // Every non-boolean column at once — a fuller scan.
     scenario("decode/all", Projection::columns([0, 1, 2, 3, 4]));
 }

@@ -14,16 +14,16 @@
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use bytes::Bytes;
-use dispatch::arrays::BooleanBuilder;
+use dispatch::arrays::{BitSink, BooleanBuilder};
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
 
 use crate::reading::decoding::leaf_decoders::{
-    ArrayBuilder, DecodeEncoding, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, LeafType,
-    TypedLeafDecoder, Unsupported,
+    DecodeEncoding, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, LeafType, TypedLeafDecoder,
+    Unsupported,
 };
 
 /// [`DecodePlain`] implementation for booleans: one bit per value, least
-/// significant bit first, copied into the builder's bitmap.
+/// significant bit first, copied into a bitmap.
 ///
 /// The cursor is the byte holding the next value's bit and which bit of it
 /// that is, so a read or skip may stop anywhere within a byte.
@@ -35,8 +35,8 @@ pub struct BooleanPlainDecoder {
 }
 
 impl BooleanPlainDecoder {
-    /// Appends `size` values to `builder`, one buffer of the page at a time.
-    fn append_to(&mut self, builder: &mut BooleanBuilder, size: usize) {
+    /// Appends `size` values to `sink`, one buffer of the page at a time.
+    fn append_to<S: BitSink>(&mut self, sink: &mut S, size: usize) {
         let mut left = size;
         while left > 0 {
             let buffer = &self.data[self.position.buffer_index];
@@ -48,7 +48,7 @@ impl BooleanPlainDecoder {
                 continue;
             }
             let take = left.min(bits_left);
-            builder.append_bits(&buffer[self.position.offset..], self.bit, take);
+            sink.append_bits(&buffer[self.position.offset..], self.bit, take);
             self.advance(take);
             left -= take;
         }
@@ -103,7 +103,9 @@ enum Run {
     Packed { left: usize },
 }
 
-/// [`DecodeEncoding`] implementation for an RLE boolean page.
+/// [`DecodeEncoding`] implementation for an RLE boolean page. A page of
+/// definition levels for a column with one level is the same stream, so the
+/// levels decoder reads through it too, into the page's presence bitmap.
 pub struct BooleanRleDecoder {
     /// The cursor over the page's bytes, which reads a packed run's bits.
     bits: BooleanPlainDecoder,
@@ -111,6 +113,50 @@ pub struct BooleanRleDecoder {
 }
 
 impl BooleanRleDecoder {
+    /// Starts reading the stream at `position`, where its byte length leads
+    /// it. What follows bounds the reads by its own value count, so the
+    /// length is stepped over.
+    pub(super) fn read_from(data: Vec<Bytes>, mut position: ReaderPosition) -> Self {
+        MultiBufferReader::new(&data, &mut position).read_u32_le();
+        Self {
+            bits: BooleanPlainDecoder::new(data, position),
+            run: Run::Header,
+        }
+    }
+
+    /// Appends the next `size` values to `sink`.
+    pub(super) fn read_bits<S: BitSink>(&mut self, sink: &mut S, size: usize) {
+        let mut left = size;
+        while left > 0 {
+            if matches!(self.run, Run::Header) {
+                self.run = self.parse_run();
+            }
+            let run_left = match &mut self.run {
+                Run::Header => unreachable!("a run was just parsed"),
+                Run::Repeated {
+                    value,
+                    left: run_left,
+                } => {
+                    let take = left.min(*run_left);
+                    sink.append_run(*value, take);
+                    *run_left -= take;
+                    left -= take;
+                    *run_left
+                }
+                Run::Packed { left: run_left } => {
+                    let take = left.min(*run_left);
+                    self.bits.append_to(sink, take);
+                    *run_left -= take;
+                    left -= take;
+                    *run_left
+                }
+            };
+            if run_left == 0 {
+                self.run = Run::Header;
+            }
+        }
+    }
+
     /// Parses the run header at the cursor, which a packed run leaves on a
     /// byte boundary since its groups are whole bytes.
     ///
@@ -166,46 +212,12 @@ fn decode_varint(bytes: &[u8]) -> (usize, usize) {
 impl DecodeEncoding for BooleanRleDecoder {
     type Builder = BooleanBuilder;
 
-    fn new(data: Vec<Bytes>, mut position: ReaderPosition) -> Option<Self> {
-        // The stream's byte length leads it. The page's value count already
-        // bounds the reads, so the length is stepped over.
-        MultiBufferReader::new(&data, &mut position).read_u32_le();
-        Some(Self {
-            bits: BooleanPlainDecoder::new(data, position),
-            run: Run::Header,
-        })
+    fn new(data: Vec<Bytes>, position: ReaderPosition) -> Option<Self> {
+        Some(Self::read_from(data, position))
     }
 
     fn read(&mut self, builder: &mut BooleanBuilder, size: usize) {
-        let mut left = size;
-        while left > 0 {
-            if matches!(self.run, Run::Header) {
-                self.run = self.parse_run();
-            }
-            let run_left = match &mut self.run {
-                Run::Header => unreachable!("a run was just parsed"),
-                Run::Repeated {
-                    value,
-                    left: run_left,
-                } => {
-                    let take = left.min(*run_left);
-                    builder.push(value, take);
-                    *run_left -= take;
-                    left -= take;
-                    *run_left
-                }
-                Run::Packed { left: run_left } => {
-                    let take = left.min(*run_left);
-                    self.bits.append_to(builder, take);
-                    *run_left -= take;
-                    left -= take;
-                    *run_left
-                }
-            };
-            if run_left == 0 {
-                self.run = Run::Header;
-            }
-        }
+        self.read_bits(builder, size);
     }
 
     fn skip(&mut self, size: usize) {

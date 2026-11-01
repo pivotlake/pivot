@@ -14,7 +14,7 @@
 //! are type aliases over `TypedLeafDecoder` with the appropriate leaf type.
 
 use super::{BuiltDictionary, SharedDictionary};
-use crate::reading::decoding::leaf_decoders::levels::decode_def_levels;
+use crate::reading::decoding::leaf_decoders::levels::{Presence, decode_def_levels};
 use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::reading::decoding::leaf_decoders::{
     ArrayBuilder, DecodeEncoding, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
@@ -73,22 +73,18 @@ fn skip_run<L: LeafType>(decoder: &mut ValueDecoder<L>, n: usize) {
     }
 }
 
-/// A nullable page's definition levels: `present[i]` is whether logical row `i`
-/// holds a value (vs a null), consumed run-wise via a cursor.
+/// A nullable page's definition levels as the page's presence bitmap, one
+/// bit per logical row, consumed run-wise via a cursor.
 struct DefLevels {
-    present: Vec<bool>,
+    presence: Presence,
     pos: usize,
 }
 
 impl DefLevels {
     /// The next run of equal present/null rows, capped at `max`.
     fn next_run(&mut self, max: usize) -> (bool, usize) {
-        let present = self.present[self.pos];
-        let run = self.present[self.pos..]
-            .iter()
-            .take_while(|&&p| p == present)
-            .count()
-            .min(max);
+        let present = self.presence.is_present(self.pos);
+        let run = self.presence.run_from(self.pos, max);
         self.pos += run;
         (present, run)
     }
@@ -171,6 +167,7 @@ impl<L: LeafType> ReadPage<L> {
                 .def_levels
                 .as_mut()
                 .expect("nullable page has def levels");
+            let run_start = def.pos;
             let mut run_left = run;
             while run_left > 0 {
                 let (present, n) = def.next_run(run_left);
@@ -190,12 +187,11 @@ impl<L: LeafType> ReadPage<L> {
                     (false, true) => skip_run(&mut self.decoder, n),
                     (false, false) => {}
                 }
-                if keep {
-                    validity.append_n(n, present);
-                }
                 run_left -= n;
             }
             if keep {
+                // The kept rows' validity is the page's presence over them.
+                validity.append_bits(def.presence.bytes(), run_start, run);
                 kept_left -= run;
             }
         }
@@ -344,15 +340,8 @@ impl<L: LeafType> TypedLeafDecoder<L> {
         // decode them (advancing `position` past them). An all-present page
         // yields `None` and decodes by the fast, non-null path below.
         let def_levels = if self.max_def_level > 0 {
-            let mut reader = MultiBufferReader::new(&page.data, &mut position);
-            let def_level_byte_len = reader.read_u32_le() as usize;
-            decode_def_levels(
-                &mut reader,
-                num_values,
-                def_level_byte_len,
-                self.max_def_level,
-            )
-            .map(|present| DefLevels { present, pos: 0 })
+            decode_def_levels(&page.data, &mut position, num_values, self.max_def_level)
+                .map(|presence| DefLevels { presence, pos: 0 })
         } else {
             None
         };

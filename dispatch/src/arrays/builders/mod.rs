@@ -2,20 +2,25 @@
 //! array with zero copies. [`ArrayBuilder`] is the interface the parquet page
 //! decoders and the GROUP BY output write through; [`PrimitiveBuilder`] builds
 //! fixed-width primitive arrays, [`BooleanBuilder`] boolean arrays and
-//! [`ViewBuilder`] byte-view arrays, and [`ValidityBuilder`] the null bitmap
-//! that goes with any of them.
+//! [`ViewBuilder`] byte-view arrays, and [`BitmapBuilder`] a bitmap: the null
+//! bitmap that goes with any of them, under the name [`ValidityBuilder`], and
+//! the values of a boolean array. [`BitSink`] is what the decoders append
+//! bits through, whichever bitmap they are building.
 
+mod bitmap_builder;
 mod boolean_builder;
 mod primitive_builder;
-mod validity_builder;
 mod view_builder;
 
 use arrow_array::ArrayRef;
 use arrow_buffer::Buffer;
+pub use bitmap_builder::{BitSink, BitmapBuilder, append_bits, set_bit, set_run};
 pub use boolean_builder::BooleanBuilder;
 pub use primitive_builder::PrimitiveBuilder;
-pub use validity_builder::ValidityBuilder;
 pub use view_builder::ViewBuilder;
+
+/// The null bitmap of a nullable column: `1` marks a present row.
+pub type ValidityBuilder = BitmapBuilder;
 
 use crate::memory::SlabAllocator;
 
