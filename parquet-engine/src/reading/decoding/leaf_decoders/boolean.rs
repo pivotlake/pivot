@@ -196,7 +196,7 @@ fn run_of(header: usize, value: impl FnOnce() -> u8) -> Run {
 
 /// Decodes the LEB128 varint at the start of `bytes`: its value and how many
 /// bytes it took.
-fn decode_varint(bytes: &[u8]) -> (usize, usize) {
+pub(super) fn decode_varint(bytes: &[u8]) -> (usize, usize) {
     let mut value = 0;
     let mut used = 0;
     loop {

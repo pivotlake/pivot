@@ -9,15 +9,16 @@
 //!
 //! The result is the page's [`Presence`], one bit per row. For a column with
 //! one level the stream is the presence bitmap itself, stored as runs the way
-//! an RLE boolean page stores its values, so it is read by that page's decoder:
-//! a repeated run becomes a bit fill and a bit-packed run a byte copy. Nested
-//! levels are extracted one at a time and compared to the maximum.
+//! an RLE boolean page stores its values, and it is decoded a word at a time:
+//! a repeated run shifts ones or zeros into the word, a bit-packed run shifts
+//! its bytes in, and each full word is written whole. Nested levels are
+//! extracted one at a time and compared to the maximum.
 
 use bytes::Bytes;
 use dispatch::arrays::{BitSink, append_bits, count_set, set_run};
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
-use super::boolean::BooleanRleDecoder;
+use super::boolean::decode_varint;
 
 /// Which rows of a page hold a value, one bit per row, `1` for present.
 pub struct Presence {
@@ -88,9 +89,8 @@ pub fn decode_def_levels(
     let levels_start = *position;
     let byte_len = MultiBufferReader::new(data, position).read_u32_le() as usize;
     let mut presence = Presence::with_capacity(num_values);
-    if max_def_level == 1 {
-        BooleanRleDecoder::read_from(data.to_vec(), levels_start)
-            .read_bits(&mut presence, num_values);
+    let present = if max_def_level == 1 {
+        decode_one_bit_levels(data, position, num_values, &mut presence)
     } else {
         let mut reader = MultiBufferReader::new(data, position);
         decode_nested_levels(
@@ -100,10 +100,185 @@ pub fn decode_def_levels(
             max_def_level,
             &mut presence,
         );
-    }
+        presence.count_present()
+    };
     *position = levels_start;
     MultiBufferReader::new(data, position).skip(4 + byte_len);
-    (presence.count_present() < num_values).then_some(presence)
+    (present < num_values).then_some(presence)
+}
+
+/// Decodes `num_values` one-bit levels, the stream a column with one level
+/// carries, into `presence`, and tells how many rows are present. The stream
+/// is the presence bitmap stored as runs, so the bits go through a word that
+/// is written whole each time it fills: a repeated run is a shift of ones or
+/// zeros, a bit-packed run a shift of its bytes.
+fn decode_one_bit_levels(
+    data: &[Bytes],
+    position: &mut ReaderPosition,
+    num_values: usize,
+    presence: &mut Presence,
+) -> usize {
+    let mut bits = WordBits::over(&mut presence.bytes);
+    let mut left = num_values;
+    while left > 0 {
+        let (header, value) = read_run_header(data, position);
+        if header & 1 == 0 {
+            let count = (header >> 1).min(left);
+            bits.push_run(value, count);
+            left -= count;
+        } else {
+            // The run's groups are whole bytes at the cursor, possibly spread
+            // over buffers; the stream's last group may pad past the rows.
+            let mut bytes_left = header >> 1;
+            while bytes_left > 0 && left > 0 {
+                let buffer = &data[position.buffer_index];
+                if position.offset == buffer.len() {
+                    position.buffer_index += 1;
+                    position.offset = 0;
+                    continue;
+                }
+                let take = bytes_left.min(buffer.len() - position.offset);
+                let count = (take * 8).min(left);
+                bits.push_bytes(&buffer[position.offset..position.offset + take], count);
+                left -= count;
+                bytes_left -= take;
+                position.offset += take;
+            }
+        }
+    }
+    presence.len = num_values;
+    bits.finish()
+}
+
+/// Reads the run header at `position`: the header word and, for a repeated
+/// run, its one-byte value. A header is at most a five-byte varint and that
+/// byte; one the buffer holds whole is decoded in place, one at a buffer's
+/// end through the reader, which crosses into the next buffer.
+fn read_run_header(data: &[Bytes], position: &mut ReaderPosition) -> (usize, bool) {
+    let buffer = &data[position.buffer_index];
+    let bytes = &buffer[position.offset..];
+    if bytes.len() >= 6 {
+        let (header, used) = decode_varint(bytes);
+        if header & 1 == 0 {
+            position.offset += used + 1;
+            (header, bytes[used] & 1 == 1)
+        } else {
+            position.offset += used;
+            (header, false)
+        }
+    } else {
+        let mut reader = MultiBufferReader::new(data, position);
+        let header = reader.read_varint() as usize;
+        let value = header & 1 == 0 && reader.read_u8() & 1 == 1;
+        (header, value)
+    }
+}
+
+/// Bits appended to a byte buffer through a word: the word is written whole
+/// each time it fills, and the count of set bits is kept as it goes.
+struct WordBits<'a> {
+    bytes: &'a mut [u8],
+    /// Bits written to `bytes`, a multiple of 64 until `finish`.
+    written: usize,
+    word: u64,
+    /// Bits in `word`, below 64.
+    filled: u32,
+    present: usize,
+}
+
+impl<'a> WordBits<'a> {
+    fn over(bytes: &'a mut [u8]) -> Self {
+        Self {
+            bytes,
+            written: 0,
+            word: 0,
+            filled: 0,
+            present: 0,
+        }
+    }
+
+    /// Appends the low `count` bits of `bits`, `count` at most 64 and the
+    /// higher bits zero.
+    #[inline(always)]
+    fn push(&mut self, bits: u64, count: u32) {
+        let room = 64 - self.filled;
+        if count < room {
+            self.word |= bits << self.filled;
+            self.filled += count;
+            return;
+        }
+        self.word |= bits << self.filled;
+        self.flush();
+        // The bits that did not fit start the next word.
+        self.word = if room == 64 { 0 } else { bits >> room };
+        self.filled = count - room;
+    }
+
+    fn flush(&mut self) {
+        let at = self.written / 8;
+        self.bytes[at..at + 8].copy_from_slice(&self.word.to_le_bytes());
+        self.present += self.word.count_ones() as usize;
+        self.written += 64;
+        self.word = 0;
+        self.filled = 0;
+    }
+
+    /// Appends `count` bits of `value`.
+    fn push_run(&mut self, value: bool, mut count: usize) {
+        let pattern = if value { u64::MAX } else { 0 };
+        while count > 0 {
+            if self.filled == 0 && count >= 64 {
+                // Whole words straight to the buffer, which is zero already.
+                let words = count / 64;
+                let at = self.written / 8;
+                if value {
+                    self.bytes[at..at + words * 8].fill(0xff);
+                    self.present += words * 64;
+                }
+                self.written += words * 64;
+                count -= words * 64;
+                continue;
+            }
+            let take = count.min(64) as u32;
+            let bits = if take == 64 {
+                pattern
+            } else {
+                pattern & ((1u64 << take) - 1)
+            };
+            self.push(bits, take);
+            count -= take as usize;
+        }
+    }
+
+    /// Appends the first `count` bits of `chunk`, which holds them packed
+    /// least significant bit first.
+    fn push_bytes(&mut self, chunk: &[u8], mut count: usize) {
+        let mut at = 0;
+        while count >= 64 {
+            let word = u64::from_le_bytes(chunk[at..at + 8].try_into().unwrap());
+            self.push(word, 64);
+            at += 8;
+            count -= 64;
+        }
+        if count > 0 {
+            let mut tail = [0u8; 8];
+            let used = count.div_ceil(8);
+            tail[..used].copy_from_slice(&chunk[at..at + used]);
+            let word = u64::from_le_bytes(tail) & ((1u64 << count) - 1);
+            self.push(word, count as u32);
+        }
+    }
+
+    /// Writes the bits still in the word and returns the count of set bits.
+    fn finish(mut self) -> usize {
+        if self.filled > 0 {
+            let at = self.written / 8;
+            let used = (self.filled as usize).div_ceil(8);
+            self.bytes[at..at + used].copy_from_slice(&self.word.to_le_bytes()[..used]);
+            self.present += self.word.count_ones() as usize;
+        }
+        self.present
+    }
 }
 
 /// Decodes `num_values` levels of more than one bit each, present where a
@@ -312,6 +487,31 @@ mod tests {
             decode(&bytes, 6, 1),
             Some(vec![true, false, true, false, false, true])
         );
+    }
+
+    #[test]
+    fn bit_packed_levels_cross_word_boundaries() {
+        let levels: Vec<u8> = (0..150).map(|i| (i % 5 != 2) as u8).collect();
+        let bytes = bit_packed(&levels, 1);
+
+        let want: Vec<bool> = levels.iter().map(|&l| l == 1).collect();
+        assert_eq!(decode(&bytes, 150, 1), Some(want));
+    }
+
+    #[test]
+    fn runs_and_groups_mix_across_words() {
+        // Ten present, a packed group with nulls, a run of 70 nulls, three
+        // present: runs that start and end inside words and a group between.
+        let mut stream = rle(&[1; 10]);
+        stream.extend(bit_packed(&[1, 0, 1, 1, 0, 0, 1, 0], 1));
+        stream.extend(rle(&[0; 70]));
+        stream.extend(rle(&[1; 3]));
+
+        let mut want = vec![true; 10];
+        want.extend([true, false, true, true, false, false, true, false]);
+        want.extend([false; 70]);
+        want.extend([true; 3]);
+        assert_eq!(decode(&stream, 91, 1), Some(want));
     }
 
     #[test]
