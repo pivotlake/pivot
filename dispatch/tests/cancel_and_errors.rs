@@ -83,13 +83,14 @@ fn cancelled_query_returns_without_hanging() {
                 dispatch::RowSelection::Indices
             }
         })
-        .execute_as::<RecordBatch>();
+        .map_maybe_ordered(|| |batch: RecordBatch| batch.num_rows())
+        .execute();
     handle.cancel();
     let result = handle.collect();
 
     // Assert: collect succeeded and returned no more rows than we fed in.
     let batches = result.expect("cancelled query should not return an error");
-    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let total: usize = batches.iter().sum();
     assert!(
         total <= n as usize,
         "cancelled query returned more rows ({total}) than the input ({n})"

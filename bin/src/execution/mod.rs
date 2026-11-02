@@ -3,9 +3,9 @@
 //! [`Executor`] owns the planner cache and coordinates one statement
 //! transaction across planning, dataflow execution, cancellation, and commit
 //! or rollback. Frontends choose how query batches are converted before they
-//! leave a dispatch worker. The PostgreSQL frontend turns them into wire rows,
-//! while a local frontend can copy Arrow batches or turn cells into terminal
-//! text.
+//! leave a dispatch worker by passing a conversion closure. The PostgreSQL
+//! frontend turns them into wire rows, while a local frontend can copy Arrow
+//! batches or turn cells into terminal text.
 
 mod copy;
 mod dataflow;
@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
-use dispatch::OutputBatch;
 
 use dataflow::{
     StatementHandle, StatementKind, StatementResults, affected_rows,
@@ -59,24 +58,31 @@ impl Executor {
         sql: String,
         options: ExecuteOptions,
     ) -> Result<Execution<RecordBatch>> {
-        self.execute_with_output::<RecordBatch>(sql, options).await
+        self.execute_with_output(sql, options, || dispatch::copy_out_batch)
+            .await
     }
 
-    /// Execute a statement with a frontend-selected output batch type.
+    /// Execute a statement, converting each result batch with a closure the
+    /// frontend supplies.
     ///
-    /// [`OutputBatch::from_record_batch`] runs on each dispatch worker before
-    /// the result leaves dispatch memory.
-    pub async fn execute_with_output<T>(
+    /// `convert` is called once per dispatch worker to build that worker's
+    /// conversion closure, which runs on the worker before each batch leaves
+    /// dispatch memory. The closure must not keep ring-backed Arrow buffers;
+    /// it copies or encodes everything it returns.
+    pub async fn execute_with_output<T, F, FB>(
         &self,
         sql: String,
         options: ExecuteOptions,
+        convert: FB,
     ) -> Result<Execution<T>>
     where
-        T: OutputBatch,
+        T: Send + 'static,
+        F: FnMut(RecordBatch) -> T + Send + 'static,
+        FB: Fn() -> F + Send + 'static,
     {
         let transaction = self.catalog.begin_transaction();
         let result = self
-            .execute_in_transaction::<T>(sql, options, transaction.clone())
+            .execute_in_transaction(sql, options, transaction.clone(), convert)
             .await;
         match result {
             // A COPY FROM STDIN hands the transaction to whoever drives the
@@ -126,14 +132,17 @@ impl Executor {
         }
     }
 
-    async fn execute_in_transaction<T>(
+    async fn execute_in_transaction<T, F, FB>(
         &self,
         sql: String,
         options: ExecuteOptions,
         transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+        convert: FB,
     ) -> Result<Execution<T>>
     where
-        T: OutputBatch,
+        T: Send + 'static,
+        F: FnMut(RecordBatch) -> T + Send + 'static,
+        FB: Fn() -> F + Send + 'static,
     {
         let started = Instant::now();
         let plan = plan_query(
@@ -241,8 +250,10 @@ impl Executor {
                     let output = spec.map(|| affected_rows_from_record_batch);
                     StatementHandle::Insert(output.execute())
                 }
-                (_, true) => StatementHandle::Batches(spec.execute_with_stats_as::<T>()),
-                (_, false) => StatementHandle::Batches(spec.execute_as::<T>()),
+                (_, true) => {
+                    StatementHandle::Batches(spec.map_maybe_ordered(convert).execute_with_stats())
+                }
+                (_, false) => StatementHandle::Batches(spec.map_maybe_ordered(convert).execute()),
             })
         })
         .await

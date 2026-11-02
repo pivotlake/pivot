@@ -142,19 +142,25 @@ pub struct RecordBatchOperatorSpec {
     stream_ordered: bool,
 }
 
-/// An owned batch representation that can leave a dispatch worker safely.
-///
-/// The conversion runs on the worker that produced the input. Implementations
-/// must not retain ring-backed Arrow buffers; copy or encode everything kept in
-/// the returned value.
-pub trait OutputBatch: Sized + Send + 'static {
-    fn from_record_batch(batch: RecordBatch) -> Self;
+/// Deep-copy a ring-backed batch into heap allocations so it can leave its
+/// dispatch worker.
+pub fn copy_out_batch(batch: RecordBatch) -> RecordBatch {
+    copy_out(batch).expect("copying a valid RecordBatch should succeed")
 }
 
-impl OutputBatch for RecordBatch {
-    fn from_record_batch(batch: RecordBatch) -> Self {
-        copy_out(batch).expect("copying a valid RecordBatch should succeed")
-    }
+/// Box a spec's per-worker factories so specs built over different channel
+/// kinds share one type.
+fn erase_factories<T, OF>(spec: OperatorSpec<T, OF>) -> OperatorSpec<T, Box<dyn OperatorFactory<T>>>
+where
+    OF: OperatorFactory<T> + 'static,
+{
+    let (dispatcher, factories) = spec.into_parts();
+    OperatorSpec::new(
+        dispatcher,
+        factories
+            .into_iter()
+            .map(|factory| Box::new(factory) as Box<dyn OperatorFactory<T>>),
+    )
 }
 
 /// Return type of [`RecordBatchOperatorSpec::map`]: a generic
@@ -516,6 +522,29 @@ impl RecordBatchOperatorSpec {
             })
             .collect();
         OperatorSpec::new(self.dispatcher, factories)
+    }
+
+    /// Apply a type-changing map that keeps the batch order when the stream
+    /// has one and uses work-stealing delivery otherwise.
+    ///
+    /// This is the stage that turns result batches into whatever leaves the
+    /// dataflow. The closure runs on the worker that produced each batch, so
+    /// it must not retain ring-backed Arrow buffers; copy or encode everything
+    /// kept in the returned value.
+    pub fn map_maybe_ordered<T, F, FB>(
+        self,
+        builder: FB,
+    ) -> OperatorSpec<T, Box<dyn OperatorFactory<T>>>
+    where
+        T: Send + 'static,
+        F: FnMut(RecordBatch) -> T + Send + 'static,
+        FB: Fn() -> F,
+    {
+        if self.stream_ordered {
+            erase_factories(self.map_ordered(builder))
+        } else {
+            erase_factories(self.map(builder))
+        }
     }
 
     /// Sugar for [`map`](Self::map) when the output is `RecordBatch`: applies
@@ -1334,52 +1363,24 @@ impl RecordBatchOperatorSpec {
         OperatorSpec::new(self.dispatcher, factories).execute()
     }
 
-    /// Convert each result batch to `T` on its dispatch worker, then launch the
-    /// dataflow.
-    pub fn execute_as<T: OutputBatch>(self) -> DataFlowHandle<T> {
-        if self.stream_ordered {
-            self.map_ordered(|| T::from_record_batch).execute()
-        } else {
-            self.map(|| T::from_record_batch).execute()
-        }
-    }
-
     /// Like [`execute`](Self::execute), with worker statistics enabled.
     pub fn execute_with_stats(self) -> DataFlowHandle<RecordBatch> {
         let factories: Vec<_> = self.factories.into_iter().collect();
         OperatorSpec::new(self.dispatcher, factories).execute_with_stats()
     }
 
-    /// Like [`execute_as`](Self::execute_as), with worker statistics enabled.
-    pub fn execute_with_stats_as<T: OutputBatch>(self) -> DataFlowHandle<T> {
-        if self.stream_ordered {
-            self.map_ordered(|| T::from_record_batch)
-                .execute_with_stats()
-        } else {
-            self.map(|| T::from_record_batch).execute_with_stats()
-        }
-    }
-
     /// Run the dataflow and collect heap-backed Arrow batches.
     pub fn collect(self) -> crate::data_flow::Result<Vec<RecordBatch>> {
-        self.collect_as::<RecordBatch>()
-    }
-
-    /// Run the dataflow and collect output batches converted on their workers.
-    pub fn collect_as<T: OutputBatch>(self) -> crate::data_flow::Result<Vec<T>> {
-        self.execute_as::<T>().collect()
+        self.map_maybe_ordered(|| copy_out_batch)
+            .execute()
+            .collect()
     }
 
     /// Like [`collect`](Self::collect), but also returns the dataflow's IO/CPU
     /// stats folded across workers.
     pub fn collect_with_stats(self) -> crate::data_flow::Result<(Vec<RecordBatch>, DataFlowStats)> {
-        self.collect_with_stats_as::<RecordBatch>()
-    }
-
-    /// Like [`collect_as`](Self::collect_as), with worker statistics enabled.
-    pub fn collect_with_stats_as<T: OutputBatch>(
-        self,
-    ) -> crate::data_flow::Result<(Vec<T>, DataFlowStats)> {
-        self.execute_with_stats_as::<T>().collect_with_stats()
+        self.map_maybe_ordered(|| copy_out_batch)
+            .execute_with_stats()
+            .collect_with_stats()
     }
 }

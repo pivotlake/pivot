@@ -122,12 +122,13 @@ impl PivotQueryHandler {
 
         let result = self
             .executor
-            .execute_with_output::<PGRowBatch>(
+            .execute_with_output(
                 query.to_string(),
                 ExecuteOptions {
                     collect_stats,
                     profile,
                 },
+                || PGRowBatch::from,
             )
             .await;
 
