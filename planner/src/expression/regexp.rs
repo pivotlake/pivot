@@ -62,11 +62,19 @@ impl RegexpReplace {
 
         Ok(Box::new(move || {
             let replacement = replacement.clone();
+            let pattern = pattern.clone();
             // A fresh `Regex` per worker: a cloned `Regex` funnels every match
-            // through a shared pool guarded by atomics, contending in the row loop.
-            let regex = build_regex(&pattern).expect("pattern validated at plan compile");
+            // through a shared pool guarded by atomics, contending in the row
+            // loop. It is built on the worker's first batch, not here: this
+            // builder runs once per worker on the thread compiling the plan, so
+            // building it here would cost that thread one regex compile per
+            // worker.
+            let mut regex = None;
             let mut input_expr = input_builder();
             Box::new(move |batch: &RecordBatch| {
+                let regex = regex.get_or_insert_with(|| {
+                    build_regex(&pattern).expect("pattern validated at plan compile")
+                });
                 let input = input_expr(batch);
                 let (arr, _) = input.as_datum().get();
                 let strings = arr.as_string_view();
@@ -115,10 +123,15 @@ impl RegexpFullMatch {
         let input_builder = self.input.compile()?;
 
         Ok(Box::new(move || {
-            // A fresh `Regex` per worker, for the reason `RegexpReplace` gives above.
-            let regex = build_anchored_regex(&pattern).expect("pattern validated at plan compile");
+            let pattern = pattern.clone();
+            // A fresh `Regex` per worker, built on its first batch, for the
+            // reasons `RegexpReplace` gives above.
+            let mut regex = None;
             let mut input_expr = input_builder();
             Box::new(move |batch: &RecordBatch| {
+                let regex = regex.get_or_insert_with(|| {
+                    build_anchored_regex(&pattern).expect("pattern validated at plan compile")
+                });
                 let input = input_expr(batch);
                 let (arr, _) = input.as_datum().get();
                 let strings = arr.as_string_view();

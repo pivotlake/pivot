@@ -1,5 +1,6 @@
 use crate::Identifier;
 use crate::api::BuildContext;
+use crate::api::launch::WorkerLaunch;
 use crate::data_flow::DataFlow;
 use crate::operations::Operator;
 use crate::stats::DataFlowStats;
@@ -7,6 +8,7 @@ use ahash::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, mpsc};
+use std::time::Instant;
 use thiserror::Error;
 
 static ID: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
@@ -148,61 +150,30 @@ impl OperatorGraphBuilder {
     }
 }
 
-/// A factory + output sender pair, ready to be sent to a worker thread.
-///
-/// Created by [`RecordBatchOperatorSpec::collect`](super::record_batch_operator::RecordBatchOperatorSpec::collect),
-/// one per worker. The worker calls [`build`](DataFlowBuilder::build) to produce a `DataFlow`,
-/// which triggers the recursive factory build chain on the worker thread.
+/// One worker's view of a launched dataflow: the shared launch and which
+/// worker this is. The worker calls [`build`](DataFlowBuilder::build) to
+/// produce its `DataFlow`, which makes and builds its operator chain on the
+/// worker thread.
 pub struct DataFlowBuilder {
-    /// A flag shared across all workers (and the DataFlowHandle) on whether to cancel this query
-    cancelled: Arc<AtomicBool>,
-    /// A sender for errors that may occur during running
-    err_tx: mpsc::Sender<crate::data_flow::Error>,
-    /// Where this worker's stats tally is shipped (used only when `collect_stats`)
-    stats_tx: mpsc::Sender<DataFlowStats>,
-    /// Whether the query opted into per-dataflow stats collection
-    collect_stats: bool,
-    /// Whether this dataflow is profiled: it runs exclusively (the worker pauses
-    /// other dataflows) while a `perf` capture is in progress. Set when the
-    /// launching dispatcher was marked (see [`with_profiling`](Self::with_profiling)).
-    #[cfg(feature = "perf")]
-    profiled: bool,
-    /// Builds the per-worker operator graph.
-    build: Box<dyn FnOnce(&mut BuildContext) -> OperatorGraphBuilder + Send>,
+    launch: Arc<dyn WorkerLaunch>,
+    worker_idx: usize,
 }
 
 impl DataFlowBuilder {
-    pub fn new(
-        build: Box<dyn FnOnce(&mut BuildContext) -> OperatorGraphBuilder + Send>,
-        cancelled: Arc<AtomicBool>,
-        err_tx: mpsc::Sender<crate::data_flow::Error>,
-        stats_tx: mpsc::Sender<DataFlowStats>,
-        collect_stats: bool,
-    ) -> Self {
-        Self {
-            cancelled,
-            err_tx,
-            stats_tx,
-            collect_stats,
-            #[cfg(feature = "perf")]
-            profiled: false,
-            build,
-        }
-    }
-
-    /// Mark this builder's dataflow profiled, so it runs exclusively while a
-    /// `perf` capture is in progress.
-    #[cfg(feature = "perf")]
-    pub fn with_profiling(mut self, profiled: bool) -> Self {
-        self.profiled = profiled;
-        self
+    pub(crate) fn new(launch: Arc<dyn WorkerLaunch>, worker_idx: usize) -> Self {
+        Self { launch, worker_idx }
     }
 
     /// Build the full operator graph and convert it into an executable `DataFlow`.
     /// Called on the worker thread.
     pub fn build(self) -> Result<DataFlow> {
+        let Self { launch, worker_idx } = self;
+        // Only a dataflow that opted into stats pays for the clock reads.
+        let started = launch.collect_stats().then(Instant::now);
         let mut context = BuildContext::default();
-        let graph = match catch_unwind(AssertUnwindSafe(|| (self.build)(&mut context))) {
+        let graph = match catch_unwind(AssertUnwindSafe(|| {
+            launch.clone().build_graph(worker_idx, &mut context)
+        })) {
             Ok(graph) => graph,
             Err(e) => {
                 let msg = e
@@ -215,27 +186,31 @@ impl DataFlowBuilder {
                 // built their piece of the graph hold output senders until the
                 // query is cancelled, and the collector blocks until every
                 // sender drops, so swallowing the error here hangs the caller.
-                if self
-                    .err_tx
+                if launch
+                    .err_tx()
                     .send(crate::data_flow::Error::Panic(msg.to_string()))
                     .is_err()
                 {
                     tracing::warn!("Unable to send build error...");
                 }
-                self.cancelled.store(true, Ordering::Relaxed);
+                launch.cancelled().store(true, Ordering::Relaxed);
                 crate::waker::waker_set().notify_all();
                 return Err(Error::PanicOnBuild(msg.to_string()));
             }
         };
 
         let data_flow = graph.into_data_flow(
-            self.cancelled,
-            self.err_tx,
-            self.stats_tx,
-            self.collect_stats,
+            launch.cancelled().clone(),
+            launch.err_tx().clone(),
+            launch.stats_tx().clone(),
+            launch.collect_stats(),
         );
         #[cfg(feature = "perf")]
-        let data_flow = data_flow.with_profiling(self.profiled);
+        let data_flow = data_flow.with_profiling(launch.profiled());
+        let mut data_flow = data_flow;
+        if let Some(started) = started {
+            data_flow.stats().record_build(started, Instant::now());
+        }
         Ok(data_flow)
     }
 }

@@ -27,6 +27,7 @@
 //! receiver worker is guaranteed to hold at least `fetch` rows by the time
 //! `reached` latches, so it never has to block waiting on a straggler.
 
+use crate::api::{HandOut, WorkerMaker, per_worker};
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::factory::UnaryFactory;
@@ -35,7 +36,7 @@ use crate::waker::waker_set;
 use arrow_array::RecordBatch;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 /// Per-worker `LIMIT` consumer. See the [module docs](self).
 pub struct Limit {
@@ -234,19 +235,23 @@ impl LimitFactory {
         limit: usize,
         offset: usize,
         worker_count: usize,
-    ) -> impl IntoIterator<Item = LimitFactory> {
+    ) -> impl WorkerMaker<LimitFactory> {
         let (tx, rx) = mpsc::channel();
-        let mut rx_opt = Some(rx);
+        // The first worker's limit collects every worker's rows, and sees the
+        // channel close once every worker's limit has sent.
+        let sender = HandOut::new(tx, worker_count);
+        let receiver = Mutex::new(Some(rx));
         let rows_seen = Arc::new(AtomicUsize::new(0));
         let reached = Arc::new(AtomicBool::new(false));
-
-        (0..worker_count).map(move |_| LimitFactory {
+        per_worker(move |worker_idx| LimitFactory {
             limit,
             offset,
             rows_seen: rows_seen.clone(),
             reached: reached.clone(),
-            sender: tx.clone(),
-            receiver: rx_opt.take(),
+            sender: sender.take(),
+            receiver: (worker_idx == 0)
+                .then(|| receiver.lock().expect("never poisoned").take())
+                .flatten(),
         })
     }
 }

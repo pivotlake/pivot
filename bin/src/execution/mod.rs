@@ -13,7 +13,7 @@ mod planning;
 mod types;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use dispatch::OutputBatch;
@@ -230,24 +230,26 @@ impl Executor {
 
         let started = Instant::now();
         let compile_transaction = transaction;
-        let handle = tokio::task::spawn_blocking(move || -> Result<StatementHandle<T>> {
-            let spec = plan.compile(&dispatcher, compile_transaction.as_ref())?;
-            Ok(match (statement_kind, options.collect_stats) {
-                (StatementKind::Insert, true) => {
-                    let output = spec.map(|| affected_rows_from_record_batch);
-                    StatementHandle::Insert(output.execute_with_stats())
-                }
-                (StatementKind::Insert, false) => {
-                    let output = spec.map(|| affected_rows_from_record_batch);
-                    StatementHandle::Insert(output.execute())
-                }
-                (_, true) => StatementHandle::Batches(spec.execute_with_stats_as::<T>()),
-                (_, false) => StatementHandle::Batches(spec.execute_as::<T>()),
+        let (handle, compile_time) =
+            run_without_thread_hop(move || -> Result<(StatementHandle<T>, Duration)> {
+                let spec = plan.compile(&dispatcher, compile_transaction.as_ref())?;
+                let compile_time = started.elapsed();
+                let handle = match (statement_kind, options.collect_stats) {
+                    (StatementKind::Insert, true) => {
+                        let output = spec.map(|| affected_rows_from_record_batch);
+                        StatementHandle::Insert(output.execute_with_stats())
+                    }
+                    (StatementKind::Insert, false) => {
+                        let output = spec.map(|| affected_rows_from_record_batch);
+                        StatementHandle::Insert(output.execute())
+                    }
+                    (_, true) => StatementHandle::Batches(spec.execute_with_stats_as::<T>()),
+                    (_, false) => StatementHandle::Batches(spec.execute_as::<T>()),
+                };
+                Ok((handle, compile_time))
             })
-        })
-        .await
-        .map_err(Error::PlannerPanic)??;
-        let compile_time = started.elapsed();
+            .await??;
+        let dispatch_time = started.elapsed().saturating_sub(compile_time);
 
         let (results, flow, execute_time) = collect_handle(handle).await?;
         let output = match (statement_kind, results) {
@@ -278,9 +280,38 @@ impl Executor {
             stats: ExecutionStats {
                 plan: plan_time,
                 compile: compile_time,
+                dispatch: dispatch_time,
                 execute: execute_time,
                 flow,
             },
         })
+    }
+}
+
+/// Run a short blocking step on the current thread instead of a blocking-pool
+/// thread.
+///
+/// Compiling and launching a statement take a fraction of a millisecond, but a
+/// blocking-pool thread first has to be woken onto a core. With a dispatch
+/// worker pinned to every core, the woken thread queues behind whichever
+/// worker is busy there (tearing down the previous query, or spinning at a
+/// barrier) and waits out that worker's scheduler slice: several
+/// milliseconds, more than the step itself. The current thread already holds
+/// its core, so on a multi-thread runtime the step runs here while
+/// `block_in_place` keeps the runtime's other tasks moving. A current-thread
+/// runtime has no other thread to move them to, so there the step still goes
+/// through the blocking pool.
+async fn run_without_thread_hop<T, F>(step: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let flavor = tokio::runtime::Handle::current().runtime_flavor();
+    if flavor == tokio::runtime::RuntimeFlavor::CurrentThread {
+        tokio::task::spawn_blocking(step)
+            .await
+            .map_err(Error::PlannerPanic)
+    } else {
+        Ok(tokio::task::block_in_place(step))
     }
 }

@@ -134,7 +134,7 @@ where
     let rows = Arc::new(AtomicUsize::new(0));
     let remaining_workers = Arc::new(AtomicUsize::new(workers));
     let uploads = encoded.chain(
-        stealable::<AssembledFile>(topology).into_iter().collect(),
+        stealable::<AssembledFile>(topology),
         (0..workers)
             .map(|_| {
                 UploadFactory::new(
@@ -146,7 +146,7 @@ where
                     remaining_workers.clone(),
                 )
             })
-            .collect(),
+            .collect::<Vec<_>>(),
     );
     RecordBatchOperatorSpec::from_spec(uploads)
 }

@@ -1,3 +1,4 @@
+use crate::api::{WorkerMaker, per_worker, split};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
@@ -55,62 +56,22 @@ type JoinBuildCollector<K, const TRACK_MATCHED_BUILD_ROWS: bool> = CollectorFact
     BuildWorkerOutput<<K as JoinKey>::Stored>,
     JoinBuilder<<K as JoinKey>::Stored, TRACK_MATCHED_BUILD_ROWS>,
 >;
-type JoinProbeFactories<
+/// The probe factory of a join with the given kind flags.
+type ProbeFactory<
     K,
     const TRACK_MATCHED_BUILD_ROWS: bool,
     const STOP_AFTER_FIRST_MATCH: bool,
     const TRACK_UNMATCHED_PROBE_ROWS: bool,
     const DISCARD_MATCHED_ROWS: bool,
     const EMIT_MARK_COLUMN: bool,
-> = Vec<
-    JoinProbeFactory<
-        K,
-        TRACK_MATCHED_BUILD_ROWS,
-        STOP_AFTER_FIRST_MATCH,
-        TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_ROWS,
-        EMIT_MARK_COLUMN,
-    >,
+> = JoinProbeFactory<
+    K,
+    TRACK_MATCHED_BUILD_ROWS,
+    STOP_AFTER_FIRST_MATCH,
+    TRACK_UNMATCHED_PROBE_ROWS,
+    DISCARD_MATCHED_ROWS,
+    EMIT_MARK_COLUMN,
 >;
-type DirectJoinFactories<
-    K,
-    const TRACK_MATCHED_BUILD_ROWS: bool,
-    const STOP_AFTER_FIRST_MATCH: bool,
-    const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_ROWS: bool,
-    const EMIT_MARK_COLUMN: bool,
-> = (
-    Vec<DirectJoinBuildFactory<K, TRACK_MATCHED_BUILD_ROWS>>,
-    JoinProbeFactories<
-        K,
-        TRACK_MATCHED_BUILD_ROWS,
-        STOP_AFTER_FIRST_MATCH,
-        TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_ROWS,
-        EMIT_MARK_COLUMN,
-    >,
-    Arc<AtomicBool>,
-);
-type NormalizingJoinFactories<
-    K,
-    const TRACK_MATCHED_BUILD_ROWS: bool,
-    const STOP_AFTER_FIRST_MATCH: bool,
-    const TRACK_UNMATCHED_PROBE_ROWS: bool,
-    const DISCARD_MATCHED_ROWS: bool,
-    const EMIT_MARK_COLUMN: bool,
-> = (
-    Vec<NormalizingJoinBuildFactory<K, TRACK_MATCHED_BUILD_ROWS>>,
-    Vec<JoinBuildCollector<K, TRACK_MATCHED_BUILD_ROWS>>,
-    JoinProbeFactories<
-        K,
-        TRACK_MATCHED_BUILD_ROWS,
-        STOP_AFTER_FIRST_MATCH,
-        TRACK_UNMATCHED_PROBE_ROWS,
-        DISCARD_MATCHED_ROWS,
-        EMIT_MARK_COLUMN,
-    >,
-    Arc<AtomicBool>,
-);
 
 /// Creates one [`Probe`] per worker, all sharing the same [`JoinTable`].
 pub struct JoinProbeFactory<
@@ -148,14 +109,20 @@ pub fn create_for_workers<
 >(
     spec: JoinSpec,
     worker_count: usize,
-) -> DirectJoinFactories<
-    K,
-    TRACK_MATCHED_BUILD_ROWS,
-    STOP_AFTER_FIRST_MATCH,
-    TRACK_UNMATCHED_PROBE_ROWS,
-    DISCARD_MATCHED_ROWS,
-    EMIT_MARK_COLUMN,
-> {
+) -> (
+    impl WorkerMaker<DirectJoinBuildFactory<K, TRACK_MATCHED_BUILD_ROWS>>,
+    impl WorkerMaker<
+        ProbeFactory<
+            K,
+            TRACK_MATCHED_BUILD_ROWS,
+            STOP_AFTER_FIRST_MATCH,
+            TRACK_UNMATCHED_PROBE_ROWS,
+            DISCARD_MATCHED_ROWS,
+            EMIT_MARK_COLUMN,
+        >,
+    >,
+    Arc<AtomicBool>,
+) {
     debug_assert_eq!(
         TRACK_MATCHED_BUILD_ROWS,
         matches!(
@@ -219,47 +186,44 @@ pub fn create_for_workers<
     let table_clone = table.clone();
     let hs_clone = hash_state.clone();
     let probe_gate = build_ready.clone();
-    let build_factories = (0..worker_count)
-        .map(|_| {
-            let filter_arrays: WorkerFilterArrays = Arc::new(OnceLock::new());
-            let outputter = JoinBuilder::new(
-                table.clone(),
-                injector.clone(),
-                jobs_injected.clone(),
-                build_ready.clone(),
-                remaining_jobs.clone(),
-                gather.clone(),
-                partitions,
-                spec.build_output_indices.clone(),
-                spec.build_filters.clone(),
-                filter_arrays.clone(),
-                pending_key_bitsets.clone(),
-            );
-            JoinBuildFactory {
-                key_columns: spec.build_key_indices.clone(),
-                filter_columns: spec
-                    .build_filters
-                    .iter()
-                    .map(|filter| filter.build_column)
-                    .collect(),
-                hash_state: hash_state.clone(),
-                outputter,
-                filter_arrays,
-                partitions,
-                _key: PhantomData,
-            }
-        })
-        .collect::<Vec<_>>();
+    let probe_spec = spec.clone();
+    let build_factories = per_worker(move |_| {
+        let filter_arrays: WorkerFilterArrays = Arc::new(OnceLock::new());
+        let outputter = JoinBuilder::new(
+            table.clone(),
+            injector.clone(),
+            jobs_injected.clone(),
+            build_ready.clone(),
+            remaining_jobs.clone(),
+            gather.clone(),
+            partitions,
+            spec.build_output_indices.clone(),
+            spec.build_filters.clone(),
+            filter_arrays.clone(),
+            pending_key_bitsets.clone(),
+        );
+        JoinBuildFactory {
+            key_columns: spec.build_key_indices.clone(),
+            filter_columns: spec
+                .build_filters
+                .iter()
+                .map(|filter| filter.build_column)
+                .collect(),
+            hash_state: hash_state.clone(),
+            outputter,
+            filter_arrays,
+            partitions,
+            _key: PhantomData,
+        }
+    });
 
     let unmatched = Arc::new(UnmatchedScan::new(worker_count));
-    let probe_factories = (0..worker_count)
-        .map(move |_| JoinProbeFactory {
-            table: table_clone.clone(),
-            hash_state: hs_clone.clone(),
-            spec: spec.clone(),
-            unmatched: unmatched.clone(),
-        })
-        .collect();
+    let probe_factories = per_worker(move |_| JoinProbeFactory {
+        table: table_clone.clone(),
+        hash_state: hs_clone.clone(),
+        spec: probe_spec.clone(),
+        unmatched: unmatched.clone(),
+    });
 
     (build_factories, probe_factories, probe_gate)
 }
@@ -279,14 +243,21 @@ pub(crate) fn create_normalizing_for_workers<
     spec: JoinSpec,
     worker_count: usize,
     collector_worker: usize,
-) -> NormalizingJoinFactories<
-    K,
-    TRACK_MATCHED_BUILD_ROWS,
-    STOP_AFTER_FIRST_MATCH,
-    TRACK_UNMATCHED_PROBE_ROWS,
-    DISCARD_MATCHED_ROWS,
-    EMIT_MARK_COLUMN,
-> {
+) -> (
+    impl WorkerMaker<NormalizingJoinBuildFactory<K, TRACK_MATCHED_BUILD_ROWS>>,
+    impl WorkerMaker<JoinBuildCollector<K, TRACK_MATCHED_BUILD_ROWS>>,
+    impl WorkerMaker<
+        ProbeFactory<
+            K,
+            TRACK_MATCHED_BUILD_ROWS,
+            STOP_AFTER_FIRST_MATCH,
+            TRACK_UNMATCHED_PROBE_ROWS,
+            DISCARD_MATCHED_ROWS,
+            EMIT_MARK_COLUMN,
+        >,
+    >,
+    Arc<AtomicBool>,
+) {
     let (build_factories, probe_factories, build_ready) = create_for_workers::<
         K,
         TRACK_MATCHED_BUILD_ROWS,
@@ -296,29 +267,35 @@ pub(crate) fn create_normalizing_for_workers<
         EMIT_MARK_COLUMN,
     >(spec, worker_count);
     let normalizers = Normalizer::create_for_workers(worker_count);
-    let mut normalized_builds = Vec::with_capacity(worker_count);
-    let mut collectors = Vec::with_capacity(worker_count);
-    for (worker, (build, normalizer)) in build_factories.into_iter().zip(normalizers).enumerate() {
-        let JoinBuildFactory {
-            key_columns,
-            filter_columns,
-            hash_state,
-            outputter,
-            filter_arrays,
-            partitions,
-            _key,
-        } = build;
-        normalized_builds.push(JoinBuildFactory {
-            key_columns,
-            filter_columns,
-            hash_state,
-            outputter: normalizer,
-            filter_arrays,
-            partitions,
-            _key,
-        });
-        collectors.push(CollectorFactory::new(outputter, worker == collector_worker));
-    }
+    // A worker's normalized build and its collector share one filter-array
+    // cell, so both come from the one build factory made for it.
+    let (normalized_builds, collectors) = split(
+        worker_count,
+        per_worker(move |worker| {
+            let JoinBuildFactory {
+                key_columns,
+                filter_columns,
+                hash_state,
+                outputter,
+                filter_arrays,
+                partitions,
+                _key,
+            } = build_factories.make(worker);
+            let normalized = JoinBuildFactory {
+                key_columns,
+                filter_columns,
+                hash_state,
+                outputter: normalizers.make(worker),
+                filter_arrays,
+                partitions,
+                _key,
+            };
+            (
+                normalized,
+                CollectorFactory::new(outputter, worker == collector_worker),
+            )
+        }),
+    );
     (normalized_builds, collectors, probe_factories, build_ready)
 }
 

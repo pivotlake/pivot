@@ -16,6 +16,7 @@ mod keys;
 
 pub use k_way_merge::{KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput};
 
+use crate::api::{WorkerMaker, per_worker, split};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -239,11 +240,13 @@ pub struct OrderByFactory<O = RunMerger> {
 
 type NormalizingOrderByFactory = OrderByFactory<Normalizer<WorkerRuns>>;
 type OrderByCollectorFactory = CollectorFactory<WorkerRuns, RunMerger>;
-type NormalizingOrderByFactories = (Vec<NormalizingOrderByFactory>, Vec<OrderByCollectorFactory>);
 
 impl OrderByFactory<RunMerger> {
     /// Creates one factory per worker with shared merge coordination.
-    pub fn create_for_workers(order_by: Vec<OrderBy>, topology: Topology) -> Vec<OrderByFactory> {
+    pub fn create_for_workers(
+        order_by: Vec<OrderBy>,
+        topology: Topology,
+    ) -> impl WorkerMaker<OrderByFactory> {
         let order_by: Arc<[OrderBy]> = order_by.into();
         let shared = Arc::new(SharedMergeState {
             order_by: order_by.clone(),
@@ -258,22 +261,20 @@ impl OrderByFactory<RunMerger> {
             merges_complete: AtomicBool::new(false),
             output_claimed: AtomicBool::new(false),
         });
-        (0..topology.total_workers())
-            .map(|worker_id| {
-                let node_id = topology.node_of_worker(worker_id);
-                let local_worker_id = topology.local_index_of_worker(worker_id);
-                OrderByFactory {
-                    order_by: order_by.clone(),
+        per_worker(move |worker_id| {
+            let node_id = topology.node_of_worker(worker_id);
+            let local_worker_id = topology.local_index_of_worker(worker_id);
+            OrderByFactory {
+                order_by: order_by.clone(),
+                node_id,
+                local_worker_id,
+                outputter: RunMerger {
+                    shared: shared.clone(),
                     node_id,
-                    local_worker_id,
-                    outputter: RunMerger {
-                        shared: shared.clone(),
-                        node_id,
-                        allocator: None,
-                    },
-                }
-            })
-            .collect()
+                    allocator: None,
+                },
+            }
+        })
     }
 }
 
@@ -284,27 +285,33 @@ pub(crate) fn create_normalizing_for_workers(
     order_by: Vec<OrderBy>,
     topology: Topology,
     collector_worker: usize,
-) -> NormalizingOrderByFactories {
+) -> (
+    impl WorkerMaker<NormalizingOrderByFactory>,
+    impl WorkerMaker<OrderByCollectorFactory>,
+) {
     let direct = OrderByFactory::create_for_workers(order_by, topology);
     let normalizers = Normalizer::create_for_workers(topology.total_workers());
-    let mut sorters = Vec::with_capacity(topology.total_workers());
-    let mut collectors = Vec::with_capacity(topology.total_workers());
-    for (worker, (factory, normalizer)) in direct.into_iter().zip(normalizers).enumerate() {
-        let OrderByFactory {
-            order_by,
-            node_id,
-            local_worker_id,
-            outputter,
-        } = factory;
-        sorters.push(OrderByFactory {
-            order_by,
-            node_id,
-            local_worker_id,
-            outputter: normalizer,
-        });
-        collectors.push(CollectorFactory::new(outputter, worker == collector_worker));
-    }
-    (sorters, collectors)
+    split(
+        topology.total_workers(),
+        per_worker(move |worker| {
+            let OrderByFactory {
+                order_by,
+                node_id,
+                local_worker_id,
+                outputter,
+            } = direct.make(worker);
+            let sorter = OrderByFactory {
+                order_by,
+                node_id,
+                local_worker_id,
+                outputter: normalizers.make(worker),
+            };
+            (
+                sorter,
+                CollectorFactory::new(outputter, worker == collector_worker),
+            )
+        }),
+    )
 }
 
 impl<O, Out> UnaryFactory<RecordBatch, Out> for OrderByFactory<O>
@@ -510,8 +517,10 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     fn consumers(order_by: Vec<OrderBy>, worker_count: usize) -> Vec<OrderBySorter> {
-        OrderByFactory::create_for_workers(order_by, Topology::single_node(worker_count))
-            .into_iter()
+        let maker =
+            OrderByFactory::create_for_workers(order_by, Topology::single_node(worker_count));
+        (0..worker_count)
+            .map(|worker| maker.make(worker))
             .map(|factory| match factory.build_unary() {
                 PipelineBreaker::Consuming(sorter) => sorter,
                 _ => unreachable!("factories build consuming breakers"),
@@ -570,14 +579,14 @@ mod tests {
         let node_wakers: Vec<_> = (0..2).map(|_| Arc::new(WorkerWaker::new(1))).collect();
         init_worker_waker(&node_wakers[0]);
         init_waker_set(WakerSet::new(node_wakers, 1));
-        let mut consumers: Vec<_> =
-            OrderByFactory::create_for_workers(ascending_by_key(), topology)
-                .into_iter()
-                .map(|factory| match factory.build_unary() {
-                    PipelineBreaker::Consuming(sorter) => sorter,
-                    _ => unreachable!("factories build consuming breakers"),
-                })
-                .collect();
+        let maker = OrderByFactory::create_for_workers(ascending_by_key(), topology);
+        let mut consumers: Vec<_> = (0..topology.total_workers())
+            .map(|worker| maker.make(worker))
+            .map(|factory| match factory.build_unary() {
+                PipelineBreaker::Consuming(sorter) => sorter,
+                _ => unreachable!("factories build consuming breakers"),
+            })
+            .collect();
         let mut ignored = CollectSender::new();
         consumers[0]
             .consume(int_batch(&[9, 1, 5]), &mut ignored)

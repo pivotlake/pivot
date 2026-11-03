@@ -10,6 +10,7 @@
 //! locality. Callers should therefore reserve it for work large enough to
 //! justify those costs.
 
+use crate::api::WorkerMaker;
 use crate::operations::channels;
 use crate::operations::channels::{ChannelFactory, Receiver, Sender};
 use crate::waker::worker_waker;
@@ -73,11 +74,29 @@ impl<T> Receiver<T> for SharedWorkQueueReceiver<T> {
 }
 
 /// Creates `worker_count` endpoints backed by one queue.
-pub fn shared_work_queue<T: Send>(
-    worker_count: usize,
-) -> impl IntoIterator<Item = SharedWorkQueueChannelFactory<T>> {
-    let queue = Arc::new(Injector::new());
-    (0..worker_count).map(move |_| SharedWorkQueueChannelFactory {
-        queue: queue.clone(),
-    })
+/// A shared work queue stage: one queue every worker's endpoint polls.
+pub struct SharedWorkQueueStage<T: Send> {
+    queue: Arc<Injector<T>>,
+}
+
+crate::maker_into_worker_maker!(
+    SharedWorkQueueStage<T>,
+    SharedWorkQueueChannelFactory<T>,
+    [T],
+    [T: Send + 'static]
+);
+
+impl<T: Send + 'static> WorkerMaker<SharedWorkQueueChannelFactory<T>> for SharedWorkQueueStage<T> {
+    fn make(&self, _worker_idx: usize) -> SharedWorkQueueChannelFactory<T> {
+        SharedWorkQueueChannelFactory {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+/// One queue shared by every worker of the stage.
+pub fn shared_work_queue<T: Send + 'static>(_worker_count: usize) -> SharedWorkQueueStage<T> {
+    SharedWorkQueueStage {
+        queue: Arc::new(Injector::new()),
+    }
 }

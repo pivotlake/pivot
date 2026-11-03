@@ -115,6 +115,29 @@ where
     }
 }
 
+/// Like [`FilterFactory`], holding the stage's one builder shared by every
+/// worker, which runs it on its own thread (see
+/// [`SharedMapFactory`](crate::operations::SharedMapFactory)).
+pub struct SharedFilterFactory<FB>(pub std::sync::Arc<FB>, pub RowDelivery);
+
+impl<F, FB> UnaryFactory<RecordBatch, RecordBatch> for SharedFilterFactory<FB>
+where
+    FB: Fn() -> F + Send + Sync + 'static,
+    F: FnMut(
+            &RecordBatch,
+            &mut SlabAllocator,
+            &mut SelectionScratch,
+        ) -> unary::Result<RowSelection>
+        + Send
+        + 'static,
+{
+    type Unary = Filter<F>;
+
+    fn build_unary(self) -> Self::Unary {
+        FilterFactory((self.0)(), self.1).build_unary()
+    }
+}
+
 pub struct Filter<F>
 where
     F: FnMut(

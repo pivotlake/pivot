@@ -22,6 +22,7 @@
 //! `AVG(x)` to `sum(x) / count(x)`, so an average arrives as a `Sum` slot and a
 //! `Count` slot.
 
+use crate::api::{HandOut, WorkerMaker, per_worker};
 use crate::cpu_features::multitarget_kernel;
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
@@ -41,6 +42,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
 
 /// A numeric aggregate op (`SUM`/`MIN`/`MAX`) shared by the integer and float
@@ -490,15 +492,19 @@ impl<A: IntCell> AggregateFactory<A> {
     pub fn create_for_workers(
         specs: Vec<AggregationSlot>,
         worker_count: usize,
-    ) -> impl IntoIterator<Item = AggregateFactory<A>> {
+    ) -> impl WorkerMaker<AggregateFactory<A>> {
         let specs = Arc::new(specs);
         let (tx, rx) = mpsc::channel();
-        let mut rx_opt = Some(rx);
-
-        (0..worker_count).map(move |_| AggregateFactory {
+        // The first worker's aggregate collects every worker's slots, and
+        // sees the channel close once every worker's aggregate has sent.
+        let sender = HandOut::new(tx, worker_count);
+        let receiver = Mutex::new(Some(rx));
+        per_worker(move |worker_idx| AggregateFactory {
             specs: specs.clone(),
-            sender: tx.clone(),
-            receiver: rx_opt.take(),
+            sender: sender.take(),
+            receiver: (worker_idx == 0)
+                .then(|| receiver.lock().expect("never poisoned").take())
+                .flatten(),
         })
     }
 }

@@ -11,8 +11,8 @@
 //! parallelism-aware, and workers synchronize with each other only at the deepest level
 //! (a running `Operator`).
 //!
-//! The main execution is done through sending a [`DataFlowBuilder`] to each worker. For a
-//! given query, every worker receives the full dataflow (source through output), with each
+//! The main execution is done through publishing a dataflow once for every worker to take. For a
+//! given query, every worker builds the full dataflow (source through output), with each
 //! stage able to synchronize across workers. For example, in a `Table -> Filter -> Aggregate`
 //! query, each worker filters its own chunk of data and maintains a local count, then the
 //! aggregate operators coordinate to produce the final result.
@@ -54,9 +54,9 @@
 // a published API — so allow public docs to reference private items.
 #![allow(rustdoc::private_intra_doc_links)]
 
+use api::launch::{LaunchLog, WorkerLaunch};
 use core_affinity::CoreId;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Sender as StdSender, channel};
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use tikv_jemallocator::Jemalloc;
@@ -123,10 +123,10 @@ pub use stats::StatsCollector;
 
 pub use operations::channels::{
     ChannelFactory, FanInChannelFactory, MpscReceiver, NodeIdOutput, NodeWorkQueueChannelFactory,
-    Receiver, ReturnToWorkerMpscFactory, RootChannelFactory, SharedWorkQueueChannelFactory,
-    StealableChannelFactory, WorkerAwareSender, WorkerIdOutput, fan_in, mpsc_channel,
-    node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, stealable_fifo,
-    to_single_worker_mpsc,
+    NodeWorkQueueStage, Receiver, ReturnToWorkerMpscFactory, RootChannelFactory,
+    SharedWorkQueueChannelFactory, SharedWorkQueueStage, StealableChannelFactory, StealableStage,
+    WorkerAwareSender, WorkerIdOutput, fan_in, mpsc_channel, node_work_queue,
+    return_to_worker_mpsc, shared_work_queue, stealable, stealable_fifo, to_single_worker_mpsc,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use operations::unary::test_utils;
@@ -184,8 +184,8 @@ impl Shutdown {
 
 #[derive(Clone)]
 pub struct DataFlowDispatcher {
-    /// One channel per worker, in global worker order (node 0's workers first).
-    senders: Vec<StdSender<DataFlowBuilder>>,
+    /// Where a launched dataflow is published once for every worker to take.
+    launch_log: Arc<LaunchLog>,
     /// The worker/node shape, mirrored by every per-worker structure a
     /// dataflow builds (channels, sibling counters).
     topology: numa::Topology,
@@ -227,16 +227,11 @@ impl DataFlowDispatcher {
 }
 
 impl DataFlowDispatcher {
-    /// Dispatch one pre-built `DataFlow` bundle across the node groups.
-    /// Builder `i` goes to global worker `i` (node `i / workers_per_node`). A
-    /// full bundle has one builder per worker; a shorter one reaches only the
-    /// first workers, consistent with the dense `0..builder_count` indexing its
-    /// channels were built for. Returns the wakers of every node, so cancellation
-    /// can wake parked workers on any node.
-    pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) -> WakerSet {
-        for (worker, builder) in builders.into_iter().enumerate() {
-            self.senders[worker].send(builder).unwrap();
-        }
+    /// Hand a dataflow to every worker: publish it once and wake the pool.
+    /// Returns the wakers of every node, so cancellation can wake parked
+    /// workers on any node.
+    pub(crate) fn launch(&self, launch: Arc<dyn WorkerLaunch>) -> WakerSet {
+        self.launch_log.publish(launch);
         // Wake idle workers on every node so they pick up the new dataflow
         // without waiting out their park.
         self.waker_set.notify_all_delegated();
@@ -317,13 +312,13 @@ impl DataFlowDispatcher {
 /// Owns the worker threads and exposes a [`DataFlowDispatcher`] for sending work to them.
 ///
 /// Created via [`Dispatch::spin_up`], which spawns one `Worker` per CPU core (pinned
-/// to its core, connected via an mpsc channel for receiving [`DataFlowBuilder`]s) and
+/// to its core, taking launched dataflows from the pool's shared log) and
 /// then blocks until all workers have completed their startup. Borrow the inner
 /// dispatcher with [`dispatcher`](Self::dispatcher) and shut everything down with
 /// [`exit`](Self::exit).
 ///
 /// `Dispatch` does not actively schedule — [`push_data_flow`](DataFlowDispatcher::push_data_flow)
-/// just sends one `DataFlowBuilder` to each worker. The workers themselves drive
+/// just publishes a dataflow for every worker to take. The workers themselves drive
 /// execution in their own event loops.
 pub struct Dispatch {
     dataflow_dispatcher: DataFlowDispatcher,
@@ -404,12 +399,10 @@ impl Dispatch {
             .collect();
         let waker_set = WakerSet::new(node_wakers.clone(), topology.workers_per_node);
 
+        let launch_log = Arc::new(LaunchLog::new(total_workers));
         let mut threads = vec![];
-        let mut senders = vec![];
         for (node, group) in core_groups.into_iter().enumerate() {
             for (node_local_idx, core) in group.into_iter().enumerate() {
-                let (tx, rx) = channel();
-                senders.push(tx);
                 threads.push(Worker::create(
                     node * topology.workers_per_node + node_local_idx,
                     total_workers,
@@ -418,7 +411,7 @@ impl Dispatch {
                     should_exit.clone(),
                     memory_factories.next().unwrap(),
                     disk_cache.clone(),
-                    rx,
+                    launch_log.clone(),
                     barrier.clone(),
                     node_wakers[node].clone(),
                     waker_set.clone(),
@@ -430,7 +423,7 @@ impl Dispatch {
 
         Dispatch {
             dataflow_dispatcher: DataFlowDispatcher {
-                senders,
+                launch_log,
                 topology,
                 waker_set: waker_set.clone(),
                 buffers: layout.total_slots(),

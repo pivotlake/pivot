@@ -155,12 +155,7 @@ impl CopyFromStdin {
             })
             .collect();
         let conformed = batches
-            .chain(
-                stealable::<RecordBatch>(dispatcher.topology())
-                    .into_iter()
-                    .collect(),
-                conformers,
-            )
+            .chain(stealable::<RecordBatch>(dispatcher.topology()), conformers)
             .record_batches();
         let insert = self.table.compile_insert(conformed, dispatcher)?;
         Ok((sender, insert))

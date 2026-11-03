@@ -49,7 +49,6 @@
 //! See [`OperatorFactory`] and [`operator_spec`](super::operator_spec) for
 //! details on why this split exists.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -58,16 +57,17 @@ use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
+use crate::api::{WorkerMaker, per_worker};
 use crate::boundary_slot::BoundarySlot;
 use crate::operations::channels::{
     SingleWorkerMpscFactory, StealableChannelFactory, stealable, to_single_worker_mpsc,
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CteFactory, CteScanFactory, Distinct,
-    DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind,
-    JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
-    NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory,
-    OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
+    DynamicRowKey, F64Cell, GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind,
+    JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, NoOpNullaryFactory,
+    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory, OrderByLimitFactory,
+    PackedKey, RangeJoinSpec, SharedFilterFactory, SharedMapFactory, SingleColumnKey, UnaryFactory,
     UnaryOperatorFactory, WideCell, copy_out, create_join_factories,
     create_normalizing_join_factories, create_normalizing_order_by_factories,
     create_range_join_factories,
@@ -141,9 +141,20 @@ pub const RECORD_BATCH_SIZE: usize = 8192;
 /// })
 /// # ;
 /// ```
+/// Makes one worker's operator chain, on that worker.
+type ChainMaker = Box<dyn WorkerMaker<Box<dyn OperatorFactory<RecordBatch>>>>;
+
+/// A maker of each worker's chain from a closure, erased to a [`ChainMaker`].
+fn chain_maker<F>(make: F) -> ChainMaker
+where
+    F: Fn(usize) -> Box<dyn OperatorFactory<RecordBatch>> + Send + Sync + 'static,
+{
+    Box::new(per_worker(make))
+}
+
 pub struct RecordBatchOperatorSpec {
     dispatcher: DataFlowDispatcher,
-    factories: VecDeque<Box<dyn OperatorFactory<RecordBatch>>>,
+    make: ChainMaker,
     /// Whether batches form one ordered stream. Downstream stages must then
     /// consume through FIFO rather than work-stealing queues, which may reorder
     /// batches even when every batch is internally sorted.
@@ -167,12 +178,12 @@ impl OutputBatch for RecordBatch {
 
 /// Return type of [`RecordBatchOperatorSpec::map`]: a generic
 /// [`OperatorSpec<T, _>`] wrapping the RB→T map stage.
-type MapOperatorSpec<T, F> = OperatorSpec<
+type MapOperatorSpec<T, FB> = OperatorSpec<
     T,
     UnaryOperatorFactory<
         RecordBatch,
         T,
-        MapFactory<F>,
+        SharedMapFactory<FB>,
         StealableChannelFactory<RecordBatch>,
         Box<dyn OperatorFactory<RecordBatch>>,
     >,
@@ -180,12 +191,12 @@ type MapOperatorSpec<T, F> = OperatorSpec<
 
 /// FIFO counterpart to [`MapOperatorSpec`], used when mapping a stream whose
 /// batch order is already significant.
-type OrderedMapOperatorSpec<T, F> = OperatorSpec<
+type OrderedMapOperatorSpec<T, FB> = OperatorSpec<
     T,
     UnaryOperatorFactory<
         RecordBatch,
         T,
-        MapFactory<F>,
+        SharedMapFactory<FB>,
         SingleWorkerMpscFactory<RecordBatch>,
         Box<dyn OperatorFactory<RecordBatch>>,
     >,
@@ -199,26 +210,21 @@ impl RecordBatchOperatorSpec {
     pub fn from_spec<OF: OperatorFactory<RecordBatch> + 'static>(
         spec: OperatorSpec<RecordBatch, OF>,
     ) -> Self {
-        let (dispatcher, factories) = spec.into_parts();
+        let (dispatcher, make) = spec.into_parts();
         Self {
             dispatcher,
-            factories: factories
-                .into_iter()
-                .map(|f| Box::new(f) as Box<dyn OperatorFactory<RecordBatch>>)
-                .collect(),
+            make: chain_maker(move |worker_idx| {
+                Box::new(make.make(worker_idx)) as Box<dyn OperatorFactory<RecordBatch>>
+            }),
             stream_ordered: false,
         }
     }
 
-    /// Decompose into the dispatcher and per-worker factories, so out-of-crate
-    /// code (e.g. late materialization in `catalog`) can chain further stages.
-    pub fn into_parts(
-        self,
-    ) -> (
-        DataFlowDispatcher,
-        VecDeque<Box<dyn OperatorFactory<RecordBatch>>>,
-    ) {
-        (self.dispatcher, self.factories)
+    /// Decompose into the dispatcher and the maker of each worker's chain, so
+    /// out-of-crate code (e.g. late materialization in `catalog`) can chain
+    /// further stages.
+    pub fn into_parts(self) -> (DataFlowDispatcher, ChainMaker) {
+        (self.dispatcher, self.make)
     }
 
     /// Build a `RecordBatchOperatorSpec` from per-worker nullary factories.
@@ -243,10 +249,21 @@ impl RecordBatchOperatorSpec {
     /// work and finishes on its first finish pass. This is the plan for a
     /// statement that turns out to have nothing to do.
     pub fn no_op(dispatcher: &DataFlowDispatcher) -> Self {
-        Self::from_nullary(
-            dispatcher,
-            (0..dispatcher.worker_count()).map(|_| NoOpNullaryFactory),
-        )
+        Self::from_nullary_maker(dispatcher, per_worker(|_| NoOpNullaryFactory))
+    }
+
+    /// Like [`from_nullary`](Self::from_nullary), each worker making its own
+    /// nullary factory.
+    pub fn from_nullary_maker<NF: NullaryFactory<RecordBatch>>(
+        dispatcher: &DataFlowDispatcher,
+        nullary_factories: impl WorkerMaker<NF>,
+    ) -> Self {
+        Self::from_spec(OperatorSpec::from_maker(
+            dispatcher.clone(),
+            per_worker(move |worker_idx| {
+                NullaryOperatorFactory::new(nullary_factories.make(worker_idx))
+            }),
+        ))
     }
 
     /// One scan site of a CTE: a source over every row the CTE's definition
@@ -259,19 +276,16 @@ impl RecordBatchOperatorSpec {
     /// finishes.
     pub fn cte_scan(dispatcher: &DataFlowDispatcher, cte_index: usize) -> Self {
         let siblings_left = Arc::new(AtomicUsize::new(dispatcher.worker_count()));
-        let factories = stealable::<RecordBatch>(dispatcher.topology())
-            .into_iter()
-            .map(|channel_factory| {
-                Box::new(CteScanFactory {
-                    channel_factory,
-                    cte_index,
-                    siblings_left: siblings_left.clone(),
-                }) as Box<dyn OperatorFactory<RecordBatch>>
-            })
-            .collect();
+        let channels = stealable::<RecordBatch>(dispatcher.topology());
         Self {
             dispatcher: dispatcher.clone(),
-            factories,
+            make: chain_maker(move |worker_idx| {
+                Box::new(CteScanFactory {
+                    channel_factory: channels.make(worker_idx),
+                    cte_index,
+                    siblings_left: siblings_left.clone(),
+                })
+            }),
             stream_ordered: false,
         }
     }
@@ -289,28 +303,23 @@ impl RecordBatchOperatorSpec {
         cte_index: usize,
         sites: usize,
     ) -> Self {
-        let (_, definition_heads) = definition.into_parts();
         assert_eq!(
-            self.factories.len(),
-            definition_heads.len(),
+            self.worker_count(),
+            definition.worker_count(),
             "a CTE and its definition must use the same worker count"
         );
-        let factories = self
-            .factories
-            .into_iter()
-            .zip(definition_heads)
-            .map(|(body_head, definition_head)| {
-                Box::new(CteFactory {
-                    definition_head,
-                    body_head,
-                    cte_index,
-                    sites,
-                }) as Box<dyn OperatorFactory<RecordBatch>>
-            })
-            .collect();
+        let (_, definition_heads) = definition.into_parts();
+        let body_heads = self.make;
         Self {
             dispatcher: self.dispatcher,
-            factories,
+            make: chain_maker(move |worker_idx| {
+                Box::new(CteFactory {
+                    definition_head: definition_heads.make(worker_idx),
+                    body_head: body_heads.make(worker_idx),
+                    cte_index,
+                    sites,
+                })
+            }),
             stream_ordered: self.stream_ordered,
         }
     }
@@ -322,52 +331,46 @@ impl RecordBatchOperatorSpec {
 
     /// Append a unary (one-in, one-out) stage to the dataflow.
     ///
-    /// Takes an iterator of [`UnaryFactory`] instances (one per worker) and wraps
-    /// each existing factory with a [`UnaryOperatorFactory`].
+    /// Takes a maker of the stage's [`UnaryFactory`] (one per worker) and wraps
+    /// each worker's existing chain with a [`UnaryOperatorFactory`].
     fn unary<UF: UnaryFactory<RecordBatch, RecordBatch>>(
         self,
-        unary_factories: impl IntoIterator<Item = UF>,
+        unary_factories: impl WorkerMaker<UF>,
     ) -> Self {
         let siblings_left = Arc::new(AtomicUsize::new(self.worker_count()));
-        let factories = if self.stream_ordered {
+        let heads = self.make;
+        let make = if self.stream_ordered {
             let target = self.dispatcher.next_worker();
-            to_single_worker_mpsc::<RecordBatch>(self.worker_count(), target)
-                .into_iter()
-                .zip(unary_factories)
-                .zip(self.factories)
-                .map(|((channel_factory, unary_factory), head)| {
-                    Box::new(UnaryOperatorFactory::new(
-                        head,
-                        unary_factory,
-                        channel_factory,
-                        siblings_left.clone(),
-                    )) as Box<dyn OperatorFactory<RecordBatch>>
-                })
-                .collect()
+            let channels =
+                to_single_worker_mpsc::<RecordBatch>(self.dispatcher.worker_count(), target);
+            chain_maker(move |worker_idx| {
+                Box::new(UnaryOperatorFactory::new(
+                    heads.make(worker_idx),
+                    unary_factories.make(worker_idx),
+                    channels.make(worker_idx),
+                    siblings_left.clone(),
+                ))
+            })
         } else {
-            stealable::<RecordBatch>(self.dispatcher.topology())
-                .into_iter()
-                .zip(unary_factories)
-                .zip(self.factories)
-                .map(|((channel_factory, unary_factory), head)| {
-                    Box::new(UnaryOperatorFactory::new(
-                        head,
-                        unary_factory,
-                        channel_factory,
-                        siblings_left.clone(),
-                    )) as Box<dyn OperatorFactory<RecordBatch>>
-                })
-                .collect()
+            let channels = stealable::<RecordBatch>(self.dispatcher.topology());
+            chain_maker(move |worker_idx| {
+                Box::new(UnaryOperatorFactory::new(
+                    heads.make(worker_idx),
+                    unary_factories.make(worker_idx),
+                    channels.make(worker_idx),
+                    siblings_left.clone(),
+                ))
+            })
         };
         Self {
             dispatcher: self.dispatcher,
-            factories,
+            make,
             stream_ordered: self.stream_ordered,
         }
     }
 
     fn worker_count(&self) -> usize {
-        self.factories.len()
+        self.dispatcher.worker_count()
     }
 
     /// Filter rows from each batch.
@@ -416,7 +419,7 @@ impl RecordBatchOperatorSpec {
             ) -> crate::UnaryResult<crate::RowSelection>
             + Send
             + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         self.filter_with_delivery(builder, crate::RowDelivery::Coalesced)
     }
@@ -437,10 +440,12 @@ impl RecordBatchOperatorSpec {
             ) -> crate::UnaryResult<crate::RowSelection>
             + Send
             + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
-        let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| FilterFactory(builder(), delivery)))
+        let builder = Arc::new(builder);
+        self.unary(per_worker(move |_| {
+            SharedFilterFactory(builder.clone(), delivery)
+        }))
     }
 
     /// Apply a per-batch 1→1 transform that can change the output type.
@@ -476,56 +481,55 @@ impl RecordBatchOperatorSpec {
     /// })
     /// # ;
     /// ```
-    pub fn map<T, F, FB>(self, builder: FB) -> MapOperatorSpec<T, F>
+    pub fn map<T, F, FB>(self, builder: FB) -> MapOperatorSpec<T, FB>
     where
         T: Send + 'static,
         F: FnMut(RecordBatch) -> crate::UnaryResult<T> + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
-        let worker_count = self.worker_count();
-        let siblings_left = Arc::new(AtomicUsize::new(worker_count));
-        let factories: Vec<_> = stealable::<RecordBatch>(self.dispatcher.topology())
-            .into_iter()
-            .zip((0..worker_count).map(|_| MapFactory(builder())))
-            .zip(self.factories)
-            .map(|((channel_factory, unary_factory), head)| {
+        let siblings_left = Arc::new(AtomicUsize::new(self.worker_count()));
+        let builder = Arc::new(builder);
+        let channels = stealable::<RecordBatch>(self.dispatcher.topology());
+        let heads = self.make;
+        OperatorSpec::from_maker(
+            self.dispatcher,
+            per_worker(move |worker_idx| {
                 UnaryOperatorFactory::new(
-                    head,
-                    unary_factory,
-                    channel_factory,
+                    heads.make(worker_idx),
+                    SharedMapFactory(builder.clone()),
+                    channels.make(worker_idx),
                     siblings_left.clone(),
                 )
-            })
-            .collect();
-        OperatorSpec::new(self.dispatcher, factories)
+            }),
+        )
     }
 
     /// Apply a type-changing map without changing an already-established
     /// batch order. The ordered producer emits from one worker, and the FIFO
     /// channel delivers those batches to one consumer in the same sequence.
-    fn map_ordered<T, F, FB>(self, builder: FB) -> OrderedMapOperatorSpec<T, F>
+    fn map_ordered<T, F, FB>(self, builder: FB) -> OrderedMapOperatorSpec<T, FB>
     where
         T: Send + 'static,
         F: FnMut(RecordBatch) -> crate::UnaryResult<T> + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
         let siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let target = self.dispatcher.next_worker();
-        let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(worker_count, target)
-            .into_iter()
-            .zip((0..worker_count).map(|_| MapFactory(builder())))
-            .zip(self.factories)
-            .map(|((channel_factory, unary_factory), head)| {
+        let builder = Arc::new(builder);
+        let channels = to_single_worker_mpsc::<RecordBatch>(worker_count, target);
+        let heads = self.make;
+        OperatorSpec::from_maker(
+            self.dispatcher,
+            per_worker(move |worker_idx| {
                 UnaryOperatorFactory::new(
-                    head,
-                    unary_factory,
-                    channel_factory,
+                    heads.make(worker_idx),
+                    SharedMapFactory(builder.clone()),
+                    channels.make(worker_idx),
                     siblings_left.clone(),
                 )
-            })
-            .collect();
-        OperatorSpec::new(self.dispatcher, factories)
+            }),
+        )
     }
 
     /// Sugar for [`map`](Self::map) when the output is `RecordBatch`: applies
@@ -539,10 +543,10 @@ impl RecordBatchOperatorSpec {
     pub fn project<F, FB>(self, builder: FB) -> Self
     where
         F: FnMut(RecordBatch) -> crate::UnaryResult<RecordBatch> + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
-        let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| MapFactory(builder())))
+        let builder = Arc::new(builder);
+        self.unary(per_worker(move |_| SharedMapFactory(builder.clone())))
     }
 
     /// Global aggregates (no GROUP BY): one or more `SUM`/`COUNT` slots over
@@ -628,63 +632,46 @@ impl RecordBatchOperatorSpec {
         let input_siblings = Arc::new(AtomicUsize::new(worker_count));
         let collector_siblings = Arc::new(AtomicUsize::new(worker_count));
         let group_channels = to_single_worker_mpsc(worker_count, collector_worker);
+        let heads = self.make;
 
-        let factories = if self.stream_ordered {
+        let make = if self.stream_ordered {
             let input_worker = self.dispatcher.next_worker();
             let input_channels = to_single_worker_mpsc::<RecordBatch>(worker_count, input_worker);
-            self.factories
-                .into_iter()
-                .zip(sorters)
-                .zip(collectors)
-                .zip(input_channels)
-                .zip(group_channels)
-                .map(
-                    |((((head, sorter), collector), input_channel), group_channel)| {
-                        let sorter = UnaryOperatorFactory::new(
-                            head,
-                            sorter,
-                            input_channel,
-                            input_siblings.clone(),
-                        );
-                        Box::new(UnaryOperatorFactory::new(
-                            sorter,
-                            collector,
-                            group_channel,
-                            collector_siblings.clone(),
-                        )) as Box<dyn OperatorFactory<RecordBatch>>
-                    },
-                )
-                .collect()
+            chain_maker(move |worker_idx| {
+                let sorter = UnaryOperatorFactory::new(
+                    heads.make(worker_idx),
+                    sorters.make(worker_idx),
+                    input_channels.make(worker_idx),
+                    input_siblings.clone(),
+                );
+                Box::new(UnaryOperatorFactory::new(
+                    sorter,
+                    collectors.make(worker_idx),
+                    group_channels.make(worker_idx),
+                    collector_siblings.clone(),
+                ))
+            })
         } else {
             let input_channels = stealable::<RecordBatch>(topology);
-            self.factories
-                .into_iter()
-                .zip(sorters)
-                .zip(collectors)
-                .zip(input_channels)
-                .zip(group_channels)
-                .map(
-                    |((((head, sorter), collector), input_channel), group_channel)| {
-                        let sorter = UnaryOperatorFactory::new(
-                            head,
-                            sorter,
-                            input_channel,
-                            input_siblings.clone(),
-                        );
-                        Box::new(UnaryOperatorFactory::new(
-                            sorter,
-                            collector,
-                            group_channel,
-                            collector_siblings.clone(),
-                        )) as Box<dyn OperatorFactory<RecordBatch>>
-                    },
-                )
-                .collect()
+            chain_maker(move |worker_idx| {
+                let sorter = UnaryOperatorFactory::new(
+                    heads.make(worker_idx),
+                    sorters.make(worker_idx),
+                    input_channels.make(worker_idx),
+                    input_siblings.clone(),
+                );
+                Box::new(UnaryOperatorFactory::new(
+                    sorter,
+                    collectors.make(worker_idx),
+                    group_channels.make(worker_idx),
+                    collector_siblings.clone(),
+                ))
+            })
         };
 
         Self {
             dispatcher: self.dispatcher,
-            factories,
+            make,
             stream_ordered: true,
         }
     }
@@ -1020,10 +1007,11 @@ impl RecordBatchOperatorSpec {
 
         let topology = self.dispatcher.topology();
         let (_, build_heads) = build.into_parts();
+        let probe_heads = self.make;
         let probe_siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let probe_channels = stealable::<RecordBatch>(topology);
 
-        let factories = if normalize_build {
+        let make = if normalize_build {
             let collector_worker = self.dispatcher.next_worker();
             let (build_factories, collector_factories, probe_factories, build_ready) =
                 create_normalizing_join_factories::<
@@ -1039,53 +1027,28 @@ impl RecordBatchOperatorSpec {
             let build_channels = stealable::<RecordBatch>(topology);
             let group_channels = to_single_worker_mpsc(worker_count, collector_worker);
 
-            self.factories
-                .into_iter()
-                .zip(build_heads)
-                .zip(build_factories)
-                .zip(collector_factories)
-                .zip(probe_factories)
-                .zip(build_channels)
-                .zip(group_channels)
-                .zip(probe_channels)
-                .map(
-                    |(
-                        (
-                            (
-                                (
-                                    (((probe_head, build_head), build_factory), collector_factory),
-                                    probe_factory,
-                                ),
-                                build_channel,
-                            ),
-                            group_channel,
-                        ),
-                        probe_channel_factory,
-                    )| {
-                        let first_breaker = UnaryOperatorFactory::new(
-                            build_head,
-                            build_factory,
-                            build_channel,
-                            build_siblings_left.clone(),
-                        );
-                        let build_graph = Box::new(UnaryOperatorFactory::new(
-                            first_breaker,
-                            collector_factory,
-                            group_channel,
-                            collector_siblings_left.clone(),
-                        ))
-                            as Box<dyn OperatorFactory<()>>;
-                        Box::new(JoinRecordBatchOperatorFactory {
-                            probe_head,
-                            build_graph,
-                            probe_factory,
-                            probe_channel_factory,
-                            probe_siblings_left: probe_siblings_left.clone(),
-                            build_ready: build_ready.clone(),
-                        }) as Box<dyn OperatorFactory<RecordBatch>>
-                    },
-                )
-                .collect()
+            chain_maker(move |worker_idx| {
+                let first_breaker = UnaryOperatorFactory::new(
+                    build_heads.make(worker_idx),
+                    build_factories.make(worker_idx),
+                    build_channels.make(worker_idx),
+                    build_siblings_left.clone(),
+                );
+                let build_graph = Box::new(UnaryOperatorFactory::new(
+                    first_breaker,
+                    collector_factories.make(worker_idx),
+                    group_channels.make(worker_idx),
+                    collector_siblings_left.clone(),
+                )) as Box<dyn OperatorFactory<()>>;
+                Box::new(JoinRecordBatchOperatorFactory {
+                    probe_head: probe_heads.make(worker_idx),
+                    build_graph,
+                    probe_factory: probe_factories.make(worker_idx),
+                    probe_channel_factory: probe_channels.make(worker_idx),
+                    probe_siblings_left: probe_siblings_left.clone(),
+                    build_ready: build_ready.clone(),
+                })
+            })
         } else {
             let (build_factories, probe_factories, build_ready) = create_join_factories::<
                 K,
@@ -1098,41 +1061,27 @@ impl RecordBatchOperatorSpec {
             let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
             let build_channels = stealable::<RecordBatch>(topology);
 
-            self.factories
-                .into_iter()
-                .zip(build_heads)
-                .zip(build_factories)
-                .zip(probe_factories)
-                .zip(build_channels)
-                .zip(probe_channels)
-                .map(
-                    |(
-                        ((((probe_head, build_head), build_factory), probe_factory), build_channel),
-                        probe_channel_factory,
-                    )| {
-                        let build_graph = Box::new(UnaryOperatorFactory::new(
-                            build_head,
-                            build_factory,
-                            build_channel,
-                            build_siblings_left.clone(),
-                        ))
-                            as Box<dyn OperatorFactory<()>>;
-                        Box::new(JoinRecordBatchOperatorFactory {
-                            probe_head,
-                            build_graph,
-                            probe_factory,
-                            probe_channel_factory,
-                            probe_siblings_left: probe_siblings_left.clone(),
-                            build_ready: build_ready.clone(),
-                        }) as Box<dyn OperatorFactory<RecordBatch>>
-                    },
-                )
-                .collect()
+            chain_maker(move |worker_idx| {
+                let build_graph = Box::new(UnaryOperatorFactory::new(
+                    build_heads.make(worker_idx),
+                    build_factories.make(worker_idx),
+                    build_channels.make(worker_idx),
+                    build_siblings_left.clone(),
+                )) as Box<dyn OperatorFactory<()>>;
+                Box::new(JoinRecordBatchOperatorFactory {
+                    probe_head: probe_heads.make(worker_idx),
+                    build_graph,
+                    probe_factory: probe_factories.make(worker_idx),
+                    probe_channel_factory: probe_channels.make(worker_idx),
+                    probe_siblings_left: probe_siblings_left.clone(),
+                    build_ready: build_ready.clone(),
+                })
+            })
         };
 
         Self {
             dispatcher: self.dispatcher,
-            factories,
+            make,
             stream_ordered: false,
         }
     }
@@ -1266,47 +1215,31 @@ impl RecordBatchOperatorSpec {
             create_range_join_factories::<T>(spec, worker_count, target);
 
         let (_, build_heads) = build.into_parts();
+        let probe_heads = self.make;
         let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let probe_siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let build_channels = to_single_worker_mpsc::<RecordBatch>(worker_count, target);
         let probe_channels = stealable::<RecordBatch>(self.dispatcher.topology());
-        let factories = self
-            .factories
-            .into_iter()
-            .zip(build_heads)
-            .zip(build_factories)
-            .zip(probe_factories)
-            .zip(build_channels)
-            .zip(probe_channels)
-            .map(
-                |(
-                    (
-                        (((probe_head, build_head), build_factory), probe_factory),
-                        build_channel_factory,
-                    ),
-                    probe_channel_factory,
-                )| {
-                    let build_graph = Box::new(UnaryOperatorFactory::new(
-                        build_head,
-                        build_factory,
-                        build_channel_factory,
-                        build_siblings_left.clone(),
-                    )) as Box<dyn OperatorFactory<()>>;
-                    Box::new(JoinRecordBatchOperatorFactory {
-                        probe_head,
-                        build_graph,
-                        probe_factory,
-                        probe_channel_factory,
-                        probe_siblings_left: probe_siblings_left.clone(),
-                        build_ready: build_ready.clone(),
-                    }) as Box<dyn OperatorFactory<RecordBatch>>
-                },
-            )
-            .collect();
+        let make = chain_maker(move |worker_idx| {
+            let build_graph = Box::new(UnaryOperatorFactory::new(
+                build_heads.make(worker_idx),
+                build_factories.make(worker_idx),
+                build_channels.make(worker_idx),
+                build_siblings_left.clone(),
+            )) as Box<dyn OperatorFactory<()>>;
+            Box::new(JoinRecordBatchOperatorFactory {
+                probe_head: probe_heads.make(worker_idx),
+                build_graph,
+                probe_factory: probe_factories.make(worker_idx),
+                probe_channel_factory: probe_channels.make(worker_idx),
+                probe_siblings_left: probe_siblings_left.clone(),
+                build_ready: build_ready.clone(),
+            })
+        });
 
         Self {
             dispatcher: self.dispatcher,
-            factories,
+            make,
             stream_ordered: false,
         }
     }
@@ -1342,8 +1275,7 @@ impl RecordBatchOperatorSpec {
     /// ```
     /// Dispatch the pipeline and return its ring-backed Arrow output.
     pub fn execute(self) -> DataFlowHandle<RecordBatch> {
-        let factories: Vec<_> = self.factories.into_iter().collect();
-        OperatorSpec::new(self.dispatcher, factories).execute()
+        OperatorSpec::from_maker(self.dispatcher, self.make).execute()
     }
 
     /// Convert each result batch to `T` on its dispatch worker, then launch the
@@ -1358,8 +1290,7 @@ impl RecordBatchOperatorSpec {
 
     /// Like [`execute`](Self::execute), with worker statistics enabled.
     pub fn execute_with_stats(self) -> DataFlowHandle<RecordBatch> {
-        let factories: Vec<_> = self.factories.into_iter().collect();
-        OperatorSpec::new(self.dispatcher, factories).execute_with_stats()
+        OperatorSpec::from_maker(self.dispatcher, self.make).execute_with_stats()
     }
 
     /// Like [`execute_as`](Self::execute_as), with worker statistics enabled.

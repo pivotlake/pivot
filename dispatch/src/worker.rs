@@ -1,14 +1,14 @@
 //! Per-core worker threads that execute dataflows.
 //!
 //! Each worker is pinned to a CPU core and runs an event loop that:
-//! - Receives [`DataFlowBuilder`]s from the [`Dispatch`](crate::Dispatch) via a channel
+//! - Takes launched dataflows from the pool's shared log
 //! - Builds them into [`DataFlow`]s (creating operators, channels, etc. on the worker thread)
 //! - Drives execution by interleaving CPU work, IO, and work stealing
 //!
 //! Workers are the execution backbone of the system. A query built with
 //! [`RecordBatchOperatorSpec`](crate::api::RecordBatchOperatorSpec)
 //! doesn't run until [`.collect()`](crate::api::RecordBatchOperatorSpec::collect)
-//! sends one `DataFlowBuilder` to each worker. The worker then:
+//! publishes a dataflow for every worker to take. The worker then:
 //!
 //! 1. Calls [`DataFlowBuilder::build`] to construct the operator chain — this happens
 //!    here because some resources (`Rc<Worker<T>>`, thread-local buffers) are not `Send`
@@ -24,6 +24,7 @@
 
 use crate::Identifier;
 use crate::api::DataFlowBuilder;
+use crate::api::launch::LaunchLog;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
@@ -67,7 +68,6 @@ fn in_flight_spin_limit() -> u32 {
         crate::env::get_env_var_with_default("PIVOT_SPIN_LIMIT", IN_FLIGHT_SPIN_LIMIT)
     })
 }
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use std::{result, thread};
@@ -135,9 +135,13 @@ pub struct Worker {
     /// A requester (through a single per-core uring) for all IO — both disk reads
     /// and HTTP(S) reads of remote regions share the one ring.
     io: IORequester,
-    /// A queue of dataflows for the worker to work on. The worker can work on many dataflows
-    /// simultaneously
-    data_flow_queue: Receiver<DataFlowBuilder>,
+    /// This worker's global index, dense across all NUMA node groups.
+    worker_idx: usize,
+    /// Where launched dataflows are published for every worker to take. The
+    /// worker can work on many dataflows simultaneously.
+    launch_log: Arc<LaunchLog>,
+    /// The latest launch this worker has taken from the log.
+    launch_cursor: u64,
     /// A mapping of dataflows currently running
     data_flows: HashMap<Identifier, DataFlow>,
     /// Did the worker do work on last iteration? This is used to decide whether the worker should
@@ -173,7 +177,7 @@ impl Worker {
     /// inside the event loop propagate normally and surface through the
     /// returned [`JoinHandle`].
     #[allow(clippy::too_many_arguments)]
-    pub fn create(
+    pub(crate) fn create(
         idx: usize,
         num_workers: usize,
         node: usize,
@@ -181,7 +185,7 @@ impl Worker {
         should_exit: Arc<AtomicBool>,
         memory_context_factory: MemoryContextFactory,
         disk_cache: Option<Arc<DiskCache>>,
-        receiver: Receiver<DataFlowBuilder>,
+        launch_log: Arc<LaunchLog>,
         ready_barrier: Arc<Barrier>,
         waker: Arc<WorkerWaker>,
         waker_set: WakerSet,
@@ -221,7 +225,9 @@ impl Worker {
                     io: IORequester::new(disk_cache),
                     id: core.id,
                     data_flows: HashMap::new(),
-                    data_flow_queue: receiver,
+                    worker_idx: idx,
+                    launch_log,
+                    launch_cursor: 0,
                     did_work_last_iteration: false,
                     should_exit,
                     waker,
@@ -509,16 +515,16 @@ impl Worker {
     }
 
     fn try_receiving_new_dataflow(&mut self) {
-        // Drain everything queued. Taking one builder per pass loses dataflows:
+        // Take everything published. Taking one launch per pass loses dataflows:
         // two dispatches can land while this worker is parked, their notifies
         // coalescing into one wake-count advance. The woken pass would take only
-        // the first builder, finish it without setting `did_work`, and re-park
-        // with the count already current, stranding the second dataflow's
-        // builder in the queue forever (its query hangs; sibling workers spin
-        // or park waiting for this worker's operator to ever exist).
-        while let Ok(builder) = self.data_flow_queue.try_recv() {
+        // the first launch, finish it without setting `did_work`, and re-park
+        // with the count already current, stranding the second dataflow in the
+        // log forever (its query hangs; sibling workers spin or park waiting
+        // for this worker's operator to ever exist).
+        for launch in self.launch_log.take_new(&mut self.launch_cursor) {
             debug!("Received data flow...");
-            match builder.build() {
+            match DataFlowBuilder::new(launch, self.worker_idx).build() {
                 Ok(data_flow) => {
                     LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
                     self.data_flows.insert(data_flow.id(), data_flow);

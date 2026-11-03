@@ -1,21 +1,21 @@
-//! Work-stealing channel for passing messages between dataflow operators.
+//! Stealable channels: each worker owns a deque, and idle workers steal from
+//! same-node peers.
 //!
-//! Each worker gets its own LIFO deque for the channel. The producer (upstream operator)
-//! pushes into the local deque; the consumer (downstream operator) pops from it.  When a
-//! worker's local deque is empty it steals from a *same-NUMA-node* peer's deque, which
-//! balances load across the node's workers without any central coordination. Stealing
-//! never crosses nodes: the messages are typically backed by ring memory the producer's
-//! node owns, so a cross-node steal would drag every downstream access of that item to
-//! remote memory. Cross-node balance comes from the work's *source* instead (a shared
-//! injector of row groups / items), where claiming an item moves only metadata and all
-//! the memory it touches is then allocated locally.
+//! The channel's locality follows the NUMA layout of the dispatch pool. A
+//! message pushed on one node stays on that node: a thief only scans the
+//! deques of its own node's workers, so the buffers it takes were allocated
+//! and filled by a core sharing its memory controller and last-level cache.
+//! Work moves across nodes only through the scan split and the pipeline
+//! breakers that partition by hash, never through stealing.
 //!
-//! Messages flowing through these channels (e.g. `RecordBatch`) will continue processing on
-//! a different worker thread than the one that produced it. This means the message must not be
+//! Note that this should be used for messages that are logically independent of the
+//! worker that sent them; for example, it's fine for a RecordBatch to be processed on
+//! any worker. In contrast, there are some messages that are `Send`, but are still
 //! logically local to a worker; for example, while `CompressedPage` *is* `Send`, it is critical to
 //! return it to the worker that sent out, since it needs to be sent to the Decoder of that row group.
 //! Therefore it should *not* be in a stealable channel (but in `return_to_worker`)
 
+use crate::api::WorkerSlots;
 use crate::numa::Topology;
 use crate::operations::channels;
 use crate::operations::channels::{ChannelFactory, Receiver, Sender};
@@ -24,27 +24,43 @@ use crossbeam_deque::{Stealer, Worker};
 use std::rc::Rc;
 use std::sync::Arc;
 
+/// The order a deque hands its owning worker its own messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Order {
+    Lifo,
+    Fifo,
+}
+
+impl Order {
+    fn new_deque<T>(self) -> Worker<T> {
+        match self {
+            Order::Lifo => Worker::new_lifo(),
+            Order::Fifo => Worker::new_fifo(),
+        }
+    }
+}
+
 /// Factory for building one worker's stealable channel endpoint.
 ///
-/// Holds the local [`Worker`] deque plus a *shared* slice of every worker's
-/// [`Stealer`] and this worker's place in it.
+/// Holds the local [`Worker`] deque plus the *shared* stealers over every
+/// worker's deque and this worker's place among them.
 pub struct StealableChannelFactory<T: Send> {
-    worker: Worker<T>,
+    deque: Worker<T>,
     stealers: Arc<[Stealer<T>]>,
     worker_idx: usize,
     topology: Topology,
 }
 
 impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
-    type Sender = Rc<Worker<T>>;
+    type Sender = StealableSender<T>;
     type Receiver = StealableReceiver<T>;
 
-    fn build(self) -> (Rc<Worker<T>>, StealableReceiver<T>) {
-        let worker = Rc::new(self.worker);
+    fn build(self) -> (StealableSender<T>, StealableReceiver<T>) {
+        let deque = Rc::new(self.deque);
         (
-            worker.clone(),
+            StealableSender(deque.clone()),
             StealableReceiver {
-                worker,
+                deque,
                 stealers: self.stealers,
                 siblings: self.topology.node_siblings(self.worker_idx),
                 worker_idx: self.worker_idx,
@@ -53,9 +69,12 @@ impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
     }
 }
 
-impl<O> Sender<O> for Rc<Worker<O>> {
+/// The producing end: pushes onto the worker's own deque.
+pub struct StealableSender<T>(Rc<Worker<T>>);
+
+impl<O> Sender<O> for StealableSender<O> {
     fn send(&mut self, item: O) -> channels::Result<()> {
-        self.push(item);
+        self.0.push(item);
         // One new item needs one thief: wake a single parked same-node peer.
         // Waking more would just herd workers into finding nothing (the send
         // path must stay cheap; see WorkerWaker).
@@ -66,29 +85,29 @@ impl<O> Sender<O> for Rc<Worker<O>> {
 
 /// Receiving end of a stealable channel.
 ///
-/// Shares an `Rc<Worker<I>>` with the sender (both live on the same worker thread).
+/// Shares the deque with the sender (both live on the same worker thread).
 /// [`Receiver::try_recv`] pops from the local deque; [`Receiver::steal`] tries its
 /// same-node peers' deques in order when the local one is empty, enabling
 /// cross-worker load balancing within the node.
 pub struct StealableReceiver<I> {
-    worker: Rc<Worker<I>>,
+    deque: Rc<Worker<I>>,
     /// Every worker's stealer, shared by all receivers of the stage.
     stealers: Arc<[Stealer<I>]>,
-    /// The slice of `stealers` this worker may steal from (its node's workers).
+    /// The slice of the stealers this worker may steal from (its node's workers).
     siblings: std::ops::Range<usize>,
-    /// This worker's own index in `stealers`, skipped when stealing.
+    /// This worker's own index among the stealers, skipped when stealing.
     worker_idx: usize,
 }
 
 impl<I> Receiver<I> for StealableReceiver<I> {
     fn is_empty(&self) -> bool {
-        self.worker.is_empty()
+        self.deque.is_empty()
     }
 
     /// Pop a message from the local deque (newest first, or oldest first for
     /// a [`stealable_fifo`] channel).
     fn try_recv(&self) -> Option<I> {
-        self.worker.pop()
+        self.deque.pop()
     }
 
     /// Try to steal a message from a same-node peer worker's deque.
@@ -112,8 +131,8 @@ impl<I> Receiver<I> for StealableReceiver<I> {
             loop {
                 match stealer.steal() {
                     Steal::Success(item) => return Some(item),
-                    Steal::Retry => continue,
                     Steal::Empty => break,
+                    Steal::Retry => continue,
                 }
             }
         }
@@ -121,98 +140,82 @@ impl<I> Receiver<I> for StealableReceiver<I> {
     }
 }
 
-/// Create one [`StealableChannelFactory`] per worker, each wired to steal from
+/// A stealable stage: the deques are made with the stage, on the thread
+/// compiling the dataflow, and every worker takes its own when it builds.
+/// Making each deque on its worker instead moves the same work into the
+/// workers' build, on the query's critical path, where the compiling thread
+/// does it while the workers are still finishing the previous query; it also
+/// needs the stealers published to peers before any of them may steal.
+pub type StealableStage<T> = WorkerSlots<StealableChannelFactory<T>>;
+
+/// A stealable channel over `topology`'s workers, each wired to steal from
 /// its same-node peers only (see the module docs for why stealing never
 /// crosses NUMA nodes). The local worker pops its newest message first.
-pub fn stealable<T: Send>(
-    topology: Topology,
-) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
-    stealable_with(topology, Worker::new_lifo)
+pub fn stealable<T: Send + 'static>(topology: Topology) -> StealableStage<T> {
+    stealable_with(topology, Order::Lifo)
 }
 
 /// Like [`stealable`], but the local worker pops its oldest message first,
 /// for messages that form a sequence the worker should follow in order.
 /// Thieves take the oldest message in both flavours.
-pub fn stealable_fifo<T: Send>(
-    topology: Topology,
-) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
-    stealable_with(topology, Worker::new_fifo)
+pub fn stealable_fifo<T: Send + 'static>(topology: Topology) -> StealableStage<T> {
+    stealable_with(topology, Order::Fifo)
 }
 
-fn stealable_with<T: Send>(
-    topology: Topology,
-    new_worker: fn() -> Worker<T>,
-) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
-    let workers: Vec<_> = (0..topology.total_workers())
-        .map(|_| new_worker())
+fn stealable_with<T: Send + 'static>(topology: Topology, order: Order) -> StealableStage<T> {
+    let deques: Vec<Worker<T>> = (0..topology.total_workers())
+        .map(|_| order.new_deque())
         .collect();
-    let stealers: Arc<[Stealer<T>]> = workers.iter().map(Worker::stealer).collect();
-
-    workers
-        .into_iter()
-        .enumerate()
-        .map(move |(worker_idx, worker)| StealableChannelFactory {
-            worker,
+    let stealers: Arc<[Stealer<T>]> = deques.iter().map(Worker::stealer).collect();
+    WorkerSlots::new(deques.into_iter().enumerate().map(|(worker_idx, deque)| {
+        StealableChannelFactory {
+            deque,
             stealers: stealers.clone(),
             worker_idx,
             topology,
-        })
+        }
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::WorkerMaker;
 
-    type Endpoint<T> = (
-        <StealableChannelFactory<T> as ChannelFactory<T>>::Sender,
-        StealableReceiver<T>,
-    );
+    type Endpoint<T> = (StealableSender<T>, StealableReceiver<T>);
 
     fn two_node_endpoints<T: Send + 'static>() -> Vec<Endpoint<T>> {
         crate::waker::install_test_worker_waker();
-        stealable::<T>(Topology {
+        let stage = stealable::<T>(Topology {
             workers_per_node: 2,
             node_count: 2,
-        })
-        .into_iter()
-        .map(ChannelFactory::build)
-        .collect()
+        });
+        (0..4).map(|worker| stage.make(worker).build()).collect()
     }
 
     #[test]
-    fn same_node_sibling_can_steal() {
+    fn a_worker_steals_only_from_its_node() {
         let mut endpoints = two_node_endpoints::<i64>();
+        endpoints[0].0.send(1).unwrap();
 
-        endpoints[0].0.send(7).unwrap();
-
-        assert_eq!(endpoints[1].1.steal(), Some(7));
+        assert_eq!(endpoints[1].1.steal(), Some(1));
+        assert_eq!(endpoints[2].1.steal(), None);
+        assert_eq!(endpoints[3].1.steal(), None);
     }
 
     #[test]
     fn a_fifo_channel_hands_the_owner_its_oldest_message() {
         crate::waker::install_test_worker_waker();
-        let mut endpoints: Vec<Endpoint<i64>> = stealable_fifo::<i64>(Topology {
+        let stage = stealable_fifo::<i64>(Topology {
             workers_per_node: 2,
             node_count: 1,
-        })
-        .into_iter()
-        .map(ChannelFactory::build)
-        .collect();
+        });
+        let mut endpoints: Vec<Endpoint<i64>> =
+            (0..2).map(|worker| stage.make(worker).build()).collect();
         endpoints[0].0.send(1).unwrap();
         endpoints[0].0.send(2).unwrap();
 
-        let own = endpoints[0].1.try_recv();
-
-        assert_eq!(own, Some(1));
-    }
-
-    #[test]
-    fn other_node_worker_cannot_steal() {
-        let mut endpoints = two_node_endpoints::<i64>();
-
-        endpoints[0].0.send(7).unwrap();
-
-        assert_eq!(endpoints[2].1.steal(), None);
-        assert_eq!(endpoints[3].1.steal(), None);
+        assert_eq!(endpoints[0].1.try_recv(), Some(1));
+        assert_eq!(endpoints[0].1.try_recv(), Some(2));
     }
 }

@@ -16,12 +16,12 @@
 //! before producing another.
 
 use crate::api::{BuildContext, OperatorFactory, OperatorGraphBuilder};
-use crate::operations::channels::{ChannelFactory, Sender, StealableChannelFactory};
+use crate::operations::channels::{
+    ChannelFactory, Sender, StealableChannelFactory, StealableSender,
+};
 use crate::operations::in_memory::Forward;
 use crate::operations::unary::UnaryOperator;
 use arrow_array::RecordBatch;
-use crossbeam_deque::Worker;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -30,11 +30,11 @@ use std::sync::atomic::AtomicUsize;
 /// Cloning a `RecordBatch` bumps a reference count per column, so a site's copy
 /// shares the producer's buffers rather than duplicating them.
 pub struct CteFanOut {
-    sites: Vec<Rc<Worker<RecordBatch>>>,
+    sites: Vec<StealableSender<RecordBatch>>,
 }
 
 impl CteFanOut {
-    pub(crate) fn new(sites: Vec<Rc<Worker<RecordBatch>>>) -> Self {
+    pub(crate) fn new(sites: Vec<StealableSender<RecordBatch>>) -> Self {
         Self { sites }
     }
 }

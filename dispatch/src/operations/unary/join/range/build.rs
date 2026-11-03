@@ -12,6 +12,7 @@
 //!
 //! [`to_single_worker_mpsc`]: crate::operations::channels::to_single_worker_mpsc
 
+use crate::api::{WorkerMaker, per_worker};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -78,11 +79,11 @@ where
 /// every probe-input root on the returned flag, exactly as for the hash join.
 pub(crate) fn create_range_join_factories<T: ArrowPrimitiveType>(
     spec: RangeJoinSpec,
-    worker_count: usize,
+    _worker_count: usize,
     target: usize,
 ) -> (
-    impl IntoIterator<Item = RangeBuildFactory<T>>,
-    impl IntoIterator<Item = RangeProbeFactory<T>>,
+    impl WorkerMaker<RangeBuildFactory<T>>,
+    impl WorkerMaker<RangeProbeFactory<T>>,
     Arc<AtomicBool>,
 )
 where
@@ -98,13 +99,13 @@ where
     let probe_table = table.clone();
     let gate = build_ready.clone();
 
-    let build_factories = (0..worker_count).map(move |worker_id| RangeBuildFactory {
+    let build_factories = per_worker(move |worker_id| RangeBuildFactory {
         spec: spec.clone(),
         publisher: worker_id == target,
         table: table.clone(),
         build_ready: build_ready.clone(),
     });
-    let probe_factories = (0..worker_count).map(move |_| RangeProbeFactory {
+    let probe_factories = per_worker(move |_| RangeProbeFactory {
         spec: probe_spec.clone(),
         table: probe_table.clone(),
     });

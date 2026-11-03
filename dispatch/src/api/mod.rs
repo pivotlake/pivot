@@ -30,22 +30,24 @@
 //!
 //! # Internal architecture
 //!
-//! A query is a blueprint: one factory per worker thread. Nothing runs until
+//! A query is a blueprint: a maker of one factory per worker thread. Nothing runs until
 //! [`RecordBatchOperatorSpec::collect`] is called. The lifecycle is:
 //!
-//! 1. **Build factories** — Each chained method (`.filter(...)`, `.aggregate(...)`, etc.) wraps
-//!    the previous factories in a new layer of [`UnaryOperatorFactory`](crate::UnaryOperatorFactory), producing
-//!    already one factory per worker.
-//!    The factories are stored as `Box<dyn OperatorFactory<RecordBatch>>`
-//!    to erase the nested generic types.
+//! 1. **Describe the stages** — Each chained method (`.filter(...)`, `.aggregate(...)`, etc.)
+//!    sets up what its stage's workers share (a channel's deques, a builder closure, a
+//!    group's arenas) and wraps the previous stages' maker in a new one, which makes a
+//!    worker's [`UnaryOperatorFactory`](crate::UnaryOperatorFactory) around that worker's
+//!    head. The makers are stored as `Box<dyn WorkerMaker<Box<dyn OperatorFactory<RecordBatch>>>>`
+//!    to erase the nested generic types. The thread compiling the query does a fixed
+//!    amount of work per stage, however many workers the pool has.
 //!
-//! 2. **Ship to workers** — `collect()` pairs each factory with an `MpscSender<RecordBatch>`
-//!    inside a [`DataFlowBuilder`] and sends it to the corresponding worker thread. Building
+//! 2. **Publish to workers** — `collect()` puts the maker and the output `MpscSender<RecordBatch>`
+//!    in one launch, published once to the pool's log; every worker takes it. Building
 //!    is deferred because the build step creates things which may not be `Send` such as `Rc<Worker<T>>`
 //!    which live on the worker thread.
 //!
-//! 3. **Build on worker** — The worker calls [`DataFlowBuilder::build`], which calls
-//!    `build(sender)` on the factory. This recursively builds the full operator
+//! 3. **Build on worker** — The worker calls [`DataFlowBuilder::build`], which makes its
+//!    factory and calls `build(sender)` on it. This recursively builds the full operator
 //!    chain: each factory creates a channel, builds its head with the channel's sender,
 //!    then appends its own operator reading from the channel's receiver.
 //!
@@ -55,7 +57,11 @@
 //! # Key types
 //!
 //! - [`RecordBatchOperatorSpec`] — The user-facing query builder.
-//!   Holds `VecDeque<Box<dyn OperatorFactory<RecordBatch>>>` (one per worker).
+//!   Holds the maker of each worker's `Box<dyn OperatorFactory<RecordBatch>>`.
+//!
+//! - [`WorkerMaker`] — Makes one worker's piece of a stage on that worker's thread;
+//!   [`per_worker`] makes one from a closure, [`WorkerSlots`] hands out pieces made
+//!   ahead of time, and [`split`] shares one making between two pieces.
 //!
 //! - [`OperatorFactory<O>`](OperatorFactory) — Factory trait with
 //!   `build(self: Box<Self>, sender: Box<dyn Sender<O>>)`. The sender is a trait
@@ -63,7 +69,7 @@
 //!   Also carries pipelines that flow through non-RecordBatch intermediate types —
 //!   e.g. the multi-stage decode in `catalog`'s Parquet reader.
 //!
-//! - [`OperatorSpec<O, OF>`](OperatorSpec) — Generic spec holding `VecDeque<OF>`. Can be used for
+//! - [`OperatorSpec<O, OF>`](OperatorSpec) — Generic spec holding a maker of `OF`. Can be used for
 //!   any operator that does not expose `RecordBatch`. Used to build multi-stage
 //!   pipelines (e.g. `catalog`'s Parquet reader) before erasing into
 //!   `RecordBatchOperatorSpec` via `from_spec`.
@@ -71,14 +77,21 @@
 //! - [`OperatorGraphBuilder`] — Accumulates operators and edges during the build step,
 //!   then converts them to a `DataFlow`.
 //!
-//! - [`DataFlowBuilder`] — Pairs a `Box<dyn OperatorFactory<RecordBatch>>` with the output
-//!   `MpscSender`. Sent to a worker thread, which calls `.build()` to produce a `DataFlow`.
+//! - [`DataFlowBuilder`] — One worker's view of a published launch. The worker calls
+//!   `.build()` on it to make its factory and produce its `DataFlow`.
 
 mod build_context;
 pub use build_context::BuildContext;
 
 mod builder;
 pub use builder::{DataFlowBuilder, OperatorGraphBuilder};
+
+mod worker_maker;
+pub use worker_maker::{
+    FnMaker, HandOut, IntoWorkerMaker, SplitHalf, WorkerMaker, WorkerSlots, per_worker, split,
+};
+
+pub(crate) mod launch;
 
 mod operator_spec;
 pub use operator_spec::{OperatorFactory, OperatorSpec};

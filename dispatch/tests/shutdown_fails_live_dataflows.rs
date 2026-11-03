@@ -53,9 +53,7 @@ fn shutting_down_fails_a_dataflow_still_running() {
     let dispatcher = dispatch.dispatcher().clone();
     let (result_tx, result_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let channels: Vec<_> = stealable::<i64>(dispatcher.topology())
-            .into_iter()
-            .collect();
+        let channels = stealable::<i64>(dispatcher.topology());
         let factories: Vec<_> = (0..WORKERS).map(|_| EndlessBreakerFactory).collect();
         let result = values_input(&dispatcher, 0..WORKERS as i64)
             .chain(channels, factories)

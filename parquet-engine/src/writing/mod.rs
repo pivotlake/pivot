@@ -109,11 +109,11 @@ pub fn encode_record_batches_spec(
     let order_by = sort_order(&schema, &sort_column_names);
 
     let (dispatcher, heads) = spec.into_parts();
-    let input_batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
+    let input_batches = OperatorSpec::from_maker(dispatcher, heads);
     let topology = input_batches.dispatcher().topology();
     let files = input_batches
         .chain(
-            stealable::<RecordBatch>(topology).into_iter().collect(),
+            stealable::<RecordBatch>(topology),
             PartitionSorterFactory::create_for_workers(
                 partition_column_indices,
                 order_by.clone(),
@@ -123,9 +123,7 @@ pub fn encode_record_batches_spec(
         // Each worker collects the runs it sorted: the collectors share their
         // pending runs, so no run queues behind a single collecting worker.
         .chain(
-            stealable::<SortedPartitionRun>(topology)
-                .into_iter()
-                .collect(),
+            stealable::<SortedPartitionRun>(topology),
             file_collector::factories(
                 partition_column_names,
                 order_by.into(),
@@ -156,21 +154,16 @@ pub fn encode_compaction_batches_spec(
     let spec = unshred_batches_spec(spec);
     let order_by = sort_order(&schema, &sort_column_names);
     let (dispatcher, heads) = spec.into_parts();
-    let worker_count = heads.len();
+    let worker_count = dispatcher.worker_count();
     let file_collector_worker = dispatcher.next_worker();
-    let input_batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
+    let input_batches = OperatorSpec::from_maker(dispatcher, heads);
     let topology = input_batches.dispatcher().topology();
     let presorted_runs =
         PresortedRun::create_for_workers(partition.as_ref(), &partition_column_names, topology);
     let files = input_batches
+        .chain(stealable::<RecordBatch>(topology), presorted_runs)
         .chain(
-            stealable::<RecordBatch>(topology).into_iter().collect(),
-            presorted_runs,
-        )
-        .chain(
-            to_single_worker_mpsc::<SortedPartitionRun>(worker_count, file_collector_worker)
-                .into_iter()
-                .collect(),
+            to_single_worker_mpsc::<SortedPartitionRun>(worker_count, file_collector_worker),
             file_collector::factories(
                 partition_column_names,
                 order_by.into(),
@@ -222,51 +215,37 @@ where
     let topology = files.dispatcher().topology();
     files
         .chain(
-            node_work_queue::<FileOrderInput>(topology)
-                .into_iter()
-                .collect(),
+            node_work_queue::<FileOrderInput>(topology),
             DefaultUnaryFactory::<file_merge::LocalMergePlanner>::create_for_workers(worker_count),
         )
         .chain(
-            node_work_queue::<LocalMergeJob>(topology)
-                .into_iter()
-                .collect(),
+            node_work_queue::<LocalMergeJob>(topology),
             DefaultUnaryFactory::<file_merge::LocalMergeExecutor>::create_for_workers(worker_count),
         )
         .chain(
-            shared_work_queue::<LocalMergeResult>(worker_count)
-                .into_iter()
-                .collect(),
+            shared_work_queue::<LocalMergeResult>(worker_count),
             DefaultUnaryFactory::<file_merge::GlobalMergePlanner>::create_for_workers(worker_count),
         )
         .chain(
-            node_work_queue::<GlobalMergeJob>(topology)
-                .into_iter()
-                .collect(),
+            node_work_queue::<GlobalMergeJob>(topology),
             DefaultUnaryFactory::<file_merge::GlobalMergeExecutor>::create_for_workers(
                 worker_count,
             ),
         )
         .chain(
-            node_work_queue::<ReadyFile>(topology).into_iter().collect(),
+            node_work_queue::<ReadyFile>(topology),
             row_group_planner::factories(topology),
         )
         .chain(
-            node_work_queue::<ColumnChunkJob>(topology)
-                .into_iter()
-                .collect(),
+            node_work_queue::<ColumnChunkJob>(topology),
             shredder::factories(worker_count),
         )
         .chain(
-            node_work_queue::<LeafChunkJob>(topology)
-                .into_iter()
-                .collect(),
+            node_work_queue::<LeafChunkJob>(topology),
             encoder::factories(worker_count),
         )
         .chain(
-            return_to_worker_mpsc::<EncodedLeafChunk>(worker_count)
-                .into_iter()
-                .collect(),
+            return_to_worker_mpsc::<EncodedLeafChunk>(worker_count),
             assembler::factories(worker_count),
         )
 }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crossbeam_deque::{Injector, Steal};
 
 use crate::Topology;
+use crate::api::WorkerMaker;
 use crate::waker::waker_set;
 
 use super::{ChannelFactory, Receiver, Result, Sender};
@@ -84,14 +85,39 @@ impl<T> Receiver<T> for NodeWorkQueueReceiver<T> {
 }
 
 /// Creates one endpoint per worker, backed by one queue per NUMA node.
-pub fn node_work_queue<T: NodeIdOutput + Send>(
+/// A node work queue stage: one queue per node, each worker's endpoint
+/// polling its node's.
+pub struct NodeWorkQueueStage<T: NodeIdOutput + Send> {
+    queues: Arc<[Injector<T>]>,
     topology: Topology,
-) -> impl IntoIterator<Item = NodeWorkQueueChannelFactory<T>> {
-    let queues: Arc<[Injector<T>]> = (0..topology.node_count).map(|_| Injector::new()).collect();
-    (0..topology.total_workers()).map(move |worker_id| NodeWorkQueueChannelFactory {
-        queues: queues.clone(),
-        node_id: topology.node_of_worker(worker_id),
-    })
+}
+
+crate::maker_into_worker_maker!(
+    NodeWorkQueueStage<T>,
+    NodeWorkQueueChannelFactory<T>,
+    [T],
+    [T: NodeIdOutput + Send + 'static]
+);
+
+impl<T: NodeIdOutput + Send + 'static> WorkerMaker<NodeWorkQueueChannelFactory<T>>
+    for NodeWorkQueueStage<T>
+{
+    fn make(&self, worker_idx: usize) -> NodeWorkQueueChannelFactory<T> {
+        NodeWorkQueueChannelFactory {
+            queues: self.queues.clone(),
+            node_id: self.topology.node_of_worker(worker_idx),
+        }
+    }
+}
+
+/// One queue per node of `topology`.
+pub fn node_work_queue<T: NodeIdOutput + Send + 'static>(
+    topology: Topology,
+) -> NodeWorkQueueStage<T> {
+    NodeWorkQueueStage {
+        queues: (0..topology.node_count).map(|_| Injector::new()).collect(),
+        topology,
+    }
 }
 
 #[cfg(test)]
@@ -115,10 +141,8 @@ mod tests {
         };
         let wakers: Vec<_> = (0..2).map(|_| Arc::new(WorkerWaker::new(1))).collect();
         init_waker_set(WakerSet::new(wakers, 1));
-        let mut endpoints: Vec<_> = node_work_queue(topology)
-            .into_iter()
-            .map(ChannelFactory::build)
-            .collect();
+        let stage = node_work_queue(topology);
+        let mut endpoints: Vec<_> = (0..2).map(|worker| stage.make(worker).build()).collect();
 
         endpoints[0].0.send(Work(1)).unwrap();
 

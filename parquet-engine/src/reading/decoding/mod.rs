@@ -80,15 +80,19 @@ pub struct DecoderFactory {
     /// Whether to append row-group-id and row-index metadata columns to each
     /// output batch (used by the materializer path).
     pub add_row_group_metadata: bool,
-    /// The worker's allocator for decoded batches.
-    pub allocator: Arc<WorkerAllocator>,
 }
 
 impl UnaryFactory<DecodeRange, RecordBatch> for DecoderFactory {
     type Unary = Decoder;
 
     fn build_unary(self) -> Self::Unary {
-        Decoder::new(self.batch_size, self.add_row_group_metadata, self.allocator)
+        // The worker's own allocator for decoded batches, made here on the
+        // worker rather than once per worker on the thread compiling the plan.
+        Decoder::new(
+            self.batch_size,
+            self.add_row_group_metadata,
+            Arc::new(WorkerAllocator::new()),
+        )
     }
 }
 
@@ -542,7 +546,7 @@ pub(crate) mod tests {
         eq_predicates: Vec<ScanEqualityPredicate>,
     ) -> RangeCutter {
         RangeCutter::new(
-            Projection::all_from_schema(table.schema()),
+            Arc::new(Projection::all_from_schema(table.schema())),
             Arc::new(eq_predicates),
             Arc::new(AtomicUsize::new(usize::MAX / 2)),
             Arc::new(AtomicUsize::new(usize::MAX / 2)),

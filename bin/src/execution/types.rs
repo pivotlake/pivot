@@ -114,7 +114,10 @@ pub enum StatementOutput<T> {
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionStats {
     pub plan: Duration,
+    /// Lowering the plan into an operator spec, on the planner thread.
     pub compile: Duration,
+    /// Handing the spec to the workers, on the planner thread.
+    pub dispatch: Duration,
     pub execute: Duration,
     pub flow: DataFlowStats,
 }
@@ -125,13 +128,18 @@ impl ExecutionStats {
         let ms = |duration: Duration| duration.as_secs_f64() * 1e3;
         let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
         format!(
-            "stats: plan={:.1}ms compile={:.1}ms exec={:.1}ms | \
+            "stats: plan={:.1}ms compile={:.1}ms exec={:.1}ms dispatch={:.1}ms \
+             build={:.1}ms/max={:.1}ms/span={:.1}ms | \
              disk={} ops/{:.1}MiB/read={:.1}ms/write={:.1}ms  \
              http={} ops/{:.1}MiB/get={:.1}ms/upload={:.1}ms  \
              http-disk-cache={} ops/{:.1}MiB/{:.1}ms  cpu={:.1}ms",
             ms(self.plan),
             ms(self.compile),
             ms(self.execute),
+            ms(self.dispatch),
+            ms(self.flow.build),
+            ms(self.flow.build_max),
+            ms(self.flow.build_span()),
             self.flow.disk_requests,
             mib(self.flow.disk_bytes),
             ms(self.flow.disk_read_time),

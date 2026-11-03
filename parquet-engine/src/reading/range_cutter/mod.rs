@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Factory for creating [`RangeCutter`] instances, one per worker thread.
 pub struct RangeCutterFactory {
-    /// Which columns are decoded.
-    pub projection: Projection,
+    /// Which columns are decoded; one projection shared by every worker's cutter.
+    pub projection: Arc<Projection>,
     /// Pushed-down equality predicates for dictionary pruning (may be empty).
     pub eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
     /// This worker's claimed-but-not-yet-cut row-group count, shared with
@@ -43,8 +43,6 @@ pub struct RangeCutterFactory {
     /// range is decoded, on whichever worker; one that is pruned or empty
     /// is released here.
     pub outstanding_row_groups: Arc<AtomicUsize>,
-    /// The worker's allocator for the dictionaries it builds.
-    pub allocator: Arc<WorkerAllocator>,
 }
 
 impl UnaryFactory<DecompressedPage, DecodeRange> for RangeCutterFactory {
@@ -56,7 +54,10 @@ impl UnaryFactory<DecompressedPage, DecodeRange> for RangeCutterFactory {
             self.eq_predicates,
             self.pending_row_groups,
             self.outstanding_row_groups,
-            self.allocator,
+            // The worker's own allocator for the dictionaries it builds, made
+            // here on the worker rather than once per worker on the thread
+            // compiling the plan.
+            Arc::new(WorkerAllocator::new()),
         )
     }
 }
@@ -74,7 +75,7 @@ struct OpenRowGroup {
 /// Collects the pages of this worker's row groups and emits their
 /// [`DecodeRange`]s.
 pub struct RangeCutter {
-    projection: Projection,
+    projection: Arc<Projection>,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
     /// Slab allocator for the dictionaries built here, the worker's own.
     allocator: Arc<WorkerAllocator>,
@@ -88,7 +89,7 @@ pub struct RangeCutter {
 
 impl RangeCutter {
     pub fn new(
-        projection: Projection,
+        projection: Arc<Projection>,
         eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
         pending_row_groups: Arc<AtomicUsize>,
         outstanding_row_groups: Arc<AtomicUsize>,
@@ -381,7 +382,7 @@ mod tests {
         let pending = Arc::new(AtomicUsize::new(1));
         let outstanding = Arc::new(AtomicUsize::new(1));
         let cutter = RangeCutter::new(
-            Projection::all_from_schema(table.schema()),
+            Arc::new(Projection::all_from_schema(table.schema())),
             Arc::new(Vec::new()),
             pending.clone(),
             outstanding.clone(),
@@ -407,7 +408,7 @@ mod tests {
         let dict = i32_dict_page(metadata.clone(), &[10, 20]);
         let pending = Arc::new(AtomicUsize::new(1));
         let cutter = RangeCutter::new(
-            Projection::all_from_schema(table.schema()),
+            Arc::new(Projection::all_from_schema(table.schema())),
             Arc::new(vec![i32_eq_predicate(5)]),
             pending.clone(),
             Arc::new(AtomicUsize::new(1)),

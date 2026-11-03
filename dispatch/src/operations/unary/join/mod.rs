@@ -280,6 +280,7 @@ pub(crate) struct JoinTable<K> {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::WorkerMaker;
     use std::sync::Arc;
 
     use arrow_array::types::{Int32Type, Int64Type};
@@ -493,9 +494,8 @@ mod tests {
                 spec, workers,
             );
 
-        let mut consumers: Vec<_> = builds
-            .into_iter()
-            .map(|f| extract_consumer(f.build_unary()))
+        let mut consumers: Vec<_> = (0..workers)
+            .map(|worker| extract_consumer(builds.make(worker).build_unary()))
             .collect();
 
         let mut void = CollectSender::<()>::new();
@@ -527,7 +527,9 @@ mod tests {
             }
         }
 
-        let mut probers: Vec<_> = probes.into_iter().map(|p| p.build_unary()).collect();
+        let mut probers: Vec<_> = (0..workers)
+            .map(|worker| probes.make(worker).build_unary())
+            .collect();
         let mut sender = CollectSender::new();
         let mut test_io = crate::io::TestOperatorIO::default();
         let mut io = test_io.io();

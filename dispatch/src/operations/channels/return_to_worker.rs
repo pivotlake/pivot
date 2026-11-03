@@ -9,6 +9,7 @@
 //! only messages destined for it.
 
 use crate::Identifier;
+use crate::api::WorkerSlots;
 use crate::operations::channels;
 use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel_to};
 use crate::operations::channels::{ChannelFactory, Sender};
@@ -63,7 +64,7 @@ impl<O: WorkerIdOutput> Sender<O> for WorkerAwareSender<O> {
 /// sender slice (for routing) and its own receiver.
 pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(
     count: usize,
-) -> impl IntoIterator<Item = ReturnToWorkerMpscFactory<T>> {
+) -> WorkerSlots<ReturnToWorkerMpscFactory<T>> {
     let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
         .map(|worker| mpsc_channel_to::<T>(worker))
         .unzip();
@@ -75,4 +76,6 @@ pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(
             senders: senders.clone(),
             receiver: rx,
         })
+        .collect::<Vec<_>>()
+        .into()
 }

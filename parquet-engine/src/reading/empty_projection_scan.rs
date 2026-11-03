@@ -18,7 +18,7 @@ use arrow_schema::Schema;
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, RECORD_BATCH_SIZE,
-    RecordBatchOperatorSpec, Sender, WorkStatus,
+    RecordBatchOperatorSpec, Sender, WorkStatus, per_worker,
 };
 
 use crate::RowGroupFilter;
@@ -33,17 +33,18 @@ pub(crate) fn empty_projection_scan(
     filter: Option<RowGroupFilter>,
     add_row_group_metadata: bool,
 ) -> RecordBatchOperatorSpec {
-    let n = dispatcher.worker_count();
     let row_groups = Arc::new(Injector::new());
     for idx in 0..table.row_groups.len() {
         row_groups.push(QueryRowGroupMetadata::new(table, idx, RowSelection::All));
     }
-    let factories = (0..n).map(|_| EmptyProjectionScanFactory {
-        row_groups: row_groups.clone(),
-        filter: filter.clone(),
-        add_row_group_metadata,
-    });
-    RecordBatchOperatorSpec::from_nullary(dispatcher, factories)
+    RecordBatchOperatorSpec::from_nullary_maker(
+        dispatcher,
+        per_worker(move |_| EmptyProjectionScanFactory {
+            row_groups: row_groups.clone(),
+            filter: filter.clone(),
+            add_row_group_metadata,
+        }),
+    )
 }
 
 /// Per-worker factory for [`EmptyProjectionScan`]. Workers share one

@@ -9,6 +9,7 @@
 //! other workers' receivers stay empty.
 
 use crate::Identifier;
+use crate::api::WorkerSlots;
 use crate::operations::channels;
 use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel_to};
 use crate::operations::channels::{ChannelFactory, Sender};
@@ -54,7 +55,8 @@ impl<O> Sender<O> for SingleWorkerSender<O> {
 pub fn to_single_worker_mpsc<T: 'static + Send>(
     count: usize,
     target: Identifier,
-) -> impl IntoIterator<Item = SingleWorkerMpscFactory<T>> {
+) -> WorkerSlots<SingleWorkerMpscFactory<T>> {
+    assert!(target < count, "the funnel's target must name a worker");
     let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
         .map(|worker| mpsc_channel_to::<T>(worker))
         .unzip();
@@ -67,4 +69,6 @@ pub fn to_single_worker_mpsc<T: 'static + Send>(
             target,
             receiver: rx,
         })
+        .collect::<Vec<_>>()
+        .into()
 }

@@ -15,15 +15,15 @@ use crate::types::metadata::QueryRowGroupMetadata;
 use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
-    RecordBatchOperatorSpec, RootUnaryOperatorFactory, UnaryOperatorFactory, return_to_worker_mpsc,
-    stealable, stealable_fifo, to_single_worker_mpsc,
+    RecordBatchOperatorSpec, RootUnaryOperatorFactory, UnaryOperatorFactory, WorkerMaker,
+    per_worker, return_to_worker_mpsc, stealable, stealable_fifo, to_single_worker_mpsc,
 };
 
 use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
     IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
     RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate, ScanOrder,
-    WorkerAllocator, pending_claim_bound,
+    pending_claim_bound,
 };
 
 /// Append the index → decompress → cut → decode stages onto a source of
@@ -34,7 +34,7 @@ pub(crate) fn read_parquet<OF>(
     batch_size: usize,
     add_row_group_metadata: bool,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
-    pending_row_groups: Vec<Arc<AtomicUsize>>,
+    pending_row_groups: Arc<[Arc<AtomicUsize>]>,
     outstanding_row_groups: Arc<AtomicUsize>,
 ) -> RecordBatchOperatorSpec
 where
@@ -42,55 +42,40 @@ where
 {
     let n = input.dispatcher().worker_count();
     let topology = input.dispatcher().topology();
-    // Two allocators per worker: one for the dictionaries its range cutter
-    // builds, which live as long as their row group, and one for the batches
-    // its decoder emits, which usually die before the next one is built. Kept
-    // apart, a dictionary never pins the buffer the batches cycle through, so
-    // the decoder keeps rewriting the same cache-resident bytes.
-    let dictionary_allocators: Vec<Arc<WorkerAllocator>> =
-        (0..n).map(|_| Arc::new(WorkerAllocator::new())).collect();
-    let batch_allocators: Vec<Arc<WorkerAllocator>> =
-        (0..n).map(|_| Arc::new(WorkerAllocator::new())).collect();
-    let decoded = input
+    // Each worker's range cutter and decoder make their own allocators when
+    // built: one for the dictionaries the cutter builds, which live as long
+    // as their row group, and one for the batches the decoder emits, which
+    // usually die before the next one is built. Kept apart, a dictionary
+    // never pins the buffer the batches cycle through, so the decoder keeps
+    // rewriting the same cache-resident bytes.
+    let projection = Arc::new(projection);
+    let indexed = input.chain(
+        stealable::<RowGroupBuffer>(topology),
+        per_worker(|_| IndexerFactory::new()),
+    );
+    let decompressed = indexed.chain(
+        stealable::<CompressedPage>(topology),
+        per_worker(|_| DecompressorFactory::new()),
+    );
+    let decoded = decompressed
         .chain(
-            stealable::<RowGroupBuffer>(topology).into_iter().collect(),
-            (0..n).map(|_| IndexerFactory::new()).collect(),
-        )
-        .chain(
-            stealable::<CompressedPage>(topology).into_iter().collect(),
-            (0..n).map(|_| DecompressorFactory::new()).collect(),
-        )
-        .chain(
-            return_to_worker_mpsc::<DecompressedPage>(n)
-                .into_iter()
-                .collect(),
-            pending_row_groups
-                .into_iter()
-                .zip(dictionary_allocators)
-                .map(|(pending, allocator)| RangeCutterFactory {
-                    projection: projection.clone(),
-                    eq_predicates: eq_predicates.clone(),
-                    pending_row_groups: pending,
-                    outstanding_row_groups: outstanding_row_groups.clone(),
-                    allocator,
-                })
-                .collect(),
+            return_to_worker_mpsc::<DecompressedPage>(n),
+            per_worker(move |worker_idx| RangeCutterFactory {
+                projection: projection.clone(),
+                eq_predicates: eq_predicates.clone(),
+                pending_row_groups: pending_row_groups[worker_idx].clone(),
+                outstanding_row_groups: outstanding_row_groups.clone(),
+            }),
         )
         // A worker takes its own row groups' ranges oldest first, so it
         // follows each row group as one stream; a peer with nothing to do
         // takes the oldest range waiting on another worker.
         .chain(
-            stealable_fifo::<DecodeRange>(topology)
-                .into_iter()
-                .collect(),
-            batch_allocators
-                .into_iter()
-                .map(|allocator| DecoderFactory {
-                    batch_size,
-                    add_row_group_metadata,
-                    allocator,
-                })
-                .collect(),
+            stealable_fifo::<DecodeRange>(topology),
+            per_worker(move |_| DecoderFactory {
+                batch_size,
+                add_row_group_metadata,
+            }),
         );
     RecordBatchOperatorSpec::from_spec(decoded)
 }
@@ -99,7 +84,7 @@ where
 /// worker's fetcher (increments and gates claims) and its range cutter
 /// (decrements as row groups are cut or pruned). See `RowGroupFetcher` for
 /// why claims are bounded this way.
-fn pending_row_group_counters(n: usize) -> Vec<Arc<AtomicUsize>> {
+fn pending_row_group_counters(n: usize) -> Arc<[Arc<AtomicUsize>]> {
     (0..n).map(|_| Arc::new(AtomicUsize::new(0))).collect()
 }
 
@@ -182,21 +167,21 @@ pub fn table_input_with_filter_and_eq_predicates(
     // in-flight count separately, plus its worker's undecoded-claims count.
     let claim_bound = pending_claim_bound(table);
     let shared_projection = Arc::new(projection.clone());
-    let factories: Vec<_> = pending_row_groups
-        .iter()
-        .map(|pending| {
+    let fetcher_pending = pending_row_groups.clone();
+    let input = OperatorSpec::from_maker(
+        dispatcher.clone(),
+        per_worker(move |worker_idx| {
             RootUnaryOperatorFactory::new(
                 RowGroupFetcherFactory::new(
                     shared_projection.clone(),
-                    pending.clone(),
+                    fetcher_pending[worker_idx].clone(),
                     claim_bound,
                 ),
                 injector.clone(),
                 siblings.clone(),
             )
-        })
-        .collect();
-    let input = OperatorSpec::new(dispatcher.clone(), factories);
+        }),
+    );
     read_parquet(
         input,
         projection,
@@ -217,7 +202,7 @@ pub fn materialize(
     table: Arc<ParquetTable>,
     projection: Projection,
 ) -> RecordBatchOperatorSpec {
-    let (dispatcher, mut heads) = spec.into_parts();
+    let (dispatcher, heads) = spec.into_parts();
     let n = dispatcher.worker_count();
     let siblings_materializer = Arc::new(AtomicUsize::new(n));
     let siblings_fetcher = Arc::new(AtomicUsize::new(n));
@@ -235,29 +220,29 @@ pub fn materialize(
     // all pin one worker.
     let host = dispatcher.next_worker();
     let shared_projection = Arc::new(projection.clone());
-    let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(n, host)
-        .into_iter()
-        .zip(stealable::<QueryRowGroupMetadata>(dispatcher.topology()))
-        .zip(pending_row_groups.iter())
-        .map(|((rb_ch, rq_ch), pending)| {
+    let batch_channels = to_single_worker_mpsc::<RecordBatch>(n, host);
+    let request_channels = stealable::<QueryRowGroupMetadata>(dispatcher.topology());
+    let fetcher_pending = pending_row_groups.clone();
+    let input = OperatorSpec::from_maker(
+        dispatcher,
+        per_worker(move |worker_idx| {
             UnaryOperatorFactory::new(
                 UnaryOperatorFactory::new(
-                    heads.pop_front().unwrap(),
+                    heads.make(worker_idx),
                     MaterializerFactory::new(table.clone()),
-                    rb_ch,
+                    batch_channels.make(worker_idx),
                     siblings_materializer.clone(),
                 ),
                 RowGroupFetcherFactory::new(
                     shared_projection.clone(),
-                    pending.clone(),
+                    fetcher_pending[worker_idx].clone(),
                     claim_bound,
                 ),
-                rq_ch,
+                request_channels.make(worker_idx),
                 siblings_fetcher.clone(),
             )
-        })
-        .collect();
-    let input = OperatorSpec::new(dispatcher, factories);
+        }),
+    );
     read_parquet(
         input,
         projection,

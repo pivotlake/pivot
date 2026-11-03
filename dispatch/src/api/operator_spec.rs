@@ -1,4 +1,5 @@
-use crate::api::BuildContext;
+use crate::api::launch::Launch;
+use crate::api::{BuildContext, IntoWorkerMaker, WorkerMaker, WorkerSlots, per_worker};
 use crate::operations::channels::{
     ChannelFactory, RootChannelFactory, Sender, StealableChannelFactory, mpsc_channel, stealable,
 };
@@ -6,15 +7,14 @@ use crate::operations::{
     ChannelInputSender, ChannelSourceFactory, DefaultUnaryFactory, Forward, InjectorSourceFactory,
     MapFactory, RootUnaryOperatorFactory, UnaryFactory, UnaryOperatorFactory,
 };
-use crate::{DataFlowBuilder, DataFlowDispatcher, DataFlowHandle, OperatorGraphBuilder};
+use crate::{DataFlowDispatcher, DataFlowHandle, OperatorGraphBuilder};
 use arrow_array::RecordBatch;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// Generic, strongly-typed spec for building multi-stage pipelines.
 ///
-/// Holds one factory per worker, where the factory type `OF` carries the full nested
+/// Holds a maker of one factory per worker, where the factory type `OF` carries the full nested
 /// generic chain (e.g. `UnaryOperatorFactory<..., UnaryOperatorFactory<..., OF>>`).
 /// This is needed when a pipeline flows through non-RecordBatch types — e.g.
 /// `catalog`'s Parquet reader, whose decode stages pass format-specific buffers
@@ -30,15 +30,22 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 /// on the trait.
 pub struct OperatorSpec<O, OF: OperatorFactory<O>> {
     dispatcher: DataFlowDispatcher,
-    factories: VecDeque<OF>,
+    /// Makes each worker's factory, on that worker.
+    make: Box<dyn WorkerMaker<OF>>,
     _phantom: std::marker::PhantomData<O>,
 }
 
-impl<O, OF: OperatorFactory<O>> OperatorSpec<O, OF> {
+impl<O, OF: OperatorFactory<O> + 'static> OperatorSpec<O, OF> {
+    /// A spec over factories made ahead of time, one per worker.
     pub fn new(dispatcher: DataFlowDispatcher, factories: impl IntoIterator<Item = OF>) -> Self {
+        Self::from_maker(dispatcher, WorkerSlots::new(factories))
+    }
+
+    /// A spec whose every worker makes its own factory with `make`.
+    pub fn from_maker(dispatcher: DataFlowDispatcher, make: impl WorkerMaker<OF>) -> Self {
         Self {
             dispatcher,
-            factories: factories.into_iter().collect(),
+            make: Box::new(make),
             _phantom: Default::default(),
         }
     }
@@ -47,12 +54,12 @@ impl<O, OF: OperatorFactory<O>> OperatorSpec<O, OF> {
         &self.dispatcher
     }
 
-    pub fn into_parts(self) -> (DataFlowDispatcher, VecDeque<OF>) {
-        (self.dispatcher, self.factories)
+    pub fn into_parts(self) -> (DataFlowDispatcher, Box<dyn WorkerMaker<OF>>) {
+        (self.dispatcher, self.make)
     }
 
-    pub fn factories(self) -> VecDeque<OF> {
-        self.factories
+    pub fn into_maker(self) -> Box<dyn WorkerMaker<OF>> {
+        self.make
     }
 }
 
@@ -75,28 +82,20 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let cancelled = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "perf")]
         let profiled = self.dispatcher.profiled();
-        let wakers = self
-            .dispatcher
-            .push_data_flow(self.factories.into_iter().map(|f| {
-                let tx = tx.clone();
-                let build = Box::new(move |context: &mut BuildContext| {
-                    Box::new(f).build(Box::new(tx), context)
-                });
-                let builder = DataFlowBuilder::new(
-                    build,
-                    cancelled.clone(),
-                    err_tx.clone(),
-                    stats_tx.clone(),
-                    collect_stats,
-                );
-                #[cfg(feature = "perf")]
-                let builder = builder.with_profiling(profiled);
-                builder
-            }));
-        // Close our local copies of the senders so the channels close once
-        // every worker drops theirs.
-        drop(err_tx);
-        drop(stats_tx);
+        // The launch owns the only output sender and the pool's only copies
+        // of the error and stats senders, so each channel closes once every
+        // worker has dropped its chain and let go of the launch.
+        let launch = Launch::new(
+            self.make,
+            tx,
+            err_tx,
+            stats_tx,
+            cancelled.clone(),
+            collect_stats,
+            #[cfg(feature = "perf")]
+            profiled,
+        );
+        let wakers = self.dispatcher.launch(Arc::new(launch));
 
         let (rx, _) = rx.into_parts();
         DataFlowHandle::new(rx, err_rx, stats_rx, cancelled, wakers)
@@ -120,26 +119,33 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     /// pipeline breaker give one worker a distinct role (e.g. the receiver end
     /// of a single-worker merge). The `siblings_left` finishing counter is set up for
     /// you.
-    pub fn chain<O2, UF, C>(
+    pub fn chain<O2, CM, UM>(
         self,
-        channels: Vec<C>,
-        unaries: Vec<UF>,
-    ) -> OperatorSpec<O2, UnaryOperatorFactory<O, O2, UF, C, OF>>
+        channels: CM,
+        unaries: UM,
+    ) -> OperatorSpec<O2, UnaryOperatorFactory<O, O2, UM::Piece, CM::Piece, OF>>
     where
         O2: Send + 'static,
-        UF: UnaryFactory<O, O2>,
-        C: ChannelFactory<O>,
+        CM: IntoWorkerMaker,
+        CM::Piece: ChannelFactory<O> + Send + 'static,
+        UM: IntoWorkerMaker,
+        UM::Piece: UnaryFactory<O, O2>,
     {
-        let siblings_left = Arc::new(AtomicUsize::new(self.factories.len()));
-        let factories: Vec<_> = channels
-            .into_iter()
-            .zip(unaries)
-            .zip(self.factories)
-            .map(|((channel, unary), head)| {
-                UnaryOperatorFactory::new(head, unary, channel, siblings_left.clone())
-            })
-            .collect();
-        OperatorSpec::new(self.dispatcher, factories)
+        let siblings_left = Arc::new(AtomicUsize::new(self.dispatcher.worker_count()));
+        let channels = channels.into_worker_maker();
+        let unaries = unaries.into_worker_maker();
+        let heads = self.make;
+        OperatorSpec::from_maker(
+            self.dispatcher,
+            per_worker(move |worker_idx| {
+                UnaryOperatorFactory::new(
+                    heads.make(worker_idx),
+                    unaries.make(worker_idx),
+                    channels.make(worker_idx),
+                    siblings_left.clone(),
+                )
+            }),
+        )
     }
 
     /// Append a parallel 1→1 map stage: every item is transformed by `f` on
@@ -159,14 +165,10 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     ) -> OperatorSpec<O2, UnaryOperatorFactory<O, O2, MapFactory<F>, StealableChannelFactory<O>, OF>>
     where
         O2: Send + 'static,
-        F: FnMut(O) -> crate::UnaryResult<O2> + Clone + Send + 'static,
+        F: FnMut(O) -> crate::UnaryResult<O2> + Clone + Send + Sync + 'static,
     {
-        let worker_count = self.factories.len();
-        let channels: Vec<_> = stealable::<O>(self.dispatcher.topology())
-            .into_iter()
-            .collect();
-        let unaries: Vec<_> = (0..worker_count).map(|_| MapFactory(f.clone())).collect();
-        self.chain(channels, unaries)
+        let channels = stealable::<O>(self.dispatcher.topology());
+        self.chain(channels, per_worker(move |_| MapFactory(f.clone())))
     }
 }
 
@@ -191,22 +193,21 @@ pub fn values_input<T: Send + 'static>(
 /// counter the finish protocol needs: the assembly every stolen-item source
 /// (in-memory or producer-fed) fans out with.
 #[allow(clippy::type_complexity)]
-fn source_input<T: Send + 'static, S: RootChannelFactory<T> + Clone>(
+fn source_input<T: Send + 'static, S: RootChannelFactory<T> + Clone + Send + Sync + 'static>(
     dispatcher: &DataFlowDispatcher,
     source: S,
 ) -> OperatorSpec<T, RootUnaryOperatorFactory<T, T, DefaultUnaryFactory<Forward<T>>, S>> {
-    let worker_count = dispatcher.worker_count();
-    let siblings_left = Arc::new(AtomicUsize::new(worker_count));
-    let factories: Vec<_> = (0..worker_count)
-        .map(|_| {
+    let siblings_left = Arc::new(AtomicUsize::new(dispatcher.worker_count()));
+    OperatorSpec::from_maker(
+        dispatcher.clone(),
+        per_worker(move |_| {
             RootUnaryOperatorFactory::new(
                 DefaultUnaryFactory::<Forward<T>>::new(),
                 source.clone(),
                 siblings_left.clone(),
             )
-        })
-        .collect();
-    OperatorSpec::new(dispatcher.clone(), factories)
+        }),
+    )
 }
 
 /// Source: stream producer-fed values across the worker pool.
