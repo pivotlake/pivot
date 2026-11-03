@@ -64,10 +64,10 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CteFactory, CteScanFactory, Distinct,
-    DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind,
-    JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
-    NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory,
-    OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
+    DynamicRowKey, F64Cell, GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind,
+    JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, NoOpNullaryFactory,
+    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory, OrderByLimitFactory,
+    PackedKey, RangeJoinSpec, SharedFilterFactory, SharedMapFactory, SingleColumnKey, UnaryFactory,
     UnaryOperatorFactory, WideCell, copy_out, create_join_factories,
     create_normalizing_join_factories, create_normalizing_order_by_factories,
     create_range_join_factories,
@@ -167,12 +167,12 @@ impl OutputBatch for RecordBatch {
 
 /// Return type of [`RecordBatchOperatorSpec::map`]: a generic
 /// [`OperatorSpec<T, _>`] wrapping the RB→T map stage.
-type MapOperatorSpec<T, F> = OperatorSpec<
+type MapOperatorSpec<T, FB> = OperatorSpec<
     T,
     UnaryOperatorFactory<
         RecordBatch,
         T,
-        MapFactory<F>,
+        SharedMapFactory<FB>,
         StealableChannelFactory<RecordBatch>,
         Box<dyn OperatorFactory<RecordBatch>>,
     >,
@@ -180,12 +180,12 @@ type MapOperatorSpec<T, F> = OperatorSpec<
 
 /// FIFO counterpart to [`MapOperatorSpec`], used when mapping a stream whose
 /// batch order is already significant.
-type OrderedMapOperatorSpec<T, F> = OperatorSpec<
+type OrderedMapOperatorSpec<T, FB> = OperatorSpec<
     T,
     UnaryOperatorFactory<
         RecordBatch,
         T,
-        MapFactory<F>,
+        SharedMapFactory<FB>,
         SingleWorkerMpscFactory<RecordBatch>,
         Box<dyn OperatorFactory<RecordBatch>>,
     >,
@@ -416,7 +416,7 @@ impl RecordBatchOperatorSpec {
             ) -> crate::UnaryResult<crate::RowSelection>
             + Send
             + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         self.filter_with_delivery(builder, crate::RowDelivery::Coalesced)
     }
@@ -437,10 +437,11 @@ impl RecordBatchOperatorSpec {
             ) -> crate::UnaryResult<crate::RowSelection>
             + Send
             + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| FilterFactory(builder(), delivery)))
+        let builder = Arc::new(builder);
+        self.unary((0..worker_count).map(|_| SharedFilterFactory(builder.clone(), delivery)))
     }
 
     /// Apply a per-batch 1→1 transform that can change the output type.
@@ -476,17 +477,18 @@ impl RecordBatchOperatorSpec {
     /// })
     /// # ;
     /// ```
-    pub fn map<T, F, FB>(self, builder: FB) -> MapOperatorSpec<T, F>
+    pub fn map<T, F, FB>(self, builder: FB) -> MapOperatorSpec<T, FB>
     where
         T: Send + 'static,
         F: FnMut(RecordBatch) -> crate::UnaryResult<T> + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
         let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let builder = Arc::new(builder);
         let factories: Vec<_> = stealable::<RecordBatch>(self.dispatcher.topology())
             .into_iter()
-            .zip((0..worker_count).map(|_| MapFactory(builder())))
+            .zip((0..worker_count).map(|_| SharedMapFactory(builder.clone())))
             .zip(self.factories)
             .map(|((channel_factory, unary_factory), head)| {
                 UnaryOperatorFactory::new(
@@ -503,18 +505,19 @@ impl RecordBatchOperatorSpec {
     /// Apply a type-changing map without changing an already-established
     /// batch order. The ordered producer emits from one worker, and the FIFO
     /// channel delivers those batches to one consumer in the same sequence.
-    fn map_ordered<T, F, FB>(self, builder: FB) -> OrderedMapOperatorSpec<T, F>
+    fn map_ordered<T, F, FB>(self, builder: FB) -> OrderedMapOperatorSpec<T, FB>
     where
         T: Send + 'static,
         F: FnMut(RecordBatch) -> crate::UnaryResult<T> + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
         let siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let target = self.dispatcher.next_worker();
+        let builder = Arc::new(builder);
         let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(worker_count, target)
             .into_iter()
-            .zip((0..worker_count).map(|_| MapFactory(builder())))
+            .zip((0..worker_count).map(|_| SharedMapFactory(builder.clone())))
             .zip(self.factories)
             .map(|((channel_factory, unary_factory), head)| {
                 UnaryOperatorFactory::new(
@@ -539,10 +542,11 @@ impl RecordBatchOperatorSpec {
     pub fn project<F, FB>(self, builder: FB) -> Self
     where
         F: FnMut(RecordBatch) -> crate::UnaryResult<RecordBatch> + Send + 'static,
-        FB: Fn() -> F,
+        FB: Fn() -> F + Send + Sync + 'static,
     {
         let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| MapFactory(builder())))
+        let builder = Arc::new(builder);
+        self.unary((0..worker_count).map(|_| SharedMapFactory(builder.clone())))
     }
 
     /// Global aggregates (no GROUP BY): one or more `SUM`/`COUNT` slots over

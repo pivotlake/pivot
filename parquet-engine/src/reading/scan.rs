@@ -23,7 +23,7 @@ use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
     IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
     RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate, ScanOrder,
-    WorkerAllocator, pending_claim_bound,
+    pending_claim_bound,
 };
 
 /// Append the index → decompress → cut → decode stages onto a source of
@@ -42,37 +42,33 @@ where
 {
     let n = input.dispatcher().worker_count();
     let topology = input.dispatcher().topology();
-    // Two allocators per worker: one for the dictionaries its range cutter
-    // builds, which live as long as their row group, and one for the batches
-    // its decoder emits, which usually die before the next one is built. Kept
-    // apart, a dictionary never pins the buffer the batches cycle through, so
-    // the decoder keeps rewriting the same cache-resident bytes.
-    let dictionary_allocators: Vec<Arc<WorkerAllocator>> =
-        (0..n).map(|_| Arc::new(WorkerAllocator::new())).collect();
-    let batch_allocators: Vec<Arc<WorkerAllocator>> =
-        (0..n).map(|_| Arc::new(WorkerAllocator::new())).collect();
-    let decoded = input
-        .chain(
-            stealable::<RowGroupBuffer>(topology).into_iter().collect(),
-            (0..n).map(|_| IndexerFactory::new()).collect(),
-        )
-        .chain(
-            stealable::<CompressedPage>(topology).into_iter().collect(),
-            (0..n).map(|_| DecompressorFactory::new()).collect(),
-        )
+    // Each worker's range cutter and decoder make their own allocators when
+    // built: one for the dictionaries the cutter builds, which live as long
+    // as their row group, and one for the batches the decoder emits, which
+    // usually die before the next one is built. Kept apart, a dictionary
+    // never pins the buffer the batches cycle through, so the decoder keeps
+    // rewriting the same cache-resident bytes.
+    let projection = Arc::new(projection);
+    let indexed = input.chain(
+        stealable::<RowGroupBuffer>(topology).into_iter().collect(),
+        (0..n).map(|_| IndexerFactory::new()).collect(),
+    );
+    let decompressed = indexed.chain(
+        stealable::<CompressedPage>(topology).into_iter().collect(),
+        (0..n).map(|_| DecompressorFactory::new()).collect(),
+    );
+    let decoded = decompressed
         .chain(
             return_to_worker_mpsc::<DecompressedPage>(n)
                 .into_iter()
                 .collect(),
             pending_row_groups
                 .into_iter()
-                .zip(dictionary_allocators)
-                .map(|(pending, allocator)| RangeCutterFactory {
+                .map(|pending| RangeCutterFactory {
                     projection: projection.clone(),
                     eq_predicates: eq_predicates.clone(),
                     pending_row_groups: pending,
                     outstanding_row_groups: outstanding_row_groups.clone(),
-                    allocator,
                 })
                 .collect(),
         )
@@ -83,12 +79,10 @@ where
             stealable_fifo::<DecodeRange>(topology)
                 .into_iter()
                 .collect(),
-            batch_allocators
-                .into_iter()
-                .map(|allocator| DecoderFactory {
+            (0..n)
+                .map(|_| DecoderFactory {
                     batch_size,
                     add_row_group_metadata,
-                    allocator,
                 })
                 .collect(),
         );

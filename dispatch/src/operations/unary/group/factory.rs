@@ -31,6 +31,14 @@ use std::sync::atomic::AtomicBool;
 ///   (a merge job reads one node's tables, so it queues on that node)
 /// - A [`GatherBarrier`] collecting per-worker tables after consumption
 pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
+    stage: Arc<GroupStage<K, V>>,
+}
+
+/// What every worker's [`Group`] of one stage starts from. A worker takes its
+/// own copies of the key columns, value slots and key config when it builds,
+/// on its own thread, so the thread compiling the plan clones one `Arc` per
+/// worker instead of all of this.
+struct GroupStage<K: KeyExtractor, V: AggregationValue + ?Sized> {
     key_arena: Arc<SharedArena>,
     value_arena: Arc<SharedArena>,
     key_cols: Vec<usize>,
@@ -85,21 +93,25 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             ..RadixConfig::DEFAULT
         };
 
-        (0..topology.total_workers()).map(move |_| GroupFactory {
-            key_arena: key_arena.clone(),
-            value_arena: value_arena.clone(),
-            key_cols: key_cols.clone(),
-            value_slots: value_slots.clone(),
-            key_config: key_config.clone(),
+        let stage = Arc::new(GroupStage {
+            key_arena,
+            value_arena,
+            key_cols,
+            value_slots,
+            key_config,
             output_limit,
             count_only,
-            hash_state: hash_state.clone(),
-            injectors: injectors.clone(),
-            partition_jobs_injected: partition_jobs_injected.clone(),
-            gather: gather.clone(),
+            hash_state,
+            injectors,
+            partition_jobs_injected,
+            gather,
             radix,
-            topk_threshold: topk_threshold.clone(),
-            shared_bin_totals: shared_bin_totals.clone(),
+            topk_threshold,
+            shared_bin_totals,
+        });
+
+        (0..topology.total_workers()).map(move |_| GroupFactory {
+            stage: stage.clone(),
         })
     }
 }
@@ -110,21 +122,22 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>>;
 
     fn build_unary(self) -> PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>> {
+        let stage = self.stage;
         PipelineBreaker::Consuming(Group::new(
-            self.key_arena,
-            self.value_arena,
-            self.hash_state,
-            self.injectors,
-            self.key_cols,
-            self.value_slots,
-            self.key_config,
-            self.output_limit,
-            self.count_only,
-            self.gather,
-            self.partition_jobs_injected,
-            self.radix,
-            self.topk_threshold,
-            self.shared_bin_totals,
+            stage.key_arena.clone(),
+            stage.value_arena.clone(),
+            stage.hash_state.clone(),
+            stage.injectors.clone(),
+            stage.key_cols.clone(),
+            stage.value_slots.clone(),
+            stage.key_config.clone(),
+            stage.output_limit,
+            stage.count_only,
+            stage.gather.clone(),
+            stage.partition_jobs_injected.clone(),
+            stage.radix,
+            stage.topk_threshold.clone(),
+            stage.shared_bin_totals.clone(),
         ))
     }
 }

@@ -11,6 +11,7 @@
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::{self, Unary, UnaryFactory};
+use std::sync::Arc;
 
 /// Factory wrapping the per-worker closure.
 pub struct MapFactory<F>(pub F);
@@ -25,6 +26,26 @@ where
 
     fn build_unary(self) -> Self::Unary {
         Map { func: self.0 }
+    }
+}
+
+/// Factory holding the stage's one builder, shared by every worker: each
+/// worker runs it on its own thread to make its private closure. The thread
+/// compiling the plan then does one `Arc` clone per worker instead of one
+/// builder call per worker, which for a wide projection was most of its work.
+pub struct SharedMapFactory<FB>(pub Arc<FB>);
+
+impl<I, O, F, FB> UnaryFactory<I, O> for SharedMapFactory<FB>
+where
+    FB: Fn() -> F + Send + Sync + 'static,
+    F: FnMut(I) -> unary::Result<O> + Send + 'static,
+    I: 'static,
+    O: 'static,
+{
+    type Unary = Map<F>;
+
+    fn build_unary(self) -> Self::Unary {
+        Map { func: (self.0)() }
     }
 }
 

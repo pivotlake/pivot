@@ -15,37 +15,168 @@
 //! logically local to a worker; for example, while `CompressedPage` *is* `Send`, it is critical to
 //! return it to the worker that sent out, since it needs to be sent to the Decoder of that row group.
 //! Therefore it should *not* be in a stealable channel (but in `return_to_worker`)
+//!
+//! A deque allocates its buffer when created, and a dataflow creates one per
+//! worker per stealable stage on the thread compiling it, so on a large pool
+//! those allocations were most of a small query's compile. Instead, the deques
+//! of a finished channel go back to a pool, by message type, and the next
+//! channel of that type takes them from there.
 
 use crate::numa::Topology;
 use crate::operations::channels;
 use crate::operations::channels::{ChannelFactory, Receiver, Sender};
 use crate::waker::worker_waker;
 use crossbeam_deque::{Stealer, Worker};
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
-/// Factory for building one worker's stealable channel endpoint.
-///
-/// Holds the local [`Worker`] deque plus a *shared* slice of every worker's
-/// [`Stealer`] and this worker's place in it.
-pub struct StealableChannelFactory<T: Send> {
-    worker: Worker<T>,
-    stealers: Arc<[Stealer<T>]>,
+/// The order a deque hands its owning worker its own messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Order {
+    Lifo,
+    Fifo,
+}
+
+impl Order {
+    fn new_deque<T>(self) -> Worker<T> {
+        match self {
+            Order::Lifo => Worker::new_lifo(),
+            Order::Fifo => Worker::new_fifo(),
+        }
+    }
+}
+
+/// The deques of finished channels, keyed by message type and order, each
+/// entry a `Vec<Worker<T>>` for its type.
+type DequePool = Mutex<HashMap<(TypeId, Order), Box<dyn Any + Send>>>;
+
+static DEQUE_POOL: LazyLock<DequePool> = LazyLock::new(Default::default);
+
+/// At most this many deques are kept per message type and order: several
+/// dataflows' worth on a large pool, so a burst of concurrent queries does not
+/// park memory for good once it passes.
+const MAX_POOLED_DEQUES_PER_SHAPE: usize = 4096;
+
+/// `count` deques for messages of type `T`, from the pool while it has them
+/// and freshly created for the rest.
+fn take_deques<T: Send + 'static>(order: Order, count: usize) -> Vec<Worker<T>> {
+    let mut deques = {
+        let mut pool = DEQUE_POOL.lock().unwrap();
+        match pool.get_mut(&(TypeId::of::<T>(), order)) {
+            Some(entry) => {
+                let pooled = entry
+                    .downcast_mut::<Vec<Worker<T>>>()
+                    .expect("a pool entry holds the deques of the type and order it is keyed by");
+                let keep = pooled.len().saturating_sub(count);
+                pooled.split_off(keep)
+            }
+            None => Vec::new(),
+        }
+    };
+    let missing = count - deques.len();
+    deques.extend((0..missing).map(|_| order.new_deque()));
+    deques
+}
+
+fn return_deques<T: Send + 'static>(order: Order, deques: Vec<Worker<T>>) {
+    if deques.is_empty() {
+        return;
+    }
+    let mut pool = DEQUE_POOL.lock().unwrap();
+    let pooled = pool
+        .entry((TypeId::of::<T>(), order))
+        .or_insert_with(|| Box::new(Vec::<Worker<T>>::new()))
+        .downcast_mut::<Vec<Worker<T>>>()
+        .expect("a pool entry holds the deques of the type and order it is keyed by");
+    let room = MAX_POOLED_DEQUES_PER_SHAPE.saturating_sub(pooled.len());
+    pooled.extend(deques.into_iter().take(room));
+}
+
+#[cfg(test)]
+fn pooled_deque_count<T: Send + 'static>(order: Order) -> usize {
+    let pool = DEQUE_POOL.lock().unwrap();
+    pool.get(&(TypeId::of::<T>(), order)).map_or(0, |entry| {
+        entry
+            .downcast_ref::<Vec<Worker<T>>>()
+            .expect("a pool entry holds the deques of the type and order it is keyed by")
+            .len()
+    })
+}
+
+/// What one channel's workers share: every worker's stealer, and a slot per
+/// worker for its deque once that worker's endpoints are gone. The deques go
+/// back to the pool together when the last worker lets go of this, since a
+/// stealer can reach a peer's deque only while this is alive, so a pooled
+/// deque is never one a peer could still steal from.
+struct StageDeques<T: Send + 'static> {
+    stealers: Box<[Stealer<T>]>,
+    order: Order,
+    returned: Box<[Mutex<Option<Worker<T>>>]>,
+}
+
+impl<T: Send + 'static> Drop for StageDeques<T> {
+    fn drop(&mut self) {
+        let deques = self
+            .returned
+            .iter()
+            .filter_map(|slot| slot.lock().unwrap().take())
+            .collect();
+        return_deques(self.order, deques);
+    }
+}
+
+/// One worker's deque, shared by that worker's sender and receiver. When the
+/// last of the two drops, a drained deque goes into the stage's slot for the
+/// pool; one still holding messages belongs to a cancelled dataflow, and
+/// drops with them rather than carry them into the next dataflow's channel.
+struct DequeOwner<T: Send + 'static> {
+    deque: Option<Worker<T>>,
+    stage: Arc<StageDeques<T>>,
+    worker_idx: usize,
+}
+
+impl<T: Send + 'static> DequeOwner<T> {
+    fn deque(&self) -> &Worker<T> {
+        self.deque
+            .as_ref()
+            .expect("the deque leaves its owner only when the owner drops")
+    }
+}
+
+impl<T: Send + 'static> Drop for DequeOwner<T> {
+    fn drop(&mut self) {
+        let Some(deque) = self.deque.take() else {
+            return;
+        };
+        if deque.is_empty() {
+            *self.stage.returned[self.worker_idx].lock().unwrap() = Some(deque);
+        }
+    }
+}
+
+pub struct StealableChannelFactory<T: Send + 'static> {
+    deque: Worker<T>,
+    stage: Arc<StageDeques<T>>,
     worker_idx: usize,
     topology: Topology,
 }
 
 impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
-    type Sender = Rc<Worker<T>>;
+    type Sender = StealableSender<T>;
     type Receiver = StealableReceiver<T>;
 
-    fn build(self) -> (Rc<Worker<T>>, StealableReceiver<T>) {
-        let worker = Rc::new(self.worker);
+    fn build(self) -> (StealableSender<T>, StealableReceiver<T>) {
+        let owner = Rc::new(DequeOwner {
+            deque: Some(self.deque),
+            stage: self.stage,
+            worker_idx: self.worker_idx,
+        });
         (
-            worker.clone(),
+            StealableSender(owner.clone()),
             StealableReceiver {
-                worker,
-                stealers: self.stealers,
+                owner,
                 siblings: self.topology.node_siblings(self.worker_idx),
                 worker_idx: self.worker_idx,
             },
@@ -53,59 +184,40 @@ impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
     }
 }
 
-impl<O> Sender<O> for Rc<Worker<O>> {
+/// The producing end: pushes onto the worker's own deque.
+pub struct StealableSender<T: Send + 'static>(Rc<DequeOwner<T>>);
+
+impl<O: Send + 'static> Sender<O> for StealableSender<O> {
     fn send(&mut self, item: O) -> channels::Result<()> {
-        self.push(item);
-        // One new item needs one thief: wake a single parked same-node peer.
-        // Waking more would just herd workers into finding nothing (the send
-        // path must stay cheap; see WorkerWaker).
+        self.0.deque().push(item);
         worker_waker().notify_one();
         Ok(())
     }
 }
 
-/// Receiving end of a stealable channel.
-///
-/// Shares an `Rc<Worker<I>>` with the sender (both live on the same worker thread).
-/// [`Receiver::try_recv`] pops from the local deque; [`Receiver::steal`] tries its
-/// same-node peers' deques in order when the local one is empty, enabling
-/// cross-worker load balancing within the node.
-pub struct StealableReceiver<I> {
-    worker: Rc<Worker<I>>,
-    /// Every worker's stealer, shared by all receivers of the stage.
-    stealers: Arc<[Stealer<I>]>,
-    /// The slice of `stealers` this worker may steal from (its node's workers).
+pub struct StealableReceiver<I: Send + 'static> {
+    owner: Rc<DequeOwner<I>>,
     siblings: std::ops::Range<usize>,
-    /// This worker's own index in `stealers`, skipped when stealing.
     worker_idx: usize,
 }
 
-impl<I> Receiver<I> for StealableReceiver<I> {
+impl<I: Send + 'static> Receiver<I> for StealableReceiver<I> {
     fn is_empty(&self) -> bool {
-        self.worker.is_empty()
+        self.owner.deque().is_empty()
     }
 
-    /// Pop a message from the local deque (newest first, or oldest first for
-    /// a [`stealable_fifo`] channel).
     fn try_recv(&self) -> Option<I> {
-        self.worker.pop()
+        self.owner.deque().pop()
     }
 
-    /// Try to steal a message from a same-node peer worker's deque.
-    /// Iterates through the node's stealers, retrying on contention.
-    ///
-    /// The `is_empty` pre-check keeps the (very common) all-empty scan cheap:
-    /// it is a couple of plain loads, while `steal()` pins a crossbeam epoch
-    /// and CASes even when it finds nothing. Idle workers re-run this scan on
-    /// every wakeup, so without the pre-check the pool burns a large share of
-    /// its cycles in epoch bookkeeping just discovering there is no work.
     fn steal(&self) -> Option<I> {
         use crossbeam_deque::Steal;
+        let stealers = &self.owner.stage.stealers;
         for peer in self.siblings.clone() {
             if peer == self.worker_idx {
                 continue;
             }
-            let stealer = &self.stealers[peer];
+            let stealer = &stealers[peer];
             if stealer.is_empty() {
                 continue;
             }
@@ -121,39 +233,40 @@ impl<I> Receiver<I> for StealableReceiver<I> {
     }
 }
 
-/// Create one [`StealableChannelFactory`] per worker, each wired to steal from
-/// its same-node peers only (see the module docs for why stealing never
-/// crosses NUMA nodes). The local worker pops its newest message first.
-pub fn stealable<T: Send>(
+/// Create one [`StealableChannelFactory`] per worker. The local worker pops its
+/// newest message first.
+pub fn stealable<T: Send + 'static>(
     topology: Topology,
 ) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
-    stealable_with(topology, Worker::new_lifo)
+    stealable_with(topology, Order::Lifo)
 }
 
 /// Like [`stealable`], but the local worker pops its oldest message first,
 /// for messages that form a sequence the worker should follow in order.
 /// Thieves take the oldest message in both flavours.
-pub fn stealable_fifo<T: Send>(
+pub fn stealable_fifo<T: Send + 'static>(
     topology: Topology,
 ) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
-    stealable_with(topology, Worker::new_fifo)
+    stealable_with(topology, Order::Fifo)
 }
 
-fn stealable_with<T: Send>(
+fn stealable_with<T: Send + 'static>(
     topology: Topology,
-    new_worker: fn() -> Worker<T>,
+    order: Order,
 ) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
-    let workers: Vec<_> = (0..topology.total_workers())
-        .map(|_| new_worker())
-        .collect();
-    let stealers: Arc<[Stealer<T>]> = workers.iter().map(Worker::stealer).collect();
+    let deques = take_deques::<T>(order, topology.total_workers());
+    let stage = Arc::new(StageDeques {
+        stealers: deques.iter().map(Worker::stealer).collect(),
+        order,
+        returned: deques.iter().map(|_| Mutex::new(None)).collect(),
+    });
 
-    workers
+    deques
         .into_iter()
         .enumerate()
-        .map(move |(worker_idx, worker)| StealableChannelFactory {
-            worker,
-            stealers: stealers.clone(),
+        .map(move |(worker_idx, deque)| StealableChannelFactory {
+            deque,
+            stage: stage.clone(),
             worker_idx,
             topology,
         })
@@ -214,5 +327,32 @@ mod tests {
 
         assert_eq!(endpoints[2].1.steal(), None);
         assert_eq!(endpoints[3].1.steal(), None);
+    }
+
+    /// Each test pools under its own message type, so tests sharing the
+    /// process-wide pool do not see each other's deques.
+    #[test]
+    fn a_finished_channel_pools_its_drained_deques_for_the_next_channel() {
+        struct Message;
+        let endpoints = two_node_endpoints::<Message>();
+
+        drop(endpoints);
+        let pooled_after_drop = pooled_deque_count::<Message>(Order::Lifo);
+        let _next = two_node_endpoints::<Message>();
+        let pooled_after_reuse = pooled_deque_count::<Message>(Order::Lifo);
+
+        assert_eq!(pooled_after_drop, 4);
+        assert_eq!(pooled_after_reuse, 0);
+    }
+
+    #[test]
+    fn a_deque_still_holding_messages_is_not_pooled() {
+        struct Message;
+        let mut endpoints = two_node_endpoints::<Message>();
+        endpoints[0].0.send(Message).unwrap();
+
+        drop(endpoints);
+
+        assert_eq!(pooled_deque_count::<Message>(Order::Lifo), 3);
     }
 }

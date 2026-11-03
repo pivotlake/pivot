@@ -56,19 +56,27 @@ impl RegexpJitReplace {
 
         Ok(Box::new(move || {
             let template = template.clone();
-            // A fresh regex per worker avoids shared-state contention in the row loop.
-            let regex = build_jit_regex(&pattern).expect("pattern validated at plan compile");
-            // One reusable capture buffer per worker, refilled by every match so
-            // the row loop allocates no per-row PCRE2 match data.
-            let mut locations = regex.capture_locations();
+            let pattern = pattern.clone();
+            // A fresh regex per worker avoids shared-state contention in the row
+            // loop, with one reusable capture buffer per worker so the row loop
+            // allocates no per-row PCRE2 match data. Both are built on the
+            // worker's first batch: this builder runs once per worker on the
+            // thread compiling the plan, and a JIT compile per worker there
+            // would grow that thread's work with the worker count.
+            let mut compiled = None;
             let mut input_expr = input_builder();
             Box::new(move |batch: &RecordBatch| {
+                let (regex, locations) = compiled.get_or_insert_with(|| {
+                    let regex =
+                        build_jit_regex(&pattern).expect("pattern validated at plan compile");
+                    let locations = regex.capture_locations();
+                    (regex, locations)
+                });
                 let input = input_expr(batch);
                 let (arr, _) = input.as_datum().get();
                 let strings = arr.as_string_view();
-                let result = replace_column(strings, |s| {
-                    replace_first(&regex, &mut locations, s, &template)
-                });
+                let result =
+                    replace_column(strings, |s| replace_first(regex, locations, s, &template));
                 ExprResult::Array(result)
             }) as ExprEvalFn
         }))

@@ -10,26 +10,26 @@
 
 use crate::Identifier;
 use crate::operations::channels;
-use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel_to};
+use crate::operations::channels::mpsc::{WorkerChannelReceiver, WorkerChannelSet};
 use crate::operations::channels::{ChannelFactory, Sender};
 use std::sync::Arc;
 
-/// Factory for one worker's end of the funnel: the shared sender slice (every
+/// Factory for one worker's end of the funnel: the shared channel set (every
 /// build routes to `target`) and this worker's receiver.
-pub struct SingleWorkerMpscFactory<T> {
-    senders: Arc<[MpscSender<T>]>,
+pub struct SingleWorkerMpscFactory<T: Send + 'static> {
+    set: Arc<WorkerChannelSet<T>>,
     target: Identifier,
-    receiver: MpscReceiver<T>,
+    receiver: WorkerChannelReceiver<T>,
 }
 
 impl<T: 'static + Send> ChannelFactory<T> for SingleWorkerMpscFactory<T> {
     type Sender = SingleWorkerSender<T>;
-    type Receiver = MpscReceiver<T>;
+    type Receiver = WorkerChannelReceiver<T>;
 
     fn build(self) -> (Self::Sender, Self::Receiver) {
         (
             SingleWorkerSender {
-                senders: self.senders,
+                set: self.set,
                 target: self.target,
             },
             self.receiver,
@@ -37,16 +37,15 @@ impl<T: 'static + Send> ChannelFactory<T> for SingleWorkerMpscFactory<T> {
     }
 }
 
-/// A sender that puts every message on the `target` worker's mpsc channel.
-pub struct SingleWorkerSender<O> {
-    senders: Arc<[MpscSender<O>]>,
+/// A sender that puts every message on the `target` worker's channel.
+pub struct SingleWorkerSender<O: Send + 'static> {
+    set: Arc<WorkerChannelSet<O>>,
     target: Identifier,
 }
 
-impl<O> Sender<O> for SingleWorkerSender<O> {
+impl<O: Send + 'static> Sender<O> for SingleWorkerSender<O> {
     fn send(&mut self, item: O) -> channels::Result<()> {
-        self.senders[self.target].send_ref(item)?;
-        Ok(())
+        self.set.send_to(self.target, item)
     }
 }
 
@@ -55,16 +54,13 @@ pub fn to_single_worker_mpsc<T: 'static + Send>(
     count: usize,
     target: Identifier,
 ) -> impl IntoIterator<Item = SingleWorkerMpscFactory<T>> {
-    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
-        .map(|worker| mpsc_channel_to::<T>(worker))
-        .unzip();
-    let senders: Arc<[MpscSender<T>]> = senders.into();
+    let (set, receivers) = WorkerChannelSet::new(count);
 
     receivers
         .into_iter()
-        .map(move |rx| SingleWorkerMpscFactory {
-            senders: senders.clone(),
+        .map(move |receiver| SingleWorkerMpscFactory {
+            set: set.clone(),
             target,
-            receiver: rx,
+            receiver,
         })
 }
