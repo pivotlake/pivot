@@ -121,11 +121,18 @@ impl Layout for Dynamic {
     }
 
     fn slab_rows(&self, slabs_so_far: usize) -> usize {
-        let doubled = self
-            .first_slab_rows
-            .checked_shl(slabs_so_far as u32)
-            .unwrap_or(self.max_slab_rows);
-        doubled.min(self.max_slab_rows)
+        // Double once per slab filled, stopping at the cap. A shift would
+        // wrap once the doublings pass the word size: a power-of-two first
+        // slab shifted that far is exactly zero, and a zero-row slab is a
+        // slab of no bytes whose rows land past its buffer.
+        let mut rows = self.first_slab_rows;
+        for _ in 0..slabs_so_far {
+            if rows >= self.max_slab_rows {
+                break;
+            }
+            rows *= 2;
+        }
+        rows.min(self.max_slab_rows)
     }
 
     unsafe fn row_mut<'a>(&self, row: *mut u8) -> &'a mut [u8] {
@@ -143,6 +150,18 @@ mod tests {
 
         assert_eq!(layout.slab_rows(0), 12);
         assert_eq!(layout.slab_rows(5), 12);
+    }
+
+    #[test]
+    fn a_dynamic_layout_stays_at_its_cap_after_many_slabs() {
+        let layout = Dynamic::new(32, 16, 8 * 1024, 64 * 1024);
+
+        let rows: Vec<usize> = [55, 56, 60, 63, 64, 1000]
+            .iter()
+            .map(|&slabs| layout.slab_rows(slabs))
+            .collect();
+
+        assert_eq!(rows, [2048, 2048, 2048, 2048, 2048, 2048]);
     }
 
     #[test]
