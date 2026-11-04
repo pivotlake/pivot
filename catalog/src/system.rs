@@ -335,13 +335,13 @@ impl DatastoreTransaction for SystemTransaction {
 
     fn bind_create_table(&self, request: CreateTableRequest) -> Result<Box<dyn TableCreation>> {
         Err(CatalogError::Other(Box::new(Error::CreateTable(
-            request.schema_qualified_name(),
+            request.schema_qualified_name(planner::DEFAULT_SCHEMA_NAME),
         ))))
     }
 
     fn bind_drop_table(&self, request: DropTableRequest) -> Result<Box<dyn TableDrop>> {
         Err(CatalogError::Other(Box::new(Error::DropTable(
-            request.schema_qualified_name(),
+            request.schema_qualified_name(planner::DEFAULT_SCHEMA_NAME),
         ))))
     }
 

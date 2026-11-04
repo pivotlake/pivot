@@ -79,7 +79,7 @@ pub struct TableFunctionDef {
     pub supports_late_materialization: bool,
 }
 
-pub use crate::duckdb_bridge::ffi::ScalarFunctionDef;
+pub use crate::duckdb_bridge::ffi::{DatabaseAttachment, ScalarFunctionDef};
 
 /// One planning transaction's binder: resolves table names against the
 /// snapshot the transaction was opened on, so everything a single plan binds
@@ -129,28 +129,35 @@ pub trait DuckDBTransaction: Send + Sync {
 /// and all other catalog resolution use the per-query [`DuckDBTransaction`].
 pub struct CatalogContext {
     table_functions: Vec<TableFunctionDef>,
-    database_names: Vec<String>,
+    databases: Vec<DatabaseAttachment>,
     default_name: String,
 }
 
 impl CatalogContext {
     pub(crate) fn new(
         table_functions: Vec<TableFunctionDef>,
-        database_names: Vec<String>,
+        databases: Vec<DatabaseAttachment>,
         default_name: String,
     ) -> Self {
         CatalogContext {
             table_functions,
-            database_names,
+            databases,
             default_name,
         }
     }
 }
 
-/// The datastore names to attach, one DuckDB `ATTACH` per name. Called from the
-/// C++ context constructor.
-pub(crate) fn catalog_context_names(ctx: &CatalogContext) -> Vec<String> {
-    ctx.database_names.clone()
+/// The datastores to attach, one DuckDB `ATTACH` per entry, each with the
+/// schema its unqualified names resolve in. Called from the C++ context
+/// constructor.
+pub(crate) fn catalog_context_databases(ctx: &CatalogContext) -> Vec<DatabaseAttachment> {
+    ctx.databases
+        .iter()
+        .map(|database| DatabaseAttachment {
+            name: database.name.clone(),
+            default_schema: database.default_schema.clone(),
+        })
+        .collect()
 }
 
 /// The datastore DuckDB should make its current database (`USE`). Called from the

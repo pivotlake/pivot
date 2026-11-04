@@ -51,6 +51,10 @@ pub use datastore::Datastore;
 /// [`planner::DEFAULT_DATASTORE_NAME`].
 pub use planner::DEFAULT_DATASTORE_NAME;
 
+/// The conventional name for a datastore's default schema; see
+/// [`planner::DEFAULT_SCHEMA_NAME`].
+pub use planner::DEFAULT_SCHEMA_NAME;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
@@ -147,10 +151,23 @@ impl PivotCatalog {
         &self.default_name
     }
 
-    pub fn datastore_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.datastores.keys().cloned().collect();
-        names.push(system::DATASTORE_NAME.to_string());
-        names
+    /// Every datastore a planner over this catalog attaches: the configured
+    /// ones, each with the schema its unqualified names resolve in, and the
+    /// `system` datastore, whose relations all live in the conventional schema.
+    pub fn attached_datastores(&self) -> Vec<planner::AttachedDatastore> {
+        let mut datastores: Vec<_> = self
+            .datastores
+            .iter()
+            .map(|(name, datastore)| planner::AttachedDatastore {
+                name: name.clone(),
+                default_schema: datastore.default_schema_name().to_string(),
+            })
+            .collect();
+        datastores.push(planner::AttachedDatastore {
+            name: system::DATASTORE_NAME.to_string(),
+            default_schema: DEFAULT_SCHEMA_NAME.to_string(),
+        });
+        datastores
     }
 
     /// Start every datastore's background maintenance. Called once when the
@@ -534,6 +551,10 @@ mod tests {
 
         fn data_path(&self) -> String {
             "memory://".to_string()
+        }
+
+        fn default_schema_name(&self) -> &str {
+            DEFAULT_SCHEMA_NAME
         }
     }
 

@@ -64,7 +64,7 @@ marked as the default.
 ### Naming tables
 
 A table's full name is `datastore.schema.table`. An unqualified name refers
-to the `main` schema of the default datastore:
+to the default schema of the default datastore:
 
 ```sql
 SELECT count(*) FROM clicks;              -- local.main.clicks
@@ -72,8 +72,36 @@ SELECT count(*) FROM lake.sales.orders;   -- the orders table in the lake datast
 ```
 
 A two-part name such as `sales.orders` can name either a schema in the default
-datastore or a datastore's `main` schema. Use the full three-part name when a
+datastore or a datastore's default schema. Use the full three-part name when a
 datastore and a schema share a name.
+
+### Default schema
+
+Each datastore's default schema is `main` unless its `default_schema` key
+names another. It is the schema an unqualified table name resolves in when the
+datastore is the default, and the one a two-part `datastore.table` name
+resolves in always:
+
+```yaml
+datastores:
+  lake:
+    kind: iceberg
+    uri: https://catalog.example.com/api
+    default: true
+    default_schema: public
+```
+
+```sql
+SELECT count(*) FROM orders;        -- lake.public.orders
+SELECT count(*) FROM lake.orders;   -- lake.public.orders
+```
+
+This lets queries written for a database whose schemas are mirrored as
+Iceberg namespaces run unchanged. The datastore must define the schema before
+a name resolves through it: a pivotlake datastore always defines `main`, and
+`CREATE SCHEMA` adds another, while an Iceberg datastore defines the
+namespaces its catalog holds. A name that resolves in a default schema the
+datastore does not define fails as a missing schema.
 
 ### pivotlake datastores
 
@@ -88,6 +116,7 @@ datastores:
 | --- | --- | --- |
 | `location` | Required | Where the datastore's tables are stored. See the table below. |
 | `default` | `false` | Whether this is the [default datastore](#default-datastore). |
+| `default_schema` | `main` | The schema unqualified table names resolve in. See [Default schema](#default-schema). |
 | `compact` | `true` | Run background compaction. See [Compaction](#compaction). |
 | `compact_bytes` | `64m` | The target size of a compacted file. |
 | `compact_merge_bytes` | 1.3 × `compact_bytes` | How many bytes of small files trigger a merge. |
@@ -125,6 +154,7 @@ datastores:
 | `secret` | None | The name of an [`iceberg` secret](#iceberg-catalog-secrets) to authenticate to the catalog with. Omit it for a catalog that requires no authentication. |
 | `properties` | `{}` | Additional REST client properties, passed to the catalog client as written. |
 | `default` | `false` | Whether this is the [default datastore](#default-datastore). |
+| `default_schema` | `main` | The namespace unqualified table names resolve in. See [Default schema](#default-schema). |
 
 Each catalog namespace appears as a schema, and the datastore is read-only.
 Table files are read from the locations the catalog reports, using the

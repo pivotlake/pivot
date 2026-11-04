@@ -105,9 +105,9 @@ pub struct DatastoreFileMetadata {
 #[async_trait]
 pub trait DatastoreTransaction: Debug + Send + Sync {
     /// Whether this datastore defines a schema named `schema` in the
-    /// transaction's frozen snapshot. Every datastore defines
-    /// [`planner::DEFAULT_SCHEMA_NAME`], so a table named with no schema always
-    /// has a schema to resolve in.
+    /// transaction's frozen snapshot. The planner asks this for the datastore's
+    /// [`default_schema_name`](Datastore::default_schema_name) too, so a table
+    /// named with no schema fails as a missing schema when that one is absent.
     fn does_schema_exist(&self, schema: &str) -> Result<bool>;
 
     /// Resolve the schema-qualified `name`, in the datastore the catalog serves
@@ -233,6 +233,13 @@ pub trait Datastore: Debug + Send + Sync {
     /// `s3://bucket/prefix`). Every path a table or a file of this datastore
     /// reports is relative to it.
     fn data_path(&self) -> String;
+
+    /// The schema a reference into this datastore that names no schema resolves
+    /// in: a bare `t` when the datastore is the default, and `datastore.t`
+    /// always. Configured per datastore; [`planner::DEFAULT_SCHEMA_NAME`] by
+    /// convention. Nothing checks that the datastore defines it until a
+    /// reference resolves through it, which then fails as a missing schema.
+    fn default_schema_name(&self) -> &str;
 
     /// Start this datastore's background maintenance (e.g. periodic refresh and
     /// compaction), spawning its tasks onto the ambient async runtime. Called

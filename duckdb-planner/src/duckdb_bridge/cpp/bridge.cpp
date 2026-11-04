@@ -165,34 +165,46 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
 	// DuckDB database per datastore. All attached databases share this one
 	// PivotStorageInfo; each ATTACH's alias is the datastore name, which the
 	// schema-entry lookups pass back so a table lookup routes to that datastore's
-	// snapshot in the current transaction. Finally make the default datastore the
-	// current database, so unqualified names resolve against it.
+	// snapshot in the current transaction. The DEFAULT_SCHEMA option hands the
+	// catalog the schema its unqualified names resolve in (see
+	// `pivot_catalog_attach`). Finally make the default datastore the current
+	// database, so unqualified names resolve against it.
 	auto ext = duckdb::StorageExtension::Find(
 	    duckdb::DBConfig::GetConfig(*db.instance), "pivotdb");
 	ext->storage_info = duckdb::make_shared_ptr<PivotStorageInfo>();
 	RegisterPivotTableFunctions(*con.context, *this->catalog);
 
-	for (const auto &name : catalog_context_names(*this->catalog)) {
-		std::string db_name(name);
+	std::string default_name(catalog_context_default(*this->catalog));
+	std::string default_schema;
+	for (const auto &database : catalog_context_databases(*this->catalog)) {
+		std::string db_name(database.name);
+		std::string schema(database.default_schema);
 		std::string sql = "ATTACH " + duckdb::KeywordHelper::WriteQuoted(db_name, '\'') +
 		                  " AS " + duckdb::KeywordHelper::WriteQuoted(db_name, '"') +
-		                  " (TYPE pivotdb)";
+		                  " (TYPE pivotdb, DEFAULT_SCHEMA " +
+		                  duckdb::KeywordHelper::WriteQuoted(schema, '\'') + ")";
 		auto attach_result = con.Query(sql);
 		if (attach_result->HasError()) {
 			throw std::runtime_error(attach_result->GetError());
 		}
+		if (db_name == default_name) {
+			default_schema = schema;
+		}
+	}
+	if (default_schema.empty()) {
+		throw std::runtime_error("default datastore `" + default_name +
+		                         "` is not among the datastores to attach");
 	}
 
-	// Make the default datastore the current database. Set the search path
-	// directly rather than through `USE`: the binder verifies a `USE` target's
-	// schema through the catalog, and schema lookups need a published
-	// transaction, which only exists while a plan is being extracted. The
-	// unverified path is checked at bind time by every plan that resolves an
-	// unqualified name through it.
-	std::string default_name(catalog_context_default(*this->catalog));
+	// Make the default datastore the current database, with its own default
+	// schema. Set the search path directly rather than through `USE`: the binder
+	// verifies a `USE` target's schema through the catalog, and schema lookups
+	// need a published transaction, which only exists while a plan is being
+	// extracted. The unverified path is checked at bind time by every plan that
+	// resolves an unqualified name through it.
 	duckdb::ClientData::Get(*con.context)
 	    .catalog_search_path->Set(
-	        duckdb::CatalogSearchEntry(default_name, DEFAULT_SCHEMA),
+	        duckdb::CatalogSearchEntry(default_name, default_schema),
 	        duckdb::CatalogSetPathType::SET_DIRECTLY);
 }
 

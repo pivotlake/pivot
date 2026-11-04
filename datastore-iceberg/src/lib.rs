@@ -254,6 +254,9 @@ pub struct IcebergDatastore {
     /// The refresh task [`start`](Datastore::start) spawned, so
     /// [`abort`](Datastore::abort) can stop it on shutdown.
     refresh_task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// The namespace a reference that names no schema resolves in; see
+    /// [`Datastore::default_schema_name`].
+    default_schema: String,
 }
 
 /// The datastore's index, built from one answer of the catalog and shaped as
@@ -319,12 +322,15 @@ impl IcebergDatastore {
     /// `store_factory` opens the object stores the tables' files live in, so
     /// their credentials follow the same policy as every other datastore's;
     /// `refresh_interval` is how often the catalog is asked again once
-    /// [`start`](Datastore::start) is called.
+    /// [`start`](Datastore::start) is called; `default_schema` is the namespace
+    /// a reference that names no schema resolves in, which the catalog need not
+    /// hold for the open to succeed.
     pub fn open(
         config: &IcebergCatalogConfig,
         store_factory: Arc<dyn ExternalStoreFactory>,
         dispatcher: &DataFlowDispatcher,
         refresh_interval: Duration,
+        default_schema: String,
     ) -> Result<Arc<Self>> {
         let datastore = Self {
             config: config.clone(),
@@ -334,6 +340,7 @@ impl IcebergDatastore {
             index: RwLock::new(Arc::new(DatastoreIndex::default())),
             refresh_interval,
             refresh_task: Mutex::new(None),
+            default_schema,
         };
         datastore.refresh()?;
         Ok(Arc::new(datastore))
@@ -494,6 +501,10 @@ impl Datastore for IcebergDatastore {
 
     fn kind(&self) -> &'static str {
         "iceberg"
+    }
+
+    fn default_schema_name(&self) -> &str {
+        &self.default_schema
     }
 
     /// The catalog's URI: every file path a table reports is a full location

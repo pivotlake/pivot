@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use catalog::metastore::{Metastore, UserAuth};
-use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use catalog::{DEFAULT_DATASTORE_NAME, DEFAULT_SCHEMA_NAME, Datastore, PivotCatalog};
 use datastore_iceberg::IcebergDatastore;
 use datastore_pivotlake::{DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, PivotlakeDatastore};
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
@@ -256,7 +256,8 @@ impl Drop for ShellInstance {
 /// maintenance (see [`ShellInstance::open_with_resources`]); an Iceberg
 /// datastore reads its tables' files through the process's own credential
 /// policy, the same one the `AWS_*` and `GOOGLE_*` variables set for a pivotlake
-/// datastore in a bucket.
+/// datastore in a bucket. The shell has no configuration to name another, so
+/// unqualified names resolve in the conventional default schema.
 fn open_datastore(
     target: &ShellTarget,
     dispatcher: &DataFlowDispatcher,
@@ -274,6 +275,7 @@ fn open_datastore(
                 store,
                 dispatcher,
                 Some(maintenance),
+                DEFAULT_SCHEMA_NAME.to_string(),
             )?)
         }
         ShellTarget::Iceberg(config) => Ok(IcebergDatastore::open(
@@ -281,6 +283,7 @@ fn open_datastore(
             Arc::new(AmbientExternalStoreFactory),
             dispatcher,
             refresh_interval,
+            DEFAULT_SCHEMA_NAME.to_string(),
         )?),
     }
 }

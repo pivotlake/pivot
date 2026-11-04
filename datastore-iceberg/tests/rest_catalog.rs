@@ -676,9 +676,14 @@ impl Harness {
             properties,
             ..IcebergCatalogConfig::default()
         };
-        let datastore =
-            IcebergDatastore::open(&config, store_factory, self.dispatcher(), REFRESH_INTERVAL)
-                .expect("open the iceberg datastore");
+        let datastore = IcebergDatastore::open(
+            &config,
+            store_factory,
+            self.dispatcher(),
+            REFRESH_INTERVAL,
+            planner::DEFAULT_SCHEMA_NAME.to_string(),
+        )
+        .expect("open the iceberg datastore");
         let catalog = PivotCatalog::new(
             HashMap::from([(DATASTORE.to_string(), datastore as Arc<dyn Datastore>)]),
             DATASTORE.to_string(),

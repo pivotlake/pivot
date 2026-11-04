@@ -135,7 +135,8 @@ pub struct TableRevision {
 /// `Some` even for an unqualified `CREATE TABLE t`, which arrives carrying the
 /// current database and schema. They stay optional so a caller building a
 /// request by hand (an embedded API, a test) can leave the choice to the
-/// catalog, which reads a `None` as the default.
+/// catalog, which reads a `None` as the default datastore and that datastore's
+/// default schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTableRequest {
     pub datastore_name: Option<String>,
@@ -148,12 +149,11 @@ pub struct CreateTableRequest {
 
 impl CreateTableRequest {
     /// The name the target datastore will register the new table under: the
-    /// schema the statement named, or the default when it named none.
-    pub fn schema_qualified_name(&self) -> SchemaQualifiedTableName {
+    /// schema the statement named, or `default_schema`, the target datastore's
+    /// own default, when it named none.
+    pub fn schema_qualified_name(&self, default_schema: &str) -> SchemaQualifiedTableName {
         SchemaQualifiedTableName::new(
-            self.schema_name
-                .as_deref()
-                .unwrap_or(crate::DEFAULT_SCHEMA_NAME),
+            self.schema_name.as_deref().unwrap_or(default_schema),
             self.name.clone(),
         )
     }
@@ -169,7 +169,7 @@ impl CreateTableRequest {
 /// found. They stay optional both for a caller building a request by hand and
 /// for an `IF EXISTS` drop of a missing table, where DuckDB has nothing to
 /// resolve and leaves the qualifiers as written (possibly absent); the catalog
-/// reads a `None` as the default.
+/// reads a `None` as the default datastore and that datastore's default schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropTableRequest {
     pub datastore_name: Option<String>,
@@ -180,12 +180,11 @@ pub struct DropTableRequest {
 
 impl DropTableRequest {
     /// The name the target datastore resolves the dropped table by: the schema
-    /// the statement named, or the default when it named none.
-    pub fn schema_qualified_name(&self) -> SchemaQualifiedTableName {
+    /// the statement named, or `default_schema`, the target datastore's own
+    /// default, when it named none.
+    pub fn schema_qualified_name(&self, default_schema: &str) -> SchemaQualifiedTableName {
         SchemaQualifiedTableName::new(
-            self.schema_name
-                .as_deref()
-                .unwrap_or(crate::DEFAULT_SCHEMA_NAME),
+            self.schema_name.as_deref().unwrap_or(default_schema),
             self.name.clone(),
         )
     }

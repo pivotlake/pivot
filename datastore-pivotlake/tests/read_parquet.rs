@@ -41,6 +41,10 @@ impl Datastore for EmptyDatastore {
     fn data_path(&self) -> String {
         String::new()
     }
+
+    fn default_schema_name(&self) -> &str {
+        planner::DEFAULT_SCHEMA_NAME
+    }
 }
 
 #[derive(Debug)]

@@ -10,7 +10,7 @@ pub mod duckdb_types;
 
 use crate::catalog_provider::{
     CatalogContext, OptionalTableWrapper, TransactionContext, catalog_bind_table_function,
-    catalog_context_default, catalog_context_names, catalog_does_schema_exist,
+    catalog_context_databases, catalog_context_default, catalog_does_schema_exist,
     catalog_get_scalar_function, catalog_get_table, catalog_table_functions,
     clone_table_function_table, pushdown_filter, table_estimate_row_count,
     table_supports_late_materialization,
@@ -77,6 +77,14 @@ pub mod ffi {
         pub supports_late_materialization: bool,
     }
 
+    /// One datastore to attach as a DuckDB database: `name` is the attach
+    /// alias a query qualifies tables with, and `default_schema` the schema a
+    /// reference into the database that names no schema resolves in.
+    struct DatabaseAttachment {
+        pub name: String,
+        pub default_schema: String,
+    }
+
     /// One invocation-specific table-function binding: its footer-derived
     /// columns and the regular table object carried into the logical scan.
     struct CatalogBindTableFunctionResult {
@@ -134,9 +142,9 @@ pub mod ffi {
         type CatalogContext;
         type TransactionContext;
         type OptionalTableWrapper;
-        /// Datastore names to attach (one DuckDB database each), and which is the
+        /// The datastores to attach (one DuckDB database each), and which is the
         /// current database, read by the C++ context constructor.
-        fn catalog_context_names(ctx: &CatalogContext) -> Vec<String>;
+        fn catalog_context_databases(ctx: &CatalogContext) -> Vec<DatabaseAttachment>;
         fn catalog_context_default(ctx: &CatalogContext) -> String;
         fn catalog_table_functions(ctx: &CatalogContext) -> Vec<TableFunctionDef>;
         /// Whether `datastore` defines `schema`, asked when the binder looks a

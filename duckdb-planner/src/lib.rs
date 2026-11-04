@@ -68,7 +68,7 @@ use std::sync::Arc;
 use duckdb_bridge::ffi;
 use thiserror::Error;
 
-pub use catalog_provider::{DuckDBTable, DuckDBTransaction};
+pub use catalog_provider::{DatabaseAttachment, DuckDBTable, DuckDBTransaction};
 pub use duckdb_bridge::duckdb_types::LogicalTypeId;
 pub use duckdb_bridge::ffi::DuckDBColumn;
 pub use handle::{BridgeError, Expr, LogicalOp, Plan};
@@ -136,21 +136,22 @@ pub struct PlannerContext {
 
 impl PlannerContext {
     /// Create a planner context with the given static table-function overloads,
-    /// attaching one DuckDB database per name in `database_names` and making
-    /// `default_name` the current database. Function invocations and per-query
-    /// catalog lookups are routed through the transaction handed to
-    /// [`plan`](Self::plan).
+    /// attaching one DuckDB database per entry of `databases` (each resolving
+    /// its unqualified names in its own default schema) and making
+    /// `default_name`, which must be one of them, the current database.
+    /// Function invocations and per-query catalog lookups are routed through
+    /// the transaction handed to [`plan`](Self::plan).
     /// Creating the context attaches every datastore as a DuckDB database, and
     /// any of those steps can fail inside DuckDB; the C++ exception comes back
     /// as [`Error::Bridge`].
     pub fn new(
         table_functions: Vec<catalog_provider::TableFunctionDef>,
-        database_names: Vec<String>,
+        databases: Vec<DatabaseAttachment>,
         default_name: String,
     ) -> Result<Self, Error> {
         let ctx = Box::new(catalog_provider::CatalogContext::new(
             table_functions,
-            database_names,
+            databases,
             default_name,
         ));
         Ok(Self {

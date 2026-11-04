@@ -20,16 +20,18 @@ On context creation (`new_context`):
 
 1. Register a `PivotExtension` storage extension (in `extension.cpp`)
 2. Create a `PivotStorageInfo` that holds a pointer to the Rust `CatalogContext`
-3. `ATTACH '' AS pv (TYPE pivotdb)` — DuckDB calls our `pivot_catalog_attach`,
-   which creates a `PivotCatalog` backed by the Rust catalog
-4. `USE pv` — makes it the default catalog so all unqualified table references
-   go through our catalog
+3. `ATTACH 'pv' AS pv (TYPE pivotdb, DEFAULT_SCHEMA 'main')` per datastore —
+   DuckDB calls our `pivot_catalog_attach`, which creates a `PivotCatalog`
+   backed by the Rust catalog; the option is the schema a reference into the
+   datastore that names no schema resolves in
+4. Set the search path to the default datastore and its default schema, so all
+   unqualified table references go through our catalog
 
 When DuckDB plans a query and encounters a table name, it walks:
 
 ```
 DuckDB binder
-  -> PivotCatalog::LookupSchema("main")
+  -> PivotCatalog::LookupSchema(<the schema named, or the default schema>)
   -> PivotSchemaCatalogEntry::LookupEntry("users")
        calls Rust FFI: catalog_get_table(transaction, datastore, schema, "users")
        Rust calls DuckDBTransaction::bind_table(...)

@@ -1,6 +1,7 @@
 use duckdb_planner::catalog_provider::ScalarFunctionDef;
 use duckdb_planner::{
-    DuckDBColumn, DuckDBTable, DuckDBTransaction, Error, LogicalTypeId, PlannerContext,
+    DatabaseAttachment, DuckDBColumn, DuckDBTable, DuckDBTransaction, Error, LogicalTypeId,
+    PlannerContext,
 };
 use std::sync::Arc;
 
@@ -85,7 +86,11 @@ impl DuckDBTransaction for ScalarTransaction {
 }
 
 fn create_simple_context() -> PlannerContext {
-    PlannerContext::new(Vec::new(), vec!["db".to_string()], "db".to_string()).unwrap()
+    let database = DatabaseAttachment {
+        name: "db".to_string(),
+        default_schema: "main".to_string(),
+    };
+    PlannerContext::new(Vec::new(), vec![database], "db".to_string()).unwrap()
 }
 
 fn plan(p: &mut PlannerContext, query: &str) -> Result<duckdb_planner::Plan, Error> {

@@ -8,7 +8,8 @@
 
 using namespace duckdb;
 
-PivotCatalog::PivotCatalog(AttachedDatabase &db) : Catalog(db) {
+PivotCatalog::PivotCatalog(AttachedDatabase &db, std::string default_schema)
+    : Catalog(db), default_schema(std::move(default_schema)) {
 }
 
 void PivotCatalog::Initialize(bool load_builtin) {
@@ -16,6 +17,10 @@ void PivotCatalog::Initialize(bool load_builtin) {
 
 string PivotCatalog::GetCatalogType() {
 	return "pivot";
+}
+
+string PivotCatalog::GetDefaultSchema() const {
+	return default_schema;
 }
 
 optional_ptr<CatalogEntry> PivotCatalog::CreateSchema(CatalogTransaction, CreateSchemaInfo &) { RUST_NOT_IMPLEMENTED; }
@@ -47,9 +52,9 @@ bool PivotCatalog::DoesSchemaExist(const std::string &name) {
 optional_ptr<SchemaCatalogEntry> PivotCatalog::LookupSchema(CatalogTransaction transaction,
                                                             const EntryLookupInfo &schema_lookup,
                                                             OnEntryNotFound if_not_found) {
-	// A lookup that names no schema is a reference to the default one.
+	// A lookup that names no schema is a reference to this datastore's default.
 	auto &requested = schema_lookup.GetEntryName();
-	auto name = requested == INVALID_SCHEMA ? std::string(DEFAULT_SCHEMA) : requested;
+	auto name = requested == INVALID_SCHEMA ? default_schema : requested;
 
 	if (!DoesSchemaExist(name)) {
 		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {

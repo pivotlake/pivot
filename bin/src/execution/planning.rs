@@ -75,8 +75,8 @@ impl PlannerPool {
     pub(super) fn new(catalog: Arc<catalog::PivotCatalog>) -> Result<Self, planner::Error> {
         let planners = (0..INITIAL_PLANNERS)
             .map(|_| {
-                planner::Planner::from_datastore_names(
-                    catalog.datastore_names(),
+                planner::Planner::from_datastores(
+                    catalog.attached_datastores(),
                     catalog.default_datastore_name().to_string(),
                 )
             })
@@ -98,8 +98,8 @@ impl PlannerPool {
         let idle_planner = self.idle_planners.lock().unwrap().pop();
         let mut planner = match idle_planner {
             Some(planner) => planner,
-            None => planner::Planner::from_datastore_names(
-                self.catalog.datastore_names(),
+            None => planner::Planner::from_datastores(
+                self.catalog.attached_datastores(),
                 self.catalog.default_datastore_name().to_string(),
             )?,
         };

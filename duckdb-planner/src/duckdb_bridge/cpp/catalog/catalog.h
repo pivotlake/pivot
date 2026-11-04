@@ -15,6 +15,10 @@ class PivotCatalog : public duckdb::Catalog {
 	// Planning is single-threaded per context, so the map needs no lock.
 	duckdb::unordered_map<std::string, duckdb::unique_ptr<PivotSchemaCatalogEntry>> schemas;
 
+	// The schema a reference into this datastore that names no schema resolves
+	// in: the one the datastore was attached with, fixed for the catalog's life.
+	const std::string default_schema;
+
 	// The entry for `name`, creating it on first resolution.
 	PivotSchemaCatalogEntry &FindOrCreateSchema(const std::string &name);
 
@@ -23,10 +27,13 @@ class PivotCatalog : public duckdb::Catalog {
 	bool DoesSchemaExist(const std::string &name);
 
 public:
-	explicit PivotCatalog(duckdb::AttachedDatabase &db);
+	PivotCatalog(duckdb::AttachedDatabase &db, std::string default_schema);
 
 	void Initialize(bool load_builtin) override;
 	std::string GetCatalogType() override;
+	// DuckDB resolves a `datastore.table` reference, and a search-path entry
+	// that names only this catalog, in the schema this returns.
+	std::string GetDefaultSchema() const override;
 
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateSchema(duckdb::CatalogTransaction transaction,
 	                                                         duckdb::CreateSchemaInfo &info) override;

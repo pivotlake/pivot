@@ -22,6 +22,10 @@ COMPACT events;
 COMPACT [datastore.][schema.]table [FINAL];
 ```
 
+A table that names no datastore is in the default datastore, and one that
+names no schema is in its datastore's
+[default schema](/docs/reference/server/datastores/#default-schema).
+
 ## Compaction behavior
 
 Regular `COMPACT` merges small files and re-sorts overlapping files until no

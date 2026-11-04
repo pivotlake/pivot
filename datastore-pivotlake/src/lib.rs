@@ -314,6 +314,9 @@ pub struct PivotlakeDatastore {
     /// Handle to the one compaction actor serving both timer ticks and explicit
     /// commands. Created lazily by maintenance startup or the first command.
     compacter: Arc<Mutex<Option<crate::compact::CompacterHandle>>>,
+    /// The schema a reference that names no schema resolves in; see
+    /// [`Datastore::default_schema_name`].
+    default_schema: String,
 }
 
 impl std::fmt::Debug for PivotlakeDatastore {
@@ -330,10 +333,17 @@ impl PivotlakeDatastore {
     /// table the manifest records at its latest version: read each table's
     /// manifest (schema + file list) and fetch its files' footers, building the
     /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.
-    /// No background maintenance runs (see [`from_store`](Self::from_store)).
+    /// No background maintenance runs, and unqualified names resolve in the
+    /// conventional [`DEFAULT_SCHEMA_NAME`](planner::DEFAULT_SCHEMA_NAME) (see
+    /// [`from_store`](Self::from_store) for both).
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Arc<Self>> {
         let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
-        Self::from_store(store, dispatcher, None)
+        Self::from_store(
+            store,
+            dispatcher,
+            None,
+            planner::DEFAULT_SCHEMA_NAME.to_string(),
+        )
     }
 
     /// Open a persisted database over an already-built object store. This is the
@@ -341,10 +351,13 @@ impl PivotlakeDatastore {
     /// store (local dir / S3, with whatever credentials it holds) and hands
     /// it in, rather than having the datastore re-derive one from a URI. Reloads
     /// every table the manifest records, exactly as [`open`](Self::open) does.
+    /// `default_schema` is the schema a reference that names no schema resolves
+    /// in; the datastore need not define it yet (`CREATE SCHEMA` can).
     pub fn from_store(
         store: Arc<dyn ObjectStore>,
         dispatcher: &DataFlowDispatcher,
         maintenance: Option<crate::MaintenanceConfig>,
+        default_schema: String,
     ) -> Result<Arc<Self>> {
         // Only local pivotlake datastores take a process lock; remote stores have
         // no local root and skip this.
@@ -375,6 +388,7 @@ impl PivotlakeDatastore {
             maintenance,
             maintenance_tasks: Arc::new(Mutex::new(Vec::new())),
             compacter: Arc::new(Mutex::new(None)),
+            default_schema,
         }))
     }
 
@@ -923,7 +937,7 @@ impl PivotlakeTransaction {
     /// only points at data to adopt; nothing is written to that directory. A
     /// statement that names none yields an empty table.
     fn bind_create(&self, request: CreateTableRequest) -> Result<PivotlakeTableCreation> {
-        let name = request.schema_qualified_name();
+        let name = request.schema_qualified_name(&self.datastore.default_schema);
 
         Self::reject_unknown_options(&request)?;
 
@@ -967,7 +981,7 @@ impl PivotlakeTransaction {
     }
 
     fn bind_drop(&self, request: DropTableRequest) -> Result<PivotlakeTableDrop> {
-        let name = request.schema_qualified_name();
+        let name = request.schema_qualified_name(&self.datastore.default_schema);
         if !request.if_exists {
             if !self.contains_schema(&name.schema) {
                 return Err(Error::SchemaNotFound(name.schema));
@@ -1246,6 +1260,10 @@ impl Datastore for PivotlakeDatastore {
     /// it reports is relative to it.
     fn data_path(&self) -> String {
         self.store.location_uri()
+    }
+
+    fn default_schema_name(&self) -> &str {
+        &self.default_schema
     }
 
     /// Spawn this datastore's configured maintenance onto the ambient runtime: a

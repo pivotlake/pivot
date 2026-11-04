@@ -187,11 +187,22 @@ impl From<duckdb_planner::BridgeError> for Error {
 /// lowest crate that names it; `catalog` re-exports it.
 pub const DEFAULT_DATASTORE_NAME: &str = "default";
 
-/// The conventional name for the schema every datastore has: DuckDB's default
-/// schema, and the one a reference that names no schema resolves in. A datastore
-/// always defines it, so a two-part `datastore.table` reference always resolves.
-/// Owned here beside [`DEFAULT_DATASTORE_NAME`], the lowest crate that names it.
+/// The conventional name for a datastore's default schema: the schema a
+/// reference into the datastore that names no schema resolves in, unless the
+/// datastore is configured with another (see [`AttachedDatastore`]). A pivotlake
+/// datastore always defines it. Owned here beside [`DEFAULT_DATASTORE_NAME`],
+/// the lowest crate that names it.
 pub const DEFAULT_SCHEMA_NAME: &str = "main";
+
+/// One datastore a [`Planner`] attaches to DuckDB as a database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedDatastore {
+    /// The datastore's name: the qualifier a query names it by (`name.schema.t`).
+    pub name: String,
+    /// The schema a reference into this datastore that names no schema resolves
+    /// in: a bare `t` when the datastore is the default, and `name.t` always.
+    pub default_schema: String,
+}
 
 /// Entry point for using crate: plans SQL statements into a Pivot [`Plan`].
 ///
@@ -212,25 +223,49 @@ pub struct Planner {
 unsafe impl Send for Planner {}
 
 impl Planner {
-    /// Create a `Planner` over several named datastores, each attached to DuckDB
-    /// as its own database so a query can name it (`db.schema.t`). `default_name`
-    /// is the current database. The planner holds no catalog: the per-query
+    /// Create a `Planner` over several datastores, each attached to DuckDB as
+    /// its own database so a query can name it (`db.schema.t`) and each resolving
+    /// its unqualified names in its own default schema. `default_name` is the
+    /// current database. The planner holds no catalog: the per-query
     /// [`CatalogTransaction`] passed to [`plan`](Self::plan) must span these
     /// datastores and routes each table to the right one's snapshot by the attach
     /// name.
-    pub fn from_datastore_names(
-        database_names: Vec<String>,
+    pub fn from_datastores(
+        datastores: Vec<AttachedDatastore>,
         default_name: String,
     ) -> Result<Self, Error> {
         let table_function_defs =
             built_in_table_function_defs().map_err(Error::TableFunctionRegistry)?;
+        let databases = datastores
+            .into_iter()
+            .map(|datastore| duckdb_planner::DatabaseAttachment {
+                name: datastore.name,
+                default_schema: datastore.default_schema,
+            })
+            .collect();
         Ok(Self {
             planner_context: duckdb_planner::PlannerContext::new(
                 table_function_defs,
-                database_names,
+                databases,
                 default_name,
             )?,
         })
+    }
+
+    /// [`from_datastores`](Self::from_datastores) over datastores known by name
+    /// alone, each resolving its unqualified names in [`DEFAULT_SCHEMA_NAME`].
+    pub fn from_datastore_names(
+        datastore_names: Vec<String>,
+        default_name: String,
+    ) -> Result<Self, Error> {
+        let datastores = datastore_names
+            .into_iter()
+            .map(|name| AttachedDatastore {
+                name,
+                default_schema: DEFAULT_SCHEMA_NAME.to_string(),
+            })
+            .collect();
+        Self::from_datastores(datastores, default_name)
     }
 
     /// Plan a SQL statement into a Pivot [`Plan`], inside `transaction`.

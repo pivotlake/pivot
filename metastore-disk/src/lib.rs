@@ -142,11 +142,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use catalog::Datastore;
 use catalog::metastore::{
     DEFAULT_USER_NAME, Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth,
     format_scram_verifier, parse_scram_verifier,
 };
+use catalog::{DEFAULT_SCHEMA_NAME, Datastore};
 use datastore_iceberg::{IcebergCatalogAuth, IcebergCatalogConfig, IcebergDatastore};
 use datastore_pivotlake::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
@@ -319,13 +319,19 @@ impl DiskMetastore {
                             compaction: config.compaction(),
                             vacuum: config.vacuum(),
                         };
-                        PivotlakeDatastore::from_store(store, dispatcher, Some(maintenance))?
+                        PivotlakeDatastore::from_store(
+                            store,
+                            dispatcher,
+                            Some(maintenance),
+                            config.default_schema.clone(),
+                        )?
                     }
                     DatastoreConfig::Iceberg(config) => IcebergDatastore::open(
                         &config.catalog_config(name, &self.secrets)?,
                         self.external_store_factory(),
                         dispatcher,
                         self.refresh_interval,
+                        config.default_schema.clone(),
                     )?,
                 };
                 Ok((name.clone(), datastore))
@@ -701,6 +707,11 @@ pub struct IcebergDatastoreConfig {
     /// unqualified table names. Exactly one datastore must set it.
     #[serde(rename = "default", default)]
     is_default: bool,
+    /// The namespace a table name that names no schema resolves in: a bare
+    /// `table` when this datastore is the default, and `datastore.table`
+    /// always. Defaults to [`DEFAULT_SCHEMA_NAME`].
+    #[serde(default = "default_schema_name")]
+    default_schema: String,
 }
 
 impl IcebergDatastoreConfig {
@@ -739,6 +750,13 @@ pub struct PivotlakeDatastoreConfig {
     /// unqualified table names and DDL. Exactly one datastore must set it.
     #[serde(rename = "default", default)]
     is_default: bool,
+    /// The schema a table name that names no schema resolves in: a bare `table`
+    /// when this datastore is the default, and `datastore.table` always. The
+    /// datastore must define it before such a name resolves (`CREATE SCHEMA`
+    /// does). Defaults to [`DEFAULT_SCHEMA_NAME`], which every pivotlake
+    /// datastore defines.
+    #[serde(default = "default_schema_name")]
+    default_schema: String,
     /// Run this datastore's own background compaction. On by default;
     /// `compact_bytes` applies only when it is on. Compaction rewrites small
     /// Parquet files and overlapping large ones, so run it in only one process
@@ -777,6 +795,11 @@ pub struct PivotlakeDatastoreConfig {
 /// run unless a datastore explicitly turns them off.
 fn default_true() -> bool {
     true
+}
+
+/// Serde default for a datastore's `default_schema`: the conventional schema.
+fn default_schema_name() -> String {
+    DEFAULT_SCHEMA_NAME.to_string()
 }
 
 impl PivotlakeDatastoreConfig {
@@ -978,6 +1001,39 @@ datastores:
         assert_eq!(hot.min_files, 42);
         assert_eq!(hot.max_concurrent_merges, 7);
         assert!(warm.is_none());
+    }
+
+    #[test]
+    fn a_datastore_names_the_schema_its_unqualified_tables_resolve_in() {
+        let yaml = r#"
+datastores:
+  hot:
+    kind: pivotlake
+    location: /tmp/hot
+    default: true
+    default_schema: reporting
+  lake:
+    kind: iceberg
+    uri: https://catalog.example.com/api
+    default_schema: public
+"#;
+
+        let store = from_yaml(yaml).unwrap();
+
+        assert_eq!(datastore(&store, "hot").default_schema, "reporting");
+        let DatastoreConfig::Iceberg(lake) = datastore_config(&store, "lake") else {
+            panic!("lake is an iceberg datastore");
+        };
+        assert_eq!(lake.default_schema, "public");
+    }
+
+    #[test]
+    fn the_default_schema_is_the_conventional_one_unless_named() {
+        let store = from_yaml(HOT_SECTION).unwrap();
+
+        let config = datastore(&store, "hot");
+
+        assert_eq!(config.default_schema, DEFAULT_SCHEMA_NAME);
     }
 
     #[test]

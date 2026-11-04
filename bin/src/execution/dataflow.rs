@@ -146,11 +146,16 @@ pub(super) async fn execute_compact(
         .datastore
         .as_deref()
         .unwrap_or_else(|| catalog.default_datastore_name());
+    let datastore = catalog.get_datastore(datastore_name).ok_or_else(|| {
+        planner::catalog::Error::Other(Box::new(catalog::Error::UnknownDatastore(
+            datastore_name.to_string(),
+        )))
+    })?;
     let table = planner::catalog::SchemaQualifiedTableName::new(
         request
             .schema
             .as_deref()
-            .unwrap_or(planner::DEFAULT_SCHEMA_NAME),
+            .unwrap_or_else(|| datastore.default_schema_name()),
         request.table.as_str(),
     );
     Ok(transaction

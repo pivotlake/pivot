@@ -68,6 +68,7 @@ datastores:
     kind: pivotlake
     location: /var/lib/pivot/datastores/<name>
     default: true               # on exactly one datastore
+    # default_schema: main
     # compact: true
     # compact_bytes: 64m
     # compact_merge_bytes: <1.3 x compact_bytes>
@@ -81,6 +82,7 @@ datastores:
     # secret: <secret name>
     # properties: {}
     # default: false            # true on exactly one datastore
+    # default_schema: main
 
 secrets:
   <name>:
