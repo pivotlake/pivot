@@ -95,7 +95,8 @@ pub fn encode_batch(batch: &RecordBatch, format: FieldFormat) -> Result<PGRowBat
 /// The arms that fit neither shape stay spelled out, because their text and
 /// binary encodings come from different values:
 ///
-/// - `UInt64`: no signed type fits, so it ships as TEXT via `to_string`.
+/// - `UInt64`: no signed type fits, so it is a NUMERIC, as its decimal digits
+///   in text and via [`encode_numeric_binary`] in binary.
 /// - `Decimal64`/`Decimal128`: NUMERIC, as `value_as_string` in text and via
 ///   [`encode_numeric_binary`] in binary.
 /// - `Date32`/`Timestamp`/`Interval`: rendered as a Postgres server prints
@@ -114,8 +115,9 @@ macro_rules! arrow_pg_types {
             match dt {
                 $( DataType::$dt => Type::$pg, )+
                 $( DataType::$udt => Type::$upg, )+
-                // UInt64 can't fit any signed type, so it ships as TEXT.
-                DataType::UInt64 => Type::TEXT,
+                // UInt64 can't fit any signed type, so it is a NUMERIC, which a
+                // client decodes as a number of whatever width it asks for.
+                DataType::UInt64 => Type::NUMERIC,
                 DataType::Decimal64(_, _) | DataType::Decimal128(_, _) => Type::NUMERIC,
                 // Temporal types reinterpreted from the executor's int columns at
                 // the output boundary (see `encode_cell`). A zone-carrying
@@ -158,8 +160,17 @@ macro_rules! arrow_pg_types {
                 // Ints widen to a Postgres integer type the value fits.
                 $( DataType::$udt => encoder
                     .encode_field(&(arr.as_any().downcast_ref::<$uarray>().unwrap().value(row) as $signed)), )+
-                DataType::UInt64 => encoder
-                    .encode_field(&arr.as_any().downcast_ref::<UInt64Array>().unwrap().value(row).to_string()),
+                // NUMERIC's text form is the plain decimal digits; in binary the
+                // value is a scale-0 numeric.
+                DataType::UInt64 => {
+                    let value = arr.as_any().downcast_ref::<UInt64Array>().unwrap().value(row);
+                    match format {
+                        FieldFormat::Text => encoder.encode_field(&value.to_string()),
+                        FieldFormat::Binary => {
+                            encoder.encode_field(&encode_numeric_binary(i128::from(value), 0))
+                        }
+                    }
+                }
                 // Decimals in either carrier width (Decimal128 is e.g. the SUM
                 // aggregate output). `value_as_string` renders the
                 // integer/decimal with its scale applied; scale 0 yields a
@@ -462,7 +473,7 @@ mod tests {
         assert_eq!(fields[0].format(), FieldFormat::Text);
         assert_eq!(fields[1].datatype(), &Type::INT2);
         assert_eq!(fields[2].datatype(), &Type::INT8);
-        assert_eq!(fields[3].datatype(), &Type::TEXT);
+        assert_eq!(fields[3].datatype(), &Type::NUMERIC);
         assert_eq!(fields[4].datatype(), &Type::FLOAT8);
         assert_eq!(fields[5].datatype(), &Type::TEXT);
     }
@@ -733,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_batch_encodes_uint64_as_text() {
+    fn encode_batch_encodes_uint64_as_numeric_text() {
         let col: ArrayRef = Arc::new(UInt64Array::from(vec![u64::MAX, 0]));
         let b = batch(vec![("v", DataType::UInt64)], vec![col]);
 
@@ -741,6 +752,21 @@ mod tests {
 
         assert_eq!(decoded[0], vec![Some(u64::MAX.to_string())]);
         assert_eq!(decoded[1], vec![Some("0".to_string())]);
+    }
+
+    #[test]
+    fn binary_encodes_uint64_as_a_whole_numeric() {
+        let col: ArrayRef = Arc::new(UInt64Array::from(vec![u64::MAX, 0, 70_000]));
+        let b = batch(vec![("v", DataType::UInt64)], vec![col]);
+
+        let cells = binary_cells(&b);
+
+        assert_eq!(
+            cells[0],
+            Some(numeric(4, 0x0000, 0, &[1844, 6744, 737, 955, 1615]))
+        );
+        assert_eq!(cells[1], Some(numeric(0, 0x0000, 0, &[])));
+        assert_eq!(cells[2], Some(numeric(1, 0x0000, 0, &[7])));
     }
 
     #[test]
