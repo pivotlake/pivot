@@ -437,6 +437,7 @@ impl<L: Layout> PartitionAllocator<L> {
         let rows = self
             .layout
             .slab_rows(self.partitions[partition].slabs_filled);
+        assert!(rows > 0, "a slab must hold at least one row");
         let size = rows * self.layout.row_size();
         let align = self.layout.row_align();
         assert!(
