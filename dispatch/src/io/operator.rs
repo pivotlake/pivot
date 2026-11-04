@@ -6,8 +6,10 @@
 //! asks, through the [`OperatorIO`] handle dispatch wraps around each call.
 
 use super::OpenFile;
+use crate::io::requester::resolve_read_through_cache;
 use crate::memory::FileBytes;
 use bytes::Bytes;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Identifies one logical read within an operator node.
@@ -120,6 +122,9 @@ pub struct PendingReadRequest {
 pub struct PendingWriteRequest {
     pub id: WriteRequestId,
     pub open_file: OpenFile,
+    /// Where in a local file `data` goes; a remote object is always written
+    /// whole.
+    pub offset: u64,
     pub data: Arc<FileBytes>,
 }
 
@@ -130,7 +135,10 @@ pub struct PendingWriteRequest {
 /// retains only its logical request identifiers and domain state, and never
 /// sees the requester's worker-lifecycle surface.
 pub struct OperatorIO<'a> {
-    requester: &'a mut crate::io::IORequester,
+    /// The worker's requester, borrowed for the length of each call rather
+    /// than held: an operator allocating ring memory mid-run may have to
+    /// evict, and eviction borrows the requester to wait on spill writes.
+    requester: &'a RefCell<crate::io::IORequester>,
     data_flow_id: crate::Identifier,
     operator_idx: crate::Identifier,
     stats: &'a mut crate::stats::StatsCollector,
@@ -141,7 +149,7 @@ pub struct OperatorIO<'a> {
 
 impl<'a> OperatorIO<'a> {
     pub(crate) fn new(
-        requester: &'a mut crate::io::IORequester,
+        requester: &'a RefCell<crate::io::IORequester>,
         data_flow_id: crate::Identifier,
         operator_idx: crate::Identifier,
         stats: &'a mut crate::stats::StatsCollector,
@@ -168,8 +176,15 @@ impl<'a> OperatorIO<'a> {
             open_file,
             locations: locations.into_iter().collect(),
         };
-        self.requester
-            .request_read(self.data_flow_id, self.operator_idx, request, self.stats)?;
+        // Resolving may allocate cache slots, and so evict, before the borrow.
+        let cache_lookups = resolve_read_through_cache(&request);
+        self.requester.borrow_mut().request_read(
+            self.data_flow_id,
+            self.operator_idx,
+            request,
+            cache_lookups,
+            self.stats,
+        )?;
         Ok(id)
     }
 
@@ -184,29 +199,40 @@ impl<'a> OperatorIO<'a> {
         let request = PendingWriteRequest {
             id,
             open_file,
+            offset: 0,
             data,
         };
-        self.requester
-            .request_write(self.data_flow_id, self.operator_idx, request, self.stats)?;
+        self.requester.borrow_mut().request_write(
+            self.data_flow_id,
+            self.operator_idx,
+            request,
+            self.stats,
+        )?;
         Ok(id)
     }
 
-    /// Write spilled `data` to `open_file`. Like [`write`](Self::write), except
-    /// the id is marked as a spill so the worker completes it instead of the
-    /// operator.
+    /// Write spilled `data` to `open_file` at `offset`. Like
+    /// [`write`](Self::write), except the id is marked as a spill so the
+    /// worker completes it instead of the operator.
     pub(crate) fn write_spill(
         &mut self,
         open_file: OpenFile,
+        offset: u64,
         data: Arc<FileBytes>,
     ) -> Result<WriteRequestId, crate::io::IORequesterError> {
         let id = WriteRequestId::next(self.next_request_id, true);
         let request = PendingWriteRequest {
             id,
             open_file,
+            offset,
             data,
         };
-        self.requester
-            .request_write(self.data_flow_id, self.operator_idx, request, self.stats)?;
+        self.requester.borrow_mut().request_write(
+            self.data_flow_id,
+            self.operator_idx,
+            request,
+            self.stats,
+        )?;
         Ok(id)
     }
 
@@ -231,7 +257,7 @@ impl<'a> OperatorIO<'a> {
 /// can hand its operator a real handle without running a worker.
 #[cfg(any(test, feature = "test-util"))]
 pub struct TestOperatorIO {
-    requester: crate::io::IORequester,
+    requester: RefCell<crate::io::IORequester>,
     stats: crate::stats::StatsCollector,
     next_request_id: usize,
     data_flow_id: crate::Identifier,
@@ -252,7 +278,7 @@ impl TestOperatorIO {
     /// such as spill files, stay apart.
     pub fn for_operator(data_flow_id: crate::Identifier, operator_idx: crate::Identifier) -> Self {
         Self {
-            requester: crate::io::IORequester::default(),
+            requester: RefCell::new(crate::io::IORequester::default()),
             stats: crate::stats::StatsCollector::disabled(),
             next_request_id: 0,
             data_flow_id,
@@ -262,7 +288,7 @@ impl TestOperatorIO {
 
     pub fn io(&mut self) -> OperatorIO<'_> {
         OperatorIO::new(
-            &mut self.requester,
+            &self.requester,
             self.data_flow_id,
             self.operator_idx,
             &mut self.stats,
@@ -270,45 +296,32 @@ impl TestOperatorIO {
         )
     }
 
-    /// A spiller over this IO, recording its writes in `writes_in_flight` as
-    /// the worker's would.
-    pub fn spiller<'a>(
-        &'a mut self,
-        writes_in_flight: &'a mut ahash::HashMap<
-            WriteRequestId,
-            Arc<std::sync::atomic::AtomicUsize>,
-        >,
-    ) -> crate::memory::Spiller<'a> {
-        crate::memory::Spiller::new(self.io(), writes_in_flight)
+    /// A spiller over this IO. Its writes are recorded with the memory
+    /// context, as the worker's are.
+    pub fn spiller(&mut self) -> crate::memory::Spiller<'_> {
+        crate::memory::Spiller::new(self.io())
     }
 
-    /// Wait for every spill write in `writes_in_flight` to land, counting each
-    /// off its buffer as the worker does.
-    pub fn finish_spill_writes(
-        &mut self,
-        writes_in_flight: &mut ahash::HashMap<WriteRequestId, Arc<std::sync::atomic::AtomicUsize>>,
-    ) {
-        while !writes_in_flight.is_empty() {
-            self.requester.wait().unwrap();
-            for completion in self.requester.completions().unwrap() {
-                if let Ok(crate::io::Completion::FsWrite(write)) = completion {
-                    let count = writes_in_flight
-                        .remove(&write.request.id)
-                        .expect("a completed spill write was recorded when issued");
-                    count.fetch_sub(1, std::sync::atomic::Ordering::Release);
-                }
-            }
+    /// Wait for every spill write in flight to land, counting each off its
+    /// buffer as the worker does.
+    pub fn finish_spill_writes(&mut self) {
+        let mut requester = self.requester.borrow_mut();
+        while crate::memory::memory_ctx().has_spill_writes_in_flight() {
+            requester.wait().unwrap();
+            requester.collect_completions().unwrap();
+            crate::memory::memory_ctx().complete_landed_spill_writes(&mut requester);
         }
     }
 
     /// Wait for IO to complete and hand every finished logical read to
     /// `deliver`, as the worker does for its operators.
     pub fn deliver_completed_reads(&mut self, mut deliver: impl FnMut(ReadResponse)) {
-        self.requester.wait().unwrap();
-        for completion in self.requester.completions().unwrap() {
+        let mut requester = self.requester.borrow_mut();
+        requester.wait().unwrap();
+        for completion in requester.completions().unwrap() {
             assert!(completion.is_ok(), "a test's IO does not fail");
         }
-        for ready in self.requester.take_ready_reads() {
+        for ready in requester.take_ready_reads() {
             deliver(ready.response);
         }
     }

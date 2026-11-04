@@ -272,8 +272,7 @@ mod tests {
             asked: asked.clone(),
         });
         let mut test_io = TestOperatorIO::default();
-        let mut writes_in_flight = ahash::HashMap::default();
-        let mut spiller = Spiller::new(test_io.io(), &mut writes_in_flight);
+        let mut spiller = Spiller::new(test_io.io());
         let mut sender = crate::operations::unary::test_utils::CollectSender::<()>::new();
 
         breaker.spill(&mut spiller, 1).unwrap();

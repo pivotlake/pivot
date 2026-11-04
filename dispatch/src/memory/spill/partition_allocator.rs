@@ -380,6 +380,7 @@ impl<L: Layout> PartitionAllocator<L> {
                         .spill_file
                         .clone()
                         .expect("every partition in the buffer had its file opened just above"),
+                    offset: self.partitions[partition].bytes_spilled,
                     rows: FileBytes::new(),
                 });
             }
@@ -476,60 +477,54 @@ impl<L: Layout> PartitionAllocator<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WriteRequestId;
-    use crate::io::{Completion, IORequester, OperatorIO};
+    use crate::io::{IORequester, OperatorIO};
     use crate::memory::init_test_free_pool;
     use crate::memory::spill::directory;
     use crate::memory::spill::layout::{Dynamic, Fixed};
     use crate::memory::spill::partition_tree::PARTITIONS_PER_GROUP;
     use crate::stats::StatsCollector;
     use crate::worker::WORKER_IDX;
-    use ahash::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::cell::RefCell;
+    use std::sync::atomic::Ordering;
 
     /// What a `Spiller` borrows, under a dataflow id of the test's own so its
     /// spill files clash with no other test's.
     struct SpillerParts {
         dataflow: usize,
-        requester: IORequester,
+        requester: RefCell<IORequester>,
         stats: StatsCollector,
         next_request_id: usize,
-        writes_in_flight: HashMap<WriteRequestId, Arc<AtomicUsize>>,
     }
 
     impl SpillerParts {
         fn new(dataflow: usize) -> Self {
             Self {
                 dataflow,
-                requester: IORequester::default(),
+                requester: RefCell::new(IORequester::default()),
                 stats: StatsCollector::disabled(),
                 next_request_id: 0,
-                writes_in_flight: HashMap::default(),
             }
         }
 
         fn spiller(&mut self) -> Spiller<'_> {
             let io = OperatorIO::new(
-                &mut self.requester,
+                &self.requester,
                 self.dataflow,
                 0,
                 &mut self.stats,
                 &mut self.next_request_id,
             );
-            Spiller::new(io, &mut self.writes_in_flight)
+            Spiller::new(io)
         }
 
         /// Complete every spill write issued so far, counting each off its
         /// buffer as the worker does.
         fn finish_writes(&mut self) {
-            while !self.writes_in_flight.is_empty() {
-                self.requester.wait().unwrap();
-                for completion in self.requester.completions().unwrap() {
-                    if let Ok(Completion::FsWrite(write)) = completion {
-                        let count = self.writes_in_flight.remove(&write.request.id).unwrap();
-                        count.fetch_sub(1, Ordering::Release);
-                    }
-                }
+            let mut requester = self.requester.borrow_mut();
+            while memory_ctx().has_spill_writes_in_flight() {
+                requester.wait().unwrap();
+                requester.collect_completions().unwrap();
+                memory_ctx().complete_landed_spill_writes(&mut requester);
             }
         }
 
@@ -808,14 +803,8 @@ mod tests {
         let slab = (BUFFER_SIZE / 4) as u64;
         let offsets: Vec<u64> = second.slabs.iter().map(|s| s.file_offset).collect();
         assert_eq!(offsets, [slab, 2 * slab, 3 * slab, 4 * slab]);
-        // The file was opened for appending, so on Linux the second spill's
-        // four slabs land after the first spill's one. macOS honors the offset
-        // the write names instead, so there the second write overwrites the
-        // first and only its four slabs remain.
-        #[cfg(target_os = "linux")]
+        // The second spill's four slabs land after the first spill's one.
         assert_eq!(parts.file_len(0), (5 * BUFFER_SIZE / 4) as u64);
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(parts.file_len(0), BUFFER_SIZE as u64);
         assert!(allocator.partitions[64].spill_file.is_some());
         assert!(allocator.partitions[1].spill_file.is_none());
     }

@@ -571,11 +571,8 @@ mod tests {
         // every spilled buffer, so the merge has to read those rows back.
         let mut evicted = 0;
         let sender = run_consumers_with(groups, worker_batches, 9_000_040, |worker, group, io| {
-            let mut writes_in_flight = ahash::HashMap::default();
-            group
-                .spill(&mut io.spiller(&mut writes_in_flight), usize::MAX)
-                .unwrap();
-            io.finish_spill_writes(&mut writes_in_flight);
+            group.spill(&mut io.spiller(), usize::MAX).unwrap();
+            io.finish_spill_writes();
             while let Some(freed) = evictors[worker].borrow_mut().evict() {
                 drop(freed);
                 evicted += 1;

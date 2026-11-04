@@ -21,22 +21,21 @@
 
 use crate::Identifier;
 use crate::graph::Graph;
-use crate::io::{
-    FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse, WriteRequestId,
-};
+use crate::io::{FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse};
 use crate::memory::{DataflowEvict, Evict, Spiller, memory_ctx, spill_directory};
 use crate::operations::{FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::waker::waker_set;
 use crate::worker::WORKER_IDX;
 use ahash::HashMap;
+use std::cell::RefCell;
 use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
-use std::{mem, panic, result};
+use std::{panic, result};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -571,7 +570,7 @@ impl DataFlow {
         &mut self,
         node_id: Identifier,
         response: ReadResponse,
-        requester: &mut IORequester,
+        requester: &RefCell<IORequester>,
     ) {
         self.try_run(|d| {
             let data_flow_id = d.id;
@@ -618,7 +617,7 @@ impl DataFlow {
 
     /// Run one unit of CPU work, traversing leaf-to-root (downstream first for cache locality).
     /// Returns [`WorkStatus::Ran`] if any operator did work.
-    pub fn run_ready_cpu_work(&mut self, requester: &mut IORequester) -> WorkStatus {
+    pub fn run_ready_cpu_work(&mut self, requester: &RefCell<IORequester>) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
             d.graph
@@ -640,15 +639,10 @@ impl DataFlow {
     /// Ask this dataflow's operators to spill up to `count` ring slots' worth of
     /// buffers. Returns how many slots they started spilling, which is
     /// less than `count` when the operators had less to give.
-    pub fn spill(
-        &mut self,
-        requester: &mut IORequester,
-        spill_writes_in_flight: &mut HashMap<WriteRequestId, Arc<AtomicUsize>>,
-        count: usize,
-    ) -> usize {
+    pub fn spill(&mut self, requester: &RefCell<IORequester>, count: usize) -> usize {
         self.try_run_or(0, |d| {
             let io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
-            let mut spiller = Spiller::new(io, spill_writes_in_flight);
+            let mut spiller = Spiller::new(io);
             // The walk stops once the count is met; only the count matters here.
             let _: ControlFlow<()> = d.graph.traverse_backwards(|node_id, operator| {
                 spiller.set_operator_idx(node_id);
@@ -666,7 +660,7 @@ impl DataFlow {
 
     /// Attempt to steal work from peer workers, traversing root-to-leaf (upstream first
     /// so the original worker's downstream data stays hot).
-    pub fn try_stealing_work(&mut self, requester: &mut IORequester) -> WorkStatus {
+    pub fn try_stealing_work(&mut self, requester: &RefCell<IORequester>) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
             d.graph
@@ -826,7 +820,7 @@ mod tests {
             false,
         );
 
-        let spilled = flow.spill(&mut IORequester::default(), &mut HashMap::default(), 5);
+        let spilled = flow.spill(&RefCell::new(IORequester::default()), 5);
 
         assert_eq!(spilled, 5);
         assert_eq!(*asked[2].lock().unwrap(), [5]);
@@ -929,16 +923,16 @@ mod tests {
             false,
         );
 
-        let mut requester = IORequester::default();
+        let requester = RefCell::new(IORequester::default());
         assert!(matches!(
-            flow.run_ready_cpu_work(&mut requester),
+            flow.run_ready_cpu_work(&requester),
             WorkStatus::Pending
         ));
         assert_eq!(runs.load(Ordering::Relaxed), 0);
 
         gate.store(true, Ordering::Release);
         assert!(matches!(
-            flow.run_ready_cpu_work(&mut requester),
+            flow.run_ready_cpu_work(&requester),
             WorkStatus::Ran
         ));
         assert_eq!(runs.load(Ordering::Relaxed), 1);

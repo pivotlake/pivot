@@ -910,7 +910,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{Completion, IORequester, OperatorIO, WriteRequestId};
+    use crate::io::{IORequester, OperatorIO};
+    use crate::memory::memory_ctx;
     use crate::memory::{init_test_free_pool, spill_directory};
     use crate::operations::unary::group::keys::IntKeyExtractor;
     use crate::operations::unary::group::values::{
@@ -921,8 +922,8 @@ mod tests {
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use std::cell::RefCell;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
     type CountValue = Compiled<(CountSlot,), u8>;
@@ -1084,44 +1085,39 @@ mod tests {
     /// spill files clash with no other test's.
     struct SpillerParts {
         dataflow: usize,
-        requester: IORequester,
+        requester: RefCell<IORequester>,
         stats: StatsCollector,
         next_request_id: usize,
-        writes_in_flight: ahash::HashMap<WriteRequestId, Arc<AtomicUsize>>,
     }
 
     impl SpillerParts {
         fn new(dataflow: usize) -> Self {
             Self {
                 dataflow,
-                requester: IORequester::default(),
+                requester: RefCell::new(IORequester::default()),
                 stats: StatsCollector::disabled(),
                 next_request_id: 0,
-                writes_in_flight: ahash::HashMap::default(),
             }
         }
 
         fn spiller(&mut self) -> Spiller<'_> {
             let io = OperatorIO::new(
-                &mut self.requester,
+                &self.requester,
                 self.dataflow,
                 0,
                 &mut self.stats,
                 &mut self.next_request_id,
             );
-            Spiller::new(io, &mut self.writes_in_flight)
+            Spiller::new(io)
         }
 
         /// Complete every spill write issued so far, as the worker would.
         fn finish_writes(&mut self) {
-            while !self.writes_in_flight.is_empty() {
-                self.requester.wait().unwrap();
-                for completion in self.requester.completions().unwrap() {
-                    if let Ok(Completion::FsWrite(write)) = completion {
-                        let count = self.writes_in_flight.remove(&write.request.id).unwrap();
-                        count.fetch_sub(1, Ordering::Release);
-                    }
-                }
+            let mut requester = self.requester.borrow_mut();
+            while memory_ctx().has_spill_writes_in_flight() {
+                requester.wait().unwrap();
+                requester.collect_completions().unwrap();
+                memory_ctx().complete_landed_spill_writes(&mut requester);
             }
         }
     }
