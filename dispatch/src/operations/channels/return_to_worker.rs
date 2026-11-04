@@ -70,12 +70,12 @@ pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(
         .unzip();
     let senders: Arc<[MpscSender<T>]> = senders.into();
 
-    receivers
-        .into_iter()
-        .map(move |rx| ReturnToWorkerMpscFactory {
-            senders: senders.clone(),
-            receiver: rx,
-        })
-        .collect::<Vec<_>>()
-        .into()
+    WorkerSlots::new(
+        receivers
+            .into_iter()
+            .map(move |rx| ReturnToWorkerMpscFactory {
+                senders: senders.clone(),
+                receiver: rx,
+            }),
+    )
 }

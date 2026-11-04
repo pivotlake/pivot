@@ -17,7 +17,9 @@ use arrow_row::{OwnedRow, RowConverter, SortField};
 
 use dispatch::arrays::{take, take_chunked};
 use dispatch::memory::SlabAllocator;
-use dispatch::{OrderBy, Sender, Topology, Unary, UnaryFactory, UnaryResult, batch_sort_indices};
+use dispatch::{
+    OrderBy, Sender, Topology, Unary, UnaryFactory, UnaryResult, WorkerMaker, batch_sort_indices,
+};
 
 /// One independently owned sorted run for a single table partition.
 pub(super) struct SortedPartitionRun {
@@ -42,16 +44,14 @@ impl PartitionSorterFactory {
         partition_column_indices: Vec<usize>,
         order_by: Vec<OrderBy>,
         topology: Topology,
-    ) -> Vec<PartitionSorterFactory> {
+    ) -> impl WorkerMaker<PartitionSorterFactory> {
         let partition_column_indices: Arc<[usize]> = partition_column_indices.into();
         let order_by: Arc<[OrderBy]> = order_by.into();
-        (0..topology.total_workers())
-            .map(|worker_id| PartitionSorterFactory {
-                partition_column_indices: partition_column_indices.clone(),
-                order_by: order_by.clone(),
-                source_node: topology.node_of_worker(worker_id),
-            })
-            .collect()
+        move |worker_id| PartitionSorterFactory {
+            partition_column_indices: partition_column_indices.clone(),
+            order_by: order_by.clone(),
+            source_node: topology.node_of_worker(worker_id),
+        }
     }
 }
 
@@ -246,8 +246,7 @@ mod tests {
             vec![OrderBy::new(1, false, true)],
             Topology::single_node(1),
         )
-        .pop()
-        .unwrap()
+        .for_worker(0)
         .build_unary()
     }
 
@@ -328,8 +327,7 @@ mod tests {
             vec![OrderBy::new(1, false, true)],
             Topology::single_node(1),
         )
-        .pop()
-        .unwrap()
+        .for_worker(0)
         .build_unary();
         let mut sender = CollectSender::new();
 

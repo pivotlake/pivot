@@ -51,16 +51,6 @@ pub struct DataFlowStats {
     /// CPU time spent in this dataflow's operators (decode, group-by, …), summed
     /// across workers. Excludes time parked waiting on IO.
     pub cpu: Duration,
-    /// Time the workers spent building their operator chains, summed across
-    /// workers.
-    pub build: Duration,
-    /// The longest single worker's build.
-    pub build_max: Duration,
-    /// When the first worker started building, so the handle can tell how
-    /// long the pool took to have every chain in place.
-    pub build_started: Option<Instant>,
-    /// When the last worker finished building.
-    pub build_finished: Option<Instant>,
 }
 
 impl DataFlowStats {
@@ -78,19 +68,6 @@ impl DataFlowStats {
         self.disk_read_time += other.disk_read_time;
         self.disk_write_time += other.disk_write_time;
         self.cpu += other.cpu;
-        self.build += other.build;
-        self.build_max = self.build_max.max(other.build_max);
-        self.build_started = earliest(self.build_started, other.build_started);
-        self.build_finished = latest(self.build_finished, other.build_finished);
-    }
-
-    /// From the first worker starting its build to the last worker finishing
-    /// its own: how long the pool took to have the whole dataflow in place.
-    pub fn build_span(&self) -> Duration {
-        match (self.build_started, self.build_finished) {
-            (Some(started), Some(finished)) => finished.saturating_duration_since(started),
-            _ => Duration::ZERO,
-        }
     }
 
     /// Log the IO tally at WARN when any operation happened, for a path that has no
@@ -115,20 +92,6 @@ impl DataFlowStats {
             cpu_ms = self.cpu.as_millis() as u64,
             "query failed; IO completed before the failure"
         );
-    }
-}
-
-fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
-fn latest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
     }
 }
 
@@ -231,18 +194,6 @@ impl StatsCollector {
     ) {
         if let (Some(stats), Some(submitted_at)) = (&mut self.stats, submitted_at) {
             *bucket(stats) += submitted_at.elapsed();
-        }
-    }
-
-    /// Record this worker's build of its operator chain, from `started` to
-    /// `finished`.
-    pub fn record_build(&mut self, started: Instant, finished: Instant) {
-        if let Some(stats) = &mut self.stats {
-            let elapsed = finished.saturating_duration_since(started);
-            stats.build += elapsed;
-            stats.build_max = elapsed;
-            stats.build_started = Some(started);
-            stats.build_finished = Some(finished);
         }
     }
 

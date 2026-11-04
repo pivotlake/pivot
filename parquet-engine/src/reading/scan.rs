@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
     RecordBatchOperatorSpec, RootUnaryOperatorFactory, UnaryOperatorFactory, WorkerMaker,
-    per_worker, return_to_worker_mpsc, stealable, stealable_fifo, to_single_worker_mpsc,
+    return_to_worker_mpsc, stealable, stealable_fifo, to_single_worker_mpsc,
 };
 
 use crate::{
@@ -49,34 +49,31 @@ where
     // never pins the buffer the batches cycle through, so the decoder keeps
     // rewriting the same cache-resident bytes.
     let projection = Arc::new(projection);
-    let indexed = input.chain(
-        stealable::<RowGroupBuffer>(topology),
-        per_worker(|_| IndexerFactory::new()),
-    );
-    let decompressed = indexed.chain(
-        stealable::<CompressedPage>(topology),
-        per_worker(|_| DecompressorFactory::new()),
-    );
+    let indexed = input.chain(stealable::<RowGroupBuffer>(topology), |_| {
+        IndexerFactory::new()
+    });
+    let decompressed = indexed.chain(stealable::<CompressedPage>(topology), |_| {
+        DecompressorFactory::new()
+    });
     let decoded = decompressed
         .chain(
             return_to_worker_mpsc::<DecompressedPage>(n),
-            per_worker(move |worker_idx| RangeCutterFactory {
+            move |worker_idx: usize| RangeCutterFactory {
                 projection: projection.clone(),
                 eq_predicates: eq_predicates.clone(),
                 pending_row_groups: pending_row_groups[worker_idx].clone(),
                 outstanding_row_groups: outstanding_row_groups.clone(),
-            }),
+            },
         )
         // A worker takes its own row groups' ranges oldest first, so it
         // follows each row group as one stream; a peer with nothing to do
         // takes the oldest range waiting on another worker.
-        .chain(
-            stealable_fifo::<DecodeRange>(topology),
-            per_worker(move |_| DecoderFactory {
+        .chain(stealable_fifo::<DecodeRange>(topology), move |_| {
+            DecoderFactory {
                 batch_size,
                 add_row_group_metadata,
-            }),
-        );
+            }
+        });
     RecordBatchOperatorSpec::from_spec(decoded)
 }
 
@@ -168,20 +165,17 @@ pub fn table_input_with_filter_and_eq_predicates(
     let claim_bound = pending_claim_bound(table);
     let shared_projection = Arc::new(projection.clone());
     let fetcher_pending = pending_row_groups.clone();
-    let input = OperatorSpec::from_maker(
-        dispatcher.clone(),
-        per_worker(move |worker_idx| {
-            RootUnaryOperatorFactory::new(
-                RowGroupFetcherFactory::new(
-                    shared_projection.clone(),
-                    fetcher_pending[worker_idx].clone(),
-                    claim_bound,
-                ),
-                injector.clone(),
-                siblings.clone(),
-            )
-        }),
-    );
+    let input = OperatorSpec::from_maker(dispatcher.clone(), move |worker_idx: usize| {
+        RootUnaryOperatorFactory::new(
+            RowGroupFetcherFactory::new(
+                shared_projection.clone(),
+                fetcher_pending[worker_idx].clone(),
+                claim_bound,
+            ),
+            injector.clone(),
+            siblings.clone(),
+        )
+    });
     read_parquet(
         input,
         projection,
@@ -223,26 +217,23 @@ pub fn materialize(
     let batch_channels = to_single_worker_mpsc::<RecordBatch>(n, host);
     let request_channels = stealable::<QueryRowGroupMetadata>(dispatcher.topology());
     let fetcher_pending = pending_row_groups.clone();
-    let input = OperatorSpec::from_maker(
-        dispatcher,
-        per_worker(move |worker_idx| {
+    let input = OperatorSpec::from_maker(dispatcher, move |worker_idx| {
+        UnaryOperatorFactory::new(
             UnaryOperatorFactory::new(
-                UnaryOperatorFactory::new(
-                    heads.make(worker_idx),
-                    MaterializerFactory::new(table.clone()),
-                    batch_channels.make(worker_idx),
-                    siblings_materializer.clone(),
-                ),
-                RowGroupFetcherFactory::new(
-                    shared_projection.clone(),
-                    fetcher_pending[worker_idx].clone(),
-                    claim_bound,
-                ),
-                request_channels.make(worker_idx),
-                siblings_fetcher.clone(),
-            )
-        }),
-    );
+                heads.for_worker(worker_idx),
+                MaterializerFactory::new(table.clone()),
+                batch_channels.for_worker(worker_idx),
+                siblings_materializer.clone(),
+            ),
+            RowGroupFetcherFactory::new(
+                shared_projection.clone(),
+                fetcher_pending[worker_idx].clone(),
+                claim_bound,
+            ),
+            request_channels.for_worker(worker_idx),
+            siblings_fetcher.clone(),
+        )
+    });
     read_parquet(
         input,
         projection,

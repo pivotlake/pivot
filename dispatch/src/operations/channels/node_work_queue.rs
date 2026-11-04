@@ -84,39 +84,14 @@ impl<T> Receiver<T> for NodeWorkQueueReceiver<T> {
     }
 }
 
-/// Creates one endpoint per worker, backed by one queue per NUMA node.
-/// A node work queue stage: one queue per node, each worker's endpoint
-/// polling its node's.
-pub struct NodeWorkQueueStage<T: NodeIdOutput + Send> {
-    queues: Arc<[Injector<T>]>,
-    topology: Topology,
-}
-
-crate::maker_into_worker_maker!(
-    NodeWorkQueueStage<T>,
-    NodeWorkQueueChannelFactory<T>,
-    [T],
-    [T: NodeIdOutput + Send + 'static]
-);
-
-impl<T: NodeIdOutput + Send + 'static> WorkerMaker<NodeWorkQueueChannelFactory<T>>
-    for NodeWorkQueueStage<T>
-{
-    fn make(&self, worker_idx: usize) -> NodeWorkQueueChannelFactory<T> {
-        NodeWorkQueueChannelFactory {
-            queues: self.queues.clone(),
-            node_id: self.topology.node_of_worker(worker_idx),
-        }
-    }
-}
-
-/// One queue per node of `topology`.
+/// One endpoint per worker, backed by one queue per NUMA node.
 pub fn node_work_queue<T: NodeIdOutput + Send + 'static>(
     topology: Topology,
-) -> NodeWorkQueueStage<T> {
-    NodeWorkQueueStage {
-        queues: (0..topology.node_count).map(|_| Injector::new()).collect(),
-        topology,
+) -> impl WorkerMaker<NodeWorkQueueChannelFactory<T>> {
+    let queues: Arc<[Injector<T>]> = (0..topology.node_count).map(|_| Injector::new()).collect();
+    move |worker_idx| NodeWorkQueueChannelFactory {
+        queues: queues.clone(),
+        node_id: topology.node_of_worker(worker_idx),
     }
 }
 
@@ -142,7 +117,9 @@ mod tests {
         let wakers: Vec<_> = (0..2).map(|_| Arc::new(WorkerWaker::new(1))).collect();
         init_waker_set(WakerSet::new(wakers, 1));
         let stage = node_work_queue(topology);
-        let mut endpoints: Vec<_> = (0..2).map(|worker| stage.make(worker).build()).collect();
+        let mut endpoints: Vec<_> = (0..2)
+            .map(|worker| stage.for_worker(worker).build())
+            .collect();
 
         endpoints[0].0.send(Work(1)).unwrap();
 

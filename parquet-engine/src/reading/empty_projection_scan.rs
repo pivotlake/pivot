@@ -18,7 +18,7 @@ use arrow_schema::Schema;
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, RECORD_BATCH_SIZE,
-    RecordBatchOperatorSpec, Sender, WorkStatus, per_worker,
+    RecordBatchOperatorSpec, Sender, WorkStatus,
 };
 
 use crate::RowGroupFilter;
@@ -37,14 +37,11 @@ pub(crate) fn empty_projection_scan(
     for idx in 0..table.row_groups.len() {
         row_groups.push(QueryRowGroupMetadata::new(table, idx, RowSelection::All));
     }
-    RecordBatchOperatorSpec::from_nullary_maker(
-        dispatcher,
-        per_worker(move |_| EmptyProjectionScanFactory {
-            row_groups: row_groups.clone(),
-            filter: filter.clone(),
-            add_row_group_metadata,
-        }),
-    )
+    RecordBatchOperatorSpec::from_nullary_maker(dispatcher, move |_| EmptyProjectionScanFactory {
+        row_groups: row_groups.clone(),
+        filter: filter.clone(),
+        add_row_group_metadata,
+    })
 }
 
 /// Per-worker factory for [`EmptyProjectionScan`]. Workers share one

@@ -22,7 +22,7 @@
 //! `AVG(x)` to `sum(x) / count(x)`, so an average arrives as a `Sum` slot and a
 //! `Count` slot.
 
-use crate::api::{HandOut, WorkerMaker, per_worker};
+use crate::api::{HandOut, WorkerMaker};
 use crate::cpu_features::multitarget_kernel;
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
@@ -499,13 +499,15 @@ impl<A: IntCell> AggregateFactory<A> {
         // sees the channel close once every worker's aggregate has sent.
         let sender = HandOut::new(tx, worker_count);
         let receiver = Mutex::new(Some(rx));
-        per_worker(move |worker_idx| AggregateFactory {
+        move |worker_idx| AggregateFactory {
             specs: specs.clone(),
             sender: sender.take(),
-            receiver: (worker_idx == 0)
-                .then(|| receiver.lock().expect("never poisoned").take())
-                .flatten(),
-        })
+            receiver: if worker_idx == 0 {
+                receiver.lock().expect("never poisoned").take()
+            } else {
+                None
+            },
+        }
     }
 }
 

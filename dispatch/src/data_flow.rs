@@ -1,8 +1,7 @@
 //! A DataFlow is a graph of operators that a single worker executes.
 //!
-//! Built from an [`OperatorGraphBuilder`](crate::api::OperatorGraphBuilder) during
-//! [`DataFlowBuilder::build`](crate::api::DataFlowBuilder::build)
-//! on the worker thread. Operators are connected by channels created during the
+//! Built from an [`OperatorGraphBuilder`](crate::api::OperatorGraphBuilder) when the
+//! worker builds a launched dataflow, on the worker thread. Operators are connected by channels created during the
 //! build step; a graph may contain multiple roots, such as a join's build and probe paths.
 //!
 //! The worker drives execution by calling methods on the `DataFlow`:

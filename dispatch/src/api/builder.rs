@@ -1,14 +1,10 @@
 use crate::Identifier;
-use crate::api::BuildContext;
-use crate::api::launch::WorkerLaunch;
 use crate::data_flow::DataFlow;
 use crate::operations::Operator;
 use crate::stats::DataFlowStats;
 use ahash::HashMap;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, mpsc};
-use std::time::Instant;
 use thiserror::Error;
 
 static ID: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
@@ -23,7 +19,7 @@ pub enum Error {
     PanicOnBuild(String),
 }
 
-type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A build-time operator graph assembled by factories on a worker thread.
 ///
@@ -147,71 +143,6 @@ impl OperatorGraphBuilder {
             stats_tx,
             collect_stats,
         )
-    }
-}
-
-/// One worker's view of a launched dataflow: the shared launch and which
-/// worker this is. The worker calls [`build`](DataFlowBuilder::build) to
-/// produce its `DataFlow`, which makes and builds its operator chain on the
-/// worker thread.
-pub struct DataFlowBuilder {
-    launch: Arc<dyn WorkerLaunch>,
-    worker_idx: usize,
-}
-
-impl DataFlowBuilder {
-    pub(crate) fn new(launch: Arc<dyn WorkerLaunch>, worker_idx: usize) -> Self {
-        Self { launch, worker_idx }
-    }
-
-    /// Build the full operator graph and convert it into an executable `DataFlow`.
-    /// Called on the worker thread.
-    pub fn build(self) -> Result<DataFlow> {
-        let Self { launch, worker_idx } = self;
-        // Only a dataflow that opted into stats pays for the clock reads.
-        let started = launch.collect_stats().then(Instant::now);
-        let mut context = BuildContext::default();
-        let graph = match catch_unwind(AssertUnwindSafe(|| {
-            launch.clone().build_graph(worker_idx, &mut context)
-        })) {
-            Ok(graph) => graph,
-            Err(e) => {
-                let msg = e
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| e.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                // A build failure must fail the whole query the way a runtime
-                // failure does (see `DataFlow::bail_and_cancel`): peers that
-                // built their piece of the graph hold output senders until the
-                // query is cancelled, and the collector blocks until every
-                // sender drops, so swallowing the error here hangs the caller.
-                if launch
-                    .err_tx()
-                    .send(crate::data_flow::Error::Panic(msg.to_string()))
-                    .is_err()
-                {
-                    tracing::warn!("Unable to send build error...");
-                }
-                launch.cancelled().store(true, Ordering::Relaxed);
-                crate::waker::waker_set().notify_all();
-                return Err(Error::PanicOnBuild(msg.to_string()));
-            }
-        };
-
-        let data_flow = graph.into_data_flow(
-            launch.cancelled().clone(),
-            launch.err_tx().clone(),
-            launch.stats_tx().clone(),
-            launch.collect_stats(),
-        );
-        #[cfg(feature = "perf")]
-        let data_flow = data_flow.with_profiling(launch.profiled());
-        let mut data_flow = data_flow;
-        if let Some(started) = started {
-            data_flow.stats().record_build(started, Instant::now());
-        }
-        Ok(data_flow)
     }
 }
 

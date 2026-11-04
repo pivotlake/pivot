@@ -33,9 +33,9 @@ where
 /// worker runs it on its own thread to make its private closure. The thread
 /// compiling the plan then does one `Arc` clone per worker instead of one
 /// builder call per worker, which for a wide projection was most of its work.
-pub struct SharedMapFactory<FB>(pub Arc<FB>);
+pub struct MapBuilderFactory<FB>(pub Arc<FB>);
 
-impl<I, O, F, FB> UnaryFactory<I, O> for SharedMapFactory<FB>
+impl<I, O, F, FB> UnaryFactory<I, O> for MapBuilderFactory<FB>
 where
     FB: Fn() -> F + Send + Sync + 'static,
     F: FnMut(I) -> unary::Result<O> + Send + 'static,

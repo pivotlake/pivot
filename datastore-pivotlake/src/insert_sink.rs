@@ -13,7 +13,8 @@ use dispatch::io::{
     FsWriteRequest, HttpUploadRequest, LocalFile, OpenFile, OperatorIO, RemoteFile,
 };
 use dispatch::{
-    OperatorFactory, OperatorSpec, RecordBatchOperatorSpec, Sender, Unary, UnaryFactory, stealable,
+    OperatorFactory, OperatorSpec, RecordBatchOperatorSpec, Sender, Unary, UnaryFactory,
+    WorkerSlots, stealable,
 };
 use planner::catalog::Column;
 
@@ -135,18 +136,16 @@ where
     let remaining_workers = Arc::new(AtomicUsize::new(workers));
     let uploads = encoded.chain(
         stealable::<AssembledFile>(topology),
-        (0..workers)
-            .map(|_| {
-                UploadFactory::new(
-                    store.clone(),
-                    location.clone(),
-                    declared_columns.clone(),
-                    uploaded_files.clone(),
-                    rows.clone(),
-                    remaining_workers.clone(),
-                )
-            })
-            .collect::<Vec<_>>(),
+        WorkerSlots::new((0..workers).map(|_| {
+            UploadFactory::new(
+                store.clone(),
+                location.clone(),
+                declared_columns.clone(),
+                uploaded_files.clone(),
+                rows.clone(),
+                remaining_workers.clone(),
+            )
+        })),
     );
     RecordBatchOperatorSpec::from_spec(uploads)
 }

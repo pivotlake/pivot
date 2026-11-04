@@ -16,7 +16,7 @@ mod keys;
 
 pub use k_way_merge::{KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput};
 
-use crate::api::{WorkerMaker, per_worker, split};
+use crate::api::WorkerMaker;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -261,7 +261,7 @@ impl OrderByFactory<RunMerger> {
             merges_complete: AtomicBool::new(false),
             output_claimed: AtomicBool::new(false),
         });
-        per_worker(move |worker_id| {
+        move |worker_id| {
             let node_id = topology.node_of_worker(worker_id);
             let local_worker_id = topology.local_index_of_worker(worker_id);
             OrderByFactory {
@@ -274,7 +274,7 @@ impl OrderByFactory<RunMerger> {
                     allocator: None,
                 },
             }
-        })
+        }
     }
 }
 
@@ -289,29 +289,32 @@ pub(crate) fn create_normalizing_for_workers(
     impl WorkerMaker<NormalizingOrderByFactory>,
     impl WorkerMaker<OrderByCollectorFactory>,
 ) {
-    let direct = OrderByFactory::create_for_workers(order_by, topology);
+    let direct = Arc::new(OrderByFactory::create_for_workers(order_by, topology));
     let normalizers = Normalizer::create_for_workers(topology.total_workers());
-    split(
-        topology.total_workers(),
-        per_worker(move |worker| {
+    let sorters = {
+        let direct = direct.clone();
+        move |worker| {
             let OrderByFactory {
                 order_by,
                 node_id,
                 local_worker_id,
-                outputter,
-            } = direct.make(worker);
-            let sorter = OrderByFactory {
+                outputter: _,
+            } = direct.for_worker(worker);
+            OrderByFactory {
                 order_by,
                 node_id,
                 local_worker_id,
-                outputter: normalizers.make(worker),
-            };
-            (
-                sorter,
-                CollectorFactory::new(outputter, worker == collector_worker),
-            )
-        }),
-    )
+                outputter: normalizers.for_worker(worker),
+            }
+        }
+    };
+    let collectors = move |worker| {
+        CollectorFactory::new(
+            direct.for_worker(worker).outputter,
+            worker == collector_worker,
+        )
+    };
+    (sorters, collectors)
 }
 
 impl<O, Out> UnaryFactory<RecordBatch, Out> for OrderByFactory<O>
@@ -520,7 +523,7 @@ mod tests {
         let maker =
             OrderByFactory::create_for_workers(order_by, Topology::single_node(worker_count));
         (0..worker_count)
-            .map(|worker| maker.make(worker))
+            .map(|worker| maker.for_worker(worker))
             .map(|factory| match factory.build_unary() {
                 PipelineBreaker::Consuming(sorter) => sorter,
                 _ => unreachable!("factories build consuming breakers"),
@@ -581,7 +584,7 @@ mod tests {
         init_waker_set(WakerSet::new(node_wakers, 1));
         let maker = OrderByFactory::create_for_workers(ascending_by_key(), topology);
         let mut consumers: Vec<_> = (0..topology.total_workers())
-            .map(|worker| maker.make(worker))
+            .map(|worker| maker.for_worker(worker))
             .map(|factory| match factory.build_unary() {
                 PipelineBreaker::Consuming(sorter) => sorter,
                 _ => unreachable!("factories build consuming breakers"),

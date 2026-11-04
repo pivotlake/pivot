@@ -1,8 +1,9 @@
 //! Scratch state shared by the factories building one worker's operator graph.
 
-use crate::operations::channels::StealableSender;
 use ahash::HashMap;
 use arrow_array::RecordBatch;
+use crossbeam_deque::Worker;
+use std::rc::Rc;
 
 /// State that outlives a single factory's `build` but not the graph build as a
 /// whole, passed down the recursive build chain.
@@ -19,19 +20,19 @@ use arrow_array::RecordBatch;
 /// creatable before the build.
 #[derive(Default)]
 pub struct BuildContext {
-    cte_senders: HashMap<usize, Vec<StealableSender<RecordBatch>>>,
+    cte_senders: HashMap<usize, Vec<Rc<Worker<RecordBatch>>>>,
 }
 
 impl BuildContext {
     /// Leave one scan site's sending end for CTE `id` to pick up.
-    pub fn deposit_cte_sender(&mut self, id: usize, sender: StealableSender<RecordBatch>) {
+    pub fn deposit_cte_sender(&mut self, id: usize, sender: Rc<Worker<RecordBatch>>) {
         self.cte_senders.entry(id).or_default().push(sender);
     }
 
     /// Take every sending end left for CTE `id`, in the order the sites were
     /// built. Taking them empties the entry, so a second CTE with the same id
     /// (which cannot happen: ids are minted per compile) would find nothing.
-    pub fn take_cte_senders(&mut self, id: usize) -> Vec<StealableSender<RecordBatch>> {
+    pub fn take_cte_senders(&mut self, id: usize) -> Vec<Rc<Worker<RecordBatch>>> {
         self.cte_senders.remove(&id).unwrap_or_default()
     }
 }

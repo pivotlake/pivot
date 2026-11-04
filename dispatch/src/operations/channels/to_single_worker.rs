@@ -62,13 +62,13 @@ pub fn to_single_worker_mpsc<T: 'static + Send>(
         .unzip();
     let senders: Arc<[MpscSender<T>]> = senders.into();
 
-    receivers
-        .into_iter()
-        .map(move |rx| SingleWorkerMpscFactory {
-            senders: senders.clone(),
-            target,
-            receiver: rx,
-        })
-        .collect::<Vec<_>>()
-        .into()
+    WorkerSlots::new(
+        receivers
+            .into_iter()
+            .map(move |rx| SingleWorkerMpscFactory {
+                senders: senders.clone(),
+                target,
+                receiver: rx,
+            }),
+    )
 }

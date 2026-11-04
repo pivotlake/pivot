@@ -46,7 +46,7 @@
 //!    is deferred because the build step creates things which may not be `Send` such as `Rc<Worker<T>>`
 //!    which live on the worker thread.
 //!
-//! 3. **Build on worker** — The worker calls [`DataFlowBuilder::build`], which makes its
+//! 3. **Build on worker** — The worker builds the launch, which makes its
 //!    factory and calls `build(sender)` on it. This recursively builds the full operator
 //!    chain: each factory creates a channel, builds its head with the channel's sender,
 //!    then appends its own operator reading from the channel's receiver.
@@ -59,9 +59,9 @@
 //! - [`RecordBatchOperatorSpec`] — The user-facing query builder.
 //!   Holds the maker of each worker's `Box<dyn OperatorFactory<RecordBatch>>`.
 //!
-//! - [`WorkerMaker`] — Makes one worker's piece of a stage on that worker's thread;
-//!   [`per_worker`] makes one from a closure, [`WorkerSlots`] hands out pieces made
-//!   ahead of time, and [`split`] shares one making between two pieces.
+//! - [`WorkerMaker`] — Makes one worker's part of a stage on that worker's thread.
+//!   A closure of the worker index is one; [`WorkerSlots`] hands out parts made
+//!   ahead of time.
 //!
 //! - [`OperatorFactory<O>`](OperatorFactory) — Factory trait with
 //!   `build(self: Box<Self>, sender: Box<dyn Sender<O>>)`. The sender is a trait
@@ -77,19 +77,15 @@
 //! - [`OperatorGraphBuilder`] — Accumulates operators and edges during the build step,
 //!   then converts them to a `DataFlow`.
 //!
-//! - [`DataFlowBuilder`] — One worker's view of a published launch. The worker calls
-//!   `.build()` on it to make its factory and produce its `DataFlow`.
 
 mod build_context;
 pub use build_context::BuildContext;
 
 mod builder;
-pub use builder::{DataFlowBuilder, OperatorGraphBuilder};
+pub use builder::OperatorGraphBuilder;
 
 mod worker_maker;
-pub use worker_maker::{
-    FnMaker, HandOut, IntoWorkerMaker, SplitHalf, WorkerMaker, WorkerSlots, per_worker, split,
-};
+pub use worker_maker::{HandOut, WorkerMaker, WorkerSlots};
 
 pub(crate) mod launch;
 

@@ -117,10 +117,10 @@ where
 
 /// Like [`FilterFactory`], holding the stage's one builder shared by every
 /// worker, which runs it on its own thread (see
-/// [`SharedMapFactory`](crate::operations::SharedMapFactory)).
-pub struct SharedFilterFactory<FB>(pub std::sync::Arc<FB>, pub RowDelivery);
+/// [`MapBuilderFactory`](crate::operations::MapBuilderFactory)).
+pub struct FilterBuilderFactory<FB>(pub std::sync::Arc<FB>, pub RowDelivery);
 
-impl<F, FB> UnaryFactory<RecordBatch, RecordBatch> for SharedFilterFactory<FB>
+impl<F, FB> UnaryFactory<RecordBatch, RecordBatch> for FilterBuilderFactory<FB>
 where
     FB: Fn() -> F + Send + Sync + 'static,
     F: FnMut(

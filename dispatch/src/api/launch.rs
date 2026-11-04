@@ -12,12 +12,27 @@
 //! when the last of those handles goes, which is when the last worker drops
 //! its chain, exactly as it did when each worker held a sender of its own.
 
-use crate::api::{BuildContext, OperatorFactory, OperatorGraphBuilder, WorkerMaker};
+use crate::api::builder::{self, OperatorGraphBuilder};
+use crate::api::{BuildContext, OperatorFactory, WorkerMaker};
+use crate::data_flow::DataFlow;
 use crate::operations::channels::{MpscSender, Sender};
 use crate::stats::DataFlowStats;
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+
+/// What every worker's chain of one dataflow shares.
+pub(crate) struct LaunchShared {
+    pub(crate) err_tx: mpsc::Sender<crate::data_flow::Error>,
+    pub(crate) stats_tx: mpsc::Sender<DataFlowStats>,
+    pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) collect_stats: bool,
+    /// Whether the dataflow runs exclusively while a `perf` capture is in
+    /// progress.
+    #[cfg(feature = "perf")]
+    pub(crate) profiled: bool,
+}
 
 /// A dataflow as every worker sees it: how to make its own chain, and what
 /// every chain shares.
@@ -29,49 +44,67 @@ pub(crate) trait WorkerLaunch: Send + Sync {
         worker_idx: usize,
         context: &mut BuildContext,
     ) -> OperatorGraphBuilder;
-    fn cancelled(&self) -> &Arc<AtomicBool>;
-    fn err_tx(&self) -> &mpsc::Sender<crate::data_flow::Error>;
-    fn stats_tx(&self) -> &mpsc::Sender<DataFlowStats>;
-    fn collect_stats(&self) -> bool;
-    #[cfg(feature = "perf")]
-    fn profiled(&self) -> bool;
+
+    fn shared(&self) -> &LaunchShared;
+}
+
+impl dyn WorkerLaunch {
+    /// Build this worker's operator graph and turn it into its executable
+    /// `DataFlow`. Called on the worker thread.
+    pub(crate) fn build_for_worker(
+        self: Arc<Self>,
+        worker_idx: usize,
+    ) -> builder::Result<DataFlow> {
+        let mut context = BuildContext::default();
+        let graph = match catch_unwind(AssertUnwindSafe(|| {
+            self.clone().build_graph(worker_idx, &mut context)
+        })) {
+            Ok(graph) => graph,
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                // A build failure must fail the whole query the way a runtime
+                // failure does (see `DataFlow::bail_and_cancel`): peers that
+                // built their part of the graph hold output senders until the
+                // query is cancelled, and the collector blocks until every
+                // sender drops, so swallowing the error here hangs the caller.
+                let shared = self.shared();
+                if shared
+                    .err_tx
+                    .send(crate::data_flow::Error::Panic(message.to_string()))
+                    .is_err()
+                {
+                    tracing::warn!("Unable to send build error...");
+                }
+                shared.cancelled.store(true, Ordering::Relaxed);
+                crate::waker::waker_set().notify_all();
+                return Err(builder::Error::PanicOnBuild(message.to_string()));
+            }
+        };
+
+        let shared = self.shared();
+        let data_flow = graph.into_data_flow(
+            shared.cancelled.clone(),
+            shared.err_tx.clone(),
+            shared.stats_tx.clone(),
+            shared.collect_stats,
+        );
+        #[cfg(feature = "perf")]
+        let data_flow = data_flow.with_profiling(shared.profiled);
+        Ok(data_flow)
+    }
 }
 
 /// The launch of a spec whose per-worker chains a maker of `OF` produces.
 pub(crate) struct Launch<O, OF> {
-    make: Box<dyn WorkerMaker<OF>>,
+    pub(crate) chain: Box<dyn WorkerMaker<OF>>,
     /// The dataflow's one output sender; every worker's chain sends through
     /// a handle on this launch.
-    output: MpscSender<O>,
-    err_tx: mpsc::Sender<crate::data_flow::Error>,
-    stats_tx: mpsc::Sender<DataFlowStats>,
-    cancelled: Arc<AtomicBool>,
-    collect_stats: bool,
-    #[cfg(feature = "perf")]
-    profiled: bool,
-}
-
-impl<O, OF> Launch<O, OF> {
-    pub(crate) fn new(
-        make: Box<dyn WorkerMaker<OF>>,
-        output: MpscSender<O>,
-        err_tx: mpsc::Sender<crate::data_flow::Error>,
-        stats_tx: mpsc::Sender<DataFlowStats>,
-        cancelled: Arc<AtomicBool>,
-        collect_stats: bool,
-        #[cfg(feature = "perf")] profiled: bool,
-    ) -> Self {
-        Self {
-            make,
-            output,
-            err_tx,
-            stats_tx,
-            cancelled,
-            collect_stats,
-            #[cfg(feature = "perf")]
-            profiled,
-        }
-    }
+    pub(crate) output: MpscSender<O>,
+    pub(crate) shared: LaunchShared,
 }
 
 /// One worker's handle on the launch's output sender.
@@ -91,30 +124,13 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> WorkerLaunch fo
         worker_idx: usize,
         context: &mut BuildContext,
     ) -> OperatorGraphBuilder {
-        let factory = self.make.make(worker_idx);
+        let factory = self.chain.for_worker(worker_idx);
         let output = Box::new(LaunchOutput { launch: self });
         Box::new(factory).build(output, context)
     }
 
-    fn cancelled(&self) -> &Arc<AtomicBool> {
-        &self.cancelled
-    }
-
-    fn err_tx(&self) -> &mpsc::Sender<crate::data_flow::Error> {
-        &self.err_tx
-    }
-
-    fn stats_tx(&self) -> &mpsc::Sender<DataFlowStats> {
-        &self.stats_tx
-    }
-
-    fn collect_stats(&self) -> bool {
-        self.collect_stats
-    }
-
-    #[cfg(feature = "perf")]
-    fn profiled(&self) -> bool {
-        self.profiled
+    fn shared(&self) -> &LaunchShared {
+        &self.shared
     }
 }
 
@@ -198,21 +214,8 @@ mod tests {
         fn build_graph(self: Arc<Self>, _: usize, _: &mut BuildContext) -> OperatorGraphBuilder {
             unreachable!("the log test never builds")
         }
-        fn cancelled(&self) -> &Arc<AtomicBool> {
-            unreachable!()
-        }
-        fn err_tx(&self) -> &mpsc::Sender<crate::data_flow::Error> {
-            unreachable!()
-        }
-        fn stats_tx(&self) -> &mpsc::Sender<DataFlowStats> {
-            unreachable!()
-        }
-        fn collect_stats(&self) -> bool {
-            false
-        }
-        #[cfg(feature = "perf")]
-        fn profiled(&self) -> bool {
-            false
+        fn shared(&self) -> &LaunchShared {
+            unreachable!("the log test never builds")
         }
     }
 

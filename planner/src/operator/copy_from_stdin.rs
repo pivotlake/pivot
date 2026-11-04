@@ -7,7 +7,7 @@ use arrow_array::{ArrayRef, RecordBatch, new_null_array};
 use arrow_schema::{Field, Schema, SchemaRef};
 use dispatch::{
     ChannelInputSender, DataFlowDispatcher, RecordBatchOperatorSpec, Unary, UnaryError,
-    UnaryFactory, UnaryResult, channel_input, stealable,
+    UnaryFactory, UnaryResult, WorkerSlots, channel_input, stealable,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -155,7 +155,10 @@ impl CopyFromStdin {
             })
             .collect();
         let conformed = batches
-            .chain(stealable::<RecordBatch>(dispatcher.topology()), conformers)
+            .chain(
+                stealable::<RecordBatch>(dispatcher.topology()),
+                WorkerSlots::new(conformers),
+            )
             .record_batches();
         let insert = self.table.compile_insert(conformed, dispatcher)?;
         Ok((sender, insert))

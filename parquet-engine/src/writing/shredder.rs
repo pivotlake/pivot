@@ -17,7 +17,9 @@
 
 use arrow_array::{Array, ArrayRef};
 use dispatch::memory::SlabAllocator;
-use dispatch::{DefaultUnaryFactory, RECORD_BATCH_SIZE, Sender, Unary, UnaryResult, WorkStatus};
+use dispatch::{
+    DefaultUnaryFactory, RECORD_BATCH_SIZE, Sender, Unary, UnaryResult, WorkStatus, WorkerMaker,
+};
 
 use super::error::WriteResult;
 use super::leaves::{self, Leaf};
@@ -26,7 +28,7 @@ use super::types::{ColumnChunkJob, LeafChunkJob};
 
 pub(super) type ShredderFactory = DefaultUnaryFactory<Shredder>;
 
-pub(super) fn factories(worker_count: usize) -> Vec<ShredderFactory> {
+pub(super) fn factories(worker_count: usize) -> impl WorkerMaker<ShredderFactory> {
     DefaultUnaryFactory::create_for_workers(worker_count)
 }
 

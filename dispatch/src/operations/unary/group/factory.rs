@@ -6,7 +6,7 @@
 //! to produce the actual [`Group`] operator.
 
 use crate::GatherBarrier;
-use crate::api::{WorkerMaker, per_worker};
+use crate::api::WorkerMaker;
 use crate::numa::Topology;
 use crate::operations::UnaryFactory;
 use crate::operations::unary::group::arena::SharedArena;
@@ -111,9 +111,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             shared_bin_totals,
         });
 
-        per_worker(move |_| GroupFactory {
+        move |_| GroupFactory {
             stage: stage.clone(),
-        })
+        }
     }
 }
 

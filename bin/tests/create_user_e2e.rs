@@ -76,7 +76,7 @@ async fn admin() -> Client {
         .unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_created_user_logs_in_and_lands_in_the_metastore_file() {
     let server = create_user_server();
     let admin = admin().await;
@@ -97,7 +97,7 @@ async fn a_created_user_logs_in_and_lands_in_the_metastore_file() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_created_user_without_a_password_is_trusted() {
     let server = create_user_server();
     let admin = admin().await;
@@ -107,7 +107,7 @@ async fn a_created_user_without_a_password_is_trusted() {
     login_without_password(server.port, "jesse").await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn creating_an_existing_user_is_refused() {
     let admin = admin().await;
 

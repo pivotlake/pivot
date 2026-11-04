@@ -8,7 +8,7 @@
 //! a second pipeline breaker whose [`Collector`] initializes the original
 //! operation-specific outputter.
 
-use crate::api::{WorkerMaker, per_worker};
+use crate::api::WorkerMaker;
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -157,9 +157,9 @@ pub(crate) struct Normalizer<G> {
 impl<G: NormalizationBatches> Normalizer<G> {
     pub(crate) fn create_for_workers(worker_count: usize) -> impl WorkerMaker<Self> {
         let shared = Arc::new(NormalizerState::new(worker_count));
-        per_worker(move |_| Self {
+        move |_| Self {
             shared: shared.clone(),
-        })
+        }
     }
 }
 
@@ -328,7 +328,9 @@ mod tests {
     fn normalize(groups: Vec<TestGroup>) -> Vec<TestGroup> {
         install_test_worker_waker();
         let maker = Normalizer::create_for_workers(groups.len());
-        let mut normalizers: Vec<_> = (0..groups.len()).map(|worker| maker.make(worker)).collect();
+        let mut normalizers: Vec<_> = (0..groups.len())
+            .map(|worker| maker.for_worker(worker))
+            .collect();
         for (worker, (normalizer, group)) in normalizers.iter_mut().zip(groups).enumerate() {
             WORKER_IDX.set(worker);
             normalizer.accept(group).unwrap();

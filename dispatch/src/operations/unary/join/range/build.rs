@@ -12,7 +12,7 @@
 //!
 //! [`to_single_worker_mpsc`]: crate::operations::channels::to_single_worker_mpsc
 
-use crate::api::{WorkerMaker, per_worker};
+use crate::api::WorkerMaker;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -99,16 +99,16 @@ where
     let probe_table = table.clone();
     let gate = build_ready.clone();
 
-    let build_factories = per_worker(move |worker_id| RangeBuildFactory {
+    let build_factories = move |worker_id| RangeBuildFactory {
         spec: spec.clone(),
         publisher: worker_id == target,
         table: table.clone(),
         build_ready: build_ready.clone(),
-    });
-    let probe_factories = per_worker(move |_| RangeProbeFactory {
+    };
+    let probe_factories = move |_| RangeProbeFactory {
         spec: probe_spec.clone(),
         table: probe_table.clone(),
-    });
+    };
 
     (build_factories, probe_factories, gate)
 }

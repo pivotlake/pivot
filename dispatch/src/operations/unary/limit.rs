@@ -27,7 +27,7 @@
 //! receiver worker is guaranteed to hold at least `fetch` rows by the time
 //! `reached` latches, so it never has to block waiting on a straggler.
 
-use crate::api::{HandOut, WorkerMaker, per_worker};
+use crate::api::{HandOut, WorkerMaker};
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::factory::UnaryFactory;
@@ -243,16 +243,18 @@ impl LimitFactory {
         let receiver = Mutex::new(Some(rx));
         let rows_seen = Arc::new(AtomicUsize::new(0));
         let reached = Arc::new(AtomicBool::new(false));
-        per_worker(move |worker_idx| LimitFactory {
+        move |worker_idx| LimitFactory {
             limit,
             offset,
             rows_seen: rows_seen.clone(),
             reached: reached.clone(),
             sender: sender.take(),
-            receiver: (worker_idx == 0)
-                .then(|| receiver.lock().expect("never poisoned").take())
-                .flatten(),
-        })
+            receiver: if worker_idx == 0 {
+                receiver.lock().expect("never poisoned").take()
+            } else {
+                None
+            },
+        }
     }
 }
 

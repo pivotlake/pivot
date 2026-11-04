@@ -29,7 +29,7 @@ use crate::types::columns::TableColumns;
 use crate::types::metadata::RowGroupMetadata;
 use dispatch::{
     DataFlowDispatcher, OperatorSpec, RecordBatchOperatorSpec, RootUnaryOperatorFactory,
-    UnaryFactory, fan_in,
+    UnaryFactory, WorkerSlots, fan_in,
 };
 use fetcher::FileRowGroupsFetcher;
 use object_storage::file_injector::FileInjectorFactory;
@@ -212,9 +212,10 @@ where
             FileRowGroupsSinkFactory::new(if worker == target { stage.take() } else { None })
         })
         .collect();
-    RecordBatchOperatorSpec::from_spec(
-        fetch.chain(fan_in::<FileRowGroups>(worker_count, target), sinks),
-    )
+    RecordBatchOperatorSpec::from_spec(fetch.chain(
+        WorkerSlots::new(fan_in::<FileRowGroups>(worker_count, target)),
+        WorkerSlots::new(sinks),
+    ))
 }
 
 #[cfg(test)]

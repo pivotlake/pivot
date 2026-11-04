@@ -2,7 +2,7 @@
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_row::{OwnedRow, RowConverter, SortField};
-use dispatch::{Sender, Topology, Unary, UnaryFactory, UnaryResult};
+use dispatch::{Sender, Topology, Unary, UnaryFactory, UnaryResult, WorkerMaker};
 
 use super::partition_sorter::SortedPartitionRun;
 
@@ -20,7 +20,7 @@ impl PresortedRun {
         partition: Option<&crate::PartitionValues>,
         partition_column_names: &[String],
         topology: Topology,
-    ) -> Vec<Self> {
+    ) -> impl WorkerMaker<Self> {
         let partition_key = partition.map(|partition| {
             let columns: Vec<ArrayRef> = partition_column_names
                 .iter()
@@ -45,12 +45,10 @@ impl PresortedRun {
                 .row(0)
                 .owned()
         });
-        (0..topology.total_workers())
-            .map(|worker_id| Self {
-                partition_key: partition_key.clone(),
-                source_node: topology.node_of_worker(worker_id),
-            })
-            .collect()
+        move |worker_id| Self {
+            partition_key: partition_key.clone(),
+            source_node: topology.node_of_worker(worker_id),
+        }
     }
 }
 
@@ -100,8 +98,7 @@ mod tests {
         let in_memory_bytes = batch.get_array_memory_size();
         let input_values = batch.column(0).clone();
         let mut wrapper = PresortedRun::create_for_workers(None, &[], Topology::single_node(1))
-            .pop()
-            .unwrap()
+            .for_worker(0)
             .build_unary();
         let mut sender = CollectSender::new();
 

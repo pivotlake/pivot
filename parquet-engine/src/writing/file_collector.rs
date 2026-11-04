@@ -23,6 +23,7 @@ use arrow_row::OwnedRow;
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{
     LocatedBatch, MergeRun, OrderBy, Sender, Topology, Unary, UnaryFactory, UnaryResult,
+    WorkerMaker,
 };
 
 use super::error::WriteError;
@@ -79,7 +80,7 @@ pub(super) fn factories(
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
     topology: Topology,
-) -> Vec<FileCollectorFactory> {
+) -> impl WorkerMaker<FileCollectorFactory> {
     let shared = Arc::new(SharedCollector {
         partitions: RwLock::new(HashMap::new()),
         next_file_id: AtomicU64::new(0),
@@ -95,17 +96,15 @@ pub(super) fn factories(
             .expect("partition registry poisoned")
             .insert(None, PendingRuns::new());
     }
-    (0..topology.total_workers())
-        .map(|_| FileCollectorFactory {
-            partition_column_names: partition_column_names.clone(),
-            order_by: order_by.clone(),
-            target_rows_per_group,
-            target_in_memory_bytes_per_file,
-            max_file_size,
-            topology,
-            shared: shared.clone(),
-        })
-        .collect()
+    move |_| FileCollectorFactory {
+        partition_column_names: partition_column_names.clone(),
+        order_by: order_by.clone(),
+        target_rows_per_group,
+        target_in_memory_bytes_per_file,
+        max_file_size,
+        topology,
+        shared: shared.clone(),
+    }
 }
 
 impl UnaryFactory<SortedPartitionRun, FileOrderInput> for FileCollectorFactory {

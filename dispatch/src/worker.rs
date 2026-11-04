@@ -10,7 +10,7 @@
 //! doesn't run until [`.collect()`](crate::api::RecordBatchOperatorSpec::collect)
 //! publishes a dataflow for every worker to take. The worker then:
 //!
-//! 1. Calls [`DataFlowBuilder::build`] to construct the operator chain — this happens
+//! 1. Builds its operator chain from the launch — this happens
 //!    here because some resources (`Rc<Worker<T>>`, thread-local buffers) are not `Send`
 //!    and must be created on the thread that uses them.
 //! 2. Runs the resulting `DataFlow` through its event loop, which prioritizes keeping IO
@@ -23,7 +23,6 @@
 //! operators.
 
 use crate::Identifier;
-use crate::api::DataFlowBuilder;
 use crate::api::launch::LaunchLog;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
@@ -524,7 +523,7 @@ impl Worker {
         // for this worker's operator to ever exist).
         for launch in self.launch_log.take_new(&mut self.launch_cursor) {
             debug!("Received data flow...");
-            match DataFlowBuilder::new(launch, self.worker_idx).build() {
+            match launch.build_for_worker(self.worker_idx) {
                 Ok(data_flow) => {
                     LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
                     self.data_flows.insert(data_flow.id(), data_flow);

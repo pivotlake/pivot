@@ -5,8 +5,8 @@
 mod common;
 
 use dispatch::{
-    Consumer, Dispatch, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult, stealable,
-    values_input,
+    Consumer, Dispatch, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult, WorkerSlots,
+    stealable, values_input,
 };
 use std::sync::mpsc;
 use std::time::Duration;
@@ -56,7 +56,7 @@ fn shutting_down_fails_a_dataflow_still_running() {
         let channels = stealable::<i64>(dispatcher.topology());
         let factories: Vec<_> = (0..WORKERS).map(|_| EndlessBreakerFactory).collect();
         let result = values_input(&dispatcher, 0..WORKERS as i64)
-            .chain(channels, factories)
+            .chain(channels, WorkerSlots::new(factories))
             .collect();
         let _ = result_tx.send(result);
     });

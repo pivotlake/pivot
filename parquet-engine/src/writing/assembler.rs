@@ -21,7 +21,7 @@ use crate::thrift::footer::{
 use crate::thrift::general::Encoding;
 use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use arrow_schema::{DataType, FieldRef, SchemaRef};
-use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
+use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult, WorkerMaker};
 
 use dispatch::memory::{FileBytes, Slab, SlabAllocator};
 
@@ -41,7 +41,7 @@ const PARQUET_VERSION: i32 = 1;
 
 pub(super) type FileAssemblerFactory = DefaultUnaryFactory<FileAssembler>;
 
-pub(super) fn factories(worker_count: usize) -> Vec<FileAssemblerFactory> {
+pub(super) fn factories(worker_count: usize) -> impl WorkerMaker<FileAssemblerFactory> {
     DefaultUnaryFactory::create_for_workers(worker_count)
 }
 

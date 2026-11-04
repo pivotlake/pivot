@@ -1,5 +1,5 @@
 use crate::GatherBarrier;
-use crate::api::{WorkerMaker, per_worker};
+use crate::api::WorkerMaker;
 use crate::boundary_slot::BoundarySlot;
 use crate::operations::unary::factory::UnaryFactory;
 use crate::operations::unary::order_by_limit::{OrderBy, OrderByLimit};
@@ -33,14 +33,14 @@ impl OrderByLimitFactory {
         let gather = Arc::new(GatherBarrier::new(worker_count));
         let key_window = Arc::new(Mutex::new(None));
 
-        per_worker(move |_| OrderByLimitFactory {
+        move |_| OrderByLimitFactory {
             order_by: order_by.clone(),
             limit,
             offset,
             gather: gather.clone(),
             boundary_slot: boundary_slot.clone(),
             key_window: key_window.clone(),
-        })
+        }
     }
 }
 

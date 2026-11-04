@@ -495,7 +495,7 @@ mod tests {
             );
 
         let mut consumers: Vec<_> = (0..workers)
-            .map(|worker| extract_consumer(builds.make(worker).build_unary()))
+            .map(|worker| extract_consumer(builds.for_worker(worker).build_unary()))
             .collect();
 
         let mut void = CollectSender::<()>::new();
@@ -528,7 +528,7 @@ mod tests {
         }
 
         let mut probers: Vec<_> = (0..workers)
-            .map(|worker| probes.make(worker).build_unary())
+            .map(|worker| probes.for_worker(worker).build_unary())
             .collect();
         let mut sender = CollectSender::new();
         let mut test_io = crate::io::TestOperatorIO::default();

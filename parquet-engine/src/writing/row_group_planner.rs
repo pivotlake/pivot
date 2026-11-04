@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use dispatch::{Sender, Topology, Unary, UnaryFactory, UnaryResult};
+use dispatch::{Sender, Topology, Unary, UnaryFactory, UnaryResult, WorkerMaker};
 
 use super::leaves;
 use super::shredding;
@@ -17,12 +17,10 @@ pub(super) struct RowGroupPlannerFactory {
     node_count: usize,
 }
 
-pub(super) fn factories(topology: Topology) -> Vec<RowGroupPlannerFactory> {
-    (0..topology.total_workers())
-        .map(|_| RowGroupPlannerFactory {
-            node_count: topology.node_count,
-        })
-        .collect()
+pub(super) fn factories(topology: Topology) -> impl WorkerMaker<RowGroupPlannerFactory> {
+    move |_| RowGroupPlannerFactory {
+        node_count: topology.node_count,
+    }
 }
 
 impl UnaryFactory<ReadyFile, ColumnChunkJob> for RowGroupPlannerFactory {

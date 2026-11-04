@@ -3,6 +3,7 @@
 //! Useful for unary transforms that need no per-worker configuration (e.g. the
 //! parquet indexer and decompressor, which are stateless or self-initializing).
 
+use crate::api::WorkerMaker;
 use crate::operations::{Unary, UnaryFactory};
 use std::marker::PhantomData;
 
@@ -19,8 +20,11 @@ impl<U> DefaultUnaryFactory<U> {
     }
 
     /// Creates one default factory for each dispatch worker.
-    pub fn create_for_workers(worker_count: usize) -> Vec<Self> {
-        (0..worker_count).map(|_| Self::new()).collect()
+    pub fn create_for_workers(_worker_count: usize) -> impl WorkerMaker<Self>
+    where
+        U: 'static,
+    {
+        |_| Self::new()
     }
 }
 

@@ -22,8 +22,8 @@ mod common;
 
 use common::dispatch;
 use dispatch::{
-    Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult, stealable,
-    values_input,
+    Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult, WorkerSlots,
+    stealable, values_input,
 };
 use std::sync::mpsc;
 use std::time::Duration;
@@ -95,7 +95,7 @@ fn pipeline_breaker_flush_does_not_hang_the_pool() {
             // Tiny source: just enough to drive the breaker, with minimal
             // consume-phase notify traffic so the workers stay caught up.
             let result = values_input(&d, 0..WORKERS as i64)
-                .chain(channels, factories)
+                .chain(channels, WorkerSlots::new(factories))
                 .collect();
             let _ = tx.send(result);
         });

@@ -1,4 +1,4 @@
-use crate::api::{WorkerMaker, per_worker, split};
+use crate::api::WorkerMaker;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
@@ -182,13 +182,20 @@ pub fn create_for_workers<
     let remaining_jobs = Arc::new(AtomicUsize::new(partitions + worker_count));
     let gather = Arc::new(GatherBarrier::new(worker_count));
     let pending_key_bitsets: PendingKeyBitsets = Arc::new(OnceLock::new());
+    // Each worker's filter arrays, shared by every part of the build phase
+    // made for that worker (a normalizing build and its collector both read
+    // them), so the cell is made once however many parts ask for it.
+    let filter_arrays_by_worker: Arc<[OnceLock<WorkerFilterArrays>]> =
+        (0..worker_count).map(|_| OnceLock::new()).collect();
 
     let table_clone = table.clone();
     let hs_clone = hash_state.clone();
     let probe_gate = build_ready.clone();
     let probe_spec = spec.clone();
-    let build_factories = per_worker(move |_| {
-        let filter_arrays: WorkerFilterArrays = Arc::new(OnceLock::new());
+    let build_factories = move |worker_idx: usize| {
+        let filter_arrays = filter_arrays_by_worker[worker_idx]
+            .get_or_init(|| Arc::new(OnceLock::new()))
+            .clone();
         let outputter = JoinBuilder::new(
             table.clone(),
             injector.clone(),
@@ -215,15 +222,15 @@ pub fn create_for_workers<
             partitions,
             _key: PhantomData,
         }
-    });
+    };
 
     let unmatched = Arc::new(UnmatchedScan::new(worker_count));
-    let probe_factories = per_worker(move |_| JoinProbeFactory {
+    let probe_factories = move |_| JoinProbeFactory {
         table: table_clone.clone(),
         hash_state: hs_clone.clone(),
         spec: probe_spec.clone(),
         unmatched: unmatched.clone(),
-    });
+    };
 
     (build_factories, probe_factories, probe_gate)
 }
@@ -267,35 +274,36 @@ pub(crate) fn create_normalizing_for_workers<
         EMIT_MARK_COLUMN,
     >(spec, worker_count);
     let normalizers = Normalizer::create_for_workers(worker_count);
-    // A worker's normalized build and its collector share one filter-array
-    // cell, so both come from the one build factory made for it.
-    let (normalized_builds, collectors) = split(
-        worker_count,
-        per_worker(move |worker| {
+    let build_factories = Arc::new(build_factories);
+    let normalized_builds = {
+        let build_factories = build_factories.clone();
+        move |worker| {
             let JoinBuildFactory {
                 key_columns,
                 filter_columns,
                 hash_state,
-                outputter,
+                outputter: _,
                 filter_arrays,
                 partitions,
                 _key,
-            } = build_factories.make(worker);
-            let normalized = JoinBuildFactory {
+            } = build_factories.for_worker(worker);
+            JoinBuildFactory {
                 key_columns,
                 filter_columns,
                 hash_state,
-                outputter: normalizers.make(worker),
+                outputter: normalizers.for_worker(worker),
                 filter_arrays,
                 partitions,
                 _key,
-            };
-            (
-                normalized,
-                CollectorFactory::new(outputter, worker == collector_worker),
-            )
-        }),
-    );
+            }
+        }
+    };
+    let collectors = move |worker| {
+        CollectorFactory::new(
+            build_factories.for_worker(worker).outputter,
+            worker == collector_worker,
+        )
+    };
     (normalized_builds, collectors, probe_factories, build_ready)
 }
 

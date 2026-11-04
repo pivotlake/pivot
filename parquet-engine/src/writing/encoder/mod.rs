@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::thrift::footer::Statistics;
 use crate::thrift::general::Encoding;
 use dispatch::memory::SlabAllocator;
-use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
+use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult, WorkerMaker};
 
 use super::compression;
 use super::error::{WriteError, WriteResult};
@@ -33,7 +33,7 @@ use dispatch::arrays::concat_chunks;
 
 pub(super) type LeafEncoderFactory = DefaultUnaryFactory<LeafEncoder>;
 
-pub(super) fn factories(worker_count: usize) -> Vec<LeafEncoderFactory> {
+pub(super) fn factories(worker_count: usize) -> impl WorkerMaker<LeafEncoderFactory> {
     DefaultUnaryFactory::create_for_workers(worker_count)
 }
 
