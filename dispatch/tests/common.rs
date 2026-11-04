@@ -41,6 +41,13 @@ impl Drop for DispatchGuard {
     }
 }
 
+impl DispatchGuard {
+    pub fn new(dispatch: Dispatch) -> Self {
+        init_tracing();
+        Self(Some(dispatch))
+    }
+}
+
 /// Spin a `Dispatch` up on the calling thread and return a guard for it.
 ///
 /// The buffer count is a process total that `spin_up` divides across NUMA node

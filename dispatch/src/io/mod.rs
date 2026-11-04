@@ -356,6 +356,9 @@ pub struct FsWriteRequest {
     /// write, so the operator can match the completion to its own bookkeeping.
     pub id: WriteRequestId,
     pub file: LocalFile,
+    /// Where in the file `data` goes. A file an operator produces is written
+    /// whole at zero; a spill file is appended to, one write after another.
+    pub offset: u64,
     pub data: Arc<FileBytes>,
 }
 

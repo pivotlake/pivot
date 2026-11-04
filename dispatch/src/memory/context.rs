@@ -1,4 +1,6 @@
 use crate::Identifier;
+use crate::WriteRequestId;
+use crate::io::{Completion, IORequester};
 use crate::memory::clock::{Clock, Owner, Sweep};
 use crate::memory::compressed_cache::CompressedCache;
 use crate::memory::decompressed_cache::DecompressedCache;
@@ -8,8 +10,9 @@ use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::status::{MemoryBlockStatus, read_block_status};
 use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
 use crate::worker::WORKER_IDX;
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -122,6 +125,8 @@ impl MemoryContextFactory {
             layout: self.layout,
             evictors: RefCell::new(HashMap::new()),
             buffers_spilled: self.buffers_spilled,
+            io_requester: OnceCell::new(),
+            spill_writes_in_flight: RefCell::new(HashMap::new()),
             node: self.node,
         }
     }
@@ -155,6 +160,14 @@ pub struct MemoryContext {
     /// node's workers, so a slot one worker is already spilling is not asked
     /// for again by another.
     buffers_spilled: Arc<[AtomicUsize]>,
+    /// The worker's IO requester, attached once the worker has built it, so
+    /// that eviction can wait for spill writes to land when nothing else can
+    /// be reclaimed. Shared with the worker, which drives it.
+    io_requester: OnceCell<Rc<RefCell<IORequester>>>,
+    /// Every spill write in flight on this worker, by its id, pointing at the
+    /// in-flight count of the spilled buffer it belongs to. A count that
+    /// reaches zero tells the buffer's evictor the whole buffer is on disk.
+    spill_writes_in_flight: RefCell<HashMap<WriteRequestId, Arc<AtomicUsize>>>,
     /// This worker's NUMA node, i.e. the ring region it allocates and evicts from.
     node: usize,
 }
@@ -408,6 +421,10 @@ impl MemoryContext {
                 if let Some(buffer) = self.evict_from_dataflow_operators() {
                     return buffer;
                 }
+                if self.has_spill_writes_in_flight() {
+                    self.wait_for_a_spill_write_to_land();
+                    iterations = 0;
+                }
                 continue;
             }
 
@@ -446,10 +463,14 @@ impl MemoryContext {
                 if drained || nothing_left_to_drain {
                     sweeping_other_tier = !sweeping_other_tier;
                     tiers_exhausted += 1;
-                    if tiers_exhausted >= 2
-                        && let Some(buffer) = self.evict_from_dataflow_operators()
-                    {
-                        return buffer;
+                    if tiers_exhausted >= 2 {
+                        if let Some(buffer) = self.evict_from_dataflow_operators() {
+                            return buffer;
+                        }
+                        if self.has_spill_writes_in_flight() {
+                            self.wait_for_a_spill_write_to_land();
+                            iterations = 0;
+                        }
                     }
                 }
                 aged_this_revolution = 0;
@@ -527,6 +548,73 @@ impl MemoryContext {
             removed.is_some(),
             "dataflow {dataflow_id} never registered evictors"
         );
+    }
+
+    /// Share the worker's IO requester with this context, once, so that
+    /// eviction can wait on it (see [`evict`](Self::evict)).
+    pub fn attach_io_requester(&self, requester: Rc<RefCell<IORequester>>) {
+        self.io_requester
+            .set(requester)
+            .unwrap_or_else(|_| panic!("the worker attached its IO requester twice"));
+    }
+
+    /// Note a spill write issued for a buffer, so that when it lands the
+    /// buffer's `writes_in_flight` is counted down.
+    pub fn record_spill_write_issued(
+        &self,
+        id: WriteRequestId,
+        writes_in_flight: Arc<AtomicUsize>,
+    ) {
+        let replaced = self
+            .spill_writes_in_flight
+            .borrow_mut()
+            .insert(id, writes_in_flight);
+        assert!(replaced.is_none(), "spill write {id:?} issued twice");
+    }
+
+    pub fn has_spill_writes_in_flight(&self) -> bool {
+        !self.spill_writes_in_flight.borrow().is_empty()
+    }
+
+    /// Take the spill writes that `requester` has collected as complete and
+    /// count each off its buffer. The worker runs this on every pass over its
+    /// completions, and eviction runs it after waiting for one.
+    pub fn complete_landed_spill_writes(&self, requester: &mut IORequester) {
+        let mut spill_writes_in_flight = self.spill_writes_in_flight.borrow_mut();
+        let landed = requester.extract_completions_if(|completion| {
+            matches!(completion, Ok(Completion::FsWrite(write)) if write.request.id.is_spill())
+        });
+        for completion in landed {
+            let Ok(Completion::FsWrite(write)) = completion else {
+                unreachable!("extracted only spill writes");
+            };
+            let writes_in_flight = spill_writes_in_flight
+                .remove(&write.request.id)
+                .expect("a spill write that completed was recorded when issued");
+            writes_in_flight.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    /// Block until the ring reports progress, then count the spill writes
+    /// that landed off their buffers. Every slot this worker could reclaim is
+    /// held by a spilled buffer whose write has not landed yet, so the only
+    /// way forward is to let the writes finish. Runs inside an operator's run,
+    /// so it leaves every other completion for the worker's next pass.
+    fn wait_for_a_spill_write_to_land(&self) {
+        let requester = self
+            .io_requester
+            .get()
+            .expect("spill writes are in flight only on a worker with an attached IO requester");
+        let mut requester = requester
+            .try_borrow_mut()
+            .expect("eviction does not run from inside the IO requester's own calls");
+        requester
+            .wait()
+            .expect("waiting on the IO ring while evicting");
+        requester
+            .collect_completions()
+            .expect("collecting IO completions while evicting");
+        self.complete_landed_spill_writes(&mut requester);
     }
 
     /// Ask each registered dataflow's operators for a slot they can give up and

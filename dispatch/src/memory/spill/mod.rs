@@ -8,11 +8,10 @@
 //!
 //! [`PartitionAllocator`]: partition_allocator::PartitionAllocator
 
+use crate::OperatorIO;
 use crate::io::{IORequesterError, LocalFile, OpenFile};
 use crate::memory::{FileBytes, FrozenSlab, WriteBuffer, memory_ctx};
 use crate::worker::WORKER_IDX;
-use crate::{OperatorIO, WriteRequestId};
-use ahash::HashMap;
 use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,6 +30,9 @@ pub use partition_tree::PARTITIONS;
 /// One partition's rows from a sealed buffer, going to its file as one write.
 pub struct SpillWrite {
     file: OpenFile,
+    /// Where in the file the rows go: right after everything the partition
+    /// spilled before.
+    offset: u64,
     rows: FileBytes,
 }
 
@@ -71,23 +73,16 @@ impl SpilledBuffer {
 
 /// What an operator hands its sealed buffers to when asked to spill. It writes
 /// each partition's rows to that partition's file and records every write with
-/// the worker, which counts the writes off as they land.
+/// the memory context, which counts the writes off as they land.
 pub struct Spiller<'a> {
     io: OperatorIO<'a>,
-    /// Every spill write in flight on this worker, by its id, pointing at the
-    /// in-flight count of the buffer it belongs to.
-    writes_in_flight: &'a mut HashMap<WriteRequestId, Arc<AtomicUsize>>,
     buffers_spilled: usize,
 }
 
 impl<'a> Spiller<'a> {
-    pub(crate) fn new(
-        io: OperatorIO<'a>,
-        writes_in_flight: &'a mut HashMap<WriteRequestId, Arc<AtomicUsize>>,
-    ) -> Self {
+    pub(crate) fn new(io: OperatorIO<'a>) -> Self {
         Self {
             io,
-            writes_in_flight,
             buffers_spilled: 0,
         }
     }
@@ -95,8 +90,8 @@ impl<'a> Spiller<'a> {
     /// Create the file that spilled rows of `spill_partition_id` are appended
     /// to, under this operator's spill directory (see [`directory`]). Each
     /// partition's file is created once; a second call for the same partition
-    /// fails. Opened for appending, so every write goes to the end whatever
-    /// offset it names.
+    /// fails. Each write names where in the file it goes, so the file grows
+    /// the same way on every platform.
     pub fn open_spill_file(&self, spill_partition_id: usize) -> std::io::Result<OpenFile> {
         let path = directory::partition_file_path(
             self.io.data_flow_id(),
@@ -110,7 +105,7 @@ impl<'a> Spiller<'a> {
         )?;
         let file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create_new(true)
             .open(&path)?;
         Ok(OpenFile::Local(LocalFile::new(file)?))
@@ -121,13 +116,12 @@ impl<'a> Spiller<'a> {
     }
 
     /// Issue one sealed buffer's writes, one per partition, and return the
-    /// count of them in flight, which the worker counts down as they land.
+    /// count of them in flight, which is counted down as they land.
     pub fn spill(&mut self, writes: Vec<SpillWrite>) -> Result<Arc<AtomicUsize>, IORequesterError> {
         let writes_in_flight = Arc::new(AtomicUsize::new(writes.len()));
-        for SpillWrite { file, rows } in writes {
-            let write_id = self.io.write_spill(file, Arc::new(rows))?;
-            self.writes_in_flight
-                .insert(write_id, writes_in_flight.clone());
+        for SpillWrite { file, offset, rows } in writes {
+            let write_id = self.io.write_spill(file, offset, Arc::new(rows))?;
+            memory_ctx().record_spill_write_issued(write_id, writes_in_flight.clone());
         }
         memory_ctx().record_buffers_spilled(1);
         self.buffers_spilled += 1;
@@ -150,26 +144,23 @@ impl<'a> Spiller<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{Completion, IORequester};
+    use crate::io::IORequester;
     use crate::memory::{BUFFER_SIZE, Slab, init_test_free_pool};
     use crate::stats::StatsCollector;
-    use std::sync::atomic::Ordering;
+    use std::cell::RefCell;
 
-    /// Take the next completed spill write off the requester and count it off
-    /// its buffer, as the worker does.
+    /// Wait for the next of the buffer's spill writes to land and count it off
+    /// `buffer_writes_in_flight`, as the worker does.
     fn complete_one_spill_write(
-        requester: &mut IORequester,
-        writes_in_flight: &mut HashMap<WriteRequestId, Arc<AtomicUsize>>,
+        requester: &RefCell<IORequester>,
+        buffer_writes_in_flight: &AtomicUsize,
     ) {
-        loop {
+        let mut requester = requester.borrow_mut();
+        let in_flight_before = buffer_writes_in_flight.load(Ordering::Acquire);
+        while buffer_writes_in_flight.load(Ordering::Acquire) == in_flight_before {
             requester.wait().unwrap();
-            for completion in requester.completions().unwrap() {
-                if let Ok(Completion::FsWrite(write)) = completion {
-                    let count = writes_in_flight.remove(&write.request.id).unwrap();
-                    count.fetch_sub(1, Ordering::Release);
-                    return;
-                }
-            }
+            requester.collect_completions().unwrap();
+            memory_ctx().complete_landed_spill_writes(&mut requester);
         }
     }
 
@@ -177,18 +168,17 @@ mod tests {
     fn a_spilled_buffer_is_on_disk_once_each_partitions_write_has_landed() {
         init_test_free_pool(1);
         let (dataflow, operator) = (9_000_004, 2);
-        let mut requester = IORequester::default();
+        let requester = RefCell::new(IORequester::default());
         let mut stats = StatsCollector::disabled();
         let mut next_request_id = 0;
-        let mut writes_in_flight = HashMap::default();
         let io = OperatorIO::new(
-            &mut requester,
+            &requester,
             dataflow,
             operator,
             &mut stats,
             &mut next_request_id,
         );
-        let mut spiller = Spiller::new(io, &mut writes_in_flight);
+        let mut spiller = Spiller::new(io);
         // Three 1KB slabs of one buffer: two for partition 5, one for partition 9.
         let mut buffer = memory_ctx().get_write_buffer(false);
         buffer.as_mut_slice()[..3072].fill(0xAB);
@@ -207,10 +197,12 @@ mod tests {
         let writes = vec![
             SpillWrite {
                 file: spiller.open_spill_file(5).unwrap(),
+                offset: 0,
                 rows: rows_of(&[&first, &third]),
             },
             SpillWrite {
                 file: spiller.open_spill_file(9).unwrap(),
+                offset: 0,
                 rows: rows_of(&[&second]),
             },
         ];
@@ -231,15 +223,15 @@ mod tests {
         };
         let in_flight_after_issuing = spilled.writes_in_flight.load(Ordering::Acquire);
         drop(spiller);
-        complete_one_spill_write(&mut requester, &mut writes_in_flight);
+        complete_one_spill_write(&requester, &spilled.writes_in_flight);
         let in_flight_after_one = spilled.writes_in_flight.load(Ordering::Acquire);
-        complete_one_spill_write(&mut requester, &mut writes_in_flight);
+        complete_one_spill_write(&requester, &spilled.writes_in_flight);
         let in_flight_after_both = spilled.writes_in_flight.load(Ordering::Acquire);
 
         assert_eq!(in_flight_after_issuing, 2);
         assert_eq!(in_flight_after_one, 1);
         assert_eq!(in_flight_after_both, 0);
-        assert!(writes_in_flight.is_empty());
+        assert!(!memory_ctx().has_spill_writes_in_flight());
         let file_len = |partition| {
             std::fs::metadata(directory::partition_file_path(
                 dataflow,
@@ -268,18 +260,17 @@ mod tests {
     fn a_spill_file_is_created_once_under_its_operators_directory() {
         WORKER_IDX.set(0);
         let (dataflow, operator) = (9_000_003, 4);
-        let mut requester = IORequester::default();
+        let requester = RefCell::new(IORequester::default());
         let mut stats = StatsCollector::disabled();
         let mut next_request_id = 0;
         let io = OperatorIO::new(
-            &mut requester,
+            &requester,
             dataflow,
             operator,
             &mut stats,
             &mut next_request_id,
         );
-        let mut writing = HashMap::default();
-        let spiller = Spiller::new(io, &mut writing);
+        let spiller = Spiller::new(io);
 
         let opened = spiller.open_spill_file(7).is_ok();
         let again = spiller.open_spill_file(7).err().map(|error| error.kind());

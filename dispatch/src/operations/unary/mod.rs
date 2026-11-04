@@ -399,7 +399,6 @@ mod tests {
     use super::*;
     use crate::io::TestOperatorIO;
     use crate::operations::channels::mpsc_channel;
-    use ahash::HashMap;
     use test_utils::CollectSender;
 
     /// A transform holding a job it steps through: it takes no input, and each
@@ -470,8 +469,7 @@ mod tests {
             Arc::new(AtomicUsize::new(1)),
         );
         let mut test_io = TestOperatorIO::default();
-        let mut writes_in_flight = HashMap::default();
-        let mut spiller = Spiller::new(test_io.io(), &mut writes_in_flight);
+        let mut spiller = Spiller::new(test_io.io());
 
         Operator::spill(&mut operator, &mut spiller, 3).unwrap();
 

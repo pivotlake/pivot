@@ -357,8 +357,7 @@ mod tests {
             Box::new(SharedCollectSender(items)),
         );
         let mut test_io = crate::io::TestOperatorIO::default();
-        let mut writes_in_flight = ahash::HashMap::default();
-        let mut spiller = Spiller::new(test_io.io(), &mut writes_in_flight);
+        let mut spiller = Spiller::new(test_io.io());
 
         Operator::spill(&mut operator, &mut spiller, 2).unwrap();
 

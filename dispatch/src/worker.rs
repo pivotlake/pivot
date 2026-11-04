@@ -22,16 +22,17 @@
 //! has no direct knowledge of other workers; synchronization is encapsulated in the
 //! operators.
 
+use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
-use crate::{Identifier, WriteRequestId};
 use ahash::HashMap;
 use core_affinity::CoreId;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Live per-worker dataflows across the pool.
@@ -133,8 +134,9 @@ pub struct Worker {
     id: Identifier,
     should_exit: Arc<AtomicBool>,
     /// A requester (through a single per-core uring) for all IO — both disk reads
-    /// and HTTP(S) reads of remote regions share the one ring.
-    io: IORequester,
+    /// and HTTP(S) reads of remote regions share the one ring. Shared with the
+    /// memory context, so that eviction can wait on spill writes.
+    io: Rc<RefCell<IORequester>>,
     /// A queue of dataflows for the worker to work on. The worker can work on many dataflows
     /// simultaneously
     data_flow_queue: Receiver<DataFlowBuilder>,
@@ -162,10 +164,6 @@ pub struct Worker {
     /// Last delegated-broadcast epoch this worker has fanned out (see
     /// [`WorkerWaker::finish_delegated_wake`]).
     last_seen_broadcast: u64,
-    /// Every spill write in flight on this worker, by its id, pointing at the
-    /// in-flight count of the spilled buffer it belongs to. A count that
-    /// reaches zero tells the buffer's owner the whole buffer is on disk.
-    spill_writes_in_flight: HashMap<WriteRequestId, Arc<AtomicUsize>>,
 }
 
 impl Worker {
@@ -222,7 +220,7 @@ impl Worker {
                 // `drop_cache()` can clear it; the requester takes ownership.
                 crate::io::disk_cache::install_worker_disk_cache(disk_cache.clone());
                 let worker = Self {
-                    io: IORequester::new(disk_cache),
+                    io: Rc::new(RefCell::new(IORequester::new(disk_cache))),
                     id: core.id,
                     data_flows: Default::default(),
                     data_flow_queue: receiver,
@@ -233,16 +231,16 @@ impl Worker {
                     last_seen_ring_wake_count,
                     node_local_idx,
                     last_seen_broadcast,
-                    spill_writes_in_flight: Default::default(),
                 };
                 // Notifiers must be able to interrupt this worker's blocking
                 // IO wait, not just its thread park; register the ring's wake
                 // line alongside the thread handle.
                 worker
                     .waker
-                    .register_ring_waker(node_local_idx, worker.io.wake_handle());
+                    .register_ring_waker(node_local_idx, worker.io.borrow().wake_handle());
                 debug!("Initializing memory context for worker {:?}", idx);
                 init_memory_context(memory_context_factory.create_memory_ctx());
+                memory_ctx().attach_io_requester(worker.io.clone());
                 debug!("Pre-faulting for worker {:?}", idx);
                 memory_ctx().prefault_buffers();
                 worker
@@ -273,17 +271,13 @@ impl Worker {
     /// path) that resolves straight from the caches, so loop until quiescent.
     fn deliver_ready_reads(&mut self) {
         loop {
-            let ready = self.io.take_ready_reads();
+            let ready = self.io.borrow_mut().take_ready_reads();
             if ready.is_empty() {
                 return;
             }
             for ready in ready {
                 if let Some(flow) = self.data_flows.get_mut(&ready.route.data_flow_id) {
-                    flow.process_read_response(
-                        ready.route.operator_idx,
-                        ready.response,
-                        &mut self.io,
-                    );
+                    flow.process_read_response(ready.route.operator_idx, ready.response, &self.io);
                 }
             }
         }
@@ -300,7 +294,7 @@ impl Worker {
             return;
         }
         for flow in self.data_flows.values_mut() {
-            let spilled = flow.spill(&mut self.io, &mut self.spill_writes_in_flight, wanted);
+            let spilled = flow.spill(&self.io, wanted);
             if spilled > 0 {
                 self.did_work_last_iteration = true;
                 wanted = wanted.saturating_sub(spilled);
@@ -320,7 +314,7 @@ impl Worker {
             if Self::paused_for_profiling(flow) {
                 continue;
             }
-            if let WorkStatus::Ran = flow.run_ready_cpu_work(&mut self.io) {
+            if let WorkStatus::Ran = flow.run_ready_cpu_work(&self.io) {
                 self.did_work_last_iteration = true;
             }
         }
@@ -330,7 +324,15 @@ impl Worker {
     /// transport to its own handler; by the time we're here each block's bytes
     /// are already committed to its cache slot.
     fn process_io_completions(&mut self) -> Result<()> {
-        for completion in self.io.completions()? {
+        let completions = {
+            let mut io = self.io.borrow_mut();
+            io.collect_completions()?;
+            // Spill writes were issued by the memory context's spiller, not by
+            // an operator, so they are counted off there.
+            memory_ctx().complete_landed_spill_writes(&mut io);
+            io.take_completions()
+        };
+        for completion in completions {
             match completion {
                 // The owning dataflow may already be gone: a finished or
                 // cancelled query/compaction leaves its read-ahead reads in
@@ -345,15 +347,7 @@ impl Worker {
                 Ok(Completion::FsWrite(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_disk_write_time(r.submitted_at);
-                        if r.request.id.is_spill() {
-                            let writes_in_flight = self
-                                .spill_writes_in_flight
-                                .remove(&r.request.id)
-                                .expect("a spill write that completed was recorded when issued");
-                            writes_in_flight.fetch_sub(1, Ordering::Release);
-                        } else {
-                            data_flow.process_fs_write(r.operator_idx, r.request);
-                        }
+                        data_flow.process_fs_write(r.operator_idx, r.request);
                     }
                 }
                 Ok(Completion::HttpGet(r, time)) => {
@@ -452,7 +446,7 @@ impl Worker {
             if Self::paused_for_profiling(flow) {
                 continue;
             }
-            if let WorkStatus::Ran = flow.try_stealing_work(&mut self.io) {
+            if let WorkStatus::Ran = flow.try_stealing_work(&self.io) {
                 self.did_work_last_iteration = true;
             }
         }
@@ -527,7 +521,7 @@ impl Worker {
             }
         });
         for id in cancelled {
-            self.io.cancel_dataflow(id);
+            self.io.borrow_mut().cancel_dataflow(id);
             self.release_live_dataflow();
         }
     }
@@ -606,7 +600,7 @@ impl Worker {
                 // slot published around it lets a notifier interrupt the ring
                 // (see `begin_ring_wait`), so a message sent mid-wait resumes
                 // the loop instead of stalling behind the slowest read.
-                if self.io.has_pending() {
+                if self.io.borrow().has_pending() {
                     debug!("Waiting for IO...");
                     if self
                         .waker
@@ -619,7 +613,7 @@ impl Worker {
                         // instead of reaching a live parked one, and the wake
                         // itself writes to an eventfd this thread closed on
                         // its way out.
-                        let wait_result = self.io.wait();
+                        let wait_result = self.io.borrow_mut().wait();
                         self.waker.end_ring_wait(self.node_local_idx);
                         wait_result?;
                     }
