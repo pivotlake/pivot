@@ -13,10 +13,10 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, RecordBatch,
-    StringArray, StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal64Array,
+    Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    IntervalMonthDayNanoArray, LargeBinaryArray, RecordBatch, StringArray, StringViewArray,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
 use pg_interval_2::Interval;
@@ -102,8 +102,8 @@ pub fn encode_batch(batch: &RecordBatch, format: FieldFormat) -> Result<PGRowBat
 /// - `Date32`/`Timestamp`/`Interval`: rendered as a Postgres server prints
 ///   them in text, and handed to the encoder as chrono / [`Interval`] values
 ///   in binary.
-/// - The advertise-only `Binary`/`LargeUtf8`, which fall through to the
-///   best-effort text fallback in `encode_cell`, and are refused in binary.
+/// - The advertise-only `LargeUtf8`, which falls through to the best-effort
+///   text fallback in `encode_cell`, and is refused in binary.
 macro_rules! arrow_pg_types {
     (
         direct: [ $( ($dt:ident, $array:ty, $pg:ident) ),+ $(,)? ],
@@ -129,7 +129,6 @@ macro_rules! arrow_pg_types {
                 DataType::Interval(_) => Type::INTERVAL,
                 // Advertised but encoded via the text fallback below.
                 DataType::LargeUtf8 => Type::TEXT,
-                DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Type::BYTEA,
                 _ => Type::TEXT,
             }
         }
@@ -359,6 +358,9 @@ arrow_pg_types! {
         (Float64,  Float64Array,    FLOAT8),
         (Utf8,     StringArray,     TEXT),
         (Utf8View, StringViewArray, TEXT),
+        (Binary,      BinaryArray,      BYTEA),
+        (LargeBinary, LargeBinaryArray, BYTEA),
+        (BinaryView,  BinaryViewArray,  BYTEA),
     ],
     widened: [
         (Int8,   Int8Array,   INT2, i16),
@@ -833,17 +835,68 @@ mod tests {
 
     #[test]
     fn binary_refuses_columns_it_has_no_binary_encoding_for() {
-        let col: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![&b"ab"[..]]));
-        let b = batch(vec![("bytes", DataType::Binary)], vec![col]);
+        let col: ArrayRef = Arc::new(arrow_array::LargeStringArray::from(vec!["ab"]));
+        let b = batch(vec![("s", DataType::LargeUtf8)], vec![col]);
 
         let encoded = encode_batch(&b, FieldFormat::Binary);
 
         assert!(matches!(
             encoded,
             Err(EncodeError::NoBinaryEncoding {
-                data_type: DataType::Binary
+                data_type: DataType::LargeUtf8
             })
         ));
+    }
+
+    #[test]
+    fn bytes_columns_map_to_bytea() {
+        let schema = schema(vec![
+            ("b", DataType::Binary),
+            ("l", DataType::LargeBinary),
+            ("v", DataType::BinaryView),
+        ]);
+
+        let fields = build_field_info(&schema, FieldFormat::Text);
+
+        assert!(fields.iter().all(|f| f.datatype() == &Type::BYTEA));
+    }
+
+    #[test]
+    fn encode_batch_encodes_bytes_as_hex_text() {
+        let col: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&b"\x00ab"[..]), None]));
+        let b = batch(vec![("bytes", DataType::Binary)], vec![col]);
+
+        let decoded = rows(&b);
+
+        assert_eq!(decoded[0], vec![Some("\\x006162".to_string())]);
+        assert_eq!(decoded[1], vec![None]);
+    }
+
+    #[test]
+    fn binary_encodes_bytes_verbatim() {
+        let plain: ArrayRef = Arc::new(BinaryArray::from(vec![&b"\x00ab"[..]]));
+        let large: ArrayRef = Arc::new(LargeBinaryArray::from(vec![&b"cd"[..]]));
+        let view: ArrayRef = Arc::new(BinaryViewArray::from(vec![&b"ef"[..]]));
+        let b = batch(
+            vec![
+                ("b", DataType::Binary),
+                ("l", DataType::LargeBinary),
+                ("v", DataType::BinaryView),
+            ],
+            vec![plain, large, view],
+        );
+
+        let pg = encode_batch(&b, FieldFormat::Binary).unwrap();
+        let decoded: Vec<_> = pg.rows.iter().map(decode_binary_row).collect();
+
+        assert_eq!(
+            decoded[0],
+            vec![
+                Some(b"\x00ab".to_vec()),
+                Some(b"cd".to_vec()),
+                Some(b"ef".to_vec())
+            ]
+        );
     }
 
     #[test]
