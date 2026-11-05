@@ -16,7 +16,7 @@
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
-use dispatch::io::{AuthHeader, OpenFile, RemoteFile, open_direct_read};
+use dispatch::io::{OpenFile, RemoteFile, RequestAuth, open_direct_read};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -127,20 +127,21 @@ pub struct DataFile {
 
 /// Where a data file's bytes live, for reading or writing: a local filesystem
 /// path (via the io_uring file path) or a remote URL (HTTP on the same ring). A
-/// remote URL either carries its own auth (an S3 presigned URL), needs no auth
-/// (anonymous S3), or pairs a stable URL with an [`AuthHeader`] that mints a
-/// fresh bearer token per request. Which variant a store yields is its business,
-/// not the caller's.
+/// remote URL is stable; it either needs no auth (anonymous S3, a public URL)
+/// or pairs with a [`RequestAuth`] that mints the headers authenticating each
+/// request (a GCS bearer token, an S3 signature) from state the store keeps
+/// current. Which a store yields is its business, not the caller's.
 ///
-/// The same key maps to a different URL per direction — [`source`](ObjectStore::source)
-/// builds the read URL, [`sink`](ObjectStore::sink) the write URL (e.g. S3 presigns
-/// a GET vs a PUT) — so both return this one type. Uploads are always a `PUT`.
+/// The same key may map to a different URL per direction — [`source`](ObjectStore::source)
+/// builds the read URL, [`sink`](ObjectStore::sink) the write URL (GCS reads
+/// over its JSON API and writes over its XML one) — so both return this one
+/// type. Uploads are always a `PUT`.
 #[derive(Clone)]
 pub enum DataFileLocation {
     Local(PathBuf),
     Remote {
         url: url::Url,
-        auth: Option<AuthHeader>,
+        auth: Option<Arc<dyn RequestAuth>>,
     },
 }
 
@@ -260,8 +261,8 @@ pub trait ObjectStore: Debug + Send + Sync {
     ) -> Result<DirectoryListing>;
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
-    /// a filesystem path, a remote one a GET URL — either presigned or paired
-    /// with a per-request bearer token. (Identity — the [`FileRef`] — is the
+    /// a filesystem path, a remote one a GET URL, paired with what authenticates
+    /// each request when the store signs. (Identity — the [`FileRef`] — is the
     /// caller's; this is only how to read the bytes.)
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation>;
 

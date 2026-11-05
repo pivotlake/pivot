@@ -8,7 +8,7 @@ use arrow_schema::{Field, Schema};
 use dispatch::DataFlowDispatcher;
 use iceberg::spec::{ManifestFile, SchemaRef, TableMetadataRef, Transform};
 use iceberg::table::Table;
-use object_storage::ExternalStoreFactory;
+use object_storage::S3Credentials;
 use parquet_engine::{FileRowGroups, ParquetTable, TableColumns, load_file_row_groups};
 use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 use planner::types::physical_arrow_type;
@@ -243,16 +243,13 @@ fn identity_columns<'a>(
         .collect()
 }
 
-/// The store `table`'s files are read through: opened with the credentials
-/// the catalog vended for the table, or through `store_factory` when it
-/// vended none. Opened when the table is indexed rather than when a query loads
-/// it, since opening a store may ask the bucket for its region; and opened
-/// again at every refresh, so vended credentials never outlive their session.
-pub(crate) fn open_table_store(
+/// Where `table`'s metadata lives and the S3 credentials the catalog vended
+/// for it, if any: what opening its store, or renewing the one the last index
+/// read it through, takes.
+pub(crate) fn table_store_credentials<'a>(
     name: &SchemaQualifiedTableName,
-    table: &Table,
-    store_factory: &dyn ExternalStoreFactory,
-) -> Result<TableStore> {
+    table: &'a Table,
+) -> Result<(&'a str, Option<S3Credentials>)> {
     let table_name = name.to_string();
     let metadata_location = table
         .metadata_location()
@@ -260,7 +257,7 @@ pub(crate) fn open_table_store(
             table: table_name.clone(),
         })?;
     let vended = read_vended_s3_credentials(&table_name, table.file_io().config().props())?;
-    TableStore::open(&table_name, metadata_location, store_factory, vended)
+    Ok((metadata_location, vended))
 }
 
 /// The size of `table`'s current manifest list, or `None` when the table has

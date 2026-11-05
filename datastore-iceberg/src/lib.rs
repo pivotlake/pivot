@@ -43,12 +43,15 @@
 //! Every table load asks the catalog to vend storage credentials
 //! (`X-Iceberg-Access-Delegation: vended-credentials`). A catalog that does
 //! answers with S3 keys in the table's storage properties, and the table's
-//! store is opened with them; those keys are usually an STS session's,
-//! short-lived, and scoped to the table, so the store is opened again at every
-//! refresh from the keys the catalog vended then. A catalog that vends nothing
-//! leaves the store to the factory the datastore was opened with, the
-//! process's own credential policy. Only the flat `s3.*` form is read; the
-//! per-prefix `storage-credentials` list is not.
+//! store signs its requests with them. Those keys are usually an STS
+//! session's, short-lived, and scoped to the table, so every refresh loads
+//! the table again and renews the keys of its store in place: a query that
+//! outlives the keys it started with signs its next request with the new
+//! ones. The refresh interval must therefore stay shorter than the keys'
+//! lifetime. A catalog that vends nothing leaves the store to the factory
+//! the datastore was opened with, the process's own credential policy. Only
+//! the flat `s3.*` form is read; the per-prefix `storage-credentials` list is
+//! not.
 //!
 //! A table's files are read through one store, the bucket its metadata file
 //! is in. The managed catalogs keep a table in one bucket; a table split
@@ -93,7 +96,7 @@ use planner::catalog::{
 use crate::binding::IcebergTableBinding;
 use crate::rest_catalog::{block_on, build_rest_catalog};
 use crate::store::TableStore;
-use crate::table::{LoadedTable, fetch_manifest_list_size, open_table_store};
+use crate::table::{LoadedTable, fetch_manifest_list_size, table_store_credentials};
 
 /// How to reach the REST catalog. The fields mirror the properties the
 /// Iceberg REST client is configured with; `properties` passes any further
@@ -283,8 +286,8 @@ struct SchemaEntry {
 
 /// One table's entry in the index: the table as the catalog returned it, with
 /// what a load needs that the response does not say: the store its files are
-/// read through, opened with the credentials the catalog vended, and the size
-/// of the current snapshot's manifest list.
+/// read through, signing with the credentials the catalog vended, and the
+/// size of the current snapshot's manifest list.
 struct TableEntry {
     table: Table,
     store: TableStore,
@@ -402,24 +405,41 @@ impl IcebergDatastore {
         Ok(index)
     }
 
-    /// `table`'s entry: with its store, opened now from the credentials the
-    /// catalog just vended, and its manifest list's size, the one `previous`
-    /// learned when the snapshot is the one it entered, else asked of the
-    /// store now.
+    /// `table`'s entry: with its store, `previous`'s renewed with the
+    /// credentials the catalog just vended when they are for the place it was
+    /// opened for, else opened now (here rather than when a query loads the
+    /// table, since opening a store may ask the bucket for its region); and
+    /// its manifest list's size, the one `previous` learned when the snapshot
+    /// is the one it entered, else asked of the store now.
     fn build_table_entry(
         &self,
         name: &SchemaQualifiedTableName,
         table: Table,
         previous: Option<&Result<TableEntry, String>>,
     ) -> Result<TableEntry> {
-        let store = open_table_store(name, &table, &*self.store_factory)?;
+        let previous = previous.and_then(|previous| previous.as_ref().ok());
+        let (metadata_location, vended) = table_store_credentials(name, &table)?;
+        let store = match previous {
+            Some(previous)
+                if previous
+                    .store
+                    .renew_credentials(metadata_location, vended.as_ref())? =>
+            {
+                previous.store.clone()
+            }
+            _ => TableStore::open(
+                &name.to_string(),
+                metadata_location,
+                &*self.store_factory,
+                vended,
+            )?,
+        };
         let path = table
             .metadata()
             .current_snapshot()
             .map(|snapshot| snapshot.manifest_list());
-        let unchanged = previous
-            .and_then(|previous| previous.as_ref().ok())
-            .filter(|previous| path.is_some() && previous.manifest_list_path() == path);
+        let unchanged =
+            previous.filter(|previous| path.is_some() && previous.manifest_list_path() == path);
         let manifest_list_size = match unchanged {
             Some(previous) => previous.manifest_list_size,
             None => fetch_manifest_list_size(name, &table, &store)?,
