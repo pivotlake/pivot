@@ -11,7 +11,29 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Decimal64Type, Decimal128Type};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
+use dispatch::RecordBatchOperatorSpec;
 use std::sync::Arc;
+
+/// Reinterpret each output column `i` of `op` to `targets[i]`, leaving columns
+/// with a `None` target untouched. No projection is added when every target is
+/// `None`.
+pub(in crate::operator) fn reinterpret_output(
+    op: RecordBatchOperatorSpec,
+    targets: Vec<Option<DataType>>,
+) -> RecordBatchOperatorSpec {
+    if !targets.iter().any(Option::is_some) {
+        return op;
+    }
+    let targets = Arc::new(targets);
+    op.project(move || {
+        let targets = targets.clone();
+        move |batch: RecordBatch| {
+            Ok(reinterpret_columns(batch, |i, _| {
+                targets.get(i).and_then(Option::clone)
+            })?)
+        }
+    })
+}
 
 /// Rebuild `batch`, replacing each column `i` whose `target(i, current_type)`
 /// returns a different `DataType` with that column reinterpreted to the target.
