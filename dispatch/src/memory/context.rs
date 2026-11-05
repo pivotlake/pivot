@@ -164,10 +164,12 @@ pub struct MemoryContext {
     /// that eviction can wait for spill writes to land when nothing else can
     /// be reclaimed. Shared with the worker, which drives it.
     io_requester: OnceCell<Rc<RefCell<IORequester>>>,
-    /// Every spill write in flight on this worker, by its id, pointing at the
-    /// in-flight count of the spilled buffer it belongs to. A count that
-    /// reaches zero tells the buffer's evictor the whole buffer is on disk.
-    spill_writes_in_flight: RefCell<HashMap<WriteRequestId, Arc<AtomicUsize>>>,
+    /// Every spill write in flight on this worker, pointing at the in-flight
+    /// count of the spilled buffer it belongs to. A count that reaches zero
+    /// tells the buffer's evictor the whole buffer is on disk. Keyed by the
+    /// issuing dataflow as well as the write id, because write ids are drawn
+    /// per dataflow and two dataflows spilling on one worker repeat them.
+    spill_writes_in_flight: RefCell<HashMap<(Identifier, WriteRequestId), Arc<AtomicUsize>>>,
     /// This worker's NUMA node, i.e. the ring region it allocates and evicts from.
     node: usize,
 }
@@ -558,18 +560,22 @@ impl MemoryContext {
             .unwrap_or_else(|_| panic!("the worker attached its IO requester twice"));
     }
 
-    /// Note a spill write issued for a buffer, so that when it lands the
-    /// buffer's `writes_in_flight` is counted down.
+    /// Note a spill write issued for a buffer by `dataflow`, so that when it
+    /// lands the buffer's `writes_in_flight` is counted down.
     pub fn record_spill_write_issued(
         &self,
+        dataflow: Identifier,
         id: WriteRequestId,
         writes_in_flight: Arc<AtomicUsize>,
     ) {
         let replaced = self
             .spill_writes_in_flight
             .borrow_mut()
-            .insert(id, writes_in_flight);
-        assert!(replaced.is_none(), "spill write {id:?} issued twice");
+            .insert((dataflow, id), writes_in_flight);
+        assert!(
+            replaced.is_none(),
+            "spill write {id:?} of dataflow {dataflow} issued twice"
+        );
     }
 
     pub fn has_spill_writes_in_flight(&self) -> bool {
@@ -589,7 +595,7 @@ impl MemoryContext {
                 unreachable!("extracted only spill writes");
             };
             let writes_in_flight = spill_writes_in_flight
-                .remove(&write.request.id)
+                .remove(&(write.data_flow_id, write.request.id))
                 .expect("a spill write that completed was recorded when issued");
             writes_in_flight.fetch_sub(1, Ordering::Release);
         }
