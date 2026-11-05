@@ -18,7 +18,7 @@
 
 use crate::RECORD_BATCH_SIZE;
 use crate::io::IORequesterError;
-use crate::memory::{SharedPartitionEvictor, SlabAllocator, Spiller};
+use crate::memory::{SharedPartitionEvictor, SlabAllocator, Spiller, memory_ctx};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::HashTable;
@@ -664,8 +664,21 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         // The spilled buffers still resident come back for the merge to read
         // in memory, and the evicted rows as the file ranges to load them
         // from. Nothing spills or is evicted while the merge runs, so the
-        // evictor is emptied here.
-        let spilled = self.evictor.borrow_mut().take_all();
+        // evictor is emptied here. From then on these buffers are ordinary
+        // memory that nothing can take back, and a worker that consumed under
+        // pressure has them filling the ring: while the node is short of free
+        // slots, the ones whose rows are already on disk are let go of first,
+        // so the merge has memory for its tables and reads.
+        let spilled = {
+            let mut evictor = self.evictor.borrow_mut();
+            while memory_ctx().is_short_of_free_or_cached_slots() {
+                let Some(freed) = evictor.evict() else {
+                    break;
+                };
+                drop(freed);
+            }
+            evictor.take_all()
+        };
         let partition_rows = self
             .buffers
             .map(|buffers| buffers.into_partition_rows(spilled));

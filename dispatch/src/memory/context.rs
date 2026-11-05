@@ -494,17 +494,36 @@ impl MemoryContext {
     /// release, so the result is approximate by a few slots, which a watermark
     /// tolerates.
     pub fn slots_to_spill(&self) -> usize {
-        let free = self.dirty_pool.free_slots() + self.zeroed_pool.free_slots();
-        let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
-            + self.clock.owned_in_region(Owner::Decompressed, self.node);
         let spilled = self.buffers_spilled[self.node].load(Ordering::Relaxed);
-        let target =
-            self.layout.node_slots(self.node).len() * RECLAIMABLE_SLOTS_TARGET_PERCENT / 100;
-        let reclaimable = free + cached + spilled;
+        let reclaimable = self.free_or_cached_slots() + spilled;
+        let target = self.reclaimable_slots_target();
         if reclaimable >= target {
             return 0;
         }
         (target - reclaimable).div_ceil(self.layout.topology().workers_per_node)
+    }
+
+    /// Whether this node holds fewer free and cached slots than the
+    /// reclaimable target, counting none of the slots that are reclaimable
+    /// only through an operator's evictor. For an operator about to keep its
+    /// spilled buffers as ordinary memory: while this holds, the ones already
+    /// on disk are better let go of.
+    pub fn is_short_of_free_or_cached_slots(&self) -> bool {
+        self.free_or_cached_slots() < self.reclaimable_slots_target()
+    }
+
+    /// Slots of this node that eviction can take back without an operator's
+    /// help: free, or owned by a cache, which the sweep reclaims at will.
+    fn free_or_cached_slots(&self) -> usize {
+        let free = self.dirty_pool.free_slots() + self.zeroed_pool.free_slots();
+        let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
+            + self.clock.owned_in_region(Owner::Decompressed, self.node);
+        free + cached
+    }
+
+    /// See [`RECLAIMABLE_SLOTS_TARGET_PERCENT`].
+    fn reclaimable_slots_target(&self) -> usize {
+        self.layout.node_slots(self.node).len() * RECLAIMABLE_SLOTS_TARGET_PERCENT / 100
     }
 
     /// Count `count` more of this node's slots as spilled, so that
@@ -747,6 +766,22 @@ mod tests {
         assert_eq!(evicted.slot_idx, held_slot);
         assert_eq!(*log.borrow(), ["group"]);
         memory_ctx().unregister_dataflow_evictors(7);
+    }
+
+    #[test]
+    fn spilled_slots_do_not_count_against_being_short_of_free_or_cached_slots() {
+        // 128 slots, so the target is 25; 10 free and 15 spilled.
+        init_test_free_pool(10);
+        memory_ctx().record_buffers_spilled(15);
+
+        let short_with_spilled = memory_ctx().is_short_of_free_or_cached_slots();
+        memory_ctx().record_spilled_buffers_released(15);
+        for idx in 10..25 {
+            memory_ctx().clock().bind(idx, Owner::Compressed);
+        }
+        let short_with_cached = memory_ctx().is_short_of_free_or_cached_slots();
+
+        assert_eq!([short_with_spilled, short_with_cached], [true, false]);
     }
 
     #[test]
