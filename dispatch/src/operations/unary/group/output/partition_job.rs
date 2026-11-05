@@ -190,7 +190,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
     /// `acc` (building columns into `allocator`). Accumulating across
     /// partition jobs, rather than emitting one batch per job, keeps the radix
     /// path's many small partitions from each producing a tiny `RecordBatch`.
-    /// Afterwards the partition's scatter buckets on this node are released.
+    ///
+    /// The partition's scatter buckets on this node are released first. Every
+    /// row of theirs is in `result` by now, and the order matters for the
+    /// free pool, which hands out the buffer freed last: a scatter buffer
+    /// shared by many partitions comes free here cold, read by whichever
+    /// workers merged the partitions in it, while the buffers `result` frees
+    /// when it has been emitted are the ones this worker just wrote. Freed
+    /// after the buckets, they are the ones the next job's table is built in,
+    /// still in this core's cache.
     pub(super) fn finish(
         self,
         result: HashTable<K::Persisted, V>,
@@ -198,9 +206,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
-        let outcome = self.emit(result, acc, sender, allocator);
         self.release_buckets();
-        outcome
+        self.emit(result, acc, sender, allocator)
     }
 
     /// Let go of a pruned partition's scatter buckets without merging it.

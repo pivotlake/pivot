@@ -247,11 +247,16 @@ impl<L: Layout> PartitionAllocator<L> {
     /// buffer is let go of at once rather than when the partition next
     /// receives a row; the row itself stays valid, the ring memory does not
     /// move.
+    ///
+    /// This is the scatter loop's inner step, so it stays small enough to
+    /// inline into that loop: opening and closing a slab, which happen once
+    /// per slab rather than once per row, are kept out of line.
+    #[inline(always)]
     pub fn reserve(&mut self, partition: usize) -> &mut L::Row {
         if self.partitions[partition].open_slab.is_none() {
-            let slab = self.allocate_slab_for(partition);
-            self.partitions[partition].open_slab = Some(slab);
+            self.open_slab_for(partition);
         }
+        let row_size = self.layout.row_size();
         let open = self.partitions[partition]
             .open_slab
             .as_mut()
@@ -261,17 +266,32 @@ impl<L: Layout> PartitionAllocator<L> {
             open.slab
                 .as_mut_slice()
                 .as_mut_ptr()
-                .add(open.len * self.layout.row_size())
+                .add(open.len * row_size)
         };
         open.len += 1;
         if open.len == open.rows {
-            let full = self.partitions[partition]
-                .open_slab
-                .take()
-                .expect("the slab the row was just reserved in is still open");
-            self.close(partition, full);
+            self.close_open_slab(partition);
         }
         unsafe { self.layout.row_mut(row) }
+    }
+
+    /// Give `partition` a fresh slab to append into.
+    #[cold]
+    #[inline(never)]
+    fn open_slab_for(&mut self, partition: usize) {
+        let slab = self.allocate_slab_for(partition);
+        self.partitions[partition].open_slab = Some(slab);
+    }
+
+    /// Close the slab `partition` has just filled.
+    #[cold]
+    #[inline(never)]
+    fn close_open_slab(&mut self, partition: usize) {
+        let full = self.partitions[partition]
+            .open_slab
+            .take()
+            .expect("the slab the row was just reserved in is still open");
+        self.close(partition, full);
     }
 
     /// Take the allocator apart into every partition's contents, indexed by
