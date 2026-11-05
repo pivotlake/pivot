@@ -38,6 +38,10 @@ pub struct PoolFactory {
     registry: Arc<Mutex<Vec<Stealer<usize>>>>,
     /// One injector per worker across all nodes, indexed by global worker index.
     injectors: Arc<Vec<Injector<usize>>>,
+    /// How many indices each node's pools hold, indexed by node.
+    node_free_counts: Arc<[AtomicUsize]>,
+    /// The node of the worker this factory is for.
+    node: usize,
     /// Registration barrier for this worker's node.
     barrier: Arc<Barrier>,
     layout: RingLayout,
@@ -60,12 +64,17 @@ impl PoolFactory {
         let node_barriers: Vec<_> = (0..topology.node_count)
             .map(|_| Arc::new(Barrier::new(topology.workers_per_node)))
             .collect();
+        let node_free_counts: Arc<[AtomicUsize]> = (0..topology.node_count)
+            .map(|_| AtomicUsize::new(0))
+            .collect();
         (0..topology.total_workers())
             .map(|worker| {
                 let node = topology.node_of_worker(worker);
                 Self {
                     registry: node_registries[node].clone(),
                     injectors: injectors.clone(),
+                    node_free_counts: node_free_counts.clone(),
+                    node,
                     barrier: node_barriers[node].clone(),
                     layout,
                 }
@@ -86,6 +95,8 @@ impl PoolFactory {
             worker: local,
             stealers,
             injectors: self.injectors.clone(),
+            node_free_counts: self.node_free_counts.clone(),
+            node: self.node,
             last_stealer_idx: AtomicUsize::new(0),
             layout: self.layout,
         }
@@ -98,6 +109,17 @@ pub struct FreePool {
     worker: Worker<usize>,
     stealers: Vec<Stealer<usize>>,
     injectors: Arc<Vec<Injector<usize>>>,
+    /// How many indices each node's pools hold, indexed by node and shared by
+    /// every pool of the set. An index joins a node's count when it is pushed
+    /// and leaves it when it is popped; stealing moves an index between the
+    /// deques of one node, so the count stays. Kept as one number per node so
+    /// that asking how full the node's pools are reads one line instead of the
+    /// head of every sibling's deque and injector, lines those siblings write
+    /// on every push and pop.
+    node_free_counts: Arc<[AtomicUsize]>,
+    /// The node of the worker that owns this pool, whose count its pops come
+    /// off.
+    node: usize,
     last_stealer_idx: AtomicUsize,
     layout: RingLayout,
 }
@@ -115,6 +137,17 @@ impl FreePool {
     ///
     /// Returns `None` only when every consulted source is empty.
     pub fn pop(&self, steal: bool) -> Option<usize> {
+        let idx = self.pop_from_deques(steal);
+        if idx.is_some() {
+            self.node_free_counts[self.node].fetch_sub(1, Ordering::Relaxed);
+        }
+        idx
+    }
+
+    /// `pop` without the count. Every source consulted here belongs to this
+    /// worker's node: its own deque and injector, and its node siblings'
+    /// deques.
+    fn pop_from_deques(&self, steal: bool) -> Option<usize> {
         if let Some(idx) = self.worker.pop() {
             return Some(idx);
         }
@@ -156,17 +189,11 @@ impl FreePool {
 
     /// How many free indices this worker's node holds right now, across every
     /// same-node deque and the injectors of the node's workers. Peers keep
-    /// popping and pushing while this counts, so the answer describes the pool
-    /// at the instant it was read, which is all a memory-pressure check needs.
+    /// popping and pushing while this is read, so the answer describes the
+    /// pool at the instant it was read, which is all a memory-pressure check
+    /// needs.
     pub fn free_slots(&self) -> usize {
-        let queued: usize = self.stealers.iter().map(Stealer::len).sum();
-        let returning: usize = self
-            .layout
-            .topology()
-            .node_siblings(WORKER_IDX.get())
-            .map(|worker| self.injectors[worker].len())
-            .sum();
-        queued + returning
+        self.node_free_counts[self.node].load(Ordering::Relaxed)
     }
 
     /// Return a buffer index. If this worker is `idx`'s home worker, the index
@@ -174,9 +201,12 @@ impl FreePool {
     /// injector, where the home worker can pick it up on its next `pop`. The
     /// home worker is always on the slot's own node, so a buffer released on
     /// another node finds its way back without the releaser ever *acquiring*
-    /// remote memory.
+    /// remote memory, and the index is counted for the slot's node, not the
+    /// releaser's.
     pub(crate) fn push(&self, idx: usize) {
         let home_worker = self.layout.home_worker(idx);
+        let topology = self.layout.topology();
+        self.node_free_counts[topology.node_of_worker(home_worker)].fetch_add(1, Ordering::Relaxed);
         if WORKER_IDX.get() == home_worker {
             self.worker.push(idx)
         } else {
@@ -205,12 +235,15 @@ mod tests {
         let injectors: Arc<Vec<_>> = Arc::new((0..count).map(|_| Injector::new()).collect());
         let workers: Vec<Worker<usize>> = (0..count).map(|_| Worker::new_lifo()).collect();
         let stealers: Vec<_> = workers.iter().map(|w| w.stealer()).collect();
+        let node_free_counts: Arc<[AtomicUsize]> = std::iter::once(AtomicUsize::new(0)).collect();
         workers
             .into_iter()
             .map(|w| FreePool {
                 worker: w,
                 stealers: stealers.clone(),
                 injectors: injectors.clone(),
+                node_free_counts: node_free_counts.clone(),
+                node: 0,
                 last_stealer_idx: AtomicUsize::new(0),
                 layout: RingLayout::single_node(count, 128),
             })
@@ -394,5 +427,36 @@ mod tests {
 
         // Assert
         assert_eq!(popped, Some(7));
+    }
+
+    #[test]
+    fn free_slots_follows_pushes_and_pops() {
+        act_as_worker(0, 1);
+        let pool = build_pools(1).pop().unwrap();
+
+        pool.push(0);
+        pool.push(1);
+        let after_two_pushes = pool.free_slots();
+        pool.pop(true);
+        let after_a_pop = pool.free_slots();
+        pool.pop(true);
+        pool.pop(true);
+        let after_draining = pool.free_slots();
+
+        assert_eq!([after_two_pushes, after_a_pop, after_draining], [2, 1, 0]);
+    }
+
+    #[test]
+    fn a_slot_released_on_another_node_counts_for_its_own_node() {
+        let pools = build_two_node_pools();
+
+        // Slot 2 lives in node 1's region; released from node 0's worker.
+        act_as_worker(0, 2);
+        pools[0].push(2);
+        let on_releasing_node = pools[0].free_slots();
+        act_as_worker(1, 2);
+        let on_home_node = pools[1].free_slots();
+
+        assert_eq!([on_releasing_node, on_home_node], [0, 1]);
     }
 }
