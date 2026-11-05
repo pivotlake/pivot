@@ -21,9 +21,9 @@ mod global;
 mod global_distinct;
 pub(super) mod grouped;
 mod grouped_distinct;
-mod reinterpret;
+pub(super) mod reinterpret;
 
-use self::reinterpret::{reinterpret_columns, temporal_to_int};
+use self::reinterpret::{reinterpret_columns, reinterpret_output, temporal_to_int};
 use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
 use crate::types::Type;
@@ -33,7 +33,6 @@ use dispatch::{
     AggregationKind, AggregationSlot, GroupLimit, RecordBatchOperatorSpec, RowKeySchema,
 };
 use std::fmt;
-use std::sync::Arc;
 
 /// GROUP BY + aggregate functions.
 #[derive(Debug)]
@@ -187,18 +186,7 @@ impl Aggregate {
             .map(|g| g.result_type().ok().and_then(|t| key_output_type(&t)))
             .collect();
         targets.extend(self.expressions.iter().map(aggregate_value_temporal));
-        if !targets.iter().any(Option::is_some) {
-            return op;
-        }
-        let targets = Arc::new(targets);
-        op.project(move || {
-            let targets = targets.clone();
-            move |batch: RecordBatch| {
-                Ok(reinterpret_columns(batch, |i, _| {
-                    targets.get(i).and_then(Option::clone)
-                })?)
-            }
-        })
+        reinterpret_output(op, targets)
     }
 
     fn is_lone_count_star(&self) -> bool {
@@ -302,7 +290,7 @@ pub(super) fn temporal_output_type(t: &Type) -> Option<DataType> {
 /// restored to its `Date32`/`Timestamp`; a decimal key to its declared
 /// `Decimal64(p, s)`/`Decimal128(p, s)`, because the single-key extractor emits
 /// it at the extractor's default decimal shape with correct raw values.
-fn key_output_type(t: &Type) -> Option<DataType> {
+pub(super) fn key_output_type(t: &Type) -> Option<DataType> {
     match t {
         Type::Decimal { .. } => Some(crate::types::physical_arrow_type(t)),
         _ => temporal_output_type(t),
