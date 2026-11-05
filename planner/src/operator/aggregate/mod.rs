@@ -187,18 +187,7 @@ impl Aggregate {
             .map(|g| g.result_type().ok().and_then(|t| key_output_type(&t)))
             .collect();
         targets.extend(self.expressions.iter().map(aggregate_value_temporal));
-        if !targets.iter().any(Option::is_some) {
-            return op;
-        }
-        let targets = Arc::new(targets);
-        op.project(move || {
-            let targets = targets.clone();
-            move |batch: RecordBatch| {
-                Ok(reinterpret_columns(batch, |i, _| {
-                    targets.get(i).and_then(Option::clone)
-                })?)
-            }
-        })
+        reinterpret_output(op, targets)
     }
 
     fn is_lone_count_star(&self) -> bool {
@@ -295,6 +284,37 @@ fn extreme_kind(ty: &Type, kind: AggregationKind) -> Option<AggregationKind> {
 pub(super) fn temporal_output_type(t: &Type) -> Option<DataType> {
     let arrow = crate::types::physical_arrow_type(t);
     temporal_to_int(&arrow).is_some().then_some(arrow)
+}
+
+/// Restore the declared arrow type of the key columns a keys-only dedup emits,
+/// one per entry of `key_types`, in key order. The same restore
+/// [`Aggregate::restore_declared_output`] applies to its group keys.
+pub(in crate::operator) fn restore_key_columns(
+    op: RecordBatchOperatorSpec,
+    key_types: &[Type],
+) -> RecordBatchOperatorSpec {
+    reinterpret_output(op, key_types.iter().map(key_output_type).collect())
+}
+
+/// Reinterpret each output column `i` of `op` to `targets[i]`, leaving columns
+/// with a `None` target untouched. No projection is added when every target is
+/// `None`.
+fn reinterpret_output(
+    op: RecordBatchOperatorSpec,
+    targets: Vec<Option<DataType>>,
+) -> RecordBatchOperatorSpec {
+    if !targets.iter().any(Option::is_some) {
+        return op;
+    }
+    let targets = Arc::new(targets);
+    op.project(move || {
+        let targets = targets.clone();
+        move |batch: RecordBatch| {
+            Ok(reinterpret_columns(batch, |i, _| {
+                targets.get(i).and_then(Option::clone)
+            })?)
+        }
+    })
 }
 
 /// The arrow type a group-key column must be restored to on output, or `None`
