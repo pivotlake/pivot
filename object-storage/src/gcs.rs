@@ -18,6 +18,11 @@
 //! current token. RS256 signing uses `ring`; everything is synchronous, no async
 //! runtime.
 //!
+//! A store opened with a token handed to it ([`GcsStore::with_token`]) mints
+//! none: it authenticates with that token until its owner hands it another
+//! ([`ObjectStore::renew_credentials`]), which a file opened before the
+//! renewal is then read on with.
+//!
 //! Reads and writes address the same object through different APIs, because the
 //! ring speaks one method per direction. A read is a `GET` of the JSON API's
 //! `?alt=media` URL; an upload is a `PUT`, which the JSON API's upload endpoint
@@ -27,10 +32,11 @@
 
 use super::{
     DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
-    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, encode_child_key,
-    object_key, parse_iso8601_millis, percent_encode,
+    ObjectVersion, Result, StoreConnection, StoreCredentials, StoreError, absolute_object_key,
+    encode_child_key, object_key, parse_iso8601_millis, percent_encode,
 };
 use base64::Engine;
+use dispatch::io::RequestAuth;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -79,14 +85,48 @@ struct GcsAuth {
     /// Whether the endpoint is an emulator: it ignores credentials, so we never
     /// mint a token and reads need no `Authorization` header.
     emulated: bool,
+    /// Whether the token was handed to the store rather than minted by it.
+    /// Such a store holds a token from the moment it is opened and never
+    /// mints one.
+    token_is_handed: bool,
 }
 
 #[derive(Debug, Clone)]
 struct CachedToken {
     /// The full header value (`Bearer <token>`), ready to send as-is.
     header: Arc<str>,
-    /// Unix seconds after which the token must be re-minted.
-    expires_at: u64,
+    /// Unix seconds after which the token is no longer valid. `None` for a
+    /// handed token that came without an expiry.
+    expires_at: Option<u64>,
+}
+
+impl CachedToken {
+    fn of_handed_token(token: &GcsToken) -> Self {
+        Self {
+            header: Arc::from(format!("Bearer {}", token.token)),
+            expires_at: token
+                .expires_at_unix_ms
+                .map(|expires_at_unix_ms| expires_at_unix_ms / 1000),
+        }
+    }
+}
+
+/// An OAuth2 access token handed to a store, as a catalog vends one for a
+/// table.
+#[derive(Clone)]
+pub struct GcsToken {
+    pub token: String,
+    /// When the token stops being valid, in Unix milliseconds, when whoever
+    /// handed it over said.
+    pub expires_at_unix_ms: Option<u64>,
+}
+
+/// Redacted: the token must not leak into a log through a `{:?}` of whatever
+/// holds it.
+impl std::fmt::Debug for GcsToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GcsToken(redacted)")
+    }
 }
 
 impl GcsStore {
@@ -97,7 +137,14 @@ impl GcsStore {
     /// to target a `fake-gcs-server` emulator instead of the real service: the
     /// scheme is optional and defaults to `http`.
     pub fn with_default_credentials(uri: &str) -> Result<Self> {
-        Self::build(uri, None)
+        Self::build(uri, None, None)
+    }
+
+    /// Open `gs://bucket/prefix` authenticating with `token` and nothing else:
+    /// the store mints no token of its own, and sends this one until it is
+    /// handed another through [`ObjectStore::renew_credentials`].
+    pub fn with_token(uri: &str, token: GcsToken) -> Result<Self> {
+        Self::build(uri, None, Some(token))
     }
 
     /// Parse `gs://bucket/prefix` but mint tokens from the service-account (or
@@ -105,10 +152,14 @@ impl GcsStore {
     /// environment, the path a metastore uses to open a datastore with its own
     /// configured credentials.
     pub fn with_credentials_file(uri: &str, credentials_file: &str) -> Result<Self> {
-        Self::build(uri, Some(credentials_file.to_string()))
+        Self::build(uri, Some(credentials_file.to_string()), None)
     }
 
-    fn build(uri: &str, credentials_file: Option<String>) -> Result<Self> {
+    fn build(
+        uri: &str,
+        credentials_file: Option<String>,
+        handed_token: Option<GcsToken>,
+    ) -> Result<Self> {
         let rest = uri
             .strip_prefix("gs://")
             .ok_or_else(|| StoreError::UnsupportedUri(uri.to_string()))?;
@@ -132,7 +183,8 @@ impl GcsStore {
             endpoint,
             auth: Arc::new(GcsAuth {
                 agent: ureq::AgentBuilder::new().build(),
-                token: RwLock::new(None),
+                token_is_handed: handed_token.is_some(),
+                token: RwLock::new(handed_token.as_ref().map(CachedToken::of_handed_token)),
                 credentials_file,
                 emulated,
             }),
@@ -172,16 +224,33 @@ impl GcsAuth {
     /// A current `Authorization` header, minting and caching a fresh token when
     /// the cached one is missing or near expiry. Blocking (`ureq`); call only on
     /// the control thread — workers use [`current`](Self::current) instead.
+    ///
+    /// A handed token is returned as it is and never replaced here. One past
+    /// its expiry is an error naming the cause, rather than a request the
+    /// service would refuse.
     fn header(&self) -> Result<Arc<str>> {
         // An emulator ignores `Authorization`; never mint (no credentials exist).
         if self.emulated {
             return Ok(Arc::from("Bearer emulator"));
         }
         let now = unix_now();
-        if let Some(token) = self.token.read().unwrap().as_ref()
-            && token.expires_at > now + TOKEN_REFRESH_MARGIN
+        let cached = self.token.read().unwrap().clone();
+        if self.token_is_handed {
+            let token = cached.expect("a store handed its token holds one from when it is opened");
+            if token.expires_at.is_some_and(|expires_at| expires_at <= now) {
+                return Err(StoreError::Config(
+                    "the GCS token this store was handed has expired and was not renewed"
+                        .to_string(),
+                ));
+            }
+            return Ok(token.header);
+        }
+        if let Some(token) = cached
+            && token
+                .expires_at
+                .is_some_and(|expires_at| expires_at > now + TOKEN_REFRESH_MARGIN)
         {
-            return Ok(token.header.clone());
+            return Ok(token.header);
         }
         // Mint without holding the lock — a concurrent mint is harmless (last
         // writer wins) and this way a worker's `current` read never waits on the
@@ -190,7 +259,7 @@ impl GcsAuth {
         let header: Arc<str> = Arc::from(format!("Bearer {value}"));
         *self.token.write().unwrap() = Some(CachedToken {
             header: header.clone(),
-            expires_at: now + expires_in,
+            expires_at: Some(now + expires_in),
         });
         Ok(header)
     }
@@ -493,6 +562,19 @@ impl ObjectStore for GcsStore {
         self.auth.header()?;
         Ok(())
     }
+
+    /// Takes a GCS token when this store was opened with one handed to it. A
+    /// store that mints its own keeps doing so and takes none.
+    fn renew_credentials(&self, credentials: &StoreCredentials) -> bool {
+        let StoreCredentials::Gcs(token) = credentials else {
+            return false;
+        };
+        if !self.auth.token_is_handed {
+            return false;
+        }
+        *self.auth.token.write().unwrap() = Some(CachedToken::of_handed_token(token));
+        true
+    }
 }
 
 impl GcsStore {
@@ -605,11 +687,29 @@ impl GcsStore {
             return Ok(DataFileLocation::Remote { url, auth: None });
         }
         self.auth.header()?;
-        let auth = self.auth.clone();
         Ok(DataFileLocation::Remote {
             url,
-            auth: Some(Arc::new(move || auth.current())),
+            auth: Some(Arc::new(BearerToken(Arc::clone(&self.auth)))),
         })
+    }
+}
+
+/// The token the store last minted, as each request's `Authorization` header.
+/// Never mints: the store primes the cell before it hands a location out, and
+/// a request before any mint is an error rather than an unauthenticated one.
+struct BearerToken(Arc<GcsAuth>);
+
+impl RequestAuth for BearerToken {
+    fn authenticate(
+        &self,
+        _method: &str,
+        _request_target: &str,
+    ) -> std::io::Result<Vec<(String, String)>> {
+        let header = self
+            .0
+            .current()
+            .ok_or_else(|| std::io::Error::other("no GCS token has been minted for this store"))?;
+        Ok(vec![("Authorization".to_string(), header.to_string())])
     }
 }
 
@@ -732,6 +832,53 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn handed_token(token: &str, expires_at_unix_ms: Option<u64>) -> GcsToken {
+        GcsToken {
+            token: token.to_string(),
+            expires_at_unix_ms,
+        }
+    }
+
+    #[test]
+    fn a_renewed_token_authenticates_the_next_request_of_a_file_opened_before() {
+        let store = GcsStore::with_token("gs://lake/root", handed_token("first", None)).unwrap();
+        let DataFileLocation::Remote {
+            auth: Some(auth), ..
+        } = store.source(&ObjectPath::new("part.parquet")).unwrap()
+        else {
+            panic!("a store with a token authenticates its requests");
+        };
+
+        let renewed = store.renew_credentials(&StoreCredentials::Gcs(handed_token("second", None)));
+
+        let headers = auth.authenticate("GET", "/part.parquet").unwrap();
+        assert!(renewed);
+        assert_eq!(
+            headers,
+            vec![("Authorization".to_string(), "Bearer second".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_store_that_mints_its_own_token_takes_none() {
+        let store = GcsStore::with_default_credentials("gs://lake/root").unwrap();
+
+        let renewed = store.renew_credentials(&StoreCredentials::Gcs(handed_token("second", None)));
+
+        assert!(!renewed);
+    }
+
+    #[test]
+    fn a_handed_token_past_its_expiry_is_refused() {
+        let store = GcsStore::with_token("gs://lake/root", handed_token("first", Some(1))).unwrap();
+
+        let Err(error) = store.source(&ObjectPath::new("part.parquet")) else {
+            panic!("an expired token must be refused");
+        };
+
+        assert!(error.to_string().contains("expired"), "{error}");
+    }
+
     #[test]
     fn list_response_parses_names_string_sizes_and_timestamps() {
         // GCS reports object size as a decimal string; the reader parses it to
@@ -770,6 +917,7 @@ mod tests {
             agent: ureq::AgentBuilder::new().build(),
             token: RwLock::new(token),
             credentials_file: None,
+            token_is_handed: false,
             emulated,
         }
     }
@@ -788,7 +936,7 @@ mod tests {
     fn current_reads_cached_header_without_minting() {
         let cached = CachedToken {
             header: Arc::from("Bearer abc"),
-            expires_at: u64::MAX,
+            expires_at: Some(u64::MAX),
         };
         let auth = auth(false, Some(cached));
 

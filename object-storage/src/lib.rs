@@ -16,7 +16,7 @@
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
-use dispatch::io::{AuthHeader, OpenFile, RemoteFile, open_direct_read};
+use dispatch::io::{OpenFile, RemoteFile, RequestAuth, open_direct_read};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,7 +32,7 @@ mod object_path;
 mod s3;
 #[cfg(feature = "test-support")]
 pub mod test_support;
-pub use gcs::GcsStore;
+pub use gcs::{GcsStore, GcsToken};
 pub use instance_bandwidth::{
     INSTANCE_METADATA_ENDPOINT, InstanceBandwidth, InstanceBandwidthError,
     find_instance_type_bandwidth, look_up_instance_bandwidth,
@@ -132,20 +132,21 @@ pub struct DataFile {
 
 /// Where a data file's bytes live, for reading or writing: a local filesystem
 /// path (via the io_uring file path) or a remote URL (HTTP on the same ring). A
-/// remote URL either carries its own auth (an S3 presigned URL), needs no auth
-/// (anonymous S3), or pairs a stable URL with an [`AuthHeader`] that mints a
-/// fresh bearer token per request. Which variant a store yields is its business,
-/// not the caller's.
+/// remote URL is stable; it either needs no auth (anonymous S3, a public URL)
+/// or pairs with a [`RequestAuth`] that mints the headers authenticating each
+/// request (a GCS bearer token, an S3 signature) from state the store keeps
+/// current. Which a store yields is its business, not the caller's.
 ///
-/// The same key maps to a different URL per direction — [`source`](ObjectStore::source)
-/// builds the read URL, [`sink`](ObjectStore::sink) the write URL (e.g. S3 presigns
-/// a GET vs a PUT) — so both return this one type. Uploads are always a `PUT`.
+/// The same key may map to a different URL per direction — [`source`](ObjectStore::source)
+/// builds the read URL, [`sink`](ObjectStore::sink) the write URL (GCS reads
+/// over its JSON API and writes over its XML one) — so both return this one
+/// type. Uploads are always a `PUT`.
 #[derive(Clone)]
 pub enum DataFileLocation {
     Local(PathBuf),
     Remote {
         url: url::Url,
-        auth: Option<AuthHeader>,
+        auth: Option<Arc<dyn RequestAuth>>,
     },
 }
 
@@ -294,8 +295,8 @@ pub trait ObjectStore: Debug + Send + Sync {
     ) -> Result<DirectoryListing>;
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
-    /// a filesystem path, a remote one a GET URL — either presigned or paired
-    /// with a per-request bearer token. (Identity — the [`FileRef`] — is the
+    /// a filesystem path, a remote one a GET URL, paired with what authenticates
+    /// each request when the store signs. (Identity — the [`FileRef`] — is the
     /// caller's; this is only how to read the bytes.)
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation>;
 
@@ -344,6 +345,25 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// needs a separate client implementation can build it from the same root
     /// and credentials without adding that client's dependencies here.
     fn connection(&self) -> StoreConnection;
+
+    /// Authenticate with `credentials` from now on, when they are of the kind
+    /// this store was opened with and for the place it was opened for. Every
+    /// request sent after that carries them, from a file opened before as
+    /// much as one opened after, so a session's credentials nearing their
+    /// expiry are renewed under the queries reading and writing through the
+    /// store. Returns whether the store took them; one that did not is left
+    /// as it was. The default takes none.
+    fn renew_credentials(&self, _credentials: &StoreCredentials) -> bool {
+        false
+    }
+}
+
+/// Credentials handed to a store from outside, such as the ones a catalog
+/// vends for a table: what a store is opened with, and what
+/// [`ObjectStore::renew_credentials`] replaces them with.
+pub enum StoreCredentials {
+    S3(S3Credentials),
+    Gcs(GcsToken),
 }
 
 /// Resolved backend settings, shared with adapters that need to address the

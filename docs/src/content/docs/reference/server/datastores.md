@@ -127,9 +127,10 @@ datastores:
 | `default` | `false` | Whether this is the [default datastore](#default-datastore). |
 
 Each catalog namespace appears as a schema. Table files are read from the
-locations the catalog reports, using the credentials the catalog vends, or the
-[storage secret](#storage-credentials) whose scope covers the file when it
-vends none.
+locations the catalog reports, using the credentials the catalog vends (S3
+keys, or a GCS access token), or the [storage secret](#storage-credentials)
+whose scope covers the file when it vends none. Vended credentials are renewed
+at every [refresh](#refresh).
 
 `INSERT` and `COPY` append to a catalog table: the rows are written as Parquet
 files under the table's data path, partitioned as the table's partition spec
@@ -280,7 +281,9 @@ the catalog.
 Every refresh interval, each datastore reloads the tables it holds and the
 files each table has committed. Commits made by this server are visible
 immediately. Commits made by another process to a shared datastore, or tables
-added to an Iceberg catalog, become visible at the next refresh.
+added to an Iceberg catalog, become visible at the next refresh. A refresh of
+an Iceberg catalog also renews the storage credentials the catalog vends, so
+the interval must stay shorter than their lifetime.
 
 ### Compaction
 

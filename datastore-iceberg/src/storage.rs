@@ -23,7 +23,7 @@ use object_storage::{ExternalStoreFactory, ObjectPath, ObjectStore};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::table_store::{open_store_at_root, read_vended_s3_credentials};
+use crate::table_store::{open_store_at_root, read_vended_credentials};
 
 /// Builds the file IO of every table the catalog client loads: a storage that
 /// opens the table's root through the process's store factory, or with the
@@ -88,7 +88,7 @@ impl CatalogTableLocator {
         let opened = match self.store.get() {
             Some(opened) => opened,
             None => {
-                let vended = read_vended_s3_credentials(location, &self.properties)?;
+                let vended = read_vended_credentials(&root, &self.properties)?;
                 let object_store = open_store_at_root(&root, self.store_factory.as_ref(), vended)?;
                 // Two first locations racing here open two stores; the one
                 // set serves both, and the other is checked below as any
