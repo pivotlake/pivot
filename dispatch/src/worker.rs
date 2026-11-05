@@ -71,6 +71,7 @@ fn in_flight_spin_limit() -> u32 {
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use std::{result, thread};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
@@ -164,7 +165,17 @@ pub struct Worker {
     /// Last delegated-broadcast epoch this worker has fanned out (see
     /// [`WorkerWaker::finish_delegated_wake`]).
     last_seen_broadcast: u64,
+    /// When this worker last asked how many slots its operators should spill.
+    /// See [`maybe_spill`](Self::maybe_spill).
+    last_spill_check: Instant,
 }
+
+/// How long a worker waits between two looks at its node's spill pressure.
+/// The look reads every sibling's free-pool counters, lines they write on
+/// each buffer they take or return, so once per loop iteration is a steady
+/// cross-core drain; pressure builds by whole buffers and a millisecond's
+/// delay in answering it still runs well ahead of exhaustion.
+const SPILL_CHECK_INTERVAL: Duration = Duration::from_millis(1);
 
 impl Worker {
     /// Spawn a worker thread pinned to `core`. Blocks on `ready_barrier` before
@@ -231,6 +242,7 @@ impl Worker {
                     last_seen_ring_wake_count,
                     node_local_idx,
                     last_seen_broadcast,
+                    last_spill_check: Instant::now(),
                 };
                 // Notifiers must be able to interrupt this worker's blocking
                 // IO wait, not just its thread park; register the ring's wake
@@ -287,8 +299,13 @@ impl Worker {
     /// dataflows' operators to spill this worker's share of the shortfall. The
     /// memory comes back later, once the writes land, so this runs ahead of
     /// exhaustion rather than at it. Runs before CPU work so the slots that
-    /// work will allocate are already on their way back.
+    /// work will allocate are already on their way back, and at most once per
+    /// [`SPILL_CHECK_INTERVAL`].
     fn maybe_spill(&mut self) {
+        if self.last_spill_check.elapsed() < SPILL_CHECK_INTERVAL {
+            return;
+        }
+        self.last_spill_check = Instant::now();
         let mut wanted = memory_ctx().slots_to_spill();
         if wanted == 0 {
             return;
