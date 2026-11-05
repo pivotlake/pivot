@@ -550,6 +550,12 @@ impl MemoryContext {
             removed.is_some(),
             "dataflow {dataflow_id} never registered evictors"
         );
+        // A dataflow that failed takes its queued IO with it, so a spill write
+        // of its that was never submitted never lands. Left here, it would
+        // keep eviction waiting for a write that is not coming.
+        self.spill_writes_in_flight
+            .borrow_mut()
+            .retain(|(dataflow, _), _| *dataflow != dataflow_id);
     }
 
     /// Share the worker's IO requester with this context, once, so that
@@ -594,10 +600,14 @@ impl MemoryContext {
             let Ok(Completion::FsWrite(write)) = completion else {
                 unreachable!("extracted only spill writes");
             };
-            let writes_in_flight = spill_writes_in_flight
-                .remove(&(write.data_flow_id, write.request.id))
-                .expect("a spill write that completed was recorded when issued");
-            writes_in_flight.fetch_sub(1, Ordering::Release);
+            // A write of a dataflow that has since failed is no longer
+            // recorded (see `unregister_dataflow_evictors`); its buffer went
+            // with the dataflow, so there is nothing left to count it off.
+            if let Some(writes_in_flight) =
+                spill_writes_in_flight.remove(&(write.data_flow_id, write.request.id))
+            {
+                writes_in_flight.fetch_sub(1, Ordering::Release);
+            }
         }
     }
 
