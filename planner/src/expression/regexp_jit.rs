@@ -85,6 +85,11 @@ fn build_jit_regex(pattern: &str) -> Result<Pcre2Regex, pcre2::Error> {
 /// spans are read into `locations` (reused across calls), and group bytes are
 /// sliced straight out of `s`. Returns `None` when nothing matched, so the
 /// caller passes `s` through unchanged.
+///
+/// Called once per distinct row from inside the column loop's closure, so it
+/// is inlined there rather than left to the optimizer's budget, which has gone
+/// either way between builds.
+#[inline(always)]
 fn replace_first(
     regex: &Pcre2Regex,
     locations: &mut CaptureLocations,
