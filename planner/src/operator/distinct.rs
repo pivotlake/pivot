@@ -33,8 +33,8 @@ impl Distinct {
         input: RecordBatchOperatorSpec,
         input_nullability: Vec<bool>,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // The dedup groups a date as its day count; restore the declared key
-        // types on its output.
+        // The dedup groups a date as its day count and a boolean as 0/1;
+        // restore the declared key types on its output.
         let deduped = build_dedup_operator(input, &self.keys, &input_nullability)?;
         let key_types: Vec<Type> = self.keys.iter().map(|(_, ty)| ty.clone()).collect();
         Ok(restore_key_columns(deduped, &key_types))
@@ -45,10 +45,40 @@ impl Distinct {
 mod tests {
     use crate::test_support::*;
     use crate::types::Type;
-    use arrow_array::{ArrayRef, Date32Array};
+    use arrow_array::{ArrayRef, BooleanArray, Date32Array};
     use arrow_schema::DataType;
     use rstest::rstest;
     use std::sync::Arc;
+
+    #[rstest]
+    fn distinct_boolean_keys_stay_boolean(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "flags",
+            &[(
+                "f",
+                Type::Boolean,
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    None,
+                ])) as ArrayRef,
+            )],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT DISTINCT f FROM flags ORDER BY f",
+        );
+
+        assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Boolean);
+        let mut values: Vec<Option<bool>> = batches_to_json(&batches)
+            .iter()
+            .map(|r| r["f"].as_bool())
+            .collect();
+        values.sort();
+        assert_eq!(values, vec![None, Some(false), Some(true)]);
+    }
 
     #[rstest]
     fn distinct_date_keys_stay_dates(mut testing_planner: TestingPlanner) {

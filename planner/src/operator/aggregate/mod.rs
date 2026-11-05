@@ -319,12 +319,13 @@ fn reinterpret_output(
 
 /// The arrow type a group-key column must be restored to on output, or `None`
 /// when the group operator already emits the declared type. A temporal key is
-/// restored to its `Date32`/`Timestamp`; a decimal key to its declared
+/// restored to its `Date32`/`Timestamp`; a boolean key, which the row encoder
+/// groups as `Int8`, to `Boolean`; a decimal key to its declared
 /// `Decimal64(p, s)`/`Decimal128(p, s)`, because the single-key extractor emits
 /// it at the extractor's default decimal shape with correct raw values.
 fn key_output_type(t: &Type) -> Option<DataType> {
     match t {
-        Type::Decimal { .. } => Some(crate::types::physical_arrow_type(t)),
+        Type::Decimal { .. } | Type::Boolean => Some(crate::types::physical_arrow_type(t)),
         _ => temporal_output_type(t),
     }
 }
@@ -374,11 +375,16 @@ pub(super) fn row_key_schema<'a>(
 /// day/second count is lossless (the temporal type is restored on the output). A
 /// decimal key keeps its exact `Decimal64(p, s)`/`Decimal128(p, s)` shape, so the
 /// row reader never casts it (a decimal-to-decimal arrow cast would rescale the
-/// values). `Boolean`/`Float64` can't pack, so they return `None` for a clean
-/// "unsupported" rather than a panic in `RowKeySchema::new`.
+/// values). A `Boolean` key groups as `Int8` (0/1), which the row reader casts
+/// it to and [`key_output_type`] casts back. `Float64` can't pack, so it
+/// returns `None` for a clean "unsupported" rather than a panic in
+/// `RowKeySchema::new`.
 fn row_key_arrow_type(t: &Type) -> Option<DataType> {
     let dt = crate::types::physical_arrow_type(t);
-    let dt = temporal_to_int(&dt).unwrap_or(dt);
+    let dt = match dt {
+        DataType::Boolean => DataType::Int8,
+        _ => temporal_to_int(&dt).unwrap_or(dt),
+    };
     (dt.is_integer()
         || matches!(dt, DataType::Decimal64(_, _) | DataType::Decimal128(_, _))
         || dt == DataType::Utf8View)
@@ -387,8 +393,8 @@ fn row_key_arrow_type(t: &Type) -> Option<DataType> {
 
 /// Whether any key extractor can group on this type. The dedicated single/pair/
 /// int-string extractors handle exactly the integer widths, the decimals, and
-/// `Utf8`; every other groupable type (`Date`/`Timestamp`) rides the row
-/// encoder. A type this rejects (`Float`/`Boolean`) has no grouping path at all,
+/// `Utf8`; every other groupable type (`Date`/`Timestamp`/`Boolean`) rides the
+/// row encoder. A type this rejects (`Float`) has no grouping path at all,
 /// so the caller can reject it up front and name the offending column.
 pub(super) fn is_groupable_key_type(t: &Type) -> bool {
     row_key_arrow_type(t).is_some()
