@@ -110,6 +110,22 @@ impl Default for PartitionEvictor {
     }
 }
 
+impl Drop for PartitionEvictor {
+    /// An evictor dropped while still holding spilled buffers, as a failed
+    /// dataflow's is, frees them with it; they stop counting as spilled, or
+    /// the memory context would go on seeing slots to reclaim that are gone.
+    fn drop(&mut self) {
+        let mut held = 0;
+        let _: ControlFlow<()> = self.tree.walk_spill_order(|_, spilled_buffers| {
+            held += spilled_buffers.len();
+            ControlFlow::Continue(())
+        });
+        if held > 0 {
+            memory_ctx().record_spilled_buffers_released(held);
+        }
+    }
+}
+
 impl Evict for SharedPartitionEvictor {
     fn evict(&self) -> Option<WriteBuffer> {
         self.borrow_mut().evict()
