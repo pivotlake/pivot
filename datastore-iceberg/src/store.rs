@@ -8,6 +8,12 @@
 //! another root is refused: the managed catalogs keep a table in one bucket,
 //! and a table deliberately split across buckets is not served rather than
 //! read through the wrong store.
+//!
+//! Vended credentials are a session's: short-lived. A later load of the table
+//! that vends keys for the same root, region and endpoint renews the keys of
+//! the store already open ([`TableStore::renew_credentials`]) rather than
+//! opening another, so a query holding the store signs its next request with
+//! the new keys.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +39,19 @@ pub(crate) struct TableStore {
     /// [`split_location`] names it.
     root: String,
     store: Arc<dyn ObjectStore>,
+    /// This store as the S3 store the catalog's vended keys opened, when they
+    /// did: what a later load's keys renew.
+    vended: Option<VendedStore>,
+}
+
+/// The S3 store a table's vended keys opened, with what they were vended for:
+/// the keys of a later load that match on both renew this store rather than
+/// open another.
+#[derive(Clone)]
+struct VendedStore {
+    store: Arc<S3Store>,
+    region: Option<String>,
+    endpoint: Option<String>,
 }
 
 impl TableStore {
@@ -46,17 +65,55 @@ impl TableStore {
         vended: Option<S3Credentials>,
     ) -> Result<Self> {
         let (root, _) = split_location(metadata_location)?;
-        let store: Arc<dyn ObjectStore> = match vended {
+        let (store, vended): (Arc<dyn ObjectStore>, _) = match vended {
             Some(credentials) if StoreScheme::of(&root)? == StoreScheme::S3 => {
-                Arc::new(S3Store::with_credentials(&root, credentials)?)
+                let region = credentials.region.clone();
+                let endpoint = credentials.endpoint.clone();
+                let store = Arc::new(S3Store::with_credentials(&root, credentials)?);
+                (
+                    Arc::clone(&store) as Arc<dyn ObjectStore>,
+                    Some(VendedStore {
+                        store,
+                        region,
+                        endpoint,
+                    }),
+                )
             }
-            _ => factory.open(&root)?,
+            _ => (factory.open(&root)?, None),
         };
         Ok(Self {
             table: table.to_string(),
             root,
             store,
+            vended,
         })
+    }
+
+    /// Whether `vended` keys are for the root of `metadata_location` and the
+    /// region and endpoint this store was opened for. When they are, this
+    /// store signs with them from now on: the keys are renewed in place, so a
+    /// query holding the store signs its next request with them. When they
+    /// are not (the table's metadata moved to another root, the keys are for
+    /// another region or endpoint, or the catalog vended none where it vended
+    /// keys before), nothing changes and the table needs a store opened
+    /// afresh.
+    pub(crate) fn renew_credentials(
+        &self,
+        metadata_location: &str,
+        vended: Option<&S3Credentials>,
+    ) -> Result<bool> {
+        let (root, _) = split_location(metadata_location)?;
+        let (Some(held), Some(credentials)) = (&self.vended, vended) else {
+            return Ok(false);
+        };
+        if self.root != root
+            || held.region != credentials.region
+            || held.endpoint != credentials.endpoint
+        {
+            return Ok(false);
+        }
+        held.store.renew_keys(credentials.keys.clone())?;
+        Ok(true)
     }
 
     /// The file at `location`, of `size` bytes, located for reading. Its
@@ -171,7 +228,7 @@ fn split_location(location: &str) -> Result<(String, ObjectPath)> {
 
 #[cfg(test)]
 mod tests {
-    use object_storage::{DataFileLocation, LocalStore};
+    use object_storage::{DataFileLocation, LocalStore, StoreConnection, StoreError};
 
     use super::*;
 
@@ -182,7 +239,88 @@ mod tests {
             table: "db.t".to_string(),
             root: "s3://lake".to_string(),
             store: Arc::new(LocalStore::new(std::env::temp_dir()).unwrap()),
+            vended: None,
         }
+    }
+
+    /// A factory that opens nothing, for a table whose every store the catalog
+    /// vends keys for.
+    #[derive(Debug)]
+    struct NoStoreFactory;
+
+    impl ExternalStoreFactory for NoStoreFactory {
+        fn open(&self, root_uri: &str) -> object_storage::Result<Arc<dyn ObjectStore>> {
+            Err(StoreError::Config(format!(
+                "nothing vended for `{root_uri}`"
+            )))
+        }
+    }
+
+    /// Keys vended for the `lake` bucket at a fixed endpoint and region, so
+    /// opening the store asks nothing of the network.
+    fn vended_keys(access_key: &str, endpoint: &str) -> S3Credentials {
+        S3Credentials {
+            region: Some("eu-west-1".to_string()),
+            keys: S3Keys {
+                access_key: access_key.to_string(),
+                secret_key: "secret".to_string(),
+                session_token: Some(format!("{access_key}-token")),
+            },
+            endpoint: Some(endpoint.to_string()),
+        }
+    }
+
+    fn access_key_of(store: &TableStore) -> String {
+        match store.store.connection() {
+            StoreConnection::S3 {
+                credentials: Some(credentials),
+                ..
+            } => credentials.keys.access_key,
+            _ => panic!("not a signing S3 store"),
+        }
+    }
+
+    #[test]
+    fn a_later_loads_keys_renew_the_store_a_query_holds() {
+        let first = TableStore::open(
+            "db.t",
+            "s3://lake/db/t/metadata/v1.metadata.json",
+            &NoStoreFactory,
+            Some(vended_keys("first", "http://objects.example")),
+        )
+        .unwrap();
+        let held = first.clone();
+
+        let renewed = first
+            .renew_credentials(
+                "s3://lake/db/t/metadata/v2.metadata.json",
+                Some(&vended_keys("second", "http://objects.example")),
+            )
+            .unwrap();
+
+        assert!(renewed);
+        assert_eq!(access_key_of(&held), "second");
+    }
+
+    #[test]
+    fn keys_vended_for_another_endpoint_do_not_renew_the_store() {
+        let first = TableStore::open(
+            "db.t",
+            "s3://lake/db/t/metadata/v1.metadata.json",
+            &NoStoreFactory,
+            Some(vended_keys("first", "http://objects.example")),
+        )
+        .unwrap();
+
+        let renewed = first
+            .renew_credentials(
+                "s3://lake/db/t/metadata/v2.metadata.json",
+                Some(&vended_keys("second", "http://elsewhere.example")),
+            )
+            .unwrap();
+
+        assert!(!renewed);
+        assert_eq!(access_key_of(&first), "first");
     }
 
     #[test]
