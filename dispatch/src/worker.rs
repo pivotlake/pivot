@@ -168,6 +168,8 @@ pub struct Worker {
     /// When this worker last asked how many slots its operators should spill.
     /// See [`maybe_spill`](Self::maybe_spill).
     last_spill_check: Instant,
+    /// Loop passes since the clock was last read for `last_spill_check`.
+    passes_since_spill_clock_read: u32,
 }
 
 /// How long a worker waits between two looks at its node's spill pressure.
@@ -176,6 +178,17 @@ pub struct Worker {
 /// cross-core drain; pressure builds by whole buffers and a millisecond's
 /// delay in answering it still runs well ahead of exhaustion.
 const SPILL_CHECK_INTERVAL: Duration = Duration::from_millis(1);
+
+/// How many loop passes a worker lets go by between two reads of the clock
+/// that times [`SPILL_CHECK_INTERVAL`]. Reading the clock is itself a cost
+/// per pass: it runs through the vDSO and touches the kernel's clock data
+/// page, a page nothing else in the loop uses, so on a scan every pass took
+/// a data TLB refill and the clock code's instruction fetches for it. A loop
+/// pass that does no work is a microsecond or less, so even with this stride
+/// the clock is read many times a millisecond while the worker spins, and a
+/// pass that does work allocates at most a batch's worth of buffers, so the
+/// pressure that can build between two reads stays bounded.
+const SPILL_CLOCK_READ_STRIDE: u32 = 32;
 
 impl Worker {
     /// Spawn a worker thread pinned to `core`. Blocks on `ready_barrier` before
@@ -243,6 +256,7 @@ impl Worker {
                     node_local_idx,
                     last_seen_broadcast,
                     last_spill_check: Instant::now(),
+                    passes_since_spill_clock_read: 0,
                 };
                 // Notifiers must be able to interrupt this worker's blocking
                 // IO wait, not just its thread park; register the ring's wake
@@ -300,8 +314,14 @@ impl Worker {
     /// memory comes back later, once the writes land, so this runs ahead of
     /// exhaustion rather than at it. Runs before CPU work so the slots that
     /// work will allocate are already on their way back, and at most once per
-    /// [`SPILL_CHECK_INTERVAL`].
+    /// [`SPILL_CHECK_INTERVAL`], timed by a clock read once per
+    /// [`SPILL_CLOCK_READ_STRIDE`] passes.
     fn maybe_spill(&mut self) {
+        self.passes_since_spill_clock_read += 1;
+        if self.passes_since_spill_clock_read < SPILL_CLOCK_READ_STRIDE {
+            return;
+        }
+        self.passes_since_spill_clock_read = 0;
         if self.last_spill_check.elapsed() < SPILL_CHECK_INTERVAL {
             return;
         }
