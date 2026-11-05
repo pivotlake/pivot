@@ -43,7 +43,6 @@ impl LoadedTable {
         name: &SchemaQualifiedTableName,
         table: &Table,
         store: TableStore,
-        manifest_list_size: Option<u64>,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<Self> {
         let table_name = name.to_string();
@@ -76,13 +75,7 @@ impl LoadedTable {
                 .map(|field| (field.source_id, &field.transform)),
         );
 
-        let manifest_list = ManifestList::load(
-            &table_name,
-            &metadata,
-            manifest_list_size,
-            &store,
-            dispatcher,
-        )?;
+        let manifest_list = ManifestList::load(&table_name, &metadata, &store, dispatcher)?;
         Ok(Self {
             name: name.clone(),
             uuid: metadata.uuid().to_string(),
@@ -261,28 +254,6 @@ pub(crate) fn open_table_store(
         })?;
     let vended = read_vended_s3_credentials(&table_name, table.file_io().config().props())?;
     TableStore::open(&table_name, metadata_location, store_factory, vended)
-}
-
-/// The size of `table`'s current manifest list, or `None` when the table has
-/// no current snapshot. The snapshot names its manifest list without a
-/// length, and a ring read needs one, so the store is asked once, when the
-/// table is indexed, rather than on every query over it.
-pub(crate) fn fetch_manifest_list_size(
-    name: &SchemaQualifiedTableName,
-    table: &Table,
-    store: &TableStore,
-) -> Result<Option<u64>> {
-    let Some(snapshot) = table.metadata().current_snapshot() else {
-        return Ok(None);
-    };
-    let path = snapshot.manifest_list();
-    let size = store
-        .object_size(path)?
-        .ok_or_else(|| Error::MissingMetadataObject {
-            table: name.to_string(),
-            path: path.to_string(),
-        })?;
-    Ok(Some(size))
 }
 
 #[cfg(test)]

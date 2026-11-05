@@ -15,7 +15,7 @@ use iceberg::spec::{
     PartitionSpecRef, SchemaRef, TableMetadata,
 };
 use iceberg::{ErrorKind, Result};
-use object_storage::load_objects;
+use object_storage::{download_objects, load_objects};
 use planner::expression::Expression;
 use std::collections::HashMap;
 
@@ -44,25 +44,23 @@ struct ListedManifest {
 }
 
 impl ManifestList {
-    /// Read the current snapshot's manifest list, of `size` bytes, and keep
-    /// its manifests in order. A table without a snapshot has none. A delete
-    /// manifest whose files were all removed carries nothing to apply and is
-    /// left out.
+    /// Read the current snapshot's manifest list and keep its manifests in
+    /// order. The snapshot names the list without a length, so it is
+    /// downloaded whole: one request, sized by its response. A table without
+    /// a snapshot has no manifests. A delete manifest whose files were all
+    /// removed carries nothing to apply and is left out.
     pub fn load(
         table: &str,
         metadata: &TableMetadata,
-        size: Option<u64>,
         store: &TableStore,
         dispatcher: &DataFlowDispatcher,
     ) -> crate::Result<Self> {
         let mut manifests = Vec::new();
         if let Some(snapshot) = metadata.current_snapshot() {
             let path = snapshot.manifest_list();
-            let size = size
-                .expect("a table with a current snapshot is indexed with its manifest list's size");
-            let bytes = load_objects(dispatcher, &[store.data_file(path, size)?])?
+            let bytes = download_objects(dispatcher, &[store.unsized_object(path)?])?
                 .pop()
-                .expect("load_objects returns one object per file")
+                .expect("download_objects returns one object per entry")
                 .bytes;
             let list = IcebergManifestList::parse_with_version(&bytes, metadata.format_version())
                 .map_err(|source| Error::MalformedMetadataObject {

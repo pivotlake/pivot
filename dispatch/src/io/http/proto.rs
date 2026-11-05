@@ -1,11 +1,13 @@
-//! Object-store range-read **policy** over the sans-IO HTTP/1.1 helpers
+//! Object-store read **policy** over the sans-IO HTTP/1.1 helpers
 //! ([`super::http1`]).
 //!
 //! `http1` parses a response head and tracks an identity body; this layer adds
-//! the range-read policy on top: build the `Range` GET, and accept only a `206
-//! Partial Content` response whose `Content-Length` body fits the requested slot.
-//! Keeping the policy here (rather than in `http1`) means both platform backends
-//! share identical, socket-free, unit-testable logic.
+//! the policy on top: build the `Range` GET, and accept only a `206 Partial
+//! Content` response whose `Content-Length` body fits the requested slot; build
+//! the whole-object GET, and accept only a `200 OK` response that declares its
+//! body's length, since that length is what the download is sized by. Keeping
+//! the policy here (rather than in `http1`) means both platform backends share
+//! identical, socket-free, unit-testable logic.
 
 use super::http1;
 use thiserror::Error;
@@ -18,6 +20,10 @@ pub enum ProtoError {
     UnexpectedStatus(u16),
     #[error("range response missing Content-Length")]
     MissingContentLength,
+    #[error("unexpected http status {0} (expected 200 OK)")]
+    UnexpectedWholeObjectStatus(u16),
+    #[error("whole-object response missing Content-Length, which sizes the download")]
+    MissingWholeObjectLength,
     #[error("range response body ({got} bytes) does not match the expected {want} bytes")]
     BodyLengthMismatch { got: u64, want: usize },
     #[error("unexpected upload status {0} (expected a 2xx response)")]
@@ -70,7 +76,25 @@ pub fn build_range_get(
     .into_bytes()
 }
 
-/// A parsed (and validated `206`) response head.
+/// Build an origin-form HTTP/1.1 GET of a whole object, for a download whose
+/// size the response declares. The same headers as a range GET, less the
+/// `Range`: `Accept-Encoding: identity` is what makes the declared length the
+/// object's own.
+pub fn build_whole_object_get(host: &str, target: &str, auth: Option<&str>) -> Vec<u8> {
+    let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
+    format!(
+        "GET {target} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         {auth}\
+         Accept-Encoding: identity\r\n\
+         Connection: keep-alive\r\n\
+         User-Agent: pivotdb-dispatch/0.1\r\n\
+         \r\n"
+    )
+    .into_bytes()
+}
+
+/// A parsed (and validated) response head.
 #[derive(Debug, Clone, Copy)]
 pub struct ResponseHead {
     /// Length of the header section, including the terminating `\r\n\r\n`. The
@@ -125,6 +149,31 @@ pub fn parse_get_response_head(buf: &[u8], expected_len: usize) -> Result<HeadPa
         });
     }
 
+    Ok(HeadParse::Complete(ResponseHead {
+        head_len: head.head_len,
+        content_length,
+        reuse_connection: true,
+    }))
+}
+
+/// Try to parse the head of a whole-object GET response. Returns
+/// [`HeadParse::Incomplete`] if the header section hasn't fully arrived yet.
+///
+/// Validates that the status is `200 OK` and that a `Content-Length` is
+/// present: it is the only thing the download's destination can be sized by,
+/// so a body of unknown framing (chunked, close-delimited) is refused rather
+/// than grown into.
+pub fn parse_whole_object_response_head(buf: &[u8]) -> Result<HeadParse, ProtoError> {
+    let head = match http1::parse_response_head(buf)? {
+        http1::HeadStatus::Incomplete => return Ok(HeadParse::Incomplete),
+        http1::HeadStatus::Complete(head) => head,
+    };
+    if head.status != 200 {
+        return Err(ProtoError::UnexpectedWholeObjectStatus(head.status));
+    }
+    let content_length = head
+        .content_length
+        .ok_or(ProtoError::MissingWholeObjectLength)?;
     Ok(HeadParse::Complete(ResponseHead {
         head_len: head.head_len,
         content_length,
@@ -228,6 +277,52 @@ mod tests {
         };
 
         assert!(!head.reuse_connection, "unknown body framing must not pool");
+    }
+
+    #[test]
+    fn whole_object_get_carries_no_range() {
+        let req = build_whole_object_get("example.com", "/list.avro", Some("Bearer tok"));
+
+        let text = String::from_utf8(req).unwrap();
+
+        assert!(text.starts_with("GET /list.avro HTTP/1.1\r\n"));
+        assert!(!text.contains("Range:"));
+        assert!(text.contains("Authorization: Bearer tok\r\n"));
+        assert!(text.contains("Accept-Encoding: identity\r\n"));
+    }
+
+    #[test]
+    fn whole_object_head_yields_the_declared_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nXX";
+
+        let HeadParse::Complete(head) = parse_whole_object_response_head(raw).unwrap() else {
+            panic!("expected complete head");
+        };
+
+        assert_eq!(head.content_length, 12);
+        assert_eq!(&raw[head.head_len..], b"XX");
+        assert!(head.reuse_connection);
+    }
+
+    #[test]
+    fn whole_object_head_rejects_a_partial_content_status() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 12\r\n\r\n";
+
+        let result = parse_whole_object_response_head(raw);
+
+        assert!(matches!(
+            result,
+            Err(ProtoError::UnexpectedWholeObjectStatus(206))
+        ));
+    }
+
+    #[test]
+    fn whole_object_head_without_a_length_is_refused() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+        let result = parse_whole_object_response_head(raw);
+
+        assert!(matches!(result, Err(ProtoError::MissingWholeObjectLength)));
     }
 
     #[test]

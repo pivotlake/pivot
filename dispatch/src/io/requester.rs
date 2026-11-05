@@ -5,8 +5,9 @@ use crate::io::disk_cache::DiskCache;
 use crate::io::hardware_queues::{InFlightPermit, WorkerHardwareQueues};
 use crate::io::{
     Completion, DataFlowRequest, FailedIO, FsReadRequest, FsRequest, FsWriteRequest,
-    HttpGetRequest, HttpRequest, HttpUploadRequest, OpenFile, PendingReadRequest,
-    PendingWriteRequest, ReadData, ReadResponse, RemoteSplit,
+    HttpDownloadRequest, HttpGetRequest, HttpRequest, HttpUploadRequest, OpenFile,
+    PendingReadRequest, PendingWriteRequest, ReadData, ReadRequestId, ReadResponse, RemoteFile,
+    RemoteSplit,
 };
 use crate::memory::compressed_cache::MissingExtent;
 use crate::memory::{CacheLookup, memory_ctx};
@@ -126,8 +127,8 @@ impl IORead {
             },
             Self::Http(request) => match &request.request {
                 HttpRequest::Get(read) => &read.block,
-                HttpRequest::Upload(_) => {
-                    unreachable!("registered reads never contain uploads")
+                HttpRequest::Download(_) | HttpRequest::Upload(_) => {
+                    unreachable!("registered reads never contain downloads or uploads")
                 }
             },
         }
@@ -353,6 +354,28 @@ impl IORequester {
             let cache_extent = http_cache_extent(&request);
             self.withdraw_registered_read(cache_extent, request.pending_read_id);
         }
+    }
+
+    /// Submit a whole-object download of `remote`, whose size is unknown until
+    /// the response says. It registers no cache extent: the bytes come back
+    /// as the ready read `read_id`, straight from the transport.
+    pub fn request_download(
+        &mut self,
+        data_flow_id: Identifier,
+        operator_idx: Identifier,
+        read_id: ReadRequestId,
+        remote: Arc<RemoteFile>,
+        stats: &mut StatsCollector,
+    ) -> Result<()> {
+        let mut request = DataFlowRequest::new(
+            data_flow_id,
+            operator_idx,
+            HttpRequest::Download(HttpDownloadRequest { remote, read_id }),
+        );
+        stats.stamp_issued(std::slice::from_mut(&mut request));
+        let split = self.submit_http_request_to_backend(request)?;
+        stats.record_issued_remote(split);
+        Ok(())
     }
 
     /// Select the transport for one logical write and submit it immediately.
@@ -688,6 +711,24 @@ impl IORequester {
                     submitted_at,
                 },
             ),
+            // A download's bytes are counted when it lands, since only the
+            // response says how many there are.
+            HttpRequest::Download(request) => self
+                .http
+                .download(
+                    &mut self.backend,
+                    DataFlowRequest {
+                        data_flow_id,
+                        operator_idx,
+                        request,
+                        pending_read_id,
+                        submitted_at,
+                    },
+                )
+                .map(|()| RemoteSplit {
+                    http_requests: 1,
+                    ..RemoteSplit::default()
+                }),
             HttpRequest::Upload(request) => {
                 let bytes = request.data.len() as u64;
                 self.http
@@ -951,9 +992,14 @@ impl IORequester {
         // this pass.
         self.drain_fs_backlog()?;
 
-        // HTTP reads the engine finished this pass (and any write-backs they queue).
-        self.http
-            .drain(&mut self.backend, &mut self.next_id, &mut out)?;
+        // HTTP requests the engine finished this pass (and any write-backs the
+        // reads queue); a landed download is a ready read.
+        self.http.drain(
+            &mut self.backend,
+            &mut self.next_id,
+            &mut out,
+            &mut self.ready_reads,
+        )?;
 
         // Reads waiting on fills the ring did not carry for this requester.
         self.resolve_piggybacked(&mut out);
@@ -974,7 +1020,11 @@ impl IORequester {
                         self.complete_pending_read(id);
                     }
                 }
-                Ok(Completion::FsWrite(_) | Completion::HttpUpload(_)) => {}
+                Ok(
+                    Completion::FsWrite(_)
+                    | Completion::HttpDownload(..)
+                    | Completion::HttpUpload(_),
+                ) => {}
                 Err(failed) => {
                     if let Some(id) = failed.pending_read_id {
                         let _ = self.fail_pending_read(id);
@@ -1029,7 +1079,7 @@ fn fs_cache_extent(request: &DataFlowRequest<FsRequest>) -> Option<(OpenFile, Mi
 fn http_cache_extent(request: &DataFlowRequest<HttpRequest>) -> Option<(OpenFile, MissingExtent)> {
     match &request.request {
         HttpRequest::Get(read) => Some((OpenFile::Remote(read.remote.clone()), read.block.clone())),
-        HttpRequest::Upload(_) => None,
+        HttpRequest::Download(_) | HttpRequest::Upload(_) => None,
     }
 }
 
@@ -2046,6 +2096,180 @@ mod tests {
             results.iter().all(|r| r.is_err()),
             "every http read should fail"
         );
+    }
+
+    /// Spawn a server that serves `requests` whole-object GETs of `object` on
+    /// one keep-alive connection: a `200` whose `Content-Length` is the
+    /// object's size, which is how a download learns it. Also serves a plain
+    /// (non-TLS) client when `tls` is false, which exercises the recv path
+    /// that lands body bytes straight in the destination.
+    fn spawn_whole_object_server(object: Arc<Vec<u8>>, requests: usize, tls: bool) -> u16 {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut stream: Box<dyn ReadWrite> = if tls {
+                let conn = rustls::ServerConnection::new(server_config).unwrap();
+                Box::new(rustls::StreamOwned::new(conn, tcp))
+            } else {
+                Box::new(tcp)
+            };
+            for _ in 0..requests {
+                let head = read_head(&mut stream);
+                let head = String::from_utf8_lossy(&head);
+                assert!(
+                    !head.contains("Range:"),
+                    "a download asks for the whole object: {head}"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: keep-alive\r\n\r\n",
+                    object.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.write_all(&object).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        port
+    }
+
+    trait ReadWrite: Read + Write {}
+    impl<T: Read + Write> ReadWrite for T {}
+
+    /// Spawn a server that answers the one request it gets with a `404`.
+    fn spawn_not_found_server() -> u16 {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            read_head(&mut tls);
+            tls.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            tls.flush().unwrap();
+        });
+
+        port
+    }
+
+    /// Submit a download of the object the server on `port` serves and drive it
+    /// to its one completion, returning the completion and the ready read it
+    /// produced, if any.
+    fn download(
+        requester: &mut IORequester,
+        port: u16,
+        tls: bool,
+        read_id: ReadRequestId,
+    ) -> (
+        std::result::Result<Completion, FailedIO>,
+        Option<RoutedReadResponse>,
+    ) {
+        let scheme = if tls { "https" } else { "http" };
+        let url = Url::parse(&format!("{scheme}://127.0.0.1:{port}/obj")).unwrap();
+        let remote = Arc::new(RemoteFile::open_unsized(url, None).unwrap());
+        requester
+            .request_download(7, 3, read_id, remote, &mut disabled_stats())
+            .unwrap();
+
+        let mut results = Vec::new();
+        while results.is_empty() {
+            if requester.has_pending() {
+                requester.wait().unwrap();
+            }
+            results.extend(requester.completions().unwrap());
+        }
+        assert_eq!(results.len(), 1, "a download is one completion");
+        (results.pop().unwrap(), requester.take_ready_reads().pop())
+    }
+
+    /// The one request of a download sizes it: the body, longer than a ring
+    /// slot here, lands in as many slots as it fills and comes back as the
+    /// read the operator asked for, in one location from offset zero. The
+    /// second download reuses the pooled connection.
+    #[test]
+    fn a_download_lands_the_whole_object_as_one_read() {
+        init_test_free_pool(16);
+        let object: Arc<Vec<u8>> = Arc::new(
+            (0..crate::memory::BUFFER_SIZE + 4097)
+                .map(pattern)
+                .collect(),
+        );
+        let port = spawn_whole_object_server(object.clone(), 2, true);
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let (completion, ready) = download(&mut requester, port, true, ReadRequestId(9));
+        let (_, again) = download(&mut requester, port, true, ReadRequestId(10));
+
+        let Ok(Completion::HttpDownload(request, bytes)) = completion else {
+            panic!("expected a download completion");
+        };
+        assert_eq!((request.data_flow_id, request.operator_idx), (7, 3));
+        assert_eq!(bytes as usize, object.len());
+        let ready = ready.expect("the download is a ready read");
+        assert_eq!(ready.route.data_flow_id, 7);
+        assert_eq!(ready.response.id(), ReadRequestId(9));
+        let locations = ready.response.into_locations();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].offset, 0);
+        assert_eq!(locations[0].bytes.len(), 2, "one run per ring slot");
+        let landed: Vec<u8> = locations[0].bytes.iter().flatten().copied().collect();
+        assert_eq!(landed, *object);
+        assert_eq!(again.unwrap().response.into_bytes(), *object);
+    }
+
+    /// Over plain HTTP the body is received straight into the download's
+    /// runs, so a body crossing a run boundary continues into the next run.
+    #[test]
+    fn a_plaintext_download_lands_across_runs() {
+        init_test_free_pool(16);
+        let object: Arc<Vec<u8>> = Arc::new(
+            (0..2 * crate::memory::BUFFER_SIZE + 1)
+                .map(pattern)
+                .collect(),
+        );
+        let port = spawn_whole_object_server(object.clone(), 1, false);
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let (_, ready) = download(&mut requester, port, false, ReadRequestId(1));
+
+        assert_eq!(ready.unwrap().response.into_bytes(), *object);
+    }
+
+    #[test]
+    fn an_empty_object_downloads_as_no_bytes() {
+        init_test_free_pool(16);
+        let port = spawn_whole_object_server(Arc::new(Vec::new()), 1, true);
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let (completion, ready) = download(&mut requester, port, true, ReadRequestId(1));
+
+        assert!(matches!(completion, Ok(Completion::HttpDownload(_, 0))));
+        assert!(ready.unwrap().response.into_bytes().is_empty());
+    }
+
+    /// A refused download fails just its dataflow, like a refused range read.
+    #[test]
+    fn a_download_the_server_refuses_fails_its_dataflow() {
+        init_test_free_pool(16);
+        let port = spawn_not_found_server();
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let (completion, ready) = download(&mut requester, port, true, ReadRequestId(1));
+
+        let Err(failed) = completion else {
+            panic!("expected the download to fail");
+        };
+        assert_eq!(failed.data_flow_id, 7);
+        assert!(failed.error.to_string().contains("404"), "{}", failed.error);
+        assert!(ready.is_none());
     }
 
     /// Drive every pending read *and* write-back to completion - `fetch` only

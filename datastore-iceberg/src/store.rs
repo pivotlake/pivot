@@ -17,7 +17,7 @@ use iceberg::io::{
 };
 use object_storage::{
     DataFile, ExternalStoreFactory, FileRef, ObjectPath, ObjectStore, S3Credentials, S3Keys,
-    S3Store, StoreScheme, local_path,
+    S3Store, StoreScheme, UnsizedObject, local_path,
 };
 
 use crate::{Error, Result};
@@ -72,18 +72,15 @@ impl TableStore {
         })
     }
 
-    /// The size of the object at `location`, or `None` when no such object
-    /// exists: one listing narrowed to the object's own name. What a file the
-    /// catalog names without a length (a manifest list) is sized by.
-    pub(crate) fn object_size(&self, location: &str) -> Result<Option<u64>> {
-        let key = self.key_under_root(location)?;
-        let directory = key.parent().unwrap_or_default();
-        let listing = self.store.list_with_name_prefix(&directory, key.name())?;
-        Ok(listing
-            .objects
-            .into_iter()
-            .find(|object| object.file.path.as_str() == key.name())
-            .map(|object| object.file.size))
+    /// The file at `location`, located for reading whole without its size:
+    /// what a file the catalog names without a length (a manifest list) is
+    /// read as. Its identity is the full location, as the catalog names it.
+    pub(crate) fn unsized_object(&self, location: &str) -> Result<UnsizedObject> {
+        let source = self.store.source(&self.key_under_root(location)?)?;
+        Ok(UnsizedObject {
+            path: ObjectPath::new(location),
+            source,
+        })
     }
 
     /// The key of `location` under the table's root, refusing a location
