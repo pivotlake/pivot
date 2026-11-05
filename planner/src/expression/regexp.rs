@@ -179,6 +179,10 @@ fn translate_replacement(replacement: &str) -> Vec<u8> {
 /// row through unchanged. Values arrive in runs (sessions repeat the same URL),
 /// so an equal-to-previous input reuses the prior row's result without
 /// re-matching. Shared with [`RegexpJitReplace`](super::regexp_jit::RegexpJitReplace).
+///
+/// Generic over the closure, so each caller gets its own copy; inlined into
+/// that caller so the closure's body and this loop end up as one function.
+#[inline(always)]
 pub(super) fn replace_column(
     strings: &StringViewArray,
     mut replace_first: impl FnMut(&[u8]) -> Option<Vec<u8>>,
