@@ -121,7 +121,11 @@ impl<'a> Spiller<'a> {
         let writes_in_flight = Arc::new(AtomicUsize::new(writes.len()));
         for SpillWrite { file, offset, rows } in writes {
             let write_id = self.io.write_spill(file, offset, Arc::new(rows))?;
-            memory_ctx().record_spill_write_issued(write_id, writes_in_flight.clone());
+            memory_ctx().record_spill_write_issued(
+                self.io.data_flow_id(),
+                write_id,
+                writes_in_flight.clone(),
+            );
         }
         memory_ctx().record_buffers_spilled(1);
         self.buffers_spilled += 1;
