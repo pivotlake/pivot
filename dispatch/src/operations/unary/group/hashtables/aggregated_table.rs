@@ -17,7 +17,7 @@
 //! ```
 
 use crate::RECORD_BATCH_SIZE;
-use crate::memory::SlabAllocator;
+use crate::memory::{SlabAllocator, SlabBuffer};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::HashTable;
@@ -225,7 +225,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Radix threshold and partition count.
     radix_config: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
-    hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    hashes: HashScratch,
     /// Per-worker reusable key-extraction scratch (e.g. the row extractor's
     /// encode buffers). Lent to the reader each batch and reused, never
     /// reallocated. `()` for extractors that read columns directly.
@@ -235,6 +235,34 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// here. There is at most one such key (the hash is a bijection), so this
     /// boolean adds 0 or 1 to the distinct count at output.
     zero_hash_seen: bool,
+}
+
+/// One batch's worth of row hashes, carved from the table's slab memory. The
+/// worker's ring buffer is resident; a heap allocation of this size is handed
+/// back to the OS when the table drops, and every worker then page-faults it
+/// in again on the next query, all at the same moment.
+struct HashScratch(SlabBuffer<u64>);
+
+impl HashScratch {
+    fn new(allocator: &mut SlabAllocator) -> Self {
+        Self(allocator.create_slab_buffer(RECORD_BATCH_SIZE, false))
+    }
+}
+
+impl std::ops::Deref for HashScratch {
+    type Target = [u64; RECORD_BATCH_SIZE];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the slab holds exactly `RECORD_BATCH_SIZE` aligned `u64`s.
+        unsafe { &*(self.0.ptr_at_index(0) as *const Self::Target) }
+    }
+}
+
+impl std::ops::DerefMut for HashScratch {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: as in `deref`, and `&mut self` makes the access exclusive.
+        unsafe { &mut *(self.0.ptr_at_index(0) as *mut Self::Target) }
+    }
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
@@ -248,6 +276,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = HashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
+        let hashes = HashScratch::new(&mut allocator);
         Self {
             hash_state,
             shared_context,
@@ -263,10 +292,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             scatter_raw: false,
             rows_since_clear: 0,
             radix_config,
-            hashes: vec![0u64; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
+            hashes,
             scratch: K::Scratch::default(),
             zero_hash_seen: false,
         }

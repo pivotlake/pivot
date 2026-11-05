@@ -54,9 +54,10 @@
 // a published API — so allow public docs to reference private items.
 #![allow(rustdoc::private_intra_doc_links)]
 
-use api::launch::{LaunchLog, WorkerLaunch};
+use api::launch::WorkerLaunch;
 use core_affinity::CoreId;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Sender as StdSender, channel};
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use tikv_jemallocator::Jemalloc;
@@ -184,8 +185,9 @@ impl Shutdown {
 
 #[derive(Clone)]
 pub struct DataFlowDispatcher {
-    /// Where a launched dataflow is published once for every worker to take.
-    launch_log: Arc<LaunchLog>,
+    /// One inbox sender per worker, in worker order; a launched dataflow is
+    /// sent to every one of them.
+    launch_senders: Vec<StdSender<Arc<dyn WorkerLaunch>>>,
     /// The worker/node shape, mirrored by every per-worker structure a
     /// dataflow builds (channels, sibling counters).
     topology: numa::Topology,
@@ -227,11 +229,15 @@ impl DataFlowDispatcher {
 }
 
 impl DataFlowDispatcher {
-    /// Hand a dataflow to every worker: publish it once and wake the pool.
-    /// Returns the wakers of every node, so cancellation can wake parked
-    /// workers on any node.
+    /// Hand a dataflow to every worker: send the shared launch to each
+    /// worker's inbox and wake the pool. Returns the wakers of every node, so
+    /// cancellation can wake parked workers on any node.
     pub(crate) fn launch(&self, launch: Arc<dyn WorkerLaunch>) -> WakerSet {
-        self.launch_log.publish(launch);
+        for sender in &self.launch_senders {
+            sender
+                .send(launch.clone())
+                .expect("a worker's inbox stays open until the pool exits");
+        }
         // Wake idle workers on every node so they pick up the new dataflow
         // without waiting out their park.
         self.waker_set.notify_all_delegated();
@@ -399,10 +405,12 @@ impl Dispatch {
             .collect();
         let waker_set = WakerSet::new(node_wakers.clone(), topology.workers_per_node);
 
-        let launch_log = Arc::new(LaunchLog::new(total_workers));
         let mut threads = vec![];
+        let mut launch_senders = vec![];
         for (node, group) in core_groups.into_iter().enumerate() {
             for (node_local_idx, core) in group.into_iter().enumerate() {
+                let (launch_sender, launch_inbox) = channel();
+                launch_senders.push(launch_sender);
                 threads.push(Worker::create(
                     node * topology.workers_per_node + node_local_idx,
                     total_workers,
@@ -411,7 +419,7 @@ impl Dispatch {
                     should_exit.clone(),
                     memory_factories.next().unwrap(),
                     disk_cache.clone(),
-                    launch_log.clone(),
+                    launch_inbox,
                     barrier.clone(),
                     node_wakers[node].clone(),
                     waker_set.clone(),
@@ -423,7 +431,7 @@ impl Dispatch {
 
         Dispatch {
             dataflow_dispatcher: DataFlowDispatcher {
-                launch_log,
+                launch_senders,
                 topology,
                 waker_set: waker_set.clone(),
                 buffers: layout.total_slots(),

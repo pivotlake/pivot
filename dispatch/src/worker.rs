@@ -23,7 +23,7 @@
 //! operators.
 
 use crate::Identifier;
-use crate::api::launch::LaunchLog;
+use crate::api::launch::WorkerLaunch;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
@@ -67,6 +67,7 @@ fn in_flight_spin_limit() -> u32 {
         crate::env::get_env_var_with_default("PIVOT_SPIN_LIMIT", IN_FLIGHT_SPIN_LIMIT)
     })
 }
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use std::{result, thread};
@@ -136,11 +137,9 @@ pub struct Worker {
     io: IORequester,
     /// This worker's global index, dense across all NUMA node groups.
     worker_idx: usize,
-    /// Where launched dataflows are published for every worker to take. The
+    /// Where the dispatcher sends this worker every launched dataflow. The
     /// worker can work on many dataflows simultaneously.
-    launch_log: Arc<LaunchLog>,
-    /// The latest launch this worker has taken from the log.
-    launch_cursor: u64,
+    launch_inbox: Receiver<Arc<dyn WorkerLaunch>>,
     /// A mapping of dataflows currently running
     data_flows: HashMap<Identifier, DataFlow>,
     /// Did the worker do work on last iteration? This is used to decide whether the worker should
@@ -184,7 +183,7 @@ impl Worker {
         should_exit: Arc<AtomicBool>,
         memory_context_factory: MemoryContextFactory,
         disk_cache: Option<Arc<DiskCache>>,
-        launch_log: Arc<LaunchLog>,
+        launch_inbox: Receiver<Arc<dyn WorkerLaunch>>,
         ready_barrier: Arc<Barrier>,
         waker: Arc<WorkerWaker>,
         waker_set: WakerSet,
@@ -225,8 +224,7 @@ impl Worker {
                     id: core.id,
                     data_flows: HashMap::new(),
                     worker_idx: idx,
-                    launch_log,
-                    launch_cursor: 0,
+                    launch_inbox,
                     did_work_last_iteration: false,
                     should_exit,
                     waker,
@@ -514,14 +512,14 @@ impl Worker {
     }
 
     fn try_receiving_new_dataflow(&mut self) {
-        // Take everything published. Taking one launch per pass loses dataflows:
+        // Drain everything queued. Taking one launch per pass loses dataflows:
         // two dispatches can land while this worker is parked, their notifies
         // coalescing into one wake-count advance. The woken pass would take only
         // the first launch, finish it without setting `did_work`, and re-park
         // with the count already current, stranding the second dataflow in the
-        // log forever (its query hangs; sibling workers spin or park waiting
+        // inbox forever (its query hangs; sibling workers spin or park waiting
         // for this worker's operator to ever exist).
-        for launch in self.launch_log.take_new(&mut self.launch_cursor) {
+        while let Ok(launch) = self.launch_inbox.try_recv() {
             debug!("Received data flow...");
             match launch.build_for_worker(self.worker_idx) {
                 Ok(data_flow) => {

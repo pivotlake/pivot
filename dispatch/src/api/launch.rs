@@ -1,11 +1,13 @@
 //! A dataflow handed to the pool: published once, and built by every worker
 //! from the same shared description.
 //!
-//! The thread executing a spec publishes one [`WorkerLaunch`] to the pool's
-//! [`LaunchLog`] and wakes the workers. Each worker takes every launch it has
-//! not seen, makes its own operator chain from the launch's maker, and runs
-//! it. So handing a dataflow to 192 workers costs the publishing thread one
-//! log entry, not 192 sends; the per-worker work happens on the workers.
+//! The thread executing a spec sends one shared [`WorkerLaunch`] to every
+//! worker's own inbox and wakes the workers. Each worker takes the launches
+//! from its inbox, makes its own operator chain from the launch's maker, and
+//! runs it. Every worker reads only its own inbox, so the pickup never
+//! contends on anything shared: a lock every worker takes on the same wake
+//! would be handed from worker to worker, and the last in line would start
+//! its chain hundreds of microseconds late.
 //!
 //! The launch also owns the dataflow's one output sender. Every worker's
 //! chain sends through a handle on the launch, and the output channel closes
@@ -17,10 +19,9 @@ use crate::api::{BuildContext, OperatorFactory, WorkerMaker};
 use crate::data_flow::DataFlow;
 use crate::operations::channels::{MpscSender, Sender};
 use crate::stats::DataFlowStats;
-use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 /// What every worker's chain of one dataflow shares.
 pub(crate) struct LaunchShared {
@@ -131,119 +132,5 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> WorkerLaunch fo
 
     fn shared(&self) -> &LaunchShared {
         &self.shared
-    }
-}
-
-struct LogEntry {
-    seq: u64,
-    launch: Arc<dyn WorkerLaunch>,
-    /// How many workers have taken this entry; it leaves the log once every
-    /// worker has, so the log never keeps a finished dataflow's output
-    /// channel open.
-    taken: usize,
-}
-
-/// The pool's launches, in publication order, each kept until every worker
-/// has taken it.
-pub(crate) struct LaunchLog {
-    entries: Mutex<VecDeque<LogEntry>>,
-    /// The sequence number of the latest entry, written under the lock and
-    /// read without it, so a worker with nothing new to take skips the lock.
-    published: AtomicU64,
-    worker_count: usize,
-}
-
-impl LaunchLog {
-    pub(crate) fn new(worker_count: usize) -> Self {
-        Self {
-            entries: Mutex::new(VecDeque::new()),
-            published: AtomicU64::new(0),
-            worker_count,
-        }
-    }
-
-    pub(crate) fn publish(&self, launch: Arc<dyn WorkerLaunch>) {
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("the launch log is never poisoned");
-        let seq = self.published.load(Ordering::Relaxed) + 1;
-        entries.push_back(LogEntry {
-            seq,
-            launch,
-            taken: 0,
-        });
-        self.published.store(seq, Ordering::Release);
-    }
-
-    /// Every launch published since the one `cursor` names, oldest first,
-    /// advancing `cursor` past them.
-    pub(crate) fn take_new(&self, cursor: &mut u64) -> Vec<Arc<dyn WorkerLaunch>> {
-        if self.published.load(Ordering::Acquire) == *cursor {
-            return Vec::new();
-        }
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("the launch log is never poisoned");
-        let mut taken = Vec::new();
-        for entry in entries.iter_mut() {
-            if entry.seq > *cursor {
-                taken.push(entry.launch.clone());
-                entry.taken += 1;
-                *cursor = entry.seq;
-            }
-        }
-        while entries
-            .front()
-            .is_some_and(|entry| entry.taken == self.worker_count)
-        {
-            entries.pop_front();
-        }
-        taken
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct Inert;
-
-    impl WorkerLaunch for Inert {
-        fn build_graph(self: Arc<Self>, _: usize, _: &mut BuildContext) -> OperatorGraphBuilder {
-            unreachable!("the log test never builds")
-        }
-        fn shared(&self) -> &LaunchShared {
-            unreachable!("the log test never builds")
-        }
-    }
-
-    #[test]
-    fn each_worker_takes_every_launch_once_in_order() {
-        let log = LaunchLog::new(2);
-        log.publish(Arc::new(Inert));
-        log.publish(Arc::new(Inert));
-        let mut cursor = 0;
-
-        let first_pass = log.take_new(&mut cursor).len();
-        let second_pass = log.take_new(&mut cursor).len();
-
-        assert_eq!((first_pass, second_pass, cursor), (2, 0, 2));
-    }
-
-    #[test]
-    fn a_launch_leaves_the_log_once_every_worker_took_it() {
-        let log = LaunchLog::new(2);
-        let launch: Arc<dyn WorkerLaunch> = Arc::new(Inert);
-        log.publish(launch.clone());
-        let (mut first, mut second) = (0, 0);
-
-        log.take_new(&mut first);
-        let held_by_one = Arc::strong_count(&launch);
-        log.take_new(&mut second);
-        let held_by_none = Arc::strong_count(&launch);
-
-        assert_eq!((held_by_one, held_by_none), (2, 1));
     }
 }
