@@ -134,4 +134,27 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
     pub(super) fn memory_bytes(&self) -> usize {
         self.allocator.bytes_held() + self.reads_in_flight.values().sum::<usize>()
     }
+
+    /// Take a finished merge apart into its job and its result table, letting
+    /// go of everything else first. That order matters for the free pool,
+    /// which hands out the buffer freed last: the allocator's working buffer
+    /// is one the table never reached, untouched since it was popped, while
+    /// the table's own buffers are the ones this worker just wrote. Freed
+    /// first, the working buffer sits under them, and the next job's table is
+    /// built in the buffers still in this core's cache.
+    pub(super) fn into_job_and_table(self) -> (PartitionJob<K, V>, HashTable<K::Persisted, V>) {
+        let Self {
+            job,
+            table,
+            allocator,
+            reads_in_flight,
+            capacity: _,
+        } = self;
+        debug_assert!(
+            reads_in_flight.is_empty(),
+            "a merge is taken apart only once every read of its rows has landed"
+        );
+        drop(allocator);
+        (job, table)
+    }
 }

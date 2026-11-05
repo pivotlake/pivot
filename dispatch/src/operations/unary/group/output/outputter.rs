@@ -436,7 +436,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         running: RunningPartitionMerge<K, V>,
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
-        let RunningPartitionMerge { job, table, .. } = running;
+        let (job, table) = running.into_job_and_table();
         let allocator = self
             .output_allocator
             .get_or_insert_with(|| SlabAllocator::new(false));

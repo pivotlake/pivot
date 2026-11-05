@@ -24,17 +24,31 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// The slab a partition is appending into, and where it came from, so that
-/// once full it can be recorded against its buffer.
+/// once full it can be recorded against its buffer. How far it is filled is
+/// kept in the partition's [`RowCursor`].
 struct OpenSlab {
     slab: Slab,
-    /// Rows written so far.
-    len: usize,
     /// Rows the slab holds when full.
     rows: usize,
     /// The tree node of the partition group slot the slab was allocated from.
     partition_group_slot: usize,
     /// The ring slot of that buffer, which identifies it within the node.
     buffer_slot_idx: usize,
+}
+
+/// Where a partition's next row goes, and how many more fit in its open slab.
+///
+/// The scatter loop hops between thousands of partitions in hash order, so
+/// what it touches per partition is a cache-resident working set and every
+/// extra line costs a stalled access. The per-row step therefore reads and
+/// writes only this cursor, 16 bytes, with the open slab's handle and
+/// provenance kept apart in [`Partition`] for the once-per-slab open and
+/// close. `rows_left` is zero exactly when the partition has no open slab: a
+/// slab is closed on the reserve that fills it.
+#[derive(Clone, Copy)]
+struct RowCursor {
+    next_row: *mut u8,
+    rows_left: usize,
 }
 
 struct Partition {
@@ -224,6 +238,8 @@ pub struct PartitionAllocator<L: Layout> {
     layout: L,
     tree: PartitionTree<PartitionGroupSlot>,
     partitions: Box<[Partition]>,
+    /// Each partition's cursor into its open slab, indexed like `partitions`.
+    cursors: Box<[RowCursor]>,
 }
 
 impl<L: Layout> PartitionAllocator<L> {
@@ -239,6 +255,14 @@ impl<L: Layout> PartitionAllocator<L> {
             })
             .take(PARTITIONS)
             .collect(),
+            cursors: vec![
+                RowCursor {
+                    next_row: std::ptr::null_mut(),
+                    rows_left: 0,
+                };
+                PARTITIONS
+            ]
+            .into_boxed_slice(),
         }
     }
 
@@ -247,31 +271,59 @@ impl<L: Layout> PartitionAllocator<L> {
     /// buffer is let go of at once rather than when the partition next
     /// receives a row; the row itself stays valid, the ring memory does not
     /// move.
+    ///
+    /// This is the scatter loop's inner step, so it stays small enough to
+    /// inline into that loop and touches only the partition's cursor: opening
+    /// and closing a slab, which happen once per slab rather than once per
+    /// row, are kept out of line.
+    #[inline(always)]
     pub fn reserve(&mut self, partition: usize) -> &mut L::Row {
-        if self.partitions[partition].open_slab.is_none() {
-            let slab = self.allocate_slab_for(partition);
-            self.partitions[partition].open_slab = Some(slab);
+        if self.cursors[partition].rows_left == 0 {
+            self.open_slab_for(partition);
         }
-        let open = self.partitions[partition]
-            .open_slab
-            .as_mut()
-            .expect("a partition has an open slab right after one was allocated for it");
-        // The slab holds `rows` rows of the layout's size, aligned for them.
-        let row = unsafe {
-            open.slab
-                .as_mut_slice()
-                .as_mut_ptr()
-                .add(open.len * self.layout.row_size())
-        };
-        open.len += 1;
-        if open.len == open.rows {
-            let full = self.partitions[partition]
-                .open_slab
-                .take()
-                .expect("the slab the row was just reserved in is still open");
-            self.close(partition, full);
+        let row_size = self.layout.row_size();
+        let cursor = &mut self.cursors[partition];
+        let row = cursor.next_row;
+        // The slab holds `rows_left` more rows of the layout's size past this
+        // one, aligned for them.
+        cursor.next_row = unsafe { row.add(row_size) };
+        cursor.rows_left -= 1;
+        if cursor.rows_left == 0 {
+            self.close_open_slab(partition);
         }
         unsafe { self.layout.row_mut(row) }
+    }
+
+    /// Give `partition` a fresh slab to append into, and point its cursor at
+    /// the slab's first row.
+    #[cold]
+    #[inline(never)]
+    fn open_slab_for(&mut self, partition: usize) {
+        let mut slab = self.allocate_slab_for(partition);
+        self.cursors[partition] = RowCursor {
+            next_row: slab.slab.as_mut_slice().as_mut_ptr(),
+            rows_left: slab.rows,
+        };
+        self.partitions[partition].open_slab = Some(slab);
+    }
+
+    /// Close the slab `partition` has just filled.
+    #[cold]
+    #[inline(never)]
+    fn close_open_slab(&mut self, partition: usize) {
+        let full = self.partitions[partition]
+            .open_slab
+            .take()
+            .expect("the slab the row was just reserved in is still open");
+        self.close(partition, full);
+    }
+
+    /// Rows written into `partition`'s open slab so far; zero without one.
+    fn open_slab_len(&self, partition: usize) -> usize {
+        match &self.partitions[partition].open_slab {
+            Some(open) => open.rows - self.cursors[partition].rows_left,
+            None => 0,
+        }
     }
 
     /// Take the allocator apart into every partition's contents, indexed by
@@ -279,6 +331,9 @@ impl<L: Layout> PartitionAllocator<L> {
     /// here were never spilled; spilled slabs are the evictor's.
     pub fn into_partitions(self) -> Vec<PartitionContents> {
         let row_size = self.layout.row_size();
+        let open_slab_lens: Vec<usize> = (0..PARTITIONS)
+            .map(|partition| self.open_slab_len(partition))
+            .collect();
         let mut slabs_by_partition: Vec<Vec<PartitionSlab>> =
             (0..PARTITIONS).map(|_| Vec::new()).collect();
         for partition_group_slot in self.tree.into_nodes() {
@@ -298,13 +353,14 @@ impl<L: Layout> PartitionAllocator<L> {
             .into_vec()
             .into_iter()
             .zip(slabs_by_partition)
-            .map(|(partition, mut slabs)| {
+            .zip(open_slab_lens)
+            .map(|((partition, mut slabs), open_slab_len)| {
                 if let Some(open_slab) = partition.open_slab
-                    && open_slab.len > 0
+                    && open_slab_len > 0
                 {
                     slabs.push(PartitionSlab {
                         slab: open_slab.slab.freeze(),
-                        rows: open_slab.len,
+                        rows: open_slab_len,
                     });
                 }
                 PartitionContents {
@@ -410,7 +466,10 @@ impl<L: Layout> PartitionAllocator<L> {
 
     /// Close a full slab, recording it against the buffer it was allocated from.
     fn close(&mut self, partition: usize, full: OpenSlab) {
-        assert_eq!(full.len, full.rows, "only full slabs are closed");
+        assert_eq!(
+            self.cursors[partition].rows_left, 0,
+            "only full slabs are closed"
+        );
         self.partitions[partition].slabs_filled += 1;
         let group_buffer = self
             .tree
@@ -468,7 +527,6 @@ impl<L: Layout> PartitionAllocator<L> {
         };
         OpenSlab {
             slab: allocated.slab,
-            len: 0,
             rows,
             partition_group_slot: node,
             buffer_slot_idx: allocated.buffer_slot_idx,
@@ -624,8 +682,7 @@ mod tests {
             .map(|bytes| u64::from_ne_bytes(*bytes))
             .collect();
         assert_eq!(values, (0..ROWS_PER_SLAB as u64).collect::<Vec<_>>());
-        let open = allocator.partitions[3].open_slab.as_ref().unwrap();
-        assert_eq!(open.len, 1);
+        assert_eq!(allocator.open_slab_len(3), 1);
     }
 
     #[test]
