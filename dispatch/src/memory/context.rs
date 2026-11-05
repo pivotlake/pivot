@@ -498,8 +498,12 @@ impl MemoryContext {
         let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
             + self.clock.owned_in_region(Owner::Decompressed, self.node);
         let spilled = self.buffers_spilled[self.node].load(Ordering::Relaxed);
-        let target =
-            self.layout.node_slots(self.node).len() * RECLAIMABLE_SLOTS_TARGET_PERCENT / 100;
+        // The share of the node, but never less than the headroom a slab
+        // rollover needs, or a small ring runs out while the buffers it could
+        // spill are still sealing.
+        let target = (self.layout.node_slots(self.node).len() * RECLAIMABLE_SLOTS_TARGET_PERCENT
+            / 100)
+            .max(crate::memory::SPILL_HEADROOM_SLOTS);
         let reclaimable = free + cached + spilled;
         if reclaimable >= target {
             return 0;
@@ -751,7 +755,8 @@ mod tests {
 
     #[test]
     fn cached_slots_count_as_reclaimable_for_spilling() {
-        // 128 slots, so the target is 25 reclaimable; 10 free plus 15 cached.
+        // 128 slots, so the target is the headroom floor; 10 free plus 15
+        // cached count as 25 reclaimable.
         init_test_free_pool(10);
         for idx in 10..25 {
             memory_ctx().clock().bind(idx, Owner::Compressed);
@@ -759,12 +764,13 @@ mod tests {
 
         let shortfall = memory_ctx().slots_to_spill();
 
-        assert_eq!(shortfall, 0);
+        assert_eq!(shortfall, crate::memory::SPILL_HEADROOM_SLOTS - 25);
     }
 
     #[test]
     fn slots_to_spill_is_the_shortfall_below_the_reclaimable_target_less_what_is_spilled() {
-        // 128 slots, so the target is 25 reclaimable; seed 10 free, nothing cached.
+        // 128 slots, so the target is the headroom floor; seed 10 free, nothing
+        // cached.
         init_test_free_pool(10);
 
         let shortfall = memory_ctx().slots_to_spill();
@@ -773,14 +779,16 @@ mod tests {
         memory_ctx().record_spilled_buffers_released(shortfall);
         let after_release = memory_ctx().slots_to_spill();
 
-        assert_eq!(shortfall, 15);
+        let expected = crate::memory::SPILL_HEADROOM_SLOTS - 10;
+        assert_eq!(shortfall, expected);
         assert_eq!(while_spilled, 0);
-        assert_eq!(after_release, 15);
+        assert_eq!(after_release, expected);
     }
 
     #[test]
     fn slots_to_spill_is_this_workers_share_of_the_nodes_shortfall_rounded_up() {
-        // Four workers on one node of 128 slots; 10 free leaves a shortfall of 15.
+        // Four workers on one node of 128 slots, so the target is the headroom
+        // floor; 10 free leaves a shortfall split four ways, rounded up.
         WORKER_IDX.set(0);
         crate::worker::NUM_WORKERS.set(4);
         crate::waker::install_test_worker_waker();
@@ -806,7 +814,10 @@ mod tests {
 
         let share = memory_ctx().slots_to_spill();
 
-        assert_eq!(share, 4);
+        assert_eq!(
+            share,
+            (crate::memory::SPILL_HEADROOM_SLOTS - 10).div_ceil(4)
+        );
     }
 
     /// Install a context with no buffers seeded.

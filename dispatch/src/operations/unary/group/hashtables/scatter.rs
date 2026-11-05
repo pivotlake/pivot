@@ -19,7 +19,8 @@
 use super::hash_table::{PersistedKey, entry_layout};
 use crate::io::{FileRange, IORequesterError, OpenFile, ReadData};
 use crate::memory::{
-    Dynamic, PARTITIONS, PartitionAllocator, PartitionSlab, SpilledBuffer, Spiller, TakenSpills,
+    Dynamic, LARGEST_SLAB_BYTES, PARTITIONS, PartitionAllocator, PartitionSlab, SpilledBuffer,
+    Spiller, TakenSpills,
 };
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
@@ -27,7 +28,7 @@ use std::marker::PhantomData;
 /// Target size of a partition's slabs once it has filled a few, and of the
 /// first one, which is kept small so a partition with a handful of rows wastes
 /// little.
-const SLAB_BYTES: usize = 64 * 1024;
+const SLAB_BYTES: usize = LARGEST_SLAB_BYTES;
 const FIRST_SLAB_BYTES: usize = SLAB_BYTES / 8;
 
 /// Copyable layout for scatter rows.

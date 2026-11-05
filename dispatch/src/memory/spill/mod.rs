@@ -27,6 +27,22 @@ pub use partition_allocator::{PartitionAllocator, PartitionContents, PartitionSl
 pub use partition_evictor::{PartitionEvictor, SharedPartitionEvictor, TakenSpills};
 pub use partition_tree::PARTITIONS;
 
+/// The largest slab a partition grows to. Every partition can open one such
+/// slab between two spill checks, which bounds how much a consumer can take
+/// from the ring before the worker looks at the pressure again.
+pub const LARGEST_SLAB_BYTES: usize = 64 * 1024;
+
+/// Ring slots the spill check keeps reclaimable at the least. A worker spills
+/// ahead of exhaustion only if the headroom covers what it allocates between
+/// one check that finds something sealed and the next. Partitions filled at
+/// the same rate open their next slab in the same short stretch of batches,
+/// every one of them at once at the largest size, and the buffers of the slabs
+/// they just closed seal only as that stretch ends: a check in the middle of
+/// it finds nothing to spill. The headroom therefore carries two such
+/// rollovers, the one under way and the next one's worth of slack.
+pub const SPILL_HEADROOM_SLOTS: usize =
+    2 * PARTITIONS * LARGEST_SLAB_BYTES / crate::memory::BUFFER_SIZE;
+
 /// One partition's rows from a sealed buffer, going to its file as one write.
 pub struct SpillWrite {
     file: OpenFile,

@@ -73,8 +73,9 @@ pub use evict::{DataflowEvict, Evict};
 mod spill;
 pub(crate) use spill::directory as spill_directory;
 pub use spill::{
-    Dynamic, Fixed, Layout, PARTITIONS, PartitionAllocator, PartitionContents, PartitionEvictor,
-    PartitionSlab, SharedPartitionEvictor, SpilledBuffer, SpilledSlab, Spiller, TakenSpills,
+    Dynamic, Fixed, LARGEST_SLAB_BYTES, Layout, PARTITIONS, PartitionAllocator, PartitionContents,
+    PartitionEvictor, PartitionSlab, SPILL_HEADROOM_SLOTS, SharedPartitionEvictor, SpilledBuffer,
+    SpilledSlab, Spiller, TakenSpills,
 };
 
 #[cfg(any(test, feature = "test-util"))]
