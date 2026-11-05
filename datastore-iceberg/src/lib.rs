@@ -11,8 +11,8 @@
 //! # Writing
 //!
 //! An INSERT writes its Parquet files under the table's data path through
-//! Pivot's own store, with the credentials the catalog vended for the table
-//! when the statement was bound, cut by the table's partition spec (a
+//! Pivot's own store, with the credentials the catalog vends for the table,
+//! renewed at every refresh, cut by the table's partition spec (a
 //! transform of a column, a day or a bucket, is computed per row and
 //! recorded as the file's partition value). The commit is the
 //! `iceberg-tables` crate's, the one the pivotlake datastore commits its own
@@ -111,12 +111,15 @@
 //! Every table load asks the catalog to vend storage credentials
 //! (`X-Iceberg-Access-Delegation: vended-credentials`). A catalog that does
 //! answers with S3 keys in the table's storage properties, and the table's
-//! store is opened with them; those keys are usually an STS session's,
-//! short-lived, and scoped to the table, so the store is opened again at every
-//! refresh from the keys the catalog vended then. A catalog that vends nothing
-//! leaves the store to the factory the datastore was opened with, the
-//! process's own credential policy. Only the flat `s3.*` form is read; the
-//! per-prefix `storage-credentials` list is not.
+//! store signs its requests with them. Those keys are usually an STS
+//! session's, short-lived, and scoped to the table, so every refresh loads
+//! the table again and renews the keys of its store in place: a query that
+//! outlives the keys it started with signs its next request with the new
+//! ones. The refresh interval must therefore stay shorter than the keys'
+//! lifetime. A catalog that vends nothing leaves the store to the factory
+//! the datastore was opened with, the process's own credential policy. Only
+//! the flat `s3.*` form is read; the per-prefix `storage-credentials` list is
+//! not.
 //!
 //! A table's files are read through one store, the bucket its metadata file
 //! is in. The managed catalogs keep a table in one bucket; a table split
@@ -185,7 +188,7 @@ use iceberg_tables::block_on;
 use iceberg_tables::table_metadata_cache::TableCacheSlot;
 use iceberg_tables::{MetadataFile, MetadataStore, Table, TableLocation, check_partition_terms};
 
-use crate::table_store::{fetch_manifest_list_size, open_table_store};
+use crate::table_store::{fetch_manifest_list_size, open_table_store, renew_table_store};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -331,13 +334,14 @@ struct SchemaEntry {
 /// One table's entry in the index: the table's metadata and where it is, as
 /// the catalog last answered or as a commit of this process left it, with
 /// what building the table needs that the answer does not say: the store
-/// its files are read through, opened with the credentials the catalog
+/// its files are read through, signing with the credentials the catalog
 /// vended, and the size of the current snapshot's manifest list.
 #[derive(Clone)]
 struct TableEntry {
     metadata_file: MetadataFile,
-    /// Opened on the root of the metadata location the table was at when
-    /// it was entered.
+    /// Opened on the root of the table's metadata location: when this
+    /// version was entered, or for an earlier entry of the table, its keys
+    /// renewed at every refresh since.
     store: Arc<dyn ObjectStore>,
     /// Iceberg names the manifest list without a length, and a ring read needs
     /// one, so the store is asked once, at refresh, and the answer kept here
@@ -535,30 +539,44 @@ impl IcebergDatastore {
         Ok(index)
     }
 
-    /// `table`'s entry: with its store, opened now from the credentials the
-    /// catalog just vended, its manifest list's size, the one `previous`
-    /// learned when the snapshot is the one it entered, else asked of the
-    /// store now. Nothing of the table is read.
+    /// `table`'s entry: with its store, `previous`'s renewed with the
+    /// credentials the catalog just vended when it takes them, else opened
+    /// now; and its manifest list's size, the one `previous` learned when
+    /// the snapshot is the one it entered, else asked of the store now.
+    /// Nothing of the table is read.
     fn build_table_entry(
         &self,
         name: &SchemaQualifiedTableName,
         table: SpecTable,
         previous: Option<&Result<TableEntry, String>>,
     ) -> Result<TableEntry> {
+        let previous = previous.and_then(|previous| previous.as_ref().ok());
         let metadata_file = MetadataFile::try_from(&table)?;
-        let store = open_table_store(
-            name,
-            table.file_io().config().props(),
-            &metadata_file.location,
-            &*self.store_factory,
-        )?;
+        let storage_properties = table.file_io().config().props();
+        let store = match previous {
+            Some(previous)
+                if renew_table_store(
+                    name,
+                    &*previous.store,
+                    storage_properties,
+                    &metadata_file.location,
+                )? =>
+            {
+                Arc::clone(&previous.store)
+            }
+            _ => open_table_store(
+                name,
+                storage_properties,
+                &metadata_file.location,
+                &*self.store_factory,
+            )?,
+        };
         let path = table
             .metadata()
             .current_snapshot()
             .map(|snapshot| snapshot.manifest_list());
-        let unchanged = previous
-            .and_then(|previous| previous.as_ref().ok())
-            .filter(|previous| path.is_some() && previous.manifest_list_path() == path);
+        let unchanged =
+            previous.filter(|previous| path.is_some() && previous.manifest_list_path() == path);
         let manifest_list_size = match unchanged.and_then(|previous| previous.manifest_list_size) {
             Some(size) => Some(size),
             None => fetch_manifest_list_size(name, &metadata_file, &*store)?,

@@ -8,6 +8,11 @@
 //! any, else through the factory that applies the process's credential
 //! policy. A snapshot names its manifest list without a length, so the
 //! store is asked for the size of the current one when the table is indexed.
+//!
+//! Vended credentials are a session's: short-lived. A later load of the table
+//! that vends keys for the same root, region and endpoint renews the keys of
+//! the store already open rather than opening another, so a query holding
+//! the store signs its next request with the new keys.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +20,7 @@ use std::sync::Arc;
 use iceberg::io::{
     CLIENT_REGION, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
 };
-use iceberg_tables::metadata::layout::key_under_root;
+use iceberg_tables::metadata::layout::{is_same_root, key_under_root};
 use iceberg_tables::{MetadataFile, split_location};
 use object_storage::{
     ExternalStoreFactory, ObjectStore, S3Credentials, S3Keys, S3Store, StoreScheme,
@@ -29,9 +34,7 @@ use crate::{Error, Result};
 /// `storage_properties`, the table's storage properties as the catalog
 /// client merged them, when the catalog vended any, else through
 /// `store_factory`. Opened when the table is indexed rather than when a
-/// query loads it, since opening a store may ask the bucket for its region;
-/// and opened again at every refresh, so vended credentials never outlive
-/// their session.
+/// query loads it, since opening a store may ask the bucket for its region.
 pub(crate) fn open_table_store(
     name: &SchemaQualifiedTableName,
     storage_properties: &HashMap<String, String>,
@@ -41,6 +44,27 @@ pub(crate) fn open_table_store(
     let vended = read_vended_s3_credentials(&name.to_string(), storage_properties)?;
     let (root, _) = split_location(metadata_location)?;
     open_store_at_root(&root, store_factory, vended)
+}
+
+/// Whether `store`, the one the last load of the table `name` was given,
+/// signs with the credentials among `storage_properties` from now on. It
+/// does when the catalog vended credentials, the store is on the root of
+/// `metadata_location`, and it takes them: a query holding the store then
+/// signs its next request with the new keys, so vended credentials are
+/// renewed under it at every refresh. A store that does not is left as it
+/// was, and the table needs one opened afresh.
+pub(crate) fn renew_table_store(
+    name: &SchemaQualifiedTableName,
+    store: &dyn ObjectStore,
+    storage_properties: &HashMap<String, String>,
+    metadata_location: &str,
+) -> Result<bool> {
+    let Some(credentials) = read_vended_s3_credentials(&name.to_string(), storage_properties)?
+    else {
+        return Ok(false);
+    };
+    let (root, _) = split_location(metadata_location)?;
+    Ok(is_same_root(&store.location_uri(), &root) && store.renew_s3_credentials(&credentials))
 }
 
 /// The size of the manifest list of the current snapshot `metadata_file`
@@ -120,7 +144,115 @@ pub(crate) fn read_vended_s3_credentials(
 
 #[cfg(test)]
 mod tests {
+    use object_storage::{StoreConnection, StoreError};
+
     use super::*;
+
+    /// A factory that opens nothing, for a table whose every store the catalog
+    /// vends keys for.
+    #[derive(Debug)]
+    struct NoStoreFactory;
+
+    impl ExternalStoreFactory for NoStoreFactory {
+        fn open(&self, root_uri: &str) -> object_storage::Result<Arc<dyn ObjectStore>> {
+            Err(StoreError::Config(format!(
+                "nothing vended for `{root_uri}`"
+            )))
+        }
+    }
+
+    /// The storage properties of a table the catalog vended keys for under
+    /// `access_key`, at a fixed region and endpoint, so opening a store with
+    /// them asks nothing of the network.
+    fn vended_properties(access_key: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("s3.access-key-id".to_string(), access_key.to_string()),
+            ("s3.secret-access-key".to_string(), "secret".to_string()),
+            (
+                "s3.session-token".to_string(),
+                format!("{access_key}-token"),
+            ),
+            ("s3.region".to_string(), "eu-west-1".to_string()),
+            (
+                "s3.endpoint".to_string(),
+                "http://objects.example".to_string(),
+            ),
+        ])
+    }
+
+    fn table_name() -> SchemaQualifiedTableName {
+        SchemaQualifiedTableName::new("db".to_string(), "t".to_string())
+    }
+
+    /// The store of a table in the `lake` bucket, as a query holds it: opened
+    /// with the keys the catalog vended under `access_key`.
+    fn open_store_held_by_query(access_key: &str) -> Arc<dyn ObjectStore> {
+        open_table_store(
+            &table_name(),
+            &vended_properties(access_key),
+            "s3://lake/db/t/metadata/v1.metadata.json",
+            &NoStoreFactory,
+        )
+        .unwrap()
+    }
+
+    fn access_key_of(store: &dyn ObjectStore) -> String {
+        match store.connection() {
+            StoreConnection::S3 {
+                credentials: Some(credentials),
+                ..
+            } => credentials.keys.access_key,
+            _ => panic!("not a signing S3 store"),
+        }
+    }
+
+    #[test]
+    fn a_later_loads_keys_renew_the_store_a_query_holds() {
+        let held_by_query = open_store_held_by_query("first");
+
+        let renewed = renew_table_store(
+            &table_name(),
+            held_by_query.as_ref(),
+            &vended_properties("second"),
+            "s3://lake/db/t/metadata/v2.metadata.json",
+        )
+        .unwrap();
+
+        assert!(renewed);
+        assert_eq!(access_key_of(held_by_query.as_ref()), "second");
+    }
+
+    #[test]
+    fn keys_vended_for_a_table_moved_to_another_bucket_do_not_renew_the_store() {
+        let held_by_query = open_store_held_by_query("first");
+
+        let renewed = renew_table_store(
+            &table_name(),
+            held_by_query.as_ref(),
+            &vended_properties("second"),
+            "s3://other-lake/db/t/metadata/v2.metadata.json",
+        )
+        .unwrap();
+
+        assert!(!renewed);
+        assert_eq!(access_key_of(held_by_query.as_ref()), "first");
+    }
+
+    #[test]
+    fn a_load_that_vends_no_keys_does_not_renew_the_store() {
+        let held_by_query = open_store_held_by_query("first");
+
+        let renewed = renew_table_store(
+            &table_name(),
+            held_by_query.as_ref(),
+            &HashMap::from([("s3.region".to_string(), "eu-west-1".to_string())]),
+            "s3://lake/db/t/metadata/v2.metadata.json",
+        )
+        .unwrap();
+
+        assert!(!renewed);
+        assert_eq!(access_key_of(held_by_query.as_ref()), "first");
+    }
 
     #[test]
     fn vended_keys_become_credentials_with_their_token_region_and_endpoint() {

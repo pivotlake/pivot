@@ -1,7 +1,7 @@
 //! End-to-end pgwire tests over object storage: stand up a real `Server` whose
 //! catalog is rooted in a bucket (MinIO / fake-gcs, or a local dir), `CREATE
 //! TABLE` over Parquet files sitting in that bucket, and query them through a
-//! Postgres client — the full `CREATE TABLE` → plan → scan-over-presigned-URL →
+//! Postgres client — the full `CREATE TABLE` → plan → scan-over-signed-HTTP →
 //! wire-encode path, against real object storage.
 //!
 //! Each behaviour is written once over a `&Backend` and run on local / S3 / GCS
@@ -118,7 +118,7 @@ mod bodies {
     }
 
     /// A filtered `COUNT(*)` scans the bucket-resident files through the executor
-    /// (presigned reads) and counts only the matching rows. The predicate forces
+    /// (signed range reads) and counts only the matching rows. The predicate forces
     /// a real (non-empty) scan, so `COUNT(*)` is answered correctly here.
     pub async fn count_with_filter(b: &Backend) {
         let client = events_server(b).await;
