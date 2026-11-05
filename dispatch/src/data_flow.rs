@@ -126,6 +126,15 @@ struct OperatorGraph {
     /// Whether the dataflow registered its operators' evictors with the memory
     /// context, so that a dropped operator's evictor has to be removed there.
     evictors_registered: bool,
+    /// Whether this dataflow's operators have been asked to spill on this
+    /// worker, so that there may be files under the worker's spill directory
+    /// to remove. Until then nothing is removed: each removal is a path walk
+    /// through the kernel, once per retired operator and once per dropped
+    /// dataflow on every worker, and a query that never came under memory
+    /// pressure would pay for all of them. Set when the operators are asked,
+    /// not when a buffer is counted as spilled, because a spill opens its
+    /// files before its writes are issued and counted.
+    may_have_spill_files_on_this_worker: bool,
 }
 
 impl OperatorGraph {
@@ -155,6 +164,7 @@ impl OperatorGraph {
             graph: Graph::from_edges(nodes, &publisher_to_subscriber),
             dataflow_id,
             evictors_registered,
+            may_have_spill_files_on_this_worker: false,
         }
     }
 
@@ -164,6 +174,9 @@ impl OperatorGraph {
         self.graph.node_mut(idx).operator = None;
         if self.evictors_registered {
             memory_ctx().remove_operator_evictor(self.dataflow_id, idx);
+        }
+        if !self.may_have_spill_files_on_this_worker {
+            return;
         }
         if let Err(error) =
             spill_directory::remove_operator_directory(self.dataflow_id, WORKER_IDX.get(), idx)
@@ -350,7 +363,9 @@ impl Drop for DataFlow {
         if self.registered_evictors {
             memory_ctx().unregister_dataflow_evictors(self.id);
         }
-        if let Err(error) = spill_directory::remove_worker_directory(self.id, WORKER_IDX.get()) {
+        if self.graph.may_have_spill_files_on_this_worker
+            && let Err(error) = spill_directory::remove_worker_directory(self.id, WORKER_IDX.get())
+        {
             warn!(
                 "could not remove dataflow {}'s spill files: {error}",
                 self.id
@@ -641,6 +656,7 @@ impl DataFlow {
     /// less than `count` when the operators had less to give.
     pub fn spill(&mut self, requester: &RefCell<IORequester>, count: usize) -> usize {
         self.try_run_or(0, |d| {
+            d.graph.may_have_spill_files_on_this_worker = true;
             let io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
             let mut spiller = Spiller::new(io);
             // The walk stops once the count is met; only the count matters here.
@@ -826,6 +842,53 @@ mod tests {
         assert_eq!(*asked[2].lock().unwrap(), [5]);
         assert_eq!(*asked[1].lock().unwrap(), [2]);
         assert!(asked[0].lock().unwrap().is_empty());
+    }
+
+    /// A dataflow of one operator that can spill `capacity` buffers.
+    fn dataflow_with_one_spilling_operator(id: Identifier, capacity: usize) -> DataFlow {
+        let (err_tx, _err_rx) = mpsc::channel();
+        let (stats_tx, _stats_rx) = mpsc::channel();
+        DataFlow::new(
+            id,
+            Arc::new(AtomicBool::new(false)),
+            err_tx,
+            vec![Box::new(SpillingOperator {
+                capacity,
+                asked: Arc::default(),
+            })],
+            vec![None],
+            Vec::new(),
+            HashMap::default(),
+            stats_tx,
+            false,
+        )
+    }
+
+    #[test]
+    fn a_dataflow_that_never_spilled_leaves_the_spill_directory_alone_when_dropped() {
+        let dataflow_id = 9_000_010;
+        let directory = spill_directory::operator_directory(dataflow_id, WORKER_IDX.get(), 0);
+        std::fs::create_dir_all(&directory).unwrap();
+        let flow = dataflow_with_one_spilling_operator(dataflow_id, 1);
+
+        drop(flow);
+
+        let left_alone = directory.exists();
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(left_alone);
+    }
+
+    #[test]
+    fn a_dataflow_that_spilled_removes_its_spill_directory_when_dropped() {
+        let dataflow_id = 9_000_011;
+        let directory = spill_directory::operator_directory(dataflow_id, WORKER_IDX.get(), 0);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut flow = dataflow_with_one_spilling_operator(dataflow_id, 1);
+        flow.spill(&RefCell::new(IORequester::default()), 1);
+
+        drop(flow);
+
+        assert!(!directory.exists());
     }
 
     struct CountingOperator(Arc<AtomicUsize>);
