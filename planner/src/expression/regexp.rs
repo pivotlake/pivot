@@ -19,9 +19,10 @@
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use arrow_array::builder::{BooleanBufferBuilder, StringViewBuilder};
+use arrow_array::builder::BooleanBufferBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringViewArray};
+use arrow_buffer::{Buffer, NullBufferBuilder, ScalarBuffer};
 use regex::bytes::{Captures, Regex as BytesRegex, RegexBuilder as BytesRegexBuilder};
 use std::borrow::Cow;
 use std::fmt::{self, Display};
@@ -177,9 +178,12 @@ fn translate_replacement(replacement: &str) -> Vec<u8> {
 /// Apply a first-match replacement across every row of `strings`.
 /// `replace_first` returns the replaced bytes for a row, or `None` to pass the
 /// row through unchanged. Values arrive in runs (sessions repeat the same URL),
-/// so an equal-to-previous input reuses the prior row's result without
+/// so an equal-to-previous input reuses the prior row's view without
 /// re-matching. Shared with [`RegexpJitReplace`](super::regexp_jit::RegexpJitReplace).
 ///
+/// The output views are written here rather than through a builder: the
+/// builder's append is a call per row that the optimizer inlines in one build
+/// and not in another, and left out of line it costs as much as the match.
 /// Generic over the closure, so each caller gets its own copy; inlined into
 /// that caller so the closure's body and this loop end up as one function.
 #[inline(always)]
@@ -187,37 +191,62 @@ pub(super) fn replace_column(
     strings: &StringViewArray,
     mut replace_first: impl FnMut(&[u8]) -> Option<Vec<u8>>,
 ) -> ArrayRef {
-    let mut out = StringViewBuilder::with_capacity(strings.len());
+    let mut views: Vec<u128> = Vec::with_capacity(strings.len());
+    // Every value longer than a view holds inline goes in here, back to back.
+    let mut long_values: Vec<u8> = Vec::new();
+    let mut nulls = NullBufferBuilder::new(strings.len());
     let mut last_input: Option<&str> = None;
-    // `None` means "no match — pass the input through".
-    let mut last_output: Option<Vec<u8>> = None;
+    let mut last_view = 0u128;
     for value in strings.iter() {
         let Some(s) = value else {
-            out.append_null();
+            views.push(0);
+            nulls.append_null();
             continue;
         };
-        if last_input == Some(s) {
-            match &last_output {
-                // SAFETY: bytes came from matching/splicing this column's
-                // (already `&str`) values.
-                Some(bytes) => out.append_value(unsafe { std::str::from_utf8_unchecked(bytes) }),
-                None => out.append_value(s),
-            }
-            continue;
+        nulls.append_non_null();
+        if last_input != Some(s) {
+            last_input = Some(s);
+            last_view = match replace_first(s.as_bytes()) {
+                Some(bytes) => write_view(&mut long_values, &bytes),
+                None => write_view(&mut long_values, s.as_bytes()),
+            };
         }
-        last_input = Some(s);
-        match replace_first(s.as_bytes()) {
-            Some(bytes) => {
-                out.append_value(unsafe { std::str::from_utf8_unchecked(&bytes) });
-                last_output = Some(bytes);
-            }
-            None => {
-                out.append_value(s);
-                last_output = None;
-            }
-        }
+        views.push(last_view);
     }
-    Arc::new(out.finish()) as ArrayRef
+    // SAFETY: every view was written by `write_view` for bytes that are in
+    // `long_values` when longer than inline, and the bytes are UTF-8: the
+    // inputs are `&str` and a replacement splices pieces of them with a
+    // UTF-8 template.
+    let array = unsafe {
+        StringViewArray::new_unchecked(
+            ScalarBuffer::from(views),
+            vec![Buffer::from_vec(long_values)],
+            nulls.finish(),
+        )
+    };
+    Arc::new(array) as ArrayRef
+}
+
+/// The 16-byte view of `bytes` for a string-view array whose single data
+/// buffer is `long_values`: the length, then the bytes themselves when they
+/// fit the twelve remaining bytes, otherwise their first four bytes, the
+/// buffer index (zero) and their offset in `long_values`, where they are
+/// appended.
+#[inline(always)]
+fn write_view(long_values: &mut Vec<u8>, bytes: &[u8]) -> u128 {
+    const INLINE_BYTES: usize = 12;
+    let mut view = [0u8; 16];
+    view[..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+    if bytes.len() <= INLINE_BYTES {
+        view[4..4 + bytes.len()].copy_from_slice(bytes);
+    } else {
+        view[4..8].copy_from_slice(&bytes[..4]);
+        let offset =
+            u32::try_from(long_values.len()).expect("a batch's replaced strings fit one buffer");
+        view[12..].copy_from_slice(&offset.to_le_bytes());
+        long_values.extend_from_slice(bytes);
+    }
+    u128::from_le_bytes(view)
 }
 
 #[cfg(test)]
@@ -273,6 +302,38 @@ mod tests {
         );
 
         assert_eq!(*only_column(&rows[0]), "bXnana");
+    }
+
+    #[rstest]
+    fn replacements_longer_than_a_view_holds_inline_come_back_whole(
+        mut testing_planner: TestingPlanner,
+    ) {
+        urls(
+            &mut testing_planner,
+            vec!["banana", "banana", "cherry", "banana", "cherry"],
+        );
+
+        let mut rows = run(
+            &mut testing_planner,
+            "SELECT regexp_replace(url, 'a', 'XYZXYZXYZXYZXYZ') FROM urls",
+        );
+
+        let got = rows
+            .iter_mut()
+            .map(|r| only_column(r).as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        // The replaced value is twenty bytes, past what a view holds inline;
+        // the untouched one stays inline, and both repeat.
+        assert_eq!(
+            got,
+            vec![
+                "bXYZXYZXYZXYZXYZnana",
+                "bXYZXYZXYZXYZXYZnana",
+                "cherry",
+                "bXYZXYZXYZXYZXYZnana",
+                "cherry",
+            ]
+        );
     }
 
     #[rstest]
