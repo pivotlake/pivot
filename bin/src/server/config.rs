@@ -344,6 +344,7 @@ mod tests {
             config.entries,
             None,
             config.datastore_refresh_interval.as_duration(),
+            1024 * 1024,
         )
         .unwrap();
 

@@ -122,6 +122,7 @@ async fn queries_bind_tables_by_datastore_name() {
                 config.entries,
                 Some(&path),
                 config.datastore_refresh_interval.as_duration(),
+                1024 * 1024,
             )
             .unwrap(),
         );

@@ -1,5 +1,6 @@
-//! The buffer-pool budget a `pivot` process takes, shared by `pivot server`
-//! and `pivot open`: an absolute size, or a share of the machine's memory.
+//! The memory budget a `pivot` process takes, shared by `pivot server` and
+//! `pivot open`: an absolute size, or a share of the machine's memory, most
+//! of it the buffer pool and a fixed part the metadata cache.
 
 use std::str::FromStr;
 
@@ -23,7 +24,11 @@ pub const DEFAULT_MEMORY_PCT: u64 = 80;
 /// ring and the pool budget is the whole memory budget.
 pub const OVERHEAD_RESERVE_BYTES: u64 = 4 * GIB;
 
-/// A buffer-pool budget as the config file or the command line spells it: an
+/// The share of the memory budget the metadata cache takes, in percent. The
+/// buffer pool takes the rest.
+pub const METADATA_CACHE_PCT: u64 = 5;
+
+/// A memory budget as the config file or the command line spells it: an
 /// absolute size such as `32g`, or a share of the machine's physical memory
 /// such as `80%`, from which [`OVERHEAD_RESERVE_BYTES`] is held back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,25 +84,51 @@ pub struct MachineTooSmall {
     memory_pct: u64,
 }
 
+/// A memory budget resolved to bytes: what the buffer pool is sized to, and
+/// what the metadata cache (the manifests of Iceberg tables, held parsed in
+/// memory between plans) may hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedMemoryBudget {
+    pub pool_bytes: u64,
+    pub metadata_cache_bytes: u64,
+}
+
+impl ResolvedMemoryBudget {
+    /// The budget the two parts add up to.
+    pub fn budget_bytes(&self) -> u64 {
+        self.pool_bytes + self.metadata_cache_bytes
+    }
+}
+
 impl MemoryBudget {
-    /// The pool's byte budget on a machine with `total_bytes` of physical
-    /// memory: the size as written, or the share of `total_bytes` minus
-    /// [`OVERHEAD_RESERVE_BYTES`].
-    pub fn resolve(self, total_bytes: u64) -> Result<u64, MachineTooSmall> {
-        match self {
-            Self::Bytes(size) => Ok(size.as_bytes()),
+    /// The budget on a machine with `total_bytes` of physical memory, the
+    /// size as written or the share of `total_bytes` minus
+    /// [`OVERHEAD_RESERVE_BYTES`], shared out: [`METADATA_CACHE_PCT`] of it to
+    /// the metadata cache, the rest to the pool.
+    pub fn resolve(self, total_bytes: u64) -> Result<ResolvedMemoryBudget, MachineTooSmall> {
+        let budget_bytes = match self {
+            Self::Bytes(size) => size.as_bytes(),
             Self::Percent(memory_pct) => {
                 let share = total_bytes * memory_pct / 100;
-                let pool_bytes = share.saturating_sub(OVERHEAD_RESERVE_BYTES);
-                if pool_bytes < BUFFER_SIZE as u64 {
-                    return Err(MachineTooSmall {
-                        total_bytes,
-                        memory_pct,
-                    });
-                }
-                Ok(pool_bytes)
+                share.saturating_sub(OVERHEAD_RESERVE_BYTES)
             }
+        };
+        // Divided first: a budget written as the largest size must still resolve
+        // to be refused against the machine's memory.
+        let metadata_cache_bytes = budget_bytes / 100 * METADATA_CACHE_PCT;
+        let pool_bytes = budget_bytes - metadata_cache_bytes;
+        if let Self::Percent(memory_pct) = self
+            && pool_bytes < BUFFER_SIZE as u64
+        {
+            return Err(MachineTooSmall {
+                total_bytes,
+                memory_pct,
+            });
         }
+        Ok(ResolvedMemoryBudget {
+            pool_bytes,
+            metadata_cache_bytes,
+        })
     }
 }
 
@@ -110,7 +141,7 @@ mod tests {
         let budget: MemoryBudget = "32g".parse().unwrap();
 
         assert_eq!(budget, MemoryBudget::Bytes(ByteSize::from_bytes(32 * GIB)));
-        assert_eq!(budget.resolve(8 * GIB).unwrap(), 32 * GIB);
+        assert_eq!(budget.resolve(8 * GIB).unwrap().budget_bytes(), 32 * GIB);
     }
 
     #[test]
@@ -119,9 +150,19 @@ mod tests {
 
         assert_eq!(budget, MemoryBudget::Percent(50));
         assert_eq!(
-            budget.resolve(64 * GIB).unwrap(),
+            budget.resolve(64 * GIB).unwrap().budget_bytes(),
             32 * GIB - OVERHEAD_RESERVE_BYTES
         );
+    }
+
+    #[test]
+    fn the_metadata_cache_takes_its_part_of_the_budget_and_the_pool_the_rest() {
+        let budget: MemoryBudget = "100g".parse().unwrap();
+
+        let resolved = budget.resolve(256 * GIB).unwrap();
+
+        assert_eq!(resolved.metadata_cache_bytes, 5 * GIB);
+        assert_eq!(resolved.pool_bytes, 95 * GIB);
     }
 
     #[test]

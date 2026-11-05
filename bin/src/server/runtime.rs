@@ -82,13 +82,19 @@ fn build_metastore(
     path: &Path,
     store: Option<MetastoreStore>,
     refresh_interval: Duration,
+    metadata_cache_bytes: u64,
 ) -> Result<Arc<DiskMetastore>, Error> {
     let metastore_file = store.map(|MetastoreStore::File { path }| path);
-    let metastore = DiskMetastore::open(entries, metastore_file.as_deref(), refresh_interval)
-        .map_err(|source| Error::Metastore {
-            path: path.to_path_buf(),
-            source: Box::new(source),
-        })?;
+    let metastore = DiskMetastore::open(
+        entries,
+        metastore_file.as_deref(),
+        refresh_interval,
+        metadata_cache_bytes,
+    )
+    .map_err(|source| Error::Metastore {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })?;
     Ok(Arc::new(metastore))
 }
 
@@ -146,13 +152,18 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
             cache.open()
         })
         .transpose()?;
-    let pool_bytes = config.memory.resolve(get_total_memory() as u64)? as usize;
+    let memory = config.memory.resolve(get_total_memory() as u64)?;
+    let pool_bytes = memory.pool_bytes as usize;
+    let metadata_cache_bytes = memory.metadata_cache_bytes;
     // The pool is a share of *total* memory, but every one of its slots is
     // faulted in while the workers start, so what it has to fit into is what the
     // machine has free. Asking for more than that is not a slower server: it is
     // an OOM kill part way through boot, which leaves nobody around to say why.
     let available_bytes = get_available_memory();
-    info!(pool_bytes, available_bytes, "buffer pool memory budget");
+    info!(
+        pool_bytes,
+        metadata_cache_bytes, available_bytes, "memory budget"
+    );
     if pool_bytes > available_bytes {
         return Err(Error::InsufficientMemory {
             requested_bytes: pool_bytes,
@@ -178,6 +189,7 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
             &options.config,
             config.metastore,
             config.datastore_refresh_interval.as_duration(),
+            metadata_cache_bytes,
         )?;
         let catalog = build_catalog(&options.config, &metastore, dispatch.dispatcher())?;
         let mut server = Server::new(server_config.bind, dispatch, catalog, metastore)?;

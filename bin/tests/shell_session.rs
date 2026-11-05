@@ -115,6 +115,7 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
                 &ShellTarget::pivot(location),
                 1,
                 32,
+                1024 * 1024,
                 DEFAULT_REFRESH_INTERVAL,
             )
         })
@@ -174,6 +175,7 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
         &ShellTarget::pivot(location),
         1,
         32,
+        1024 * 1024,
         DEFAULT_REFRESH_INTERVAL,
     ) {
         Ok(_) => panic!("a second instance opened the locked datastore"),
@@ -193,6 +195,7 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
                 &ShellTarget::pivot(location),
                 1,
                 32,
+                1024 * 1024,
                 DEFAULT_REFRESH_INTERVAL,
             )
         })
@@ -219,12 +222,12 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
 }
 
 #[test]
-fn default_pool_budget_is_the_share_less_the_overhead_reserve() {
+fn default_memory_budget_is_the_share_less_the_overhead_reserve() {
     use bin::memory::{GIB, OVERHEAD_RESERVE_BYTES};
 
-    let pool_bytes = MemoryBudget::default().resolve(100 * GIB).unwrap();
+    let resolved = MemoryBudget::default().resolve(100 * GIB).unwrap();
 
-    assert_eq!(pool_bytes, 80 * GIB - OVERHEAD_RESERVE_BYTES);
+    assert_eq!(resolved.budget_bytes(), 80 * GIB - OVERHEAD_RESERVE_BYTES);
 }
 
 #[test]

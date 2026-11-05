@@ -36,6 +36,13 @@ iceberg-catalog-rest = { git = "https://github.com/pivotlake/iceberg-rust", bran
 # The REST client's reqwest carries no TLS backend of its own; a catalog behind
 # https needs one.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# The crate plans a scan through a file IO of this crate's own, over the
+# table's store: its storage traits are object-safe through typetag, read and
+# write `Bytes`, and stream deletes.
+typetag = "0.2"
+serde = { workspace = true }
+bytes = { workspace = true }
+futures = "0.3"
 
 [dev-dependencies]
 # The integration tests stand up a real REST catalog (apache/iceberg-rest-fixture)
@@ -51,3 +58,4 @@ arrow-schema = { workspace = true }
 ureq = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
 url = { workspace = true }
+tempfile = { workspace = true }

@@ -267,6 +267,7 @@ mod tests {
                     &ShellTarget::pivot(directory.to_str().unwrap()),
                     1,
                     32,
+                    1024 * 1024,
                     datastore_pivotlake::DEFAULT_REFRESH_INTERVAL,
                 )
             })

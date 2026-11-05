@@ -128,7 +128,7 @@ all of them out.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `memory` | `80%` | Buffer-pool budget: a [size](#sizes-and-intervals) such as `32g`, or a percentage of the machine's physical memory. A percentage holds back a 4 GiB reserve for allocations outside the pool, so `80%` on a 64 GiB machine is a 47 GiB pool. Pivot checks that the budget fits available memory before starting. |
+| `memory` | `80%` | Memory budget: a [size](#sizes-and-intervals) such as `32g`, or a percentage of the machine's physical memory. A percentage holds back a 4 GiB reserve for allocations outside the budget, so `80%` on a 64 GiB machine is a 47 GiB budget. 5% of the budget is the metadata cache, which holds the manifests of Iceberg tables between queries; the buffer pool takes the rest. Pivot checks that the budget fits available memory before starting. |
 | `workers` | Machine core count | Dispatch worker threads. Must be at least one. |
 | `datastore_refresh_interval` | `30s` | How often each datastore brings itself up to date with its store: the tables it has and each table's committed files. For a shared remote store, this bounds how stale a query's view of another process's commits can be. This process's own commits are visible immediately. |
 | `log` | `info` | What the server logs to stdout. A level for everything, such as `info` or `debug`, or per-target levels such as `info,dispatch=debug`. |

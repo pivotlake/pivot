@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use datastore_iceberg::{IcebergCatalogAuth, IcebergCatalogConfig, IcebergDatastore};
+use datastore_iceberg::{
+    IcebergCatalogAuth, IcebergCatalogConfig, IcebergDatastore, ManifestCache,
+};
 use dispatch::Dispatch;
 use object_storage::{ExternalStoreFactory, ObjectStore, StoreError};
 use testcontainers::core::{ContainerPort, IntoContainerPort};
@@ -113,6 +115,7 @@ fn refresh_succeeds_after_the_first_token_expires() {
     let datastore = IcebergDatastore::open(
         &config,
         Arc::new(NoStoreFactory),
+        ManifestCache::new(1024 * 1024),
         dispatch.dispatcher(),
         Duration::from_secs(3600),
     )

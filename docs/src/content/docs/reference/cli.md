@@ -34,7 +34,7 @@ Opens a single datastore and starts the [SQL shell](#sql-shell) over it.
 | `<DATASTORE_LOCATION>` | **Required.** Where the datastore is: a local directory or object-store URI for `--kind pivotlake`, or the REST catalog's `http(s)` base URI for `--kind iceberg`. See [Datastore locations](#datastore-locations). |
 | `--kind <KIND>` | The datastore implementation, `pivotlake` (also accepted as `pivot`) or `iceberg`.<br />**Default:** `pivotlake` |
 | `--warehouse <WAREHOUSE>` | The warehouse to serve, for an Iceberg catalog that serves several. Only valid with `--kind iceberg`. |
-| `--memory <SIZE>` | The buffer-pool budget, as a size such as `8g` or a share of memory such as `50%`. See [Memory budget](#memory-budget).<br />**Default:** `80%` |
+| `--memory <SIZE>` | The memory budget, as a size such as `8g` or a share of memory such as `50%`. See [Memory budget](#memory-budget).<br />**Default:** `80%` |
 | `--workers <COUNT>` | The number of worker threads that execute queries. Must be at least 1.<br />**Default:** the number of available cores |
 
 ### Datastore locations
@@ -112,7 +112,7 @@ pivot open --kind iceberg https://catalog.example.com/api \
   --warehouse s3://lake/warehouse
 ```
 
-Limit the shell to 2 GiB of buffer pool and 4 worker threads:
+Limit the shell to a 2 GiB memory budget and 4 worker threads:
 
 ```sh
 pivot open --memory 2g --workers 4 ./pivot-data
@@ -233,9 +233,11 @@ Ctrl-D
 
 ## Memory budget
 
-Both commands allocate a fixed buffer pool at startup. `pivot open` takes
-its budget from `--memory`, and `pivot server` from the `memory` key of its
-configuration file. The value takes one of two forms:
+Both commands take a fixed memory budget at startup: 5% of it is the
+metadata cache, which holds the manifests of Iceberg tables between queries,
+and the rest is the buffer pool. `pivot open` takes the budget from
+`--memory`, and `pivot server` from the `memory` key of its configuration
+file. The value takes one of two forms:
 
 | Form | Example | Meaning |
 | --- | --- | --- |
@@ -244,10 +246,10 @@ configuration file. The value takes one of two forms:
 
 The default is `80%`.
 
-The pool is divided into 2 MiB slots, so the budget must be at least 2 MiB.
-Every slot is allocated as the process starts, so Pivot refuses to start when
-the budget exceeds the memory currently available, rather than being killed
-by the operating system partway through startup.
+The pool is divided into 2 MiB slots, so the budget must leave room for at
+least one. Every slot is allocated as the process starts, so Pivot refuses to
+start when the budget exceeds the memory currently available, rather than
+being killed by the operating system partway through startup.
 
 :::note
 On a machine with little memory, the 4 GiB reserve can leave nothing for the

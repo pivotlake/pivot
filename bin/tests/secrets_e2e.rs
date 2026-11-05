@@ -59,6 +59,7 @@ fn start_server_from_config(config_yaml: &str) -> u16 {
                     config.entries,
                     None,
                     config.datastore_refresh_interval.as_duration(),
+                    1024 * 1024,
                 )
                 .unwrap(),
             );

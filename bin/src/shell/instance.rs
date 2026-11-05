@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use datastore_iceberg::IcebergDatastore;
+use datastore_iceberg::{IcebergDatastore, ManifestCache};
 use datastore_pivotlake::{DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, PivotlakeDatastore};
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use object_storage::{AmbientExternalStoreFactory, ObjectStore, open_store};
@@ -155,33 +155,40 @@ impl ShellInstance {
             return Err(ResourceLimitError::NoWorkers.into());
         }
 
-        let memory_bytes = limits
+        let resolved = limits
             .memory
             .unwrap_or_default()
             .resolve(memory().total_memory())?;
-        if memory_bytes < BUFFER_SIZE as u64 {
+        if resolved.pool_bytes < BUFFER_SIZE as u64 {
             return Err(ResourceLimitError::MemoryTooSmall {
-                requested_bytes: memory_bytes,
+                requested_bytes: resolved.budget_bytes(),
             }
             .into());
         }
 
         let available_bytes = memory().available_memory();
-        if memory_bytes > available_bytes {
+        if resolved.budget_bytes() > available_bytes {
             return Err(ResourceLimitError::InsufficientMemory {
-                requested_bytes: memory_bytes,
+                requested_bytes: resolved.budget_bytes(),
                 available_bytes,
             }
             .into());
         }
 
-        let buffers = usize::try_from(memory_bytes / BUFFER_SIZE as u64)
+        let buffers = usize::try_from(resolved.pool_bytes / BUFFER_SIZE as u64)
             .map_err(|_| ResourceLimitError::MemoryTooLarge)?;
-        Self::open_with_resources(target, workers, buffers, DEFAULT_REFRESH_INTERVAL)
+        Self::open_with_resources(
+            target,
+            workers,
+            buffers,
+            resolved.metadata_cache_bytes,
+            DEFAULT_REFRESH_INTERVAL,
+        )
     }
 
-    /// Open `target` with an explicit dispatch shape and refresh cadence. This
-    /// is useful for embedding and for small black-box test instances.
+    /// Open `target` with an explicit dispatch shape, metadata cache budget
+    /// and refresh cadence. This is useful for embedding and for small
+    /// black-box test instances.
     ///
     /// The instance reloads its tables every `refresh_interval`, the same
     /// background sweep the server runs, so data another process commits to a
@@ -194,10 +201,16 @@ impl ShellInstance {
         target: &ShellTarget,
         workers: usize,
         buffers: usize,
+        metadata_cache_bytes: u64,
         refresh_interval: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
-        let datastore = open_datastore(target, dispatch.dispatcher(), refresh_interval)?;
+        let datastore = open_datastore(
+            target,
+            dispatch.dispatcher(),
+            metadata_cache_bytes,
+            refresh_interval,
+        )?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
         let catalog = Arc::new(
             PivotCatalog::new(
@@ -256,10 +269,12 @@ impl Drop for ShellInstance {
 /// maintenance (see [`ShellInstance::open_with_resources`]); an Iceberg
 /// datastore reads its tables' files through the process's own credential
 /// policy, the same one the `AWS_*` and `GOOGLE_*` variables set for a pivotlake
-/// datastore in a bucket.
+/// datastore in a bucket, holding `metadata_cache_bytes` of the manifests
+/// its plans read.
 fn open_datastore(
     target: &ShellTarget,
     dispatcher: &DataFlowDispatcher,
+    metadata_cache_bytes: u64,
     refresh_interval: Duration,
 ) -> Result<Arc<dyn Datastore>, Box<dyn std::error::Error>> {
     match target {
@@ -279,6 +294,7 @@ fn open_datastore(
         ShellTarget::Iceberg(config) => Ok(IcebergDatastore::open(
             config,
             Arc::new(AmbientExternalStoreFactory),
+            ManifestCache::new(metadata_cache_bytes),
             dispatcher,
             refresh_interval,
         )?),

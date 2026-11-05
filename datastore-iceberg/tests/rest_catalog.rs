@@ -19,7 +19,7 @@ use arrow_array::types::{ArrowPrimitiveType, Float64Type, Int64Type};
 use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{Datastore, PivotCatalog};
-use datastore_iceberg::{IcebergCatalogConfig, IcebergDatastore};
+use datastore_iceberg::{IcebergCatalogConfig, IcebergDatastore, ManifestCache};
 use dispatch::{DataFlowDispatcher, Dispatch};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{
@@ -63,6 +63,8 @@ const WAREHOUSE: &str = "s3://pivot-it/iceberg-warehouse";
 const REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 /// How long a test waits for a refresh to show a change before giving up.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+/// What a test datastore may hold of the manifests its plans read.
+const MANIFEST_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 /// The Spark that writes what the iceberg crate's writer cannot, and the
 /// Iceberg it loads; the Spark major and Scala version are in the
 /// runtime's name.
@@ -676,9 +678,14 @@ impl Harness {
             properties,
             ..IcebergCatalogConfig::default()
         };
-        let datastore =
-            IcebergDatastore::open(&config, store_factory, self.dispatcher(), REFRESH_INTERVAL)
-                .expect("open the iceberg datastore");
+        let datastore = IcebergDatastore::open(
+            &config,
+            store_factory,
+            ManifestCache::new(MANIFEST_CACHE_BYTES),
+            self.dispatcher(),
+            REFRESH_INTERVAL,
+        )
+        .expect("open the iceberg datastore");
         let catalog = PivotCatalog::new(
             HashMap::from([(DATASTORE.to_string(), datastore as Arc<dyn Datastore>)]),
             DATASTORE.to_string(),
@@ -1973,8 +1980,8 @@ fn concurrent_clones_share_one_metadata_load() {
     );
     assert_eq!(
         paths.iter().filter(|path| path.ends_with(".avro")).count(),
-        1,
-        "{paths:?}"
+        2,
+        "the manifest list and the one manifest, planned once for eight clones: {paths:?}"
     );
 }
 
@@ -2525,8 +2532,8 @@ fn overlapping_bindings_reload_metadata_and_keep_independent_row_group_filters()
     );
     assert_eq!(
         reads.iter().filter(|path| path.ends_with(".avro")).count(),
-        5,
-        "{reads:?}"
+        3,
+        "one list and two manifests, the second binding planned from the cache: {reads:?}"
     );
 }
 
@@ -2539,13 +2546,15 @@ fn floating_point_predicates_prune_files_without_nans() {
     let reads = ReadLog::default();
     let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
 
-    for (predicate, expected) in [
-        ("= 1", 1),
-        ("<> 1", 3),
-        ("< 2", 1),
-        ("<= 1", 1),
-        ("> 2", 3),
-        (">= 3", 3),
+    // Bounds are not exact extrema, so `<>` cannot rule a file out: the
+    // reference evaluator keeps both files for it.
+    for (predicate, expected, files_read) in [
+        ("= 1", 1, 1),
+        ("<> 1", 3, 2),
+        ("< 2", 1, 1),
+        ("<= 1", 1, 1),
+        ("> 2", 3, 1),
+        (">= 3", 3, 1),
     ] {
         reads.take();
         let rows = harness.query(
@@ -2561,7 +2570,7 @@ fn floating_point_predicates_prune_files_without_nans() {
                 .iter()
                 .filter(|path| path.ends_with(".parquet"))
                 .count(),
-            1,
+            files_read,
             "{predicate}: {paths:?}"
         );
     }

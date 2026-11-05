@@ -13,22 +13,27 @@
 //! background, the way the pivotlake datastore refreshes its own tables, so a
 //! query never waits on the catalog and reads a snapshot at most one interval
 //! old. A table created or committed to between refreshes is seen at the next
-//! one. What is indexed is small (kilobytes per table). Binding reads the
-//! manifest list; preparing a scan lazily reads selected manifests and footers
-//! through the ring's caches. Those objects are not indexed.
+//! one. What is indexed is small (kilobytes per table). Preparing a scan
+//! lazily reads the manifest list, the selected manifests and the selected
+//! footers. Those objects are not indexed.
 //!
 //! Every bind of one query resolves against the same index, so a refresh landing
 //! mid-query does not move a table under it.
 //!
-//! # Reading through the ring
+//! # Planning and reading
 //!
-//! Manifest lists and manifests are read as whole objects over the io_uring
-//! ring ([`object_storage::load_objects`]), and deletion vectors as their
-//! blob's range of its Puffin file, so they pass through the compressed cache
-//! and the disk cache exactly as data does: a restarted server finds them on
-//! local disk. A filtered query reads only the manifests whose
-//! partition summaries admit its predicates, and only the footers of the files
-//! whose partition values and column bounds do. Data files are Parquet, read
+//! The iceberg crate plans every scan: given the query's filters as an
+//! Iceberg predicate, it reads the manifest list and the manifests whose
+//! partition summaries admit the filters, and keeps the files whose partition
+//! values and column bounds do, each paired with the delete files that apply
+//! to it. It reads those manifests through the table's store, into one cache
+//! ([`ManifestCache`]) the datastore's tables share within a byte budget of
+//! its own, apart from the ring, so a plan reads a table's manifests from
+//! memory once they were read once, however much data scans pull through the
+//! ring's caches in between. Deletion vectors are read as their blob's range
+//! of its Puffin file, over the ring, and pass through the compressed cache
+//! and the disk cache exactly as data does. Only the footers of the files the
+//! plan kept are read. Data files are Parquet, read
 //! by the same engine that reads every other datastore, with row-group
 //! pruning, late materialization and dynamic filters. Columns are matched to
 //! each file by Parquet field id, so renamed columns read correctly and a column added after
@@ -68,9 +73,10 @@ mod columns;
 mod deletes;
 mod describe;
 pub mod env;
-mod manifests;
-mod pruning;
+mod planning;
+mod predicate;
 mod rest_catalog;
+mod storage;
 mod store;
 mod table;
 
@@ -81,6 +87,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use dispatch::DataFlowDispatcher;
+use iceberg::io::ObjectCache;
 use iceberg::table::Table;
 use iceberg::{Catalog, ErrorKind};
 use iceberg_catalog_rest::RestCatalog;
@@ -92,8 +99,9 @@ use planner::catalog::{
 
 use crate::binding::IcebergTableBinding;
 use crate::rest_catalog::{block_on, build_rest_catalog};
+use crate::storage::build_file_io;
 use crate::store::TableStore;
-use crate::table::{LoadedTable, fetch_manifest_list_size, open_table_store};
+use crate::table::{LoadedTable, open_table_store};
 
 /// How to reach the REST catalog. The fields mirror the properties the
 /// Iceberg REST client is configured with; `properties` passes any further
@@ -182,17 +190,9 @@ pub enum Error {
         file: String,
         format: String,
     },
-    #[error("table `{table}` metadata object `{path}` is not in the store")]
-    MissingMetadataObject { table: String, path: String },
-    #[error("table `{table}` partition metadata is invalid: {source}")]
-    InvalidPartitionMetadata {
+    #[error("table `{table}` could not be planned: {source}")]
+    Planning {
         table: String,
-        #[source]
-        source: Box<iceberg::Error>,
-    },
-    #[error("metadata object `{path}` does not parse: {source}")]
-    MalformedMetadataObject {
-        path: String,
         #[source]
         source: Box<iceberg::Error>,
     },
@@ -222,6 +222,19 @@ impl From<Error> for CatalogError {
     }
 }
 
+/// The parsed manifest lists and manifests of every table of the datastores
+/// sharing it, within a byte budget: the most recently used stay, so a scan
+/// plans over a table from memory once the table's manifests were read once.
+#[derive(Clone, Debug)]
+pub struct ManifestCache(Arc<ObjectCache>);
+
+impl ManifestCache {
+    /// A cache holding at most `budget_bytes` of parsed manifests.
+    pub fn new(budget_bytes: u64) -> Self {
+        Self(Arc::new(ObjectCache::new_with_capacity(budget_bytes)))
+    }
+}
+
 /// The tables of one REST catalog, as the catalog last reported them.
 pub struct IcebergDatastore {
     /// What the REST catalog client is built from: the catalog is the source
@@ -240,9 +253,13 @@ pub struct IcebergDatastore {
     /// interval rather than pinned for the process, and the catalog's vended
     /// credentials take its place for a table it vended for.
     store_factory: Arc<dyn ExternalStoreFactory>,
-    /// The worker pool a table's metadata (manifest list, manifests, footers)
-    /// is read through when it loads. Held by the datastore because a resolve
-    /// drives its own dataflows, with no dispatcher passed in.
+    /// Holds the manifest lists and manifests every table's plans read, so
+    /// a table's next plan reads them from memory. Every table the index
+    /// holds is given it.
+    manifest_cache: ManifestCache,
+    /// The worker pool a table's footers and deletion vectors are read
+    /// through when it loads. Held by the datastore because a resolve drives
+    /// its own dataflows, with no dispatcher passed in.
     dispatcher: DataFlowDispatcher,
     /// The catalog's schemas and tables as of the last refresh: what every
     /// bind resolves against. Replaced whole by each refresh; a query holds
@@ -273,35 +290,21 @@ impl DatastoreIndex {
 }
 
 /// One schema's tables. A table the catalog listed but that could not be
-/// indexed (it would not load, or its manifest list could not be sized) is
-/// entered with the reason, so a query over it reports that reason rather
-/// than "no such table".
+/// indexed (it would not load, or its store would not open) is entered with
+/// the reason, so a query over it reports that reason rather than "no such
+/// table".
 #[derive(Default)]
 struct SchemaEntry {
     tables: HashMap<String, Result<TableEntry, String>>,
 }
 
-/// One table's entry in the index: the table as the catalog returned it, with
-/// what a load needs that the response does not say: the store its files are
-/// read through, opened with the credentials the catalog vended, and the size
-/// of the current snapshot's manifest list.
+/// One table's entry in the index: the table as the catalog returned it,
+/// reading its manifests through the store its files are read through,
+/// opened with the credentials the catalog vended, into the datastore's
+/// shared cache.
 struct TableEntry {
     table: Table,
     store: TableStore,
-    /// Iceberg names the manifest list without a length, and a ring read needs
-    /// one, so the store is asked once, at refresh, and the answer kept here
-    /// rather than asked again by every query. Ugly, but off the query path.
-    /// `None` for a table with no current snapshot.
-    manifest_list_size: Option<u64>,
-}
-
-impl TableEntry {
-    fn manifest_list_path(&self) -> Option<&str> {
-        self.table
-            .metadata()
-            .current_snapshot()
-            .map(|snapshot| snapshot.manifest_list())
-    }
 }
 
 impl std::fmt::Debug for IcebergDatastore {
@@ -318,11 +321,13 @@ impl IcebergDatastore {
     /// store that cannot be read fails a pivotlake datastore's.
     /// `store_factory` opens the object stores the tables' files live in, so
     /// their credentials follow the same policy as every other datastore's;
-    /// `refresh_interval` is how often the catalog is asked again once
-    /// [`start`](Datastore::start) is called.
+    /// `manifest_cache` holds the manifests the tables' plans read, and may
+    /// be shared with other datastores; `refresh_interval` is how often the
+    /// catalog is asked again once [`start`](Datastore::start) is called.
     pub fn open(
         config: &IcebergCatalogConfig,
         store_factory: Arc<dyn ExternalStoreFactory>,
+        manifest_cache: ManifestCache,
         dispatcher: &DataFlowDispatcher,
         refresh_interval: Duration,
     ) -> Result<Arc<Self>> {
@@ -330,6 +335,7 @@ impl IcebergDatastore {
             config: config.clone(),
             catalog_uri: config.uri.clone(),
             store_factory,
+            manifest_cache,
             dispatcher: dispatcher.clone(),
             index: RwLock::new(Arc::new(DatastoreIndex::default())),
             refresh_interval,
@@ -353,7 +359,6 @@ impl IcebergDatastore {
     /// namespace, and every table of theirs. Namespaces nested below the top
     /// level are not schemas of this datastore and are not listed.
     fn fetch_index(&self, catalog: &RestCatalog) -> Result<DatastoreIndex> {
-        let previous = self.index();
         let mut index = DatastoreIndex::default();
         let namespaces = block_on(catalog.list_namespaces(None)).map_err(Box::new)?;
         for namespace in namespaces {
@@ -369,7 +374,7 @@ impl IcebergDatastore {
                 let name = SchemaQualifiedTableName::new(schema.clone(), ident.name.clone());
                 let entry = match block_on(catalog.load_table(&ident)) {
                     Ok(table) => self
-                        .build_table_entry(&name, table, previous.table_entry(&name))
+                        .build_table_entry(&name, table)
                         .map_err(|error| error.to_string()),
                     // A table dropped between the listing and its load is
                     // simply not there any more.
@@ -403,32 +408,18 @@ impl IcebergDatastore {
     }
 
     /// `table`'s entry: with its store, opened now from the credentials the
-    /// catalog just vended, and its manifest list's size, the one `previous`
-    /// learned when the snapshot is the one it entered, else asked of the
-    /// store now.
+    /// catalog just vended, and the table reading its manifests through that
+    /// store into the datastore's shared cache.
     fn build_table_entry(
         &self,
         name: &SchemaQualifiedTableName,
         table: Table,
-        previous: Option<&Result<TableEntry, String>>,
     ) -> Result<TableEntry> {
         let store = open_table_store(name, &table, &*self.store_factory)?;
-        let path = table
-            .metadata()
-            .current_snapshot()
-            .map(|snapshot| snapshot.manifest_list());
-        let unchanged = previous
-            .and_then(|previous| previous.as_ref().ok())
-            .filter(|previous| path.is_some() && previous.manifest_list_path() == path);
-        let manifest_list_size = match unchanged {
-            Some(previous) => previous.manifest_list_size,
-            None => fetch_manifest_list_size(name, &table, &store)?,
-        };
-        Ok(TableEntry {
-            table,
-            store,
-            manifest_list_size,
-        })
+        let table = table
+            .with_file_io(build_file_io(&store))
+            .with_object_cache(self.manifest_cache.0.clone());
+        Ok(TableEntry { table, store })
     }
 
     /// The index as of now: the `Arc` a query pins for its lifetime, so the
@@ -451,13 +442,7 @@ impl IcebergDatastore {
             table: name.to_string(),
             message: message.clone(),
         })?;
-        let loaded = LoadedTable::load(
-            name,
-            &entry.table,
-            entry.store.clone(),
-            entry.manifest_list_size,
-            &self.dispatcher,
-        )?;
+        let loaded = LoadedTable::load(name, &entry.table, entry.store.clone(), &self.dispatcher)?;
         Ok(Some(Arc::new(loaded)))
     }
 

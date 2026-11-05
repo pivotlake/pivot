@@ -8,6 +8,10 @@
 //! another root is refused: the managed catalogs keep a table in one bucket,
 //! and a table deliberately split across buckets is not served rather than
 //! read through the wrong store.
+//!
+//! Data files are read over the ring. Metadata objects (the manifest list,
+//! the manifests) are read whole through the store, by the iceberg crate's
+//! file IO over it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,10 +63,34 @@ impl TableStore {
         })
     }
 
+    pub(crate) fn table_name(&self) -> &str {
+        &self.table
+    }
+
+    pub(crate) fn store(&self) -> &dyn ObjectStore {
+        self.store.as_ref()
+    }
+
+    /// The object at `location`, whole, or `None` when there is none.
+    pub(crate) fn get_object(&self, location: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.store.get(&self.key_of(location)?)?)
+    }
+
+    /// `bytes` written as the object at `location`.
+    pub(crate) fn put_object(&self, location: &str, bytes: &[u8]) -> Result<()> {
+        Ok(self.store.put(&self.key_of(location)?, bytes)?)
+    }
+
+    /// The object at `location` deleted; deleting what is not there is not
+    /// an error.
+    pub(crate) fn delete_object(&self, location: &str) -> Result<()> {
+        Ok(self.store.delete(&self.key_of(location)?)?)
+    }
+
     /// The file at `location`, of `size` bytes, located for reading. Its
     /// identity is the full location, as the catalog names it.
     pub(crate) fn data_file(&self, location: &str, size: u64) -> Result<DataFile> {
-        let source = self.store.source(&self.key_under_root(location)?)?;
+        let source = self.store.source(&self.key_of(location)?)?;
         Ok(DataFile {
             file: FileRef {
                 path: ObjectPath::new(location),
@@ -73,10 +101,9 @@ impl TableStore {
     }
 
     /// The size of the object at `location`, or `None` when no such object
-    /// exists: one listing narrowed to the object's own name. What a file the
-    /// catalog names without a length (a manifest list) is sized by.
+    /// exists: one listing narrowed to the object's own name.
     pub(crate) fn object_size(&self, location: &str) -> Result<Option<u64>> {
-        let key = self.key_under_root(location)?;
+        let key = self.key_of(location)?;
         let directory = key.parent().unwrap_or_default();
         let listing = self.store.list_with_name_prefix(&directory, key.name())?;
         Ok(listing
@@ -88,7 +115,7 @@ impl TableStore {
 
     /// The key of `location` under the table's root, refusing a location
     /// under any other.
-    fn key_under_root(&self, location: &str) -> Result<ObjectPath> {
+    pub(crate) fn key_of(&self, location: &str) -> Result<ObjectPath> {
         let (root, key) = split_location(location)?;
         if root != self.root {
             return Err(Error::FileOutsideTableStore {

@@ -36,8 +36,9 @@ users:
             data_dir.path().display(),
         );
         let config: MetastoreConfig = serde_yaml_ng::from_str(&yaml).unwrap();
-        let metastore =
-            Arc::new(DiskMetastore::open(config, None, DEFAULT_REFRESH_INTERVAL).unwrap());
+        let metastore = Arc::new(
+            DiskMetastore::open(config, None, DEFAULT_REFRESH_INTERVAL, 1024 * 1024).unwrap(),
+        );
 
         start_server_with_metastore(64, move |dispatch| {
             let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();

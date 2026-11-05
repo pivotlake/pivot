@@ -147,7 +147,9 @@ use catalog::metastore::{
     DEFAULT_USER_NAME, Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth,
     format_scram_verifier, parse_scram_verifier,
 };
-use datastore_iceberg::{IcebergCatalogAuth, IcebergCatalogConfig, IcebergDatastore};
+use datastore_iceberg::{
+    IcebergCatalogAuth, IcebergCatalogConfig, IcebergDatastore, ManifestCache,
+};
 use datastore_pivotlake::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
     DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, MaintenanceConfig,
@@ -190,6 +192,9 @@ pub struct DiskMetastore {
     /// server takes from its own section); compaction, in contrast, is
     /// configured per datastore.
     refresh_interval: Duration,
+    /// Holds the manifests the Iceberg datastores' plans read, under one
+    /// budget for all of them.
+    manifest_cache: ManifestCache,
 }
 
 /// Opens external read-only stores with the same scoped-secret policy as a
@@ -225,11 +230,13 @@ impl DiskMetastore {
     /// A `metastore_file` that cannot be read stops startup: a metastore file
     /// that was asked for and is not there means datastores or users are
     /// missing, which would otherwise show up as tables that do not exist and
-    /// logins that are refused.
+    /// logins that are refused. `metadata_cache_bytes` is what the Iceberg
+    /// datastores may hold of the manifests they read, between them.
     pub fn open(
         server_config: MetastoreConfig,
         metastore_file: Option<&Path>,
         refresh_interval: Duration,
+        metadata_cache_bytes: u64,
     ) -> Result<Self> {
         let metastore_config = match metastore_file {
             Some(path) => read_config(path)?,
@@ -248,6 +255,7 @@ impl DiskMetastore {
             secrets,
             default_name,
             refresh_interval,
+            manifest_cache: ManifestCache::new(metadata_cache_bytes),
         })
     }
 
@@ -324,6 +332,7 @@ impl DiskMetastore {
                     DatastoreConfig::Iceberg(config) => IcebergDatastore::open(
                         &config.catalog_config(name, &self.secrets)?,
                         self.external_store_factory(),
+                        self.manifest_cache.clone(),
                         dispatcher,
                         self.refresh_interval,
                     )?,
@@ -851,6 +860,9 @@ impl PivotlakeDatastoreConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a test metastore's Iceberg datastores may hold of their manifests.
+    const METADATA_CACHE_BYTES: u64 = 1024 * 1024;
     use catalog::DEFAULT_DATASTORE_NAME;
     use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
     use std::io::Write;
@@ -859,7 +871,12 @@ mod tests {
     /// Open a config file's entries on their own, at whatever refresh cadence
     /// the tests that do not exercise it would rather not spell out.
     fn from_yaml(text: &str) -> Result<DiskMetastore> {
-        DiskMetastore::open(parse_config(text)?, None, DEFAULT_REFRESH_INTERVAL)
+        DiskMetastore::open(
+            parse_config(text)?,
+            None,
+            DEFAULT_REFRESH_INTERVAL,
+            METADATA_CACHE_BYTES,
+        )
     }
 
     /// Write `text` to a metastore file of its own, kept alive by the returned
@@ -927,6 +944,7 @@ mod tests {
             parse_config(section).unwrap(),
             Some(file.path()),
             DEFAULT_REFRESH_INTERVAL,
+            METADATA_CACHE_BYTES,
         )
         .unwrap()
     }
@@ -1009,6 +1027,7 @@ datastores:
             parse_config(yaml).unwrap(),
             None,
             Duration::from_millis(500),
+            METADATA_CACHE_BYTES,
         )
         .unwrap();
 
@@ -1806,6 +1825,7 @@ secrets:
             parse_config(section).unwrap(),
             Some(file.path()),
             DEFAULT_REFRESH_INTERVAL,
+            METADATA_CACHE_BYTES,
         )
     }
 
@@ -2003,6 +2023,7 @@ datastores:
             parse_config(section).unwrap(),
             Some(Path::new("/nonexistent/metastore.yaml")),
             DEFAULT_REFRESH_INTERVAL,
+            METADATA_CACHE_BYTES,
         )
         .err()
         .unwrap();

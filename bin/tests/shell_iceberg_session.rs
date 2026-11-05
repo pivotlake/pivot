@@ -33,7 +33,7 @@ fn an_unreachable_catalog_fails_the_open() {
     let runtime = build_runtime();
 
     let result = runtime.block_on(async {
-        ShellInstance::open_with_resources(&target, 1, 32, DEFAULT_REFRESH_INTERVAL)
+        ShellInstance::open_with_resources(&target, 1, 32, 1024 * 1024, DEFAULT_REFRESH_INTERVAL)
     });
 
     let error = match result {
@@ -57,7 +57,13 @@ fn the_shell_serves_a_catalog_table_read_only() {
     let runtime = build_runtime();
     let instance = runtime
         .block_on(async {
-            ShellInstance::open_with_resources(&target, 1, 32, DEFAULT_REFRESH_INTERVAL)
+            ShellInstance::open_with_resources(
+                &target,
+                1,
+                32,
+                1024 * 1024,
+                DEFAULT_REFRESH_INTERVAL,
+            )
         })
         .unwrap();
 

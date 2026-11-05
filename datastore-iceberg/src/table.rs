@@ -1,12 +1,13 @@
-//! A pinned Iceberg snapshot with lazily loaded manifests and file metadata.
-//! Pivot evaluates metadata bounds before reading surviving files' footers.
+//! A pinned Iceberg snapshot: the table as the catalog handed it over, planned
+//! by the iceberg crate and read by Pivot's parquet engine. Pivot evaluates
+//! the crate's plan before reading surviving files' footers.
 
 use planner::expression::Expression;
 use std::sync::Arc;
 
 use arrow_schema::{Field, Schema};
 use dispatch::DataFlowDispatcher;
-use iceberg::spec::{ManifestFile, SchemaRef, TableMetadataRef, Transform};
+use iceberg::spec::{SchemaRef, TableMetadataRef, Transform};
 use iceberg::table::Table;
 use object_storage::ExternalStoreFactory;
 use parquet_engine::{FileRowGroups, ParquetTable, TableColumns, load_file_row_groups};
@@ -14,8 +15,8 @@ use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 use planner::types::physical_arrow_type;
 
 use crate::columns::table_columns;
-use crate::deletes::{count_deleted_rows, read_deletion_vectors};
-use crate::manifests::{DataFiles, FileDescriptor, ManifestList, read_manifests};
+use crate::deletes::count_deleted_rows;
+use crate::planning::{FileDescriptor, count_rows, estimate_rows, live_delete_manifests};
 use crate::store::{TableStore, read_vended_s3_credentials};
 use crate::{Error, Result};
 
@@ -31,19 +32,20 @@ pub(crate) struct LoadedTable {
     columns: TableColumns,
     pub(super) partition_by: Vec<String>,
     pub(super) sort_by: Vec<String>,
-    manifest_list: ManifestList,
-    store: TableStore,
-    dispatcher: DataFlowDispatcher,
+    /// The table as the crate plans it: reading its manifests through the
+    /// datastore's shared cache and the table's store.
+    pub(super) table: Table,
+    pub(super) store: TableStore,
+    pub(super) dispatcher: DataFlowDispatcher,
 }
 
 impl LoadedTable {
-    /// Load the schema and manifest list, validating unsupported snapshot features
-    /// before pruning can hide them. Manifests and data footers remain lazy.
+    /// Load the schema, validating unsupported table features before a plan
+    /// can hide them. Manifests and data footers remain lazy.
     pub(crate) fn load(
         name: &SchemaQualifiedTableName,
         table: &Table,
         store: TableStore,
-        manifest_list_size: Option<u64>,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<Self> {
         let table_name = name.to_string();
@@ -75,14 +77,6 @@ impl LoadedTable {
                 .iter()
                 .map(|field| (field.source_id, &field.transform)),
         );
-
-        let manifest_list = ManifestList::load(
-            &table_name,
-            &metadata,
-            manifest_list_size,
-            &store,
-            dispatcher,
-        )?;
         Ok(Self {
             name: name.clone(),
             uuid: metadata.uuid().to_string(),
@@ -91,35 +85,22 @@ impl LoadedTable {
             columns,
             partition_by,
             sort_by,
-            manifest_list,
+            table: table.clone(),
             store,
             dispatcher: dispatcher.clone(),
         })
     }
 
-    /// Select files using metadata bounds, then fetch their row groups, with
-    /// the rows their deletion vectors delete marked on them. Manifest order,
-    /// then file-local row-group order, makes the same filters yield the same
+    /// Plan the files the filters keep, then fetch their row groups, with the
+    /// rows their deletion vectors delete marked on them. Path order, then
+    /// file-local row-group order, makes the same filters yield the same
     /// row-group positions for scanning and materialization.
     pub(crate) fn load_parquet(&self, filters: &[Expression]) -> Result<ParquetTable> {
-        let table_name = self.name.to_string();
-        let invalid_partition_metadata = |source| Error::InvalidPartitionMetadata {
-            table: table_name.clone(),
-            source: Box::new(source),
-        };
-        let selected = self
-            .manifest_list
-            .select(filters)
-            .map_err(invalid_partition_metadata)?;
-        let files = self
-            .load_data_files(selected.data.iter().copied())?
-            .select(filters)
-            .map_err(invalid_partition_metadata)?;
-        tracing::debug!(table = %self.name, manifests = selected.data.len(), files = files.len(), "selected Iceberg files");
-        let delete_manifests = read_manifests(selected.deletes, &self.store, &self.dispatcher)?;
-        let deletion_vectors =
-            read_deletion_vectors(delete_manifests, &files, &self.store, &self.dispatcher)?;
-        let mut footers = self.read_footers(&files)?;
+        let planned_files = self.plan_files(filters)?;
+        tracing::debug!(table = %self.name, files = planned_files.len(), "selected Iceberg files");
+        let deletion_vectors = self.read_deletion_vectors(&planned_files)?;
+        let mut footers =
+            self.read_footers(planned_files.iter().map(|planned| &planned.data_file))?;
         for (footer, deleted) in footers.iter_mut().zip(deletion_vectors) {
             if let Some(deleted) = deleted {
                 footer.mark_deleted_rows(deleted);
@@ -136,28 +117,13 @@ impl LoadedTable {
         })
     }
 
-    /// The data files that `manifests` list.
-    fn load_data_files<'a>(
-        &self,
-        manifests: impl IntoIterator<Item = &'a ManifestFile>,
-    ) -> Result<DataFiles> {
-        DataFiles::load(
-            &self.name.to_string(),
-            &self.metadata,
-            manifests,
-            &self.store,
-            &self.dispatcher,
-        )
-    }
-
-    pub(super) fn load_all_data_files(&self) -> Result<DataFiles> {
-        self.load_data_files(self.manifest_list.data_manifests())
-    }
-
     /// Read file metadata in parallel and return it in request order.
-    pub(super) fn read_footers(&self, files: &[FileDescriptor]) -> Result<Vec<FileRowGroups>> {
+    pub(super) fn read_footers<'a>(
+        &self,
+        files: impl IntoIterator<Item = &'a FileDescriptor>,
+    ) -> Result<Vec<FileRowGroups>> {
         let data_files = files
-            .iter()
+            .into_iter()
             .map(|file| self.store.data_file(&file.path, file.length))
             .collect::<Result<Vec<_>>>()?;
         Ok(load_file_row_groups(
@@ -210,22 +176,23 @@ impl LoadedTable {
     /// not applied; planning then has no statistic and COUNT uses the
     /// ordinary scan, which reports what is wrong.
     pub(crate) fn row_count(&self) -> Option<i64> {
-        let rows = self.manifest_list.row_count()?;
-        let delete_manifests = read_manifests(
-            self.manifest_list.delete_manifests(),
-            &self.store,
-            &self.dispatcher,
-        )
-        .ok()?;
-        let deleted = count_deleted_rows(delete_manifests).ok()?;
+        let manifest_list = self.load_manifest_list().ok()??;
+        let rows = count_rows(manifest_list.entries())?;
+        let delete_manifests = self
+            .load_manifests(live_delete_manifests(manifest_list.entries()))
+            .ok()?;
+        let deleted = count_deleted_rows(delete_manifests.iter().map(Arc::as_ref)).ok()?;
         rows.checked_sub(i64::try_from(deleted).ok()?)
     }
 
-    /// The row count as the manifest list alone has it, with nothing read:
-    /// exact when every delete file is a deletion vector, an estimate
-    /// otherwise.
+    /// The row count as the manifest list alone has it, with no manifest
+    /// read: exact when every delete file is a deletion vector, an estimate
+    /// otherwise. A table without a snapshot has no rows.
     pub(crate) fn estimated_row_count(&self) -> Option<i64> {
-        self.manifest_list.estimated_row_count()
+        match self.load_manifest_list().ok()? {
+            Some(manifest_list) => estimate_rows(manifest_list.entries()),
+            None => Some(0),
+        }
     }
 }
 
@@ -261,28 +228,6 @@ pub(crate) fn open_table_store(
         })?;
     let vended = read_vended_s3_credentials(&table_name, table.file_io().config().props())?;
     TableStore::open(&table_name, metadata_location, store_factory, vended)
-}
-
-/// The size of `table`'s current manifest list, or `None` when the table has
-/// no current snapshot. The snapshot names its manifest list without a
-/// length, and a ring read needs one, so the store is asked once, when the
-/// table is indexed, rather than on every query over it.
-pub(crate) fn fetch_manifest_list_size(
-    name: &SchemaQualifiedTableName,
-    table: &Table,
-    store: &TableStore,
-) -> Result<Option<u64>> {
-    let Some(snapshot) = table.metadata().current_snapshot() else {
-        return Ok(None);
-    };
-    let path = snapshot.manifest_list();
-    let size = store
-        .object_size(path)?
-        .ok_or_else(|| Error::MissingMetadataObject {
-            table: name.to_string(),
-            path: path.to_string(),
-        })?;
-    Ok(Some(size))
 }
 
 #[cfg(test)]

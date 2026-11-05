@@ -6,7 +6,8 @@ use object_storage::{
     ObjectPath, ObjectStore, Result, StoreConnection, StoreError,
 };
 
-/// Records objects admitted to Pivot's reader, including reads served by caches.
+/// Records objects admitted to Pivot's reader, including reads served by the
+/// ring's caches; a manifest the manifest cache serves does not reach the store.
 #[derive(Clone, Debug, Default)]
 pub struct ReadLog {
     paths: Arc<Mutex<Vec<String>>>,
@@ -53,6 +54,7 @@ impl ObjectStore for RecordingStore {
     }
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
+        self.reads.paths.lock().unwrap().push(key.to_string());
         self.inner.get(key)
     }
 

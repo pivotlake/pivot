@@ -89,7 +89,8 @@ fn authenticating_server() -> &'static AuthServer {
             data_dir.path().display(),
         );
         let config: MetastoreConfig = serde_yaml_ng::from_str(&yaml).unwrap();
-        let inner = DiskMetastore::open(config, None, DEFAULT_REFRESH_INTERVAL).unwrap();
+        let inner =
+            DiskMetastore::open(config, None, DEFAULT_REFRESH_INTERVAL, 1024 * 1024).unwrap();
         let metastore = Arc::new(MutableMetastore {
             inner,
             users: RwLock::new(HashMap::from([

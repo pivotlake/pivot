@@ -42,7 +42,13 @@ fn create_user_server() -> &'static CreateUserServer {
         );
         let config: MetastoreConfig = serde_yaml_ng::from_str(&yaml).unwrap();
         let metastore = Arc::new(
-            DiskMetastore::open(config, Some(&metastore_path), DEFAULT_REFRESH_INTERVAL).unwrap(),
+            DiskMetastore::open(
+                config,
+                Some(&metastore_path),
+                DEFAULT_REFRESH_INTERVAL,
+                1024 * 1024,
+            )
+            .unwrap(),
         );
 
         let server_metastore = metastore.clone();

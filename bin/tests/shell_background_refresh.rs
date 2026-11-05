@@ -22,6 +22,7 @@ fn a_commit_from_outside_the_shell_becomes_visible_to_later_queries() {
                 &ShellTarget::pivot(directory.path().to_str().unwrap()),
                 1,
                 32,
+                1024 * 1024,
                 Duration::from_millis(100),
             )
         })

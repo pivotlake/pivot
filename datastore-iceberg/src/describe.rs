@@ -1,7 +1,7 @@
 //! System catalog metadata. Footer reads are batched to bound retained metadata.
 
 use crate::Result;
-use crate::manifests::FileDescriptor;
+use crate::planning::FileDescriptor;
 use crate::table::LoadedTable;
 use catalog::datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, DatastoreTableMetadata};
 use iceberg::spec::{DataFile, Datum, Literal, PrimitiveType, Schema, Type};
@@ -9,10 +9,10 @@ use serde_json::{Value, value::RawValue};
 use std::collections::BTreeMap;
 
 pub(crate) fn describe_table(table: &LoadedTable) -> Result<DatastoreTableMetadata> {
-    let data_files = table.load_all_data_files()?;
-    let files: Vec<_> = data_files
+    let listed = table.list_data_files()?;
+    let files: Vec<_> = listed
         .iter()
-        .map(|file| (file.manifest, file.data))
+        .map(|file| (file.manifest.as_ref(), file.entry.data_file()))
         .collect();
     let mut column_bytes = vec![(0u64, 0u64); table.columns().len()];
     let mut described = Vec::with_capacity(files.len());
@@ -21,7 +21,7 @@ pub(crate) fn describe_table(table: &LoadedTable) -> Result<DatastoreTableMetada
     for chunk in files.chunks(1024) {
         let entries: Vec<_> = chunk
             .iter()
-            .map(|(_, file)| FileDescriptor::of(file))
+            .map(|(_, file)| FileDescriptor::new(file.file_path(), file.file_size_in_bytes()))
             .collect();
         for ((manifest, file), loaded) in chunk.iter().zip(table.read_footers(&entries)?) {
             let mut uncompressed = 0u64;

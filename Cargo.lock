@@ -1841,8 +1841,10 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "catalog",
  "dispatch",
+ "futures",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
@@ -1852,11 +1854,14 @@ dependencies = [
  "planner",
  "reqwest 0.12.28",
  "roaring",
+ "serde",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "typetag",
  "ureq",
  "url",
 ]
@@ -2875,7 +2880,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#7e72324a5916ef7ffd68f2fa8eb94f6dacc2863d"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2934,7 +2939,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#7e72324a5916ef7ffd68f2fa8eb94f6dacc2863d"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2954,7 +2959,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#7e72324a5916ef7ffd68f2fa8eb94f6dacc2863d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2964,7 +2969,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#7e72324a5916ef7ffd68f2fa8eb94f6dacc2863d"
 dependencies = [
  "anyhow",
  "async-trait",
