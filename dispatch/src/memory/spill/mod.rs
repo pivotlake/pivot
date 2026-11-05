@@ -149,15 +149,16 @@ mod tests {
     use crate::stats::StatsCollector;
     use std::cell::RefCell;
 
-    /// Wait for the next of the buffer's spill writes to land and count it off
-    /// `buffer_writes_in_flight`, as the worker does.
-    fn complete_one_spill_write(
+    /// Wait for every one of the buffer's spill writes to land, counting each
+    /// off `buffer_writes_in_flight` as the worker does. Waiting for them one
+    /// at a time is not possible: two writes can land in one wait, and a wait
+    /// with nothing left in flight never returns.
+    fn complete_spill_writes(
         requester: &RefCell<IORequester>,
         buffer_writes_in_flight: &AtomicUsize,
     ) {
         let mut requester = requester.borrow_mut();
-        let in_flight_before = buffer_writes_in_flight.load(Ordering::Acquire);
-        while buffer_writes_in_flight.load(Ordering::Acquire) == in_flight_before {
+        while buffer_writes_in_flight.load(Ordering::Acquire) > 0 {
             requester.wait().unwrap();
             requester.collect_completions().unwrap();
             memory_ctx().complete_landed_spill_writes(&mut requester);
@@ -223,14 +224,9 @@ mod tests {
         };
         let in_flight_after_issuing = spilled.writes_in_flight.load(Ordering::Acquire);
         drop(spiller);
-        complete_one_spill_write(&requester, &spilled.writes_in_flight);
-        let in_flight_after_one = spilled.writes_in_flight.load(Ordering::Acquire);
-        complete_one_spill_write(&requester, &spilled.writes_in_flight);
-        let in_flight_after_both = spilled.writes_in_flight.load(Ordering::Acquire);
+        complete_spill_writes(&requester, &spilled.writes_in_flight);
 
         assert_eq!(in_flight_after_issuing, 2);
-        assert_eq!(in_flight_after_one, 1);
-        assert_eq!(in_flight_after_both, 0);
         assert!(!memory_ctx().has_spill_writes_in_flight());
         let file_len = |partition| {
             std::fs::metadata(directory::partition_file_path(
