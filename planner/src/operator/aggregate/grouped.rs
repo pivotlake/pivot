@@ -411,6 +411,9 @@ pub(super) fn column_nullable(nullability: &[bool], column: usize) -> bool {
 fn canonical_input_type(result_type: &Type) -> Option<Type> {
     match result_type {
         Type::Utf8 => Some(Type::Utf8),
+        // A computed boolean key (`GROUP BY a IN (..)`) materialises as itself;
+        // the row encoder groups it as `Int8`.
+        Type::Boolean => Some(Type::Boolean),
         Type::Date => Some(Type::Date),
         Type::Timestamp => Some(Type::Timestamp),
         Type::TimestampTz => Some(Type::TimestampTz),
@@ -853,7 +856,9 @@ mod tests {
     use crate::types::Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Date32Type, Float64Type, Int64Type};
-    use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, RecordBatch};
+    use arrow_array::{
+        ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, RecordBatch,
+    };
     use arrow_schema::DataType;
     use rstest::rstest;
     use std::sync::Arc;
@@ -1795,5 +1800,90 @@ mod tests {
         let z_group = rows.iter().find(|r| r["s"].as_str() == Some("z")).unwrap();
         assert!(z_group["b"].is_null());
         assert_eq!(z_group["c"].as_i64(), Some(1));
+    }
+
+    fn count_where(rows: &[serde_json::Value], key: &str, value: Option<bool>) -> Option<i64> {
+        rows.iter()
+            .find(|r| r[key].as_bool() == value)
+            .and_then(|r| r["c"].as_i64())
+    }
+
+    #[rstest]
+    fn boolean_keys_group_with_a_null_group(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "flags",
+            &[(
+                "f",
+                Type::Boolean,
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    None,
+                    Some(false),
+                    Some(true),
+                ])) as ArrayRef,
+            )],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT f, COUNT(*) AS c FROM flags GROUP BY f",
+        );
+
+        assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Boolean);
+        let rows = batches_to_json(&batches);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(count_where(&rows, "f", Some(true)), Some(3));
+        assert_eq!(count_where(&rows, "f", Some(false)), Some(2));
+        assert_eq!(count_where(&rows, "f", None), Some(1));
+    }
+
+    #[rstest]
+    fn computed_boolean_keys_group(mut testing_planner: TestingPlanner) {
+        // a IN (2, b) per row: false, true, false, NULL, false, NULL.
+        let rows = run(
+            &mut testing_planner,
+            "SELECT a IN (2, b) AS hit, COUNT(*) AS c FROM nullable_table GROUP BY hit",
+        );
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(count_where(&rows, "hit", Some(false)), Some(3));
+        assert_eq!(count_where(&rows, "hit", Some(true)), Some(1));
+        assert_eq!(count_where(&rows, "hit", None), Some(2));
+    }
+
+    #[rstest]
+    fn boolean_and_integer_keys_group_together(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "tagged",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "f",
+                    Type::Boolean,
+                    Arc::new(BooleanArray::from(vec![true, false, true, true])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT g, f, COUNT(*) AS c FROM tagged GROUP BY g, f",
+        );
+
+        assert_eq!(rows.len(), 3);
+        let group = |g: i64, f: bool| {
+            rows.iter()
+                .find(|r| r["g"].as_i64() == Some(g) && r["f"].as_bool() == Some(f))
+                .and_then(|r| r["c"].as_i64())
+        };
+        assert_eq!(group(1, true), Some(2));
+        assert_eq!(group(1, false), Some(1));
+        assert_eq!(group(2, true), Some(1));
     }
 }
