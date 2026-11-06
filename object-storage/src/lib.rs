@@ -28,6 +28,7 @@ mod gcs;
 mod local;
 mod object_fetcher;
 mod object_path;
+mod object_storer;
 mod s3;
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -35,6 +36,7 @@ pub use gcs::GcsStore;
 pub use local::LocalStore;
 pub use object_fetcher::{FileSlice, LoadedObject, load_file_slices, load_objects};
 pub use object_path::ObjectPath;
+pub use object_storer::{ObjectWrite, store_objects};
 pub use s3::{S3Credentials, S3Keys, S3Store};
 
 #[derive(Debug, thiserror::Error)]

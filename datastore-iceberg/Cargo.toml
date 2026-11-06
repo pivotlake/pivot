@@ -25,6 +25,19 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 # The bitmap type a decoded deletion vector hands over to the parquet engine.
 roaring = { workspace = true }
+# A transaction's staged writes, and the files an INSERT's workers upload.
+crossbeam-deque = { workspace = true }
+# Casting a column to the Arrow type its partition transform takes.
+arrow-cast = { workspace = true }
+# A commit's manifests are written by the iceberg crate's transaction through
+# a storage of this crate's over the table's store. The crate's storage traits
+# are object-safe through typetag, which asks every implementation to
+# serialize, and the crate hands bytes over and takes paths back as `bytes`
+# and streams.
+typetag = "0.2"
+serde = { workspace = true }
+bytes = { workspace = true }
+futures = "0.3"
 # Spec metadata and the REST catalog client. Every
 # file is read through Pivot's ring and caches, not the catalog's storage layer.
 # Pinned to our fork's branch off the 0.11.x release branch, the first with
@@ -45,6 +58,8 @@ object-storage = { workspace = true, features = ["test-support"] }
 iceberg-storage-opendal = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector", default-features = false, features = ["opendal-s3"] }
 testcontainers = { version = "0.24", features = ["blocking"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+# A directory for the storage tests to write a table's objects under.
+tempfile = { workspace = true }
 parquet = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
