@@ -1146,6 +1146,8 @@ dependencies = [
  "parquet-engine",
  "planner",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1839,10 +1841,14 @@ name = "datastore-iceberg"
 version = "0.1.1"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "catalog",
+ "crossbeam-deque",
  "dispatch",
+ "futures",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
@@ -1852,11 +1858,14 @@ dependencies = [
  "planner",
  "reqwest 0.12.28",
  "roaring",
+ "serde",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "typetag",
  "ureq",
  "url",
 ]
@@ -4180,6 +4189,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zstd",
 ]
 
