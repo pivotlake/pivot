@@ -1,6 +1,7 @@
 //! A catalog authenticated to with an OAuth2 credential, against a real Apache
-//! Polaris whose tokens expire within seconds: the datastore must keep
-//! refreshing after the token it was first issued has expired.
+//! Polaris whose tokens expire within seconds: the datastore's one client
+//! must keep working after the token it was first issued has expired, and
+//! after the one it renewed with has too.
 
 use std::sync::Arc;
 use std::thread;
@@ -93,7 +94,7 @@ impl ExternalStoreFactory for NoStoreFactory {
 }
 
 #[test]
-fn refresh_succeeds_after_the_first_token_expires() {
+fn refresh_succeeds_after_the_first_token_expires_and_after_the_renewed_one_does() {
     let Some((_polaris, uri)) = start_polaris() else {
         return;
     };
@@ -119,7 +120,10 @@ fn refresh_succeeds_after_the_first_token_expires() {
     .expect("open the datastore");
 
     thread::sleep(TOKEN_LIFETIME + Duration::from_secs(1));
-    let refreshed = datastore.refresh();
+    let refreshed_once = datastore.refresh();
+    thread::sleep(TOKEN_LIFETIME + Duration::from_secs(1));
+    let refreshed_twice = datastore.refresh();
 
-    refreshed.expect("refresh with a fresh token");
+    refreshed_once.expect("refresh with a renewed token");
+    refreshed_twice.expect("refresh with a token renewed again");
 }

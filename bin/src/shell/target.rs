@@ -9,7 +9,7 @@ pub enum ShellTarget {
     /// A pivotlake datastore in a local directory (created if it does not exist)
     /// or at an object-store URI.
     Pivotlake { location: String },
-    /// The read-only tables of an Iceberg REST catalog.
+    /// The tables of an Iceberg REST catalog, read and appended to.
     Iceberg(IcebergCatalogConfig),
 }
 

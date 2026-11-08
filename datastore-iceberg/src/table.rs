@@ -27,6 +27,9 @@ pub(crate) struct LoadedTable {
     /// one, so it is the table's version: a cached plan is reused only while
     /// the table is still at the location the plan was bound at.
     pub metadata_location: String,
+    /// The table as the catalog returned it, with the file IO a commit writes
+    /// through.
+    pub(super) table: Table,
     pub(super) metadata: TableMetadataRef,
     columns: TableColumns,
     pub(super) partition_by: Vec<String>,
@@ -37,6 +40,11 @@ pub(crate) struct LoadedTable {
 }
 
 impl LoadedTable {
+    /// The store the table's files are read and written through.
+    pub(crate) fn store(&self) -> &TableStore {
+        &self.store
+    }
+
     /// Load the schema and manifest list, validating unsupported snapshot features
     /// before pruning can hide them. Manifests and data footers remain lazy.
     pub(crate) fn load(
@@ -87,6 +95,7 @@ impl LoadedTable {
             name: name.clone(),
             uuid: metadata.uuid().to_string(),
             metadata_location,
+            table: table.clone(),
             metadata,
             columns,
             partition_by,
@@ -232,7 +241,7 @@ impl LoadedTable {
 /// The names of the columns `fields` (a partition spec's or a sort order's,
 /// as source field id and transform) take by identity, in field order. A
 /// transformed field (a bucket, a day) is not a column value, so it is left out.
-fn identity_columns<'a>(
+pub(crate) fn identity_columns<'a>(
     schema: &SchemaRef,
     fields: impl Iterator<Item = (i32, &'a Transform)>,
 ) -> Vec<String> {

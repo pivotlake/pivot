@@ -64,6 +64,8 @@ struct SharedCollector {
 
 pub(super) struct FileCollectorFactory {
     partition_column_names: Arc<[String]>,
+    /// Batch columns, at the end, that key the partition and are not written.
+    unwritten_trailing_columns: usize,
     order_by: Arc<[OrderBy]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
@@ -72,8 +74,12 @@ pub(super) struct FileCollectorFactory {
     shared: Arc<SharedCollector>,
 }
 
+/// One collector per worker. The last `unwritten_trailing_columns` of the
+/// batch columns key the partition without being written: a file's partition
+/// values are read before they are dropped from its batches.
 pub(super) fn factories(
     partition_column_names: Arc<[String]>,
+    unwritten_trailing_columns: usize,
     order_by: Arc<[OrderBy]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
@@ -98,6 +104,7 @@ pub(super) fn factories(
     (0..topology.total_workers())
         .map(|_| FileCollectorFactory {
             partition_column_names: partition_column_names.clone(),
+            unwritten_trailing_columns,
             order_by: order_by.clone(),
             target_rows_per_group,
             target_in_memory_bytes_per_file,
@@ -114,6 +121,7 @@ impl UnaryFactory<SortedPartitionRun, FileOrderInput> for FileCollectorFactory {
     fn build_unary(self) -> FileCollector {
         FileCollector {
             partition_column_names: self.partition_column_names,
+            unwritten_trailing_columns: self.unwritten_trailing_columns,
             order_by: self.order_by,
             target_rows_per_group: self.target_rows_per_group,
             target_in_memory_bytes_per_file: self.target_in_memory_bytes_per_file,
@@ -155,10 +163,42 @@ impl PendingFile {
             .next()
             .expect("a pending file is nonempty")
     }
+
+    /// This file's batches without their last `count` columns: what is
+    /// written once the key-only columns have served their purpose.
+    fn without_trailing_columns(self, count: usize) -> Self {
+        let runs_by_node = self
+            .runs_by_node
+            .into_iter()
+            .map(|runs| {
+                runs.into_iter()
+                    .map(|batches| {
+                        batches
+                            .into_iter()
+                            .map(|batch| {
+                                let written: Vec<usize> =
+                                    (0..batch.num_columns() - count).collect();
+                                batch
+                                    .project(&written)
+                                    .expect("the written columns are a prefix of the batch")
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            runs_by_node,
+            row_count: self.row_count,
+            in_memory_bytes: self.in_memory_bytes,
+        }
+    }
 }
 
 pub(super) struct FileCollector {
     partition_column_names: Arc<[String]>,
+    /// Batch columns, at the end, that key the partition and are not written.
+    unwritten_trailing_columns: usize,
     order_by: Arc<[OrderBy]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
@@ -265,6 +305,13 @@ impl FileCollector {
                     .map_err(WriteError::from)?,
             ),
             None => None,
+        };
+        // A key-only column is recorded in the partition values just read and
+        // goes no further: the file is written without it.
+        let pending_file = if self.unwritten_trailing_columns > 0 {
+            pending_file.without_trailing_columns(self.unwritten_trailing_columns)
+        } else {
+            pending_file
         };
         let plan = FilePlan {
             file_id,
