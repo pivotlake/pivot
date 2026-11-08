@@ -189,7 +189,7 @@ struct ParquetLocationPattern {
 
 impl ParquetLocationPattern {
     fn parse(location: &str) -> Result<Self, Error> {
-        match StoreScheme::of(location)? {
+        match StoreScheme::from_uri(location)? {
             StoreScheme::S3 | StoreScheme::Gcs => Self::parse_remote(location),
             StoreScheme::Local => Self::parse_local(location),
         }

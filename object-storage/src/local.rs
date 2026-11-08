@@ -76,6 +76,20 @@ impl ObjectStore for LocalStore {
         }
     }
 
+    /// The file's length, without reading it; a directory at the key is not
+    /// an object.
+    fn object_size(&self, key: &ObjectPath) -> Result<Option<u64>> {
+        match std::fs::metadata(self.path_for(key)) {
+            Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(StoreError::Io {
+                key: key.to_string(),
+                source,
+            }),
+        }
+    }
+
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {
@@ -247,6 +261,21 @@ mod tests {
         store.put(&p("k"), b"first").unwrap();
         store.put(&p("k"), b"second").unwrap();
         assert_eq!(store.get(&p("k")).unwrap().unwrap(), b"second");
+    }
+
+    #[test]
+    fn object_size_is_the_files_length_and_none_for_a_missing_one_or_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path()).unwrap();
+        store.put(&p("d/k"), b"twelve bytes").unwrap();
+
+        let sized = store.object_size(&p("d/k")).unwrap();
+        let missing = store.object_size(&p("d/none")).unwrap();
+        let directory = store.object_size(&p("d")).unwrap();
+
+        assert_eq!(sized, Some(12));
+        assert_eq!(missing, None);
+        assert_eq!(directory, None);
     }
 
     #[test]

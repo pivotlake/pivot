@@ -155,7 +155,8 @@ impl SecretScope {
                 segments: Vec::new(),
             });
         };
-        if !matches!(StoreScheme::of(written), Ok(written_scheme) if written_scheme == scheme) {
+        if !matches!(StoreScheme::from_uri(written), Ok(written_scheme) if written_scheme == scheme)
+        {
             return Err(Error::SecretScope {
                 name: name.to_string(),
                 scope: written.clone(),

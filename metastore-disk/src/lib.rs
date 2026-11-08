@@ -202,7 +202,7 @@ struct SecretExternalStoreFactory {
 
 impl ExternalStoreFactory for SecretExternalStoreFactory {
     fn open(&self, root_uri: &str) -> object_storage::Result<Arc<dyn ObjectStore>> {
-        match StoreScheme::of(root_uri)? {
+        match StoreScheme::from_uri(root_uri)? {
             StoreScheme::S3 => Ok(Arc::new(match self.secrets.resolve_s3(root_uri) {
                 Some(credentials) => S3Store::with_credentials(root_uri, credentials)?,
                 None => S3Store::anonymous(root_uri)?,
@@ -832,7 +832,7 @@ impl PivotlakeDatastoreConfig {
     /// falls back to the ambient Application Default Credentials chain, which
     /// on Google compute is the whole configuration a store needs.
     fn open_store(&self, _name: &str, secrets: &Secrets) -> Result<Arc<dyn ObjectStore>> {
-        match StoreScheme::of(&self.location)? {
+        match StoreScheme::from_uri(&self.location)? {
             StoreScheme::S3 => Ok(Arc::new(match secrets.resolve_s3(&self.location) {
                 Some(credentials) => S3Store::with_credentials(&self.location, credentials)?,
                 None => S3Store::anonymous(&self.location)?,
