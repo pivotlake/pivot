@@ -5,7 +5,7 @@
 //! worker's requester performs those physical tasks the moment the operator
 //! asks, through the [`OperatorIO`] handle dispatch wraps around each call.
 
-use super::OpenFile;
+use super::{OpenFile, RemoteFile};
 use crate::memory::FileBytes;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -143,6 +143,25 @@ impl<'a> OperatorIO<'a> {
         };
         self.requester
             .request_read(self.data_flow_id, self.operator_idx, request, self.stats)?;
+        Ok(id)
+    }
+
+    /// Download the whole of `remote`, an object whose size is not known up
+    /// front: one request, sized by its response. The bytes arrive as the
+    /// response to the returned id, as one location at offset zero.
+    pub fn download(
+        &mut self,
+        remote: Arc<RemoteFile>,
+    ) -> Result<ReadRequestId, crate::io::IORequesterError> {
+        let id = ReadRequestId(*self.next_read_id);
+        *self.next_read_id += 1;
+        self.requester.request_download(
+            self.data_flow_id,
+            self.operator_idx,
+            id,
+            remote,
+            self.stats,
+        )?;
         Ok(id)
     }
 

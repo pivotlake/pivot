@@ -13,6 +13,11 @@
 //! plus per-host keep-alive pooling, lives in [`backend`]; the requester only
 //! tracks which dataflow each in-flight request belongs to and commits the block
 //! once its body has fully landed.
+//!
+//! A whole-object download is the same `GET` without a `Range`, and the one
+//! request whose destination does not exist when it is issued: its body lands
+//! in a [`DownloadBody`] allocated the moment the response head says how long
+//! the body is (see [`download`]).
 
 use crate::io::RemoteFile;
 use crate::memory::FileBytes;
@@ -20,10 +25,12 @@ use std::sync::Arc;
 use thiserror::Error;
 
 mod backend;
+mod download;
 mod http1;
 mod proto;
 mod tls;
 
+pub(crate) use download::DownloadBody;
 pub use tls::default_client_config;
 
 #[cfg(target_os = "linux")]
@@ -48,43 +55,44 @@ pub enum Error {
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// A single remote range read: fetch `[offset, offset + len)` of `remote` into
-/// `dest` (a pointer into the pinned cache slot, kept alive by the issuing
-/// [`MissingExtent`](crate::memory::compressed_cache::MissingExtent)'s pin).
+/// A single `GET` of `remote`: a sized range into a pinned cache slot, or the
+/// whole object, whose size the response head declares.
 ///
-/// `Clone` so a transient transport failure can re-issue the same read on a
-/// fresh connection (see the engine's retry path); the clone aliases the same
-/// pinned `dest`, which is sound because only one attempt is ever in flight.
+/// `Clone` so a transient transport failure can re-issue the same request on
+/// a fresh connection (see the engine's retry path); the clone aliases the
+/// same pinned `dest`, which is sound because only one attempt is ever in
+/// flight.
 #[derive(Clone)]
-pub(crate) struct RemoteRead {
+pub(crate) struct RemoteGet {
     pub remote: Arc<RemoteFile>,
-    pub offset: u64,
-    pub len: usize,
-    pub dest: *mut u8,
+    pub body: GetBody,
 }
 
-impl RemoteRead {
-    /// Expected response-body length for this block-aligned range, based on the
-    /// object size recorded when `RemoteFile` was opened.
-    ///
-    /// A range wholly inside the object should return `len` bytes. A range
-    /// overlapping EOF should return only the bytes remaining after `offset`.
-    /// An offset at or beyond EOF yields zero, though a conforming server will
-    /// normally reject that range with `416`.
-    ///
-    /// The response parser requires this exact length. A mismatch indicates a
-    /// truncated response or that the remote object no longer matches its recorded
-    /// size.
-    pub fn expected_body_len(&self) -> usize {
-        (self.len as u64).min(self.remote.size().saturating_sub(self.offset)) as usize
-    }
+/// What a [`RemoteGet`] fetches, and where its body lands.
+#[derive(Clone, Copy)]
+pub(crate) enum GetBody {
+    /// `[offset, offset + len)` of an object opened with its size, into `dest`
+    /// (a pointer into the pinned cache slot, kept alive by the issuing
+    /// [`MissingExtent`](crate::memory::compressed_cache::MissingExtent)'s
+    /// pin). The response must be a `206` of exactly the bytes the range
+    /// covers (see [`RemoteFile::range_body_len`]).
+    Range {
+        offset: u64,
+        len: usize,
+        dest: *mut u8,
+    },
+    /// The whole object, with no `Range`: the response must be a `200` that
+    /// declares its length, and the body is allocated then (see
+    /// [`download`]).
+    Whole,
 }
 
-// SAFETY: `dest` points into a cache slot kept alive for the read's whole
-// lifetime by the originating block's `Arc<ReadBuffer>` pin; only this read
-// writes to `[dest, dest+len)` (currently-invalid sub-blocks), so moving the
-// descriptor into the engine is sound. Mirrors the file path's PendingRead.
-unsafe impl Send for RemoteRead {}
+// SAFETY: a range's `dest` points into a cache slot kept alive for the
+// request's whole lifetime by the originating block's `Arc<ReadBuffer>` pin;
+// only this request writes to `[dest, dest+len)` (currently-invalid
+// sub-blocks), so moving the descriptor into the engine is sound. Mirrors the
+// file path's PendingRead.
+unsafe impl Send for RemoteGet {}
 
 /// A whole-object upload. The body is reference counted so the operator-owned
 /// bytes remain stable while socket SQEs point into them, and is held as runs so
@@ -97,15 +105,15 @@ pub(crate) struct RemoteUpload {
 
 #[derive(Clone)]
 pub(crate) enum RemoteRequest {
-    Read(RemoteRead),
+    Get(RemoteGet),
     Upload(RemoteUpload),
 }
 
 impl RemoteRequest {
     pub fn remote(&self) -> &Arc<RemoteFile> {
         match self {
-            Self::Read(r) => &r.remote,
-            Self::Upload(r) => &r.remote,
+            Self::Get(get) => &get.remote,
+            Self::Upload(upload) => &upload.remote,
         }
     }
 
@@ -113,13 +121,18 @@ impl RemoteRequest {
         let remote = self.remote();
         let auth = remote.auth_header();
         match self {
-            Self::Read(read) => proto::build_range_get(
-                remote.host_header(),
-                remote.request_target(),
-                read.offset,
-                read.len,
-                auth.as_deref(),
-            ),
+            Self::Get(get) => {
+                let range = match get.body {
+                    GetBody::Range { offset, len, .. } => Some((offset, len)),
+                    GetBody::Whole => None,
+                };
+                proto::build_get(
+                    remote.host_header(),
+                    remote.request_target(),
+                    range,
+                    auth.as_deref(),
+                )
+            }
             Self::Upload(upload) => proto::build_upload(
                 remote.host_header(),
                 remote.request_target(),
@@ -130,6 +143,6 @@ impl RemoteRequest {
     }
 }
 
-// The read pointer has the safety argument above; uploads contain only Arc-owned
-// data and are Send without an unsafe implementation of their own.
+// A GET's pointer has the safety argument above; an upload contains only
+// Arc-owned data and is Send without an unsafe implementation of its own.
 unsafe impl Send for RemoteRequest {}

@@ -172,6 +172,15 @@ impl StatsCollector {
         }
     }
 
+    /// Bill one completed whole-object download: its bytes, known only now,
+    /// and its in-flight time, as a GET's.
+    pub fn record_http_download(&mut self, bytes: u64, submitted_at: Option<Instant>) {
+        if let Some(stats) = &mut self.stats {
+            stats.http_bytes += bytes;
+        }
+        self.record_elapsed(submitted_at, |stats| &mut stats.http_get_time);
+    }
+
     /// Bill one completed HTTP upload from submission through response drain.
     pub fn record_http_upload_time(&mut self, submitted_at: Option<Instant>) {
         self.record_elapsed(submitted_at, |stats| &mut stats.http_upload_time);

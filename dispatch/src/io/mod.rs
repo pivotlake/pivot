@@ -198,9 +198,11 @@ pub struct RemoteFile {
     /// two endpoints that share a host but differ by port (e.g. two MinIO
     /// instances) on separate cache files.
     cache_identity: String,
-    /// Total object size in bytes (from the store listing). Lets the disk cache
-    /// size its resident-block bitmap exactly, up front.
-    size: u64,
+    /// Total object size in bytes, from the store listing, which a range read
+    /// clamps its last block to and the disk cache sizes its resident-block
+    /// bitmap by. `None` for an object opened to be downloaded whole: its
+    /// size arrives with the response, and nothing is asked before.
+    size: Option<u64>,
 }
 
 impl RemoteFile {
@@ -211,6 +213,21 @@ impl RemoteFile {
     /// length (from the store listing), carried so the disk cache can size its
     /// bitmap exactly.
     pub fn open(url: Url, auth: Option<AuthHeader>, size: u64) -> std::io::Result<Self> {
+        Self::open_with_size(url, auth, Some(size))
+    }
+
+    /// Open `url` to download it whole, with no size known up front: the one
+    /// `GET` of the object carries its length. Such an object is never read
+    /// by range and never enters the disk cache.
+    pub fn open_unsized(url: Url, auth: Option<AuthHeader>) -> std::io::Result<Self> {
+        Self::open_with_size(url, auth, None)
+    }
+
+    fn open_with_size(
+        url: Url,
+        auth: Option<AuthHeader>,
+        size: Option<u64>,
+    ) -> std::io::Result<Self> {
         let host = url
             .host_str()
             .ok_or_else(|| {
@@ -278,9 +295,37 @@ impl RemoteFile {
         self.auth.as_ref().and_then(|f| f())
     }
 
-    /// Total object size in bytes.
+    /// Total object size in bytes, for a range read, which is only ever issued
+    /// on an object opened with its size.
     pub fn size(&self) -> u64 {
         self.size
+            .expect("a range read is issued only on a remote object opened with its size")
+    }
+
+    /// How many bytes of the object `[offset, offset + len)` covers, which is
+    /// what a range read's response must declare: `len` for a range wholly
+    /// inside the object, the bytes remaining after `offset` for one reaching
+    /// past its end, and zero for an offset at or beyond it (a conforming
+    /// server normally rejects that range with `416`). A response of another
+    /// length is truncated, or of an object no longer matching this size.
+    pub fn range_body_len(&self, offset: u64, len: usize) -> usize {
+        (len as u64).min(self.size().saturating_sub(offset)) as usize
+    }
+
+    /// The same object, carrying the `size` a download of it reported, so
+    /// range reads can be issued on it. Keys the caches like `self`: an object
+    /// is one object whether or not its size is known.
+    pub fn with_size(&self, size: u64) -> Self {
+        Self {
+            addr: self.addr,
+            host: self.host.clone(),
+            host_header: self.host_header.clone(),
+            request_target: self.request_target.clone(),
+            is_https: self.is_https,
+            auth: self.auth.clone(),
+            cache_identity: self.cache_identity.clone(),
+            size: Some(size),
+        }
     }
 
     /// Stable identity (authority + path, no query) for keying the on-disk cache.
@@ -388,11 +433,23 @@ pub struct HttpUploadRequest {
     pub data: Arc<FileBytes>,
 }
 
+/// A whole-object `GET` of a remote object whose size is not known up front:
+/// the response head says how long the body is, and the body lands in the
+/// compressed cache, in extents allocated then, so the object is served from
+/// memory the next time it is asked for. The disk cache is passed by. The
+/// bytes come back to the operator as the response to `read_id`.
+pub struct HttpDownloadRequest {
+    pub remote: Arc<RemoteFile>,
+    pub read_id: ReadRequestId,
+}
+
 /// An HTTP operation issued by a dataflow operator. GETs pass through the
-/// compressed/disk cache; uploads bypass it but share the same worker-local
-/// transport and connection pool.
+/// compressed/disk cache; downloads fill the compressed cache alone, and
+/// uploads bypass both; all share the same worker-local transport and
+/// connection pool.
 pub enum HttpRequest {
     Get(HttpGetRequest),
+    Download(HttpDownloadRequest),
     Upload(HttpUploadRequest),
 }
 
@@ -439,6 +496,9 @@ impl ReadyBytesLen for HttpRequest {
     fn ready_bytes_len(&self) -> u64 {
         match self {
             Self::Get(request) => request.ready_bytes_len(),
+            // A download learns its length from the response; it is billed
+            // when it lands.
+            Self::Download(_) => 0,
             Self::Upload(request) => request.ready_bytes_len(),
         }
     }
@@ -510,11 +570,14 @@ pub struct RemoteReadTime {
 /// One completed I/O operation drained from [`IORequester::completions`], with
 /// its originating dataflow/operator attached. Each variant carries the concrete
 /// request it finished; a completed cache-backed GET also carries the
-/// [`RemoteReadTime`] its pieces accrued.
+/// [`RemoteReadTime`] its pieces accrued, and a completed download the number
+/// of bytes it turned out to be. The download's bytes themselves reach the
+/// operator as a ready read, not through here.
 pub enum Completion {
     FsRead(DataFlowRequest<FsReadRequest>),
     FsWrite(DataFlowRequest<FsWriteRequest>),
     HttpGet(DataFlowRequest<HttpGetRequest>, RemoteReadTime),
+    HttpDownload(DataFlowRequest<HttpDownloadRequest>, u64),
     HttpUpload(DataFlowRequest<HttpUploadRequest>),
 }
 

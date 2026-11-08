@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod file_injector;
-mod file_slice_injector;
 mod gcs;
+mod item_injector;
 mod local;
 mod object_fetcher;
 mod object_path;
@@ -33,7 +33,9 @@ mod s3;
 pub mod test_support;
 pub use gcs::GcsStore;
 pub use local::LocalStore;
-pub use object_fetcher::{FileSlice, LoadedObject, load_file_slices, load_objects};
+pub use object_fetcher::{
+    FileSlice, LoadedObject, UnsizedObject, download_objects, load_file_slices, load_objects,
+};
 pub use object_path::ObjectPath;
 pub use s3::{S3Credentials, S3Keys, S3Store};
 

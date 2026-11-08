@@ -57,6 +57,7 @@ use bytes::Bytes;
 use crossbeam_deque::{Injector, Steal};
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -467,6 +468,21 @@ struct CacheLookupStep {
     next_file_block: usize,
 }
 
+/// What the cache holds for one file: the placement of its cached extents,
+/// and its size once a download of the whole file has learned it.
+#[derive(Default)]
+struct CachedFile {
+    /// A cached extent's first file block → its [`Extent`] placement, sorted by
+    /// `first_file_block`; the extents never overlap.
+    extents: RwLock<BTreeMap<usize, Extent>>,
+    /// The file's byte length, learned from the response head of a download of
+    /// the whole file. Unset until then: a remote object is opened without a
+    /// size when nothing is asked about it before it is downloaded. Once known,
+    /// the next read of the whole file is a sized read served from these
+    /// extents, with only its evicted parts fetched again.
+    size: OnceLock<u64>,
+}
+
 /// A CLOCK-eviction cache over the shared [`Ring`](super::Ring) that packs many
 /// small reads per slot.
 ///
@@ -475,8 +491,7 @@ struct CacheLookupStep {
 /// differs.
 pub struct CompressedCache {
     /// Per-file index of what's cached and where it physically lives: file → (a
-    /// cached extent's first file block → its [`Extent`] placement). Each per-file map
-    /// is sorted by `first_file_block`, and its extents never overlap. Both the outer
+    /// cached extent's first file block → its [`Extent`] placement). Both the outer
     /// file map and each per-file extent map are independently `RwLock`'d.
     ///
     /// ```text
@@ -484,7 +499,7 @@ pub struct CompressedCache {
     ///                └─ block 40 → Extent { slot 3, slot block 88,  2 blocks }
     ///   bar.parquet ─── block 12 → Extent { slot 7, slot block 200, 1 block  }
     /// ```
-    file_maps: RwLock<HashMap<OpenFile, RwLock<BTreeMap<usize, Extent>>>>,
+    file_maps: RwLock<HashMap<OpenFile, CachedFile>>,
     /// Per-slot metadata, indexed by ring slot. `UnsafeCell` because `tenants` is
     /// mutated through a shared `&self` under the pin/exclusivity discipline.
     slot_metadatas: Box<[UnsafeCell<SlotMetadata>]>,
@@ -553,38 +568,48 @@ impl CompressedCache {
         lookups
     }
 
-    /// Mark `missing` failed and take it out of `open_file`'s map. Runs from an
-    /// unwinding owner's drop as well, so a lock another thread poisoned is
-    /// used anyway: the map is only ever read and written under it here, and
-    /// leaving the extent published would be the worse outcome.
+    /// Mark `missing` failed and take it out of `open_file`'s map, and the
+    /// file out of the cache when that was its last extent, as eviction does:
+    /// what the cache keeps about a file (its size) goes with the last of it.
+    /// Runs from an unwinding owner's drop as well, so a lock another thread
+    /// poisoned is used anyway: the map is only ever read and written under
+    /// it here, and leaving the extent published would be the worse outcome.
     fn remove_extent(&self, open_file: &OpenFile, missing: &Extent) {
-        let file_maps = self
-            .file_maps
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(extents_lock) = file_maps.get(open_file) else {
+        let emptied = {
+            let file_maps = self
+                .file_maps
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(file) = file_maps.get(open_file) else {
+                missing.failed.store(true, Ordering::Release);
+                return;
+            };
+            let mut extents = file
+                .extents
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Publish failure while holding the map write lock that excludes a
+            // new lookup from discovering this extent. New readers can allocate
+            // a fresh fill after removal; existing followers retain this shared
+            // flag.
             missing.failed.store(true, Ordering::Release);
-            return;
+            let key = extents
+                .range(..=missing.first_file_block)
+                .next_back()
+                .filter(|(_, extent)| {
+                    extent.last_file_block() >= missing.first_file_block
+                        && extent.slot_idx == missing.slot_idx
+                        && extent.slot_block_of(missing.first_file_block)
+                            == missing.first_slot_block as usize
+                })
+                .map(|(&key, _)| key);
+            if let Some(key) = key {
+                extents.remove(&key);
+            }
+            extents.is_empty()
         };
-        let mut extents = extents_lock
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Publish failure while holding the map write lock that excludes a new
-        // lookup from discovering this extent. New readers can allocate a fresh
-        // fill after removal; existing followers retain this shared flag.
-        missing.failed.store(true, Ordering::Release);
-        let key = extents
-            .range(..=missing.first_file_block)
-            .next_back()
-            .filter(|(_, extent)| {
-                extent.last_file_block() >= missing.first_file_block
-                    && extent.slot_idx == missing.slot_idx
-                    && extent.slot_block_of(missing.first_file_block)
-                        == missing.first_slot_block as usize
-            })
-            .map(|(&key, _)| key);
-        if let Some(key) = key {
-            extents.remove(&key);
+        if emptied {
+            self.prune_empty_file_locations(vec![open_file.clone()]);
         }
     }
 
@@ -608,7 +633,7 @@ impl CompressedCache {
         end_offset: usize,
     ) -> Option<CacheLookupStep> {
         let file_maps = self.file_maps.read().unwrap();
-        let extents = file_maps.get(open_file)?.read().unwrap();
+        let extents = file_maps.get(open_file)?.extents.read().unwrap();
         let found_extent = find_extent_covering(&extents, file_block)?;
 
         let pin = Arc::new(
@@ -713,10 +738,10 @@ impl CompressedCache {
         // and write at once, so it must be released before the slow path below.
         {
             let file_maps = self.file_maps.read().unwrap();
-            if let Some(extents_lock) = file_maps.get(open_file) {
+            if let Some(file) = file_maps.get(open_file) {
                 return self.try_add_extent_to_map(
                     open_file,
-                    extents_lock,
+                    &file.extents,
                     slot_idx,
                     first_slot_block,
                     file_block,
@@ -727,10 +752,10 @@ impl CompressedCache {
         // Rare: a prior eviction pruned the whole file. Recreate its map and register
         // under one outer write lock - no lock upgrade, and no prune can race in.
         let mut file_maps = self.file_maps.write().unwrap();
-        let extents_lock = file_maps.entry(open_file.clone()).or_default();
+        let file = file_maps.entry(open_file.clone()).or_default();
         self.try_add_extent_to_map(
             open_file,
-            extents_lock,
+            &file.extents,
             slot_idx,
             first_slot_block,
             file_block,
@@ -837,10 +862,10 @@ impl CompressedCache {
         {
             let file_maps = self.file_maps.read().unwrap();
             for tenant in tenants {
-                let Some(extents_lock) = file_maps.get(&tenant.open_file) else {
+                let Some(file) = file_maps.get(&tenant.open_file) else {
                     continue;
                 };
-                let mut extents = extents_lock.write().unwrap();
+                let mut extents = file.extents.write().unwrap();
                 // Skip an extent re-placed into another slot after this tenant was
                 // recorded.
                 if let Some(extent) = extents
@@ -883,10 +908,10 @@ impl CompressedCache {
         let last_file_block = (offset + len - 1) / BLOCK_SIZE;
 
         let file_maps = self.file_maps.read().unwrap();
-        let Some(extents_lock) = file_maps.get(open_file) else {
+        let Some(file) = file_maps.get(open_file) else {
             return;
         };
-        let extents = extents_lock.read().unwrap();
+        let extents = file.extents.read().unwrap();
         // The extent covering `first_file_block` may start before it, so begin the
         // walk at the greatest key at or before it and skip a leading extent that
         // doesn't actually reach the range.
@@ -907,18 +932,40 @@ impl CompressedCache {
     /// `LocalFile` / `Arc<RemoteFile>`), so without this a dead entry - pinning its
     /// `Arc` and the file/connection it holds - lingers for every file ever opened.
     /// Re-checks emptiness under the write lock so a concurrent `get` that just
-    /// cached a new extent isn't dropped.
+    /// cached a new extent isn't dropped. The size a download learned goes with
+    /// the entry: a file evicted whole is downloaded whole again.
     fn prune_empty_file_locations(&self, locations: Vec<OpenFile>) {
         if locations.is_empty() {
             return;
         }
         let mut file_maps = self.file_maps.write().unwrap();
         for open_file in locations {
-            if let Some(extents_lock) = file_maps.get(&open_file)
-                && extents_lock.read().unwrap().is_empty()
+            if let Some(file) = file_maps.get(&open_file)
+                && file.extents.read().unwrap().is_empty()
             {
                 file_maps.remove(&open_file);
             }
+        }
+    }
+
+    /// The byte length of `open_file`, if a download of the whole file has
+    /// reported it since the file was last evicted whole.
+    pub fn known_size(&self, open_file: &OpenFile) -> Option<u64> {
+        let file_maps = self.file_maps.read().unwrap();
+        file_maps.get(open_file)?.size.get().copied()
+    }
+
+    /// Record the byte length a download of the whole `open_file` reported, so
+    /// the next read of the whole file can be sized. The size is kept with
+    /// what the cache holds of the file, and only then: a file it holds no
+    /// extent of (an empty file, or one evicted whole since its download
+    /// began) is downloaded whole again, which is one request either way. A
+    /// file is never rewritten under its name, so a second report must agree
+    /// with the first.
+    pub fn remember_size(&self, open_file: &OpenFile, size: u64) {
+        let file_maps = self.file_maps.read().unwrap();
+        if let Some(file) = file_maps.get(open_file) {
+            assert_remembered_size(file, size);
         }
     }
 
@@ -946,14 +993,15 @@ impl CompressedCache {
             self.file_maps
                 .write()
                 .unwrap()
-                .insert(open_file, Default::default());
+                .insert(open_file, CachedFile::default());
         }
     }
 
     /// Evict every cached extent: drop all extent maps and recycle the ring slots they
-    /// referenced, so subsequent reads miss and re-read from disk. Registered file
-    /// descriptors stay open (their maps are just emptied). Returns the number of
-    /// extents dropped.
+    /// referenced, so subsequent reads miss and re-read from disk, and forget every
+    /// size a download learned, so a file read whole is downloaded whole again.
+    /// Registered file descriptors stay open (their maps are just emptied). Returns
+    /// the number of extents dropped.
     ///
     /// Intended for benchmarking true cold reads (`SELECT drop_cache()`). Sound only
     /// while no query is in flight: it recycles bound slots, which must not race a
@@ -968,12 +1016,13 @@ impl CompressedCache {
         // Drain every file's extents, collecting the slots they lived in.
         let mut slots = HashSet::new();
         let mut dropped = 0;
-        let file_maps = self.file_maps.read().unwrap();
-        for extents_lock in file_maps.values() {
-            for (_, extent) in std::mem::take(&mut *extents_lock.write().unwrap()) {
+        let mut file_maps = self.file_maps.write().unwrap();
+        for file in file_maps.values_mut() {
+            for (_, extent) in std::mem::take(&mut *file.extents.write().unwrap()) {
                 slots.insert(extent.slot_idx as usize);
                 dropped += 1;
             }
+            file.size = OnceLock::new();
         }
         drop(file_maps);
 
@@ -994,6 +1043,16 @@ impl CompressedCache {
         }
         dropped
     }
+}
+
+/// Set `file`'s size to the `size` a download reported, or check that it is
+/// already that: the reports of one file never disagree.
+fn assert_remembered_size(file: &CachedFile, size: u64) {
+    let known = *file.size.get_or_init(|| size);
+    assert_eq!(
+        known, size,
+        "a file downloaded whole reported {size} bytes after {known}"
+    );
 }
 
 /// The extent covering file block `file_block`, if any: the greatest-keyed extent at
@@ -1559,11 +1618,90 @@ mod tests {
         );
 
         // Reading f again must tolerate the absent entry: re-create it + miss.
-        assert!(has_misses(&cache().get(&f, 0, SB)));
+        // The lookups are held across the check: dropping them unfilled would
+        // abandon the fill and prune the entry again.
+        let lookups = cache().get(&f, 0, SB);
+        assert!(has_misses(&lookups));
         assert!(
             cache().file_maps.read().unwrap().contains_key(&f),
             "re-reading a pruned file should re-create its entry",
         );
+    }
+
+    /// A size reported for a file is known for as long as any of the file is
+    /// cached; evicting its last extent prunes the file, size included.
+    #[test]
+    fn a_reported_size_is_known_until_the_file_is_evicted_whole() {
+        init_test_free_pool(8);
+        let f = new_file();
+        fill_pattern(&cache().get(&f, 0, SB));
+        release_fill_cursor();
+        cache().remember_size(&f, SB as u64);
+        let known_while_cached = cache().known_size(&f);
+
+        memory_ctx().evict();
+
+        assert_eq!(known_while_cached, Some(SB as u64));
+        assert_eq!(cache().known_size(&f), None);
+    }
+
+    /// A size is kept with what the cache holds of the file: reported for a
+    /// file nothing of which is cached (an empty file), it is not kept.
+    #[test]
+    fn a_size_reported_for_a_file_with_nothing_cached_is_not_kept() {
+        init_test_free_pool(8);
+        let f = new_file();
+
+        cache().remember_size(&f, 0);
+
+        assert_eq!(cache().known_size(&f), None);
+    }
+
+    /// A report that disagrees with the first is a bug, not a quiet
+    /// replacement.
+    #[test]
+    fn a_second_different_size_for_a_file_is_refused() {
+        init_test_free_pool(8);
+        let f = new_file();
+        fill_pattern(&cache().get(&f, 0, SB));
+        cache().remember_size(&f, SB as u64);
+
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache().remember_size(&f, SB as u64 + 1)
+        }));
+
+        assert!(again.is_err());
+        assert_eq!(cache().known_size(&f), Some(SB as u64));
+    }
+
+    /// An abandoned fill that takes the file's last extent with it takes the
+    /// file's size too: nothing of the file is cached, so the next read of
+    /// the whole file downloads it whole again.
+    #[test]
+    fn an_abandoned_fill_that_empties_a_file_forgets_its_size() {
+        init_test_free_pool(8);
+        let f = new_file();
+        let owner = cache().get(&f, 0, SB);
+        cache().remember_size(&f, SB as u64);
+        let known_while_filling = cache().known_size(&f);
+
+        drop(owner);
+
+        assert_eq!(known_while_filling, Some(SB as u64));
+        assert_eq!(cache().known_size(&f), None);
+    }
+
+    #[test]
+    fn clearing_the_cache_forgets_reported_sizes() {
+        init_test_free_pool(8);
+        let f = new_file();
+        fill_pattern(&cache().get(&f, 0, SB));
+        release_fill_cursor();
+        cache().remember_size(&f, SB as u64);
+
+        cache().clear();
+
+        assert_eq!(cache().known_size(&f), None);
     }
 
     // -- share-routed eviction and cross-tier reinforcement --

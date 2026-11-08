@@ -10,13 +10,15 @@
 //! connection's state machine (connect → handshake → request → response). Idle
 //! keep-alive connections are pooled per host and reused.
 //!
-//! On non-Linux (macOS) there is no ring: the engine hands each range read to a
+//! On non-Linux (macOS) there is no ring: the engine hands each request to a
 //! shared pool of blocking `std::net` + `rustls::StreamOwned` threads (mirroring
 //! the file path's `pread` pool) and collects their completions over a channel,
 //! so a fetch never blocks the dataflow worker and many run concurrently.
 
 use super::proto;
-use super::{RemoteRead, RemoteRequest, RemoteUpload};
+use super::{DownloadBody, GetBody, RemoteGet, RemoteRequest, RemoteUpload};
+use crate::io::RemoteFile;
+use std::sync::Arc;
 
 const IO_CHUNK_SIZE: usize = 16 * 1024;
 
@@ -33,8 +35,115 @@ pub(crate) use blocking_engine::{HttpCompletion, HttpEngine};
 pub(crate) const HTTP_TAG: u64 = 1 << 63;
 
 /// Per-host pool key.
-fn host_key(remote: &crate::io::RemoteFile) -> String {
+fn host_key(remote: &RemoteFile) -> String {
     format!("{}:{}", remote.host(), remote.port())
+}
+
+/// Where a response body lands.
+enum BodySink {
+    /// An upload's response body: drained off the socket and discarded.
+    Discard,
+    /// A range GET's pinned cache slot region: exactly `len` bytes at `dest`
+    /// (the requested range clamped to the object's end), which the head must
+    /// declare; head parsing rejects any other length.
+    Slot { dest: *mut u8, len: usize },
+    /// A whole-object GET's body, allocated once the head declares its length.
+    Download(Option<DownloadBody>),
+}
+
+impl BodySink {
+    /// Where `get`'s body lands: the slot a range names, or a download's
+    /// body, once the head sizes it.
+    fn for_get(get: &RemoteGet) -> Self {
+        match get.body {
+            GetBody::Range { offset, len, dest } => Self::Slot {
+                dest,
+                len: get.remote.range_body_len(offset, len),
+            },
+            GetBody::Whole => Self::Download(None),
+        }
+    }
+
+    /// Parse the head of the response this sink is for, as far as `head_acc`
+    /// holds it.
+    fn parse_head(&self, head_acc: &[u8]) -> Result<proto::HeadParse, proto::ProtoError> {
+        match self {
+            Self::Discard => proto::parse_upload_response_head(head_acc),
+            Self::Slot { len, .. } => proto::parse_get_response_head(head_acc, Some(*len)),
+            Self::Download(_) => proto::parse_get_response_head(head_acc, None),
+        }
+    }
+
+    /// Size a download's body by the `content_length` its head declared, on
+    /// the thread the head reached: allocate it, or, for a retried download
+    /// that keeps the body its first attempt allocated, check that the
+    /// retry's head sizes it the same. Nothing to do for another sink.
+    fn size_download(
+        &mut self,
+        remote: &Arc<RemoteFile>,
+        content_length: u64,
+    ) -> super::Result<()> {
+        let Self::Download(allocated) = self else {
+            return Ok(());
+        };
+        match allocated {
+            None => *allocated = Some(DownloadBody::allocate(remote, content_length)),
+            Some(body) if body.len() as u64 == content_length => {}
+            Some(body) => {
+                return Err(proto::ProtoError::WholeObjectLengthChanged {
+                    first: body.len() as u64,
+                    retry: content_length,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The region the next body bytes land in, once `written` of them have:
+    /// contiguous destination, at most `max` bytes of it. Empty when the
+    /// sink keeps nothing (`Discard`) or has no room left.
+    fn region_at(&mut self, written: usize, max: usize) -> &mut [u8] {
+        match self {
+            Self::Discard | Self::Download(None) => &mut [],
+            // SAFETY: `dest` points at `len` bytes of a cache slot pinned
+            // for the request's whole lifetime, written only by this
+            // request (see `GetBody::Range`), and `written <= len`: the body
+            // decoder never hands over more than the declared length,
+            // which head parsing validated equals `len`.
+            Self::Slot { dest, len } => unsafe {
+                std::slice::from_raw_parts_mut(dest.add(written), (*len - written).min(max))
+            },
+            Self::Download(Some(body)) => {
+                let region = body.region_at(written);
+                let take = region.len().min(max);
+                &mut region[..take]
+            }
+        }
+    }
+
+    /// Land `bytes` of the body after the `written` already landed, region by
+    /// region. An upload's response body is discarded.
+    fn land(&mut self, written: &mut usize, mut bytes: &[u8]) {
+        if matches!(self, Self::Discard) {
+            return;
+        }
+        while !bytes.is_empty() {
+            let region = self.region_at(*written, bytes.len());
+            let n = region.len();
+            region.copy_from_slice(&bytes[..n]);
+            *written += n;
+            bytes = &bytes[n..];
+        }
+    }
+
+    /// A download's body; nothing for a slot or a discarded body.
+    fn into_download(self) -> Option<DownloadBody> {
+        match self {
+            Self::Download(body) => body,
+            Self::Discard | Self::Slot { .. } => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -62,13 +171,21 @@ mod blocking_engine {
     const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// A finished fetch handed back from a pool thread: `Ok` once the body landed
-    /// in the slot, `Err` for a terminal transport failure (the engine surfaces it
-    /// to the owning dataflow). The id is the read's engine-side request id.
-    pub(crate) type HttpCompletion = (Identifier, Result<()>);
+    /// (in the slot for a range read, or as the body itself for a download),
+    /// `Err` for a terminal transport failure (the engine surfaces it to the
+    /// owning dataflow). The id is the request's engine-side request id.
+    pub(crate) type HttpCompletion = (Identifier, Result<Option<DownloadBody>>);
 
-    /// One range read for a pool thread to perform: fetch `read` into its pinned
-    /// slot and report `(id, outcome)` on `sink`. `client_config` builds any fresh
-    /// connection the fetch needs.
+    /// What one finished request leaves behind: its connection, when it can be
+    /// pooled, and a download's body.
+    struct Finished {
+        conn: Option<Conn>,
+        download: Option<DownloadBody>,
+    }
+
+    /// One request for a pool thread to perform: run `request` and report
+    /// `(id, outcome)` on `sink`. `client_config` builds any fresh connection
+    /// the request needs.
     struct HttpJob {
         id: Identifier,
         request: RemoteRequest,
@@ -179,13 +296,15 @@ mod blocking_engine {
         }
     }
 
-    /// Fetch `read` into its slot, reusing a pooled keep-alive connection when one
-    /// is idle for the host and reconnecting once if it turns out to be stale.
+    /// Run `request`, reusing a pooled keep-alive connection when one is idle
+    /// for the host and reconnecting once if it turns out to be stale. Yields
+    /// the body of a download; a range read lands in its slot, an upload
+    /// leaves nothing.
     fn run_fetch(
         conns: &ConnPool,
         client_config: &Arc<rustls::ClientConfig>,
         request: &RemoteRequest,
-    ) -> Result<()> {
+    ) -> Result<Option<DownloadBody>> {
         let key = host_key(request.remote());
         // Recover a poisoned lock rather than propagating the panic: the guarded
         // region is only a pop/push, so a poisoned map is still usable, and the
@@ -196,18 +315,18 @@ mod blocking_engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_mut(&key)
             .and_then(|v| v.pop());
-        let conn = match pooled {
+        let finished = match pooled {
             // A pooled connection may have been closed by the server's keep-alive
             // timeout; on any error, reconnect once and retry.
             Some(c) => match do_request(c, request) {
-                Ok(c) => c,
+                Ok(finished) => finished,
                 Err(_) => do_request(connect(client_config, request)?, request)?,
             },
             None => do_request(connect(client_config, request)?, request)?,
         };
         // `None` means the request finished but its connection can't be pooled
         // (a response body of unknown framing); dropping it closes the socket.
-        if let Some(conn) = conn {
+        if let Some(conn) = finished.conn {
             conns
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -215,7 +334,7 @@ mod blocking_engine {
                 .or_default()
                 .push(conn);
         }
-        Ok(())
+        Ok(finished.download)
     }
 
     fn connect(client_config: &Arc<rustls::ClientConfig>, request: &RemoteRequest) -> Result<Conn> {
@@ -236,39 +355,40 @@ mod blocking_engine {
         }
     }
 
-    /// Run one request on `conn`, returning the connection for re-pooling, or
-    /// `None` when the request succeeded but the connection must be closed.
-    fn do_request(conn: Conn, request: &RemoteRequest) -> Result<Option<Conn>> {
+    /// Run one request on `conn`, returning the connection for re-pooling (or
+    /// none, when the request succeeded but the connection must be closed) and
+    /// a download's body.
+    fn do_request(conn: Conn, request: &RemoteRequest) -> Result<Finished> {
         match request {
-            // A range GET response is always identity-framed with a known
-            // Content-Length that is fully drained, so `do_read` can never leave
-            // the connection in an unreusable state: on success it always hands
-            // the connection back for pooling, hence the unconditional `Some`.
-            // Upload responses can have unknown framing, so `do_upload` decides
-            // per-response whether the connection may be reused.
-            RemoteRequest::Read(read) => do_read(conn, read).map(Some),
-            RemoteRequest::Upload(upload) => do_upload(conn, upload),
+            // A GET response is always identity-framed with a known
+            // Content-Length that is fully drained, so a GET can never leave
+            // the connection in an unreusable state: on success it always
+            // hands the connection back for pooling. Upload responses can
+            // have unknown framing, so `do_upload` decides per-response
+            // whether the connection may be reused.
+            RemoteRequest::Get(get) => do_get(conn, get).map(|(conn, download)| Finished {
+                conn: Some(conn),
+                download,
+            }),
+            RemoteRequest::Upload(upload) => do_upload(conn, upload).map(|conn| Finished {
+                conn,
+                download: None,
+            }),
         }
     }
 
-    /// Issue the range GET on `conn` and read its body into `read.dest`, returning
-    /// the connection for re-pooling on success.
-    fn do_read(mut conn: Conn, read: &RemoteRead) -> Result<Conn> {
-        let auth = read.remote.auth_header();
-        let request = proto::build_range_get(
-            read.remote.host_header(),
-            read.remote.request_target(),
-            read.offset,
-            read.len,
-            auth.as_deref(),
-        );
-        conn.write_all(&request)?;
-        conn.flush()?;
-
-        // Accumulate until the response head parses.
+    /// Read from `conn` until `parse` accepts the response head, returning the
+    /// head with every byte read so far: the body's first bytes follow the head
+    /// in them. A rejected head is reported with the start of the response,
+    /// since a bare status is hard to diagnose.
+    fn read_response_head(
+        conn: &mut Conn,
+        remote: &RemoteFile,
+        parse: impl Fn(&[u8]) -> std::result::Result<proto::HeadParse, proto::ProtoError>,
+    ) -> Result<(proto::ResponseHead, Vec<u8>)> {
         let mut chunk = vec![0u8; IO_CHUNK_SIZE];
         let mut acc: Vec<u8> = Vec::new();
-        let head = loop {
+        loop {
             let n = conn.read(&mut chunk)?;
             if n == 0 {
                 return Err(Error::Io(std::io::Error::new(
@@ -277,13 +397,13 @@ mod blocking_engine {
                 )));
             }
             acc.extend_from_slice(&chunk[..n]);
-            match proto::parse_get_response_head(&acc, read.expected_body_len()) {
-                Ok(proto::HeadParse::Complete(h)) => break h,
+            match parse(&acc) {
+                Ok(proto::HeadParse::Complete(head)) => return Ok((head, acc)),
                 Ok(proto::HeadParse::Incomplete) => continue,
                 Err(e) => {
                     // A rejected request (e.g. a GCS 404/403) carries an error
                     // body explaining why; pull a little more so it lands in the
-                    // message, since a bare status is hard to diagnose.
+                    // message.
                     if let Ok(extra) = conn.read(&mut chunk) {
                         acc.extend_from_slice(&chunk[..extra]);
                     }
@@ -291,39 +411,40 @@ mod blocking_engine {
                     let response = &response[..response.len().min(800)];
                     return Err(Error::Io(std::io::Error::other(format!(
                         "{e}; {} {} -> {response}",
-                        read.remote.host_header(),
-                        read.remote.request_target(),
+                        remote.host_header(),
+                        remote.request_target(),
                     ))));
                 }
             }
-        };
+        }
+    }
 
-        let body_len = head.content_length as usize;
-        // SAFETY: dest points into the pinned cache slot for exactly this block's
-        // currently-invalid sub-blocks; body_len == the expected body length <=
-        // read.len <= the block length (validated in parse_get_response_head).
-        let dest = unsafe { std::slice::from_raw_parts_mut(read.dest, body_len) };
+    /// Issue `get` on `conn` and read its body into where it lands: a range's
+    /// pinned slot, or a download's body, allocated once the head sizes it and
+    /// returned with the connection for re-pooling.
+    fn do_get(mut conn: Conn, get: &RemoteGet) -> Result<(Conn, Option<DownloadBody>)> {
+        let request = RemoteRequest::Get(get.clone()).request_head();
+        conn.write_all(&request)?;
+        conn.flush()?;
+        let mut sink = BodySink::for_get(get);
+        let (head, acc) = read_response_head(&mut conn, &get.remote, |acc| sink.parse_head(acc))?;
+        sink.size_download(&get.remote, head.content_length)?;
 
-        // Drive the body through the sans-IO decoder. The range policy guarantees
-        // an identity (`Content-Length`) body, so the Direct path applies: read
-        // straight into the cache slot and report the count, no intermediate
-        // buffer. `decode` first absorbs any body bytes that arrived alongside the
-        // head, and would transparently handle a chunked body too were the range
-        // policy ever relaxed.
-        let mut body = http1::BodyDecoder::new(head.content_length);
+        // Drive the body through the sans-IO decoder. A GET body is identity
+        // framed (`Content-Length`), so the Direct path applies: read straight
+        // into the sink and report the count, no intermediate buffer. `decode`
+        // first lands any body bytes that arrived alongside the head.
+        let mut decoder = http1::BodyDecoder::new(head.content_length);
         let mut written = 0usize;
-        let leftover = &acc[head.head_len..];
-        body.decode(leftover, |bytes| {
-            dest[written..written + bytes.len()].copy_from_slice(bytes);
-            written += bytes.len();
+        decoder.decode(&acc[head.head_len..], |bytes| {
+            sink.land(&mut written, bytes)
         });
-
-        while !body.is_complete() {
-            match body.read_plan() {
+        while !decoder.is_complete() {
+            match decoder.read_plan() {
                 http1::ReadPlan::Done => break,
                 http1::ReadPlan::Direct { max } => {
-                    let cap = (max as usize).min(dest.len() - written);
-                    let n = conn.read(&mut dest[written..written + cap])?;
+                    let region = sink.region_at(written, max as usize);
+                    let n = conn.read(region)?;
                     if n == 0 {
                         return Err(Error::Io(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -331,12 +452,11 @@ mod blocking_engine {
                         )));
                     }
                     written += n;
-                    body.consumed(n as u64)?;
+                    decoder.consumed(n as u64)?;
                 }
             }
         }
-
-        Ok(conn)
+        Ok((conn, sink.into_download()))
     }
 
     fn do_upload(mut conn: Conn, upload: &RemoteUpload) -> Result<Option<Conn>> {
@@ -389,7 +509,7 @@ mod blocking_engine {
     }
 
     /// A thin per-worker handle onto the shared blocking-HTTP pool. Stages each
-    /// range read onto the pool and collects completions over `rx`; the requester
+    /// request onto the pool and collects completions over `rx`; the requester
     /// drains them via [`take_completed`](Self::take_completed) /
     /// [`take_failed`](Self::take_failed) and parks on `rx` (alongside the disk
     /// channel) through [`completion_receiver`](Self::completion_receiver).
@@ -404,8 +524,9 @@ mod blocking_engine {
         rx: Receiver<HttpCompletion>,
         /// Fetches dispatched but not yet drained from `rx`.
         active: usize,
-        /// Drained successes, awaiting [`take_completed`](Self::take_completed).
-        completed: Vec<Identifier>,
+        /// Drained successes, each with its body when it was a download,
+        /// awaiting [`take_completed`](Self::take_completed).
+        completed: Vec<(Identifier, Option<DownloadBody>)>,
         /// Drained failures with their error, awaiting [`take_failed`](Self::take_failed).
         failed: Vec<(Identifier, Error)>,
     }
@@ -424,10 +545,10 @@ mod blocking_engine {
             })
         }
 
-        /// Dispatch a range read onto the pool (non-blocking); it completes later
-        /// on `rx`.
-        pub fn start_get(&mut self, id: Identifier, read: RemoteRead) -> Result<()> {
-            self.start_request(id, RemoteRequest::Read(read))
+        /// Dispatch a GET onto the pool (non-blocking); it completes later on
+        /// `rx`.
+        pub fn start_get(&mut self, id: Identifier, get: RemoteGet) -> Result<()> {
+            self.start_request(id, RemoteRequest::Get(get))
         }
 
         pub fn start_upload(&mut self, id: Identifier, upload: RemoteUpload) -> Result<()> {
@@ -453,13 +574,15 @@ mod blocking_engine {
             while let Ok((id, outcome)) = self.rx.try_recv() {
                 self.active -= 1;
                 match outcome {
-                    Ok(()) => self.completed.push(id),
+                    Ok(download) => self.completed.push((id, download)),
                     Err(error) => self.failed.push((id, error)),
                 }
             }
         }
 
-        pub fn take_completed(&mut self) -> Vec<Identifier> {
+        /// The requests that landed since the last call, each with its body
+        /// when it was a download.
+        pub fn take_completed(&mut self) -> Vec<(Identifier, Option<DownloadBody>)> {
             self.drain_rx();
             std::mem::take(&mut self.completed)
         }
@@ -585,10 +708,8 @@ mod uring_engine {
     struct HttpExchange {
         conn: Conn,
         id: Identifier,
-        dest: *mut u8,
-        /// The exact body size a well-formed response must carry (the requested
-        /// range clamped to the object's end); head parsing rejects any other.
-        expected_body_len: usize,
+        /// Where the response body goes.
+        sink: BodySink,
         request_bytes: Vec<u8>,
         request_queued: bool,
         /// The originating operation, retained for transparent reconnects and
@@ -611,11 +732,11 @@ mod uring_engine {
         // Response assembly. `head_acc` accumulates header bytes until the head
         // parses; `body` is then the sans-IO decoder that tracks body progress and
         // completion (`None` until the head is in). `body_written` is the write
-        // cursor into `dest`.
+        // cursor into `sink`.
         head_acc: Vec<u8>,
         body: Option<http1::BodyDecoder>,
         body_written: usize,
-        /// True when the last recv was posted to read straight into `dest` (a
+        /// True when the last recv was posted to read straight into the sink (a
         /// plaintext body, zero-copy) rather than into `in_buf`.
         recv_in_dest: bool,
         /// Whether the connection may return to the keep-alive pool when the
@@ -627,16 +748,15 @@ mod uring_engine {
 
     impl HttpExchange {
         fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Self {
-            let (dest, expected_body_len) = match &request {
-                RemoteRequest::Read(read) => (read.dest, read.expected_body_len()),
-                RemoteRequest::Upload(_) => (std::ptr::null_mut(), 0),
+            let sink = match &request {
+                RemoteRequest::Get(get) => BodySink::for_get(get),
+                RemoteRequest::Upload(_) => BodySink::Discard,
             };
             let request_bytes = request.request_head();
             Self {
                 conn,
                 id,
-                dest,
-                expected_body_len,
+                sink,
                 request_bytes,
                 request_queued: false,
                 request,
@@ -653,11 +773,15 @@ mod uring_engine {
             }
         }
 
-        /// Finish this exchange and return only its reusable connection. Every
-        /// request/response field, including an upload's `Arc<[u8]>`, is dropped.
-        fn into_connection(mut self) -> (Identifier, Conn) {
-            self.conn.out_buf.clear();
-            (self.id, self.conn)
+        /// Finish this exchange and return its reusable connection, with the
+        /// body when it was a download. Every other request/response field,
+        /// including an upload's `Arc<[u8]>`, is dropped.
+        fn finish(self) -> (Identifier, Conn, Option<DownloadBody>) {
+            let HttpExchange {
+                mut conn, id, sink, ..
+            } = self;
+            conn.out_buf.clear();
+            (id, conn, sink.into_download())
         }
 
         /// Ensure `out_buf` holds the next bytes to send: queue the HTTP request
@@ -716,11 +840,10 @@ mod uring_engine {
         fn consume_received(&mut self, n: usize) -> Result<()> {
             let HttpExchange {
                 conn,
+                request,
                 head_acc,
                 body,
-                request,
-                dest,
-                expected_body_len,
+                sink,
                 body_written,
                 conn_reusable,
                 ..
@@ -728,32 +851,30 @@ mod uring_engine {
             let Conn {
                 transport, in_buf, ..
             } = conn;
-            let dest = *dest;
-            let expected_body_len = *expected_body_len;
 
             match transport {
                 // Reached only in the header phase; once the head parses, `pump`
-                // recvs the body straight into `dest`, so plaintext bodies never
+                // recvs the body straight into the sink, so plaintext bodies never
                 // pass through here.
                 Transport::Plain => {
                     // A plaintext GET body is consumed either from the bytes
                     // accompanying its head in `parse_head`, or directly into
-                    // `dest` when it arrives in a later recv, so it never reaches
-                    // this branch. Nothing currently consumes the upload response
-                    // body (e.g. an ETag or JSON result); the `|_| {}` discards
-                    // it - we only drain it before pooling the connection.
+                    // the sink when it arrives in a later recv, so it never
+                    // reaches this branch. Nothing currently consumes the upload
+                    // response body (e.g. an ETag or JSON result); the `|_| {}`
+                    // discards it - we only drain it before pooling the
+                    // connection.
                     if let Some(decoder) = body.as_mut()
-                        && matches!(request, RemoteRequest::Upload(_))
+                        && matches!(sink, BodySink::Discard)
                     {
                         decoder.decode(&in_buf[..n], |_| {});
                         Ok(())
                     } else {
                         parse_head(
+                            request.remote(),
                             head_acc,
                             body,
-                            request,
-                            dest,
-                            expected_body_len,
+                            sink,
                             body_written,
                             conn_reusable,
                             &in_buf[..n],
@@ -774,7 +895,7 @@ mod uring_engine {
                         let mut drained = 0usize;
                         loop {
                             if let Some(decoder) = body.as_mut() {
-                                if matches!(request, RemoteRequest::Upload(_)) {
+                                if matches!(sink, BodySink::Discard) {
                                     // An upload endpoint may return a response body (for
                                     // example, GCS object metadata). Uploads have no cache
                                     // destination, but we must drain and discard that body
@@ -792,11 +913,13 @@ mod uring_engine {
                                     }
                                     continue;
                                 }
-                                // Body phase: decrypt straight into the cache slot.
-                                // A range body is identity-framed (the `proto`
-                                // policy enforces `Content-Length`), so the decoder
-                                // hands back a Direct plan whose `max` is the bytes
-                                // still expected — exactly the room to decrypt into.
+                                // Body phase: decrypt straight into the sink. A GET
+                                // body is identity-framed (the `proto` policy
+                                // enforces `Content-Length`), so the decoder hands
+                                // back a Direct plan whose `max` is the bytes still
+                                // expected; the sink's region is as much of that as
+                                // is contiguous (a download's body is runs, and
+                                // the next iteration moves to the next run).
                                 let remaining = match decoder.read_plan() {
                                     http1::ReadPlan::Direct { max } => max as usize,
                                     http1::ReadPlan::Done => 0,
@@ -804,16 +927,7 @@ mod uring_engine {
                                 if remaining == 0 {
                                     break;
                                 }
-                                // SAFETY: writing this block's currently-invalid,
-                                // pinned slot region; content_length ==
-                                // expected_body_len <= the block length (validated
-                                // when parsing the head).
-                                let dst = unsafe {
-                                    std::slice::from_raw_parts_mut(
-                                        dest.add(*body_written),
-                                        remaining,
-                                    )
-                                };
+                                let dst = sink.region_at(*body_written, remaining);
                                 match tls.reader().read(dst) {
                                     Ok(0) => break,
                                     Ok(m) => {
@@ -831,11 +945,10 @@ mod uring_engine {
                                     Ok(m) => {
                                         drained += m;
                                         parse_head(
+                                            request.remote(),
                                             head_acc,
                                             body,
-                                            request,
-                                            dest,
-                                            expected_body_len,
+                                            sink,
                                             body_written,
                                             conn_reusable,
                                             &header_scratch[..m],
@@ -865,47 +978,31 @@ mod uring_engine {
 
     /// Feed a header-phase (plaintext) chunk: accumulate into `head_acc` until the
     /// response head parses, then install the body decoder and copy any body bytes
-    /// that arrived in the same packet as the head into `dest`. (Subsequent body
-    /// bytes are recv'd/decrypted straight into `dest`, zero-copy.)
-    #[allow(clippy::too_many_arguments)] // one cursor per response-assembly field
+    /// that arrived in the same packet as the head into the sink. (Subsequent body
+    /// bytes are recv'd/decrypted straight into the sink, zero-copy.) A download's
+    /// sink is allocated here, once the head says how long the body is: before
+    /// any body byte has to land, and after the only point it could be refused.
+    /// A retried download keeps the sink its first attempt allocated, so the
+    /// retry's head must size the body the same.
     fn parse_head(
+        remote: &Arc<RemoteFile>,
         head_acc: &mut Vec<u8>,
         body: &mut Option<http1::BodyDecoder>,
-        request: &RemoteRequest,
-        dest: *mut u8,
-        expected_body_len: usize,
+        sink: &mut BodySink,
         body_written: &mut usize,
         conn_reusable: &mut bool,
         chunk: &[u8],
     ) -> Result<()> {
         head_acc.extend_from_slice(chunk);
-        let parsed = match request {
-            RemoteRequest::Read(_) => proto::parse_get_response_head(head_acc, expected_body_len)?,
-            RemoteRequest::Upload(_) => proto::parse_upload_response_head(head_acc)?,
-        };
-        if let proto::HeadParse::Complete(h) = parsed {
+        if let proto::HeadParse::Complete(h) = sink.parse_head(head_acc)? {
             *conn_reusable = h.reuse_connection;
+            sink.size_download(remote, h.content_length)?;
             let mut decoder = http1::BodyDecoder::new(h.content_length);
             // The body bytes that arrived alongside the head — the one copy (out of
-            // the shared recv scratch into the slot) the identity path needs; the
+            // the shared recv scratch into the sink) the identity path needs; the
             // rest of the body never passes through scratch.
-            let leftover = &head_acc[h.head_len..];
-            decoder.decode(leftover, |bytes| {
-                // Upload response body bytes are currently discarded.
-                if matches!(request, RemoteRequest::Upload(_)) {
-                    return;
-                }
-                // SAFETY: as in consume_received — pinned, currently-invalid slot
-                // region; total body (content_length) == expected_body_len <= the
-                // block length.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        dest.add(*body_written),
-                        bytes.len(),
-                    );
-                }
-                *body_written += bytes.len();
+            decoder.decode(&head_acc[h.head_len..], |bytes| {
+                sink.land(body_written, bytes)
             });
             *body = Some(decoder);
         }
@@ -924,8 +1021,9 @@ mod uring_engine {
         pool: HashMap<String, Vec<Conn>>,
         /// Requests in flight (not counting idle pooled connections).
         active: usize,
-        /// Ids whose body fully landed during the last completion routing pass.
-        completed: Vec<Identifier>,
+        /// Ids whose body fully landed during the last completion routing pass,
+        /// each with its body when it was a download.
+        completed: Vec<(Identifier, Option<DownloadBody>)>,
         /// Ids whose transport failed terminally (retries exhausted or a
         /// non-retryable error), paired with the error to report to the dataflow.
         failed: Vec<(Identifier, Error)>,
@@ -948,7 +1046,9 @@ mod uring_engine {
             self.active > 0
         }
 
-        pub fn take_completed(&mut self) -> Vec<Identifier> {
+        /// The requests that landed since the last call, each with its body
+        /// when it was a download.
+        pub fn take_completed(&mut self) -> Vec<(Identifier, Option<DownloadBody>)> {
             std::mem::take(&mut self.completed)
         }
 
@@ -956,15 +1056,15 @@ mod uring_engine {
             std::mem::take(&mut self.failed)
         }
 
-        /// Begin a range read: bind it to a pooled or fresh connection and submit
-        /// the first SQE onto `ring`.
+        /// Begin a GET: bind it to a pooled or fresh connection and submit the
+        /// first SQE onto `ring`.
         pub fn start_get(
             &mut self,
             ring: &mut IoUring,
             id: Identifier,
-            read: RemoteRead,
+            get: RemoteGet,
         ) -> Result<()> {
-            self.start_request(ring, id, RemoteRequest::Read(read))
+            self.start_request(ring, id, RemoteRequest::Get(get))
         }
 
         pub fn start_upload(
@@ -1029,7 +1129,7 @@ mod uring_engine {
                     .expect("cqe for an active HTTP exchange");
                 self.free_slots.push(idx);
                 let reusable = exchange.conn_reusable;
-                let (id, conn) = exchange.into_connection();
+                let (id, conn, download) = exchange.finish();
                 // A connection whose response body had unknown framing may
                 // still hold unread bytes; dropping it closes the socket
                 // instead of poisoning the pool.
@@ -1038,7 +1138,7 @@ mod uring_engine {
                     self.pool.entry(key).or_default().push(conn);
                 }
                 self.active -= 1;
-                self.completed.push(id);
+                self.completed.push((id, download));
                 return Ok(());
             }
 
@@ -1101,6 +1201,7 @@ mod uring_engine {
             let HttpExchange {
                 conn,
                 id,
+                sink,
                 retries,
                 request,
                 ..
@@ -1113,6 +1214,10 @@ mod uring_engine {
                     Ok(conn) => {
                         let mut fresh = HttpExchange::new(conn, id, request, State::Connecting);
                         fresh.retries = retries + 1;
+                        // The retry lands where the first attempt did: a
+                        // download's body, allocated once its head arrived,
+                        // holds the cache extents it is filling.
+                        fresh.sink = sink;
                         let new_idx = self.alloc_slot(fresh);
                         return self.start_connect(ring, new_idx);
                     }
@@ -1222,26 +1327,25 @@ mod uring_engine {
                     exchange.sending_upload_direct = false;
                     exchange.state = State::Receiving;
                     let fd = exchange.conn.fd.as_raw_fd();
-                    // Plaintext body phase: recv straight into the cache slot
+                    // Plaintext body phase: recv straight into the sink
                     // (zero-copy). Otherwise recv into the scratch `in_buf` — TLS
                     // ciphertext, or the response headers (for either scheme).
                     let plain_body = matches!(exchange.conn.transport, Transport::Plain)
                         && exchange.body.is_some()
-                        && matches!(exchange.request, RemoteRequest::Read(_));
+                        && !matches!(exchange.sink, BodySink::Discard);
                     if plain_body {
                         // Identity body: the decoder's Direct plan gives the bytes
                         // still expected. `pump` only runs while the request is
-                        // unfinished, so this is always > 0 here.
+                        // unfinished, so this is always > 0 here. The sink's
+                        // region is as much of that as is contiguous; a later
+                        // pump continues into a download's next run.
                         let remaining = match exchange.body.as_ref().unwrap().read_plan() {
                             http1::ReadPlan::Direct { max } => max as usize,
                             http1::ReadPlan::Done => 0,
                         };
                         exchange.recv_in_dest = true;
-                        // SAFETY: pinned, currently-invalid slot region; remaining
-                        // bytes are within the block (content_length ==
-                        // expected_body_len <= the block length).
-                        let a = unsafe { exchange.dest.add(exchange.body_written) } as usize;
-                        (false, a, remaining, fd)
+                        let region = exchange.sink.region_at(exchange.body_written, remaining);
+                        (false, region.as_mut_ptr() as usize, region.len(), fd)
                     } else {
                         exchange.recv_in_dest = false;
                         let a = exchange.conn.in_buf.as_mut_ptr() as usize;
