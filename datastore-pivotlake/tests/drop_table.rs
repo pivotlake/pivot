@@ -18,7 +18,7 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction as _;
-use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir};
+use common::{DispatchGuard, commit_datastore_transaction, dispatch, parquet_files_in, table_dir};
 use datastore_pivotlake::{DEFAULT_VACUUM_POLL, PivotlakeDatastore, Vacuumer};
 use planner::catalog::{
     Column, CreateTableRequest, DropTableRequest, Result as CatalogResult, SchemaQualifiedTableName,
@@ -284,4 +284,44 @@ fn refresh_removes_a_table_another_process_dropped() {
 
     assert!(changed);
     assert!(!datastore.contains_table(&name));
+}
+
+#[test]
+fn an_insert_whose_table_was_dropped_before_its_commit_fails_and_removes_its_files() {
+    let dispatch = dispatch(2);
+    let db = TempDir::new().unwrap();
+    let datastore = PivotlakeDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let table_dir = create_table(&datastore, &dispatch, db.path(), "t", None);
+    let insert = datastore.clone().begin_transaction();
+    let table = insert
+        .bind_table(
+            planner::DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
+        .unwrap()
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let rows =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))]).unwrap();
+    table
+        .compile_insert(
+            dispatch::values_input(&dispatch, vec![rows]).record_batches(),
+            &dispatch,
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(parquet_files_in(&table_dir).len(), 1);
+    drop_table(&datastore, &dispatch, drop_request("t", false)).unwrap();
+
+    let outcome = commit_datastore_transaction(insert);
+
+    assert!(
+        outcome.is_err(),
+        "the table the INSERT was bound to is gone"
+    );
+    assert!(
+        parquet_files_in(&table_dir).is_empty(),
+        "no version names the uploaded file, so the failed commit removes it"
+    );
 }

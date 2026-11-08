@@ -10,13 +10,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{
-    Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
-    TimestampMicrosecondType,
-};
-use arrow_array::{ArrayRef, Datum as _, Scalar};
-use arrow_schema::{DataType, TimeUnit};
+use arrow_array::Datum as _;
 use iceberg::Result;
 use iceberg::expr::{
     BinaryExpression, Bind, BoundPredicate, Predicate, PredicateOperator, Reference,
@@ -27,6 +21,8 @@ use iceberg::spec::{
 };
 use planner::expression::{CompareType, ConjunctionOp, Expression};
 use planner::types::Type;
+
+use crate::datum::constant_to_datum;
 
 /// Each value of an `IN` list is compared with every object's bounds, so a
 /// longer list is left to the filter above the scan.
@@ -141,7 +137,10 @@ fn compare_with_constant(
     if constant.get().0.is_null(0) {
         return Predicate::AlwaysFalse;
     }
-    let Some(constant) = constant_to_datum(constant) else {
+    // The constant is read as its own type, not the column's: the planner
+    // widens a constant beyond the column's range rather than refuse it, and
+    // the evaluator compares the bounds across that widening.
+    let Some(constant) = constant_to_datum(constant.get().0) else {
         return Predicate::AlwaysTrue;
     };
     let name = &schema.as_struct().fields()[reference.column_idx].name;
@@ -161,45 +160,6 @@ fn to_operator(compare_type: CompareType) -> PredicateOperator {
         CompareType::Greater => PredicateOperator::GreaterThan,
         CompareType::GreaterEqual => PredicateOperator::GreaterThanOrEq,
     }
-}
-
-/// A non-null constant as an Iceberg value of the type it has, or `None` for a
-/// type Iceberg columns do not hold.
-fn constant_to_datum(constant: &Scalar<ArrayRef>) -> Option<Datum> {
-    let array = constant.get().0;
-    Some(match array.data_type() {
-        DataType::Boolean => Datum::bool(array.as_boolean().value(0)),
-        DataType::Int32 => Datum::int(array.as_primitive::<Int32Type>().value(0)),
-        DataType::Int64 => Datum::long(array.as_primitive::<Int64Type>().value(0)),
-        DataType::Float32 => Datum::float(array.as_primitive::<Float32Type>().value(0)),
-        DataType::Float64 => Datum::double(array.as_primitive::<Float64Type>().value(0)),
-        DataType::Date32 => Datum::date(array.as_primitive::<Date32Type>().value(0)),
-        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
-            let micros = array.as_primitive::<TimestampMicrosecondType>().value(0);
-            match timezone {
-                Some(_) => Datum::timestamptz_micros(micros),
-                None => Datum::timestamp_micros(micros),
-            }
-        }
-        DataType::Decimal64(precision, scale) => {
-            let unscaled = array.as_primitive::<Decimal64Type>().value(0);
-            decimal_to_datum(i128::from(unscaled), *precision, *scale)?
-        }
-        DataType::Decimal128(precision, scale) => {
-            let unscaled = array.as_primitive::<Decimal128Type>().value(0);
-            decimal_to_datum(unscaled, *precision, *scale)?
-        }
-        DataType::Utf8View => Datum::string(array.as_string_view().value(0)),
-        _ => return None,
-    })
-}
-
-fn decimal_to_datum(unscaled: i128, precision: u8, scale: i8) -> Option<Datum> {
-    let decimal = PrimitiveType::Decimal {
-        precision: u32::from(precision),
-        scale: u32::try_from(scale).ok()?,
-    };
-    Datum::try_from_bytes(&unscaled.to_be_bytes(), decimal).ok()
 }
 
 /// `literal` as a value of `data_type`: the type it was written as, or the one

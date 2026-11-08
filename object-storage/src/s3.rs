@@ -332,6 +332,27 @@ impl ObjectStore for S3Store {
         Ok(self.fetch(key)?.map(|(bytes, _)| bytes))
     }
 
+    /// One `HEAD` of the object, signed as a `GET` is, read for its
+    /// `Content-Length`.
+    fn object_size(&self, key: &ObjectPath) -> Result<Option<u64>> {
+        let object = object_key(&self.prefix, key);
+        let url = self.url_for(&object);
+        let signed = self.sign("HEAD", &url, &[], &[])?;
+        let req = Self::apply(self.agent.head(&url), &signed);
+        match req.call() {
+            Ok(response) if is_redirect(&response) => Err(self.explain_redirect("HEAD", &response)),
+            Ok(response) => response
+                .header("content-length")
+                .and_then(|length| length.parse().ok())
+                .map(Some)
+                .ok_or_else(|| {
+                    StoreError::Http(format!("HEAD {object}: response names no Content-Length"))
+                }),
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(StoreError::Http(format!("HEAD {object}: {e}"))),
+        }
+    }
+
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
@@ -751,6 +772,45 @@ mod tests {
                 .unwrap()
                 .starts_with("GET /moved-bucket/?list-type=2")
         );
+    }
+
+    #[test]
+    fn an_objects_size_is_read_from_the_content_length_of_a_head_request() {
+        let (endpoint, request) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nETag: \"abc\"\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        );
+        let store =
+            S3Store::anonymous_with_options("s3://sized-bucket/root", "us-east-1", Some(endpoint))
+                .unwrap();
+
+        let size = store
+            .object_size(&ObjectPath::new("metadata/snap-1.avro"))
+            .unwrap();
+
+        assert_eq!(size, Some(4096));
+        assert!(
+            request
+                .join()
+                .unwrap()
+                .starts_with("HEAD /sized-bucket/root/metadata/snap-1.avro ")
+        );
+    }
+
+    #[test]
+    fn a_head_request_answered_not_found_sizes_a_missing_object_as_none() {
+        let (endpoint, _request) = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        );
+        let store =
+            S3Store::anonymous_with_options("s3://sized-bucket/root", "us-east-1", Some(endpoint))
+                .unwrap();
+
+        let size = store
+            .object_size(&ObjectPath::new("metadata/none.avro"))
+            .unwrap();
+
+        assert_eq!(size, None);
     }
 
     #[test]

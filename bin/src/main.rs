@@ -23,7 +23,8 @@ enum DatastoreKind {
     /// Also accepted as `pivot`, the kind's name before it was renamed.
     #[value(alias = "pivot")]
     Pivotlake,
-    /// The read-only tables of an Iceberg REST catalog at an http(s) URI.
+    /// The tables of an Iceberg REST catalog at an http(s) URI, read and
+    /// appended to.
     Iceberg,
 }
 
@@ -37,7 +38,8 @@ enum PivotCommand {
     /// or file:///path.
     ///
     /// An Iceberg datastore (--kind iceberg) is named by its REST catalog's
-    /// http(s) base URI and serves the catalog's tables read-only; each
+    /// http(s) base URI and serves the catalog's tables, reading them and
+    /// appending to them with INSERT; each
     /// namespace is a schema. The catalog is
     /// authenticated to with PIVOT_ICEBERG_TOKEN (a bearer token) or
     /// PIVOT_ICEBERG_CREDENTIAL (an OAuth2 client_id:client_secret, refined by
