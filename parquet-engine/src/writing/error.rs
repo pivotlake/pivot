@@ -39,6 +39,9 @@ pub(crate) enum WriteError {
     /// An array did not have the Arrow type its column's schema declared.
     #[error("array downcast to {expected} failed")]
     Downcast { expected: &'static str },
+    /// The arrow schema declares something the footer cannot carry as written.
+    #[error("schema: {0}")]
+    Schema(String),
 }
 
 pub(crate) type WriteResult<T> = Result<T, WriteError>;

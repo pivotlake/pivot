@@ -32,7 +32,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_schema::{DataType, Field};
 
-use super::error::WriteResult;
+use super::error::{WriteError, WriteResult};
 
 /// One primitive leaf of a column, ready to encode.
 pub(super) struct Leaf {
@@ -186,6 +186,14 @@ fn build_leaf(path: Vec<String>, values: &ArrayRef, defined: Defined) -> WriteRe
             }
         }
     };
+    // A nullable leaf's nulls were just dropped with their levels; a null
+    // still here sits under a field declared required, and writing it would
+    // store a value the row never had.
+    if values.null_count() > 0 {
+        return Err(WriteError::NullsInRequiredColumn {
+            nulls: values.null_count(),
+        });
+    }
     Ok(Leaf {
         path,
         values,
@@ -219,6 +227,22 @@ mod tests {
         assert_eq!(leaves[0].max_def_level, 0);
         assert!(leaves[0].def_levels.is_none());
         assert_eq!(leaves[0].values.len(), 3);
+    }
+
+    /// A null under a field declared required has no level to record its
+    /// absence, so it is refused rather than stored as some value.
+    #[test]
+    fn a_null_under_a_required_field_is_refused() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+
+        let Err(error) = to_parquet_leaves(&field("n", DataType::Int64, false), &values) else {
+            panic!("a null under a required field must be refused");
+        };
+
+        assert!(
+            matches!(error, WriteError::NullsInRequiredColumn { nulls: 1 }),
+            "{error}"
+        );
     }
 
     /// A nullable leaf stores only its non-null values; the levels carry which

@@ -21,7 +21,11 @@ thiserror = { workspace = true }
 # backend decides whether its commit hops to the blocking pool or finishes
 # inline, and the composite awaits each touched datastore's own commit.
 async-trait = "0.1"
-# The staging queue a CREATE USER's dataflow pushes into.
+# The staging queues a CREATE USER's dataflow and a datastore's writing
+# statements push into.
 crossbeam-deque = { workspace = true }
+# A transaction's commit applies its staged actions on the blocking pool.
+tokio = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
 # A stored SCRAM verifier's salt and salted password are base64 in its text form.
 base64 = { workspace = true }

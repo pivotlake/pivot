@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
 use arrow_array::{ArrayRef, Scalar};
-use crossbeam_deque::Injector;
+use catalog::CommitQueue;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
     ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
@@ -19,7 +19,7 @@ use planner::catalog::{
 use planner::expression::{CompareType, Expression};
 
 use super::insert_sink::build_insert_spec;
-use super::{CatalogTable, CommitAction};
+use super::{CatalogTable, PivotlakeDatastore};
 
 /// A catalog table resolved from one transaction: it captures the snapshot's own
 /// copy of the [`CatalogTable`] (schema, files, and their row groups), this
@@ -51,7 +51,7 @@ pub struct TableBinding {
     /// [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
     /// binding, so the append an INSERT compiled by this binding stages as it
     /// runs is applied by that transaction's commit.
-    commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
+    commit_actions: CommitQueue<PivotlakeDatastore>,
 }
 
 impl std::fmt::Debug for TableBinding {
@@ -70,7 +70,7 @@ impl TableBinding {
     pub(super) fn new(
         reference: TableReference,
         table: CatalogTable,
-        commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
+        commit_actions: CommitQueue<PivotlakeDatastore>,
     ) -> Self {
         let columns = table.columns();
         let nullability = table.nullability();

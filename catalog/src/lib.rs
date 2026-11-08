@@ -24,13 +24,14 @@
 
 pub mod datastore;
 pub mod metastore;
+pub mod staged_commit;
 pub mod system;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use crossbeam_deque::{Injector, Steal};
+use crossbeam_deque::Injector;
 use datastore::DatastoreTransaction;
 use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use metastore::Metastore;
@@ -46,6 +47,7 @@ use system::{DatastoreEntry, SystemTransaction};
 /// where the trait lives; concrete backends (e.g. `datastore_pivotlake::PivotlakeDatastore`)
 /// implement it and are held here behind `Arc<dyn Datastore>`.
 pub use datastore::Datastore;
+pub use staged_commit::{CommitAction, CommitQueue, StagedCommit, drain_injector};
 
 /// The conventional name for a single-datastore configuration's datastore; see
 /// [`planner::DEFAULT_DATASTORE_NAME`].
@@ -435,17 +437,6 @@ impl CatalogTransaction for PivotTransaction {
             sub_transaction.rollback();
         }
         drain_injector(&self.staged_users);
-    }
-}
-
-fn drain_injector<T>(injector: &Injector<T>) -> Vec<T> {
-    let mut items = Vec::new();
-    loop {
-        match injector.steal() {
-            Steal::Success(item) => items.push(item),
-            Steal::Retry => continue,
-            Steal::Empty => return items,
-        }
     }
 }
 
