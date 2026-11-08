@@ -214,6 +214,19 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// Fetch an object in full, or `None` if it does not exist.
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>>;
 
+    /// The size of the object at `key`, or `None` if it does not exist. The
+    /// default narrows a listing to the object's own name; a backend that can
+    /// ask for one object's metadata directly overrides it.
+    fn object_size(&self, key: &ObjectPath) -> Result<Option<u64>> {
+        let directory = key.parent().unwrap_or_default();
+        let listing = self.list_with_name_prefix(&directory, key.name())?;
+        Ok(listing
+            .objects
+            .into_iter()
+            .find(|object| object.file.path.as_str() == key.name())
+            .map(|object| object.file.size))
+    }
+
     /// Atomically replace `key` with `data` (overwriting any existing object).
     /// Reads see either the old or the new object whole, never a torn write.
     /// Concurrent writers are last-writer-wins, so this backs objects with a
@@ -365,7 +378,7 @@ impl StoreScheme {
     /// path: a mistyped or unsupported scheme would otherwise open a directory
     /// named after the URI, and the datastore would come up empty where its
     /// data was expected.
-    pub fn of(uri: &str) -> Result<Self> {
+    pub fn from_uri(uri: &str) -> Result<Self> {
         match uri.split_once("://") {
             Some(("s3" | "s3a", _)) => Ok(Self::S3),
             Some(("gs", _)) => Ok(Self::Gcs),
@@ -466,7 +479,7 @@ pub(crate) fn update_by_version_swap(
 /// key variables are absent; a caller holding its own opens the backend directly
 /// (`S3Store::with_credentials`, `GcsStore::with_credentials_file`).
 pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
-    match StoreScheme::of(uri)? {
+    match StoreScheme::from_uri(uri)? {
         StoreScheme::S3 => Ok(Box::new(S3Store::with_env_credentials(uri)?)),
         StoreScheme::Gcs => Ok(Box::new(GcsStore::with_default_credentials(uri)?)),
         StoreScheme::Local => Ok(Box::new(LocalStore::new(local_path(uri))?)),
@@ -548,6 +561,101 @@ pub(crate) fn absolute_object_key(prefix: &str, key: &ObjectPath) -> ObjectPath 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store that knows only how to list one directory: what the trait's
+    /// default size lookup is built on.
+    #[derive(Debug)]
+    struct ListingOnlyStore {
+        directory: ObjectPath,
+        objects: Vec<(&'static str, u64)>,
+    }
+
+    impl ObjectStore for ListingOnlyStore {
+        fn get(&self, _: &ObjectPath) -> Result<Option<Vec<u8>>> {
+            unreachable!("the size lookup must not read the object")
+        }
+
+        fn put(&self, _: &ObjectPath, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+
+        fn update(
+            &self,
+            _: &ObjectPath,
+            _: &mut dyn FnMut(Option<Vec<u8>>) -> Option<Vec<u8>>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        fn delete(&self, _: &ObjectPath) -> Result<()> {
+            unreachable!()
+        }
+
+        fn list_with_name_prefix(
+            &self,
+            prefix: &ObjectPath,
+            name_prefix: &str,
+        ) -> Result<DirectoryListing> {
+            assert_eq!(prefix, &self.directory);
+            Ok(DirectoryListing {
+                objects: self
+                    .objects
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(name_prefix))
+                    .map(|(name, size)| ListedObject {
+                        file: FileRef {
+                            path: ObjectPath::new(*name),
+                            size: *size,
+                        },
+                        modified_unix_ms: 0,
+                    })
+                    .collect(),
+                prefixes: Vec::new(),
+            })
+        }
+
+        fn source(&self, _: &ObjectPath) -> Result<DataFileLocation> {
+            unreachable!()
+        }
+
+        fn sink(&self, _: &ObjectPath) -> Result<DataFileLocation> {
+            unreachable!()
+        }
+
+        fn create_dir(&self, _: &ObjectPath) -> Result<()> {
+            unreachable!()
+        }
+
+        fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
+            Ok(key.clone())
+        }
+
+        fn location_uri(&self) -> String {
+            "memory:///".to_string()
+        }
+
+        fn connection(&self) -> StoreConnection {
+            StoreConnection::Local
+        }
+    }
+
+    #[test]
+    fn the_size_of_an_object_is_found_in_its_directorys_listing_by_its_exact_name() {
+        let store = ListingOnlyStore {
+            directory: ObjectPath::new("db/t/metadata"),
+            objects: vec![("m0.avro", 120), ("m0.avro.crc", 8)],
+        };
+
+        let sized = store
+            .object_size(&ObjectPath::new("db/t/metadata/m0.avro"))
+            .unwrap();
+        let missing = store
+            .object_size(&ObjectPath::new("db/t/metadata/m1.avro"))
+            .unwrap();
+
+        assert_eq!(sized, Some(120));
+        assert_eq!(missing, None);
+    }
 
     #[test]
     fn absolute_object_key_is_the_in_bucket_name_from_the_bucket_root() {
@@ -649,6 +757,9 @@ mod tests {
 
     #[test]
     fn a_relative_path_is_a_local_store() {
-        assert_eq!(StoreScheme::of("data/warm").unwrap(), StoreScheme::Local);
+        assert_eq!(
+            StoreScheme::from_uri("data/warm").unwrap(),
+            StoreScheme::Local
+        );
     }
 }
