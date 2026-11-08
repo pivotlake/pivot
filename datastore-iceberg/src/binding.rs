@@ -1,5 +1,7 @@
 //! The per-query binding of one loaded table: the snapshot the query bound
-//! plus the filters pushed into it, compiled into the Parquet scan.
+//! plus the filters pushed into it, compiled into the Parquet scan; or, for
+//! an INSERT, the write into that table, committed on whatever the catalog
+//! holds when the transaction commits.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +17,11 @@ use planner::catalog::{
 };
 use planner::expression::Expression;
 
+use catalog::CommitQueue;
+
+use crate::IcebergDatastore;
 use crate::table::LoadedTable;
+use crate::write::build_insert_spec;
 
 /// One reference to a table in a query. Filter pushdown finishes before the
 /// binding is cloned for materialization, and clones share the pruned scan
@@ -29,6 +35,8 @@ pub(crate) struct IcebergTableBinding {
     filters: Vec<Expression>,
     /// Statistics, scanning, and late materialization reuse this binding's load.
     cached_pruned_parquet: Arc<Mutex<Option<Arc<ParquetTable>>>>,
+    /// The transaction's staging queue the INSERT's commit action lands on.
+    commit_actions: CommitQueue<IcebergDatastore>,
 }
 
 impl std::fmt::Debug for IcebergTableBinding {
@@ -42,12 +50,17 @@ impl std::fmt::Debug for IcebergTableBinding {
 }
 
 impl IcebergTableBinding {
-    pub(crate) fn new(reference: TableReference, table: Arc<LoadedTable>) -> Self {
+    pub(crate) fn new(
+        reference: TableReference,
+        table: Arc<LoadedTable>,
+        commit_actions: CommitQueue<IcebergDatastore>,
+    ) -> Self {
         Self {
             reference,
             table,
             filters: Vec::new(),
             cached_pruned_parquet: Arc::default(),
+            commit_actions,
         }
     }
 
@@ -112,6 +125,22 @@ impl BoundTable for IcebergTableBinding {
             scan_order,
             Arc::new(eq_predicates),
         ))
+    }
+
+    /// The write takes the table's shape and store from the snapshot this
+    /// query bound. The files land on a queue of this statement's own as the
+    /// dataflow runs; the append staged here hands that queue to the
+    /// transaction's commit.
+    fn compile_insert(
+        &self,
+        input: RecordBatchOperatorSpec,
+        _dispatcher: &DataFlowDispatcher,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        Ok(build_insert_spec(
+            &self.table,
+            self.commit_actions.clone(),
+            input,
+        )?)
     }
 
     fn columns(&self) -> Vec<Column> {

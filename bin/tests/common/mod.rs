@@ -5,6 +5,8 @@
 
 #![allow(dead_code)] // each test binary uses a subset
 
+pub mod iceberg_fixture;
+
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::ops::Deref;
