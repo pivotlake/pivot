@@ -10,7 +10,7 @@
 
 use crate::OperatorIO;
 use crate::io::{IORequesterError, LocalFile, OpenFile};
-use crate::memory::{FileBytes, FrozenSlab, WriteBuffer, memory_ctx};
+use crate::memory::{FileBytes, WeakSlab, WriteBuffer, memory_ctx};
 use crate::worker::WORKER_IDX;
 use std::fs::OpenOptions;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ mod partition_tree;
 
 pub use layout::{Dynamic, Fixed, Layout};
 pub use partition_allocator::{PartitionAllocator, PartitionContents, PartitionSlab};
-pub use partition_evictor::{PartitionEvictor, SharedPartitionEvictor, TakenSpills};
+pub use partition_evictor::{PartitionEvictor, SharedPartitionEvictor};
 pub use partition_tree::PARTITIONS;
 
 /// One partition's rows from a sealed buffer, going to its file as one write.
@@ -37,12 +37,17 @@ pub struct SpillWrite {
 }
 
 /// A slab of a spilled buffer: where its rows are in memory, for as long as
-/// the buffer is resident, and where they are in the partition's file.
+/// the buffer is resident, and where they are in the partition's file. The
+/// handle on the slab is weak: the [`SpilledBuffer`] it belongs to is the
+/// buffer's one owner, so that nothing but a reader of the slab keeps the
+/// buffer from being evicted, and a reader learns from the handle whether the
+/// rows are still in memory.
+#[derive(Clone)]
 pub struct SpilledSlab {
     pub spill_partition_id: usize,
     /// Where in the partition's file this slab's rows begin.
     pub file_offset: u64,
-    pub slab: FrozenSlab,
+    pub slab: WeakSlab,
 }
 
 /// A buffer whose rows are being, or have been, written to disk. It stays
@@ -62,12 +67,6 @@ impl SpilledBuffer {
     /// Whether every write of this buffer has landed.
     pub fn is_on_disk(&self) -> bool {
         self.writes_in_flight.load(Ordering::Acquire) == 0
-    }
-
-    /// The buffer's slabs, still readable: the buffer stays resident for as
-    /// long as any of them is held.
-    pub fn into_slabs(self) -> Vec<SpilledSlab> {
-        self.slabs
     }
 }
 
@@ -149,7 +148,7 @@ impl<'a> Spiller<'a> {
 mod tests {
     use super::*;
     use crate::io::IORequester;
-    use crate::memory::{BUFFER_SIZE, Slab, init_test_free_pool};
+    use crate::memory::{BUFFER_SIZE, FrozenSlab, Slab, init_test_free_pool};
     use crate::stats::StatsCollector;
     use std::cell::RefCell;
 
@@ -222,7 +221,7 @@ mod tests {
                 .map(|slab| SpilledSlab {
                     spill_partition_id: 0,
                     file_offset: 0,
-                    slab,
+                    slab: slab.downgrade(),
                 })
                 .collect(),
         };
@@ -244,14 +243,17 @@ mod tests {
         };
         assert_eq!(file_len(5), 2048);
         assert_eq!(file_len(9), 1024);
-        // The test's handle, the spilled buffer's, and one per slab it kept.
-        assert_eq!(Arc::strong_count(&spilled.buffer), 1 + 1 + 3);
-        assert!(
-            spilled
-                .slabs
+        // The test's handle and the spilled buffer's: the writes let go of
+        // theirs when they landed, and the slab records hold none.
+        assert_eq!(Arc::strong_count(&spilled.buffer), 1 + 1);
+        assert!(spilled.slabs.iter().all(|s| {
+            s.slab
+                .upgrade()
+                .unwrap()
+                .as_slice()
                 .iter()
-                .all(|s| s.slab.as_slice().iter().all(|&b| b == 0xAB))
-        );
+                .all(|&b| b == 0xAB)
+        }));
         assert!(BUFFER_SIZE >= 3072);
         directory::remove_worker_directory(dataflow, WORKER_IDX.get()).unwrap();
     }

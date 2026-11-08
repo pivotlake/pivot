@@ -440,19 +440,20 @@ impl<L: Layout> PartitionAllocator<L> {
                     rows: FileBytes::new(),
                 });
             }
-            // The write gets its own handle to the rows; the buffer keeps this one.
-            writes
-                .last_mut()
-                .expect("a write was started for this partition just above")
-                .rows
-                .push_frozen_slab(slab.clone());
             let file_offset = self.partitions[partition].bytes_spilled;
             self.partitions[partition].bytes_spilled += slab.size() as u64;
             spilled_slabs.push(SpilledSlab {
                 spill_partition_id: partition,
                 file_offset,
-                slab,
+                slab: slab.downgrade(),
             });
+            // The write holds the slab until it lands; the record above does
+            // not, so the buffer's only lasting holder is the spilled buffer.
+            writes
+                .last_mut()
+                .expect("a write was started for this partition just above")
+                .rows
+                .push_frozen_slab(slab);
         }
         let writes_in_flight = spiller.spill(writes)?;
         Ok(Some(SpilledBuffer {
@@ -819,9 +820,15 @@ mod tests {
         let partitions: Vec<usize> = spilled.slabs.iter().map(|s| s.spill_partition_id).collect();
         assert_eq!(partitions, [0, 64, 128, 192]);
         assert!(spilled.slabs.iter().all(|s| s.file_offset == 0));
-        assert!(spilled.slabs.iter().all(|s| s.slab.as_slice()[0] == 1));
-        // The writes have landed and let go; the buffer and its slabs remain.
-        assert_eq!(Arc::strong_count(&spilled.buffer), 1 + spilled.slabs.len());
+        assert!(
+            spilled
+                .slabs
+                .iter()
+                .all(|s| s.slab.upgrade().unwrap().as_slice()[0] == 1)
+        );
+        // The writes have landed and let go; the spilled buffer is the one
+        // holder left.
+        assert_eq!(Arc::strong_count(&spilled.buffer), 1);
         assert!(again.is_none());
         assert!(buffers_of_slot(&mut allocator, 0).is_empty());
         for group in 0..4 {

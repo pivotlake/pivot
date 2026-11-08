@@ -19,7 +19,7 @@
 use super::hash_table::{PersistedKey, entry_layout};
 use crate::io::{FileRange, IORequesterError, OpenFile, ReadData};
 use crate::memory::{
-    Dynamic, PARTITIONS, PartitionAllocator, PartitionSlab, SpilledBuffer, Spiller, TakenSpills,
+    Dynamic, PARTITIONS, PartitionAllocator, PartitionSlab, SpilledBuffer, SpilledSlab, Spiller,
 };
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
@@ -149,39 +149,26 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
     }
 
     /// Every partition's rows, in partition order, for the merge to read: the
-    /// rows still in the allocator, the rows of spilled buffers still resident,
-    /// which stay readable for as long as their slabs are held, and the file
-    /// ranges of the rows that were evicted and are only on disk.
-    pub fn into_partition_rows(self, mut spilled: TakenSpills) -> Vec<PartitionRows<KP, V>> {
+    /// rows still in the allocator, and the partition's spilled slabs as weak
+    /// handles (`spilled[partition]`), which the merge resolves when it gets
+    /// to the partition.
+    pub fn into_partition_rows(
+        self,
+        mut spilled: Vec<Vec<SpilledSlab>>,
+    ) -> Vec<PartitionRows<KP, V>> {
         let row_size = self.row_size;
-        let mut partitions = self.allocator.into_partitions();
-        for spilled_slab in spilled
-            .resident
-            .into_iter()
-            .flat_map(SpilledBuffer::into_slabs)
-        {
-            partitions[spilled_slab.spill_partition_id]
-                .slabs
-                .push(PartitionSlab {
-                    rows: spilled_slab.slab.size() / row_size,
-                    slab: spilled_slab.slab,
-                });
-        }
-        partitions
+        self.allocator
+            .into_partitions()
             .into_iter()
             .enumerate()
             .take(self.partition_count)
             .map(|(partition, contents)| {
-                let on_disk = spilled
-                    .on_disk_by_partition
-                    .remove(&partition)
-                    .map(|ranges| OnDiskRows {
-                        file: contents
-                            .spill_file
-                            .expect("a partition with rows on disk has a spill file"),
-                        ranges,
-                    });
-                PartitionRows::new(contents.slabs, on_disk, row_size)
+                PartitionRows::new(
+                    contents.slabs,
+                    std::mem::take(&mut spilled[partition]),
+                    contents.spill_file,
+                    row_size,
+                )
             })
             .collect()
     }
@@ -200,9 +187,15 @@ pub struct OnDiskRows {
 /// rows that are only on disk, which the merge loads before it runs.
 pub struct PartitionRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     slabs: Vec<PartitionSlab>,
+    /// The partition's spilled slabs, not yet resolved into `slabs` or
+    /// `on_disk`; see [`resolve_spilled`](Self::resolve_spilled).
+    spilled: Vec<SpilledSlab>,
+    /// The file the partition's spilled rows went to, if it ever spilled.
+    spill_file: Option<OpenFile>,
     on_disk: Option<OnDiskRows>,
     /// Rows in memory and on disk together.
     rows: usize,
+    row_size: usize,
     _phantom: PhantomData<(KP, *const V)>,
 }
 
@@ -211,18 +204,52 @@ unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for PartitionRo
 unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Sync for PartitionRows<KP, V> {}
 
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
-    fn new(slabs: Vec<PartitionSlab>, on_disk: Option<OnDiskRows>, row_size: usize) -> Self {
-        let rows_in_memory: usize = slabs.iter().map(|slab| slab.rows).sum();
-        let bytes_on_disk: usize = on_disk
-            .iter()
-            .flat_map(|on_disk| on_disk.ranges.iter())
-            .map(|range| range.len)
-            .sum();
+    fn new(
+        slabs: Vec<PartitionSlab>,
+        spilled: Vec<SpilledSlab>,
+        spill_file: Option<OpenFile>,
+        row_size: usize,
+    ) -> Self {
+        let rows_in_allocator: usize = slabs.iter().map(|slab| slab.rows).sum();
+        let bytes_spilled: usize = spilled.iter().map(|handle| handle.slab.size()).sum();
         Self {
-            rows: rows_in_memory + bytes_on_disk / row_size,
+            rows: rows_in_allocator + bytes_spilled / row_size,
             slabs,
-            on_disk,
+            spilled,
+            spill_file,
+            on_disk: None,
+            row_size,
             _phantom: PhantomData,
+        }
+    }
+
+    /// Settle where the partition's spilled rows are read from, now that the
+    /// merge is about to read them: a slab whose buffer is still resident is
+    /// read from memory, and holding the upgraded handle keeps it there until
+    /// these rows are dropped; a slab whose buffer was evicted is loaded from
+    /// the partition's file.
+    pub fn resolve_spilled(&mut self) {
+        let mut ranges = Vec::new();
+        for handle in self.spilled.drain(..) {
+            match handle.slab.upgrade() {
+                Some(slab) => self.slabs.push(PartitionSlab {
+                    rows: slab.size() / self.row_size,
+                    slab,
+                }),
+                None => ranges.push(FileRange::new(
+                    handle.file_offset as usize,
+                    handle.slab.size(),
+                )),
+            }
+        }
+        if !ranges.is_empty() {
+            self.on_disk = Some(OnDiskRows {
+                file: self
+                    .spill_file
+                    .clone()
+                    .expect("a partition with rows on disk has a spill file"),
+                ranges,
+            });
         }
     }
 

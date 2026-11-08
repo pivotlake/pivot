@@ -21,7 +21,7 @@
 //! and [`SlabAllocator::create_multi_slab_buffer`] as the primary entry points.
 
 use crate::memory::WriteBuffer;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 mod allocator;
 pub use allocator::SlabAllocator;
@@ -130,6 +130,45 @@ impl FrozenSlab {
         // by the `Arc<WriteBuffer>` every handle holds, and nothing writes it
         // any more: freezing consumed the only writable handle.
         unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
+    }
+
+    /// A handle to this slab that does not keep its buffer alive.
+    pub fn downgrade(&self) -> WeakSlab {
+        WeakSlab {
+            ptr: self.ptr,
+            size: self.size,
+            buffer: Arc::downgrade(&self._buffer),
+        }
+    }
+}
+
+/// A handle to a frozen slab that does not keep its buffer alive. Whoever
+/// owns the buffer may give it up while this exists; upgrading tells whether
+/// it has, and yields the slab, holding the buffer again, when it has not.
+#[derive(Clone)]
+pub struct WeakSlab {
+    ptr: *const u8,
+    size: usize,
+    buffer: Weak<WriteBuffer>,
+}
+
+unsafe impl Send for WeakSlab {}
+
+unsafe impl Sync for WeakSlab {}
+
+impl WeakSlab {
+    /// Bytes the slab holds, whether or not it is still in memory.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// The slab, holding its buffer, if the buffer is still resident.
+    pub fn upgrade(&self) -> Option<FrozenSlab> {
+        self.buffer.upgrade().map(|buffer| FrozenSlab {
+            ptr: self.ptr,
+            size: self.size,
+            _buffer: buffer,
+        })
     }
 }
 

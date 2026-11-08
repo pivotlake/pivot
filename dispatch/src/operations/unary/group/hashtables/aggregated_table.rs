@@ -18,7 +18,7 @@
 
 use crate::RECORD_BATCH_SIZE;
 use crate::io::IORequesterError;
-use crate::memory::{SharedPartitionEvictor, SlabAllocator, Spiller};
+use crate::memory::{PARTITIONS, SharedPartitionEvictor, SlabAllocator, Spiller};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::HashTable;
@@ -128,6 +128,19 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
         let buckets_per_partition = (self.buckets.len() / num_partitions).max(1);
         let first = partition * buckets_per_partition;
         first..first + buckets_per_partition
+    }
+
+    /// Settle where bucket `index`'s spilled rows are read from (see
+    /// [`PartitionRows::resolve_spilled`]). The job merging the bucket calls
+    /// this before reading it.
+    pub fn resolve_spilled(&self, index: usize) {
+        // SAFETY: as in `with_bucket`; the resolving job is the bucket's only
+        // reader, and nothing else reaches the cell.
+        let bucket = unsafe { &mut *self.buckets[index].get() };
+        bucket
+            .as_mut()
+            .expect("a scatter bucket is released only after its partition merged it")
+            .resolve_spilled();
     }
 
     /// Runs `f` over the rows of bucket `index`. A bucket is released only by
@@ -661,11 +674,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         // `AggregatedTableOutput::raw_scatter_rows`). The bucket counts also
         // include the drained partials scattered before the fallback, which
         // only loosens the bounds further.
-        // The spilled buffers still resident come back for the merge to read
-        // in memory, and the evicted rows as the file ranges to load them
-        // from. Nothing spills or is evicted while the merge runs, so the
-        // evictor is emptied here.
-        let spilled = self.evictor.borrow_mut().take_all();
+        // The spilled rows stay with the evictor, which keeps freeing their
+        // buffers as the memory context needs slots, through the merge. The
+        // merge gets weak handles to them, and settles where each partition's
+        // rows are read from when it gets to the partition.
+        let spilled = self
+            .evictor
+            .borrow_mut()
+            .spilled_slabs_by_partition(PARTITIONS);
         let partition_rows = self
             .buffers
             .map(|buffers| buffers.into_partition_rows(spilled));
@@ -966,6 +982,7 @@ mod tests {
         let buffers = output.buffers.as_ref().expect("worker switched");
         let mut rows = 0;
         for bucket in 0..buffers.bucket_count() {
+            buffers.resolve_spilled(bucket);
             buffers.with_bucket(bucket, |rows_in_bucket| {
                 rows_in_bucket.for_each(layout, |_, _, _| rows += 1)
             });
@@ -1152,9 +1169,15 @@ mod tests {
         let (output, _totals) = table.flush();
         parts.finish_writes();
 
-        assert!(spilled);
         let in_place: usize = output.tables.iter().map(|table| table.len()).sum();
-        assert_eq!(in_place + scatter_row_count(&output), 400_000);
-        assert!(evictor.borrow_mut().evict().is_none());
+        let scatter_rows = scatter_row_count(&output);
+        let evicted_while_read = evictor.borrow_mut().evict();
+        drop(output);
+        let evicted_after = evictor.borrow_mut().evict();
+
+        assert!(spilled);
+        assert_eq!(in_place + scatter_rows, 400_000);
+        assert!(evicted_while_read.is_none());
+        assert!(evicted_after.is_some());
     }
 }
