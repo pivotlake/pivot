@@ -92,7 +92,10 @@ pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
     /// [`with_bucket`](Self::with_bucket) and empties its entries when it
     /// releases the bucket, so the slabs' memory goes back as each partition
     /// merges while this one list lives as long as the pool.
-    slabs: Box<[UnsafeCell<SlabEntry>]>,
+    /// A vector rather than a boxed slice: the list arrives with spare
+    /// capacity from growing during consume, and trimming it would copy
+    /// the whole list into fresh memory at flush.
+    slabs: Vec<UnsafeCell<SlabEntry>>,
     buckets: Vec<UnsafeCell<Option<PartitionRows<KP, V>>>>,
     /// Rows across every bucket, counted by the flushing worker so the merge
     /// coordinator sums one number per worker rather than walking the
