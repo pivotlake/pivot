@@ -14,7 +14,9 @@ use crate::operations::unary::group::hashtables::{
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
 use crate::operations::unary::group::output::merge::RunningPartitionMerge;
-use crate::operations::unary::group::output::partition_job::{PartitionJob, SharedMergeState};
+use crate::operations::unary::group::output::partition_job::{
+    PartitionJob, ReleasedJobs, SharedMergeState,
+};
 use crate::operations::unary::group::output::topk_pruning::{
     HashBinTotals, SharedBinTotals, TopKBounds, TopKThreshold,
 };
@@ -359,6 +361,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             partition_bounds,
             topk_bounds,
             limit_progress: self.topk_threshold.clone(),
+            released_jobs: ReleasedJobs::default(),
         });
         // All jobs are pushed before the injected flag flips, so a drained
         // queue means a finished phase.

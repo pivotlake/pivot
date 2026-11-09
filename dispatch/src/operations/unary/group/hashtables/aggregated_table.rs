@@ -190,6 +190,32 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
             }
         }
     }
+
+    /// Lets go of the bucket and slab lists without visiting their elements.
+    /// Only for a pool whose every bucket has been released: each element is
+    /// empty by then, so visiting them would free nothing, and the lists of
+    /// every worker together are megabytes last written on other cores, read
+    /// by whichever worker happens to drop the merge's shared state.
+    pub fn discard_released_lists(&mut self) {
+        debug_assert!(
+            self.buckets
+                .iter_mut()
+                .all(|bucket| bucket.get_mut().is_none()),
+            "every bucket is released before the lists are discarded"
+        );
+        debug_assert!(
+            self.slabs
+                .iter_mut()
+                .all(|entry| entry.get_mut().slab.is_none()),
+            "releasing every bucket empties every slab entry"
+        );
+        // SAFETY: zero is within both lists' lengths. Shrinking a list without
+        // dropping its elements only leaks what they own, which is nothing.
+        unsafe {
+            self.buckets.set_len(0);
+            self.slabs.set_len(0);
+        }
+    }
 }
 
 /// Tables, optional scatter buffers, and sizing data produced by one worker.
