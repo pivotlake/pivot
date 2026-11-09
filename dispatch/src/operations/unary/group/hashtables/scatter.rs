@@ -16,7 +16,7 @@
 //! allocator is taken apart into each partition's [`PartitionRows`], which the
 //! merge reads.
 
-use super::hash_table::{PersistedKey, entry_layout};
+use super::hash_table::{PersistedKey, entry_layout, prefetch_l1_line};
 use crate::io::{FileRange, IORequesterError, OpenFile, ReadData};
 use crate::memory::{
     Dynamic, FrozenSlab, NO_SLAB, PartitionAllocator, PartitionSlab, SlabEntry, SpilledBuffer,
@@ -272,6 +272,12 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
             while next != NO_SLAB {
                 let entry = unsafe { &*slabs[next as usize].get() };
                 next = entry.next;
+                // The chain's entries lie wherever the slabs happened to
+                // close, so the next one is a cache miss; fetching it now
+                // hides the miss under the scan of this slab's rows.
+                if next != NO_SLAB {
+                    prefetch_l1_line(slabs.as_ptr().wrapping_add(next as usize) as *const u8);
+                }
                 if let Some(slab) = &entry.slab {
                     return Some((slab, entry.rows));
                 }
