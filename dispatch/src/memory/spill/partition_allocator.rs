@@ -20,7 +20,7 @@ use crate::memory::spill::partition_tree::{
 };
 use crate::memory::spill::{SpillWrite, SpilledBuffer, SpilledSlab, Spiller};
 use crate::memory::{BUFFER_SIZE, FileBytes, FrozenSlab, Slab, WriteBuffer, memory_ctx};
-use std::ops::{ControlFlow, Range};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// The slab a partition is appending into, and where it came from, so that
@@ -55,6 +55,12 @@ struct Partition {
     open_slab: Option<OpenSlab>,
     /// Slabs this partition has filled, which the layout sizes the next by.
     slabs_filled: usize,
+    /// The partition's first and last closed slab in the allocator's list,
+    /// `NO_SLAB` while it has none; the slabs chain from first to last.
+    first_closed: u32,
+    last_closed: u32,
+    /// Rows in the partition's closed slabs.
+    rows_closed: usize,
     /// The file this partition's spilled rows are appended to, once it has
     /// spilled for the first time.
     spill_file: Option<OpenFile>,
@@ -63,25 +69,36 @@ struct Partition {
     bytes_spilled: u64,
 }
 
-/// A full slab, recorded against its buffer until the buffer is spilled. Full
-/// means no one writes it again, so it is frozen.
-struct ClosedSlab {
-    partition: usize,
-    slab: FrozenSlab,
+/// A slab closed for writing, in the worker's list of them (see
+/// [`PartitionAllocator::into_partitions`]). A partition's slabs chain through
+/// `next`, in the order they were closed, so the list is grouped by partition
+/// without ever being rearranged.
+pub struct SlabEntry {
+    /// The slab, taken when it is spilled, and when the merge releases it.
+    pub slab: Option<FrozenSlab>,
+    pub rows: usize,
+    pub partition: usize,
+    /// The partition's next closed slab, or `NO_SLAB`.
+    pub next: u32,
 }
+
+/// The end of a partition's slab chain.
+pub const NO_SLAB: u32 = u32::MAX;
 
 /// A buffer the partitions under one tree node share, and the full slabs taken
 /// from it so far.
 struct PartitionGroupBuffer {
     buffer: Arc<WriteBuffer>,
-    closed_slabs: Vec<ClosedSlab>,
+    /// The closed slabs allocated from the buffer, as indices into the
+    /// allocator's slab list.
+    closed: Vec<u32>,
 }
 
 impl PartitionGroupBuffer {
     fn new(buffer: Arc<WriteBuffer>) -> Self {
         Self {
             buffer,
-            closed_slabs: Vec::new(),
+            closed: Vec::new(),
         }
     }
 
@@ -90,7 +107,7 @@ impl PartitionGroupBuffer {
     /// reference is a partition's open slab, or the node still allocating
     /// from the buffer.
     fn is_sealed(&self) -> bool {
-        Arc::strong_count(&self.buffer) == self.closed_slabs.len() + 1
+        Arc::strong_count(&self.buffer) == self.closed.len() + 1
     }
 }
 
@@ -125,15 +142,6 @@ enum SlabAllocation {
 }
 
 impl PartitionGroupSlot {
-    /// The buffers the slot has allocated from, none for an unused slot.
-    fn buffers(&self) -> &[PartitionGroupBuffer] {
-        match self {
-            PartitionGroupSlot::Allocating { buffers, .. }
-            | PartitionGroupSlot::Split { buffers } => buffers,
-            PartitionGroupSlot::Unused => &[],
-        }
-    }
-
     fn buffers_mut(&mut self) -> &mut Vec<PartitionGroupBuffer> {
         match self {
             PartitionGroupSlot::Allocating { buffers, .. }
@@ -214,15 +222,6 @@ impl PartitionGroupSlot {
     /// Stop allocating here for good, letting go of the current buffer so it
     /// can become sealed. For an inner node whose buffer is full, before
     /// its groups move to its children.
-    /// The buffers the slot has allocated from, taking the slot apart.
-    fn into_buffers(self) -> Vec<PartitionGroupBuffer> {
-        match self {
-            PartitionGroupSlot::Allocating { buffers, .. }
-            | PartitionGroupSlot::Split { buffers } => buffers,
-            PartitionGroupSlot::Unused => Vec::new(),
-        }
-    }
-
     fn stop_allocating(&mut self) {
         let PartitionGroupSlot::Allocating { buffers, .. } = self else {
             unreachable!("only a partition group slot that is allocating can stop")
@@ -247,7 +246,10 @@ pub struct PartitionSlab {
 /// [`into_partitions`](PartitionAllocator::into_partitions) returns, and the
 /// file its spilled rows went to, if it ever spilled.
 pub struct PartitionContents {
-    pub slab_range: Range<usize>,
+    /// The partition's first slab in the list, `NO_SLAB` if it has none.
+    pub first_slab: u32,
+    /// Rows in the partition's slabs.
+    pub rows: usize,
     pub spill_file: Option<OpenFile>,
 }
 
@@ -259,6 +261,9 @@ pub struct PartitionAllocator<L: Layout> {
     partitions: Box<[Partition]>,
     /// Each partition's cursor into its open slab, indexed like `partitions`.
     cursors: Box<[RowCursor]>,
+    /// Every closed slab, in the order they closed, each chained to its
+    /// partition's next (see [`SlabEntry`]).
+    closed: Vec<SlabEntry>,
 }
 
 impl<L: Layout> PartitionAllocator<L> {
@@ -277,6 +282,9 @@ impl<L: Layout> PartitionAllocator<L> {
             partitions: std::iter::repeat_with(|| Partition {
                 open_slab: None,
                 slabs_filled: 0,
+                first_closed: NO_SLAB,
+                last_closed: NO_SLAB,
+                rows_closed: 0,
                 spill_file: None,
                 bytes_spilled: 0,
             })
@@ -290,6 +298,7 @@ impl<L: Layout> PartitionAllocator<L> {
                 partition_count
             ]
             .into_boxed_slice(),
+            closed: Vec::new(),
         }
     }
 
@@ -354,83 +363,56 @@ impl<L: Layout> PartitionAllocator<L> {
     }
 
     /// Take the allocator apart for reading, once no more rows will be
-    /// written: every slab in one list grouped by partition (a partition's
-    /// closed slabs in the order they were closed, then its open slab if it
-    /// holds rows), and each partition's range into that list, indexed by
-    /// partition. One list for the whole worker rather than one per
-    /// partition: a worker scatters into a thousand partitions and more, and
-    /// a list each is as many heap objects, built here and freed one by one
-    /// by whichever workers merge the partitions. The slabs here were never
-    /// spilled; spilled slabs are the evictor's.
-    pub fn into_partitions(self) -> (Vec<Option<PartitionSlab>>, Vec<PartitionContents>) {
-        let row_size = self.layout.row_size();
+    /// written: every slab in one list, each partition's slabs chained in the
+    /// order they were closed with its open slab last, and each partition's
+    /// first slab and row count, indexed by partition. The list is the one
+    /// the slabs were recorded in as they closed, so the worker builds
+    /// nothing here: a worker scatters into a thousand partitions and more,
+    /// and every worker flushes at once, on the query's critical path. A
+    /// spilled slab's entry stays in its chain with no slab; its rows are
+    /// the evictor's.
+    pub fn into_partitions(self) -> (Vec<SlabEntry>, Vec<PartitionContents>) {
         let partition_count = self.partitions.len();
         let open_slab_lens: Vec<usize> = (0..partition_count)
             .map(|partition| self.open_slab_len(partition))
             .collect();
-        let mut slab_counts = vec![0usize; partition_count];
-        for closed_slab in self
-            .tree
-            .nodes()
-            .iter()
-            .flat_map(PartitionGroupSlot::buffers)
-            .flat_map(|buffer| &buffer.closed_slabs)
-        {
-            slab_counts[closed_slab.partition] += 1;
-        }
-        for (count, open_slab_len) in slab_counts.iter_mut().zip(&open_slab_lens) {
-            if *open_slab_len > 0 {
-                *count += 1;
-            }
-        }
-        let mut range_starts = Vec::with_capacity(partition_count);
-        let mut total_slabs = 0;
-        for count in &slab_counts {
-            range_starts.push(total_slabs);
-            total_slabs += count;
-        }
-        let mut slabs: Vec<Option<PartitionSlab>> = (0..total_slabs).map(|_| None).collect();
-        let mut next_slot = range_starts.clone();
         let Self {
-            tree, partitions, ..
+            partitions,
+            mut closed,
+            ..
         } = self;
-        for closed_slab in tree
-            .into_nodes()
-            .into_iter()
-            .flat_map(|slot| slot.into_buffers())
-            .flat_map(|buffer| buffer.closed_slabs)
-        {
-            let slot = &mut next_slot[closed_slab.partition];
-            slabs[*slot] = Some(PartitionSlab {
-                rows: closed_slab.slab.size() / row_size,
-                slab: closed_slab.slab,
-            });
-            *slot += 1;
-        }
         let contents = partitions
             .into_vec()
             .into_iter()
             .zip(open_slab_lens)
             .enumerate()
-            .map(|(partition_idx, (partition, open_slab_len))| {
-                if let Some(open_slab) = partition.open_slab
+            .map(|(partition_idx, (mut partition, open_slab_len))| {
+                if let Some(open_slab) = partition.open_slab.take()
                     && open_slab_len > 0
                 {
-                    slabs[next_slot[partition_idx]] = Some(PartitionSlab {
-                        slab: open_slab.slab.freeze(),
+                    let entry = closed.len() as u32;
+                    closed.push(SlabEntry {
+                        slab: Some(open_slab.slab.freeze()),
                         rows: open_slab_len,
+                        partition: partition_idx,
+                        next: NO_SLAB,
                     });
-                    next_slot[partition_idx] += 1;
+                    if partition.last_closed == NO_SLAB {
+                        partition.first_closed = entry;
+                    } else {
+                        closed[partition.last_closed as usize].next = entry;
+                    }
+                    partition.last_closed = entry;
+                    partition.rows_closed += open_slab_len;
                 }
-                let start = range_starts[partition_idx];
-                debug_assert_eq!(next_slot[partition_idx], start + slab_counts[partition_idx]);
                 PartitionContents {
-                    slab_range: start..start + slab_counts[partition_idx],
+                    first_slab: partition.first_closed,
+                    rows: partition.rows_closed,
                     spill_file: partition.spill_file,
                 }
             })
             .collect();
-        (slabs, contents)
+        (closed, contents)
     }
 
     /// Spill the next sealed buffer through `spiller`, one write per partition
@@ -472,25 +454,32 @@ impl<L: Layout> PartitionAllocator<L> {
             return Ok(None);
         };
         let slot_buffers = self.tree.node_mut(partition_group_slot_idx).buffers_mut();
-        for closed_slab in &slot_buffers[sealed_buffer_idx].closed_slabs {
-            let partition = &mut self.partitions[closed_slab.partition];
+        for &entry in &slot_buffers[sealed_buffer_idx].closed {
+            let partition_idx = self.closed[entry as usize].partition;
+            let partition = &mut self.partitions[partition_idx];
             if partition.spill_file.is_none() {
-                partition.spill_file = Some(spiller.open_spill_file(closed_slab.partition)?);
+                partition.spill_file = Some(spiller.open_spill_file(partition_idx)?);
             }
         }
-        let PartitionGroupBuffer {
-            buffer,
-            mut closed_slabs,
-        } = slot_buffers.remove(sealed_buffer_idx);
+        let PartitionGroupBuffer { buffer, mut closed } = slot_buffers.remove(sealed_buffer_idx);
 
         // Each partition's rows go out as one write, so bring its slabs
         // together. Sorting is stable, so a partition's slabs keep the order
         // they were filled in, which is the order they land in its file.
-        closed_slabs.sort_by_key(|closed_slab| closed_slab.partition);
+        closed.sort_by_key(|&entry| self.closed[entry as usize].partition);
         let mut writes: Vec<SpillWrite> = Vec::new();
-        let mut spilled_slabs: Vec<SpilledSlab> = Vec::with_capacity(closed_slabs.len());
+        let mut spilled_slabs: Vec<SpilledSlab> = Vec::with_capacity(closed.len());
         let mut partition_being_gathered = None;
-        for ClosedSlab { partition, slab } in closed_slabs {
+        for entry in closed {
+            let entry = &mut self.closed[entry as usize];
+            let partition = entry.partition;
+            let slab = entry
+                .slab
+                .take()
+                .expect("a closed slab is spilled once, from the buffer it was allocated in");
+            // The rows now count as spilled, through the handle below, rather
+            // than as rows in the partition's slabs.
+            self.partitions[partition].rows_closed -= entry.rows;
             if partition_being_gathered != Some(partition) {
                 partition_being_gathered = Some(partition);
                 writes.push(SpillWrite {
@@ -543,10 +532,22 @@ impl<L: Layout> PartitionAllocator<L> {
             .expect(
                 "a slab's buffer stays recorded at its partition group slot until it is spilled",
             );
-        group_buffer.closed_slabs.push(ClosedSlab {
+        let entry = self.closed.len() as u32;
+        group_buffer.closed.push(entry);
+        self.closed.push(SlabEntry {
+            slab: Some(full.slab.freeze()),
+            rows: full.rows,
             partition,
-            slab: full.slab.freeze(),
+            next: NO_SLAB,
         });
+        let partition = &mut self.partitions[partition];
+        if partition.last_closed == NO_SLAB {
+            partition.first_closed = entry;
+        } else {
+            self.closed[partition.last_closed as usize].next = entry;
+        }
+        partition.last_closed = entry;
+        partition.rows_closed += full.rows;
     }
 
     /// Allocate a fresh slab for `partition` from its group's slot. When the
@@ -732,11 +733,14 @@ mod tests {
             allocator.reserve(3).write(value);
         }
 
-        let closed = &buffers_of_slot(&mut allocator, 0)[0].closed_slabs;
+        let closed = buffers_of_slot(&mut allocator, 0)[0].closed.clone();
         assert_eq!(closed.len(), 1);
-        assert_eq!(closed[0].partition, 3);
-        let values: Vec<u64> = closed[0]
+        let entry = &allocator.closed[closed[0] as usize];
+        assert_eq!(entry.partition, 3);
+        let values: Vec<u64> = entry
             .slab
+            .as_ref()
+            .unwrap()
             .as_slice()
             .chunks_exact(8)
             .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()))
@@ -756,7 +760,7 @@ mod tests {
 
         assert!(allocator.partitions[0].open_slab.is_none());
         assert_eq!(allocator.partitions[0].slabs_filled, 1);
-        assert_eq!(buffers_of_slot(&mut allocator, 0)[0].closed_slabs.len(), 1);
+        assert_eq!(buffers_of_slot(&mut allocator, 0)[0].closed.len(), 1);
     }
 
     #[test]
@@ -769,11 +773,16 @@ mod tests {
             allocator.reserve(0).fill(row);
         }
 
-        let closed = &buffers_of_slot(&mut allocator, 0)[0].closed_slabs;
-        let slab_sizes: Vec<usize> = closed.iter().map(|s| s.slab.size()).collect();
+        let closed: Vec<&FrozenSlab> = buffers_of_slot(&mut allocator, 0)[0]
+            .closed
+            .clone()
+            .iter()
+            .map(|&entry| allocator.closed[entry as usize].slab.as_ref().unwrap())
+            .collect();
+        let slab_sizes: Vec<usize> = closed.iter().map(|slab| slab.size()).collect();
         assert_eq!(slab_sizes, [2 * 24, 4 * 24]);
-        assert_eq!(closed[1].slab.as_slice()[0..24], [2u8; 24]);
-        assert_eq!(closed[1].slab.as_slice()[72..96], [5u8; 24]);
+        assert_eq!(closed[1].as_slice()[0..24], [2u8; 24]);
+        assert_eq!(closed[1].as_slice()[72..96], [5u8; 24]);
         assert!(allocator.partitions[0].open_slab.is_none());
     }
 

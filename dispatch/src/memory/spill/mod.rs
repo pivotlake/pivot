@@ -23,7 +23,9 @@ mod partition_evictor;
 mod partition_tree;
 
 pub use layout::{Dynamic, Fixed, Layout};
-pub use partition_allocator::{PartitionAllocator, PartitionContents, PartitionSlab};
+pub use partition_allocator::{
+    NO_SLAB, PartitionAllocator, PartitionContents, PartitionSlab, SlabEntry,
+};
 pub use partition_evictor::{PartitionEvictor, SharedPartitionEvictor};
 pub use partition_tree::PARTITIONS;
 

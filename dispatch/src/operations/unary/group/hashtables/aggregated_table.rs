@@ -18,7 +18,7 @@
 
 use crate::RECORD_BATCH_SIZE;
 use crate::io::IORequesterError;
-use crate::memory::{PartitionSlab, SharedPartitionEvictor, SlabAllocator, Spiller};
+use crate::memory::{NO_SLAB, SharedPartitionEvictor, SlabAllocator, SlabEntry, Spiller};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::HashTable;
@@ -87,12 +87,12 @@ impl RadixConfig {
 /// is a serial tail that grows with the worker count; released per partition,
 /// the teardown spreads over the jobs.
 pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
-    /// Every slab of every bucket, grouped by bucket (see [`ScatteredRows`]).
-    /// A bucket's job reads the bucket's slots through
-    /// [`with_bucket`](Self::with_bucket) and empties them when it releases
-    /// the bucket, so the slabs' memory goes back as each partition merges
-    /// while this one list lives as long as the pool.
-    slabs: Box<[UnsafeCell<Option<PartitionSlab>>]>,
+    /// Every slab of every bucket, each bucket's chained (see
+    /// [`ScatteredRows`]). A bucket's job reads the bucket's chain through
+    /// [`with_bucket`](Self::with_bucket) and empties its entries when it
+    /// releases the bucket, so the slabs' memory goes back as each partition
+    /// merges while this one list lives as long as the pool.
+    slabs: Box<[UnsafeCell<SlabEntry>]>,
     buckets: Vec<UnsafeCell<Option<PartitionRows<KP, V>>>>,
     /// Rows across every bucket, counted by the flushing worker so the merge
     /// coordinator sums one number per worker rather than walking the
@@ -101,9 +101,9 @@ pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
 }
 
 // SAFETY: the merge partitions tile the bucket range without overlap and each
-// partition has one job per source set, so a bucket, and the slab slots of its
-// range, are read and then released by exactly one job; no two threads ever
-// access the same cell.
+// partition has one job per source set, so a bucket, and the slab entries of
+// its chain, are read and then released by exactly one job; no two threads
+// ever access the same cell.
 unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Sync for PartitionBuffers<KP, V> {}
 
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
@@ -154,27 +154,20 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
 
     /// Runs `f` over the rows of bucket `index`. A bucket is released only by
     /// the job that merged it, so a bucket being read is still held.
-    /// Reads bucket `index`: its rows, and its slots of the slab list.
+    /// Reads bucket `index`: its rows, and the slab list its chain runs
+    /// through.
     pub fn with_bucket<R>(
         &self,
         index: usize,
-        f: impl FnOnce(&PartitionRows<KP, V>, &[Option<PartitionSlab>]) -> R,
+        f: impl FnOnce(&PartitionRows<KP, V>, &[UnsafeCell<SlabEntry>]) -> R,
     ) -> R {
         // SAFETY: only the bucket's own partition job reaches this cell and
-        // the slots of the bucket's range (see the `Sync` impl), and it
-        // releases the bucket only after reading it. `UnsafeCell<T>` has the
-        // layout of `T`, so the cells of the range read as a slice of slots.
+        // the entries of the bucket's chain (see the `Sync` impl), and it
+        // releases the bucket only after reading it.
         let bucket = unsafe { &*self.buckets[index].get() }
             .as_ref()
             .expect("a scatter bucket is released only after its partition merged it");
-        let range = bucket.slab_range();
-        let slabs = unsafe {
-            std::slice::from_raw_parts(
-                self.slabs.as_ptr().add(range.start) as *const Option<PartitionSlab>,
-                range.len(),
-            )
-        };
-        f(bucket, slabs)
+        f(bucket, &self.slabs)
     }
 
     /// Drops the buckets of `partition` and their slabs once its merge has
@@ -185,8 +178,11 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
             // and its read has completed.
             let bucket = unsafe { &mut *self.buckets[index].get() };
             if let Some(rows) = bucket.take() {
-                for slot in rows.slab_range() {
-                    unsafe { *self.slabs[slot].get() = None };
+                let mut next = rows.first_slab();
+                while next != NO_SLAB {
+                    let entry = unsafe { &mut *self.slabs[next as usize].get() };
+                    entry.slab = None;
+                    next = entry.next;
                 }
             }
         }

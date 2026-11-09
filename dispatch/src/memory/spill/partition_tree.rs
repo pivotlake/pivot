@@ -71,11 +71,6 @@ impl<N> PartitionTree<N> {
         &self.nodes
     }
 
-    /// Take every node, in index order.
-    pub fn into_nodes(self) -> Vec<N> {
-        self.nodes.into_vec()
-    }
-
     /// Point the groups at `node` to its children instead: the first half of
     /// them to the left child, the rest to the right.
     pub fn split(&mut self, node: usize) {
