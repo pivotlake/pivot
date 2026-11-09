@@ -44,7 +44,10 @@ pub(super) struct RunningPartitionMerge<K: KeyExtractor, V: AggregationValue + ?
     pub(super) job: PartitionJob<K, V>,
     /// The reads still in flight, each with the stretches of a spill file it
     /// is bringing back. A read's rows are merged into `table` as it lands.
-    pub(super) reads_in_flight: ahash::HashMap<ReadRequestId, Vec<OnDiskStretch>>,
+    /// A plain list: a job reads only the partition's spilled rows, a
+    /// handful of reads at most, and a hash map's seeding alone would cost
+    /// every job a write to a counter shared by every worker.
+    pub(super) reads_in_flight: Vec<(ReadRequestId, Vec<OnDiskStretch>)>,
     /// Where the rows read back from disk land, if the job reads any. Apart
     /// from `allocator` because these rows are dropped as soon as they are
     /// merged, long before the table is.
@@ -64,7 +67,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
     pub(super) fn start(job: PartitionJob<K, V>, io: &mut OperatorIO) -> unary::Result<Self> {
         let shared = job.shared.clone();
         let (buffers, tables) = &shared.sources[job.node];
-        let mut reads_in_flight = ahash::HashMap::default();
+        let mut reads_in_flight = Vec::new();
         let mut read_allocator: Option<SlabAllocator> = None;
         for worker_buffers in buffers {
             for bucket in worker_buffers.bucket_range(job.index, shared.num_partitions) {
@@ -88,7 +91,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
                     })
                     .collect();
                 let read = io.read_direct(on_disk.file, reads)?;
-                reads_in_flight.insert(read, on_disk.stretches);
+                reads_in_flight.push((read, on_disk.stretches));
             }
         }
 
@@ -136,10 +139,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
     /// Merge the rows `read`, one of this job's reads in flight, brought back
     /// from disk as `stretches_read`, one per stretch it asked for.
     pub(super) fn merge_read(&mut self, read: ReadRequestId, stretches_read: Vec<ReadData>) {
-        let stretches = self
+        let position = self
             .reads_in_flight
-            .remove(&read)
+            .iter()
+            .position(|(id, _)| *id == read)
             .expect("the read is one of this job's reads in flight");
+        let (_, stretches) = self.reads_in_flight.swap_remove(position);
         let read_allocator = self
             .read_allocator
             .as_mut()
