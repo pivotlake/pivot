@@ -1048,8 +1048,15 @@ impl IORequester {
     /// Linux both ride one ring, so a single `submit_and_wait` wakes on either.
     #[cfg(target_os = "linux")]
     pub fn wait(&mut self) -> Result<()> {
-        self.backend.submit_and_wait(1)?;
-        Ok(())
+        // A signal, such as a profiler or debugger attaching, interrupts the
+        // wait before anything completed; that is not progress or an error.
+        loop {
+            match self.backend.submit_and_wait(1) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// Non-Linux disk and HTTP completions arrive on independent channels, so park
