@@ -11,12 +11,15 @@ use crossbeam_deque::{Injector, Steal};
 /// alone it would be `workers x HASH_BINS` adds on one thread, the serial
 /// tail of every large top-k query on a big machine. Instead each node keeps
 /// a lock-free queue of arrays waiting to be summed. An arriving worker
-/// takes one array an earlier arrival left in its node's queue, merges it
-/// into its own, and queues that. Nothing ever waits, and no worker merges
-/// more than one array: a worker that arrives while another is mid-merge
-/// finds the queue empty and just queues its own. Arrivals that were spread
-/// out chain into a single array; only arrivals that overlapped leave extra
-/// ones behind, so the final arrival's sum stays small. Per-node queues keep
+/// takes every array earlier arrivals left in its node's queue, merges them
+/// into its own, and queues that. Nothing ever waits: workers that arrive
+/// together each take a share of the queue and merge it at the same time,
+/// so the queue drains as fast as the workers arrive, and what the final
+/// arrival finds left to sum is the handful of arrays of the workers that
+/// were still merging when it arrived. Merging only one array per arrival
+/// would leave every array that was queued while that merge ran, and on a
+/// big machine, where arrivals come in a burst, that is a tenth of the
+/// workers' arrays for the final arrival to sum alone. Per-node queues keep
 /// every merge in node-local memory; the final sum is the one step that
 /// reads across nodes.
 pub(crate) struct SharedBinTotals {
@@ -31,16 +34,13 @@ impl SharedBinTotals {
         }
     }
 
-    /// Adds one worker's totals: merges in one array left by an earlier
-    /// arrival, if there is one, then queues the result.
+    /// Adds one worker's totals: merges in every array left by earlier
+    /// arrivals, then queues the result.
     pub(crate) fn add(&self, node: usize, mut totals: HashBinTotals) {
         let pending = &self.pending[node];
         loop {
             match pending.steal() {
-                Steal::Success(other) => {
-                    totals.merge(&other);
-                    break;
-                }
+                Steal::Success(other) => totals.merge(&other),
                 Steal::Retry => continue,
                 Steal::Empty => break,
             }
