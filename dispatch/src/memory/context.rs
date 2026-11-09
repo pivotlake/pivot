@@ -22,6 +22,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// held by operators, the worker asks its operators to spill.
 const RECLAIMABLE_SLOTS_TARGET_PERCENT: usize = 20;
 
+/// [`RECLAIMABLE_SLOTS_TARGET_PERCENT`], or what `PIVOT_SPILL_RESERVE_PERCENT`
+/// sets in its place.
+fn get_reclaimable_slots_target_percent() -> usize {
+    static TARGET_PERCENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::env::get_tunable(
+        &TARGET_PERCENT,
+        "PIVOT_SPILL_RESERVE_PERCENT",
+        RECLAIMABLE_SLOTS_TARGET_PERCENT,
+        |percent| percent <= 100,
+    )
+}
+
 thread_local! {
     static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = const { RefCell::new(None) };
     static MEMORY_CTX_PTR: Cell<*const MemoryContext> = const { Cell::new(std::ptr::null()) };
@@ -509,7 +521,7 @@ impl MemoryContext {
             + self.clock.owned_in_region(Owner::Decompressed, self.node);
         let spilled = self.buffers_spilled[self.node].load(Ordering::Relaxed);
         let target =
-            self.layout.node_slots(self.node).len() * RECLAIMABLE_SLOTS_TARGET_PERCENT / 100;
+            self.layout.node_slots(self.node).len() * get_reclaimable_slots_target_percent() / 100;
         let reclaimable = free + cached + spilled + self.own_buffers_spilled.get();
         if reclaimable >= target {
             return 0;

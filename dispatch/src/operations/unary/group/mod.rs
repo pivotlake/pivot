@@ -224,7 +224,19 @@ fn get_scatter_bucket_count_for_worker(total_workers: usize) -> usize {
     // The largest power of two at or below the budget.
     (1usize << budget.ilog2())
         .max(total_workers.next_power_of_two())
-        .min(RADIX_PARTITIONS)
+        .min(get_most_scatter_partitions())
+}
+
+/// [`RADIX_PARTITIONS`], or the smaller power of two that
+/// `PIVOT_SCATTER_PARTITIONS` sets in its place.
+fn get_most_scatter_partitions() -> usize {
+    static MOST_PARTITIONS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::env::get_tunable(
+        &MOST_PARTITIONS,
+        "PIVOT_SCATTER_PARTITIONS",
+        RADIX_PARTITIONS,
+        |partitions| partitions.is_power_of_two() && partitions <= RADIX_PARTITIONS,
+    )
 }
 
 /// Per-worker GROUP BY consumer.

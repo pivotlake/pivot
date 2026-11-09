@@ -31,8 +31,28 @@ pub struct PartitionTree<N> {
     group_node: [u8; GROUPS],
 }
 
+/// How many groups the partitions are gathered into when
+/// `PIVOT_SPILL_GROUPS` says to use fewer than the tree's [`GROUPS`] leaves:
+/// a power of two, at most [`GROUPS`].
+fn get_groups_in_use() -> usize {
+    static GROUPS_IN_USE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::env::get_tunable(&GROUPS_IN_USE, "PIVOT_SPILL_GROUPS", GROUPS, |groups| {
+        groups.is_power_of_two() && groups <= GROUPS
+    })
+}
+
+/// The leaf group `partition` belongs to.
 pub fn group_of_partition(partition: usize) -> usize {
-    partition / PARTITIONS_PER_GROUP
+    pick_group_of_partition(partition, get_groups_in_use())
+}
+
+/// The leaf group of `partition` when only `groups_in_use` groups are used.
+/// The groups in use are spread evenly over the leaves, so the tree splits
+/// them level by level as it does all of them; below the level where each
+/// has a node to itself a split only moves it down.
+fn pick_group_of_partition(partition: usize, groups_in_use: usize) -> usize {
+    let partitions_per_group_in_use = PARTITIONS / groups_in_use;
+    (partition / partitions_per_group_in_use) * (GROUPS / groups_in_use)
 }
 
 pub fn is_leaf(node: usize) -> bool {
@@ -120,6 +140,17 @@ impl<N> PartitionTree<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fewer_groups_in_use_take_evenly_spaced_leaves() {
+        let with_every_group = pick_group_of_partition(200, GROUPS);
+        let with_sixteen_groups: Vec<usize> = [0, 255, 256, PARTITIONS - 1]
+            .map(|partition| pick_group_of_partition(partition, 16))
+            .to_vec();
+
+        assert_eq!(with_every_group, 3);
+        assert_eq!(with_sixteen_groups, [0, 0, 4, 60]);
+    }
 
     #[test]
     fn every_group_starts_at_the_root() {
