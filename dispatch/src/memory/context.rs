@@ -128,6 +128,7 @@ impl MemoryContextFactory {
             io_requester: OnceCell::new(),
             spill_writes_in_flight: RefCell::new(HashMap::new()),
             node: self.node,
+            took_buffer_since_pressure_check: Cell::new(false),
         }
     }
 }
@@ -172,6 +173,11 @@ pub struct MemoryContext {
     spill_writes_in_flight: RefCell<HashMap<(Identifier, WriteRequestId), Arc<AtomicUsize>>>,
     /// This worker's NUMA node, i.e. the ring region it allocates and evicts from.
     node: usize,
+    /// Whether this worker took a buffer since it last looked at the node's
+    /// spill pressure. Pressure rises only when a buffer is taken, so a
+    /// worker that took none since its last look has nothing new to find,
+    /// and skips the look along with the shared counts it would read.
+    took_buffer_since_pressure_check: Cell<bool>,
 }
 
 impl MemoryContext {
@@ -325,7 +331,10 @@ impl MemoryContext {
                     "pooled slot {idx} still owned by a cache",
                 );
                 match memory_ctx().ring().try_write(idx) {
-                    Some(buffer) => return buffer,
+                    Some(buffer) => {
+                        self.note_buffer_taken();
+                        return buffer;
+                    }
                     None => {
                         // Try again with a fresh idx, we don't want to start
                         // evicting yet.
@@ -339,6 +348,7 @@ impl MemoryContext {
             // contenders hold slots only transiently), then hand the rest back
             // so peers can pop them while this worker is busy evicting.
             if let Some(buffer) = contended.pop_writable() {
+                self.note_buffer_taken();
                 return buffer;
             }
             contended.release();
@@ -346,8 +356,21 @@ impl MemoryContext {
             // Evict via the shared clock, which takes from whichever tier is
             // over its target share (decompressed, in the common case of a
             // large decompressed working set).
-            return self.evict();
+            let evicted = self.evict();
+            self.note_buffer_taken();
+            return evicted;
         }
+    }
+
+    fn note_buffer_taken(&self) {
+        self.took_buffer_since_pressure_check.set(true);
+    }
+
+    /// Whether this worker took a buffer since the last call. Only then
+    /// can a look at the node's spill pressure find something this worker
+    /// has not seen, so the worker loop looks only when this says so.
+    pub fn took_buffer_since_pressure_check(&self) -> bool {
+        self.took_buffer_since_pressure_check.replace(false)
     }
 
     /// Evict a ring slot via the shared CLOCK and return it writable. Each
@@ -760,6 +783,22 @@ mod tests {
         let shortfall = memory_ctx().slots_to_spill();
 
         assert_eq!(shortfall, 0);
+    }
+
+    #[test]
+    fn a_pressure_check_is_due_once_after_a_buffer_is_taken() {
+        init_test_free_pool(4);
+
+        let before_taking = memory_ctx().took_buffer_since_pressure_check();
+        let buffer = memory_ctx().get_write_buffer(false);
+        let after_taking = memory_ctx().took_buffer_since_pressure_check();
+        let without_taking_again = memory_ctx().took_buffer_since_pressure_check();
+        drop(buffer);
+
+        assert_eq!(
+            [before_taking, after_taking, without_taking_again],
+            [false, true, false]
+        );
     }
 
     #[test]
