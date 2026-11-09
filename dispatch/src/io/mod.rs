@@ -27,7 +27,7 @@ pub(crate) mod hardware_queues;
 
 use crate::Identifier;
 use crate::memory::FileBytes;
-use crate::memory::compressed_cache::MissingExtent;
+use crate::memory::cache::MissingExtent;
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -102,7 +102,7 @@ impl AsRawFd for LocalFile {
 /// cached region — still references it), or a remote HTTP(S) object fetched
 /// via range requests.
 ///
-/// This is also the key the [`CompressedCache`](crate::memory::compressed_cache::CompressedCache)
+/// This is also the key the [`CompressedCache`](crate::memory::cache::CompressedCache)
 /// uses to bucket 2 MB regions, so it must be cheap to `Hash`/`Eq` — the
 /// cache's pin re-check runs on every hit. `Local` compares the raw fd (an
 /// `i32`; stable while the `LocalFile` is held, and holding it in the key means

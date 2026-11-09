@@ -1,5 +1,5 @@
 use crate::memory::slab::slab_buffer::SlabBuffer;
-use crate::memory::slab::{MultiSlabBuffer, Slab};
+use crate::memory::slab::{MultiSlabBuffer, Slab, SlabBacking, SlabSource};
 use crate::memory::{BUFFER_SIZE, WriteBuffer, memory_ctx};
 use std::sync::Arc;
 
@@ -54,11 +54,11 @@ impl SlabAllocator {
     /// Zeroes the slab if `zeroed` is requested but the buffer wasn't pre-zeroed.
     fn get_slab_from_current_buffer(&mut self, size: usize, zeroed: bool) -> Slab {
         debug_assert!(size <= self.remaining_in_buffer());
-        let mut slab = Slab {
-            ptr: unsafe { self.working_buffer.ptr.add(self.offset) },
+        let mut slab = Slab::new(
+            unsafe { self.working_buffer.ptr.add(self.offset) },
             size,
-            _buffer: self.working_buffer.clone(),
-        };
+            SlabBacking::Working(self.working_buffer.clone()),
+        );
         if zeroed && !self.working_buffer_zeroed {
             slab.zero_out();
         }
@@ -215,6 +215,12 @@ impl SlabAllocator {
     pub fn create_slab_buffer<T>(&mut self, size: usize, zeroed: bool) -> SlabBuffer<T> {
         let slab = self.get_aligned_slab(size * size_of::<T>(), align_of::<T>(), zeroed);
         SlabBuffer::new(slab)
+    }
+}
+
+impl SlabSource for SlabAllocator {
+    fn get_aligned_slab(&mut self, size: usize, align: usize, zeroed: bool) -> Slab {
+        SlabAllocator::get_aligned_slab(self, size, align, zeroed)
     }
 }
 

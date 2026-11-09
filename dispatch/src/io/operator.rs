@@ -7,6 +7,7 @@
 
 use super::OpenFile;
 use crate::memory::FileBytes;
+use crate::memory::cache::{CacheId, RingCache};
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -88,6 +89,9 @@ pub struct PendingReadRequest {
     pub id: ReadRequestId,
     pub open_file: OpenFile,
     pub locations: Vec<FileRange>,
+    /// The compressed cache the bytes are read through: the one of the family
+    /// the data belongs to, so they are balanced against its derived forms.
+    pub cache: CacheId,
 }
 
 /// A logical write waiting for the worker to select its transport.
@@ -129,8 +133,21 @@ impl<'a> OperatorIO<'a> {
         }
     }
 
+    /// Read Parquet page bytes: through the pages family's compressed cache.
     pub fn read(
         &mut self,
+        open_file: OpenFile,
+        locations: impl IntoIterator<Item = FileRange>,
+    ) -> Result<ReadRequestId, crate::io::IORequesterError> {
+        let pages = crate::memory::memory_ctx().page_caches().compressed.id();
+        self.read_through(pages, open_file, locations)
+    }
+
+    /// Read file bytes through the compressed cache `cache`, so what the read
+    /// brings in is cached beside that cache's family.
+    pub fn read_through(
+        &mut self,
+        cache: CacheId,
         open_file: OpenFile,
         locations: impl IntoIterator<Item = FileRange>,
     ) -> Result<ReadRequestId, crate::io::IORequesterError> {
@@ -140,6 +157,7 @@ impl<'a> OperatorIO<'a> {
             id,
             open_file,
             locations: locations.into_iter().collect(),
+            cache,
         };
         self.requester
             .request_read(self.data_flow_id, self.operator_idx, request, self.stats)?;
