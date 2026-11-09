@@ -148,10 +148,13 @@ pub(super) struct CrossNodeMerges<K: KeyExtractor, V: AggregationValue + ?Sized>
     /// One slot per (partition, node), a partition's slots adjacent. A slot
     /// holds a table exactly while its node's bit is set in the partition's
     /// entry of `sent_nodes`.
-    node_tables: Box<[UnsafeCell<MaybeUninit<HashTable<K::Persisted, V>>>]>,
+    node_tables: Box<[NodeTableSlot<K, V>]>,
     /// Per partition: one bit per node whose table waits in its slot.
     sent_nodes: Box<[AtomicU64]>,
 }
+
+/// Where one node's merged table for one partition waits for the others.
+type NodeTableSlot<K, V> = UnsafeCell<MaybeUninit<HashTable<<K as KeyExtractor>::Persisted, V>>>;
 
 // SAFETY: a slot is written by the one job of its (partition, node) and read
 // only by the job elected through `sent_nodes`, after every write to the
