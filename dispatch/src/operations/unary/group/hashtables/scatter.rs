@@ -147,18 +147,17 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
     /// rows still in the allocator, and the partition's spilled slabs as weak
     /// handles (`spilled[partition]`), which the merge resolves when it gets
     /// to the partition.
-    pub fn into_partition_rows(self, mut spilled: Vec<Vec<SpilledSlab>>) -> ScatteredRows<KP, V> {
-        assert_eq!(
-            spilled.len(),
-            self.partition_count,
-            "one spilled-slab list per scatter partition"
+    pub fn into_partition_rows(self, spilled: Vec<Vec<SpilledSlab>>) -> ScatteredRows<KP, V> {
+        assert!(
+            spilled.is_empty() || spilled.len() == self.partition_count,
+            "one spilled-slab list per scatter partition, or none when nothing spilled"
         );
         let row_size = self.row_size;
         let (slabs, contents) = self.allocator.into_partitions();
+        let mut spilled = spilled.into_iter();
         let partitions = contents
             .into_iter()
-            .enumerate()
-            .map(|(partition, contents)| {
+            .map(|contents| {
                 let rows_in_slabs = slabs[contents.slab_range.clone()]
                     .iter()
                     .flatten()
@@ -167,7 +166,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
                 PartitionRows::new(
                     contents.slab_range,
                     rows_in_slabs,
-                    std::mem::take(&mut spilled[partition]),
+                    spilled.next().unwrap_or_default(),
                     contents.spill_file,
                     row_size,
                 )
@@ -202,20 +201,27 @@ pub struct OnDiskRows {
 /// nothing but the slabs.
 pub struct PartitionRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     slab_range: Range<usize>,
-    /// Spilled slabs whose buffers were still resident when the partition
-    /// was resolved, read after the slabs of `slab_range`.
-    resident_spilled: Vec<PartitionSlab>,
-    /// The partition's spilled slabs, not yet resolved into
-    /// `resident_spilled` or `on_disk`; see
-    /// [`resolve_spilled`](Self::resolve_spilled).
-    spilled: Vec<SpilledSlab>,
-    /// The file the partition's spilled rows went to, if it ever spilled.
-    spill_file: Option<OpenFile>,
-    on_disk: Option<OnDiskRows>,
+    /// The partition's spilled rows, if it ever spilled. Boxed so that the
+    /// usual partition, which never did, is a few words: a worker has a
+    /// thousand and more of these, built at flush.
+    spill: Option<Box<SpilledPartitionRows>>,
     /// Rows in memory and on disk together.
     rows: usize,
     row_size: usize,
     _phantom: PhantomData<(KP, *const V)>,
+}
+
+/// Where a partition's spilled rows are.
+struct SpilledPartitionRows {
+    /// The spilled slabs not yet resolved into `resident` or `on_disk`; see
+    /// [`PartitionRows::resolve_spilled`].
+    handles: Vec<SpilledSlab>,
+    /// Spilled slabs whose buffers were still resident when the partition
+    /// was resolved, read after the slabs in the worker's slab list.
+    resident: Vec<PartitionSlab>,
+    /// The file the partition's spilled rows went to.
+    file: OpenFile,
+    on_disk: Option<OnDiskRows>,
 }
 
 // SAFETY: the slabs are frozen, so reading them from any thread is sound.
@@ -231,16 +237,30 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
         row_size: usize,
     ) -> Self {
         let bytes_spilled: usize = spilled.iter().map(|handle| handle.slab.size()).sum();
+        assert!(
+            spill_file.is_some() || spilled.is_empty(),
+            "a partition with spilled slabs has the file they went to"
+        );
+        let spill = spill_file.map(|file| {
+            Box::new(SpilledPartitionRows {
+                handles: spilled,
+                resident: Vec::new(),
+                file,
+                on_disk: None,
+            })
+        });
         Self {
             rows: rows_in_slabs + bytes_spilled / row_size,
             slab_range,
-            resident_spilled: Vec::new(),
-            spilled,
-            spill_file,
-            on_disk: None,
+            spill,
             row_size,
             _phantom: PhantomData,
         }
+    }
+
+    /// The spilled slabs found resident when the partition was resolved.
+    fn resident_spilled(&self) -> impl Iterator<Item = &PartitionSlab> {
+        self.spill.iter().flat_map(|spill| spill.resident.iter())
     }
 
     /// Settle where the partition's spilled rows are read from, now that the
@@ -249,10 +269,13 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
     /// these rows are dropped; a slab whose buffer was evicted is loaded from
     /// the partition's file.
     pub fn resolve_spilled(&mut self) {
+        let Some(spill) = &mut self.spill else {
+            return;
+        };
         let mut ranges = Vec::new();
-        for handle in self.spilled.drain(..) {
+        for handle in spill.handles.drain(..) {
             match handle.slab.upgrade() {
-                Some(slab) => self.resident_spilled.push(PartitionSlab {
+                Some(slab) => spill.resident.push(PartitionSlab {
                     rows: slab.size() / self.row_size,
                     slab,
                 }),
@@ -263,11 +286,8 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
             }
         }
         if !ranges.is_empty() {
-            self.on_disk = Some(OnDiskRows {
-                file: self
-                    .spill_file
-                    .clone()
-                    .expect("a partition with rows on disk has a spill file"),
+            spill.on_disk = Some(OnDiskRows {
+                file: spill.file.clone(),
                 ranges,
             });
         }
@@ -286,7 +306,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
     /// The rows that have to be loaded from disk before the partition can be
     /// merged, if any.
     pub fn on_disk(&self) -> Option<&OnDiskRows> {
-        self.on_disk.as_ref()
+        self.spill.as_ref()?.on_disk.as_ref()
     }
 
     /// Visits every row in memory, given the partition's slots of the
@@ -300,7 +320,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
         layout: ScatterLayout<V>,
         mut f: impl FnMut(u64, &KP, &V),
     ) {
-        for slab in slabs.iter().flatten().chain(&self.resident_spilled) {
+        for slab in slabs.iter().flatten().chain(self.resident_spilled()) {
             let mut row = slab.slab.as_slice().as_ptr();
             for _ in 0..slab.rows {
                 unsafe {
@@ -385,7 +405,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
         layout: ScatterLayout<V>,
         mut f: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>),
     ) {
-        for slab in slabs.iter().flatten().chain(&self.resident_spilled) {
+        for slab in slabs.iter().flatten().chain(self.resident_spilled()) {
             let mut row = slab.slab.as_slice().as_ptr();
             for i in 0..slab.rows {
                 unsafe {

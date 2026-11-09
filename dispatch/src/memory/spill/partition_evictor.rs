@@ -110,7 +110,12 @@ impl PartitionEvictor {
     /// upgrades for as long as its buffer is resident, and the slab's rows are
     /// at the given offset of the partition's file for when it is not. Slabs
     /// of buffers already evicted come with a handle that no longer upgrades.
+    /// An empty list when nothing spilled, which is the usual case, so a
+    /// flush then builds nothing for it.
     pub fn spilled_slabs_by_partition(&mut self, partitions: usize) -> Vec<Vec<SpilledSlab>> {
+        if self.evicted.is_empty() && self.tree.nodes().iter().all(Vec::is_empty) {
+            return Vec::new();
+        }
         let mut by_partition: Vec<Vec<SpilledSlab>> = (0..partitions).map(|_| Vec::new()).collect();
         let _: ControlFlow<()> = self.tree.walk_spill_order(|_, spilled_buffers| {
             for slab in spilled_buffers.iter().flat_map(|spilled| &spilled.slabs) {
