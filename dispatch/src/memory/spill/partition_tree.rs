@@ -66,6 +66,11 @@ impl<N> PartitionTree<N> {
         &mut self.nodes[node]
     }
 
+    /// Every node, in index order.
+    pub fn nodes(&self) -> &[N] {
+        &self.nodes
+    }
+
     /// Take every node, in index order.
     pub fn into_nodes(self) -> Vec<N> {
         self.nodes.into_vec()

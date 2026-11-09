@@ -18,13 +18,13 @@
 
 use crate::RECORD_BATCH_SIZE;
 use crate::io::IORequesterError;
-use crate::memory::{SharedPartitionEvictor, SlabAllocator, Spiller};
+use crate::memory::{PartitionSlab, SharedPartitionEvictor, SlabAllocator, Spiller};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::HashTable;
 use crate::operations::unary::group::hashtables::{
     AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, PartitionRows, PersistedKey,
-    ScatterLayout, ScatterRows,
+    ScatterLayout, ScatterRows, ScatteredRows,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::topk_pruning::{
@@ -87,6 +87,12 @@ impl RadixConfig {
 /// is a serial tail that grows with the worker count; released per partition,
 /// the teardown spreads over the jobs.
 pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
+    /// Every slab of every bucket, grouped by bucket (see [`ScatteredRows`]).
+    /// A bucket's job reads the bucket's slots through
+    /// [`with_bucket`](Self::with_bucket) and empties them when it releases
+    /// the bucket, so the slabs' memory goes back as each partition merges
+    /// while this one list lives as long as the pool.
+    slabs: Box<[UnsafeCell<Option<PartitionSlab>>]>,
     buckets: Vec<UnsafeCell<Option<PartitionRows<KP, V>>>>,
     /// Rows across every bucket, counted by the flushing worker so the merge
     /// coordinator sums one number per worker rather than walking the
@@ -95,15 +101,18 @@ pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
 }
 
 // SAFETY: the merge partitions tile the bucket range without overlap and each
-// partition has one job per source set, so a bucket is read and then released
-// by exactly one job; no two threads ever access the same cell.
+// partition has one job per source set, so a bucket, and the slab slots of its
+// range, are read and then released by exactly one job; no two threads ever
+// access the same cell.
 unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Sync for PartitionBuffers<KP, V> {}
 
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
-    pub fn new(buckets: Vec<PartitionRows<KP, V>>) -> Self {
-        let total_rows = buckets.iter().map(|bucket| bucket.len()).sum();
+    pub fn new(scattered: ScatteredRows<KP, V>) -> Self {
+        let ScatteredRows { slabs, partitions } = scattered;
+        let total_rows = partitions.iter().map(|bucket| bucket.len()).sum();
         Self {
-            buckets: buckets
+            slabs: slabs.into_iter().map(UnsafeCell::new).collect(),
+            buckets: partitions
                 .into_iter()
                 .map(|bucket| UnsafeCell::new(Some(bucket)))
                 .collect(),
@@ -145,21 +154,41 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
 
     /// Runs `f` over the rows of bucket `index`. A bucket is released only by
     /// the job that merged it, so a bucket being read is still held.
-    pub fn with_bucket<R>(&self, index: usize, f: impl FnOnce(&PartitionRows<KP, V>) -> R) -> R {
-        // SAFETY: only the bucket's own partition job reaches this cell (see
-        // the `Sync` impl), and it releases the bucket only after reading it.
-        let bucket = unsafe { &*self.buckets[index].get() };
-        f(bucket
+    /// Reads bucket `index`: its rows, and its slots of the slab list.
+    pub fn with_bucket<R>(
+        &self,
+        index: usize,
+        f: impl FnOnce(&PartitionRows<KP, V>, &[Option<PartitionSlab>]) -> R,
+    ) -> R {
+        // SAFETY: only the bucket's own partition job reaches this cell and
+        // the slots of the bucket's range (see the `Sync` impl), and it
+        // releases the bucket only after reading it. `UnsafeCell<T>` has the
+        // layout of `T`, so the cells of the range read as a slice of slots.
+        let bucket = unsafe { &*self.buckets[index].get() }
             .as_ref()
-            .expect("a scatter bucket is released only after its partition merged it"))
+            .expect("a scatter bucket is released only after its partition merged it");
+        let range = bucket.slab_range();
+        let slabs = unsafe {
+            std::slice::from_raw_parts(
+                self.slabs.as_ptr().add(range.start) as *const Option<PartitionSlab>,
+                range.len(),
+            )
+        };
+        f(bucket, slabs)
     }
 
-    /// Drops the buckets of `partition` once its merge has read them.
+    /// Drops the buckets of `partition` and their slabs once its merge has
+    /// read them.
     pub fn release_partition(&self, partition: usize, num_partitions: usize) {
         for index in self.bucket_range(partition, num_partitions) {
             // SAFETY: as in `with_bucket`; the releasing job is the reader,
             // and its read has completed.
-            unsafe { *self.buckets[index].get() = None };
+            let bucket = unsafe { &mut *self.buckets[index].get() };
+            if let Some(rows) = bucket.take() {
+                for slot in rows.slab_range() {
+                    unsafe { *self.slabs[slot].get() = None };
+                }
+            }
         }
     }
 }
@@ -682,14 +711,17 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             .evictor
             .borrow_mut()
             .spilled_slabs_by_partition(self.radix_config.partitions);
-        let partition_rows = self
+        let scattered = self
             .buffers
             .map(|buffers| buffers.into_partition_rows(spilled));
-        let raw_scatter_rows = match (&partition_rows, topk_bin_totals.is_some(), self.scatter_raw)
-        {
-            (Some(partitions), true, true) => {
-                Some(partitions.iter().map(|rows| rows.len() as u64).collect())
-            }
+        let raw_scatter_rows = match (&scattered, topk_bin_totals.is_some(), self.scatter_raw) {
+            (Some(scattered), true, true) => Some(
+                scattered
+                    .partitions
+                    .iter()
+                    .map(|rows| rows.len() as u64)
+                    .collect(),
+            ),
             _ => None,
         };
         self.key_arena.flush();
@@ -697,7 +729,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let output = AggregatedTableOutput {
             node: crate::worker::current_node(),
             tables: self.tables,
-            buffers: partition_rows.map(PartitionBuffers::new),
+            buffers: scattered.map(PartitionBuffers::new),
             hll: self.hll,
             has_bin_totals: topk_bin_totals.is_some(),
             raw_scatter_rows,
@@ -983,8 +1015,8 @@ mod tests {
         let mut rows = 0;
         for bucket in 0..buffers.bucket_count() {
             buffers.resolve_spilled(bucket);
-            buffers.with_bucket(bucket, |rows_in_bucket| {
-                rows_in_bucket.for_each(layout, |_, _, _| rows += 1)
+            buffers.with_bucket(bucket, |rows_in_bucket, slabs| {
+                rows_in_bucket.for_each(slabs, layout, |_, _, _| rows += 1)
             });
         }
         assert_eq!(rows, buffers.total_rows());

@@ -23,6 +23,7 @@ use crate::memory::{
 };
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
+use std::ops::Range;
 
 /// Target size of a partition's slabs once it has filled a few, and of the
 /// first one, which is kept small so a partition with a handful of rows wastes
@@ -146,30 +147,43 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
     /// rows still in the allocator, and the partition's spilled slabs as weak
     /// handles (`spilled[partition]`), which the merge resolves when it gets
     /// to the partition.
-    pub fn into_partition_rows(
-        self,
-        mut spilled: Vec<Vec<SpilledSlab>>,
-    ) -> Vec<PartitionRows<KP, V>> {
+    pub fn into_partition_rows(self, mut spilled: Vec<Vec<SpilledSlab>>) -> ScatteredRows<KP, V> {
         assert_eq!(
             spilled.len(),
             self.partition_count,
             "one spilled-slab list per scatter partition"
         );
         let row_size = self.row_size;
-        self.allocator
-            .into_partitions()
+        let (slabs, contents) = self.allocator.into_partitions();
+        let partitions = contents
             .into_iter()
             .enumerate()
             .map(|(partition, contents)| {
+                let rows_in_slabs = slabs[contents.slab_range.clone()]
+                    .iter()
+                    .flatten()
+                    .map(|slab| slab.rows)
+                    .sum();
                 PartitionRows::new(
-                    contents.slabs,
+                    contents.slab_range,
+                    rows_in_slabs,
                     std::mem::take(&mut spilled[partition]),
                     contents.spill_file,
                     row_size,
                 )
             })
-            .collect()
+            .collect();
+        ScatteredRows { slabs, partitions }
     }
+}
+
+/// A worker's scatter rows once it has consumed: every slab it wrote, in one
+/// list grouped by partition, and each partition's rows, which say where in
+/// the list the partition's slabs are. A slot is `None` once its slab has
+/// been released.
+pub struct ScatteredRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
+    pub slabs: Vec<Option<PartitionSlab>>,
+    pub partitions: Vec<PartitionRows<KP, V>>,
 }
 
 /// The rows of one partition that exist only on disk: ranges of the
@@ -180,13 +194,20 @@ pub struct OnDiskRows {
     pub ranges: Vec<FileRange>,
 }
 
-/// One partition's scatter rows, as the merge reads them: the slabs they were
-/// written into, each with how many rows it holds, and the file ranges of the
-/// rows that are only on disk, which the merge loads before it runs.
+/// One partition's scatter rows, as the merge reads them: where its slabs
+/// sit in the worker's slab list (see [`ScatteredRows`]), each slab with how
+/// many rows it holds, and the file ranges of the rows that are only on disk,
+/// which the merge loads before it runs. Holds no heap memory of its own
+/// unless the partition spilled, so releasing it after the merge frees
+/// nothing but the slabs.
 pub struct PartitionRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
-    slabs: Vec<PartitionSlab>,
-    /// The partition's spilled slabs, not yet resolved into `slabs` or
-    /// `on_disk`; see [`resolve_spilled`](Self::resolve_spilled).
+    slab_range: Range<usize>,
+    /// Spilled slabs whose buffers were still resident when the partition
+    /// was resolved, read after the slabs of `slab_range`.
+    resident_spilled: Vec<PartitionSlab>,
+    /// The partition's spilled slabs, not yet resolved into
+    /// `resident_spilled` or `on_disk`; see
+    /// [`resolve_spilled`](Self::resolve_spilled).
     spilled: Vec<SpilledSlab>,
     /// The file the partition's spilled rows went to, if it ever spilled.
     spill_file: Option<OpenFile>,
@@ -203,16 +224,17 @@ unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Sync for PartitionRo
 
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
     fn new(
-        slabs: Vec<PartitionSlab>,
+        slab_range: Range<usize>,
+        rows_in_slabs: usize,
         spilled: Vec<SpilledSlab>,
         spill_file: Option<OpenFile>,
         row_size: usize,
     ) -> Self {
-        let rows_in_allocator: usize = slabs.iter().map(|slab| slab.rows).sum();
         let bytes_spilled: usize = spilled.iter().map(|handle| handle.slab.size()).sum();
         Self {
-            rows: rows_in_allocator + bytes_spilled / row_size,
-            slabs,
+            rows: rows_in_slabs + bytes_spilled / row_size,
+            slab_range,
+            resident_spilled: Vec::new(),
             spilled,
             spill_file,
             on_disk: None,
@@ -230,7 +252,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
         let mut ranges = Vec::new();
         for handle in self.spilled.drain(..) {
             match handle.slab.upgrade() {
-                Some(slab) => self.slabs.push(PartitionSlab {
+                Some(slab) => self.resident_spilled.push(PartitionSlab {
                     rows: slab.size() / self.row_size,
                     slab,
                 }),
@@ -256,17 +278,29 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
         self.rows
     }
 
+    /// Where the partition's slabs sit in the worker's slab list.
+    pub fn slab_range(&self) -> Range<usize> {
+        self.slab_range.clone()
+    }
+
     /// The rows that have to be loaded from disk before the partition can be
     /// merged, if any.
     pub fn on_disk(&self) -> Option<&OnDiskRows> {
         self.on_disk.as_ref()
     }
 
-    /// Visits every row in memory. Rows on disk are visited through
-    /// [`for_each_loaded`](Self::for_each_loaded) once they have been read.
+    /// Visits every row in memory, given the partition's slots of the
+    /// worker's slab list (its [`slab_range`](Self::slab_range)). Rows on
+    /// disk are visited through [`for_each_loaded`](Self::for_each_loaded)
+    /// once they have been read.
     #[inline(always)]
-    pub fn for_each(&self, layout: ScatterLayout<V>, mut f: impl FnMut(u64, &KP, &V)) {
-        for slab in &self.slabs {
+    pub fn for_each(
+        &self,
+        slabs: &[Option<PartitionSlab>],
+        layout: ScatterLayout<V>,
+        mut f: impl FnMut(u64, &KP, &V),
+    ) {
+        for slab in slabs.iter().flatten().chain(&self.resident_spilled) {
             let mut row = slab.slab.as_slice().as_ptr();
             for _ in 0..slab.rows {
                 unsafe {
@@ -342,14 +376,16 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
         }
     }
 
-    /// Visits rows and exposes a future row for software prefetching.
+    /// Visits rows as [`for_each`](Self::for_each) does and exposes a future
+    /// row for software prefetching.
     #[inline(always)]
     pub fn for_each_prefetched<const AHEAD: usize>(
         &self,
+        slabs: &[Option<PartitionSlab>],
         layout: ScatterLayout<V>,
         mut f: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>),
     ) {
-        for slab in &self.slabs {
+        for slab in slabs.iter().flatten().chain(&self.resident_spilled) {
             let mut row = slab.slab.as_slice().as_ptr();
             for i in 0..slab.rows {
                 unsafe {
