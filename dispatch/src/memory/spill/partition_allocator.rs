@@ -619,7 +619,7 @@ impl<L: Layout> PartitionAllocator<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{IORequester, OperatorIO};
+    use crate::io::{DroppedAfterDataFlow, IORequester, OperatorIO};
     use crate::memory::init_test_free_pool;
     use crate::memory::spill::directory;
     use crate::memory::spill::layout::{Dynamic, Fixed};
@@ -636,6 +636,7 @@ mod tests {
         requester: RefCell<IORequester>,
         stats: StatsCollector,
         next_request_id: usize,
+        dropped_after_data_flow: DroppedAfterDataFlow,
     }
 
     impl SpillerParts {
@@ -645,6 +646,7 @@ mod tests {
                 requester: RefCell::new(IORequester::default()),
                 stats: StatsCollector::disabled(),
                 next_request_id: 0,
+                dropped_after_data_flow: Vec::new(),
             }
         }
 
@@ -655,6 +657,7 @@ mod tests {
                 0,
                 &mut self.stats,
                 &mut self.next_request_id,
+                &mut self.dropped_after_data_flow,
             );
             Spiller::new(io)
         }

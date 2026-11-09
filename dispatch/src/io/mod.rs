@@ -43,6 +43,7 @@ pub use backend::RingWakeHandle;
 pub use requester::{Error as IORequesterError, IORequester, RING_SIZE};
 
 mod operator;
+pub(crate) use operator::DroppedAfterDataFlow;
 #[cfg(any(test, feature = "test-util"))]
 pub use operator::TestOperatorIO;
 pub use operator::{

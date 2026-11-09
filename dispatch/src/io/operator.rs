@@ -9,8 +9,13 @@ use super::OpenFile;
 use crate::io::requester::resolve_read_through_cache;
 use crate::memory::FileBytes;
 use bytes::Bytes;
+use std::any::Any;
 use std::cell::RefCell;
 use std::sync::Arc;
+
+/// Values operators handed their dataflow to drop once it has finished on
+/// this worker (see [`OperatorIO::drop_after_data_flow`]).
+pub(crate) type DroppedAfterDataFlow = Vec<Box<dyn Any + Send>>;
 
 /// Identifies one logical read within an operator node.
 ///
@@ -145,6 +150,8 @@ pub struct OperatorIO<'a> {
     /// The dataflow's request-id counter for reads and writes, owned by the
     /// flow so identifiers stay unique across this handle's short lifetimes.
     next_request_id: &'a mut usize,
+    /// The dataflow's list of values to drop once it has finished here.
+    dropped_after_data_flow: &'a mut DroppedAfterDataFlow,
 }
 
 impl<'a> OperatorIO<'a> {
@@ -154,6 +161,7 @@ impl<'a> OperatorIO<'a> {
         operator_idx: crate::Identifier,
         stats: &'a mut crate::stats::StatsCollector,
         next_request_id: &'a mut usize,
+        dropped_after_data_flow: &'a mut DroppedAfterDataFlow,
     ) -> Self {
         Self {
             requester,
@@ -161,7 +169,18 @@ impl<'a> OperatorIO<'a> {
             operator_idx,
             stats,
             next_request_id,
+            dropped_after_data_flow,
         }
+    }
+
+    /// Keep `value` until the dataflow has finished on this worker, and drop
+    /// it then, on this worker. For state whose teardown is slow and that
+    /// nothing needs any more: dropped on the spot it would hold up a worker
+    /// the rest of the query may be waiting for, while here it is dropped
+    /// after the worker has released its output and reported, when nobody
+    /// waits on it.
+    pub fn drop_after_data_flow(&mut self, value: impl Any + Send) {
+        self.dropped_after_data_flow.push(Box::new(value));
     }
 
     pub fn read(
@@ -260,6 +279,7 @@ pub struct TestOperatorIO {
     requester: RefCell<crate::io::IORequester>,
     stats: crate::stats::StatsCollector,
     next_request_id: usize,
+    dropped_after_data_flow: DroppedAfterDataFlow,
     data_flow_id: crate::Identifier,
     operator_idx: crate::Identifier,
 }
@@ -281,6 +301,7 @@ impl TestOperatorIO {
             requester: RefCell::new(crate::io::IORequester::default()),
             stats: crate::stats::StatsCollector::disabled(),
             next_request_id: 0,
+            dropped_after_data_flow: Vec::new(),
             data_flow_id,
             operator_idx,
         }
@@ -293,6 +314,7 @@ impl TestOperatorIO {
             self.operator_idx,
             &mut self.stats,
             &mut self.next_request_id,
+            &mut self.dropped_after_data_flow,
         )
     }
 

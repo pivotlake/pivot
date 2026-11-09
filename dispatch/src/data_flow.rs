@@ -21,7 +21,9 @@
 
 use crate::Identifier;
 use crate::graph::Graph;
-use crate::io::{FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse};
+use crate::io::{
+    DroppedAfterDataFlow, FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse,
+};
 use crate::memory::{DataflowEvict, Evict, Spiller, memory_ctx, spill_directory};
 use crate::operations::{FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
@@ -349,6 +351,12 @@ pub struct DataFlow {
     /// context as evictors (see [`DataflowEvict`]), and so must be unregistered
     /// when it drops. False when no operator declared one.
     registered_evictors: bool,
+    /// Values operators handed over to be dropped once the dataflow has
+    /// finished here (see [`OperatorIO::drop_after_data_flow`]). Declared
+    /// last on purpose: fields drop in declaration order, so the operators'
+    /// channel ends and the stats sender above are released first, and the
+    /// handle sees this worker finished before these are torn down.
+    dropped_after_data_flow: DroppedAfterDataFlow,
 }
 
 impl Debug for DataFlow {
@@ -439,6 +447,7 @@ impl DataFlow {
             #[cfg(feature = "perf")]
             profiled: false,
             registered_evictors,
+            dropped_after_data_flow: Vec::new(),
         }
     }
     pub fn id(&self) -> Identifier {
@@ -591,10 +600,17 @@ impl DataFlow {
             let data_flow_id = d.id;
             let stats = &mut d.stats;
             let next_request_id = &mut d.next_request_id;
+            let dropped_after_data_flow = &mut d.dropped_after_data_flow;
             let node = d.graph.node_mut(node_id);
             if let Some(operator) = node.operator.as_deref_mut() {
-                let mut io =
-                    OperatorIO::new(requester, data_flow_id, node.id, stats, next_request_id);
+                let mut io = OperatorIO::new(
+                    requester,
+                    data_flow_id,
+                    node.id,
+                    stats,
+                    next_request_id,
+                    dropped_after_data_flow,
+                );
                 operator.process_read_response(&mut io, response)?;
             }
             Ok(())
@@ -634,7 +650,14 @@ impl DataFlow {
     /// Returns [`WorkStatus::Ran`] if any operator did work.
     pub fn run_ready_cpu_work(&mut self, requester: &RefCell<IORequester>) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
-            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
+            let mut io = OperatorIO::new(
+                requester,
+                d.id,
+                0,
+                &mut d.stats,
+                &mut d.next_request_id,
+                &mut d.dropped_after_data_flow,
+            );
             d.graph
                 .traverse_backwards(|node_id, operator| {
                     io.set_operator_idx(node_id);
@@ -657,7 +680,14 @@ impl DataFlow {
     pub fn spill(&mut self, requester: &RefCell<IORequester>, count: usize) -> usize {
         self.try_run_or(0, |d| {
             d.graph.may_have_spill_files_on_this_worker = true;
-            let io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
+            let io = OperatorIO::new(
+                requester,
+                d.id,
+                0,
+                &mut d.stats,
+                &mut d.next_request_id,
+                &mut d.dropped_after_data_flow,
+            );
             let mut spiller = Spiller::new(io);
             // The walk stops once the count is met; only the count matters here.
             let _: ControlFlow<()> = d.graph.traverse_backwards(|node_id, operator| {
@@ -678,7 +708,14 @@ impl DataFlow {
     /// so the original worker's downstream data stays hot).
     pub fn try_stealing_work(&mut self, requester: &RefCell<IORequester>) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
-            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
+            let mut io = OperatorIO::new(
+                requester,
+                d.id,
+                0,
+                &mut d.stats,
+                &mut d.next_request_id,
+                &mut d.dropped_after_data_flow,
+            );
             d.graph
                 .traverse_forwards(|node_id, operator| {
                     io.set_operator_idx(node_id);
@@ -889,6 +926,75 @@ mod tests {
         drop(flow);
 
         assert!(!directory.exists());
+    }
+
+    /// Records, when dropped, whether the dataflow's stats sender was already
+    /// gone, which is how the handle learns that a worker has finished.
+    struct RecordsStatsSenderOnDrop {
+        stats_rx: mpsc::Receiver<DataFlowStats>,
+        sender_gone_at_drop: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl Drop for RecordsStatsSenderOnDrop {
+        fn drop(&mut self) {
+            let sender_gone = matches!(
+                self.stats_rx.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            );
+            *self.sender_gone_at_drop.lock().unwrap() = Some(sender_gone);
+        }
+    }
+
+    /// Hands its value to the dataflow on its first run.
+    struct HandOverOperator(Option<RecordsStatsSenderOnDrop>);
+    impl Operator for HandOverOperator {
+        fn run_cpu_work(&mut self, io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
+            if let Some(value) = self.0.take() {
+                io.drop_after_data_flow(value);
+            }
+            Ok(WorkStatus::Ran)
+        }
+        fn process_fs_write_response(
+            &mut self,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
+            Ok(FinishStatus::Pending)
+        }
+    }
+
+    #[test]
+    fn a_value_handed_to_the_dataflow_is_dropped_after_its_stats_sender() {
+        let (err_tx, _err_rx) = mpsc::channel();
+        let (stats_tx, stats_rx) = mpsc::channel();
+        let sender_gone_at_drop = Arc::new(Mutex::new(None));
+        let mut flow = DataFlow::new(
+            9_000_012,
+            Arc::new(AtomicBool::new(false)),
+            err_tx,
+            vec![Box::new(HandOverOperator(Some(RecordsStatsSenderOnDrop {
+                stats_rx,
+                sender_gone_at_drop: sender_gone_at_drop.clone(),
+            })))],
+            vec![None],
+            Vec::new(),
+            HashMap::default(),
+            stats_tx,
+            false,
+        );
+        flow.run_ready_cpu_work(&RefCell::new(IORequester::default()));
+
+        drop(flow);
+
+        assert_eq!(*sender_gone_at_drop.lock().unwrap(), Some(true));
     }
 
     struct CountingOperator(Arc<AtomicUsize>);

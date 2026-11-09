@@ -1,5 +1,6 @@
 //! One partition's merge work and the state every partition job shares.
 
+use crate::OperatorIO;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
@@ -87,10 +88,9 @@ pub(super) struct SharedMergeState<K: KeyExtractor, V: AggregationValue + ?Sized
 pub(super) struct ReleasedJobs(AtomicUsize);
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> Drop for SharedMergeState<K, V> {
-    /// The job that finishes last drops this on its worker, while the query
-    /// waits for that worker. Every job has released its partition's buckets
-    /// by then unless the merge was abandoned, so the sources' bucket lists
-    /// hold nothing and are let go of unvisited.
+    /// Every job has released its partition's buckets by the time the last
+    /// one lets go of this, unless the merge was abandoned, so the sources'
+    /// bucket lists hold nothing and are let go of unvisited.
     fn drop(&mut self) {
         let job_count = self.num_partitions * self.sources.len();
         if *self.released_jobs.0.get_mut() != job_count {
@@ -285,14 +285,30 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         acc: &mut Option<OutputAccumulator<K, V>>,
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
+        io: &mut OperatorIO,
     ) -> Result<()> {
         self.release_buckets();
-        self.emit(result, acc, sender, allocator)
+        let emitted = self.emit(result, acc, sender, allocator);
+        self.release_shared_state(io);
+        emitted
     }
 
     /// Let go of a pruned partition's scatter buckets without merging it.
-    pub(super) fn skip(self) {
+    pub(super) fn skip(self, io: &mut OperatorIO) {
         self.release_buckets();
+        self.release_shared_state(io);
+    }
+
+    /// Give up this job's hold on the shared state. The job that finishes
+    /// last holds the only one left, and its worker is the one the rest of
+    /// the query waits for: its last batch is still to be flushed and every
+    /// stage downstream to finish. Dropping the state there, with every
+    /// worker's tables and lists in it, would stall all of that, so the state
+    /// is handed to the dataflow to drop once it has finished on this worker.
+    fn release_shared_state(self, io: &mut OperatorIO) {
+        if let Some(shared) = Arc::into_inner(self.shared) {
+            io.drop_after_data_flow(shared);
+        }
     }
 
     /// Drop the partition's scatter buckets on this node. Each job frees its

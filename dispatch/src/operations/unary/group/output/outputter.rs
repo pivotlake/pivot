@@ -438,12 +438,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         &mut self,
         running: RunningPartitionMerge<K, V>,
         sender: &mut dyn Sender<RecordBatch>,
+        io: &mut OperatorIO,
     ) -> unary::Result<()> {
         let (job, table) = running.into_job_and_table();
         let allocator = self
             .output_allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
-        job.finish(table, &mut self.output_accumulator, sender, allocator)
+        job.finish(table, &mut self.output_accumulator, sender, allocator, io)
             .map_err(unary::Error::from)
     }
 }
@@ -479,7 +480,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
                 break;
             };
             if job.is_pruned() {
-                job.skip();
+                job.skip(io);
                 continue;
             }
             let running = RunningPartitionMerge::start(job, io)?;
@@ -499,7 +500,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
                 .running_merges
                 .remove(complete)
                 .expect("the position was found in the running jobs just above");
-            self.finish_job(running, sender)?;
+            self.finish_job(running, sender, io)?;
             return Ok(OutputStatus::Working);
         }
         if !self.running_merges.is_empty() {

@@ -177,12 +177,14 @@ mod tests {
         let requester = RefCell::new(IORequester::default());
         let mut stats = StatsCollector::disabled();
         let mut next_request_id = 0;
+        let mut dropped_after_data_flow = Vec::new();
         let io = OperatorIO::new(
             &requester,
             dataflow,
             operator,
             &mut stats,
             &mut next_request_id,
+            &mut dropped_after_data_flow,
         );
         let mut spiller = Spiller::new(io);
         // Three 1KB slabs of one buffer: two for partition 5, one for partition 9.
@@ -267,12 +269,14 @@ mod tests {
         let requester = RefCell::new(IORequester::default());
         let mut stats = StatsCollector::disabled();
         let mut next_request_id = 0;
+        let mut dropped_after_data_flow = Vec::new();
         let io = OperatorIO::new(
             &requester,
             dataflow,
             operator,
             &mut stats,
             &mut next_request_id,
+            &mut dropped_after_data_flow,
         );
         let spiller = Spiller::new(io);
 
