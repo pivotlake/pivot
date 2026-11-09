@@ -289,6 +289,9 @@ impl Worker {
     /// exhaustion rather than at it. Runs before CPU work so the slots that
     /// work will allocate are already on their way back.
     fn maybe_spill(&mut self) {
+        if !memory_ctx().is_pressure_check_due() {
+            return;
+        }
         let mut wanted = memory_ctx().slots_to_spill();
         if wanted == 0 {
             return;

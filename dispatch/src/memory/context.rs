@@ -14,7 +14,7 @@ use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Share of a node's ring slots that spilling brings the reserve back up to.
 /// The reserve is what eviction can take back without waiting on a write:
@@ -81,6 +81,16 @@ pub fn has_memory_context() -> bool {
     MEMORY_CTX_PTR.with(|p| !p.get().is_null())
 }
 
+/// Whether a node is short of reclaimable slots, as the last worker to count
+/// them found it. Every worker of the node reads this on every loop
+/// iteration, so it has a cache line to itself and is written only when the
+/// answer changes: unlike the counts it is derived from, which every buffer
+/// pop, push and cache bind writes, it stays in every reader's cache.
+#[repr(align(128))]
+struct NodeSpillPressure {
+    is_short_of_reclaimable_slots: AtomicBool,
+}
+
 /// The in-flight write count of each spilled buffer that one spill write
 /// carries rows of.
 type BuffersWritesInFlight = Vec<Arc<AtomicUsize>>;
@@ -94,6 +104,7 @@ pub struct MemoryContextFactory {
     zeroed_pool_factory: PoolFactory,
 
     buffers_spilled: Arc<[AtomicUsize]>,
+    spill_pressure: Arc<[NodeSpillPressure]>,
     layout: RingLayout,
     node: usize,
 }
@@ -124,6 +135,11 @@ impl MemoryContextFactory {
         let buffers_spilled: Arc<[AtomicUsize]> = (0..topology.node_count)
             .map(|_| AtomicUsize::new(0))
             .collect();
+        let spill_pressure: Arc<[NodeSpillPressure]> = (0..topology.node_count)
+            .map(|_| NodeSpillPressure {
+                is_short_of_reclaimable_slots: AtomicBool::new(false),
+            })
+            .collect();
 
         zeroed_pool_factories
             .into_iter()
@@ -137,6 +153,7 @@ impl MemoryContextFactory {
                 dirty_pool_factory,
                 zeroed_pool_factory,
                 buffers_spilled: buffers_spilled.clone(),
+                spill_pressure: spill_pressure.clone(),
                 layout,
                 node: topology.node_of_worker(worker),
             })
@@ -163,9 +180,11 @@ impl MemoryContextFactory {
             evictors: RefCell::new(HashMap::new()),
             buffers_spilled: self.buffers_spilled,
             own_buffers_spilled: Cell::new(0),
+            spill_pressure: self.spill_pressure,
             io_requester: OnceCell::new(),
             spill_writes_in_flight: RefCell::new(HashMap::new()),
             node: self.node,
+            took_buffer_since_pressure_check: Cell::new(false),
         }
     }
 }
@@ -202,6 +221,10 @@ pub struct MemoryContext {
     /// holds. Only this worker's eviction can take those back, so they are
     /// what tells one worker's need to spill apart from its siblings'.
     own_buffers_spilled: Cell<usize>,
+    /// Per node, whether the last worker to count the node's reclaimable
+    /// slots found it short of them. A worker that took no buffer reads only
+    /// this to learn that its siblings have run the node short.
+    spill_pressure: Arc<[NodeSpillPressure]>,
     /// The worker's IO requester, attached once the worker has built it, so
     /// that eviction can wait for spill writes to land when nothing else can
     /// be reclaimed. Shared with the worker, which drives it.
@@ -214,6 +237,11 @@ pub struct MemoryContext {
     spill_writes_in_flight: RefCell<HashMap<(Identifier, WriteRequestId), BuffersWritesInFlight>>,
     /// This worker's NUMA node, i.e. the ring region it allocates and evicts from.
     node: usize,
+    /// Whether this worker took a buffer since it last counted the node's
+    /// reclaimable slots. The node runs short only by a buffer being taken,
+    /// so the workers that take them are the ones that count, and they tell
+    /// the rest through `spill_pressure`.
+    took_buffer_since_pressure_check: Cell<bool>,
 }
 
 impl MemoryContext {
@@ -367,7 +395,10 @@ impl MemoryContext {
                     "pooled slot {idx} still owned by a cache",
                 );
                 match memory_ctx().ring().try_write(idx) {
-                    Some(buffer) => return buffer,
+                    Some(buffer) => {
+                        self.note_buffer_taken();
+                        return buffer;
+                    }
                     None => {
                         // Try again with a fresh idx, we don't want to start
                         // evicting yet.
@@ -381,6 +412,7 @@ impl MemoryContext {
             // contenders hold slots only transiently), then hand the rest back
             // so peers can pop them while this worker is busy evicting.
             if let Some(buffer) = contended.pop_writable() {
+                self.note_buffer_taken();
                 return buffer;
             }
             contended.release();
@@ -388,7 +420,37 @@ impl MemoryContext {
             // Evict via the shared clock, which takes from whichever tier is
             // over its target share (decompressed, in the common case of a
             // large decompressed working set).
-            return self.evict();
+            let evicted = self.evict();
+            self.note_buffer_taken();
+            return evicted;
+        }
+    }
+
+    fn note_buffer_taken(&self) {
+        self.took_buffer_since_pressure_check.set(true);
+    }
+
+    /// Whether this worker should count its node's reclaimable slots now
+    /// (see [`slots_to_spill`](Self::slots_to_spill)): it took a buffer since
+    /// the last call, so the node may have just run short, or a worker of the
+    /// node already found it short. A worker that took nothing still has to
+    /// count while the node is short, because the rows it holds may be the
+    /// only ones on the node that can be spilled. Otherwise the count is
+    /// skipped, and with it the reads of lines its siblings keep writing.
+    pub fn is_pressure_check_due(&self) -> bool {
+        let took_buffer = self.took_buffer_since_pressure_check.replace(false);
+        took_buffer
+            || self.spill_pressure[self.node]
+                .is_short_of_reclaimable_slots
+                .load(Ordering::Relaxed)
+    }
+
+    /// Tell the node's workers whether the node is short of reclaimable
+    /// slots, writing only when that changed.
+    fn publish_spill_pressure(&self, is_short: bool) {
+        let published = &self.spill_pressure[self.node].is_short_of_reclaimable_slots;
+        if published.load(Ordering::Relaxed) != is_short {
+            published.store(is_short, Ordering::Relaxed);
         }
     }
 
@@ -551,6 +613,10 @@ impl MemoryContext {
     /// are read at slightly different instants while peers allocate and
     /// release, so the result is approximate by a few slots, which a watermark
     /// tolerates.
+    ///
+    /// Whether the node as a whole is short is published to its other workers
+    /// (see [`is_pressure_check_due`](Self::is_pressure_check_due)). That
+    /// leaves out this worker's own spilled slots, which only it can count.
     pub fn slots_to_spill(&self) -> usize {
         let free = self.dirty_pool.free_slots() + self.zeroed_pool.free_slots();
         let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
@@ -559,7 +625,9 @@ impl MemoryContext {
         let slots = self.layout.node_slots(self.node).len();
         let start = slots * get_reclaimable_slots_start_percent() / 100;
         let target = slots * get_reclaimable_slots_target_percent() / 100;
-        let reclaimable = free + cached + spilled + self.own_buffers_spilled.get();
+        let node_reclaimable = free + cached + spilled;
+        self.publish_spill_pressure(node_reclaimable < start);
+        let reclaimable = node_reclaimable + self.own_buffers_spilled.get();
         if reclaimable >= start {
             return 0;
         }
@@ -912,6 +980,72 @@ mod tests {
         let shortfall = memory_ctx().slots_to_spill();
 
         assert_eq!(shortfall, 0);
+    }
+
+    #[test]
+    fn a_pressure_check_is_due_once_after_a_buffer_is_taken() {
+        init_test_free_pool(64);
+
+        let before_taking = memory_ctx().is_pressure_check_due();
+        let buffer = memory_ctx().get_write_buffer(false);
+        let after_taking = memory_ctx().is_pressure_check_due();
+        let without_taking_again = memory_ctx().is_pressure_check_due();
+        drop(buffer);
+
+        assert_eq!(
+            [before_taking, after_taking, without_taking_again],
+            [false, true, false]
+        );
+    }
+
+    #[test]
+    fn a_pressure_check_stays_due_while_the_node_is_short_of_reclaimable_slots() {
+        // 128 slots, so spilling starts under 12 reclaimable; 30 are free
+        // until 20 are taken.
+        init_test_free_pool(30);
+        let held: Vec<_> = (0..20)
+            .map(|_| memory_ctx().get_write_buffer(false))
+            .collect();
+        memory_ctx().is_pressure_check_due();
+
+        memory_ctx().slots_to_spill();
+        let while_short = memory_ctx().is_pressure_check_due();
+        drop(held);
+        memory_ctx().slots_to_spill();
+        let after_release = memory_ctx().is_pressure_check_due();
+
+        assert_eq!([while_short, after_release], [true, false]);
+    }
+
+    #[test]
+    fn a_worker_that_took_no_buffer_checks_once_a_sibling_finds_the_node_short() {
+        // Two workers on one node of 128 slots, none of them free.
+        WORKER_IDX.set(0);
+        crate::worker::NUM_WORKERS.set(2);
+        crate::waker::install_test_worker_waker();
+        let mut factories = MemoryContextFactory::create_many(2, 128);
+        let (ask_sibling_to_count, sibling_asked) = std::sync::mpsc::channel::<()>();
+        let (report_built, sibling_built) = std::sync::mpsc::channel::<()>();
+        let sibling_factory = factories.pop().unwrap();
+        let sibling = std::thread::spawn(move || {
+            WORKER_IDX.set(1);
+            let sibling_ctx = sibling_factory.create_memory_ctx();
+            report_built.send(()).unwrap();
+            sibling_asked.recv().unwrap();
+            sibling_ctx.slots_to_spill();
+        });
+        init_memory_context(factories.pop().unwrap().create_memory_ctx());
+        sibling_built.recv().unwrap();
+
+        let before_sibling_counted = memory_ctx().is_pressure_check_due();
+        ask_sibling_to_count.send(()).unwrap();
+        sibling.join().unwrap();
+        let after_sibling_counted = memory_ctx().is_pressure_check_due();
+
+        assert_eq!(
+            [before_sibling_counted, after_sibling_counted],
+            [false, true]
+        );
     }
 
     #[test]
