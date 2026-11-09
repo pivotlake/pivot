@@ -121,8 +121,9 @@ multitarget_kernel! {
         for worker_buffers in buffers {
             for bucket in worker_buffers.bucket_range(partition, num_partitions) {
                 if merge_prefetch {
-                    worker_buffers.with_bucket(bucket, |rows| {
+                    worker_buffers.with_bucket(bucket, |rows, slabs| {
                         rows.for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
+                            slabs,
                             scatter_layout,
                             |hash, key, stored, ahead| {
                                 if !topk_admits(cutoff, hash) {
@@ -137,8 +138,8 @@ multitarget_kernel! {
                         )
                     });
                 } else {
-                    worker_buffers.with_bucket(bucket, |rows| {
-                        rows.for_each(scatter_layout, |hash, key, stored| {
+                    worker_buffers.with_bucket(bucket, |rows, slabs| {
+                        rows.for_each(slabs, scatter_layout, |hash, key, stored| {
                             if !topk_admits(cutoff, hash) {
                                 return;
                             }

@@ -76,7 +76,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
             for bucket in worker_buffers.bucket_range(job.index, shared.num_partitions) {
                 worker_buffers.resolve_spilled(bucket);
                 let Some(on_disk) =
-                    worker_buffers.with_bucket(bucket, |rows| rows.on_disk().cloned())
+                    worker_buffers.with_bucket(bucket, |rows, _| rows.on_disk().cloned())
                 else {
                     continue;
                 };
