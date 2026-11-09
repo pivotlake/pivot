@@ -13,7 +13,7 @@
 //! open slab is the only other holder, so a buffer referenced by exactly its
 //! closed slabs and the allocator's own record has no open slab left.
 
-use crate::io::{IORequesterError, OpenFile};
+use crate::io::{IORequesterError, LocalFile};
 use crate::memory::spill::layout::Layout;
 use crate::memory::spill::partition_tree::{
     PARTITIONS, PartitionTree, group_of_partition, is_leaf,
@@ -57,7 +57,7 @@ struct Partition {
     slabs_filled: usize,
     /// The file this partition's spilled rows are appended to, once it has
     /// spilled for the first time.
-    spill_file: Option<OpenFile>,
+    spill_file: Option<LocalFile>,
     /// Bytes appended to the spill file so far, which is where the next
     /// spilled slab's rows will begin in it.
     bytes_spilled: u64,
@@ -229,7 +229,7 @@ pub struct PartitionSlab {
 /// if it ever spilled.
 pub struct PartitionContents {
     pub slabs: Vec<PartitionSlab>,
-    pub spill_file: Option<OpenFile>,
+    pub spill_file: Option<LocalFile>,
 }
 
 /// Stores rows by partition, in slabs allocated from buffers the partitions

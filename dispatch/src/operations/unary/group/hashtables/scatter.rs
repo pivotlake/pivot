@@ -17,9 +17,10 @@
 //! merge reads.
 
 use super::hash_table::{PersistedKey, entry_layout};
-use crate::io::{FileRange, IORequesterError, OpenFile, ReadData};
+use crate::io::{FileRange, IORequesterError, LocalFile, ReadData};
 use crate::memory::{
-    Dynamic, PARTITIONS, PartitionAllocator, PartitionSlab, SpilledBuffer, SpilledSlab, Spiller,
+    BUFFER_SIZE, Dynamic, PARTITIONS, PartitionAllocator, PartitionSlab, SpilledBuffer,
+    SpilledSlab, Spiller,
 };
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
@@ -93,6 +94,7 @@ pub struct ScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     /// [`PARTITIONS`], of which only the first this many are used.
     partition_count: usize,
     row_size: usize,
+    row_align: usize,
     // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
     _phantom: PhantomData<(KP, *const V)>,
 }
@@ -112,6 +114,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
             )),
             partition_count,
             row_size: layout.stride,
+            row_align: layout.align,
             _phantom: PhantomData,
         }
     }
@@ -157,6 +160,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
         mut spilled: Vec<Vec<SpilledSlab>>,
     ) -> Vec<PartitionRows<KP, V>> {
         let row_size = self.row_size;
+        let row_align = self.row_align;
         self.allocator
             .into_partitions()
             .into_iter()
@@ -168,6 +172,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
                     std::mem::take(&mut spilled[partition]),
                     contents.spill_file,
                     row_size,
+                    row_align,
                 )
             })
             .collect()
@@ -175,11 +180,35 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
 }
 
 /// The rows of one partition that exist only on disk: ranges of the
-/// partition's spill file, each holding whole rows back to back.
+/// partition's spill file, each holding whole rows back to back and no
+/// longer than a ring buffer, so that one slab takes it.
 #[derive(Clone)]
 pub struct OnDiskRows {
-    pub file: OpenFile,
+    pub file: LocalFile,
     pub ranges: Vec<FileRange>,
+    /// The alignment memory must have for a range read into it to be read
+    /// as rows in place.
+    pub row_align: usize,
+}
+
+/// Join ranges that follow one another in the file into single ranges of at
+/// most `longest` bytes each, so that what was written as many slabs is read
+/// back in as few reads as the bytes allow. No range is split: one joined
+/// range holds whole input ranges.
+fn join_adjacent_ranges(mut ranges: Vec<FileRange>, longest: usize) -> Vec<FileRange> {
+    ranges.sort_unstable_by_key(|range| range.offset);
+    let mut joined: Vec<FileRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match joined.last_mut() {
+            Some(last)
+                if last.offset + last.len == range.offset && last.len + range.len <= longest =>
+            {
+                last.len += range.len;
+            }
+            _ => joined.push(range),
+        }
+    }
+    joined
 }
 
 /// One partition's scatter rows, as the merge reads them: the slabs they were
@@ -191,11 +220,12 @@ pub struct PartitionRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     /// `on_disk`; see [`resolve_spilled`](Self::resolve_spilled).
     spilled: Vec<SpilledSlab>,
     /// The file the partition's spilled rows went to, if it ever spilled.
-    spill_file: Option<OpenFile>,
+    spill_file: Option<LocalFile>,
     on_disk: Option<OnDiskRows>,
     /// Rows in memory and on disk together.
     rows: usize,
     row_size: usize,
+    row_align: usize,
     _phantom: PhantomData<(KP, *const V)>,
 }
 
@@ -207,8 +237,9 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
     fn new(
         slabs: Vec<PartitionSlab>,
         spilled: Vec<SpilledSlab>,
-        spill_file: Option<OpenFile>,
+        spill_file: Option<LocalFile>,
         row_size: usize,
+        row_align: usize,
     ) -> Self {
         let rows_in_allocator: usize = slabs.iter().map(|slab| slab.rows).sum();
         let bytes_spilled: usize = spilled.iter().map(|handle| handle.slab.size()).sum();
@@ -219,6 +250,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
             spill_file,
             on_disk: None,
             row_size,
+            row_align,
             _phantom: PhantomData,
         }
     }
@@ -227,7 +259,9 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
     /// merge is about to read them: a slab whose buffer is still resident is
     /// read from memory, and holding the upgraded handle keeps it there until
     /// these rows are dropped; a slab whose buffer was evicted is loaded from
-    /// the partition's file.
+    /// the partition's file. A partition's slabs were appended to its file
+    /// one after another, so evicted slabs that are neighbours there are
+    /// loaded as one range.
     pub fn resolve_spilled(&mut self) {
         let mut ranges = Vec::new();
         for handle in self.spilled.drain(..) {
@@ -248,7 +282,8 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
                     .spill_file
                     .clone()
                     .expect("a partition with rows on disk has a spill file"),
-                ranges,
+                ranges: join_adjacent_ranges(ranges, BUFFER_SIZE),
+                row_align: self.row_align,
             });
         }
     }
@@ -384,6 +419,28 @@ mod tests {
     use bytes::Bytes;
 
     type CountValue = Compiled<(CountSlot,), u8>;
+
+    #[test]
+    fn ranges_that_follow_one_another_are_joined_up_to_the_longest_allowed() {
+        let ranges = vec![
+            FileRange::new(300, 50),
+            FileRange::new(0, 100),
+            FileRange::new(100, 100),
+            FileRange::new(200, 100),
+            FileRange::new(400, 10),
+        ];
+
+        let joined = join_adjacent_ranges(ranges, 250);
+
+        assert_eq!(
+            joined,
+            [
+                FileRange::new(0, 200),
+                FileRange::new(200, 150),
+                FileRange::new(400, 10)
+            ]
+        );
+    }
 
     /// Rows of `hash | key | count` as they would be read back from a spill
     /// file: `rows` of them, cut into pieces at `cuts`.

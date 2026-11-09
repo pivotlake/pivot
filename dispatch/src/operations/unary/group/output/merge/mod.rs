@@ -28,7 +28,7 @@ use read_rows::merge_read_rows;
 use scatter_rows::merge_scatter_rows;
 use tables::merge_tables;
 
-use crate::io::{OperatorIO, ReadData, ReadRequestId};
+use crate::io::{OperatorIO, ReadData, ReadRequestId, SlabRead};
 use crate::memory::SlabAllocator;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
@@ -41,9 +41,13 @@ use crate::operations::unary::group::output::partition_job::PartitionJob;
 /// land.
 pub(super) struct RunningPartitionMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
     pub(super) job: PartitionJob<K, V>,
-    /// The reads still in flight, by id, each with the bytes it brings. A
-    /// read's rows are merged into `table` as it lands.
-    pub(super) reads_in_flight: ahash::HashMap<ReadRequestId, usize>,
+    /// The reads still in flight. A read's rows are merged into `table` as
+    /// it lands.
+    pub(super) reads_in_flight: ahash::HashSet<ReadRequestId>,
+    /// Where the rows read back from disk land, if the job reads any. Apart
+    /// from `allocator` because these rows are dropped as soon as they are
+    /// merged, long before the table is.
+    read_allocator: Option<SlabAllocator>,
     /// The partition's result so far. The rows in memory go in when the job
     /// starts, the rows read back from disk as each read lands. The table
     /// grows out of `allocator`, and `capacity` is its slot count as it does.
@@ -59,7 +63,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
     pub(super) fn start(job: PartitionJob<K, V>, io: &mut OperatorIO) -> unary::Result<Self> {
         let shared = job.shared.clone();
         let (buffers, tables) = &shared.sources[job.node];
-        let mut reads_in_flight = ahash::HashMap::default();
+        let mut reads_in_flight = ahash::HashSet::default();
+        let mut read_allocator: Option<SlabAllocator> = None;
         for worker_buffers in buffers {
             for bucket in worker_buffers.bucket_range(job.index, shared.num_partitions) {
                 worker_buffers.resolve_spilled(bucket);
@@ -68,9 +73,16 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
                 else {
                     continue;
                 };
-                let bytes = on_disk.ranges.iter().map(|range| range.len).sum::<usize>();
-                let read = io.read(on_disk.file, on_disk.ranges)?;
-                reads_in_flight.insert(read, bytes);
+                let allocator = read_allocator.get_or_insert_with(|| SlabAllocator::new(false));
+                let reads = on_disk
+                    .ranges
+                    .iter()
+                    .map(|range| SlabRead {
+                        offset: range.offset,
+                        slab: allocator.get_aligned_slab(range.len, on_disk.row_align, false),
+                    })
+                    .collect();
+                reads_in_flight.insert(io.read_direct(on_disk.file, reads)?);
             }
         }
 
@@ -86,6 +98,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
         let mut running = Self {
             job,
             reads_in_flight,
+            read_allocator,
             allocator,
             table,
             capacity,
@@ -128,11 +141,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
         );
     }
 
-    /// Memory this job holds: its result table, in whole ring buffers, and
-    /// the bytes of its reads still in flight, which land in cache slots and
-    /// are released as soon as they are merged.
+    /// Memory this job holds, in whole ring buffers: its result table, and
+    /// the rows it reads back from disk, which are released as they are
+    /// merged.
     pub(super) fn memory_bytes(&self) -> usize {
-        self.allocator.bytes_held() + self.reads_in_flight.values().sum::<usize>()
+        self.allocator.bytes_held()
+            + self
+                .read_allocator
+                .as_ref()
+                .map_or(0, SlabAllocator::bytes_held)
     }
 
     /// Take a finished merge apart into its job and its result table, letting
@@ -148,12 +165,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
             table,
             allocator,
             reads_in_flight,
+            read_allocator,
             capacity: _,
         } = self;
         debug_assert!(
             reads_in_flight.is_empty(),
             "a merge is taken apart only once every read of its rows has landed"
         );
+        drop(read_allocator);
         drop(allocator);
         (job, table)
     }

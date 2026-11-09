@@ -29,7 +29,7 @@ pub use partition_tree::PARTITIONS;
 
 /// One partition's rows from a sealed buffer, going to its file as one write.
 pub struct SpillWrite {
-    file: OpenFile,
+    file: LocalFile,
     /// Where in the file the rows go: right after everything the partition
     /// spilled before.
     offset: u64,
@@ -91,7 +91,7 @@ impl<'a> Spiller<'a> {
     /// partition's file is created once; a second call for the same partition
     /// fails. Each write names where in the file it goes, so the file grows
     /// the same way on every platform.
-    pub fn open_spill_file(&self, spill_partition_id: usize) -> std::io::Result<OpenFile> {
+    pub fn open_spill_file(&self, spill_partition_id: usize) -> std::io::Result<LocalFile> {
         let path = directory::partition_file_path(
             self.io.data_flow_id(),
             WORKER_IDX.get(),
@@ -107,7 +107,7 @@ impl<'a> Spiller<'a> {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        Ok(OpenFile::Local(LocalFile::new(file)?))
+        LocalFile::new(file)
     }
 
     pub(crate) fn set_operator_idx(&mut self, operator_idx: crate::Identifier) {
@@ -119,7 +119,9 @@ impl<'a> Spiller<'a> {
     pub fn spill(&mut self, writes: Vec<SpillWrite>) -> Result<Arc<AtomicUsize>, IORequesterError> {
         let writes_in_flight = Arc::new(AtomicUsize::new(writes.len()));
         for SpillWrite { file, offset, rows } in writes {
-            let write_id = self.io.write_spill(file, offset, Arc::new(rows))?;
+            let write_id = self
+                .io
+                .write_spill(OpenFile::Local(file), offset, Arc::new(rows))?;
             memory_ctx().record_spill_write_issued(
                 self.io.data_flow_id(),
                 write_id,
