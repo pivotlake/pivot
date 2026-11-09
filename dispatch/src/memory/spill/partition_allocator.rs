@@ -19,12 +19,132 @@ use crate::memory::spill::partition_tree::{
     PARTITIONS, PartitionTree, group_of_partition, is_leaf,
 };
 use crate::memory::spill::{
-    SPILL_BLOCK_SIZE, SpillWrite, SpilledBuffer, SpilledSlab, Spiller, padded_to_spill_block,
+    SPILL_BLOCK_SIZE, SpillCodec, SpillWrite, SpilledBuffer, SpilledSlab, Spiller, get_spill_codec,
+    padded_to_spill_block,
 };
 use crate::memory::{BUFFER_SIZE, FileBytes, FrozenSlab, Slab, WriteBuffer, memory_ctx};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+thread_local! {
+    /// Where a worker compresses the slabs of one write before it knows how
+    /// much ring memory they need.
+    static COMPRESSED_ROWS_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many ring buffers a worker's operator keeps for compressed rows on
+/// their way to disk (`PIVOT_SPILL_COMPRESSION_BUFFERS`).
+fn get_compressed_rows_buffer_count() -> usize {
+    static BUFFER_COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::env::get_tunable(
+        &BUFFER_COUNT,
+        "PIVOT_SPILL_COMPRESSION_BUFFERS",
+        32,
+        |count| count >= 2,
+    )
+}
+
+/// The ring buffers compressed rows are copied into and written from.
+///
+/// Compressing rows takes memory for the result, and rows are spilled when
+/// memory has run out. So the buffers are taken once, when rows are first
+/// spilled and the reserve still has memory to give, and are then kept: a
+/// buffer is filled from its start again as soon as every write out of it has
+/// landed. How much can be spilled at once is bounded by the buffers that are
+/// free, which also bounds the compressed rows in flight.
+struct CompressedRowsBuffers {
+    buffers: Vec<CompressedRowsBuffer>,
+}
+
+struct CompressedRowsBuffer {
+    buffer: Arc<WriteBuffer>,
+    /// Bytes handed out from the buffer's start since it was last empty.
+    taken: usize,
+}
+
+impl CompressedRowsBuffers {
+    fn take_from_pool() -> Self {
+        Self {
+            buffers: (0..get_compressed_rows_buffer_count())
+                .map(|_| CompressedRowsBuffer {
+                    buffer: Arc::new(memory_ctx().get_write_buffer(false)),
+                    taken: 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// Start from the beginning again in every buffer that no write holds
+    /// any more: every write out of it has landed.
+    fn start_over_in_landed_buffers(&mut self) {
+        for compressed_rows_buffer in &mut self.buffers {
+            if Arc::strong_count(&compressed_rows_buffer.buffer) == 1 {
+                compressed_rows_buffer.taken = 0;
+            }
+        }
+    }
+
+    /// How many buffers of rows can be compressed into the buffers that are
+    /// empty now. Rows that do not compress take slightly more room than they
+    /// had, and a write does not straddle two buffers, so each buffer of rows
+    /// is allowed two empty ones.
+    fn count_buffers_it_can_compress(&self) -> usize {
+        let empty_buffers = self
+            .buffers
+            .iter()
+            .filter(|compressed_rows_buffer| compressed_rows_buffer.taken == 0)
+            .count();
+        empty_buffers / 2
+    }
+
+    /// `len` bytes, a multiple of the spill block size, from the first buffer
+    /// with room for them.
+    fn allocate(&mut self, len: usize) -> Slab {
+        let compressed_rows_buffer = self
+            .buffers
+            .iter_mut()
+            .find(|compressed_rows_buffer| compressed_rows_buffer.taken + len <= BUFFER_SIZE)
+            .expect("no more rows are compressed at once than their buffers have room for");
+        // SAFETY: `taken + len` is inside the buffer, checked just above.
+        let start = unsafe {
+            compressed_rows_buffer
+                .buffer
+                .ptr
+                .add(compressed_rows_buffer.taken)
+        };
+        compressed_rows_buffer.taken += len;
+        Slab::new(start, len, compressed_rows_buffer.buffer.clone())
+    }
+}
+
+/// A slab compressed into the scratch for the write being gathered.
+struct PackedSlab<'a> {
+    /// The position, among the buffers being spilled, of the one it is in.
+    spilled_buffer_idx: usize,
+    /// Where its compressed bytes begin in the scratch, and so in the write.
+    start: usize,
+    compressed_len: usize,
+    slab: &'a FrozenSlab,
+}
+
+/// Have `write` count as in flight for `spilled_buffer`, which it carries
+/// rows of, unless it already does.
+fn count_write_against_buffer(write: &mut SpillWrite, spilled_buffer: &SpilledBuffer) {
+    let already_counted = write
+        .buffers_writes_in_flight
+        .iter()
+        .any(|counted| Arc::ptr_eq(counted, &spilled_buffer.writes_in_flight));
+    if !already_counted {
+        spilled_buffer
+            .writes_in_flight
+            .fetch_add(1, Ordering::Release);
+        write
+            .buffers_writes_in_flight
+            .push(spilled_buffer.writes_in_flight.clone());
+    }
+}
 
 /// The slab a partition is appending into, and where it came from, so that
 /// once full it can be recorded against its buffer. How far it is filled is
@@ -245,6 +365,9 @@ pub struct PartitionAllocator<L: Layout> {
     partitions: Box<[Partition]>,
     /// Each partition's cursor into its open slab, indexed like `partitions`.
     cursors: Box<[RowCursor]>,
+    /// Where compressed rows wait for their writes to land, once rows have
+    /// been spilled compressed.
+    compressed_rows_buffers: Option<CompressedRowsBuffers>,
 }
 
 impl<L: Layout> PartitionAllocator<L> {
@@ -268,6 +391,7 @@ impl<L: Layout> PartitionAllocator<L> {
                 PARTITIONS
             ]
             .into_boxed_slice(),
+            compressed_rows_buffers: None,
         }
     }
 
@@ -395,6 +519,17 @@ impl<L: Layout> PartitionAllocator<L> {
         spiller: &mut Spiller,
         count: usize,
     ) -> Result<Vec<SpilledBuffer>, IORequesterError> {
+        let codec = get_spill_codec();
+        let count = match codec {
+            None => count,
+            Some(_) => {
+                let compressed_rows_buffers = self
+                    .compressed_rows_buffers
+                    .get_or_insert_with(CompressedRowsBuffers::take_from_pool);
+                compressed_rows_buffers.start_over_in_landed_buffers();
+                count.min(compressed_rows_buffers.count_buffers_it_can_compress())
+            }
+        };
         // Where the sealed buffers are: each one's partition group slot in
         // the tree, and its position among that slot's buffers.
         let mut sealed_buffer_locations: Vec<(usize, usize)> = Vec::new();
@@ -464,44 +599,52 @@ impl<L: Layout> PartitionAllocator<L> {
         // buffer keep the order they were filled in.
         closed_slabs.sort_by_key(|(_, closed_slab)| closed_slab.partition);
         let mut writes: Vec<SpillWrite> = Vec::new();
-        let mut partition_being_gathered = None;
-        for (spilled_buffer_idx, ClosedSlab { partition, slab }) in closed_slabs {
-            if partition_being_gathered != Some(partition) {
-                partition_being_gathered = Some(partition);
-                writes.push(SpillWrite {
-                    file: self.partitions[partition]
-                        .spill_file
-                        .clone()
-                        .expect("every partition in the buffers had its file opened just above"),
-                    offset: self.partitions[partition].bytes_spilled,
-                    rows: FileBytes::new(),
-                    buffers_writes_in_flight: Vec::new(),
-                });
+        for partition_slabs in
+            closed_slabs.chunk_by(|(_, slab), (_, next)| slab.partition == next.partition)
+        {
+            let partition = partition_slabs[0].1.partition;
+            match codec {
+                None => writes.push(self.gather_padded_write(
+                    partition,
+                    partition_slabs,
+                    &mut spilled_buffers,
+                )),
+                Some(codec) => self.gather_compressed_writes(
+                    codec,
+                    partition,
+                    partition_slabs,
+                    &mut spilled_buffers,
+                    &mut writes,
+                ),
             }
-            let write = writes
-                .last_mut()
-                .expect("a write was started for this partition just above");
-            let spilled_buffer = &mut spilled_buffers[spilled_buffer_idx];
-            let write_counts_buffer = write
-                .buffers_writes_in_flight
-                .iter()
-                .any(|counted| Arc::ptr_eq(counted, &spilled_buffer.writes_in_flight));
-            if !write_counts_buffer {
-                spilled_buffer
-                    .writes_in_flight
-                    .fetch_add(1, Ordering::Release);
-                write
-                    .buffers_writes_in_flight
-                    .push(spilled_buffer.writes_in_flight.clone());
-            }
-            // The slab goes out padded to the block boundary its allocation
-            // reserved, so the next slab starts on one in the file too.
+        }
+        spiller.spill(writes, spilled_buffers.len())?;
+        // Back in spill order, which is the order the evictor gives them up in.
+        spilled_buffers.reverse();
+        Ok(spilled_buffers)
+    }
+
+    /// One write of `partition_slabs`, the slabs `partition` has in the
+    /// buffers being spilled, as they are in memory: each padded to the block
+    /// boundary its allocation reserved, so the next slab starts on one in
+    /// the file too.
+    fn gather_padded_write(
+        &mut self,
+        partition: usize,
+        partition_slabs: &[(usize, ClosedSlab)],
+        spilled_buffers: &mut [SpilledBuffer],
+    ) -> SpillWrite {
+        let mut write = self.start_write(partition);
+        for (spilled_buffer_idx, ClosedSlab { slab, .. }) in partition_slabs {
+            let spilled_buffer = &mut spilled_buffers[*spilled_buffer_idx];
+            count_write_against_buffer(&mut write, spilled_buffer);
             let padded_size = padded_to_spill_block(slab.size());
             let file_offset = self.partitions[partition].bytes_spilled;
             self.partitions[partition].bytes_spilled += padded_size as u64;
             spilled_buffer.slabs.push(SpilledSlab {
                 spill_partition_id: partition,
                 file_offset,
+                stored_len: slab.size(),
                 slab: slab.downgrade(),
             });
             // The write holds the slab until it lands; the record above does
@@ -511,10 +654,115 @@ impl<L: Layout> PartitionAllocator<L> {
             let padded_slab = unsafe { slab.widened_to(padded_size) };
             write.rows.push_frozen_slab(padded_slab);
         }
-        spiller.spill(writes, spilled_buffers.len())?;
-        // Back in spill order, which is the order the evictor gives them up in.
-        spilled_buffers.reverse();
-        Ok(spilled_buffers)
+        write
+    }
+
+    /// The writes of `partition_slabs`, the slabs `partition` has in the
+    /// buffers being spilled, compressed with `codec`: each slab by itself,
+    /// packed one after another into a stretch of memory that goes out as one
+    /// write, padded at its end to a block boundary. A new write is started
+    /// when the next slab might not fit a ring buffer with the ones before it.
+    fn gather_compressed_writes(
+        &mut self,
+        codec: SpillCodec,
+        partition: usize,
+        partition_slabs: &[(usize, ClosedSlab)],
+        spilled_buffers: &mut [SpilledBuffer],
+        writes: &mut Vec<SpillWrite>,
+    ) {
+        COMPRESSED_ROWS_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let scratch_len = codec.get_most_compressed_len(BUFFER_SIZE);
+            if scratch.len() < scratch_len {
+                scratch.resize(scratch_len, 0);
+            }
+            // The slabs packed into the scratch so far for the write being
+            // gathered: where each one's compressed bytes are in it.
+            let mut packed_slabs: Vec<PackedSlab> = Vec::new();
+            let mut packed_len = 0;
+            for (spilled_buffer_idx, ClosedSlab { slab, .. }) in partition_slabs {
+                let most_compressed_len = codec.get_most_compressed_len(slab.size());
+                if packed_len > 0 && packed_len + most_compressed_len > BUFFER_SIZE {
+                    writes.push(self.finish_compressed_write(
+                        partition,
+                        &scratch[..packed_len],
+                        &packed_slabs,
+                        spilled_buffers,
+                    ));
+                    packed_slabs.clear();
+                    packed_len = 0;
+                }
+                let compressed_len = codec.compress(
+                    slab.as_slice(),
+                    &mut scratch[packed_len..packed_len + most_compressed_len],
+                );
+                packed_slabs.push(PackedSlab {
+                    spilled_buffer_idx: *spilled_buffer_idx,
+                    start: packed_len,
+                    compressed_len,
+                    slab,
+                });
+                packed_len += compressed_len;
+            }
+            writes.push(self.finish_compressed_write(
+                partition,
+                &scratch[..packed_len],
+                &packed_slabs,
+                spilled_buffers,
+            ));
+        });
+    }
+
+    /// The write of `packed`, the compressed bytes of `packed_slabs`, copied
+    /// into the allocator's buffers for compressed rows, where the write
+    /// holds them until it lands.
+    fn finish_compressed_write(
+        &mut self,
+        partition: usize,
+        packed: &[u8],
+        packed_slabs: &[PackedSlab],
+        spilled_buffers: &mut [SpilledBuffer],
+    ) -> SpillWrite {
+        let padded_len = padded_to_spill_block(packed.len());
+        assert!(
+            padded_len <= BUFFER_SIZE,
+            "{} bytes of compressed rows do not fit one write",
+            packed.len()
+        );
+        let mut compressed_rows = self
+            .compressed_rows_buffers
+            .as_mut()
+            .expect("rows are compressed only once their buffers have been taken")
+            .allocate(padded_len);
+        compressed_rows.as_mut_slice()[..packed.len()].copy_from_slice(packed);
+        let mut write = self.start_write(partition);
+        self.partitions[partition].bytes_spilled += padded_len as u64;
+        write.rows.push_slab(compressed_rows);
+        for packed_slab in packed_slabs {
+            let spilled_buffer = &mut spilled_buffers[packed_slab.spilled_buffer_idx];
+            count_write_against_buffer(&mut write, spilled_buffer);
+            spilled_buffer.slabs.push(SpilledSlab {
+                spill_partition_id: partition,
+                file_offset: write.offset + packed_slab.start as u64,
+                stored_len: packed_slab.compressed_len,
+                slab: packed_slab.slab.downgrade(),
+            });
+        }
+        write
+    }
+
+    /// An empty write to `partition`'s file, right after everything the
+    /// partition spilled before.
+    fn start_write(&self, partition: usize) -> SpillWrite {
+        SpillWrite {
+            file: self.partitions[partition]
+                .spill_file
+                .clone()
+                .expect("a partition's file is opened before its rows are gathered"),
+            offset: self.partitions[partition].bytes_spilled,
+            rows: FileBytes::new(),
+            buffers_writes_in_flight: Vec::new(),
+        }
     }
 
     /// Close a full slab, recording it against the buffer it was allocated from.

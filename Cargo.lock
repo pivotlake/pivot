@@ -2107,6 +2107,7 @@ dependencies = [
  "httparse",
  "io-uring",
  "libc",
+ "lz4_flex 0.13.1 (git+https://github.com/pivotlake/lz4_flex.git?rev=a5cc41c918bbe0a2266db4cb7a1d16a406844d18)",
  "memchr",
  "nix",
  "parquet-variant-compute",
@@ -2114,6 +2115,7 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "rustls",
+ "snap 1.1.1 (git+https://github.com/pivotlake/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5)",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
@@ -2121,6 +2123,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "webpki-roots 0.26.11",
+ "zstd",
 ]
 
 [[package]]

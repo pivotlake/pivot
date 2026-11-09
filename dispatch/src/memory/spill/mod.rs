@@ -15,12 +15,14 @@ use crate::worker::WORKER_IDX;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod codec;
 pub(crate) mod directory;
 mod layout;
 mod partition_allocator;
 mod partition_evictor;
 mod partition_tree;
 
+pub use codec::{SpillCodec, get_spill_codec};
 pub use layout::{Dynamic, Fixed, Layout};
 pub use partition_allocator::{PartitionAllocator, PartitionContents, PartitionSlab};
 pub use partition_evictor::{PartitionEvictor, SharedPartitionEvictor};
@@ -60,8 +62,11 @@ pub struct SpillWrite {
 #[derive(Clone)]
 pub struct SpilledSlab {
     pub spill_partition_id: usize,
-    /// Where in the partition's file this slab's rows begin.
+    /// Where in the partition's file this slab's bytes begin.
     pub file_offset: u64,
+    /// How many bytes the slab takes in the file from there: its size, or
+    /// what it compressed to when spilled rows are compressed.
+    pub stored_len: usize,
     pub slab: WeakSlab,
 }
 
@@ -256,6 +261,7 @@ mod tests {
                 .map(|slab| SpilledSlab {
                     spill_partition_id: 0,
                     file_offset: 0,
+                    stored_len: slab.size(),
                     slab: slab.downgrade(),
                 })
                 .collect(),

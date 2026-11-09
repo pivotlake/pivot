@@ -29,12 +29,13 @@ use scatter_rows::merge_scatter_rows;
 use tables::merge_tables;
 
 use crate::io::{OperatorIO, ReadData, ReadRequestId, SlabRead};
-use crate::memory::{SPILL_BLOCK_SIZE, SlabAllocator};
+use crate::memory::{SPILL_BLOCK_SIZE, SlabAllocator, get_spill_codec};
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
     AggregationValue, DEFAULT_CAPACITY, HashTable, KeyExtractor, OnDiskStretch,
 };
 use crate::operations::unary::group::output::partition_job::PartitionJob;
+use bytes::Bytes;
 
 /// A partition job this worker is running: its rows in memory are merged, and
 /// the rows of its partition that are only on disk are merged as their reads
@@ -139,6 +140,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
             .reads_in_flight
             .remove(&read)
             .expect("the read is one of this job's reads in flight");
+        let codec = get_spill_codec();
+        let read_allocator = self
+            .read_allocator
+            .as_mut()
+            .expect("a job with a read in flight has the allocator its reads landed in");
         let rows: Vec<ReadData> = stretches
             .iter()
             .zip(stretches_read)
@@ -146,9 +152,21 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
                 let [bytes] = read_back.bytes.as_slice() else {
                     panic!("a stretch read around the cache comes back in one piece");
                 };
+                let slabs = stretch
+                    .cut_stored_slabs(bytes)
+                    .map(|(stored, row_bytes)| match codec {
+                        None => stored,
+                        Some(codec) => {
+                            let mut rows =
+                                read_allocator.get_aligned_slab(row_bytes, SPILL_BLOCK_SIZE, false);
+                            codec.decompress(&stored, rows.as_mut_slice());
+                            Bytes::from_owner(rows.freeze())
+                        }
+                    })
+                    .collect();
                 ReadData {
                     offset: read_back.offset,
-                    bytes: stretch.cut_rows(bytes),
+                    bytes: slabs,
                 }
             })
             .collect();

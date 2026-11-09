@@ -74,8 +74,8 @@ mod spill;
 pub(crate) use spill::directory as spill_directory;
 pub use spill::{
     Dynamic, Fixed, Layout, PARTITIONS, PartitionAllocator, PartitionContents, PartitionEvictor,
-    PartitionSlab, SPILL_BLOCK_SIZE, SharedPartitionEvictor, SpilledBuffer, SpilledSlab, Spiller,
-    padded_to_spill_block,
+    PartitionSlab, SPILL_BLOCK_SIZE, SharedPartitionEvictor, SpillCodec, SpilledBuffer,
+    SpilledSlab, Spiller, get_spill_codec, padded_to_spill_block,
 };
 
 #[cfg(any(test, feature = "test-util"))]
