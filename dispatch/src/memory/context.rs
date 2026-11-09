@@ -34,6 +34,23 @@ fn get_reclaimable_slots_target_percent() -> usize {
     )
 }
 
+/// The share of a node's slots below which spilling starts, when
+/// `PIVOT_SPILL_START_RESERVE_PERCENT` sets one apart from the target. Left
+/// unset it is the target, so a worker spills as soon as the reserve is at
+/// all short. Set lower, the reserve is left to run down to it and is then
+/// refilled towards the target in one go, which gives each worker a batch of
+/// buffers to spill together.
+fn get_reclaimable_slots_start_percent() -> usize {
+    static START_PERCENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let target = get_reclaimable_slots_target_percent();
+    crate::env::get_tunable(
+        &START_PERCENT,
+        "PIVOT_SPILL_START_RESERVE_PERCENT",
+        target,
+        |percent| percent <= target,
+    )
+}
+
 thread_local! {
     static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = const { RefCell::new(None) };
     static MEMORY_CTX_PTR: Cell<*const MemoryContext> = const { Cell::new(std::ptr::null()) };
@@ -182,11 +199,11 @@ pub struct MemoryContext {
     /// be reclaimed. Shared with the worker, which drives it.
     io_requester: OnceCell<Rc<RefCell<IORequester>>>,
     /// Every spill write in flight on this worker, pointing at the in-flight
-    /// count of the spilled buffer it belongs to. A count that reaches zero
-    /// tells the buffer's evictor the whole buffer is on disk. Keyed by the
-    /// issuing dataflow as well as the write id, because write ids are drawn
-    /// per dataflow and two dataflows spilling on one worker repeat them.
-    spill_writes_in_flight: RefCell<HashMap<(Identifier, WriteRequestId), Arc<AtomicUsize>>>,
+    /// count of each spilled buffer it carries rows of. A count that reaches
+    /// zero tells the buffer's evictor the whole buffer is on disk. Keyed by
+    /// the issuing dataflow as well as the write id, because write ids are
+    /// drawn per dataflow and two dataflows spilling on one worker repeat them.
+    spill_writes_in_flight: RefCell<HashMap<(Identifier, WriteRequestId), Vec<Arc<AtomicUsize>>>>,
     /// This worker's NUMA node, i.e. the ring region it allocates and evicts from.
     node: usize,
 }
@@ -511,7 +528,11 @@ impl MemoryContext {
     /// A spilled slot can be taken back only by the worker that spilled it, so
     /// this worker's own spilled slots are added on top of the node's. A worker
     /// that holds many sees no shortfall and one that holds few sees it first,
-    /// which sends each new spill to the worker with the fewest. The counts
+    /// which sends each new spill to the worker with the fewest.
+    ///
+    /// Nothing is asked for until the reclaimable slots are below where
+    /// spilling starts (see [`get_reclaimable_slots_start_percent`]), which may
+    /// be lower than the target the shortfall is then measured against. The counts
     /// are read at slightly different instants while peers allocate and
     /// release, so the result is approximate by a few slots, which a watermark
     /// tolerates.
@@ -520,10 +541,11 @@ impl MemoryContext {
         let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
             + self.clock.owned_in_region(Owner::Decompressed, self.node);
         let spilled = self.buffers_spilled[self.node].load(Ordering::Relaxed);
-        let target =
-            self.layout.node_slots(self.node).len() * get_reclaimable_slots_target_percent() / 100;
+        let slots = self.layout.node_slots(self.node).len();
+        let start = slots * get_reclaimable_slots_start_percent() / 100;
+        let target = slots * get_reclaimable_slots_target_percent() / 100;
         let reclaimable = free + cached + spilled + self.own_buffers_spilled.get();
-        if reclaimable >= target {
+        if reclaimable >= start {
             return 0;
         }
         (target - reclaimable).div_ceil(self.layout.topology().workers_per_node)
@@ -592,18 +614,19 @@ impl MemoryContext {
             .unwrap_or_else(|_| panic!("the worker attached its IO requester twice"));
     }
 
-    /// Note a spill write issued for a buffer by `dataflow`, so that when it
-    /// lands the buffer's `writes_in_flight` is counted down.
+    /// Note a spill write issued by `dataflow` that carries rows of the
+    /// buffers whose in-flight counts are given, so that when it lands each
+    /// of them is counted down.
     pub fn record_spill_write_issued(
         &self,
         dataflow: Identifier,
         id: WriteRequestId,
-        writes_in_flight: Arc<AtomicUsize>,
+        buffers_writes_in_flight: Vec<Arc<AtomicUsize>>,
     ) {
         let replaced = self
             .spill_writes_in_flight
             .borrow_mut()
-            .insert((dataflow, id), writes_in_flight);
+            .insert((dataflow, id), buffers_writes_in_flight);
         assert!(
             replaced.is_none(),
             "spill write {id:?} of dataflow {dataflow} issued twice"
@@ -629,10 +652,12 @@ impl MemoryContext {
             // A write of a dataflow that has since failed is no longer
             // recorded (see `unregister_dataflow_evictors`); its buffer went
             // with the dataflow, so there is nothing left to count it off.
-            if let Some(writes_in_flight) =
+            if let Some(buffers_writes_in_flight) =
                 spill_writes_in_flight.remove(&(write.data_flow_id, write.request.id))
             {
-                writes_in_flight.fetch_sub(1, Ordering::Release);
+                for writes_in_flight in buffers_writes_in_flight {
+                    writes_in_flight.fetch_sub(1, Ordering::Release);
+                }
             }
         }
     }

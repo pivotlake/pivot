@@ -24,6 +24,7 @@ use crate::memory::spill::{
 use crate::memory::{BUFFER_SIZE, FileBytes, FrozenSlab, Slab, WriteBuffer, memory_ctx};
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The slab a partition is appending into, and where it came from, so that
 /// once full it can be recorded against its buffer. How far it is filled is
@@ -375,81 +376,130 @@ impl<L: Layout> PartitionAllocator<L> {
             .collect()
     }
 
-    /// Spill the next sealed buffer through `spiller`, one write per partition
-    /// with rows in it, and return it for the caller to keep until it is
-    /// evicted: its rows stay readable in memory until then. `None` when no
-    /// buffer is sealed. Buffers are taken in the tree's spill order (see
+    /// Spill up to `count` sealed buffers through `spiller` and return them
+    /// for the caller to keep until they are evicted: their rows stay
+    /// readable in memory until then. Fewer are returned, or none, when fewer
+    /// are sealed. Buffers are taken in the tree's spill order (see
     /// [`PartitionTree::walk_spill_order`]), oldest first within a node. A
     /// node's current buffer is never sealed, so it is never taken.
     ///
+    /// Each partition's rows in the buffers taken go out as one write, so
+    /// taking several buffers at once makes for fewer and larger writes than
+    /// taking them one by one. A buffer is on disk once every write carrying
+    /// rows of it has landed.
+    ///
     /// A partition spilling for the first time gets its file opened through
-    /// `spiller` here. Should that fail, the buffer stays where it was.
+    /// `spiller` here. Should that fail, the buffers stay where they were.
     pub fn spill(
         &mut self,
         spiller: &mut Spiller,
-    ) -> Result<Option<SpilledBuffer>, IORequesterError> {
-        // Where the sealed buffer is: its partition group slot in the tree, and
-        // its position among that slot's buffers.
-        let sealed_buffer_location =
-            self.tree
-                .walk_spill_order(|partition_group_slot_idx, partition_group_slot| {
-                    let slot_buffers = match partition_group_slot {
-                        PartitionGroupSlot::Allocating { buffers, .. }
-                        | PartitionGroupSlot::Split { buffers } => buffers,
-                        PartitionGroupSlot::Unused => return ControlFlow::Continue(()),
-                    };
-                    match slot_buffers
-                        .iter()
-                        .position(PartitionGroupBuffer::is_sealed)
-                    {
-                        Some(sealed_buffer_idx) => {
-                            ControlFlow::Break((partition_group_slot_idx, sealed_buffer_idx))
+        count: usize,
+    ) -> Result<Vec<SpilledBuffer>, IORequesterError> {
+        // Where the sealed buffers are: each one's partition group slot in
+        // the tree, and its position among that slot's buffers.
+        let mut sealed_buffer_locations: Vec<(usize, usize)> = Vec::new();
+        if count > 0 {
+            let _: ControlFlow<()> =
+                self.tree
+                    .walk_spill_order(|partition_group_slot_idx, partition_group_slot| {
+                        let slot_buffers = match partition_group_slot {
+                            PartitionGroupSlot::Allocating { buffers, .. }
+                            | PartitionGroupSlot::Split { buffers } => buffers,
+                            PartitionGroupSlot::Unused => return ControlFlow::Continue(()),
+                        };
+                        for (buffer_idx, buffer) in slot_buffers.iter().enumerate() {
+                            if !buffer.is_sealed() {
+                                continue;
+                            }
+                            sealed_buffer_locations.push((partition_group_slot_idx, buffer_idx));
+                            if sealed_buffer_locations.len() == count {
+                                return ControlFlow::Break(());
+                            }
                         }
-                        None => ControlFlow::Continue(()),
-                    }
-                });
-        let ControlFlow::Break((partition_group_slot_idx, sealed_buffer_idx)) =
-            sealed_buffer_location
-        else {
-            return Ok(None);
-        };
-        let slot_buffers = self.tree.node_mut(partition_group_slot_idx).buffers_mut();
-        for closed_slab in &slot_buffers[sealed_buffer_idx].closed_slabs {
-            let partition = &mut self.partitions[closed_slab.partition];
-            if partition.spill_file.is_none() {
-                partition.spill_file = Some(spiller.open_spill_file(closed_slab.partition)?);
+                        ControlFlow::Continue(())
+                    });
+        }
+        for &(partition_group_slot_idx, buffer_idx) in &sealed_buffer_locations {
+            let slot_buffers = self.tree.node_mut(partition_group_slot_idx).buffers_mut();
+            for closed_slab in &slot_buffers[buffer_idx].closed_slabs {
+                let partition = &mut self.partitions[closed_slab.partition];
+                if partition.spill_file.is_none() {
+                    partition.spill_file = Some(spiller.open_spill_file(closed_slab.partition)?);
+                }
             }
         }
-        let PartitionGroupBuffer {
-            buffer,
-            mut closed_slabs,
-        } = slot_buffers.remove(sealed_buffer_idx);
+
+        // Take the buffers out of the tree, last first: the locations of one
+        // slot are in rising order, so the ones still to take stay where the
+        // walk found them. Every closed slab is gathered with the position,
+        // in `spilled_buffers`, of the buffer it came from.
+        let mut spilled_buffers: Vec<SpilledBuffer> =
+            Vec::with_capacity(sealed_buffer_locations.len());
+        let mut closed_slabs: Vec<(usize, ClosedSlab)> = Vec::new();
+        for &(partition_group_slot_idx, buffer_idx) in sealed_buffer_locations.iter().rev() {
+            let PartitionGroupBuffer {
+                buffer,
+                closed_slabs: buffer_closed_slabs,
+            } = self
+                .tree
+                .node_mut(partition_group_slot_idx)
+                .buffers_mut()
+                .remove(buffer_idx);
+            let spilled_buffer_idx = spilled_buffers.len();
+            closed_slabs.extend(
+                buffer_closed_slabs
+                    .into_iter()
+                    .map(|closed_slab| (spilled_buffer_idx, closed_slab)),
+            );
+            spilled_buffers.push(SpilledBuffer {
+                writes_in_flight: Arc::new(AtomicUsize::new(0)),
+                buffer,
+                slabs: Vec::new(),
+                partition_group_slot: partition_group_slot_idx,
+            });
+        }
 
         // Each partition's rows go out as one write, so bring its slabs
-        // together. Sorting is stable, so a partition's slabs keep the order
-        // they were filled in, which is the order they land in its file.
-        closed_slabs.sort_by_key(|closed_slab| closed_slab.partition);
+        // together. Sorting is stable, so the slabs a partition has in one
+        // buffer keep the order they were filled in.
+        closed_slabs.sort_by_key(|(_, closed_slab)| closed_slab.partition);
         let mut writes: Vec<SpillWrite> = Vec::new();
-        let mut spilled_slabs: Vec<SpilledSlab> = Vec::with_capacity(closed_slabs.len());
         let mut partition_being_gathered = None;
-        for ClosedSlab { partition, slab } in closed_slabs {
+        for (spilled_buffer_idx, ClosedSlab { partition, slab }) in closed_slabs {
             if partition_being_gathered != Some(partition) {
                 partition_being_gathered = Some(partition);
                 writes.push(SpillWrite {
                     file: self.partitions[partition]
                         .spill_file
                         .clone()
-                        .expect("every partition in the buffer had its file opened just above"),
+                        .expect("every partition in the buffers had its file opened just above"),
                     offset: self.partitions[partition].bytes_spilled,
                     rows: FileBytes::new(),
+                    buffers_writes_in_flight: Vec::new(),
                 });
+            }
+            let write = writes
+                .last_mut()
+                .expect("a write was started for this partition just above");
+            let spilled_buffer = &mut spilled_buffers[spilled_buffer_idx];
+            let write_counts_buffer = write
+                .buffers_writes_in_flight
+                .iter()
+                .any(|counted| Arc::ptr_eq(counted, &spilled_buffer.writes_in_flight));
+            if !write_counts_buffer {
+                spilled_buffer
+                    .writes_in_flight
+                    .fetch_add(1, Ordering::Release);
+                write
+                    .buffers_writes_in_flight
+                    .push(spilled_buffer.writes_in_flight.clone());
             }
             // The slab goes out padded to the block boundary its allocation
             // reserved, so the next slab starts on one in the file too.
             let padded_size = padded_to_spill_block(slab.size());
             let file_offset = self.partitions[partition].bytes_spilled;
             self.partitions[partition].bytes_spilled += padded_size as u64;
-            spilled_slabs.push(SpilledSlab {
+            spilled_buffer.slabs.push(SpilledSlab {
                 spill_partition_id: partition,
                 file_offset,
                 slab: slab.downgrade(),
@@ -459,19 +509,12 @@ impl<L: Layout> PartitionAllocator<L> {
             // SAFETY: `allocate_slab` set the padded size aside for this slab
             // alone when it carved it.
             let padded_slab = unsafe { slab.widened_to(padded_size) };
-            writes
-                .last_mut()
-                .expect("a write was started for this partition just above")
-                .rows
-                .push_frozen_slab(padded_slab);
+            write.rows.push_frozen_slab(padded_slab);
         }
-        let writes_in_flight = spiller.spill(writes)?;
-        Ok(Some(SpilledBuffer {
-            writes_in_flight,
-            buffer,
-            slabs: spilled_slabs,
-            partition_group_slot: partition_group_slot_idx,
-        }))
+        spiller.spill(writes, spilled_buffers.len())?;
+        // Back in spill order, which is the order the evictor gives them up in.
+        spilled_buffers.reverse();
+        Ok(spilled_buffers)
     }
 
     /// Close a full slab, recording it against the buffer it was allocated from.
@@ -824,8 +867,12 @@ mod tests {
         fill_and_split_root(&mut allocator);
         fill_root_slabs(&mut allocator);
 
-        let spilled = allocator.spill(&mut parts.spiller()).unwrap().unwrap();
-        let again = allocator.spill(&mut parts.spiller()).unwrap();
+        let spilled = allocator
+            .spill(&mut parts.spiller(), 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let again = allocator.spill(&mut parts.spiller(), 1).unwrap();
         let writes_issued = spilled.writes_in_flight.load(Ordering::Acquire);
         parts.finish_writes();
 
@@ -843,7 +890,7 @@ mod tests {
         // The writes have landed and let go; the spilled buffer is the one
         // holder left.
         assert_eq!(Arc::strong_count(&spilled.buffer), 1);
-        assert!(again.is_none());
+        assert!(again.is_empty());
         assert!(buffers_of_slot(&mut allocator, 0).is_empty());
         for group in 0..4 {
             assert_eq!(
@@ -860,7 +907,11 @@ mod tests {
         let mut allocator = large_rows();
         fill_and_split_root(&mut allocator);
         fill_root_slabs(&mut allocator);
-        allocator.spill(&mut parts.spiller()).unwrap().unwrap();
+        allocator
+            .spill(&mut parts.spiller(), 1)
+            .unwrap()
+            .pop()
+            .unwrap();
         let file_after_first = allocator.partitions[0].spill_file.clone().unwrap();
         // Partition 0's group moved to the root's left child, whose buffer
         // already holds another partition's open slab, so three more slabs
@@ -870,7 +921,11 @@ mod tests {
             allocator.reserve(0).write(large_row(2));
         }
 
-        let second = allocator.spill(&mut parts.spiller()).unwrap().unwrap();
+        let second = allocator
+            .spill(&mut parts.spiller(), 1)
+            .unwrap()
+            .pop()
+            .unwrap();
         parts.finish_writes();
 
         assert_eq!(second.writes_in_flight.load(Ordering::Acquire), 0);
@@ -886,6 +941,43 @@ mod tests {
         assert_eq!(parts.file_len(0), (5 * BUFFER_SIZE / 4) as u64);
         assert!(allocator.partitions[64].spill_file.is_some());
         assert!(allocator.partitions[1].spill_file.is_none());
+    }
+
+    #[test]
+    fn buffers_spilled_together_share_one_write_per_partition() {
+        init_test_free_pool(8);
+        let mut parts = SpillerParts::new(9_000_013);
+        let mut allocator = large_rows();
+        fill_and_split_root(&mut allocator);
+        fill_root_slabs(&mut allocator);
+        // Partition 0's group moved to the root's left child, whose buffer
+        // already holds another partition's open slab, so three more slabs
+        // fill it. The four after those fill the next node's buffer by
+        // themselves, and one more row moves on, leaving that buffer sealed
+        // beside the root's.
+        for _ in 0..(3 + 4) * ROWS_PER_SLAB + 1 {
+            allocator.reserve(0).write(large_row(2));
+        }
+
+        let spilled = allocator.spill(&mut parts.spiller(), 2).unwrap();
+        let writes_issued = parts.next_request_id;
+        let writes_per_buffer: Vec<usize> = spilled
+            .iter()
+            .map(|buffer| buffer.writes_in_flight.load(Ordering::Acquire))
+            .collect();
+        parts.finish_writes();
+
+        // Partition 0 has four slabs in one buffer and one in the root's, and
+        // the root's other three slabs are of three more partitions.
+        assert_eq!(spilled.len(), 2);
+        assert_eq!(writes_issued, 4);
+        assert_eq!(writes_per_buffer, [1, 4]);
+        assert!(
+            spilled
+                .iter()
+                .all(|buffer| buffer.writes_in_flight.load(Ordering::Acquire) == 0)
+        );
+        assert_eq!(parts.file_len(0), (5 * BUFFER_SIZE / 4) as u64);
     }
 
     #[test]
@@ -909,12 +1001,20 @@ mod tests {
             }
         }
 
-        allocator.spill(&mut parts.spiller()).unwrap().unwrap();
+        allocator
+            .spill(&mut parts.spiller(), 1)
+            .unwrap()
+            .pop()
+            .unwrap();
         let after_first: Vec<bool> = [32 * PARTITIONS_PER_GROUP, 0]
             .iter()
             .map(|&partition| allocator.partitions[partition].spill_file.is_some())
             .collect();
-        allocator.spill(&mut parts.spiller()).unwrap().unwrap();
+        allocator
+            .spill(&mut parts.spiller(), 1)
+            .unwrap()
+            .pop()
+            .unwrap();
         let after_second = allocator.partitions[0].spill_file.is_some();
 
         assert_eq!(after_first, [true, false]);

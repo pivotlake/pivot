@@ -38,13 +38,17 @@ pub fn padded_to_spill_block(size: usize) -> usize {
     size.next_multiple_of(SPILL_BLOCK_SIZE)
 }
 
-/// One partition's rows from a sealed buffer, going to its file as one write.
+/// One partition's rows from the sealed buffers spilled together, going to
+/// its file as one write.
 pub struct SpillWrite {
     file: LocalFile,
     /// Where in the file the rows go: right after everything the partition
     /// spilled before.
     offset: u64,
     rows: FileBytes,
+    /// The in-flight write count of each buffer the rows come from. Each
+    /// already counts this write, and is counted down when it lands.
+    buffers_writes_in_flight: Vec<Arc<AtomicUsize>>,
 }
 
 /// A slab of a spilled buffer: where its rows are in memory, for as long as
@@ -120,23 +124,33 @@ impl<'a> Spiller<'a> {
         self.io.set_operator_idx(operator_idx);
     }
 
-    /// Issue one sealed buffer's writes, one per partition, and return the
-    /// count of them in flight, which is counted down as they land.
-    pub fn spill(&mut self, writes: Vec<SpillWrite>) -> Result<Arc<AtomicUsize>, IORequesterError> {
-        let writes_in_flight = Arc::new(AtomicUsize::new(writes.len()));
-        for SpillWrite { file, offset, rows } in writes {
+    /// Issue the writes of `buffers` sealed buffers spilled together, one
+    /// write per partition with rows in them. Each write counts off the
+    /// buffers it carries rows of as it lands.
+    pub fn spill(
+        &mut self,
+        writes: Vec<SpillWrite>,
+        buffers: usize,
+    ) -> Result<(), IORequesterError> {
+        for SpillWrite {
+            file,
+            offset,
+            rows,
+            buffers_writes_in_flight,
+        } in writes
+        {
             let write_id = self
                 .io
                 .write_spill(OpenFile::Local(file), offset, Arc::new(rows))?;
             memory_ctx().record_spill_write_issued(
                 self.io.data_flow_id(),
                 write_id,
-                writes_in_flight.clone(),
+                buffers_writes_in_flight,
             );
         }
-        memory_ctx().record_buffers_spilled(1);
-        self.buffers_spilled += 1;
-        Ok(writes_in_flight)
+        memory_ctx().record_buffers_spilled(buffers);
+        self.buffers_spilled += buffers;
+        Ok(())
     }
 
     /// How many buffers this spiller has written out so far.
@@ -216,20 +230,23 @@ mod tests {
             slab_at(SPILL_BLOCK_SIZE),
             slab_at(2 * SPILL_BLOCK_SIZE),
         );
+        let buffer_writes_in_flight = Arc::new(AtomicUsize::new(2));
         let writes = vec![
             SpillWrite {
                 file: spiller.open_spill_file(5).unwrap(),
                 offset: 0,
                 rows: rows_of(&[&first, &third]),
+                buffers_writes_in_flight: vec![buffer_writes_in_flight.clone()],
             },
             SpillWrite {
                 file: spiller.open_spill_file(9).unwrap(),
                 offset: 0,
                 rows: rows_of(&[&second]),
+                buffers_writes_in_flight: vec![buffer_writes_in_flight.clone()],
             },
         ];
 
-        let buffer_writes_in_flight = spiller.spill(writes).unwrap();
+        spiller.spill(writes, 1).unwrap();
         let spilled = SpilledBuffer {
             writes_in_flight: buffer_writes_in_flight,
             buffer: buffer.clone(),

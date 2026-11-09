@@ -123,8 +123,9 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
     pub fn spill(
         &mut self,
         spiller: &mut Spiller,
-    ) -> Result<Option<SpilledBuffer>, IORequesterError> {
-        self.allocator.spill(spiller)
+        count: usize,
+    ) -> Result<Vec<SpilledBuffer>, IORequesterError> {
+        self.allocator.spill(spiller, count)
     }
 
     /// Appends a row to `partition` and initializes its value in place.

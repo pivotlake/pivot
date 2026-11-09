@@ -51,7 +51,22 @@ struct InFlightFsOp {
     /// slot and wakes any workers waiting on the queue, so it lives exactly
     /// as long as the operation (a resubmitted write keeps it).
     permit: InFlightPermit,
+    /// The runs a vectored write on the device refers to, which the kernel
+    /// reads from here until the write completes. `None` for a read and for
+    /// a write of a single run.
+    _write_runs: Option<WriteRuns>,
 }
+
+/// The array of runs one vectored write refers to, kept at a stable address
+/// for as long as the write is in flight.
+struct WriteRuns(#[allow(dead_code)] Box<[libc::iovec]>);
+
+// SAFETY: the runs point into ring memory that the write's request keeps
+// alive; the array is only ever read by the kernel.
+unsafe impl Send for WriteRuns {}
+
+/// The most runs one vectored write takes, which is the kernel's limit.
+const MOST_RUNS_PER_WRITE: usize = 1024;
 
 /// Where a logical operator request must be delivered when it becomes ready.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -796,44 +811,44 @@ impl IORequester {
         let cache_extent = fs_cache_extent(&request);
         let pending_read_id = request.pending_read_id;
         let queued = match &request.request {
-            FsRequest::Read(read) => self.backend.submit_read(
-                read.file.as_raw_fd(),
-                read.block.file_offset() as u64,
-                read.block.dest(),
-                read.block.len(),
-                self.next_id,
-            ),
-            FsRequest::ReadDirect(read) => self.backend.submit_read(
-                read.file.as_raw_fd(),
-                read.offset,
-                read.slab.ptr,
-                read.slab.size(),
-                self.next_id,
-            ),
-            // One op writes one run of the payload, and the completion path
-            // below submits the next. A run boundary looks exactly like the
-            // short write the kernel can hand back anyway.
-            FsRequest::Write(write) => {
-                let run = write.data.run_at(0);
-                self.backend.submit_write(
-                    write.file.as_raw_fd(),
-                    write.offset,
-                    run.as_ptr(),
-                    run.len(),
+            FsRequest::Read(read) => self
+                .backend
+                .submit_read(
+                    read.file.as_raw_fd(),
+                    read.block.file_offset() as u64,
+                    read.block.dest(),
+                    read.block.len(),
                     self.next_id,
                 )
+                .map(|()| None),
+            FsRequest::ReadDirect(read) => self
+                .backend
+                .submit_read(
+                    read.file.as_raw_fd(),
+                    read.offset,
+                    read.slab.ptr,
+                    read.slab.size(),
+                    self.next_id,
+                )
+                .map(|()| None),
+            FsRequest::Write(write) => {
+                submit_rest_of_write(&mut self.backend, write, 0, self.next_id)
             }
         };
-        if let Err(error) = queued {
-            self.withdraw_registered_read(cache_extent, pending_read_id);
-            return Err(error.into());
-        }
+        let write_runs = match queued {
+            Ok(write_runs) => write_runs,
+            Err(error) => {
+                self.withdraw_registered_read(cache_extent, pending_read_id);
+                return Err(error.into());
+            }
+        };
         self.pending_io_requests.insert(
             self.next_id,
             InFlightFsOp {
                 request,
                 bytes_done: 0,
                 permit,
+                _write_runs: write_runs,
             },
         );
         self.next_id += 1;
@@ -1032,30 +1047,26 @@ impl IORequester {
                 request,
                 bytes_done: done,
                 permit,
+                _write_runs: _,
             }) = self.pending_io_requests.remove(&ud)
             {
-                // A write covers one run, and may complete shorter still (the
-                // kernel caps a single write at ~2 GiB, among other reasons);
+                // A write may complete short (the kernel caps a single write
+                // at ~2 GiB and at a number of runs, among other reasons);
                 // resubmit from where it stopped, at the matching file offset,
                 // until the whole payload lands. Zero progress means the file
                 // accepts no more bytes, which is an error, not a retry.
                 if let FsRequest::Write(write) = &request.request {
                     let done = done + result.max(0) as usize;
                     if result > 0 && done < write.data.len() {
-                        let run = write.data.run_at(done);
-                        self.backend.submit_write(
-                            write.file.as_raw_fd(),
-                            write.offset + done as u64,
-                            run.as_ptr(),
-                            run.len(),
-                            self.next_id,
-                        )?;
+                        let write_runs =
+                            submit_rest_of_write(&mut self.backend, write, done, self.next_id)?;
                         self.pending_io_requests.insert(
                             self.next_id,
                             InFlightFsOp {
                                 request,
                                 bytes_done: done,
                                 permit,
+                                _write_runs: write_runs,
                             },
                         );
                         self.next_id += 1;
@@ -1260,6 +1271,50 @@ impl IORequester {
         select.recv(self.http.completion_receiver());
         select.ready();
         Ok(())
+    }
+}
+
+/// Put what is left of `write` after its first `bytes_done` bytes onto the
+/// backend's queue as one operation: every remaining run at once, as far as a
+/// single write takes them. Returns the array of runs the operation refers
+/// to, when it is a vectored one, which has to be kept until it completes.
+fn submit_rest_of_write(
+    backend: &mut IOBackend,
+    write: &FsWriteRequest,
+    bytes_done: usize,
+    request_id: Identifier,
+) -> std::result::Result<Option<WriteRuns>, crate::io::backend::Error> {
+    let mut bytes_queued = 0;
+    let runs: Box<[libc::iovec]> = write
+        .data
+        .runs_from(bytes_done)
+        .take(MOST_RUNS_PER_WRITE)
+        .take_while(|run| {
+            bytes_queued += run.len();
+            bytes_queued <= crate::io::backend::MAX_IO_OP_LEN || bytes_queued == run.len()
+        })
+        .map(|run| libc::iovec {
+            iov_base: run.as_ptr() as *mut libc::c_void,
+            iov_len: run.len(),
+        })
+        .collect();
+    let offset = write.offset + bytes_done as u64;
+    match &*runs {
+        [] => unreachable!("a write is resubmitted only while it has bytes left"),
+        [only] => {
+            backend.submit_write(
+                write.file.as_raw_fd(),
+                offset,
+                only.iov_base as *const u8,
+                only.iov_len,
+                request_id,
+            )?;
+            Ok(None)
+        }
+        _ => {
+            backend.submit_write_vectored(write.file.as_raw_fd(), offset, &runs, request_id)?;
+            Ok(Some(WriteRuns(runs)))
+        }
     }
 }
 

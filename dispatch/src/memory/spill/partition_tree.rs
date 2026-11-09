@@ -14,6 +14,7 @@ use std::ops::{ControlFlow, Range};
 pub const PARTITIONS: usize = 4096;
 /// How many groups the partitions are gathered into, one per leaf.
 pub const GROUPS: usize = 64;
+#[cfg(test)]
 pub const PARTITIONS_PER_GROUP: usize = PARTITIONS / GROUPS;
 /// Nodes of a complete binary tree with `GROUPS` leaves.
 const NODES: usize = 2 * GROUPS - 1;

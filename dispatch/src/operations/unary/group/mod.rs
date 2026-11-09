@@ -345,11 +345,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
     }
 
     fn spill(&mut self, spiller: &mut Spiller, count: usize) -> unary::Result<()> {
-        for _ in 0..count {
-            if !self.aggregated_table.spill(spiller)? {
-                break;
-            }
-        }
+        self.aggregated_table.spill(spiller, count)?;
         Ok(())
     }
 

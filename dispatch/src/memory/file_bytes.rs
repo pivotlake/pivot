@@ -69,6 +69,28 @@ impl FileBytes {
         self.runs.iter().map(FrozenSlab::as_slice)
     }
 
+    /// Everything left to write once `offset` bytes have been written, run by
+    /// run: the rest of the run `offset` falls in, then every run after it.
+    /// For a writer that can put several runs on the wire as one operation.
+    pub fn runs_from(&self, offset: usize) -> impl Iterator<Item = &[u8]> {
+        assert!(
+            offset <= self.len,
+            "offset {offset} past a {} byte file",
+            self.len
+        );
+        let mut run_start = 0;
+        self.runs.iter().filter_map(move |run| {
+            let bytes = run.as_slice();
+            let start = run_start;
+            run_start += bytes.len();
+            if offset >= start + bytes.len() {
+                None
+            } else {
+                Some(&bytes[offset.saturating_sub(start)..])
+            }
+        })
+    }
+
     /// The bytes to write next once `offset` of them have been written: the
     /// rest of the run `offset` falls in, or an empty slice once the whole file
     /// has been written.
@@ -97,6 +119,19 @@ impl FileBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runs_from_an_offset_start_inside_its_run_and_go_on_to_the_end() {
+        let (file, _allocator) = file(&[b"abc", b"defg", b"hi"]);
+
+        let from_the_start: Vec<&[u8]> = file.runs_from(0).collect();
+        let from_inside_the_second: Vec<&[u8]> = file.runs_from(4).collect();
+        let from_the_end: Vec<&[u8]> = file.runs_from(9).collect();
+
+        assert_eq!(from_the_start, [&b"abc"[..], b"defg", b"hi"]);
+        assert_eq!(from_inside_the_second, [&b"efg"[..], b"hi"]);
+        assert!(from_the_end.is_empty());
+    }
     use crate::memory::{SlabAllocator, has_memory_context, init_test_free_pool};
 
     /// Everything a writer would put on the wire for `file`, in order.

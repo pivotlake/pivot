@@ -254,6 +254,33 @@ mod uring_backend {
             Ok(())
         }
 
+        /// Pushes one write of several runs onto the submission queue: the
+        /// runs go into the file back to back from `offset`, as a single
+        /// operation. Like any write it may complete short, and the caller
+        /// resumes from where it stopped. `runs` must stay where it is until
+        /// the write completes, because the kernel reads the array itself.
+        pub fn submit_write_vectored(
+            &mut self,
+            fd: RawFd,
+            offset: u64,
+            runs: &[libc::iovec],
+            request_id: Identifier,
+        ) -> Result<()> {
+            let write_op = opcode::Writev::new(types::Fd(fd), runs.as_ptr(), runs.len() as u32)
+                .offset(offset)
+                .build()
+                .user_data(request_id as u64);
+
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&write_op)
+                    .map_err(|_| Error::SubmissionQueueFull)?;
+            }
+
+            Ok(())
+        }
+
         /// Flushes the submission queue to the kernel.
         pub fn submit(&mut self) -> io::Result<usize> {
             self.arm_wake();
@@ -610,6 +637,29 @@ mod pread_pool_backend {
                 sink: self.sink.clone(),
             });
             Ok(())
+        }
+
+        /// Stages one write of several runs, back to back in the file from
+        /// `offset`. This backend puts only the first run on the wire: a
+        /// write may always complete short, and the caller resumes from where
+        /// it stopped, so the rest follows run by run.
+        pub fn submit_write_vectored(
+            &mut self,
+            fd: RawFd,
+            offset: u64,
+            runs: &[libc::iovec],
+            request_id: Identifier,
+        ) -> Result<()> {
+            let first = runs
+                .first()
+                .expect("a vectored write is given at least one run");
+            self.submit_write(
+                fd,
+                offset,
+                first.iov_base as *const u8,
+                first.iov_len,
+                request_id,
+            )
         }
 
         /// Hands every staged op to the pool (non-blocking) and returns how many
