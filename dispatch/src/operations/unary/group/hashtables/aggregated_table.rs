@@ -18,7 +18,7 @@
 
 use crate::RECORD_BATCH_SIZE;
 use crate::io::IORequesterError;
-use crate::memory::{PARTITIONS, SharedPartitionEvictor, SlabAllocator, Spiller};
+use crate::memory::{SharedPartitionEvictor, SlabAllocator, Spiller};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::HashTable;
@@ -687,7 +687,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let spilled = self
             .evictor
             .borrow_mut()
-            .spilled_slabs_by_partition(PARTITIONS);
+            .spilled_slabs_by_partition(self.radix_config.partitions);
         let partition_rows = self
             .buffers
             .map(|buffers| buffers.into_partition_rows(spilled));
