@@ -12,7 +12,6 @@ use crate::OperatorIO;
 use crate::io::{IORequesterError, LocalFile, OpenFile};
 use crate::memory::{FileBytes, WeakSlab, WriteBuffer, memory_ctx};
 use crate::worker::WORKER_IDX;
-use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,6 +25,18 @@ pub use layout::{Dynamic, Fixed, Layout};
 pub use partition_allocator::{PartitionAllocator, PartitionContents, PartitionSlab};
 pub use partition_evictor::{PartitionEvictor, SharedPartitionEvictor};
 pub use partition_tree::PARTITIONS;
+
+/// Spill files are read and written with direct IO, which takes only
+/// operations whose file offset, length and memory address are all multiples
+/// of the device's block size. 4 KiB is a multiple of every block size in
+/// use. So each slab of rows sits at a multiple of this in its buffer and in
+/// its file, and is written and read back padded out to the next multiple.
+pub const SPILL_BLOCK_SIZE: usize = 4096;
+
+/// The bytes a slab of `size` bytes takes in its buffer and in its file.
+pub fn padded_to_spill_block(size: usize) -> usize {
+    size.next_multiple_of(SPILL_BLOCK_SIZE)
+}
 
 /// One partition's rows from a sealed buffer, going to its file as one write.
 pub struct SpillWrite {
@@ -102,12 +113,7 @@ impl<'a> Spiller<'a> {
             path.parent()
                 .expect("a partition file lies in its operator's directory"),
         )?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        LocalFile::new(file)
+        crate::io::create_direct_read_write(&path)
     }
 
     pub(crate) fn set_operator_idx(&mut self, operator_idx: crate::Identifier) {
@@ -185,12 +191,18 @@ mod tests {
             &mut next_request_id,
         );
         let mut spiller = Spiller::new(io);
-        // Three 1KB slabs of one buffer: two for partition 5, one for partition 9.
+        // Three one-block slabs of one buffer: two for partition 5, one for
+        // partition 9.
         let mut buffer = memory_ctx().get_write_buffer(false);
-        buffer.as_mut_slice()[..3072].fill(0xAB);
+        buffer.as_mut_slice()[..3 * SPILL_BLOCK_SIZE].fill(0xAB);
         let buffer = Arc::new(buffer);
         let slab_at = |offset: usize| {
-            Slab::new(unsafe { buffer.ptr.add(offset) }, 1024, buffer.clone()).freeze()
+            Slab::new(
+                unsafe { buffer.ptr.add(offset) },
+                SPILL_BLOCK_SIZE,
+                buffer.clone(),
+            )
+            .freeze()
         };
         let rows_of = |slabs: &[&FrozenSlab]| {
             let mut rows = FileBytes::new();
@@ -199,7 +211,11 @@ mod tests {
                 .for_each(|slab| rows.push_frozen_slab((*slab).clone()));
             rows
         };
-        let (first, second, third) = (slab_at(0), slab_at(1024), slab_at(2048));
+        let (first, second, third) = (
+            slab_at(0),
+            slab_at(SPILL_BLOCK_SIZE),
+            slab_at(2 * SPILL_BLOCK_SIZE),
+        );
         let writes = vec![
             SpillWrite {
                 file: spiller.open_spill_file(5).unwrap(),
@@ -243,8 +259,8 @@ mod tests {
             .unwrap()
             .len()
         };
-        assert_eq!(file_len(5), 2048);
-        assert_eq!(file_len(9), 1024);
+        assert_eq!(file_len(5), 2 * SPILL_BLOCK_SIZE as u64);
+        assert_eq!(file_len(9), SPILL_BLOCK_SIZE as u64);
         // The test's handle and the spilled buffer's: the writes let go of
         // theirs when they landed, and the slab records hold none.
         assert_eq!(Arc::strong_count(&spilled.buffer), 1 + 1);
@@ -256,7 +272,7 @@ mod tests {
                 .iter()
                 .all(|&b| b == 0xAB)
         }));
-        assert!(BUFFER_SIZE >= 3072);
+        assert!(BUFFER_SIZE >= 3 * SPILL_BLOCK_SIZE);
         directory::remove_worker_directory(dataflow, WORKER_IDX.get()).unwrap();
     }
 

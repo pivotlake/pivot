@@ -18,7 +18,9 @@ use crate::memory::spill::layout::Layout;
 use crate::memory::spill::partition_tree::{
     PARTITIONS, PartitionTree, group_of_partition, is_leaf,
 };
-use crate::memory::spill::{SpillWrite, SpilledBuffer, SpilledSlab, Spiller};
+use crate::memory::spill::{
+    SPILL_BLOCK_SIZE, SpillWrite, SpilledBuffer, SpilledSlab, Spiller, padded_to_spill_block,
+};
 use crate::memory::{BUFFER_SIZE, FileBytes, FrozenSlab, Slab, WriteBuffer, memory_ctx};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -136,7 +138,9 @@ impl PartitionGroupSlot {
     }
 
     /// Allocate `size` bytes aligned to `align` from the current buffer,
-    /// taking a first buffer if the slot has none yet.
+    /// taking a first buffer if the slot has none yet. The slab starts on a
+    /// spill block boundary and the buffer is used up to the next one after
+    /// it, so that the slab can be written and read back with direct IO.
     fn allocate_slab(&mut self, size: usize, align: usize) -> SlabAllocation {
         if let PartitionGroupSlot::Unused = self {
             self.start_new_buffer();
@@ -149,8 +153,8 @@ impl PartitionGroupSlot {
         else {
             unreachable!("groups only point at partition group slots that are allocating")
         };
-        let start = next_allocation_offset.next_multiple_of(align);
-        let end = start + size;
+        let start = next_allocation_offset.next_multiple_of(align.max(SPILL_BLOCK_SIZE));
+        let end = start + padded_to_spill_block(size);
         if end > BUFFER_SIZE {
             return SlabAllocation::BufferFull;
         }
@@ -440,8 +444,11 @@ impl<L: Layout> PartitionAllocator<L> {
                     rows: FileBytes::new(),
                 });
             }
+            // The slab goes out padded to the block boundary its allocation
+            // reserved, so the next slab starts on one in the file too.
+            let padded_size = padded_to_spill_block(slab.size());
             let file_offset = self.partitions[partition].bytes_spilled;
-            self.partitions[partition].bytes_spilled += slab.size() as u64;
+            self.partitions[partition].bytes_spilled += padded_size as u64;
             spilled_slabs.push(SpilledSlab {
                 spill_partition_id: partition,
                 file_offset,
@@ -449,11 +456,14 @@ impl<L: Layout> PartitionAllocator<L> {
             });
             // The write holds the slab until it lands; the record above does
             // not, so the buffer's only lasting holder is the spilled buffer.
+            // SAFETY: `allocate_slab` set the padded size aside for this slab
+            // alone when it carved it.
+            let padded_slab = unsafe { slab.widened_to(padded_size) };
             writes
                 .last_mut()
                 .expect("a write was started for this partition just above")
                 .rows
-                .push_frozen_slab(slab);
+                .push_frozen_slab(padded_slab);
         }
         let writes_in_flight = spiller.spill(writes)?;
         Ok(Some(SpilledBuffer {
@@ -501,8 +511,12 @@ impl<L: Layout> PartitionAllocator<L> {
         let size = rows * self.layout.row_size();
         let align = self.layout.row_align();
         assert!(
-            size <= BUFFER_SIZE,
+            padded_to_spill_block(size) <= BUFFER_SIZE,
             "a slab of {rows} rows must fit in one buffer"
+        );
+        assert!(
+            SPILL_BLOCK_SIZE % align == 0,
+            "a row aligned to {align} bytes cannot start every slab on a spill block boundary"
         );
         let node = self.tree.node_of_group(group);
         let (node, allocated) = match self.tree.node_mut(node).allocate_slab(size, align) {

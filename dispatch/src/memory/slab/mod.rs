@@ -138,6 +138,23 @@ impl FrozenSlab {
         unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
     }
 
+    /// A handle over this slab's bytes and the bytes after them in its
+    /// buffer, `size` in all. For a slab whose allocator set aside more of the
+    /// buffer than the slab's rows take, as it does up to a block boundary
+    /// for rows that are written with direct IO.
+    ///
+    /// # Safety
+    /// The `size` bytes from the slab's start must lie inside its buffer, and
+    /// those past the slab's own must belong to no other slab.
+    pub unsafe fn widened_to(&self, size: usize) -> FrozenSlab {
+        assert!(size >= self.size, "a slab is widened, not narrowed");
+        FrozenSlab {
+            ptr: self.ptr,
+            size,
+            _buffer: self._buffer.clone(),
+        }
+    }
+
     /// A handle to this slab that does not keep its buffer alive.
     pub fn downgrade(&self) -> WeakSlab {
         WeakSlab {
