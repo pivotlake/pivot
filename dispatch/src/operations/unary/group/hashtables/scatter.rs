@@ -19,7 +19,7 @@
 use super::hash_table::{PersistedKey, entry_layout};
 use crate::io::{FileRange, IORequesterError, OpenFile, ReadData};
 use crate::memory::{
-    Dynamic, PARTITIONS, PartitionAllocator, PartitionSlab, SpilledBuffer, SpilledSlab, Spiller,
+    Dynamic, PartitionAllocator, PartitionSlab, SpilledBuffer, SpilledSlab, Spiller,
 };
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
@@ -89,8 +89,8 @@ impl<V: AggregationValue + ?Sized> ScatterLayout<V> {
 /// Where a worker scatters rows while it consumes.
 pub struct ScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     allocator: PartitionAllocator<Dynamic>,
-    /// How many partitions rows are scattered into; the allocator can hold
-    /// [`PARTITIONS`], of which only the first this many are used.
+    /// How many partitions rows are scattered into, which the allocator is
+    /// sized for.
     partition_count: usize,
     row_size: usize,
     // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
@@ -99,17 +99,11 @@ pub struct ScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
 
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
     pub fn new(layout: ScatterLayout<V>, partition_count: usize) -> Self {
-        assert!(
-            partition_count <= PARTITIONS,
-            "{partition_count} scatter partitions, more than the {PARTITIONS} the allocator holds"
-        );
         Self {
-            allocator: PartitionAllocator::new(Dynamic::new(
-                layout.stride,
-                layout.align,
-                FIRST_SLAB_BYTES,
-                SLAB_BYTES,
-            )),
+            allocator: PartitionAllocator::new(
+                Dynamic::new(layout.stride, layout.align, FIRST_SLAB_BYTES, SLAB_BYTES),
+                partition_count,
+            ),
             partition_count,
             row_size: layout.stride,
             _phantom: PhantomData,
@@ -156,12 +150,16 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
         self,
         mut spilled: Vec<Vec<SpilledSlab>>,
     ) -> Vec<PartitionRows<KP, V>> {
+        assert_eq!(
+            spilled.len(),
+            self.partition_count,
+            "one spilled-slab list per scatter partition"
+        );
         let row_size = self.row_size;
         self.allocator
             .into_partitions()
             .into_iter()
             .enumerate()
-            .take(self.partition_count)
             .map(|(partition, contents)| {
                 PartitionRows::new(
                     contents.slabs,

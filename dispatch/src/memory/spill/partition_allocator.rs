@@ -243,7 +243,15 @@ pub struct PartitionAllocator<L: Layout> {
 }
 
 impl<L: Layout> PartitionAllocator<L> {
-    pub fn new(layout: L) -> Self {
+    /// An allocator for partitions `0..partition_count`. The per-partition
+    /// state is sized to that count rather than to the `PARTITIONS` ceiling,
+    /// since every worker builds one of these per query and the whole set
+    /// is written and torn down with it.
+    pub fn new(layout: L, partition_count: usize) -> Self {
+        assert!(
+            partition_count <= PARTITIONS,
+            "{partition_count} partitions, more than the {PARTITIONS} the allocator holds"
+        );
         Self {
             layout,
             tree: PartitionTree::new(|| PartitionGroupSlot::Unused),
@@ -253,14 +261,14 @@ impl<L: Layout> PartitionAllocator<L> {
                 spill_file: None,
                 bytes_spilled: 0,
             })
-            .take(PARTITIONS)
+            .take(partition_count)
             .collect(),
             cursors: vec![
                 RowCursor {
                     next_row: std::ptr::null_mut(),
                     rows_left: 0,
                 };
-                PARTITIONS
+                partition_count
             ]
             .into_boxed_slice(),
         }
@@ -331,11 +339,12 @@ impl<L: Layout> PartitionAllocator<L> {
     /// here were never spilled; spilled slabs are the evictor's.
     pub fn into_partitions(self) -> Vec<PartitionContents> {
         let row_size = self.layout.row_size();
-        let open_slab_lens: Vec<usize> = (0..PARTITIONS)
+        let partition_count = self.partitions.len();
+        let open_slab_lens: Vec<usize> = (0..partition_count)
             .map(|partition| self.open_slab_len(partition))
             .collect();
         let mut slabs_by_partition: Vec<Vec<PartitionSlab>> =
-            (0..PARTITIONS).map(|_| Vec::new()).collect();
+            (0..partition_count).map(|_| Vec::new()).collect();
         for partition_group_slot in self.tree.into_nodes() {
             let buffers = match partition_group_slot {
                 PartitionGroupSlot::Allocating { buffers, .. }
@@ -611,7 +620,7 @@ mod tests {
 
     /// `u64` rows in slabs of `ROWS_PER_SLAB`.
     fn small_rows() -> PartitionAllocator<Fixed<u64>> {
-        PartitionAllocator::new(Fixed::new(ROWS_PER_SLAB * 8))
+        PartitionAllocator::new(Fixed::new(ROWS_PER_SLAB * 8), PARTITIONS)
     }
 
     /// A row large enough that a buffer holds only four slabs of
@@ -629,7 +638,7 @@ mod tests {
     }
 
     fn large_rows() -> PartitionAllocator<Fixed<LargeRow>> {
-        PartitionAllocator::new(Fixed::new(BUFFER_SIZE / 4))
+        PartitionAllocator::new(Fixed::new(BUFFER_SIZE / 4), PARTITIONS)
     }
 
     fn buffers_of_slot(
@@ -701,7 +710,7 @@ mod tests {
     fn a_dynamic_layout_hands_out_byte_rows_in_growing_slabs() {
         init_test_free_pool(1);
         let layout = Dynamic::new(24, 8, 2 * 24, 8 * 24);
-        let mut allocator = PartitionAllocator::new(layout);
+        let mut allocator = PartitionAllocator::new(layout, PARTITIONS);
 
         for row in 0..6u8 {
             allocator.reserve(0).fill(row);
