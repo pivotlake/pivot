@@ -75,6 +75,34 @@ pub(super) struct SharedMergeState<K: KeyExtractor, V: AggregationValue + ?Sized
     /// are checked against, and the emitted-group count a plain LIMIT skips
     /// against.
     pub(super) limit_progress: Arc<TopKThreshold>,
+    /// How many jobs have released their partition's scatter buckets. Once
+    /// every job has, the shared state is dropped without walking the
+    /// sources' bucket lists.
+    pub(super) released_jobs: ReleasedJobs,
+}
+
+/// A count of released jobs on a cache line of its own: every job writes it
+/// once, and the fields beside it are read by every job all through the merge.
+#[repr(align(128))]
+#[derive(Default)]
+pub(super) struct ReleasedJobs(AtomicUsize);
+
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> Drop for SharedMergeState<K, V> {
+    /// The job that finishes last drops this on its worker, while the query
+    /// waits for that worker. Every job has released its partition's buckets
+    /// by then unless the merge was abandoned, so the sources' bucket lists
+    /// hold nothing and are let go of unvisited.
+    fn drop(&mut self) {
+        let job_count = self.num_partitions * self.sources.len();
+        if *self.released_jobs.0.get_mut() != job_count {
+            return;
+        }
+        for (buffers, _) in &mut self.sources {
+            for worker_buffers in buffers {
+                worker_buffers.discard_released_lists();
+            }
+        }
+    }
 }
 
 // The sources are read-only for the whole merge and every other field is
@@ -223,6 +251,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         for worker_buffers in buffers {
             worker_buffers.release_partition(self.index, self.shared.num_partitions);
         }
+        self.shared.released_jobs.0.fetch_add(1, Ordering::Relaxed);
     }
 
     fn emit(
