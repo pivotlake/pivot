@@ -125,6 +125,7 @@ impl MemoryContextFactory {
             layout: self.layout,
             evictors: RefCell::new(HashMap::new()),
             buffers_spilled: self.buffers_spilled,
+            own_buffers_spilled: Cell::new(0),
             io_requester: OnceCell::new(),
             spill_writes_in_flight: RefCell::new(HashMap::new()),
             node: self.node,
@@ -160,6 +161,10 @@ pub struct MemoryContext {
     /// node's workers, so a slot one worker is already spilling is not asked
     /// for again by another.
     buffers_spilled: Arc<[AtomicUsize]>,
+    /// The slots this worker itself has handed over for spilling and still
+    /// holds. Only this worker's eviction can take those back, so they are
+    /// what tells one worker's need to spill apart from its siblings'.
+    own_buffers_spilled: Cell<usize>,
     /// The worker's IO requester, attached once the worker has built it, so
     /// that eviction can wait for spill writes to land when nothing else can
     /// be reclaimed. Shared with the worker, which drives it.
@@ -489,7 +494,12 @@ impl MemoryContext {
     /// Reclaimable means free, owned by a cache, or spilled. Cached slots count
     /// because the sweep can take them back at will, and spilled slots count
     /// because eviction can take them once their write lands, so the slots
-    /// that are none of these are the ones operators still hold. The counts
+    /// that are none of these are the ones operators still hold.
+    ///
+    /// A spilled slot can be taken back only by the worker that spilled it, so
+    /// this worker's own spilled slots are added on top of the node's. A worker
+    /// that holds many sees no shortfall and one that holds few sees it first,
+    /// which sends each new spill to the worker with the fewest. The counts
     /// are read at slightly different instants while peers allocate and
     /// release, so the result is approximate by a few slots, which a watermark
     /// tolerates.
@@ -500,7 +510,7 @@ impl MemoryContext {
         let spilled = self.buffers_spilled[self.node].load(Ordering::Relaxed);
         let target =
             self.layout.node_slots(self.node).len() * RECLAIMABLE_SLOTS_TARGET_PERCENT / 100;
-        let reclaimable = free + cached + spilled;
+        let reclaimable = free + cached + spilled + self.own_buffers_spilled.get();
         if reclaimable >= target {
             return 0;
         }
@@ -511,6 +521,8 @@ impl MemoryContext {
     /// [`slots_to_spill`](Self::slots_to_spill) stops asking for them.
     pub fn record_buffers_spilled(&self, count: usize) {
         self.buffers_spilled[self.node].fetch_add(count, Ordering::Relaxed);
+        self.own_buffers_spilled
+            .set(self.own_buffers_spilled.get() + count);
     }
 
     /// Note that `count` spilled slots have been released, so they are no
@@ -521,6 +533,8 @@ impl MemoryContext {
             before >= count,
             "released more spilled buffers than were spilled"
         );
+        self.own_buffers_spilled
+            .set(self.own_buffers_spilled.get() - count);
     }
 
     /// Make `evictors` reachable from this worker's eviction for as long as the
@@ -806,6 +820,18 @@ mod tests {
         assert_eq!(shortfall, 15);
         assert_eq!(while_spilled, 0);
         assert_eq!(after_release, 15);
+    }
+
+    #[test]
+    fn a_workers_own_spilled_slots_count_again_toward_its_target() {
+        // 128 slots, so the target is 25 reclaimable; 10 free, nothing cached.
+        init_test_free_pool(10);
+        memory_ctx().record_buffers_spilled(8);
+
+        let shortfall = memory_ctx().slots_to_spill();
+
+        assert_eq!(shortfall, 0);
+        memory_ctx().record_spilled_buffers_released(8);
     }
 
     #[test]
