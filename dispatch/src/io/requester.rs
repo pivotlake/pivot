@@ -203,6 +203,10 @@ pub struct IORequester {
     /// Local-file operations accepted while their hardware queue was at
     /// capacity, submitted in order as slots free.
     fs_backlog: VecDeque<DataFlowRequest<FsRequest>>,
+    /// Spill writes held back, when `PIVOT_SPILL_WRITES_LAST` keeps them
+    /// apart: they go to the device only once `fs_backlog` is empty, so a
+    /// read never waits behind the worker's own spill writes.
+    spill_write_backlog: VecDeque<DataFlowRequest<FsRequest>>,
     /// This worker's per-device hardware-queue counters, shared with every
     /// worker whose CPU submits into the same queue.
     fs_queues: WorkerHardwareQueues,
@@ -241,6 +245,7 @@ impl IORequester {
             ready_reads: Vec::new(),
             pending_io_requests: Default::default(),
             fs_backlog: VecDeque::new(),
+            spill_write_backlog: VecDeque::new(),
             fs_queues: WorkerHardwareQueues::new(),
             piggybacked_reads: Vec::new(),
             next_id: 0,
@@ -265,6 +270,7 @@ impl IORequester {
             ready_reads: Vec::new(),
             pending_io_requests: Default::default(),
             fs_backlog: VecDeque::new(),
+            spill_write_backlog: VecDeque::new(),
             fs_queues: WorkerHardwareQueues::new(),
             piggybacked_reads: Vec::new(),
             next_id: 0,
@@ -471,6 +477,8 @@ impl IORequester {
         self.piggybacked_reads
             .retain(|request| request.data_flow_id() != data_flow_id);
         self.fs_backlog
+            .retain(|request| request.data_flow_id != data_flow_id);
+        self.spill_write_backlog
             .retain(|request| request.data_flow_id != data_flow_id);
     }
 
@@ -733,7 +741,17 @@ impl IORequester {
                 Some(permit) => permit,
                 None => {
                     self.fs_backlog.push_front(request);
-                    break;
+                    return Ok(());
+                }
+            };
+            self.submit_fs_request_now(request, permit)?;
+        }
+        while let Some(request) = self.spill_write_backlog.pop_front() {
+            let permit = match self.acquire_fs_slot(&request) {
+                Some(permit) => permit,
+                None => {
+                    self.spill_write_backlog.push_front(request);
+                    return Ok(());
                 }
             };
             self.submit_fs_request_now(request, permit)?;
@@ -746,6 +764,17 @@ impl IORequester {
     /// hardware queue is at capacity. Request-owned storage remains alive
     /// until completion.
     fn submit_fs_request_to_backend(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
+        let is_spill_write =
+            matches!(&request.request, FsRequest::Write(write) if write.id.is_spill());
+        if is_spill_write && get_spill_writes_last() {
+            // A spill write never goes ahead of anything already waiting.
+            let nothing_waiting = self.fs_backlog.is_empty() && self.spill_write_backlog.is_empty();
+            if nothing_waiting && let Some(permit) = self.acquire_fs_slot(&request) {
+                return self.submit_fs_request_now(request, permit);
+            }
+            self.spill_write_backlog.push_back(request);
+            return Ok(());
+        }
         match self.acquire_fs_slot(&request) {
             Some(permit) => self.submit_fs_request_now(request, permit),
             None => {
@@ -891,6 +920,7 @@ impl IORequester {
     pub fn has_file_pending(&self) -> bool {
         !self.pending_io_requests.is_empty()
             || !self.fs_backlog.is_empty()
+            || !self.spill_write_backlog.is_empty()
             || self.http.has_disk_pending()
     }
 
@@ -1231,6 +1261,15 @@ impl IORequester {
         select.ready();
         Ok(())
     }
+}
+
+/// Whether `PIVOT_SPILL_WRITES_LAST=1` asks for spill writes to wait behind
+/// every other local-file operation of their worker.
+fn get_spill_writes_last() -> bool {
+    static SPILL_WRITES_LAST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::env::get_tunable(&SPILL_WRITES_LAST, "PIVOT_SPILL_WRITES_LAST", 0, |flag| {
+        flag <= 1
+    }) == 1
 }
 
 /// The cache extent a queued filesystem operation registered, paired with the
