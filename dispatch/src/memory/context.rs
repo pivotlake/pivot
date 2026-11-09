@@ -611,11 +611,18 @@ impl MemoryContext {
         }
     }
 
-    /// Block until the ring reports progress, then count the spill writes
-    /// that landed off their buffers. Every slot this worker could reclaim is
-    /// held by a spilled buffer whose write has not landed yet, so the only
-    /// way forward is to let the writes finish. Runs inside an operator's run,
-    /// so it leaves every other completion for the worker's next pass.
+    /// Block until one of this worker's spill writes may have landed, and
+    /// count the ones that did off their buffers. Every slot this worker could
+    /// reclaim is held by a spilled buffer whose write has not landed yet, so
+    /// the only way forward is to let the writes finish. Runs inside an
+    /// operator's run, so it leaves every other completion for the worker's
+    /// next pass.
+    ///
+    /// A write held back because its device's hardware queue is full is not on
+    /// the ring, and the worker is told through its waker when a slot in that
+    /// queue frees. The waker reaches only a wait that was published to it, so
+    /// the wait is published the way the worker loop publishes its own: a
+    /// worker whose writes are all held back would otherwise never wake.
     fn wait_for_a_spill_write_to_land(&self) {
         let requester = self
             .io_requester
@@ -624,13 +631,36 @@ impl MemoryContext {
         let mut requester = requester
             .try_borrow_mut()
             .expect("eviction does not run from inside the IO requester's own calls");
-        requester
-            .wait()
-            .expect("waiting on the IO ring while evicting");
+        let waker = crate::waker::worker_waker();
+        let node_local_idx = self
+            .layout
+            .topology()
+            .local_index_of_worker(WORKER_IDX.get());
+        // Read before the hardware queues are tried, so a slot that frees
+        // after that makes the wait return at once instead of being missed.
+        let last_seen = waker.ring_wake_count();
+        // Take what the ring already holds, which also puts held-back writes
+        // on the device as far as its queue allows.
+        if self.count_off_landed_spill_writes(&mut requester) {
+            return;
+        }
+        if waker.begin_ring_wait(node_local_idx, last_seen) {
+            let waited = requester.wait();
+            waker.end_ring_wait(node_local_idx);
+            waited.expect("waiting on the IO ring while evicting");
+        }
+        self.count_off_landed_spill_writes(&mut requester);
+    }
+
+    /// Collect the ring's completions and count the spill writes among them
+    /// off their buffers. Returns whether any spill write had landed.
+    fn count_off_landed_spill_writes(&self, requester: &mut IORequester) -> bool {
         requester
             .collect_completions()
             .expect("collecting IO completions while evicting");
-        self.complete_landed_spill_writes(&mut requester);
+        let in_flight_before = self.spill_writes_in_flight.borrow().len();
+        self.complete_landed_spill_writes(requester);
+        self.spill_writes_in_flight.borrow().len() < in_flight_before
     }
 
     /// Ask each registered dataflow's operators for a slot they can give up and
