@@ -65,7 +65,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
     /// only on disk, one per source worker's bucket that has any, then merge
     /// the rows that are in memory while those reads run.
     pub(super) fn start(job: PartitionJob<K, V>, io: &mut OperatorIO) -> unary::Result<Self> {
-        let shared = job.shared.clone();
+        // Borrowed, not cloned: the state is shared by every job of the
+        // dataflow, and a clone per job is a write to its count from every
+        // merging worker at once.
+        let shared = &*job.shared;
         let (buffers, tables) = &shared.sources[job.node];
         let mut reads_in_flight = Vec::new();
         let mut read_allocator: Option<SlabAllocator> = None;
@@ -97,43 +100,43 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
 
         let partition_bits = shared.num_partitions.trailing_zeros();
         let mut allocator = SlabAllocator::new(true);
-        let capacity = shared.partition_capacity.max(DEFAULT_CAPACITY);
-        let table = HashTable::new(
+        let mut capacity = shared.partition_capacity.max(DEFAULT_CAPACITY);
+        let mut table = HashTable::new(
             &mut allocator,
             capacity,
             partition_bits,
             &shared.shared_context,
         );
-        let mut running = Self {
+        let cutoff = job.cutoff();
+        merge_scatter_rows::<K::Stored, V>(
+            &mut table,
+            &mut allocator,
+            &mut capacity,
+            job.index,
+            buffers,
+            shared.num_partitions,
+            &shared.key_arena,
+            &shared.shared_context,
+            cutoff,
+        );
+        merge_tables::<K::Stored, V>(
+            &mut table,
+            &mut allocator,
+            job.index,
+            partition_bits,
+            tables,
+            &shared.key_arena,
+            &shared.shared_context,
+            cutoff,
+        );
+        Ok(Self {
             job,
             reads_in_flight,
             read_allocator,
             allocator,
             table,
             capacity,
-        };
-        merge_scatter_rows::<K::Stored, V>(
-            &mut running.table,
-            &mut running.allocator,
-            &mut running.capacity,
-            running.job.index,
-            buffers,
-            shared.num_partitions,
-            &shared.key_arena,
-            &shared.shared_context,
-            running.job.cutoff(),
-        );
-        merge_tables::<K::Stored, V>(
-            &mut running.table,
-            &mut running.allocator,
-            running.job.index,
-            partition_bits,
-            tables,
-            &shared.key_arena,
-            &shared.shared_context,
-            running.job.cutoff(),
-        );
-        Ok(running)
+        })
     }
 
     /// Merge the rows `read`, one of this job's reads in flight, brought back
