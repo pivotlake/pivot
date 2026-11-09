@@ -41,9 +41,12 @@ use crate::operations::unary::group::output::partition_job::PartitionJob;
 /// land.
 pub(super) struct RunningPartitionMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
     pub(super) job: PartitionJob<K, V>,
-    /// The reads still in flight, by id, each with the bytes it brings. A
-    /// read's rows are merged into `table` as it lands.
-    pub(super) reads_in_flight: ahash::HashMap<ReadRequestId, usize>,
+    /// The reads still in flight, each with the bytes it brings. A read's
+    /// rows are merged into `table` as it lands. A plain list: a job reads
+    /// only the partition's spilled rows, a handful of ranges at most, and
+    /// a hash map's seeding alone would cost every job a write to a counter
+    /// shared by every worker.
+    pub(super) reads_in_flight: Vec<(ReadRequestId, usize)>,
     /// The partition's result so far. The rows in memory go in when the job
     /// starts, the rows read back from disk as each read lands. The table
     /// grows out of `allocator`, and `capacity` is its slot count as it does.
@@ -59,7 +62,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
     pub(super) fn start(job: PartitionJob<K, V>, io: &mut OperatorIO) -> unary::Result<Self> {
         let shared = job.shared.clone();
         let (buffers, tables) = &shared.sources[job.node];
-        let mut reads_in_flight = ahash::HashMap::default();
+        let mut reads_in_flight = Vec::new();
         for worker_buffers in buffers {
             for bucket in worker_buffers.bucket_range(job.index, shared.num_partitions) {
                 worker_buffers.resolve_spilled(bucket);
@@ -70,7 +73,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
                 };
                 let bytes = on_disk.ranges.iter().map(|range| range.len).sum::<usize>();
                 let read = io.read(on_disk.file, on_disk.ranges)?;
-                reads_in_flight.insert(read, bytes);
+                reads_in_flight.push((read, bytes));
             }
         }
 
@@ -132,7 +135,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
     /// the bytes of its reads still in flight, which land in cache slots and
     /// are released as soon as they are merged.
     pub(super) fn memory_bytes(&self) -> usize {
-        self.allocator.bytes_held() + self.reads_in_flight.values().sum::<usize>()
+        self.allocator.bytes_held()
+            + self
+                .reads_in_flight
+                .iter()
+                .map(|(_, bytes)| bytes)
+                .sum::<usize>()
     }
 
     /// Take a finished merge apart into its job and its result table, letting

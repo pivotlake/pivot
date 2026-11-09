@@ -525,9 +525,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
         let running = self
             .running_merges
             .iter_mut()
-            .find(|running| running.reads_in_flight.contains_key(&read))
+            .find(|running| running.reads_in_flight.iter().any(|(id, _)| *id == read))
             .expect("a read response belongs to a running partition job");
-        running.reads_in_flight.remove(&read);
+        running.reads_in_flight.retain(|(id, _)| *id != read);
         running.merge_read_rows(&response.into_locations());
         Ok(())
     }
