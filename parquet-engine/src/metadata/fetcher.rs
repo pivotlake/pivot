@@ -75,11 +75,9 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
 
         // This is the one registration point for a newly-opened descriptor.
         // It prevents stale cache entries from an equal, reused fd serving the
-        // new file. Later logical ranges must not call `open_entry`, because it
-        // intentionally clears the file's old extent map.
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
+        // new file. Later logical ranges must not repeat it, because it
+        // intentionally drops everything cached under the file.
+        memory_ctx().caches().file_reopened(&open_file);
 
         let request = FooterRead::new(file_ref, open_file, size);
         let range = request.probe_range();

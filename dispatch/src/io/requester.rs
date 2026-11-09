@@ -6,10 +6,10 @@ use crate::io::hardware_queues::{InFlightPermit, WorkerHardwareQueues};
 use crate::io::{
     Completion, DataFlowRequest, FailedIO, FileRange, FsDirectReadRequest, FsReadRequest,
     FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest, OpenFile,
-    PendingDirectReadRequest, PendingReadRequest, PendingWriteRequest, ReadData, ReadResponse,
-    RemoteSplit, SlabRead,
+    PendingDirectReadRequest, PendingReadRequest, PendingWriteRequest, ReadData, ReadRequestId,
+    ReadResponse, RemoteSplit, SlabRead,
 };
-use crate::memory::compressed_cache::MissingExtent;
+use crate::memory::cache::MissingExtent;
 use crate::memory::{CacheLookup, FrozenSlab, memory_ctx};
 use crate::stats::StatsCollector;
 use crate::worker::WORKER_IDX;
@@ -121,7 +121,8 @@ impl RangeLookups {
 
 struct PendingRead {
     route: RequestRoute,
-    request: PendingReadRequest,
+    id: ReadRequestId,
+    open_file: OpenFile,
     requested_range_lookups: Vec<RangeLookups>,
     /// Number of physical cache fills this logical request still awaits.
     remaining: usize,
@@ -132,8 +133,8 @@ impl PendingRead {
         RoutedReadResponse {
             route: self.route,
             response: ReadResponse::new(
-                self.request.id,
-                self.request.open_file,
+                self.id,
+                self.open_file,
                 self.requested_range_lookups
                     .into_iter()
                     .map(RangeLookups::into_ready)
@@ -503,7 +504,7 @@ impl IORequester {
 
         for (location, lookups) in request.locations.iter().zip(cache_lookups) {
             for lookup in &lookups {
-                if let Some(block) = lookup.missing() {
+                if let Some(block) = lookup.missing_extent() {
                     let id = self.next_physical_read_id;
                     self.next_physical_read_id += 1;
                     physical_reads.push(match &request.open_file {
@@ -540,7 +541,13 @@ impl IORequester {
 
         let physical_read_ids: Vec<_> =
             physical_reads.iter().map(IORead::pending_read_id).collect();
-        self.track_pending_read(route, request, locations, &physical_read_ids);
+        self.track_pending_read(
+            route,
+            request.id,
+            request.open_file,
+            locations,
+            &physical_read_ids,
+        );
         physical_reads
     }
 
@@ -549,14 +556,16 @@ impl IORequester {
     fn track_pending_read(
         &mut self,
         route: RequestRoute,
-        request: PendingReadRequest,
+        id: ReadRequestId,
+        open_file: OpenFile,
         locations: Vec<RangeLookups>,
         physical_read_ids: &[Identifier],
     ) {
         let remaining = physical_read_ids.len();
         let slot = self.insert_pending_read(PendingRead {
             route,
-            request,
+            id,
+            open_file,
             requested_range_lookups: locations,
             remaining,
         });
@@ -586,13 +595,11 @@ impl IORequester {
         let PendingDirectReadRequest { id, file, reads } = request;
         let mut fs_requests = Vec::with_capacity(reads.len());
         let mut physical_read_ids = Vec::with_capacity(reads.len());
-        let mut ranges = Vec::with_capacity(reads.len());
         let mut tracked = Vec::with_capacity(reads.len());
         for SlabRead { offset, slab } in reads {
             let physical_read_id = self.next_physical_read_id;
             self.next_physical_read_id += 1;
             physical_read_ids.push(physical_read_id);
-            ranges.push(FileRange::new(offset, slab.size()));
             tracked.push(RangeLookups {
                 offset,
                 source: RangeSource::Direct {
@@ -615,11 +622,8 @@ impl IORequester {
         }
         self.track_pending_read(
             route,
-            PendingReadRequest {
-                id,
-                open_file: OpenFile::Local(file),
-                locations: ranges,
-            },
+            id,
+            OpenFile::Local(file),
             tracked,
             &physical_read_ids,
         );
@@ -1299,8 +1303,8 @@ fn submit_rest_of_write(
 /// The cache extent a queued filesystem operation registered, paired with the
 /// file it belongs to, so a failed batch can remove it again. Writes register
 /// nothing.
-/// Resolve each of `request`'s ranges through the compressed cache, one
-/// lookup list per range. This allocates cache slots for the ranges that are
+/// Resolve each of `request`'s ranges through the compressed cache it names,
+/// one lookup list per range. This allocates cache slots for the ranges that are
 /// missing, and allocating can evict, so it runs before the requester is
 /// borrowed: eviction may need the requester to wait on spill writes.
 pub(crate) fn resolve_read_through_cache(request: &PendingReadRequest) -> Vec<Vec<CacheLookup>> {
@@ -1308,9 +1312,11 @@ pub(crate) fn resolve_read_through_cache(request: &PendingReadRequest) -> Vec<Ve
         .locations
         .iter()
         .map(|location| {
-            memory_ctx()
-                .compressed_cache()
-                .get(&request.open_file, location.offset, location.len)
+            memory_ctx().caches().compressed(request.cache).get(
+                &request.open_file,
+                location.offset,
+                location.len,
+            )
         })
         .collect()
 }
@@ -1359,7 +1365,8 @@ mod tests {
         FileRange, HttpGetRequest, HttpUploadRequest, LocalFile, OpenFile, PendingReadRequest,
         ReadRequestId, RemoteFile, open_direct_read,
     };
-    use crate::memory::{BlockKey, init_test_free_pool, memory_ctx};
+    use crate::memory::cache::{CacheKey, DecompressedPageMeta, RingCache};
+    use crate::memory::{init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
@@ -1436,6 +1443,7 @@ mod tests {
             id: ReadRequestId(0),
             open_file,
             locations: vec![FileRange::new(0, 4096)],
+            cache: pages_compressed(),
         }
     }
 
@@ -1455,9 +1463,7 @@ mod tests {
         std::fs::write(&path, &content).unwrap();
         let open_file =
             OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
+        memory_ctx().caches().file_reopened(&open_file);
         let mut requester = IORequester::default();
         requester.force_fs_queue(HardwareQueue::with_capacity(capacity));
 
@@ -1470,6 +1476,7 @@ mod tests {
                         id: ReadRequestId(block),
                         open_file: open_file.clone(),
                         locations: vec![FileRange::new(block * 4096, 4096)],
+                        cache: pages_compressed(),
                     },
                     &mut disabled_stats(),
                 )
@@ -1602,9 +1609,7 @@ mod tests {
         std::fs::write(&path, [vec![1u8; 4096], vec![2u8; 4096]].concat()).unwrap();
         let open_file =
             OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
+        memory_ctx().caches().file_reopened(&open_file);
         let shared_queue = HardwareQueue::with_capacity(1);
         let mut first = IORequester::default();
         let mut second = IORequester::default();
@@ -1619,6 +1624,7 @@ mod tests {
                     id: ReadRequestId(0),
                     open_file: open_file.clone(),
                     locations: vec![FileRange::new(0, 4096)],
+                    cache: pages_compressed(),
                 },
                 &mut disabled_stats(),
             )
@@ -1631,6 +1637,7 @@ mod tests {
                     id: ReadRequestId(1),
                     open_file,
                     locations: vec![FileRange::new(4096, 4096)],
+                    cache: pages_compressed(),
                 },
                 &mut disabled_stats(),
             )
@@ -1668,9 +1675,7 @@ mod tests {
         std::fs::write(&path, vec![7; 4096]).unwrap();
         let open_file =
             OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
+        memory_ctx().caches().file_reopened(&open_file);
         let mut owner = IORequester::default();
         let mut follower = IORequester::default();
 
@@ -1707,9 +1712,7 @@ mod tests {
         std::fs::write(&path, vec![0; 4096]).unwrap();
         let write_only = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         let open_file = OpenFile::Local(LocalFile::new(write_only).unwrap());
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
+        memory_ctx().caches().file_reopened(&open_file);
         let mut owner = IORequester::default();
         let mut follower = IORequester::default();
         let mut retry = IORequester::default();
@@ -1757,9 +1760,7 @@ mod tests {
         std::fs::write(&path, vec![0; 4096]).unwrap();
         let readable = std::fs::File::open(path).unwrap();
         let open_file = OpenFile::Local(LocalFile::new(readable).unwrap());
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
+        memory_ctx().caches().file_reopened(&open_file);
         let mut owner = IORequester::default();
         let mut retry = IORequester::default();
         owner.backend.reject_reads();
@@ -2103,11 +2104,11 @@ mod tests {
         let OpenFile::Remote(remote) = loc else {
             panic!("test fetches over http")
         };
-        let lookups = memory_ctx().compressed_cache().get(loc, offset, len);
+        let lookups = memory_ctx().page_caches().compressed.get(loc, offset, len);
         let mut split = RemoteSplit::default();
         let mut submitted = 0;
         for lookup in &lookups {
-            if let Some(block) = lookup.missing() {
+            if let Some(block) = lookup.missing_extent() {
                 let req = HttpRequest::Get(HttpGetRequest {
                     remote: remote.clone(),
                     block: block.clone(),
@@ -2138,9 +2139,9 @@ mod tests {
     /// Assert `[offset, offset + len)` of `loc` is now a full cache hit holding
     /// the expected pattern.
     fn assert_cached(loc: &OpenFile, offset: usize, len: usize) {
-        let hit = memory_ctx().compressed_cache().get(loc, offset, len);
+        let hit = memory_ctx().page_caches().compressed.get(loc, offset, len);
         assert_eq!(hit.len(), 1);
-        assert!(hit[0].missing().is_none(), "expected a cache hit");
+        assert!(hit[0].missing_extent().is_none(), "expected a cache hit");
         let bytes = hit.into_iter().next().unwrap().into_data();
         assert_eq!(bytes.len(), len);
         for (i, &b) in bytes.iter().enumerate() {
@@ -2156,7 +2157,7 @@ mod tests {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
         let loc = OpenFile::Remote(remote);
-        memory_ctx().compressed_cache().open_entry(loc.clone());
+        memory_ctx().caches().file_reopened(&loc);
 
         let mut requester = IORequester::with_http_config(client_config());
 
@@ -2193,7 +2194,7 @@ mod tests {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
         let loc = OpenFile::Remote(remote);
-        memory_ctx().compressed_cache().open_entry(loc.clone());
+        memory_ctx().caches().file_reopened(&loc);
 
         let mut requester = IORequester::with_http_config(client_config());
 
@@ -2239,10 +2240,10 @@ mod tests {
         let OpenFile::Remote(remote) = loc else {
             panic!("test fetches over http")
         };
-        let lookups = memory_ctx().compressed_cache().get(loc, offset, len);
+        let lookups = memory_ctx().page_caches().compressed.get(loc, offset, len);
         let mut submitted = 0;
         for lookup in &lookups {
-            if let Some(block) = lookup.missing() {
+            if let Some(block) = lookup.missing_extent() {
                 let req = HttpRequest::Get(HttpGetRequest {
                     remote: remote.clone(),
                     block: block.clone(),
@@ -2339,8 +2340,11 @@ mod tests {
         let results = fetch_results(&mut requester, &loc, 0, 4096);
 
         assert!(results.iter().all(|r| r.is_err()), "the read must fail");
-        let lookups = memory_ctx().compressed_cache().get(&loc, 0, 4096);
-        assert!(lookups[0].missing().is_some(), "no block may be committed");
+        let lookups = memory_ctx().page_caches().compressed.get(&loc, 0, 4096);
+        assert!(
+            lookups[0].missing_extent().is_some(),
+            "no block may be committed"
+        );
     }
 
     /// A block-aligned read overhanging the object's end is served clamped by the
@@ -2355,7 +2359,7 @@ mod tests {
         ))
         .unwrap();
         let loc = OpenFile::Remote(Arc::new(RemoteFile::open(url, None, SIZE as u64).unwrap()));
-        memory_ctx().compressed_cache().open_entry(loc.clone());
+        memory_ctx().caches().file_reopened(&loc);
         let mut requester = IORequester::with_http_config(client_config());
 
         fetch(&mut requester, &loc, 4096, SIZE - 4096);
@@ -2376,14 +2380,17 @@ mod tests {
         ))
         .unwrap();
         let loc = OpenFile::Remote(Arc::new(RemoteFile::open(url, None, SIZE as u64).unwrap()));
-        memory_ctx().compressed_cache().open_entry(loc.clone());
+        memory_ctx().caches().file_reopened(&loc);
         let mut requester = IORequester::with_http_config(client_config());
 
         let results = fetch_results(&mut requester, &loc, 0, 2 * 4096);
 
         assert!(results.iter().all(|r| r.is_err()), "the read must fail");
-        let lookups = memory_ctx().compressed_cache().get(&loc, 0, 2 * 4096);
-        assert!(lookups[0].missing().is_some(), "no block may be committed");
+        let lookups = memory_ctx().page_caches().compressed.get(&loc, 0, 2 * 4096);
+        assert!(
+            lookups[0].missing_extent().is_some(),
+            "no block may be committed"
+        );
     }
 
     /// Submit one logical read of `[offset, offset + len)` of `loc` and drive it
@@ -2402,6 +2409,7 @@ mod tests {
                     id: ReadRequestId(0),
                     open_file: loc.clone(),
                     locations: vec![FileRange::new(offset, len)],
+                    cache: pages_compressed(),
                 },
                 &mut disabled_stats(),
             )
@@ -2426,7 +2434,7 @@ mod tests {
         let body: Vec<u8> = (0..size).map(pattern).collect();
         std::fs::write(&path, body).unwrap();
         let loc = OpenFile::Local(open_direct_read(&path).unwrap());
-        memory_ctx().compressed_cache().open_entry(loc.clone());
+        memory_ctx().caches().file_reopened(&loc);
         loc
     }
 
@@ -2461,8 +2469,11 @@ mod tests {
         let result = drive_fs_read(&mut requester, &loc, 4096, 4096);
 
         assert!(result.is_err(), "the read must fail");
-        let lookups = memory_ctx().compressed_cache().get(&loc, 4096, 4096);
-        assert!(lookups[0].missing().is_some(), "no block may be committed");
+        let lookups = memory_ctx().page_caches().compressed.get(&loc, 4096, 4096);
+        assert!(
+            lookups[0].missing_extent().is_some(),
+            "no block may be committed"
+        );
     }
 
     /// A local fill leaving a whole cache block unwritten must fail for the
@@ -2477,8 +2488,11 @@ mod tests {
         let result = drive_fs_read(&mut requester, &loc, 0, 2 * 4096);
 
         assert!(result.is_err(), "the read must fail");
-        let lookups = memory_ctx().compressed_cache().get(&loc, 0, 2 * 4096);
-        assert!(lookups[0].missing().is_some(), "no block may be committed");
+        let lookups = memory_ctx().page_caches().compressed.get(&loc, 0, 2 * 4096);
+        assert!(
+            lookups[0].missing_extent().is_some(),
+            "no block may be committed"
+        );
     }
 
     /// A terminal transport failure surfaces as a `FailedIO`, never a committed
@@ -2521,7 +2535,7 @@ mod tests {
     fn remote_loc(port: u16) -> OpenFile {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let loc = OpenFile::Remote(Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap()));
-        memory_ctx().compressed_cache().open_entry(loc.clone());
+        memory_ctx().caches().file_reopened(&loc);
         loc
     }
 
@@ -2540,7 +2554,7 @@ mod tests {
         let loc = remote_loc(spawn_server(1));
         fetch(&mut requester, &loc, 0, 4096);
         settle(&mut requester);
-        memory_ctx().compressed_cache().clear();
+        memory_ctx().page_caches().compressed.clear();
 
         fetch(&mut requester, &loc, 0, 4096);
         settle(&mut requester);
@@ -2560,7 +2574,7 @@ mod tests {
 
         let cold = fetch_split(&mut requester, &loc, 0, SB);
         settle(&mut requester);
-        memory_ctx().compressed_cache().clear();
+        memory_ctx().page_caches().compressed.clear();
         let warm = fetch_split(&mut requester, &loc, 0, SB);
         settle(&mut requester);
 
@@ -2588,7 +2602,7 @@ mod tests {
         settle(&mut requester);
         fetch(&mut requester, &loc, 2 * SB, SB); // prime block 2, leaving 1 a hole
         settle(&mut requester);
-        memory_ctx().compressed_cache().clear();
+        memory_ctx().page_caches().compressed.clear();
 
         let split = fetch_split(&mut requester, &loc, 0, 3 * SB);
         settle(&mut requester);
@@ -2612,7 +2626,7 @@ mod tests {
         let loc = remote_loc(port);
         fetch(&mut requester, &loc, 0, SB);
         settle(&mut requester);
-        memory_ctx().compressed_cache().clear();
+        memory_ctx().page_caches().compressed.clear();
 
         fetch(&mut requester, &loc, 0, 2 * SB);
         settle(&mut requester);
@@ -2639,7 +2653,7 @@ mod tests {
         settle(&mut requester);
         fetch(&mut requester, &loc, 2 * SB, SB); // prime block 2, leaving 1 a hole
         settle(&mut requester);
-        memory_ctx().compressed_cache().clear();
+        memory_ctx().page_caches().compressed.clear();
 
         fetch(&mut requester, &loc, 0, 3 * SB);
         settle(&mut requester);
@@ -2663,7 +2677,7 @@ mod tests {
         let mut before = requester_with(cache_in(&dir));
         fetch(&mut before, &loc, 0, 4096);
         settle(&mut before);
-        memory_ctx().compressed_cache().clear();
+        memory_ctx().page_caches().compressed.clear();
 
         let mut after = requester_with(cache_in(&dir));
         fetch(&mut after, &loc, 0, 4096);
@@ -2683,9 +2697,7 @@ mod tests {
         std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
         let open_file =
             OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
+        memory_ctx().caches().file_reopened(&open_file);
         (open_file, dir)
     }
 
@@ -2698,6 +2710,7 @@ mod tests {
             id,
             open_file: file,
             locations: locations.into_iter().collect(),
+            cache: pages_compressed(),
         };
         (id, request)
     }
@@ -2745,20 +2758,23 @@ mod tests {
     }
 
     fn cache_decompressed(file: OpenFile, location: FileRange) {
-        let key = BlockKey {
-            open_file: file,
-            offset: location.offset,
-            len: location.len,
-        };
-        let cache = memory_ctx().decompressed_cache();
-        let mut reservation = cache.reserve(&key, 4);
-        reservation.as_mut_slices()[0].copy_from_slice(b"data");
-        cache.insert(
-            key,
-            vec![bytes::Bytes::from_static(b"header")],
-            reservation,
-            Arc::new(AtomicUsize::new(0)),
-        );
+        let key = CacheKey::new(file, location.offset, location.len);
+        memory_ctx()
+            .page_caches()
+            .decompressed
+            .insert(key, |fill| {
+                fill.get_bytes(4)[0].as_mut_slice().copy_from_slice(b"data");
+                Ok::<_, std::convert::Infallible>(DecompressedPageMeta::new(
+                    vec![bytes::Bytes::from_static(b"header")],
+                    Arc::new(AtomicUsize::new(0)),
+                ))
+            })
+            .unwrap();
+    }
+
+    /// The compressed cache page reads go through.
+    fn pages_compressed() -> crate::memory::cache::CacheId {
+        memory_ctx().page_caches().compressed.id()
     }
 
     #[test]
