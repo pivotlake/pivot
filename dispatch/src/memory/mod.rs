@@ -58,7 +58,9 @@ mod read_buffer;
 pub use read_buffer::ReadBuffer;
 
 mod slab;
-pub use slab::{FrozenSlab, MultiSlabBuffer, Slab, SlabAllocator, SlabBuffer, SlabVec, WeakSlab};
+pub use slab::{
+    FrozenSlab, MultiSlabBuffer, Slab, SlabAllocator, SlabBuffer, SlabList, SlabVec, WeakSlab,
+};
 pub(crate) use slab::{HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabTopK, slots_per_slab};
 
 mod reader;

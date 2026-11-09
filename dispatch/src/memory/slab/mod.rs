@@ -35,6 +35,9 @@ pub use multi_slab_buffer::MultiSlabBuffer;
 mod slab_vec;
 pub use slab_vec::SlabVec;
 
+mod slab_list;
+pub use slab_list::SlabList;
+
 mod slab_top_k;
 pub(crate) use slab_top_k::{HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabTopK, slots_per_slab};
 

@@ -19,8 +19,8 @@
 use super::hash_table::{PersistedKey, entry_layout, prefetch_l1_line};
 use crate::io::{FileRange, IORequesterError, OpenFile, ReadData};
 use crate::memory::{
-    Dynamic, FrozenSlab, NO_SLAB, PartitionAllocator, PartitionSlab, SlabEntry, SpilledBuffer,
-    SpilledSlab, Spiller,
+    Dynamic, FrozenSlab, NO_SLAB, PartitionAllocator, PartitionSlab, SlabEntry, SlabList,
+    SpilledBuffer, SpilledSlab, Spiller,
 };
 use crate::operations::unary::group::values::AggregationValue;
 use std::cell::UnsafeCell;
@@ -154,20 +154,21 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
             "one spilled-slab list per scatter partition, or none when nothing spilled"
         );
         let row_size = self.row_size;
-        let (slabs, contents) = self.allocator.into_partitions();
+        let (slabs, contents, mut list_allocator) = self.allocator.into_partitions();
         let mut spilled = spilled.into_iter();
-        let partitions = contents
-            .into_iter()
-            .map(|contents| {
-                PartitionRows::new(
+        let mut partitions = SlabList::new();
+        for contents in contents {
+            partitions.push(
+                &mut list_allocator,
+                Some(PartitionRows::new(
                     contents.first_slab,
                     contents.rows,
                     spilled.next().unwrap_or_default(),
                     contents.spill_file,
                     row_size,
-                )
-            })
-            .collect();
+                )),
+            );
+        }
         ScatteredRows { slabs, partitions }
     }
 }
@@ -176,9 +177,17 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
 /// list with each partition's slabs chained (see [`SlabEntry`]), and each
 /// partition's rows, which know the partition's first slab. An entry's slab
 /// is `None` once it has been released.
+///
+/// Both lists live in ring memory the worker took while it consumed (see
+/// [`SlabList`]): the merge drops them on whichever worker finishes last, and
+/// two heap blocks per worker, each allocated on another thread, would make
+/// that a serial tail growing with the worker count.
 pub struct ScatteredRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
-    pub slabs: Vec<SlabEntry>,
-    pub partitions: Vec<PartitionRows<KP, V>>,
+    pub slabs: SlabList<SlabEntry>,
+    /// Every partition's rows, each `Some`: the merge takes a partition's
+    /// rows out of the list when it lets go of them, without rebuilding the
+    /// list.
+    pub partitions: SlabList<Option<PartitionRows<KP, V>>>,
 }
 
 /// The rows of one partition that exist only on disk: ranges of the
@@ -265,7 +274,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
     /// of `PartitionBuffers`).
     fn slabs<'a>(
         &'a self,
-        slabs: &'a [UnsafeCell<SlabEntry>],
+        slabs: &'a SlabList<UnsafeCell<SlabEntry>>,
     ) -> impl Iterator<Item = (&'a FrozenSlab, usize)> + 'a {
         let mut next = self.first_slab;
         let chain = std::iter::from_fn(move || {
@@ -276,7 +285,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
                 // close, so the next one is a cache miss; fetching it now
                 // hides the miss under the scan of this slab's rows.
                 if next != NO_SLAB {
-                    prefetch_l1_line(slabs.as_ptr().wrapping_add(next as usize) as *const u8);
+                    prefetch_l1_line(slabs.ptr_at_index(next as usize) as *const u8);
                 }
                 if let Some(slab) = &entry.slab {
                     return Some((slab, entry.rows));
@@ -345,7 +354,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
     #[inline(always)]
     pub fn for_each(
         &self,
-        slabs: &[UnsafeCell<SlabEntry>],
+        slabs: &SlabList<UnsafeCell<SlabEntry>>,
         layout: ScatterLayout<V>,
         mut f: impl FnMut(u64, &KP, &V),
     ) {
@@ -430,7 +439,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
     #[inline(always)]
     pub fn for_each_prefetched<const AHEAD: usize>(
         &self,
-        slabs: &[UnsafeCell<SlabEntry>],
+        slabs: &SlabList<UnsafeCell<SlabEntry>>,
         layout: ScatterLayout<V>,
         mut f: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>),
     ) {

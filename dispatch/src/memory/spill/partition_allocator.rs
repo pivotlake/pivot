@@ -19,7 +19,9 @@ use crate::memory::spill::partition_tree::{
     PARTITIONS, PartitionTree, group_of_partition, is_leaf,
 };
 use crate::memory::spill::{SpillWrite, SpilledBuffer, SpilledSlab, Spiller};
-use crate::memory::{BUFFER_SIZE, FileBytes, FrozenSlab, Slab, WriteBuffer, memory_ctx};
+use crate::memory::{
+    BUFFER_SIZE, FileBytes, FrozenSlab, Slab, SlabAllocator, SlabList, WriteBuffer, memory_ctx,
+};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -262,8 +264,13 @@ pub struct PartitionAllocator<L: Layout> {
     /// Each partition's cursor into its open slab, indexed like `partitions`.
     cursors: Box<[RowCursor]>,
     /// Every closed slab, in the order they closed, each chained to its
-    /// partition's next (see [`SlabEntry`]).
-    closed: Vec<SlabEntry>,
+    /// partition's next (see [`SlabEntry`]). Kept in ring memory rather than
+    /// on the heap: the list outlives the allocator and is dropped by
+    /// whichever thread finishes reading the partitions last.
+    closed: SlabList<SlabEntry>,
+    /// Where `closed` takes its chunks from. It shares no buffer with the
+    /// rows, so the list never keeps a spilled buffer resident.
+    list_allocator: SlabAllocator,
 }
 
 impl<L: Layout> PartitionAllocator<L> {
@@ -298,7 +305,8 @@ impl<L: Layout> PartitionAllocator<L> {
                 partition_count
             ]
             .into_boxed_slice(),
-            closed: Vec::new(),
+            closed: SlabList::new(),
+            list_allocator: SlabAllocator::new(false),
         }
     }
 
@@ -371,7 +379,11 @@ impl<L: Layout> PartitionAllocator<L> {
     /// and every worker flushes at once, on the query's critical path. A
     /// spilled slab's entry stays in its chain with no slab; its rows are
     /// the evictor's.
-    pub fn into_partitions(self) -> (Vec<SlabEntry>, Vec<PartitionContents>) {
+    ///
+    /// The slab list lives in ring memory, and the allocator it was built
+    /// from is returned with it so the caller can put a per-partition list
+    /// of its own in the same buffer.
+    pub fn into_partitions(self) -> (SlabList<SlabEntry>, Vec<PartitionContents>, SlabAllocator) {
         let partition_count = self.partitions.len();
         let open_slab_lens: Vec<usize> = (0..partition_count)
             .map(|partition| self.open_slab_len(partition))
@@ -379,6 +391,7 @@ impl<L: Layout> PartitionAllocator<L> {
         let Self {
             partitions,
             mut closed,
+            mut list_allocator,
             ..
         } = self;
         let contents = partitions
@@ -391,12 +404,15 @@ impl<L: Layout> PartitionAllocator<L> {
                     && open_slab_len > 0
                 {
                     let entry = closed.len() as u32;
-                    closed.push(SlabEntry {
-                        slab: Some(open_slab.slab.freeze()),
-                        rows: open_slab_len,
-                        partition: partition_idx,
-                        next: NO_SLAB,
-                    });
+                    closed.push(
+                        &mut list_allocator,
+                        SlabEntry {
+                            slab: Some(open_slab.slab.freeze()),
+                            rows: open_slab_len,
+                            partition: partition_idx,
+                            next: NO_SLAB,
+                        },
+                    );
                     if partition.last_closed == NO_SLAB {
                         partition.first_closed = entry;
                     } else {
@@ -412,7 +428,7 @@ impl<L: Layout> PartitionAllocator<L> {
                 }
             })
             .collect();
-        (closed, contents)
+        (closed, contents, list_allocator)
     }
 
     /// Spill the next sealed buffer through `spiller`, one write per partition
@@ -534,12 +550,15 @@ impl<L: Layout> PartitionAllocator<L> {
             );
         let entry = self.closed.len() as u32;
         group_buffer.closed.push(entry);
-        self.closed.push(SlabEntry {
-            slab: Some(full.slab.freeze()),
-            rows: full.rows,
-            partition,
-            next: NO_SLAB,
-        });
+        self.closed.push(
+            &mut self.list_allocator,
+            SlabEntry {
+                slab: Some(full.slab.freeze()),
+                rows: full.rows,
+                partition,
+                next: NO_SLAB,
+            },
+        );
         let partition = &mut self.partitions[partition];
         if partition.last_closed == NO_SLAB {
             partition.first_closed = entry;
@@ -726,7 +745,7 @@ mod tests {
 
     #[test]
     fn a_partition_fills_one_slab_before_starting_the_next() {
-        init_test_free_pool(1);
+        init_test_free_pool(2);
         let mut allocator = small_rows();
 
         for value in 0..ROWS_PER_SLAB as u64 + 1 {
@@ -751,7 +770,7 @@ mod tests {
 
     #[test]
     fn a_full_slab_is_closed_on_the_reserve_that_fills_it() {
-        init_test_free_pool(1);
+        init_test_free_pool(2);
         let mut allocator = small_rows();
 
         for value in 0..ROWS_PER_SLAB as u64 {
@@ -765,7 +784,7 @@ mod tests {
 
     #[test]
     fn a_dynamic_layout_hands_out_byte_rows_in_growing_slabs() {
-        init_test_free_pool(1);
+        init_test_free_pool(2);
         let layout = Dynamic::new(24, 8, 2 * 24, 8 * 24);
         let mut allocator = PartitionAllocator::new(layout, PARTITIONS);
 
@@ -788,7 +807,7 @@ mod tests {
 
     #[test]
     fn partitions_of_every_group_share_the_root_buffer_at_first() {
-        init_test_free_pool(1);
+        init_test_free_pool(2);
         let mut allocator = small_rows();
 
         allocator.reserve(0).write(1);
@@ -805,7 +824,7 @@ mod tests {
 
     #[test]
     fn an_inner_node_whose_buffer_is_full_splits_its_groups_between_its_children() {
-        init_test_free_pool(3);
+        init_test_free_pool(4);
         let mut allocator = large_rows();
         fill_and_split_root(&mut allocator);
 
@@ -863,7 +882,7 @@ mod tests {
 
     #[test]
     fn a_buffer_still_being_allocated_from_is_never_sealed() {
-        init_test_free_pool(1);
+        init_test_free_pool(2);
         let mut allocator = small_rows();
 
         for value in 0..ROWS_PER_SLAB as u64 {

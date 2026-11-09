@@ -18,7 +18,7 @@
 
 use crate::RECORD_BATCH_SIZE;
 use crate::io::IORequesterError;
-use crate::memory::{NO_SLAB, SharedPartitionEvictor, SlabAllocator, SlabEntry, Spiller};
+use crate::memory::{NO_SLAB, SharedPartitionEvictor, SlabAllocator, SlabEntry, SlabList, Spiller};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::HashTable;
@@ -92,11 +92,10 @@ pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized> {
     /// [`with_bucket`](Self::with_bucket) and empties its entries when it
     /// releases the bucket, so the slabs' memory goes back as each partition
     /// merges while this one list lives as long as the pool.
-    /// A vector rather than a boxed slice: the list arrives with spare
-    /// capacity from growing during consume, and trimming it would copy
-    /// the whole list into fresh memory at flush.
-    slabs: Vec<UnsafeCell<SlabEntry>>,
-    buckets: Vec<UnsafeCell<Option<PartitionRows<KP, V>>>>,
+    /// Both lists are in ring memory (see [`ScatteredRows`]), so letting go
+    /// of them frees no heap block of another thread's.
+    slabs: SlabList<UnsafeCell<SlabEntry>>,
+    buckets: SlabList<UnsafeCell<Option<PartitionRows<KP, V>>>>,
     /// Rows across every bucket, counted by the flushing worker so the merge
     /// coordinator sums one number per worker rather than walking the
     /// pool's buckets.
@@ -112,13 +111,10 @@ unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Sync for PartitionBu
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
     pub fn new(scattered: ScatteredRows<KP, V>) -> Self {
         let ScatteredRows { slabs, partitions } = scattered;
-        let total_rows = partitions.iter().map(|bucket| bucket.len()).sum();
+        let total_rows = partitions.iter().flatten().map(|bucket| bucket.len()).sum();
         Self {
-            slabs: slabs.into_iter().map(UnsafeCell::new).collect(),
-            buckets: partitions
-                .into_iter()
-                .map(|bucket| UnsafeCell::new(Some(bucket)))
-                .collect(),
+            slabs: slabs.into_cells(),
+            buckets: partitions.into_cells(),
             total_rows,
         }
     }
@@ -162,7 +158,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
     pub fn with_bucket<R>(
         &self,
         index: usize,
-        f: impl FnOnce(&PartitionRows<KP, V>, &[UnsafeCell<SlabEntry>]) -> R,
+        f: impl FnOnce(&PartitionRows<KP, V>, &SlabList<UnsafeCell<SlabEntry>>) -> R,
     ) -> R {
         // SAFETY: only the bucket's own partition job reaches this cell and
         // the entries of the bucket's chain (see the `Sync` impl), and it
@@ -197,24 +193,22 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionBuffers<KP, V> {
     /// every worker together are megabytes last written on other cores, read
     /// by whichever worker happens to drop the merge's shared state.
     pub fn discard_released_lists(&mut self) {
+        // SAFETY (both assertions): `&mut self`, so no job reaches a cell.
         debug_assert!(
             self.buckets
-                .iter_mut()
-                .all(|bucket| bucket.get_mut().is_none()),
+                .iter()
+                .all(|bucket| unsafe { &*bucket.get() }.is_none()),
             "every bucket is released before the lists are discarded"
         );
         debug_assert!(
             self.slabs
-                .iter_mut()
-                .all(|entry| entry.get_mut().slab.is_none()),
+                .iter()
+                .all(|entry| unsafe { &*entry.get() }.slab.is_none()),
             "releasing every bucket empties every slab entry"
         );
-        // SAFETY: zero is within both lists' lengths. Shrinking a list without
-        // dropping its elements only leaks what they own, which is nothing.
-        unsafe {
-            self.buckets.set_len(0);
-            self.slabs.set_len(0);
-        }
+        // Forgetting the elements only leaks what they own, which is nothing.
+        self.buckets.forget_elements();
+        self.slabs.forget_elements();
     }
 }
 
@@ -744,6 +738,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 scattered
                     .partitions
                     .iter()
+                    .flatten()
                     .map(|rows| rows.len() as u64)
                     .collect(),
             ),
