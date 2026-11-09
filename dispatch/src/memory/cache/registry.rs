@@ -17,7 +17,9 @@
 
 use crate::io::OpenFile;
 use crate::memory::WriteBuffer;
+use crate::memory::cache::cached::Cached;
 use crate::memory::cache::compressed::CompressedCache;
+use crate::memory::cache::derived_cache::Cache;
 use crate::memory::cache::family::FamilySpec;
 use crate::memory::cache::id::{CacheId, CachePolicy, CacheSet};
 use crate::memory::cache::ring_cache::RingCache;
@@ -123,99 +125,181 @@ impl Caches {
     }
 }
 
-/// Assembles a [`Caches`]. Ids are handed out before the caches exist, since
-/// each cache is built knowing its own id:
+/// Assembles a [`Caches`], one family at a time. The builder constructs each
+/// cache itself, so a cache gets its id, its place in the registry and its
+/// family membership in a single call:
 ///
 /// ```text
-///   let id = builder.declare(policy);             // reserve the id
-///   let cache = Arc::new(Cache::<V>::new(id, ..)); // build the cache with it
-///   builder.install(cache);                        // register it under that id
-///   builder.family([(id, 100)]);                   // say who it shares bytes with
+///   let mut builder = CachesBuilder::new(slot_count);
+///   let pages = builder.add_family(|family| PageCaches {
+///       compressed: family.add_compressed(compressed_policy, 30),
+///       decompressed: family.add_derived(decompressed_policy, 70, "KILL_SWITCH"),
+///   });
+///   let caches = builder.build();
 /// ```
-#[derive(Default)]
 pub struct CachesBuilder {
+    slot_count: usize,
+    caches: Vec<Arc<dyn RingCache>>,
     policies: Vec<CachePolicy>,
-    caches: Vec<Option<Arc<dyn RingCache>>>,
     compressed: Vec<Option<Arc<CompressedCache>>>,
     families: Vec<FamilySpec>,
+    family_of: Vec<usize>,
 }
 
 impl CachesBuilder {
-    pub fn new() -> Self {
-        Self::default()
+    /// `slot_count` is the size of the ring every cache will pack into.
+    pub fn new(slot_count: usize) -> Self {
+        Self {
+            slot_count,
+            caches: Vec::new(),
+            policies: Vec::new(),
+            compressed: Vec::new(),
+            families: Vec::new(),
+            family_of: Vec::new(),
+        }
     }
 
-    /// Reserve the id the next cache will be built with.
-    pub fn declare(&mut self, policy: CachePolicy) -> CacheId {
-        assert!(
-            self.policies.len() < CacheId::MAX_CACHES,
-            "too many caches declared"
-        );
-        let id = CacheId::new(self.policies.len() as u8);
-        self.policies.push(policy);
-        self.caches.push(None);
-        self.compressed.push(None);
-        id
-    }
-
-    /// Register a derived cache under the id it was built with.
-    pub fn install(&mut self, cache: Arc<dyn RingCache>) {
-        let index = cache.id().index();
-        assert!(
-            self.caches[index].is_none(),
-            "cache {index} installed twice"
-        );
-        self.caches[index] = Some(cache);
-    }
-
-    /// Register a compressed cache, keeping a typed handle for the IO path.
-    pub fn install_compressed(&mut self, cache: Arc<CompressedCache>) {
-        self.compressed[cache.id().index()] = Some(cache.clone());
-        self.install(cache);
-    }
-
-    pub fn family(&mut self, members: impl IntoIterator<Item = (CacheId, u8)>) {
+    /// Add one family. `declare` adds the family's members through the
+    /// [`FamilyBuilder`] it is handed and returns whatever it assembled from
+    /// their handles, which is passed back to the caller. The members' target
+    /// shares must sum to 100.
+    pub fn add_family<Handles>(
+        &mut self,
+        declare: impl FnOnce(&mut FamilyBuilder) -> Handles,
+    ) -> Handles {
+        let mut family = FamilyBuilder {
+            builder: self,
+            members: Vec::new(),
+        };
+        let handles = declare(&mut family);
+        let members = family.members;
         self.families.push(FamilySpec::new(members));
+        handles
     }
 
-    /// Every declared id must be installed and belong to exactly one family.
     pub fn build(self) -> Caches {
-        let caches: Vec<Arc<dyn RingCache>> = self
-            .caches
-            .into_iter()
-            .enumerate()
-            .map(|(index, cache)| cache.unwrap_or_else(|| panic!("cache {index} never installed")))
-            .collect();
-        let mut family_of = vec![usize::MAX; caches.len()];
-        for (family_index, family) in self.families.iter().enumerate() {
-            for member in family.members() {
-                assert!(
-                    member.index() < caches.len(),
-                    "family names an undeclared cache"
-                );
-                assert_eq!(
-                    family_of[member.index()],
-                    usize::MAX,
-                    "cache {} is in two families",
-                    self.policies[member.index()].name
-                );
-                family_of[member.index()] = family_index;
-            }
-        }
-        for (index, family) in family_of.iter().enumerate() {
-            assert_ne!(
-                *family,
-                usize::MAX,
-                "cache {} is in no family",
-                self.policies[index].name
-            );
-        }
         Caches {
-            caches,
+            caches: self.caches,
             policies: self.policies,
             compressed: self.compressed,
             families: self.families,
-            family_of,
+            family_of: self.family_of,
         }
+    }
+
+    /// The id the next cache added will be built with.
+    fn next_id(&self) -> CacheId {
+        assert!(
+            self.caches.len() < CacheId::MAX_CACHES,
+            "too many caches added"
+        );
+        CacheId::new(self.caches.len() as u8)
+    }
+}
+
+/// The members of one family, while it is being added to a [`CachesBuilder`].
+pub struct FamilyBuilder<'a> {
+    builder: &'a mut CachesBuilder,
+    members: Vec<(CacheId, u8)>,
+}
+
+impl FamilyBuilder<'_> {
+    /// Add a cache of raw file bytes that should hold `target_share_pct` of
+    /// the family's slots.
+    pub fn add_compressed(
+        &mut self,
+        policy: CachePolicy,
+        target_share_pct: u8,
+    ) -> Arc<CompressedCache> {
+        let id = self.builder.next_id();
+        let cache = Arc::new(CompressedCache::new(id, self.builder.slot_count));
+        self.register_member(policy, target_share_pct, cache.clone(), Some(cache.clone()));
+        cache
+    }
+
+    /// Add a cache of the derived form `V` that should hold
+    /// `target_share_pct` of the family's slots. `kill_switch` names the
+    /// environment variable that disables it.
+    pub fn add_derived<V: Cached>(
+        &mut self,
+        policy: CachePolicy,
+        target_share_pct: u8,
+        kill_switch: &str,
+    ) -> Arc<Cache<V>> {
+        let id = self.builder.next_id();
+        let cache = Arc::new(Cache::new(id, self.builder.slot_count, kill_switch));
+        self.register_member(policy, target_share_pct, cache.clone(), None);
+        cache
+    }
+
+    /// Record `cache` in the registry and as a member of this family.
+    /// `compressed` is its typed handle when it holds raw file bytes.
+    fn register_member(
+        &mut self,
+        policy: CachePolicy,
+        target_share_pct: u8,
+        cache: Arc<dyn RingCache>,
+        compressed: Option<Arc<CompressedCache>>,
+    ) {
+        self.members.push((cache.id(), target_share_pct));
+        self.builder.family_of.push(self.builder.families.len());
+        self.builder.policies.push(policy);
+        self.builder.compressed.push(compressed);
+        self.builder.caches.push(cache);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::cache::sparse_index::SparseIndex;
+
+    fn policy(name: &'static str) -> CachePolicy {
+        CachePolicy {
+            name,
+            lives_at_insert: 1,
+            lives_per_touch: 1,
+            lives_at_reinforce: 1,
+        }
+    }
+
+    #[test]
+    fn caches_added_to_one_family_are_siblings() {
+        let mut builder = CachesBuilder::new(4);
+
+        let (compressed, decoded) = builder.add_family(|family| {
+            (
+                family.add_compressed(policy("compressed"), 30),
+                family.add_derived::<SparseIndex>(policy("decoded"), 70, "TEST_KILL_SWITCH"),
+            )
+        });
+        let caches = builder.build();
+
+        let siblings: Vec<CacheId> = caches
+            .family_of(compressed.id())
+            .siblings_of(compressed.id())
+            .collect();
+        assert_eq!(siblings, vec![decoded.id()]);
+    }
+
+    #[test]
+    fn caches_added_to_different_families_are_not_siblings() {
+        let mut builder = CachesBuilder::new(4);
+
+        let first = builder.add_family(|family| family.add_compressed(policy("first"), 100));
+        let second = builder.add_family(|family| family.add_compressed(policy("second"), 100));
+        let caches = builder.build();
+
+        assert_ne!(first.id(), second.id());
+        assert!(!caches.family_of(first.id()).contains(second.id()));
+        assert_eq!(caches.name(second.id()), "second");
+    }
+
+    #[test]
+    #[should_panic(expected = "sum to 100")]
+    fn a_family_whose_shares_do_not_sum_to_one_hundred_is_rejected() {
+        let mut builder = CachesBuilder::new(4);
+
+        builder.add_family(|family| family.add_compressed(policy("lonely"), 30));
     }
 }
