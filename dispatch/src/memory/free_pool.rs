@@ -130,6 +130,7 @@ impl FreePool {
     /// 1. Pop from the local LIFO deque (cheapest – no contention).
     /// 2. Drain the per-worker injector (buffers returned by other threads).
     /// 3. If `steal`, steal from another worker's deque (round-robin from `last_stealer_idx`).
+    /// 4. If `steal`, take from a node sibling's injector.
     ///
     /// Callers pass `steal=false` for opportunistic background work (e.g. idle-time
     /// dirty-buffer cleanup) so they don't pull buffers off peer workers that may
@@ -146,7 +147,7 @@ impl FreePool {
 
     /// `pop` without the count. Every source consulted here belongs to this
     /// worker's node: its own deque and injector, and its node siblings'
-    /// deques.
+    /// deques and injectors.
     fn pop_from_deques(&self, steal: bool) -> Option<usize> {
         if let Some(idx) = self.worker.pop() {
             return Some(idx);
@@ -177,6 +178,26 @@ impl FreePool {
             // slots exist.
             while !stealer.is_empty() {
                 match stealer.steal() {
+                    Steal::Success(idx) => return Some(idx),
+                    Steal::Retry => continue,
+                    Steal::Empty => break,
+                }
+            }
+        }
+
+        // A slot released by a worker other than its home worker waits in the
+        // home worker's injector, which that worker empties only when it pops
+        // itself. While it is parked or busy the slot is free but out of
+        // reach, so a worker that found nothing else takes from its siblings'
+        // injectors too, before it goes on to evict.
+        let own_worker = WORKER_IDX.get();
+        for sibling in self.layout.topology().node_siblings(own_worker) {
+            if sibling == own_worker {
+                continue;
+            }
+            let sibling_injector = &self.injectors[sibling];
+            while !sibling_injector.is_empty() {
+                match sibling_injector.steal() {
                     Steal::Success(idx) => return Some(idx),
                     Steal::Retry => continue,
                     Steal::Empty => break,
@@ -219,7 +240,7 @@ impl FreePool {
 mod tests {
     //! Tests at the [`FreePool`] / [`PoolFactory`] level: routing within a
     //! single pool, cross-worker routing through the shared injectors, and
-    //! work-stealing from sibling deques.
+    //! work-stealing from sibling deques and injectors.
     //!
     //! Anything that mixes a *zeroed* and a *dirty* pool — preference,
     //! fallback — lives in [`crate::memory::context`]'s tests instead, because
@@ -331,6 +352,19 @@ mod tests {
 
         // Assert: pool0 steals from pool1's deque.
         assert_eq!(popped, Some(1));
+    }
+
+    #[test]
+    fn pop_takes_from_a_siblings_injector_when_nothing_else_is_free() {
+        // Slot 0's home is worker 0; released by worker 1, it waits in worker
+        // 0's injector.
+        let pools = build_pools(2);
+        act_as_worker(1, 2);
+        pools[1].push(0);
+
+        let popped_by_the_releaser = pools[1].pop(true);
+
+        assert_eq!(popped_by_the_releaser, Some(0));
     }
 
     /// One pool per worker of a 2-node topology with 1 worker per node and 2
