@@ -159,7 +159,7 @@ impl Unary<FileSlice, LoadedObject> for ObjectFetcher {
         memory_ctx().caches().file_reopened(&open_file);
         // One range, however large: the ring tiles it into cache slots
         // itself, as it does a column chunk of any size.
-        let id = io.read(open_file, [range])?;
+        let id = io.read(&memory_ctx().page_caches().compressed, open_file, [range])?;
         self.in_flight.insert(id, (file, range));
         Ok(())
     }

@@ -7,7 +7,7 @@
 
 use super::{LocalFile, OpenFile};
 use crate::io::requester::resolve_read_through_cache;
-use crate::memory::cache::{CacheId, RingCache};
+use crate::memory::cache::{CacheId, CompressedCache, RingCache};
 use crate::memory::{FileBytes, Slab};
 use bytes::Bytes;
 use std::cell::RefCell;
@@ -183,21 +183,11 @@ impl<'a> OperatorIO<'a> {
         }
     }
 
-    /// Read Parquet page bytes: through the pages family's compressed cache.
-    pub fn read(
-        &mut self,
-        open_file: OpenFile,
-        locations: impl IntoIterator<Item = FileRange>,
-    ) -> Result<ReadRequestId, crate::io::IORequesterError> {
-        let pages = crate::memory::memory_ctx().page_caches().compressed.id();
-        self.read_through(pages, open_file, locations)
-    }
-
     /// Read file bytes through the compressed cache `cache`, so what the read
     /// brings in is cached beside that cache's family.
-    pub fn read_through(
+    pub fn read(
         &mut self,
-        cache: CacheId,
+        cache: &CompressedCache,
         open_file: OpenFile,
         locations: impl IntoIterator<Item = FileRange>,
     ) -> Result<ReadRequestId, crate::io::IORequesterError> {
@@ -207,7 +197,7 @@ impl<'a> OperatorIO<'a> {
             id,
             open_file,
             locations: locations.into_iter().collect(),
-            cache,
+            cache: cache.id(),
         };
         // Resolving may allocate cache slots, and so evict, before the borrow.
         let cache_lookups = resolve_read_through_cache(&request);
