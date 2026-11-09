@@ -5,9 +5,9 @@
 //! worker's requester performs those physical tasks the moment the operator
 //! asks, through the [`OperatorIO`] handle dispatch wraps around each call.
 
-use super::OpenFile;
+use super::{LocalFile, OpenFile};
 use crate::io::requester::resolve_read_through_cache;
-use crate::memory::FileBytes;
+use crate::memory::{FileBytes, Slab};
 use bytes::Bytes;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -118,6 +118,21 @@ pub struct PendingReadRequest {
     pub locations: Vec<FileRange>,
 }
 
+/// One range of a direct read: the `slab.size()` bytes at `offset` of the
+/// file, read into `slab`.
+pub struct SlabRead {
+    pub offset: usize,
+    pub slab: Slab,
+}
+
+/// A logical read of a local file around the compressed cache, into slabs
+/// the reader supplies.
+pub struct PendingDirectReadRequest {
+    pub id: ReadRequestId,
+    pub file: LocalFile,
+    pub reads: Vec<SlabRead>,
+}
+
 /// A logical write waiting for the worker to select its transport.
 pub struct PendingWriteRequest {
     pub id: WriteRequestId,
@@ -183,6 +198,28 @@ impl<'a> OperatorIO<'a> {
             self.operator_idx,
             request,
             cache_lookups,
+            self.stats,
+        )?;
+        Ok(id)
+    }
+
+    /// Read ranges of `file` around the compressed cache, each into the slab
+    /// given for it. For bytes only their writer reads back, such as a spill
+    /// file's: a cache fill reads whole blocks, and so bytes that writes still
+    /// in flight are changing, and keeps them. The response comes back the
+    /// same way as [`read`](Self::read)'s, one location per range in the
+    /// order given, each a view of its slab.
+    pub fn read_direct(
+        &mut self,
+        file: LocalFile,
+        reads: Vec<SlabRead>,
+    ) -> Result<ReadRequestId, crate::io::IORequesterError> {
+        let id = ReadRequestId(*self.next_request_id);
+        *self.next_request_id += 1;
+        self.requester.borrow_mut().request_read_direct(
+            self.data_flow_id,
+            self.operator_idx,
+            PendingDirectReadRequest { id, file, reads },
             self.stats,
         )?;
         Ok(id)

@@ -118,6 +118,12 @@ unsafe impl Send for FrozenSlab {}
 
 unsafe impl Sync for FrozenSlab {}
 
+impl AsRef<[u8]> for FrozenSlab {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 impl FrozenSlab {
     /// Bytes this slab holds.
     pub fn size(&self) -> usize {

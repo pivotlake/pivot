@@ -26,8 +26,8 @@ mod backend;
 pub(crate) mod hardware_queues;
 
 use crate::Identifier;
-use crate::memory::FileBytes;
 use crate::memory::compressed_cache::MissingExtent;
+use crate::memory::{FileBytes, Slab};
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -46,8 +46,8 @@ mod operator;
 #[cfg(any(test, feature = "test-util"))]
 pub use operator::TestOperatorIO;
 pub use operator::{
-    FileRange, OperatorIO, PendingReadRequest, PendingWriteRequest, ReadData, ReadRequestId,
-    ReadResponse, WriteRequestId,
+    FileRange, OperatorIO, PendingDirectReadRequest, PendingReadRequest, PendingWriteRequest,
+    ReadData, ReadRequestId, ReadResponse, SlabRead, WriteRequestId,
 };
 
 mod cached_http;
@@ -115,10 +115,24 @@ pub enum OpenFile {
     Remote(Arc<RemoteFile>),
 }
 
+impl PartialEq for LocalFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_raw_fd() == other.as_raw_fd()
+    }
+}
+
+impl Eq for LocalFile {}
+
+impl Debug for LocalFile {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Local({})", self.as_raw_fd())
+    }
+}
+
 impl PartialEq for OpenFile {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (OpenFile::Local(a), OpenFile::Local(b)) => a.as_raw_fd() == b.as_raw_fd(),
+            (OpenFile::Local(a), OpenFile::Local(b)) => a == b,
             (OpenFile::Remote(a), OpenFile::Remote(b)) => a == b,
             _ => false,
         }
@@ -145,7 +159,7 @@ impl Hash for OpenFile {
 impl Debug for OpenFile {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpenFile::Local(file) => write!(f, "Local({})", file.as_raw_fd()),
+            OpenFile::Local(file) => file.fmt(f),
             OpenFile::Remote(r) => write!(f, "Remote({})", r.display_url()),
         }
     }
@@ -362,10 +376,23 @@ pub struct FsWriteRequest {
     pub data: Arc<FileBytes>,
 }
 
+/// A filesystem read that goes around the compressed cache: `slab.size()`
+/// bytes at `offset` of `file`, into a slab its issuer supplied. For bytes
+/// only their writer reads back, such as a spill file's: a cache fill would
+/// widen the read to whole blocks and so into bytes that writes still in
+/// flight are changing, and would keep them. The request owns the slab while
+/// the read is in flight, so its memory outlives a cancelled issuer.
+pub struct FsDirectReadRequest {
+    pub file: LocalFile,
+    pub offset: u64,
+    pub slab: Slab,
+}
+
 /// A filesystem operation issued by a dataflow operator. Reads and writes use
 /// the same worker-local io_uring and operator request/completion path.
 pub enum FsRequest {
     Read(FsReadRequest),
+    ReadDirect(FsDirectReadRequest),
     Write(FsWriteRequest),
 }
 
@@ -374,7 +401,16 @@ impl FsRequest {
     pub fn as_read(&self) -> Option<&FsReadRequest> {
         match self {
             Self::Read(request) => Some(request),
-            Self::Write(_) => None,
+            Self::ReadDirect(_) | Self::Write(_) => None,
+        }
+    }
+
+    /// The file the operation touches.
+    pub fn file(&self) -> &LocalFile {
+        match self {
+            Self::Read(request) => &request.file,
+            Self::ReadDirect(request) => &request.file,
+            Self::Write(request) => &request.file,
         }
     }
 }
@@ -414,6 +450,12 @@ impl ReadyBytesLen for FsReadRequest {
     }
 }
 
+impl ReadyBytesLen for FsDirectReadRequest {
+    fn ready_bytes_len(&self) -> u64 {
+        self.slab.size() as u64
+    }
+}
+
 impl ReadyBytesLen for HttpGetRequest {
     fn ready_bytes_len(&self) -> u64 {
         self.block.len() as u64
@@ -430,6 +472,7 @@ impl ReadyBytesLen for FsRequest {
     fn ready_bytes_len(&self) -> u64 {
         match self {
             Self::Read(request) => request.ready_bytes_len(),
+            Self::ReadDirect(request) => request.ready_bytes_len(),
             Self::Write(request) => request.ready_bytes_len(),
         }
     }
@@ -519,6 +562,9 @@ pub struct RemoteReadTime {
 /// [`RemoteReadTime`] its pieces accrued.
 pub enum Completion {
     FsRead(DataFlowRequest<FsReadRequest>),
+    /// A direct read that landed, with the file range it read; its slab has
+    /// already gone to the read's response.
+    FsReadDirect(DataFlowRequest<FileRange>),
     FsWrite(DataFlowRequest<FsWriteRequest>),
     HttpGet(DataFlowRequest<HttpGetRequest>, RemoteReadTime),
     HttpUpload(DataFlowRequest<HttpUploadRequest>),

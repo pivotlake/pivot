@@ -4,14 +4,16 @@ use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
 use crate::io::hardware_queues::{InFlightPermit, WorkerHardwareQueues};
 use crate::io::{
-    Completion, DataFlowRequest, FailedIO, FsReadRequest, FsRequest, FsWriteRequest,
-    HttpGetRequest, HttpRequest, HttpUploadRequest, OpenFile, PendingReadRequest,
-    PendingWriteRequest, ReadData, ReadResponse, RemoteSplit,
+    Completion, DataFlowRequest, FailedIO, FileRange, FsDirectReadRequest, FsReadRequest,
+    FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest, OpenFile,
+    PendingDirectReadRequest, PendingReadRequest, PendingWriteRequest, ReadData, ReadResponse,
+    RemoteSplit, SlabRead,
 };
 use crate::memory::compressed_cache::MissingExtent;
-use crate::memory::{CacheLookup, memory_ctx};
+use crate::memory::{CacheLookup, FrozenSlab, memory_ctx};
 use crate::stats::StatsCollector;
 use crate::worker::WORKER_IDX;
+use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -64,25 +66,40 @@ pub(crate) struct RoutedReadResponse {
     pub response: ReadResponse,
 }
 
-/// A requested ranges cache lookups. This contains the offset in the file from where this range
-/// begins, with a vector of cache lookups, so it basically represents for example:
-///
-/// -----------------\[found=5\]\[missing=10\]\[found=3\]...
-///        offset=321
+/// Where one requested range's bytes are, once its reads have landed.
+enum RangeSource {
+    /// The cache fragments covering the range, in file order, so it basically
+    /// represents for example:
+    ///
+    /// -----------------\[found=5\]\[missing=10\]\[found=3\]...
+    ///        offset=321
+    Cache(Vec<CacheLookup>),
+    /// The slab one direct read fills, here once that read has landed.
+    Direct {
+        physical_read_id: Identifier,
+        filled: Option<FrozenSlab>,
+    },
+}
+
+/// A requested range: the offset in the file where it begins, and where its
+/// bytes are.
 struct RangeLookups {
     offset: usize,
-    lookups: Vec<CacheLookup>,
+    source: RangeSource,
 }
 
 impl RangeLookups {
     fn into_ready(self) -> ReadData {
         ReadData {
             offset: self.offset,
-            bytes: self
-                .lookups
-                .into_iter()
-                .map(CacheLookup::into_data)
-                .collect(),
+            bytes: match self.source {
+                RangeSource::Cache(lookups) => {
+                    lookups.into_iter().map(CacheLookup::into_data).collect()
+                }
+                RangeSource::Direct { filled, .. } => vec![Bytes::from_owner(
+                    filled.expect("every direct read of a ready read has landed"),
+                )],
+            },
         }
     }
 }
@@ -122,6 +139,9 @@ impl IORead {
         match self {
             Self::Fs(request) => match &request.request {
                 FsRequest::Read(read) => &read.block,
+                FsRequest::ReadDirect(_) => {
+                    unreachable!("direct reads are never registered with the cache")
+                }
                 FsRequest::Write(_) => unreachable!("registered reads never contain writes"),
             },
             Self::Http(request) => match &request.request {
@@ -499,28 +519,132 @@ impl IORequester {
             }
             locations.push(RangeLookups {
                 offset: location.offset,
-                lookups,
+                source: RangeSource::Cache(lookups),
             });
         }
 
-        let remaining = physical_reads.len();
+        let physical_read_ids: Vec<_> =
+            physical_reads.iter().map(IORead::pending_read_id).collect();
+        self.track_pending_read(route, request, locations, &physical_read_ids);
+        physical_reads
+    }
+
+    /// Track one logical read until every physical read in `physical_read_ids`
+    /// has landed; a read with none to wait for is ready at once.
+    fn track_pending_read(
+        &mut self,
+        route: RequestRoute,
+        request: PendingReadRequest,
+        locations: Vec<RangeLookups>,
+        physical_read_ids: &[Identifier],
+    ) {
+        let remaining = physical_read_ids.len();
         let slot = self.insert_pending_read(PendingRead {
             route,
             request,
             requested_range_lookups: locations,
             remaining,
         });
-
-        for read in &mut physical_reads {
+        for id in physical_read_ids {
             self.physical_read_ids_to_pending_reads_indexes
-                .insert(read.pending_read_id(), slot);
+                .insert(*id, slot);
         }
-
         if remaining == 0 {
             self.finish_pending_read(slot);
         }
+    }
 
-        physical_reads
+    /// Read ranges of a local file around the compressed cache, into the
+    /// slabs the caller supplied, and track the read until every range has
+    /// landed. Each range is one physical read.
+    pub fn request_read_direct(
+        &mut self,
+        data_flow_id: Identifier,
+        operator_idx: Identifier,
+        request: PendingDirectReadRequest,
+        stats: &mut StatsCollector,
+    ) -> Result<()> {
+        let route = RequestRoute {
+            data_flow_id,
+            operator_idx,
+        };
+        let PendingDirectReadRequest { id, file, reads } = request;
+        let mut fs_requests = Vec::with_capacity(reads.len());
+        let mut physical_read_ids = Vec::with_capacity(reads.len());
+        let mut ranges = Vec::with_capacity(reads.len());
+        let mut tracked = Vec::with_capacity(reads.len());
+        for SlabRead { offset, slab } in reads {
+            let physical_read_id = self.next_physical_read_id;
+            self.next_physical_read_id += 1;
+            physical_read_ids.push(physical_read_id);
+            ranges.push(FileRange::new(offset, slab.size()));
+            tracked.push(RangeLookups {
+                offset,
+                source: RangeSource::Direct {
+                    physical_read_id,
+                    filled: None,
+                },
+            });
+            fs_requests.push(
+                DataFlowRequest::new(
+                    data_flow_id,
+                    operator_idx,
+                    FsRequest::ReadDirect(FsDirectReadRequest {
+                        file: file.clone(),
+                        offset: offset as u64,
+                        slab,
+                    }),
+                )
+                .with_pending_read_id(physical_read_id),
+            );
+        }
+        self.track_pending_read(
+            route,
+            PendingReadRequest {
+                id,
+                open_file: OpenFile::Local(file),
+                locations: ranges,
+            },
+            tracked,
+            &physical_read_ids,
+        );
+
+        stats.record_issued_disk(&mut fs_requests);
+        let mut fs_queue = fs_requests.into_iter();
+        while let Some(request) = fs_queue.next() {
+            if let Err(error) = self.submit_fs_request_to_backend(request) {
+                self.withdraw_unsubmitted_reads(fs_queue, []);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Hand the slab a direct read filled to the logical read waiting for
+    /// it. That read may have been cancelled or failed meanwhile, and then
+    /// the slab is simply dropped.
+    fn land_direct_read(&mut self, physical_read_id: Identifier, filled_slab: FrozenSlab) {
+        let Some(slot) = self
+            .physical_read_ids_to_pending_reads_indexes
+            .get(&physical_read_id)
+        else {
+            return;
+        };
+        let Some(pending) = self.pending_reads[*slot].as_mut() else {
+            return;
+        };
+        let filled = pending
+            .requested_range_lookups
+            .iter_mut()
+            .find_map(|range| match &mut range.source {
+                RangeSource::Direct {
+                    physical_read_id: id,
+                    filled,
+                } if *id == physical_read_id => Some(filled),
+                _ => None,
+            })
+            .expect("a tracked direct read has a range waiting for its slab");
+        *filled = Some(filled_slab);
     }
 
     fn insert_pending_read(&mut self, request: PendingRead) -> usize {
@@ -581,10 +705,7 @@ impl IORequester {
     /// the next slot release, so it can park with nothing of its own in
     /// flight.
     fn acquire_fs_slot(&mut self, request: &DataFlowRequest<FsRequest>) -> Option<InFlightPermit> {
-        let device_idx = match &request.request {
-            FsRequest::Read(read) => read.file.device_idx(),
-            FsRequest::Write(write) => write.file.device_idx(),
-        };
+        let device_idx = request.request.file().device_idx();
         let queue = self.fs_queues.queue_for_device(device_idx);
         if let Some(permit) = queue.try_acquire() {
             return Some(permit);
@@ -651,6 +772,13 @@ impl IORequester {
                 read.block.file_offset() as u64,
                 read.block.dest(),
                 read.block.len(),
+                self.next_id,
+            ),
+            FsRequest::ReadDirect(read) => self.backend.submit_read(
+                read.file.as_raw_fd(),
+                read.offset,
+                read.slab.ptr,
+                read.slab.size(),
                 self.next_id,
             ),
             // One op writes one run of the payload, and the completion path
@@ -906,8 +1034,16 @@ impl IORequester {
                     }
                 }
                 let failure = match &request.request {
-                    FsRequest::Read(_) if result < 0 => {
+                    FsRequest::Read(_) | FsRequest::ReadDirect(_) if result < 0 => {
                         Some(std::io::Error::from_raw_os_error(-result))
+                    }
+                    // A direct read asks for bytes its caller knows are in
+                    // the file, so anything short of them is an error.
+                    FsRequest::ReadDirect(read) if (result as usize) < read.slab.size() => {
+                        Some(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "direct read stopped short of the requested range",
+                        ))
                     }
                     // Cache fills are block-aligned, so a tail fill can
                     // legitimately return fewer bytes than its physical extent
@@ -986,6 +1122,19 @@ impl IORequester {
                                 submitted_at,
                             })
                         }
+                        FsRequest::ReadDirect(read) => {
+                            let range = FileRange::new(read.offset as usize, read.slab.size());
+                            if let Some(id) = pending_read_id {
+                                self.land_direct_read(id, read.slab.freeze());
+                            }
+                            Completion::FsReadDirect(DataFlowRequest {
+                                data_flow_id,
+                                operator_idx,
+                                request: range,
+                                pending_read_id,
+                                submitted_at,
+                            })
+                        }
                         FsRequest::Write(write) => Completion::FsWrite(DataFlowRequest {
                             data_flow_id,
                             operator_idx,
@@ -1027,6 +1176,11 @@ impl IORequester {
                 }
                 Ok(Completion::HttpGet(request, _)) => {
                     request.request.block.wake_subscribers();
+                    if let Some(id) = request.pending_read_id {
+                        self.complete_pending_read(id);
+                    }
+                }
+                Ok(Completion::FsReadDirect(request)) => {
                     if let Some(id) = request.pending_read_id {
                         self.complete_pending_read(id);
                     }
@@ -1273,6 +1427,108 @@ mod tests {
             let block = routed.response.id().0;
             assert_eq!(routed.response.into_bytes(), vec![block as u8; 4096]);
         }
+    }
+
+    /// A direct read of `ranges`, each into a slab of its own.
+    fn pending_direct_read(
+        file: &crate::io::LocalFile,
+        ranges: &[FileRange],
+    ) -> PendingDirectReadRequest {
+        let mut allocator = crate::memory::SlabAllocator::new(false);
+        PendingDirectReadRequest {
+            id: ReadRequestId(0),
+            file: file.clone(),
+            reads: ranges
+                .iter()
+                .map(|range| SlabRead {
+                    offset: range.offset,
+                    slab: allocator.get_slab_of_size(range.len, false),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_direct_read_brings_back_exactly_the_ranges_asked_for() {
+        init_test_free_pool(2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, (0..5500).map(pattern).collect::<Vec<_>>()).unwrap();
+        let file = LocalFile::new(std::fs::File::open(path).unwrap()).unwrap();
+        let ranges = [FileRange::new(100, 3000), FileRange::new(4000, 1500)];
+        let mut requester = IORequester::default();
+
+        requester
+            .request_read_direct(
+                1,
+                2,
+                pending_direct_read(&file, &ranges),
+                &mut disabled_stats(),
+            )
+            .unwrap();
+        let mut responses = Vec::new();
+        for _ in 0..100 {
+            if !responses.is_empty() {
+                break;
+            }
+            requester.wait().unwrap();
+            requester.completions().unwrap();
+            responses.extend(requester.take_ready_reads());
+        }
+
+        let locations = responses.pop().unwrap().response.into_locations();
+        assert_eq!(locations.len(), 2);
+        for (range, data) in ranges.iter().zip(locations) {
+            assert_eq!(data.offset, range.offset);
+            let bytes: Vec<u8> = data
+                .bytes
+                .iter()
+                .flat_map(|run| run.iter().copied())
+                .collect();
+            assert_eq!(
+                bytes,
+                (range.offset..range.offset + range.len)
+                    .map(pattern)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_read_past_the_end_of_the_file_fails() {
+        init_test_free_pool(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, vec![1u8; 1000]).unwrap();
+        let file = LocalFile::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut requester = IORequester::default();
+
+        requester
+            .request_read_direct(
+                1,
+                2,
+                pending_direct_read(&file, &[FileRange::new(500, 1000)]),
+                &mut disabled_stats(),
+            )
+            .unwrap();
+        let mut failures = Vec::new();
+        for _ in 0..100 {
+            if !failures.is_empty() {
+                break;
+            }
+            requester.wait().unwrap();
+            failures.extend(
+                requester
+                    .completions()
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(Result::err),
+            );
+        }
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].error.to_string().contains("stopped short"));
+        assert!(requester.take_ready_reads().is_empty());
     }
 
     #[test]
