@@ -15,7 +15,7 @@ use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
 use crate::operations::unary::group::output::merge::RunningPartitionMerge;
 use crate::operations::unary::group::output::partition_job::{
-    PartitionJob, ReleasedJobs, SharedMergeState,
+    CrossNodeMerges, PartitionJob, ReleasedJobs, SharedMergeState,
 };
 use crate::operations::unary::group::output::topk_pruning::{
     HashBinTotals, SharedBinTotals, TopKBounds, TopKThreshold,
@@ -27,8 +27,8 @@ use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use crossbeam_deque::{Injector, Steal};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 
 /// How much memory a worker's running partition jobs may hold together: their
 /// partial result tables plus the rows still on their way from spill files.
@@ -345,10 +345,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 tables_by_node.into_iter().flatten().collect(),
             )]
         };
+        let cross_node = hierarchical.then(|| CrossNodeMerges::new(num_partitions, sources.len()));
         let shared = Arc::new(SharedMergeState {
             sources,
-            cross_node: hierarchical
-                .then(|| (0..num_partitions).map(|_| OnceLock::new()).collect()),
+            cross_node,
             key_arena: self.key_arena.clone(),
             output_buffers,
             partition_capacity,

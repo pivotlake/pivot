@@ -15,9 +15,10 @@ use crate::operations::unary::group::{GroupLimit, Result};
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
-use crossbeam_deque::{Injector, Steal};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// One node's merge sources: its switched workers' scatter buffers and its
 /// workers' in-place stacks.
@@ -41,10 +42,8 @@ pub(super) struct SharedMergeState<K: KeyExtractor, V: AggregationValue + ?Sized
     /// and non-switched workers' full stacks). A direct merge holds a single
     /// entry with every node's sources.
     pub(super) sources: Vec<NodeSources<K, V>>,
-    /// Hierarchical merge only: each partition's cross-node rendezvous,
-    /// created by the first of its jobs to survive pruning (a fully pruned
-    /// partition never allocates one).
-    pub(super) cross_node: Option<Vec<OnceLock<CrossNodeMerge<K, V>>>>,
+    /// Hierarchical merge only: every partition's cross-node rendezvous.
+    pub(super) cross_node: Option<CrossNodeMerges<K, V>>,
     pub(super) key_arena: Arc<SharedArena>,
     /// The arena's ring buffers wrapped as Arrow `Buffer`s, built once for the
     /// whole output phase. String-key output emits zero-copy views into this.
@@ -115,12 +114,12 @@ unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for SharedMergeS
 /// [`SharedMergeState`], plus which node's sources to read on a hierarchical merge.
 ///
 /// Created by the final worker to reach the gather barrier and pushed to the
-/// node's [`Injector`] for work-stealing execution. Each job merges one node's
+/// node's queue for work-stealing execution. Each job merges one node's
 /// source tables for partition `index` into one result table. On a direct
 /// merge (`SharedMergeState::cross_node` is `None`) that result is the partition's
 /// final table and its rows are emitted directly. On a hierarchical merge,
 /// each node's job merges only node-local memory and sends the resulting node
-/// table into the partition's [`CrossNodeMerge`]; the last job to finish
+/// table into the partition's slots of [`CrossNodeMerges`]; the last job to finish
 /// receives every node's table and merges them into the final one. That last
 /// merge is the only step that reads another node's memory.
 pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
@@ -133,47 +132,97 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
 
 unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionJob<K, V> {}
 
-/// One partition's pending cross-node merge: each node's job sends the node's
-/// merged aggregated table; the send that completes the set hands every
-/// node's table back to that caller, electing it to run the final merge
-/// ([`merge::merge_node_aggregated_tables`]) and emit. Senders never block
-/// and no job ever waits: the mailbox is a lock-free queue and the election
-/// is one atomic countdown.
-pub(super) struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    node_tables: Injector<HashTable<K::Persisted, V>>,
-    /// Sends still outstanding; the sender that decrements this to zero is
-    /// the receiver.
-    pending_sends: AtomicUsize,
+/// Every partition's pending cross-node merge: each node's job sends the
+/// node's merged aggregated table for its partition; the send that completes
+/// a partition's set hands every node's table back to that caller, electing
+/// it to run the final merge ([`merge::merge_node_aggregated_tables`]) and
+/// emit. Senders never block and no job ever waits: a job writes a slot only
+/// it reaches, and the election is one atomic update of the partition's set
+/// of sent nodes.
+///
+/// The slots of every partition live in one allocation made up front, so a
+/// send allocates nothing and dropping the rendezvous frees one block
+/// however many partitions the merge ran.
+pub(super) struct CrossNodeMerges<K: KeyExtractor, V: AggregationValue + ?Sized> {
+    node_count: usize,
+    /// One slot per (partition, node), a partition's slots adjacent. A slot
+    /// holds a table exactly while its node's bit is set in the partition's
+    /// entry of `sent_nodes`.
+    node_tables: Box<[UnsafeCell<MaybeUninit<HashTable<K::Persisted, V>>>]>,
+    /// Per partition: one bit per node whose table waits in its slot.
+    sent_nodes: Box<[AtomicU64]>,
 }
 
-unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for CrossNodeMerge<K, V> {}
-unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for CrossNodeMerge<K, V> {}
+// SAFETY: a slot is written by the one job of its (partition, node) and read
+// only by the job elected through `sent_nodes`, after every write to the
+// partition's slots was published by its sender's atomic update.
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for CrossNodeMerges<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for CrossNodeMerges<K, V> {}
 
-impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
-    fn new(node_count: usize) -> Self {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerges<K, V> {
+    pub(super) fn new(partition_count: usize, node_count: usize) -> Self {
+        assert!(
+            (1..=u64::BITS as usize).contains(&node_count),
+            "a partition's sent nodes are tracked in one 64-bit set"
+        );
         Self {
-            node_tables: Injector::new(),
-            pending_sends: AtomicUsize::new(node_count),
+            node_count,
+            node_tables: (0..partition_count * node_count)
+                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+                .collect(),
+            sent_nodes: (0..partition_count).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
-    /// Send this node's merged table. Exactly one call - the last - returns
-    /// the full set; that caller must run the final merge. Each sender's push
-    /// happens-before its countdown decrement, and the last sender's
-    /// decrement observes all of them, so the drain below is guaranteed to
-    /// see every node's table (and after the election nobody else touches
-    /// the queue).
-    fn send(&self, table: HashTable<K::Persisted, V>) -> Option<Vec<HashTable<K::Persisted, V>>> {
-        self.node_tables.push(table);
-        if self.pending_sends.fetch_sub(1, Ordering::AcqRel) != 1 {
+    /// Send `node`'s merged table for `partition`. Exactly one call per
+    /// partition - the last - returns the full set; that caller must run the
+    /// final merge. Each sender's slot write happens-before its update of the
+    /// sent set, and the last sender's update observes all of them, so the
+    /// reads below are guaranteed to see every node's table (and after the
+    /// election nobody else touches the partition's slots).
+    fn send(
+        &self,
+        partition: usize,
+        node: usize,
+        table: HashTable<K::Persisted, V>,
+    ) -> Option<Vec<HashTable<K::Persisted, V>>> {
+        let slots = &self.node_tables[partition * self.node_count..][..self.node_count];
+        // SAFETY: this job is the only one for (partition, node), so nothing
+        // else reaches the slot until the election below publishes it.
+        unsafe { (*slots[node].get()).write(table) };
+        let sent_nodes = &self.sent_nodes[partition];
+        let node_bit = 1u64 << node;
+        let every_node = u64::MAX >> (u64::BITS as usize - self.node_count);
+        if sent_nodes.fetch_or(node_bit, Ordering::AcqRel) | node_bit != every_node {
             return None;
         }
-        let mut all = Vec::new();
-        loop {
-            match self.node_tables.steal() {
-                Steal::Success(table) => all.push(table),
-                Steal::Empty => return Some(all),
-                Steal::Retry => continue,
+        // The slots are emptied below, so the drop must not visit them.
+        sent_nodes.store(0, Ordering::Release);
+        Some(
+            slots
+                .iter()
+                // SAFETY: every node's bit was set, so every slot holds a
+                // table, and each is moved out exactly once, here.
+                .map(|slot| unsafe { (*slot.get()).assume_init_read() })
+                .collect(),
+        )
+    }
+}
+
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> Drop for CrossNodeMerges<K, V> {
+    /// Drops the tables of partitions whose set never completed (some node's
+    /// job was pruned after another's had sent). Only the sent sets are
+    /// walked; the slots of every other partition hold nothing.
+    fn drop(&mut self) {
+        for (partition, sent_nodes) in self.sent_nodes.iter_mut().enumerate() {
+            let mut waiting_nodes = *sent_nodes.get_mut();
+            while waiting_nodes != 0 {
+                let node = waiting_nodes.trailing_zeros() as usize;
+                waiting_nodes &= waiting_nodes - 1;
+                let slot = &mut self.node_tables[partition * self.node_count + node];
+                // SAFETY: the node's bit is set, so its slot holds a table
+                // nobody received.
+                unsafe { slot.get_mut().assume_init_drop() };
             }
         }
     }
@@ -264,13 +313,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         let shared = &*self.shared;
         let result_map = match &shared.cross_node {
             None => result_map,
-            Some(cells) => {
-                // The rendezvous is created on demand by whichever of the
-                // partition's jobs gets here first, so pruned partitions
-                // never pay for one.
-                let cross_node =
-                    cells[self.index].get_or_init(|| CrossNodeMerge::new(shared.sources.len()));
-                match cross_node.send(result_map) {
+            Some(cross_node) => {
+                match cross_node.send(self.index, self.node, result_map) {
                     // Another node's job for this partition is still running;
                     // it will receive the tables and run the final merge.
                     None => return Ok(()),
