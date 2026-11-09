@@ -29,21 +29,22 @@ use scatter_rows::merge_scatter_rows;
 use tables::merge_tables;
 
 use crate::io::{OperatorIO, ReadData, ReadRequestId, SlabRead};
-use crate::memory::SlabAllocator;
+use crate::memory::{SPILL_BLOCK_SIZE, SlabAllocator, decompress_spilled_rows};
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, HashTable, KeyExtractor,
+    AggregationValue, DEFAULT_CAPACITY, HashTable, KeyExtractor, OnDiskStretch,
 };
 use crate::operations::unary::group::output::partition_job::PartitionJob;
+use bytes::Bytes;
 
 /// A partition job this worker is running: its rows in memory are merged, and
 /// the rows of its partition that are only on disk are merged as their reads
 /// land.
 pub(super) struct RunningPartitionMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
     pub(super) job: PartitionJob<K, V>,
-    /// The reads still in flight. A read's rows are merged into `table` as
-    /// it lands.
-    pub(super) reads_in_flight: ahash::HashSet<ReadRequestId>,
+    /// The reads still in flight, each with the stretches of a spill file it
+    /// is bringing back. A read's rows are merged into `table` as it lands.
+    pub(super) reads_in_flight: ahash::HashMap<ReadRequestId, Vec<OnDiskStretch>>,
     /// Where the rows read back from disk land, if the job reads any. Apart
     /// from `allocator` because these rows are dropped as soon as they are
     /// merged, long before the table is.
@@ -63,7 +64,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
     pub(super) fn start(job: PartitionJob<K, V>, io: &mut OperatorIO) -> unary::Result<Self> {
         let shared = job.shared.clone();
         let (buffers, tables) = &shared.sources[job.node];
-        let mut reads_in_flight = ahash::HashSet::default();
+        let mut reads_in_flight = ahash::HashMap::default();
         let mut read_allocator: Option<SlabAllocator> = None;
         for worker_buffers in buffers {
             for bucket in worker_buffers.bucket_range(job.index, shared.num_partitions) {
@@ -75,14 +76,19 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
                 };
                 let allocator = read_allocator.get_or_insert_with(|| SlabAllocator::new(false));
                 let reads = on_disk
-                    .ranges
+                    .stretches
                     .iter()
-                    .map(|range| SlabRead {
-                        offset: range.offset,
-                        slab: allocator.get_aligned_slab(range.len, on_disk.row_align, false),
+                    .map(|stretch| SlabRead {
+                        offset: stretch.range.offset,
+                        slab: allocator.get_aligned_slab(
+                            stretch.range.len,
+                            SPILL_BLOCK_SIZE,
+                            false,
+                        ),
                     })
                     .collect();
-                reads_in_flight.insert(io.read_direct(on_disk.file, reads)?);
+                let read = io.read_direct(on_disk.file, reads)?;
+                reads_in_flight.insert(read, on_disk.stretches);
             }
         }
 
@@ -127,8 +133,40 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
         Ok(running)
     }
 
-    /// Merge the rows one read brought back from disk.
-    pub(super) fn merge_read_rows(&mut self, rows: &[ReadData]) {
+    /// Merge the rows `read`, one of this job's reads in flight, brought back
+    /// from disk as `stretches_read`, one per stretch it asked for.
+    pub(super) fn merge_read(&mut self, read: ReadRequestId, stretches_read: Vec<ReadData>) {
+        let stretches = self
+            .reads_in_flight
+            .remove(&read)
+            .expect("the read is one of this job's reads in flight");
+        let read_allocator = self
+            .read_allocator
+            .as_mut()
+            .expect("a job with a read in flight has the allocator its reads landed in");
+        let rows: Vec<ReadData> = stretches
+            .iter()
+            .zip(stretches_read)
+            .map(|(stretch, read_back)| {
+                let [bytes] = read_back.bytes.as_slice() else {
+                    panic!("a stretch read around the cache comes back in one piece");
+                };
+                let slabs = stretch
+                    .cut_stored_slabs(bytes)
+                    .map(|(stored, row_bytes)| {
+                        let mut rows =
+                            read_allocator.get_aligned_slab(row_bytes, SPILL_BLOCK_SIZE, false);
+                        decompress_spilled_rows(&stored, rows.as_mut_slice());
+                        Bytes::from_owner(rows.freeze())
+                    })
+                    .collect();
+                ReadData {
+                    offset: read_back.offset,
+                    bytes: slabs,
+                }
+            })
+            .collect();
+        let rows = rows.as_slice();
         let shared = &*self.job.shared;
         merge_read_rows::<K::Stored, V>(
             &mut self.table,

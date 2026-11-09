@@ -332,11 +332,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
     }
 
     fn spill(&mut self, spiller: &mut Spiller, count: usize) -> unary::Result<()> {
-        for _ in 0..count {
-            if !self.aggregated_table.spill(spiller)? {
-                break;
-            }
-        }
+        self.aggregated_table.spill(spiller, count)?;
         Ok(())
     }
 
@@ -522,7 +518,13 @@ mod tests {
         radix: RadixConfig,
         spill_everything_before_output: bool,
     ) -> (CollectSender, usize) {
-        init_test_free_pool(64);
+        // A worker that spills keeps buffers for compressed rows besides the
+        // ones its rows are in, so a spilling run gets the whole test ring.
+        init_test_free_pool(if spill_everything_before_output {
+            128
+        } else {
+            64
+        });
         let worker_count = worker_batches.len();
         let key_arena = SharedArena::new(64);
         let value_arena = SharedArena::new(64);

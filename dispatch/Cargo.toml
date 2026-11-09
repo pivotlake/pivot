@@ -27,6 +27,8 @@ ahash = { workspace = true }
 tikv-jemallocator = "0.6.0"
 
 bytes = { workspace = true }
+# Compresses rows on their way to a spill file.
+zstd = { workspace = true }
 libc = { workspace = true }
 # Identifier concatenation for the icelake_kernel! macro's generated twins.
 paste = "1"

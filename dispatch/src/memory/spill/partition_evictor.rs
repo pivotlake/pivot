@@ -173,6 +173,7 @@ mod tests {
             slabs: vec![SpilledSlab {
                 spill_partition_id: 0,
                 file_offset: 0,
+                stored_len: slab.size(),
                 slab: slab.downgrade(),
             }],
             buffer,

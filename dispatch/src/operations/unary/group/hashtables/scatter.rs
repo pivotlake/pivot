@@ -19,10 +19,11 @@
 use super::hash_table::{PersistedKey, entry_layout};
 use crate::io::{FileRange, IORequesterError, LocalFile, ReadData};
 use crate::memory::{
-    BUFFER_SIZE, Dynamic, PARTITIONS, PartitionAllocator, PartitionSlab, SpilledBuffer,
-    SpilledSlab, Spiller,
+    BUFFER_SIZE, Dynamic, PARTITIONS, PartitionAllocator, PartitionSlab, SPILL_BLOCK_SIZE,
+    SpilledBuffer, SpilledSlab, Spiller, padded_to_spill_block,
 };
 use crate::operations::unary::group::values::AggregationValue;
+use bytes::Bytes;
 use std::marker::PhantomData;
 
 /// Target size of a partition's slabs once it has filled a few, and of the
@@ -94,7 +95,6 @@ pub struct ScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     /// [`PARTITIONS`], of which only the first this many are used.
     partition_count: usize,
     row_size: usize,
-    row_align: usize,
     // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
     _phantom: PhantomData<(KP, *const V)>,
 }
@@ -114,7 +114,6 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
             )),
             partition_count,
             row_size: layout.stride,
-            row_align: layout.align,
             _phantom: PhantomData,
         }
     }
@@ -124,8 +123,9 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
     pub fn spill(
         &mut self,
         spiller: &mut Spiller,
-    ) -> Result<Option<SpilledBuffer>, IORequesterError> {
-        self.allocator.spill(spiller)
+        count: usize,
+    ) -> Result<Vec<SpilledBuffer>, IORequesterError> {
+        self.allocator.spill(spiller, count)
     }
 
     /// Appends a row to `partition` and initializes its value in place.
@@ -160,7 +160,6 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
         mut spilled: Vec<Vec<SpilledSlab>>,
     ) -> Vec<PartitionRows<KP, V>> {
         let row_size = self.row_size;
-        let row_align = self.row_align;
         self.allocator
             .into_partitions()
             .into_iter()
@@ -172,43 +171,95 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
                     std::mem::take(&mut spilled[partition]),
                     contents.spill_file,
                     row_size,
-                    row_align,
                 )
             })
             .collect()
     }
 }
 
-/// The rows of one partition that exist only on disk: ranges of the
-/// partition's spill file, each holding whole rows back to back and no
-/// longer than a ring buffer, so that one slab takes it.
+/// The rows of one partition that exist only on disk, as the stretches of
+/// its spill file to read back.
 #[derive(Clone)]
 pub struct OnDiskRows {
     pub file: LocalFile,
-    pub ranges: Vec<FileRange>,
-    /// The alignment memory must have for a range read into it to be read
-    /// as rows in place.
-    pub row_align: usize,
+    pub stretches: Vec<OnDiskStretch>,
 }
 
-/// Join ranges that follow one another in the file into single ranges of at
-/// most `longest` bytes each, so that what was written as many slabs is read
-/// back in as few reads as the bytes allow. No range is split: one joined
-/// range holds whole input ranges.
-fn join_adjacent_ranges(mut ranges: Vec<FileRange>, longest: usize) -> Vec<FileRange> {
-    ranges.sort_unstable_by_key(|range| range.offset);
-    let mut joined: Vec<FileRange> = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        match joined.last_mut() {
+/// A slab as it is stored in a spill file: where its bytes begin, how many
+/// there are, and how many bytes of rows they decompress to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredSlab {
+    /// Where the slab's bytes begin: in the file, or in the stretch of it
+    /// that an [`OnDiskStretch`] reads back.
+    pub start: usize,
+    pub stored_len: usize,
+    pub row_bytes: usize,
+}
+
+/// A stretch of a spill file that holds one or more stored slabs and is no
+/// longer than a ring buffer, so that one slab of memory takes it. Its offset
+/// and length are multiples of the spill block size, as direct IO wants, so
+/// it may begin before its first slab and end after its last.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnDiskStretch {
+    pub range: FileRange,
+    /// The slabs in the stretch, in file order, each starting where
+    /// [`StoredSlab::start`] says counted from the stretch's beginning.
+    pub slabs: Vec<StoredSlab>,
+}
+
+impl OnDiskStretch {
+    /// Each slab's stored bytes, cut out of the stretch as it was read back,
+    /// with the bytes of rows they hold.
+    pub fn cut_stored_slabs<'a>(
+        &'a self,
+        stretch: &'a Bytes,
+    ) -> impl Iterator<Item = (Bytes, usize)> + 'a {
+        assert_eq!(
+            stretch.len(),
+            self.range.len,
+            "the bytes read back are not the stretch that was asked for"
+        );
+        self.slabs.iter().map(|slab| {
+            (
+                stretch.slice(slab.start..slab.start + slab.stored_len),
+                slab.row_bytes,
+            )
+        })
+    }
+}
+
+/// Gather `slabs`, given by where each is stored in the file, into stretches
+/// of whole blocks holding slabs that follow one another there, of at most
+/// `longest` bytes each. What was written as many slabs is then read back in
+/// as few reads as the bytes allow.
+fn join_adjacent_slabs(mut slabs: Vec<StoredSlab>, longest: usize) -> Vec<OnDiskStretch> {
+    slabs.sort_unstable_by_key(|slab| slab.start);
+    let mut stretches: Vec<OnDiskStretch> = Vec::new();
+    for slab in slabs {
+        let first_block = slab.start - slab.start % SPILL_BLOCK_SIZE;
+        let end_of_last_block = padded_to_spill_block(slab.start + slab.stored_len);
+        match stretches.last_mut() {
             Some(last)
-                if last.offset + last.len == range.offset && last.len + range.len <= longest =>
+                if first_block <= last.range.offset + last.range.len
+                    && end_of_last_block - last.range.offset <= longest =>
             {
-                last.len += range.len;
+                last.range.len = end_of_last_block - last.range.offset;
+                last.slabs.push(StoredSlab {
+                    start: slab.start - last.range.offset,
+                    ..slab
+                });
             }
-            _ => joined.push(range),
+            _ => stretches.push(OnDiskStretch {
+                range: FileRange::new(first_block, end_of_last_block - first_block),
+                slabs: vec![StoredSlab {
+                    start: slab.start - first_block,
+                    ..slab
+                }],
+            }),
         }
     }
-    joined
+    stretches
 }
 
 /// One partition's scatter rows, as the merge reads them: the slabs they were
@@ -225,7 +276,6 @@ pub struct PartitionRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     /// Rows in memory and on disk together.
     rows: usize,
     row_size: usize,
-    row_align: usize,
     _phantom: PhantomData<(KP, *const V)>,
 }
 
@@ -239,7 +289,6 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
         spilled: Vec<SpilledSlab>,
         spill_file: Option<LocalFile>,
         row_size: usize,
-        row_align: usize,
     ) -> Self {
         let rows_in_allocator: usize = slabs.iter().map(|slab| slab.rows).sum();
         let bytes_spilled: usize = spilled.iter().map(|handle| handle.slab.size()).sum();
@@ -250,7 +299,6 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
             spill_file,
             on_disk: None,
             row_size,
-            row_align,
             _phantom: PhantomData,
         }
     }
@@ -261,7 +309,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
     /// these rows are dropped; a slab whose buffer was evicted is loaded from
     /// the partition's file. A partition's slabs were appended to its file
     /// one after another, so evicted slabs that are neighbours there are
-    /// loaded as one range.
+    /// loaded as one stretch.
     pub fn resolve_spilled(&mut self) {
         let mut ranges = Vec::new();
         for handle in self.spilled.drain(..) {
@@ -270,10 +318,11 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
                     rows: slab.size() / self.row_size,
                     slab,
                 }),
-                None => ranges.push(FileRange::new(
-                    handle.file_offset as usize,
-                    handle.slab.size(),
-                )),
+                None => ranges.push(StoredSlab {
+                    start: handle.file_offset as usize,
+                    stored_len: handle.stored_len,
+                    row_bytes: handle.slab.size(),
+                }),
             }
         }
         if !ranges.is_empty() {
@@ -282,8 +331,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> PartitionRows<KP, V> {
                     .spill_file
                     .clone()
                     .expect("a partition with rows on disk has a spill file"),
-                ranges: join_adjacent_ranges(ranges, BUFFER_SIZE),
-                row_align: self.row_align,
+                stretches: join_adjacent_slabs(ranges, BUFFER_SIZE),
             });
         }
     }
@@ -420,26 +468,100 @@ mod tests {
 
     type CountValue = Compiled<(CountSlot,), u8>;
 
+    /// A slab stored uncompressed: as many bytes as it has rows.
+    fn stored(start: usize, len: usize) -> StoredSlab {
+        StoredSlab {
+            start,
+            stored_len: len,
+            row_bytes: len,
+        }
+    }
+
     #[test]
-    fn ranges_that_follow_one_another_are_joined_up_to_the_longest_allowed() {
-        let ranges = vec![
-            FileRange::new(300, 50),
-            FileRange::new(0, 100),
-            FileRange::new(100, 100),
-            FileRange::new(200, 100),
-            FileRange::new(400, 10),
+    fn slabs_that_follow_one_another_are_joined_up_to_the_longest_allowed() {
+        // Three slabs back to back from the start of the file, each taking
+        // one or two blocks, then one further on. Given out of order.
+        let slabs = vec![
+            stored(3 * 4096, 100),
+            stored(0, 4000),
+            stored(4096, 5000),
+            stored(6 * 4096, 4096),
         ];
 
-        let joined = join_adjacent_ranges(ranges, 250);
+        let stretches = join_adjacent_slabs(slabs, 3 * 4096);
 
         assert_eq!(
-            joined,
+            stretches,
             [
-                FileRange::new(0, 200),
-                FileRange::new(200, 150),
-                FileRange::new(400, 10)
+                OnDiskStretch {
+                    range: FileRange::new(0, 3 * 4096),
+                    slabs: vec![stored(0, 4000), stored(4096, 5000)],
+                },
+                OnDiskStretch {
+                    range: FileRange::new(3 * 4096, 4096),
+                    slabs: vec![stored(0, 100)],
+                },
+                OnDiskStretch {
+                    range: FileRange::new(6 * 4096, 4096),
+                    slabs: vec![stored(0, 4096)],
+                },
             ]
         );
+    }
+
+    #[test]
+    fn slabs_packed_inside_blocks_are_read_as_the_whole_blocks_around_them() {
+        // Two compressed slabs packed one after the other, the first starting
+        // partway into a block and the second ending in the next one.
+        let slabs = vec![
+            StoredSlab {
+                start: 5000,
+                stored_len: 3000,
+                row_bytes: 9000,
+            },
+            StoredSlab {
+                start: 8000,
+                stored_len: 1000,
+                row_bytes: 7000,
+            },
+        ];
+
+        let stretches = join_adjacent_slabs(slabs.clone(), 1 << 20);
+
+        assert_eq!(
+            stretches,
+            [OnDiskStretch {
+                range: FileRange::new(4096, 2 * 4096),
+                slabs: vec![
+                    StoredSlab {
+                        start: 5000 - 4096,
+                        ..slabs[0]
+                    },
+                    StoredSlab {
+                        start: 8000 - 4096,
+                        ..slabs[1]
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn stored_slabs_are_cut_out_of_a_stretch_without_what_surrounds_them() {
+        let stretch = OnDiskStretch {
+            range: FileRange::new(0, 3 * 4096),
+            slabs: vec![stored(0, 3), stored(4096, 4098)],
+        };
+        let mut read_back = vec![0u8; 3 * 4096];
+        read_back[..3].fill(1);
+        read_back[4096..4096 + 4098].fill(2);
+        let read_back = Bytes::from(read_back);
+
+        let cut: Vec<(Bytes, usize)> = stretch.cut_stored_slabs(&read_back).collect();
+
+        assert_eq!(cut.len(), 2);
+        assert_eq!((&cut[0].0[..], cut[0].1), (&[1u8; 3][..], 3));
+        assert_eq!((&cut[1].0[..], cut[1].1), (&[2u8; 4098][..], 4098));
     }
 
     /// Rows of `hash | key | count` as they would be read back from a spill

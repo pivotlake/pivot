@@ -16,11 +16,44 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Share of a node's ring slots that eviction should always be able to take
-/// back without waiting on a write: slots that are free, or cached and so
-/// reclaimable by the CLOCK sweep. Once fewer than this remain, the rest being
-/// held by operators, the worker asks its operators to spill.
+/// Share of a node's ring slots that spilling brings the reserve back up to.
+/// The reserve is what eviction can take back without waiting on a write:
+/// slots that are free, or cached and so reclaimable by the CLOCK sweep.
 const RECLAIMABLE_SLOTS_TARGET_PERCENT: usize = 20;
+
+/// Share of a node's ring slots below which spilling starts. Lower than the
+/// target, so the reserve is left to run down to it and is then refilled
+/// towards the target in one go, which gives each worker a batch of buffers
+/// to spill together.
+const RECLAIMABLE_SLOTS_START_PERCENT: usize = 10;
+
+/// [`RECLAIMABLE_SLOTS_TARGET_PERCENT`], or what `PIVOT_SPILL_RESERVE_PERCENT`
+/// sets in its place.
+fn get_reclaimable_slots_target_percent() -> usize {
+    static TARGET_PERCENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::env::get_tunable(
+        &TARGET_PERCENT,
+        "PIVOT_SPILL_RESERVE_PERCENT",
+        RECLAIMABLE_SLOTS_TARGET_PERCENT,
+        |percent| percent <= 100,
+    )
+}
+
+/// [`RECLAIMABLE_SLOTS_START_PERCENT`], or what
+/// `PIVOT_SPILL_START_RESERVE_PERCENT` sets in its place, which may be no
+/// higher than the target. Set to the target, a worker spills as soon as the
+/// reserve is at all short. A target set below the usual start is the start
+/// too.
+fn get_reclaimable_slots_start_percent() -> usize {
+    static START_PERCENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let target = get_reclaimable_slots_target_percent();
+    crate::env::get_tunable(
+        &START_PERCENT,
+        "PIVOT_SPILL_START_RESERVE_PERCENT",
+        RECLAIMABLE_SLOTS_START_PERCENT.min(target),
+        |percent| percent <= target,
+    )
+}
 
 thread_local! {
     static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = const { RefCell::new(None) };
@@ -47,6 +80,10 @@ pub fn memory_ctx() -> &'static MemoryContext {
 pub fn has_memory_context() -> bool {
     MEMORY_CTX_PTR.with(|p| !p.get().is_null())
 }
+
+/// The in-flight write count of each spilled buffer that one spill write
+/// carries rows of.
+type BuffersWritesInFlight = Vec<Arc<AtomicUsize>>;
 
 pub struct MemoryContextFactory {
     ring: Arc<Ring>,
@@ -170,11 +207,11 @@ pub struct MemoryContext {
     /// be reclaimed. Shared with the worker, which drives it.
     io_requester: OnceCell<Rc<RefCell<IORequester>>>,
     /// Every spill write in flight on this worker, pointing at the in-flight
-    /// count of the spilled buffer it belongs to. A count that reaches zero
-    /// tells the buffer's evictor the whole buffer is on disk. Keyed by the
-    /// issuing dataflow as well as the write id, because write ids are drawn
-    /// per dataflow and two dataflows spilling on one worker repeat them.
-    spill_writes_in_flight: RefCell<HashMap<(Identifier, WriteRequestId), Arc<AtomicUsize>>>,
+    /// count of each spilled buffer it carries rows of. A count that reaches
+    /// zero tells the buffer's evictor the whole buffer is on disk. Keyed by
+    /// the issuing dataflow as well as the write id, because write ids are
+    /// drawn per dataflow and two dataflows spilling on one worker repeat them.
+    spill_writes_in_flight: RefCell<HashMap<(Identifier, WriteRequestId), BuffersWritesInFlight>>,
     /// This worker's NUMA node, i.e. the ring region it allocates and evicts from.
     node: usize,
 }
@@ -499,7 +536,11 @@ impl MemoryContext {
     /// A spilled slot can be taken back only by the worker that spilled it, so
     /// this worker's own spilled slots are added on top of the node's. A worker
     /// that holds many sees no shortfall and one that holds few sees it first,
-    /// which sends each new spill to the worker with the fewest. The counts
+    /// which sends each new spill to the worker with the fewest.
+    ///
+    /// Nothing is asked for until the reclaimable slots are below where
+    /// spilling starts (see [`get_reclaimable_slots_start_percent`]), which may
+    /// be lower than the target the shortfall is then measured against. The counts
     /// are read at slightly different instants while peers allocate and
     /// release, so the result is approximate by a few slots, which a watermark
     /// tolerates.
@@ -508,10 +549,11 @@ impl MemoryContext {
         let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
             + self.clock.owned_in_region(Owner::Decompressed, self.node);
         let spilled = self.buffers_spilled[self.node].load(Ordering::Relaxed);
-        let target =
-            self.layout.node_slots(self.node).len() * RECLAIMABLE_SLOTS_TARGET_PERCENT / 100;
+        let slots = self.layout.node_slots(self.node).len();
+        let start = slots * get_reclaimable_slots_start_percent() / 100;
+        let target = slots * get_reclaimable_slots_target_percent() / 100;
         let reclaimable = free + cached + spilled + self.own_buffers_spilled.get();
-        if reclaimable >= target {
+        if reclaimable >= start {
             return 0;
         }
         (target - reclaimable).div_ceil(self.layout.topology().workers_per_node)
@@ -580,18 +622,19 @@ impl MemoryContext {
             .unwrap_or_else(|_| panic!("the worker attached its IO requester twice"));
     }
 
-    /// Note a spill write issued for a buffer by `dataflow`, so that when it
-    /// lands the buffer's `writes_in_flight` is counted down.
+    /// Note a spill write issued by `dataflow` that carries rows of the
+    /// buffers whose in-flight counts are given, so that when it lands each
+    /// of them is counted down.
     pub fn record_spill_write_issued(
         &self,
         dataflow: Identifier,
         id: WriteRequestId,
-        writes_in_flight: Arc<AtomicUsize>,
+        buffers_writes_in_flight: Vec<Arc<AtomicUsize>>,
     ) {
         let replaced = self
             .spill_writes_in_flight
             .borrow_mut()
-            .insert((dataflow, id), writes_in_flight);
+            .insert((dataflow, id), buffers_writes_in_flight);
         assert!(
             replaced.is_none(),
             "spill write {id:?} of dataflow {dataflow} issued twice"
@@ -617,10 +660,12 @@ impl MemoryContext {
             // A write of a dataflow that has since failed is no longer
             // recorded (see `unregister_dataflow_evictors`); its buffer went
             // with the dataflow, so there is nothing left to count it off.
-            if let Some(writes_in_flight) =
+            if let Some(buffers_writes_in_flight) =
                 spill_writes_in_flight.remove(&(write.data_flow_id, write.request.id))
             {
-                writes_in_flight.fetch_sub(1, Ordering::Release);
+                for writes_in_flight in buffers_writes_in_flight {
+                    writes_in_flight.fetch_sub(1, Ordering::Release);
+                }
             }
         }
     }
@@ -795,9 +840,10 @@ mod tests {
 
     #[test]
     fn cached_slots_count_as_reclaimable_for_spilling() {
-        // 128 slots, so the target is 25 reclaimable; 10 free plus 15 cached.
-        init_test_free_pool(10);
-        for idx in 10..25 {
+        // 128 slots, so spilling starts under 12 reclaimable; 5 free plus 10
+        // cached.
+        init_test_free_pool(5);
+        for idx in 5..15 {
             memory_ctx().clock().bind(idx, Owner::Compressed);
         }
 
@@ -808,7 +854,8 @@ mod tests {
 
     #[test]
     fn slots_to_spill_is_the_shortfall_below_the_reclaimable_target_less_what_is_spilled() {
-        // 128 slots, so the target is 25 reclaimable; seed 10 free, nothing cached.
+        // 128 slots, so spilling starts under 12 reclaimable and refills to
+        // 25; seed 10 free, nothing cached.
         init_test_free_pool(10);
 
         let shortfall = memory_ctx().slots_to_spill();
@@ -824,14 +871,15 @@ mod tests {
 
     #[test]
     fn a_workers_own_spilled_slots_count_again_toward_its_target() {
-        // 128 slots, so the target is 25 reclaimable; 10 free, nothing cached.
-        init_test_free_pool(10);
-        memory_ctx().record_buffers_spilled(8);
+        // 128 slots, so spilling starts under 12 reclaimable. 4 free and 5
+        // spilled make 9; the worker's own 5 counted again make 14.
+        init_test_free_pool(4);
+        memory_ctx().record_buffers_spilled(5);
 
         let shortfall = memory_ctx().slots_to_spill();
 
         assert_eq!(shortfall, 0);
-        memory_ctx().record_spilled_buffers_released(8);
+        memory_ctx().record_spilled_buffers_released(5);
     }
 
     #[test]

@@ -624,18 +624,24 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         table.clear();
     }
 
-    /// Spill one sealed scatter buffer, if there is one, keeping it in the
-    /// evictor so the memory context can free it once its writes land.
-    /// Returns whether a buffer was spilled.
-    pub fn spill(&mut self, spiller: &mut Spiller) -> Result<bool, IORequesterError> {
+    /// Spill up to `count` sealed scatter buffers together, keeping them in
+    /// the evictor so the memory context can free each once its writes land.
+    /// Returns how many were spilled.
+    pub fn spill(
+        &mut self,
+        spiller: &mut Spiller,
+        count: usize,
+    ) -> Result<usize, IORequesterError> {
         let Some(buffers) = &mut self.buffers else {
-            return Ok(false);
+            return Ok(0);
         };
-        let Some(spilled) = buffers.spill(spiller)? else {
-            return Ok(false);
-        };
-        self.evictor.borrow_mut().push(spilled);
-        Ok(true)
+        let spilled_buffers = buffers.spill(spiller, count)?;
+        let spilled = spilled_buffers.len();
+        let mut evictor = self.evictor.borrow_mut();
+        for spilled_buffer in spilled_buffers {
+            evictor.push(spilled_buffer);
+        }
+        Ok(spilled)
     }
 
     /// Finishes worker state for the merge phase, returning the worker's
@@ -1165,7 +1171,7 @@ mod tests {
         consume_all(&mut table, &values);
         let mut parts = SpillerParts::new(9_000_020);
 
-        let spilled = table.spill(&mut parts.spiller()).unwrap();
+        let spilled = table.spill(&mut parts.spiller(), 1).unwrap();
         let (output, _totals) = table.flush();
         parts.finish_writes();
 
@@ -1175,7 +1181,7 @@ mod tests {
         drop(output);
         let evicted_after = evictor.borrow_mut().evict();
 
-        assert!(spilled);
+        assert_eq!(spilled, 1);
         assert_eq!(in_place + scatter_rows, 400_000);
         assert!(evicted_while_read.is_none());
         assert!(evicted_after.is_some());

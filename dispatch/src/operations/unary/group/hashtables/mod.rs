@@ -14,7 +14,7 @@ mod table_reader;
 pub(crate) use table_reader::TableReader;
 
 mod scatter;
-pub use scatter::{PartitionRows, ScatterLayout, ScatterRows};
+pub use scatter::{OnDiskStretch, PartitionRows, ScatterLayout, ScatterRows};
 
 mod aggregated_table;
 pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, PartitionBuffers, RadixConfig};

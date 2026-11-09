@@ -591,20 +591,34 @@ pub struct FailedIO {
 /// - **macOS**: uses `F_NOCACHE` (best-effort, not true direct I/O).
 /// - **Other**: falls back to normal cached reads.
 pub fn open_direct_read(path: &Path) -> std::io::Result<LocalFile> {
+    open_direct(OpenOptions::new().read(true), path)
+}
+
+/// Creates a file, which must not exist yet, for direct (uncached) reads and
+/// writes: every operation on it bypasses the page cache, and so must have
+/// its file offset, its length and its memory aligned to the device's block
+/// size. Platforms as for [`open_direct_read`].
+pub fn create_direct_read_write(path: &Path) -> std::io::Result<LocalFile> {
+    open_direct(
+        OpenOptions::new().read(true).write(true).create_new(true),
+        path,
+    )
+}
+
+/// Opens `path` as `options` says, bypassing the page cache where the
+/// platform can.
+fn open_direct(options: &mut OpenOptions, path: &Path) -> std::io::Result<LocalFile> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(path)?;
+        let file = options.custom_flags(libc::O_DIRECT).open(path)?;
         LocalFile::new(file)
     }
 
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
-        let file = OpenOptions::new().read(true).open(path)?;
+        let file = options.open(path)?;
         let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
         if rc == -1 {
             return Err(std::io::Error::last_os_error());
@@ -612,15 +626,9 @@ pub fn open_direct_read(path: &Path) -> std::io::Result<LocalFile> {
         LocalFile::new(file)
     }
 
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let file = OpenOptions::new().read(true).open(path)?;
-        return LocalFile::new(file);
-    }
-
-    #[cfg(not(unix))]
-    {
-        let file = OpenOptions::new().read(true).open(path)?;
-        return LocalFile::new(file);
+        let file = options.open(path)?;
+        LocalFile::new(file)
     }
 }
