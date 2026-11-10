@@ -527,11 +527,17 @@ mod uring_engine {
     const MAX_HTTP_RETRIES: u32 = 3;
 
     /// Whether a transport error is worth retrying on a fresh connection. Socket
-    /// teardown (a closed keep-alive, a reset, a refused reconnect) is transient;
-    /// a TLS/protocol/DNS error is not — retrying would just fail the same way.
+    /// teardown (a closed keep-alive, a reset, a refused reconnect) is transient,
+    /// and so is a 5xx answer: object stores return one while they are briefly
+    /// overloaded. A TLS/protocol/DNS error is not — retrying would just fail
+    /// the same way.
     fn is_retryable(err: &Error) -> bool {
+        use crate::io::http::proto::ProtoError;
         use std::io::ErrorKind::*;
         match err {
+            Error::Proto(
+                ProtoError::UnexpectedUploadStatus(status) | ProtoError::UnexpectedStatus(status),
+            ) => (500..600).contains(status),
             Error::Io(e) => matches!(
                 e.kind(),
                 UnexpectedEof

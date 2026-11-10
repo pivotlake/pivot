@@ -1398,51 +1398,38 @@ mod tests {
         Arc::new(config)
     }
 
-    #[test]
-    fn plain_http_upload_uses_shared_connection_engine() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let server_received = received.clone();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut wire = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let (head_len, content_len) = loop {
-                let n = stream.read(&mut chunk).unwrap();
-                assert!(n > 0);
-                wire.extend_from_slice(&chunk[..n]);
-                if let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head_len = end + 4;
-                    let head = String::from_utf8_lossy(&wire[..head_len]);
-                    let content_len = head
-                        .lines()
-                        .find_map(|line| {
-                            line.strip_prefix("Content-Length: ")
-                                .and_then(|v| v.parse::<usize>().ok())
-                        })
-                        .unwrap();
-                    break (head_len, content_len);
-                }
-            };
-            while wire.len() < head_len + content_len {
-                let n = stream.read(&mut chunk).unwrap();
-                assert!(n > 0);
-                wire.extend_from_slice(&chunk[..n]);
+    /// Read one whole upload request off `stream` and return its body.
+    fn read_upload_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let (head_len, content_len) = loop {
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0);
+            wire.extend_from_slice(&chunk[..n]);
+            if let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head_len = end + 4;
+                let head = String::from_utf8_lossy(&wire[..head_len]);
+                let content_len = head
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .and_then(|v| v.parse::<usize>().ok())
+                    })
+                    .unwrap();
+                break (head_len, content_len);
             }
-            server_received
-                .lock()
-                .unwrap()
-                .extend_from_slice(&wire[head_len..head_len + content_len]);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
-                )
-                .unwrap();
-        });
+        };
+        while wire.len() < head_len + content_len {
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0);
+            wire.extend_from_slice(&chunk[..n]);
+        }
+        wire[head_len..head_len + content_len].to_vec()
+    }
 
-        // The payload is ring memory, in two runs, so the upload path is
-        // exercised the way a real file reaches it rather than as one buffer.
+    /// An upload payload held as ring memory, in two runs, so the upload path
+    /// is exercised the way a real file reaches it rather than as one buffer.
+    fn build_upload_payload() -> Arc<crate::memory::FileBytes> {
         crate::memory::init_test_free_pool(4);
         let mut allocator = crate::memory::SlabAllocator::new(false);
         let mut bytes = crate::memory::FileBytes::new();
@@ -1451,7 +1438,27 @@ mod tests {
             run.as_mut_slice().copy_from_slice(part);
             bytes.push(run);
         }
-        let data = Arc::new(bytes);
+        Arc::new(bytes)
+    }
+
+    #[test]
+    fn plain_http_upload_uses_shared_connection_engine() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let server_received = received.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let body = read_upload_body(&mut stream);
+            server_received.lock().unwrap().extend_from_slice(&body);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let data = build_upload_payload();
         let remote = Arc::new(
             RemoteFile::open(
                 Url::parse(&format!("http://{addr}/object.parquet")).unwrap(),
@@ -1502,6 +1509,49 @@ mod tests {
         let sent: Vec<u8> = data.runs().flatten().copied().collect();
         assert_eq!(*received.lock().unwrap(), sent);
         assert_eq!(Arc::strong_count(&data), 1);
+    }
+
+    /// Only the io_uring engine re-issues a failed request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upload_is_retried_after_a_server_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut overloaded, _) = listener.accept().unwrap();
+            read_upload_body(&mut overloaded);
+            overloaded
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            let (mut recovered, _) = listener.accept().unwrap();
+            let body = read_upload_body(&mut recovered);
+            recovered
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            body
+        });
+        let data = build_upload_payload();
+        let url = Url::parse(&format!("http://{addr}/object.parquet")).unwrap();
+        let remote = Arc::new(RemoteFile::open(url, None, data.len() as u64).unwrap());
+        let upload = HttpRequest::Upload(HttpUploadRequest {
+            remote,
+            data: data.clone(),
+        });
+        let mut requester = IORequester::default();
+
+        requester
+            .submit_http_request_to_backend(DataFlowRequest::new(7, 11, upload))
+            .unwrap();
+        let completion = loop {
+            if let Some(completion) = requester.completions().unwrap().into_iter().next() {
+                break completion;
+            }
+            requester.wait().unwrap();
+        };
+
+        assert!(matches!(completion, Ok(Completion::HttpUpload(_))));
+        let sent: Vec<u8> = data.runs().flatten().copied().collect();
+        assert_eq!(server.join().unwrap(), sent);
     }
 
     /// Read one range request and write back its `206` response body.
