@@ -54,11 +54,20 @@ impl Deref for ReadBuffer {
 /// evictor reads the list only after `try_write` succeeds (`used == 0`, AcqRel). Releasing
 /// here is what lets that Acquire observe the filler's tenant writes - the publication edge
 /// for shared state written by a reader and read by the next writer. See `MemoryContext::evict`.
+///
+/// The last reader also has the clock stop counting the slot as pinned. The
+/// slot's owner is read before letting go, because once the count is zero
+/// eviction may take the slot and release it from its cache at any moment.
 impl Drop for ReadBuffer {
     fn drop(&mut self) {
-        memory_ctx().ring().slots[self.slot_idx]
+        let context = memory_ctx();
+        let owner = context.clock().owner(self.slot_idx);
+        let readers_before = context.ring().slots[self.slot_idx]
             .used
             .fetch_sub(1, Ordering::Release);
+        if readers_before == 1 {
+            context.clock().count_unpinned(self.slot_idx, owner);
+        }
     }
 }
 
@@ -67,6 +76,7 @@ impl Drop for ReadBuffer {
 ///
 /// The `WriteBuffer` is forgotten (its `Drop` is skipped) and the slot's `used`
 /// count is set to 1 (one reader). The pointer is reused as-is - no copy occurs.
+/// That reader is the slot's first, so the clock counts the slot as pinned.
 ///
 /// The slot is also marked **not zeroed**: a buffer only becomes a `ReadBuffer`
 /// once it has been (or is about to be) filled with data, so its `zeroed` flag
@@ -84,6 +94,7 @@ impl From<WriteBuffer> for ReadBuffer {
         let ring = memory_ctx().ring();
         ring.set_slot_zeroed(slot_idx, false);
         ring.set_slot_used(slot_idx, 1, Ordering::Release);
+        memory_ctx().clock().count_pinned(slot_idx);
         Self { ptr, slot_idx }
     }
 }

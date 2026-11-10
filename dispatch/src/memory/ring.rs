@@ -16,6 +16,7 @@
 //! Dropping a `WriteBuffer` or all `ReadBuffer`s releases the slot back (see their
 //! respective modules for details).
 
+use crate::memory::context::memory_ctx;
 use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::write_buffer::WriteBuffer;
 use std::fmt::{Debug, Formatter};
@@ -205,7 +206,9 @@ impl Ring {
     ///
     /// Atomically increments the reader count. If the `WRITING` bit is set
     /// (a writer holds the slot), None` is
-    /// returned. Multiple readers can hold the same slot concurrently.
+    /// returned. Multiple readers can hold the same slot concurrently. The
+    /// first of them has the clock count the slot as pinned (see
+    /// [`Clock::count_pinned`](super::Clock::count_pinned)).
     pub fn try_read(&self, idx: usize) -> Option<ReadBuffer> {
         let slot = &self.slots[idx];
         let prev = slot.used.fetch_add(1, Ordering::Acquire);
@@ -220,6 +223,9 @@ impl Ring {
             // If a slot is in write mode, it will necessarily be set to a value - either 0 or 1.
             // Therefore, we don't touch it after seeing it is in write mode.
             return None;
+        }
+        if prev == 0 {
+            memory_ctx().clock().count_pinned(idx);
         }
         Some(ReadBuffer {
             ptr: slot.buffer,

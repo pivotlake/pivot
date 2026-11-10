@@ -97,6 +97,18 @@ impl Owner {
     }
 }
 
+/// How many of one region's slots each tier owns and readers hold. Kept on
+/// cache lines of its own: every worker of the region writes it as its readers
+/// take and let go of slots, far more often than anything else in the clock
+/// is written, and a neighbour on the same line would be slowed by each of
+/// those writes.
+#[repr(align(128))]
+#[derive(Default)]
+struct PinnedCounts {
+    compressed: AtomicUsize,
+    decompressed: AtomicUsize,
+}
+
 struct Slot {
     owner: AtomicU8,
     refs: AtomicU8,
@@ -123,6 +135,13 @@ pub struct Clock {
     /// balance it must judge.
     compressed_counts: Box<[AtomicUsize]>,
     decompressed_counts: Box<[AtomicUsize]>,
+    /// Of the slots counted above, how many at least one reader holds, per
+    /// region. Eviction cannot take such a slot until its last reader lets go,
+    /// so a tier whose every slot is pinned has nothing to give however long
+    /// its hand sweeps. Maintained by [`count_pinned`](Self::count_pinned) and
+    /// [`count_unpinned`](Self::count_unpinned), which the ring calls as a
+    /// slot gains its first reader and loses its last.
+    pinned_counts: Box<[PinnedCounts]>,
 }
 
 impl Clock {
@@ -147,6 +166,14 @@ impl Clock {
             slots_per_region,
             compressed_counts: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
             decompressed_counts: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
+            pinned_counts: (0..region_count).map(|_| PinnedCounts::default()).collect(),
+        }
+    }
+
+    fn pinned_count_of(&self, owner: Owner, region: usize) -> &AtomicUsize {
+        match owner {
+            Owner::Compressed => &self.pinned_counts[region].compressed,
+            Owner::Decompressed => &self.pinned_counts[region].decompressed,
         }
     }
 
@@ -219,6 +246,45 @@ impl Clock {
     /// Slots currently bound to `tier` in `region`.
     pub fn owned_in_region(&self, tier: Owner, region: usize) -> usize {
         self.counts_of(tier)[region].load(Relaxed)
+    }
+
+    /// Count `slot` as pinned, if a cache owns it. For the ring to call when
+    /// the slot gains its first reader.
+    ///
+    /// A slot is bound and released only while it is held for writing, which
+    /// excludes readers. So the owner read here is the slot's owner for as
+    /// long as any reader holds it, and the same one
+    /// [`count_unpinned`](Self::count_unpinned) is given.
+    pub fn count_pinned(&self, slot: usize) {
+        if let Some(owner) = self.owner(slot) {
+            self.pinned_count_of(owner, self.region_of(slot))
+                .fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Stop counting `slot` as pinned. For the ring to call when the slot
+    /// loses its last reader. `owner` is the slot's owner as read while that
+    /// reader still held it: once the reader has let go, eviction may release
+    /// the slot before its owner could be read here.
+    pub fn count_unpinned(&self, slot: usize, owner: Option<Owner>) {
+        if let Some(owner) = owner {
+            let pinned_before = self
+                .pinned_count_of(owner, self.region_of(slot))
+                .fetch_sub(1, Relaxed);
+            debug_assert!(
+                pinned_before > 0,
+                "slot {slot} lost a last reader it was never counted for"
+            );
+        }
+    }
+
+    /// Slots bound to `tier` in `region` that no reader holds, which are the
+    /// ones its hand could take. The two counts behind it are read one after
+    /// the other while peers bind, release, pin and unpin, so the answer may
+    /// be off by the few slots that changed in between.
+    pub fn unpinned_in_region(&self, tier: Owner, region: usize) -> usize {
+        self.owned_in_region(tier, region)
+            .saturating_sub(self.pinned_count_of(tier, region).load(Relaxed))
     }
 
     /// The most sweeps of its hand any slot can survive (the refs ceiling).
@@ -397,6 +463,32 @@ mod tests {
 
         assert_eq!(clock.owned(Owner::Compressed), 0);
         assert_eq!(clock.owned(Owner::Decompressed), 0);
+    }
+
+    #[test]
+    fn a_pinned_slot_is_not_one_its_tier_can_give() {
+        let clock = Clock::new(2);
+        clock.bind(0, Owner::Compressed);
+        clock.bind(1, Owner::Compressed);
+
+        clock.count_pinned(0);
+        let while_pinned = clock.unpinned_in_region(Owner::Compressed, 0);
+        clock.count_unpinned(0, clock.owner(0));
+        let after_unpinning = clock.unpinned_in_region(Owner::Compressed, 0);
+
+        assert_eq!(while_pinned, 1);
+        assert_eq!(after_unpinning, 2);
+    }
+
+    #[test]
+    fn pinning_a_slot_no_cache_owns_counts_against_neither_tier() {
+        let clock = Clock::new(2);
+        clock.bind(0, Owner::Decompressed);
+
+        clock.count_pinned(1);
+
+        assert_eq!(clock.unpinned_in_region(Owner::Compressed, 0), 0);
+        assert_eq!(clock.unpinned_in_region(Owner::Decompressed, 0), 1);
     }
 
     #[test]

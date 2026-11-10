@@ -398,10 +398,12 @@ impl MemoryContext {
     /// (see [`Clock::preferred_victim_tier`]) - advances that tier's hand, and
     /// routes the victim to its cache's reclaim.
     ///
-    /// A tier that owns no slots in this region is not swept at all, and when
-    /// neither tier owns any the registered [`Evict`] operators are asked at
-    /// once. When both caches have swept their region and every slot they hold
-    /// is pinned, the operators are asked before the caches are swept again.
+    /// A tier with no slot to give in this region, because it owns none or
+    /// because readers hold every slot it owns, is not swept at all, and when
+    /// neither tier has one the registered
+    /// [`Evict`](crate::memory::evict::Evict) operators are asked at
+    /// once. When both caches have swept their region without giving a slot,
+    /// the operators are asked before the caches are swept again.
     pub(crate) fn evict(&self) -> WriteBuffer {
         // Livelock guard. When a query's working set exceeds the ring, every
         // worker spins here finding nothing evictable (near-100% CPU, ~0 forward
@@ -454,14 +456,18 @@ impl MemoryContext {
                 );
             }
 
-            // The owner counts are shared with peer workers, so a slot may be
-            // bound between reading them and sweeping. Skipping an empty tier is
-            // still safe: at worst such a slot waits one revolution to be found.
-            let compressed_cached = self.clock.owned_in_region(Owner::Compressed, self.node);
-            let decompressed_cached = self.clock.owned_in_region(Owner::Decompressed, self.node);
-            if compressed_cached == 0 && decompressed_cached == 0 {
-                // Nothing is cached in this region, so the caches have nothing to
-                // give back and only the operators can.
+            // A hand can only take a slot its tier owns and no reader holds.
+            // The counts of those are shared with peer workers, so a slot may
+            // be bound or let go of between reading them and sweeping. Skipping
+            // a tier that has none is still safe: at worst such a slot waits
+            // until the next time round to be found.
+            let compressed_unpinned = self.clock.unpinned_in_region(Owner::Compressed, self.node);
+            let decompressed_unpinned = self
+                .clock
+                .unpinned_in_region(Owner::Decompressed, self.node);
+            if compressed_unpinned == 0 && decompressed_unpinned == 0 {
+                // Whatever is cached in this region is held by readers, so the
+                // caches have nothing to give back and only the operators can.
                 if let Some(buffer) = self.evict_from_dataflow_operators() {
                     return buffer;
                 }
@@ -479,10 +485,11 @@ impl MemoryContext {
                     Owner::Decompressed => Owner::Compressed,
                 };
             }
-            // An empty tier has nothing to sweep; take from the other one.
+            // A tier with nothing a hand could take is not worth sweeping; take
+            // from the other one.
             tier = match tier {
-                Owner::Compressed if compressed_cached == 0 => Owner::Decompressed,
-                Owner::Decompressed if decompressed_cached == 0 => Owner::Compressed,
+                Owner::Compressed if compressed_unpinned == 0 => Owner::Decompressed,
+                Owner::Decompressed if decompressed_unpinned == 0 => Owner::Compressed,
                 tier => tier,
             };
 
@@ -815,6 +822,7 @@ mod tests {
     //! [`init_test_free_pool`], so there's no shared state and no lock.
 
     use super::*;
+    use crate::memory::ReadBuffer;
     use crate::memory::evict::{Evict, HandOverEvictor};
     use std::rc::Rc;
 
@@ -836,6 +844,60 @@ mod tests {
         assert_eq!(evicted.slot_idx, held_slot);
         assert_eq!(*log.borrow(), ["group"]);
         memory_ctx().unregister_dataflow_evictors(7);
+    }
+
+    #[test]
+    fn evict_asks_the_operators_without_sweeping_when_readers_hold_every_cached_slot() {
+        init_test_free_pool(2);
+        let cached = memory_ctx().get_write_buffer(false);
+        memory_ctx()
+            .clock()
+            .bind(cached.slot_idx, Owner::Decompressed);
+        let _reader = ReadBuffer::from(cached);
+        let held = memory_ctx().get_write_buffer(false);
+        let held_slot = held.slot_idx;
+        let operator: Box<dyn Evict> = Box::new(HandOverEvictor {
+            label: "group",
+            log: Rc::new(RefCell::new(Vec::new())),
+            buffer: RefCell::new(Some(held)),
+        });
+        memory_ctx().register_dataflow_evictors(7, DataflowEvict::new(vec![Some(operator)], &[]));
+
+        let evicted = memory_ctx().evict();
+
+        assert_eq!(evicted.slot_idx, held_slot);
+        assert_eq!(
+            memory_ctx().clock().hand_position(Owner::Decompressed, 0),
+            0
+        );
+        memory_ctx().unregister_dataflow_evictors(7);
+    }
+
+    #[test]
+    fn a_cached_slot_can_be_taken_again_once_its_last_reader_lets_go() {
+        init_test_free_pool(1);
+        let cached = memory_ctx().get_write_buffer(false);
+        let cached_slot = cached.slot_idx;
+        memory_ctx().clock().bind(cached_slot, Owner::Decompressed);
+        let first_reader = ReadBuffer::from(cached);
+        let second_reader = memory_ctx().ring().try_read(cached_slot).unwrap();
+
+        let with_two_readers = memory_ctx()
+            .clock()
+            .unpinned_in_region(Owner::Decompressed, 0);
+        drop(first_reader);
+        let with_one_reader = memory_ctx()
+            .clock()
+            .unpinned_in_region(Owner::Decompressed, 0);
+        drop(second_reader);
+        let with_no_reader = memory_ctx()
+            .clock()
+            .unpinned_in_region(Owner::Decompressed, 0);
+
+        assert_eq!(
+            (with_two_readers, with_one_reader, with_no_reader),
+            (0, 0, 1)
+        );
     }
 
     #[test]
