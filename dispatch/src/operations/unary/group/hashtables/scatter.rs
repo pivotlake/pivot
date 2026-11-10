@@ -32,6 +32,19 @@ use std::marker::PhantomData;
 const SLAB_BYTES: usize = 64 * 1024;
 const FIRST_SLAB_BYTES: usize = SLAB_BYTES / 8;
 
+/// [`SLAB_BYTES`], or what `PIVOT_SCATTER_SLAB_BYTES` sets in its place: a
+/// whole number of spill blocks, no smaller than a partition's first slab
+/// and no larger than a ring buffer.
+fn get_slab_bytes() -> usize {
+    static SLAB_BYTES_IN_USE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::env::get_tunable(
+        &SLAB_BYTES_IN_USE,
+        "PIVOT_SCATTER_SLAB_BYTES",
+        SLAB_BYTES,
+        |bytes| bytes % SPILL_BLOCK_SIZE == 0 && (FIRST_SLAB_BYTES..=BUFFER_SIZE).contains(&bytes),
+    )
+}
+
 /// Copyable layout for scatter rows.
 ///
 /// The caller holds one layout value for all partitions. Keeping it out of
@@ -110,7 +123,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V> {
                 layout.stride,
                 layout.align,
                 FIRST_SLAB_BYTES,
-                SLAB_BYTES,
+                get_slab_bytes(),
             )),
             partition_count,
             row_size: layout.stride,
