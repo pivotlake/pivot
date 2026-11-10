@@ -82,10 +82,12 @@ pub fn has_memory_context() -> bool {
 }
 
 /// Whether a node is short of reclaimable slots, as the last worker to count
-/// them found it. Every worker of the node reads this on every loop
-/// iteration, so it has a cache line to itself and is written only when the
-/// answer changes: unlike the counts it is derived from, which every buffer
-/// pop, push and cache bind writes, it stays in every reader's cache.
+/// them found it. In a pool with a spill directory every worker of the node
+/// reads this on every loop iteration, so it has a cache line to itself and
+/// is written only when the answer changes: unlike the counts it is derived
+/// from, which every buffer pop, push and cache bind writes, it stays in
+/// every reader's cache. In a pool without one nothing counts the slots, and
+/// this is neither written nor read.
 #[repr(align(128))]
 struct NodeSpillPressure {
     is_short_of_reclaimable_slots: AtomicBool,

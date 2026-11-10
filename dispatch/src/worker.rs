@@ -26,7 +26,7 @@ use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
-use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
+use crate::memory::{MemoryContextFactory, SpillDirectory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
 use ahash::HashMap;
@@ -164,6 +164,11 @@ pub struct Worker {
     /// Last delegated-broadcast epoch this worker has fanned out (see
     /// [`WorkerWaker::finish_delegated_wake`]).
     last_seen_broadcast: u64,
+    /// Where this worker's dataflows spill to when the ring runs short. A
+    /// pool that was given no directory spills nothing: its workers never ask
+    /// an operator to, and a dataflow that needs more memory than the ring
+    /// has fails when eviction finds none to give it.
+    spill_directory: Option<SpillDirectory>,
 }
 
 impl Worker {
@@ -183,6 +188,7 @@ impl Worker {
         should_exit: Arc<AtomicBool>,
         memory_context_factory: MemoryContextFactory,
         disk_cache: Option<Arc<DiskCache>>,
+        spill_directory: Option<SpillDirectory>,
         receiver: Receiver<DataFlowBuilder>,
         ready_barrier: Arc<Barrier>,
         waker: Arc<WorkerWaker>,
@@ -231,6 +237,7 @@ impl Worker {
                     last_seen_ring_wake_count,
                     node_local_idx,
                     last_seen_broadcast,
+                    spill_directory,
                 };
                 // Notifiers must be able to interrupt this worker's blocking
                 // IO wait, not just its thread park; register the ring's wake
@@ -288,7 +295,13 @@ impl Worker {
     /// memory comes back later, once the writes land, so this runs ahead of
     /// exhaustion rather than at it. Runs before CPU work so the slots that
     /// work will allocate are already on their way back.
+    ///
+    /// Without a spill directory there is nowhere to spill to, so nothing is
+    /// asked of the operators and the node's slots are not even counted.
     fn maybe_spill(&mut self) {
+        let Some(spill_directory) = &self.spill_directory else {
+            return;
+        };
         if !memory_ctx().is_pressure_check_due() {
             return;
         }
@@ -297,7 +310,7 @@ impl Worker {
             return;
         }
         for flow in self.data_flows.values_mut() {
-            let spilled = flow.spill(&self.io, wanted);
+            let spilled = flow.spill(&self.io, spill_directory, wanted);
             if spilled > 0 {
                 self.did_work_last_iteration = true;
                 wanted = wanted.saturating_sub(spilled);
@@ -331,8 +344,11 @@ impl Worker {
             let mut io = self.io.borrow_mut();
             io.collect_completions()?;
             // Spill writes were issued by the memory context's spiller, not by
-            // an operator, so they are counted off there.
-            memory_ctx().complete_landed_spill_writes(&mut io);
+            // an operator, so they are counted off there. A worker with no
+            // spill directory issues none.
+            if self.spill_directory.is_some() {
+                memory_ctx().complete_landed_spill_writes(&mut io);
+            }
             io.take_completions()
         };
         for completion in completions {

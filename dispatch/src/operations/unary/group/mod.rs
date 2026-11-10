@@ -571,8 +571,11 @@ mod tests {
         // Spill every sealed scatter buffer, wait for the writes, then evict
         // every spilled buffer, so the merge has to read those rows back.
         let mut evicted = 0;
+        let spill_directory = crate::memory::TestSpillDirectory::new();
         let sender = run_consumers_with(groups, worker_batches, 9_000_040, |worker, group, io| {
-            group.spill(&mut io.spiller(), usize::MAX).unwrap();
+            group
+                .spill(&mut io.spiller(&spill_directory), usize::MAX)
+                .unwrap();
             io.finish_spill_writes();
             while let Some(freed) = evictors[worker].borrow_mut().evict() {
                 drop(freed);

@@ -174,7 +174,7 @@ pub fn run_consumers<C: Consumer<RecordBatch, RecordBatch>>(
 /// has consumed and before it becomes an outputter, with the IO that
 /// consumer's outputter will use. The harness is one worker, so consumer `i`'s
 /// IO acts as operator `i` of dataflow `dataflow_id` to keep their spill files
-/// apart; whatever was spilled is removed at the end.
+/// apart.
 pub fn run_consumers_with<C: Consumer<RecordBatch, RecordBatch>>(
     consumers: Vec<C>,
     worker_batches: Vec<Vec<RecordBatch>>,
@@ -185,9 +185,6 @@ pub fn run_consumers_with<C: Consumer<RecordBatch, RecordBatch>>(
     let mut dummy = CollectSender::new();
 
     let mut consumers = consumers;
-    // A run that panicked midway leaves its spill files behind; clear them so
-    // this run can create its own.
-    crate::memory::spill_directory::remove_worker_directory(dataflow_id, WORKER_IDX.get()).unwrap();
     let mut worker_ios: Vec<_> = (0..consumers.len())
         .map(|consumer| crate::io::TestOperatorIO::for_operator(dataflow_id, consumer))
         .collect();
@@ -234,7 +231,6 @@ pub fn run_consumers_with<C: Consumer<RecordBatch, RecordBatch>>(
             }
         }
     }
-    crate::memory::spill_directory::remove_worker_directory(dataflow_id, WORKER_IDX.get()).unwrap();
     sender
 }
 
