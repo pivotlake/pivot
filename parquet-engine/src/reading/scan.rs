@@ -54,7 +54,12 @@ where
     let decoded = input
         .chain(
             stealable::<RowGroupBuffer>(topology).into_iter().collect(),
-            (0..n).map(|_| IndexerFactory::new()).collect(),
+            (0..n)
+                .map(|_| IndexerFactory {
+                    projection: projection.clone(),
+                    eq_predicates: eq_predicates.clone(),
+                })
+                .collect(),
         )
         .chain(
             stealable::<CompressedPage>(topology).into_iter().collect(),

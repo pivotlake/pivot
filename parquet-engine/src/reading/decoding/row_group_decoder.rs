@@ -13,6 +13,7 @@ use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::decoding::leaf_decoders::rle::PageSkipMarks;
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
 use crate::reading::record_batch_metadata::with_row_index;
+use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::filter_mask::FilterMask;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
@@ -21,6 +22,7 @@ use crate::types::projection::Projection;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{FieldRef, Fields, Schema, SchemaRef};
+use bytes::Bytes;
 use dispatch::memory::SlabAllocator;
 use std::cmp::min;
 use std::ops::Range;
@@ -120,6 +122,29 @@ impl DecodePlan {
             prunable,
             eq_constants,
         })
+    }
+
+    /// Whether the dictionary page of decoded leaf `leaf` rules out every row
+    /// of the row group: the leaf is one the row group can be pruned by, and
+    /// its dictionary excludes the constant pushed down for it.
+    pub fn dictionary_prunes_row_group(
+        &self,
+        row_group_metadata: &QueryRowGroupMetadata,
+        leaf: usize,
+        header: &DictionaryPageHeader,
+        data: &[Bytes],
+    ) -> Result<bool> {
+        let Some((_, constant)) = self
+            .eq_constants
+            .iter()
+            .find(|(prunable_leaf, _)| *prunable_leaf == leaf)
+        else {
+            return Ok(false);
+        };
+        let chunk = &row_group_metadata.columns()[self.file_leaves[leaf]];
+        let mut leaf_decoder = create_leaf_decoder(self.leaf_fields[leaf].data_type(), chunk)?;
+        leaf_decoder.set_eq_constant(constant);
+        Ok(leaf_decoder.dictionary_excludes_constant(header, data))
     }
 
     /// How many leaves are decoded.

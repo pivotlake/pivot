@@ -402,6 +402,10 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
         self.inner.build_dictionary(header, data, allocator)
     }
 
+    fn dictionary_excludes_constant(&self, header: &DictionaryPageHeader, data: &[Bytes]) -> bool {
+        self.inner.dictionary_excludes_constant(header, data)
+    }
+
     fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {
         self.inner.adopt_dictionary(dictionary);
     }

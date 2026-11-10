@@ -12,7 +12,8 @@
 //! the row group; every range carries it for its decoder to read through.
 //! A dictionary that excludes a pushed-down equality constant prunes the
 //! row group there and then: none of its data pages is decoded, and the
-//! decompressor drops the ones still to come.
+//! decompressor drops the ones still to come. A row group the indexer
+//! pruned already is closed by the first of its pages to arrive.
 
 pub(crate) mod row_group_pages;
 pub use row_group_pages::DecodeRange;
@@ -134,6 +135,14 @@ impl RangeCutter {
         }
     }
 
+    /// Forgets a row group that was pruned before any of its pages got
+    /// here: there is nothing to cut, so both of its claims are released.
+    fn close_pruned_unopened(&mut self, row_group_index: usize) {
+        self.closed.insert(row_group_index);
+        self.release_claim();
+        self.outstanding_row_groups.fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// Emits the ranges that became ready, closing the row group after its
     /// last one.
     fn emit_ready_ranges(
@@ -170,6 +179,10 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
             return Ok(());
         }
         if !self.open.contains_key(&row_group_index) {
+            if metadata.is_pruned() {
+                self.close_pruned_unopened(row_group_index);
+                return Ok(());
+            }
             let plan = Arc::new(
                 DecodePlan::new(&metadata, &self.projection, &self.eq_predicates)
                     .map_err(crate::op_err)?,
@@ -243,7 +256,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::reading::decoding::tests::{
         cut, encode_i32s, i32_schema, make_data_page, make_rle_data_page, make_test_table,
@@ -260,7 +273,7 @@ mod tests {
     use dispatch::test_utils::{feed_unary, run_unary_to_completion};
 
     /// A table over one dictionary encoded `Int32` column.
-    fn i32_dictionary_table(num_rows: i64) -> Arc<ParquetTable> {
+    pub(crate) fn i32_dictionary_table(num_rows: i64) -> Arc<ParquetTable> {
         let file = dispatch::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap();
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
             open_file: dispatch::io::OpenFile::Local(file),
@@ -301,7 +314,7 @@ mod tests {
         }
     }
 
-    fn i32_eq_predicate(value: i32) -> ScanEqualityPredicate {
+    pub(crate) fn i32_eq_predicate(value: i32) -> ScanEqualityPredicate {
         ScanEqualityPredicate {
             column_idx: 0,
             path: Vec::new(),
@@ -421,6 +434,32 @@ mod tests {
         assert!(ranges.is_empty());
         assert!(metadata.is_pruned());
         assert_eq!(pending.load(Ordering::Relaxed), 0);
+    }
+
+    /// A row group pruned before any of its pages got here is closed by the
+    /// first one: nothing is cut and both claims are released.
+    #[test]
+    fn a_row_group_pruned_upstream_is_closed_by_its_first_page() {
+        init_test_free_pool(4);
+        let table = i32_dictionary_table(3);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        metadata.mark_pruned();
+        let dict = i32_dict_page(metadata, &[10, 20]);
+        let pending = Arc::new(AtomicUsize::new(1));
+        let outstanding = Arc::new(AtomicUsize::new(1));
+        let cutter = RangeCutter::new(
+            Projection::all_from_schema(table.schema()),
+            Arc::new(Vec::new()),
+            pending.clone(),
+            outstanding.clone(),
+            Arc::new(WorkerAllocator::new()),
+        );
+
+        let ranges = run_unary_to_completion(cutter, vec![dict]);
+
+        assert!(ranges.is_empty());
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        assert_eq!(outstanding.load(Ordering::Relaxed), 0);
     }
 
     /// The footer records no dictionary page, yet the chunk has one and a

@@ -495,15 +495,19 @@ impl<L: LeafType> LeafDecoder for TypedLeafDecoder<L> {
         data: Vec<Bytes>,
         allocator: &mut SlabAllocator,
     ) -> BuiltDictionary {
-        let size = header.num_values as usize;
-        if let Some(needle) = self.eq_const.as_ref()
-            && !L::ContiguousDict::maybe_contains(&data, size, needle)
-        {
+        if self.dictionary_excludes_constant(&header, &data) {
             return BuiltDictionary::Pruned;
         }
+        let size = header.num_values as usize;
         let storage: DictStorage<L::ContiguousDict, L::ScatteredDict> =
             DictStorage::build(data, size, allocator);
         BuiltDictionary::Built(Arc::new(storage))
+    }
+
+    fn dictionary_excludes_constant(&self, header: &DictionaryPageHeader, data: &[Bytes]) -> bool {
+        self.eq_const.as_ref().is_some_and(|needle| {
+            !L::ContiguousDict::maybe_contains(data, header.num_values as usize, needle)
+        })
     }
 
     /// Every reader of a leaf decodes it with the same decoder type, so the

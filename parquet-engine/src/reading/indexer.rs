@@ -22,25 +22,107 @@
 //!    recently-decompressed pages hot in cache.
 //! 2. **Dictionary pages** — sent last so they arrive first, ensuring the decoder has the
 //!    dictionary before any RLE-dictionary-encoded data page.
+//!
+//! ## Pruning
+//!
+//! A dictionary page whose bytes are at hand - a decompressed-cache hit, or a page
+//! stored uncompressed - is checked against the pushed-down equality constant of
+//! its column before anything is sent. A dictionary that excludes the constant
+//! prunes the row group: only its dictionary pages go on, for the range cutter to
+//! close the row group by. Sending the data pages as well would leave them to
+//! whichever worker takes them off the channel first, and one that does so before
+//! the cutter has seen the dictionary decompresses a page nobody decodes.
 
+use crate::reading::decoding::{DecodePlan, ScanEqualityPredicate};
 use crate::thrift::general::{CompressionCodec, Encoding, PageType};
 use crate::thrift::headers::{DataPageHeader, PageHeader};
 use crate::thrift::parquet_thrift::{ParquetError, ThriftReadInputProtocol};
 use crate::types::filter_mask::FilterMask;
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use crate::types::page::CompressedPage;
+use crate::types::projection::Projection;
 use crate::types::requests::{CachedColumnChunk, ColumnBuffer, RowGroupBuffer};
 use bytes::Bytes;
-use dispatch::DefaultUnaryFactory;
+use dispatch::BuildContext;
 use dispatch::Sender;
-use dispatch::Unary;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
+use dispatch::{Built, BuiltUnary};
+use dispatch::{Unary, UnaryFactory};
+use std::sync::Arc;
 
-pub type IndexerFactory = DefaultUnaryFactory<Indexer>;
+/// Factory for creating [`Indexer`] instances, one per worker thread.
+pub struct IndexerFactory {
+    /// Which columns the scan decodes.
+    pub projection: Projection,
+    /// Pushed-down equality predicates for dictionary pruning (may be empty).
+    pub eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+}
+
+impl UnaryFactory<RowGroupBuffer, CompressedPage> for IndexerFactory {
+    type Unary = Indexer;
+
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+        Built::new(Indexer::new(self.projection, self.eq_predicates))
+    }
+}
 
 /// Splits a [`RowGroupBuffer`] into individual [`CompressedPage`]s.
-#[derive(Default)]
-pub struct Indexer {}
+pub struct Indexer {
+    projection: Projection,
+    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+}
+
+impl Indexer {
+    pub fn new(projection: Projection, eq_predicates: Arc<Vec<ScanEqualityPredicate>>) -> Self {
+        Self {
+            projection,
+            eq_predicates,
+        }
+    }
+
+    /// Whether one of `dict_pages`, among those whose bytes need no
+    /// decompression, excludes the equality constant pushed down for its
+    /// column, so that the row group holds no matching row.
+    fn is_ruled_out_by_dictionary(
+        &self,
+        metadata: &QueryRowGroupMetadata,
+        dict_pages: &[CompressedPage],
+    ) -> Result<bool, crate::reading::ColumnDecoderError> {
+        if self.eq_predicates.is_empty() {
+            return Ok(false);
+        }
+        let readable_pages: Vec<_> = dict_pages
+            .iter()
+            .filter_map(|page| Some((page, readable_bytes(page)?)))
+            .collect();
+        if readable_pages.is_empty() {
+            return Ok(false);
+        }
+        let plan = DecodePlan::new(metadata, &self.projection, &self.eq_predicates)?;
+        for (page, bytes) in readable_pages {
+            let header = page
+                .header
+                .dictionary_page_header
+                .as_ref()
+                .expect("a dictionary page carries a dictionary header");
+            if plan.dictionary_prunes_row_group(metadata, page.column_idx, header, bytes)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// The page's values as they are decoded, when the page holds them without
+/// needing the decompressor: it came out of the decompressed cache, or was
+/// stored uncompressed.
+fn readable_bytes(page: &CompressedPage) -> Option<&[Bytes]> {
+    match &page.decompressed {
+        Some(decompressed) => Some(decompressed),
+        None if page.codec == CompressionCodec::UNCOMPRESSED => Some(&page.data),
+        None => None,
+    }
+}
 
 /// Running position while emitting one column's pages: how many data pages (and
 /// their rows) have been emitted so far. Threaded across all of a column's parts
@@ -267,15 +349,6 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
             .collect::<Result<Vec<_>, _>>()
             .map_err(crate::op_err)?;
 
-        // We want to send the pages out in an order that will be best for decoding. If we were to,
-        // for example, send all of column A pages and then only column B pages, we would be unable to
-        // send out record batches until AFTER we finished ALL of column A. This is horrible from a
-        // cache standpoint, as it means pages we touched for decompressing won't be in cache for
-        // the decoder.
-        // Therefore, we try to send out pages in "intelligently"- first we send out dict pages,
-        // and then we try sending out pages in an order where we will be able to send out record
-        // batches as soon as possible. We do this by always selecting pages from the column that
-        // has sent out the minimum amount of records so far
         let dict_pages: Vec<_> = pages_per_column
             .iter_mut()
             .flat_map(|pages| {
@@ -287,6 +360,26 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
             })
             .collect();
 
+        if self
+            .is_ruled_out_by_dictionary(&buffer.metadata, &dict_pages)
+            .map_err(crate::op_err)?
+        {
+            buffer.metadata.mark_pruned();
+            for page in dict_pages {
+                sender.send(page)?;
+            }
+            return Ok(());
+        }
+
+        // We want to send the pages out in an order that will be best for decoding. If we were to,
+        // for example, send all of column A pages and then only column B pages, we would be unable to
+        // send out record batches until AFTER we finished ALL of column A. This is horrible from a
+        // cache standpoint, as it means pages we touched for decompressing won't be in cache for
+        // the decoder.
+        // Therefore, we try to send out pages in "intelligently"- first we send out dict pages,
+        // and then we try sending out pages in an order where we will be able to send out record
+        // batches as soon as possible. We do this by always selecting pages from the column that
+        // has sent out the minimum amount of records so far
         let mut rows_emitted = vec![0u64; pages_per_column.len()];
 
         while let Some(col) = (0..pages_per_column.len())
@@ -309,6 +402,8 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reading::decoding::tests::encode_i32s;
+    use crate::reading::range_cutter::tests::{i32_dictionary_table, i32_eq_predicate};
     use crate::test_utils::dummy_metadata;
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::{
@@ -317,6 +412,11 @@ mod tests {
     use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
     use bytes::Bytes;
     use dispatch::test_utils::run_unary;
+
+    /// An indexer for a scan with no pushed-down predicate.
+    fn plain_indexer() -> Indexer {
+        Indexer::new(Projection::columns([]), Arc::new(Vec::new()))
+    }
 
     /// Serialize a dispatch `PageHeader` to Thrift compact bytes.
     fn serialize_header(header: &PageHeader) -> Vec<u8> {
@@ -404,7 +504,7 @@ mod tests {
         let col = make_column_buffer(&[(header, payload.clone())]);
         let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         assert_eq!(pages.len(), 1);
         let page = &pages[0];
@@ -429,7 +529,7 @@ mod tests {
         let col = make_column_buffer(&pages);
         let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         assert_eq!(pages.len(), 3);
         let mut page_indices: Vec<usize> = pages.iter().map(|p| p.page_idx).collect();
@@ -461,7 +561,7 @@ mod tests {
         ]);
         let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         assert_eq!(pages.len(), 3);
         assert_eq!(pages[0].header.r#type, PageType::DATA_PAGE);
@@ -476,7 +576,7 @@ mod tests {
         let col_b = make_column_buffer(&[(data_page_header(100, 2), vec![0xBB, 0xBB])]);
         let buffer = make_row_group_buffer(vec![col_a, col_b], RowSelection::All);
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         assert_eq!(pages.len(), 2);
         let col_ids: Vec<usize> = pages.iter().map(|p| p.column_idx).collect();
@@ -495,7 +595,7 @@ mod tests {
         let col_b = make_column_buffer(&[(data_page_header(100, 1), vec![0xB0])]);
         let buffer = make_row_group_buffer(vec![col_a, col_b], RowSelection::All);
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         assert_eq!(pages.len(), 3);
         let col_ids: Vec<usize> = pages.iter().map(|p| p.column_idx).collect();
@@ -511,7 +611,7 @@ mod tests {
         ]);
         let buffer = make_row_group_buffer(vec![col], RowSelection::Indices(vec![2, 5].into()));
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         assert_eq!(pages.len(), 2);
         let data_page = pages
@@ -532,7 +632,7 @@ mod tests {
         let col = make_column_buffer(&[(data_page_header(10, 2), vec![0xAA, 0xBB])]);
         let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         assert_eq!(pages.len(), 1);
         assert!(pages[0].filter_mask.is_none());
@@ -547,7 +647,7 @@ mod tests {
         ]);
         let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         let mut data_page_indices: Vec<usize> = pages
             .iter()
@@ -572,7 +672,7 @@ mod tests {
         }];
         let buffer = make_row_group_buffer(vec![col], RowSelection::All);
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].file_offset, 42);
@@ -596,7 +696,7 @@ mod tests {
         });
         let buffer = make_row_group_buffer(vec![parts], RowSelection::Indices(vec![15].into()));
 
-        let pages = run_unary(Indexer {}, vec![buffer]);
+        let pages = run_unary(plain_indexer(), vec![buffer]);
 
         assert_eq!(pages.len(), 2);
         let mut by_idx: Vec<_> = pages.iter().collect();
@@ -606,5 +706,73 @@ mod tests {
         // Row 15 falls in the second page's [10, 20) range, not the first's [0, 10).
         assert!(by_idx[0].filter_mask.as_ref().unwrap().all_false());
         assert_eq!(by_idx[1].filter_mask.as_ref().unwrap().rows(), 1);
+    }
+
+    /// One dictionary encoded `Int32` column: its dictionary as a
+    /// decompressed-cache hit, followed by a data page still compressed.
+    fn buffer_with_cached_dictionary(
+        metadata: QueryRowGroupMetadata,
+        dictionary_entries: &[i32],
+    ) -> RowGroupBuffer {
+        let dictionary = encode_i32s(dictionary_entries);
+        let mut parts = vec![CachedColumnChunk::Decompressed {
+            offset: 0,
+            span: dictionary.len(),
+            header: Box::new(dict_page_header(
+                dictionary_entries.len() as i32,
+                dictionary.len() as i32,
+            )),
+            data: vec![Bytes::from(dictionary)],
+        }];
+        parts.extend(make_column_buffer(&[(
+            data_page_header(3, 3),
+            vec![0, 1, 0],
+        )]));
+        RowGroupBuffer {
+            metadata,
+            columns: vec![ColumnBuffer::Resolved {
+                codec: CompressionCodec::SNAPPY,
+                parts,
+            }],
+            worker_id: 0,
+        }
+    }
+
+    fn page_types(pages: &[CompressedPage]) -> Vec<PageType> {
+        pages.iter().map(|page| page.header.r#type).collect()
+    }
+
+    /// A cached dictionary that excludes the pushed-down constant prunes the
+    /// row group before any page is sent: the data page stays behind.
+    #[test]
+    fn a_cached_dictionary_excluding_the_constant_holds_back_the_data_pages() {
+        let table = i32_dictionary_table(3);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let buffer = buffer_with_cached_dictionary(metadata.clone(), &[10, 20]);
+        let indexer = Indexer::new(
+            Projection::all_from_schema(table.schema()),
+            Arc::new(vec![i32_eq_predicate(5)]),
+        );
+
+        let pages = run_unary(indexer, vec![buffer]);
+
+        assert!(metadata.is_pruned());
+        assert_eq!(page_types(&pages), vec![PageType::DICTIONARY_PAGE]);
+    }
+
+    #[test]
+    fn a_cached_dictionary_holding_the_constant_sends_every_page() {
+        let table = i32_dictionary_table(3);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let buffer = buffer_with_cached_dictionary(metadata.clone(), &[10, 20]);
+        let indexer = Indexer::new(
+            Projection::all_from_schema(table.schema()),
+            Arc::new(vec![i32_eq_predicate(20)]),
+        );
+
+        let pages = run_unary(indexer, vec![buffer]);
+
+        assert!(!metadata.is_pruned());
+        assert_eq!(pages.len(), 2);
     }
 }

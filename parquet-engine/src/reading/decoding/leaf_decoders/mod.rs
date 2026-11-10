@@ -123,6 +123,12 @@ pub trait LeafDecoder {
         allocator: &mut SlabAllocator,
     ) -> BuiltDictionary;
 
+    /// Whether the dictionary page excludes the pushed-down equality
+    /// constant (see [`Self::set_eq_constant`]), so that no row of a fully
+    /// dictionary encoded column chunk can match. Reads the raw page; nothing
+    /// is built. Without a constant nothing is excluded.
+    fn dictionary_excludes_constant(&self, header: &DictionaryPageHeader, data: &[Bytes]) -> bool;
+
     /// Reads through a dictionary built for this leaf.
     fn adopt_dictionary(&mut self, dictionary: SharedDictionary);
 

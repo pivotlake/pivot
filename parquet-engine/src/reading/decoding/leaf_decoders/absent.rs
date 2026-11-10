@@ -43,6 +43,14 @@ impl LeafDecoder for AbsentLeafDecoder {
         unreachable!("an absent leaf has no dictionary page")
     }
 
+    fn dictionary_excludes_constant(
+        &self,
+        _header: &DictionaryPageHeader,
+        _data: &[Bytes],
+    ) -> bool {
+        unreachable!("an absent leaf has no dictionary page")
+    }
+
     fn adopt_dictionary(&mut self, _dictionary: SharedDictionary) {
         unreachable!("an absent leaf has no dictionary page")
     }
