@@ -45,7 +45,8 @@ pub const RING_SIZE: u32 = 64;
 struct InFlightFsOp {
     request: DataFlowRequest<FsRequest>,
     /// Bytes already completed by earlier submissions (nonzero only for a
-    /// write whose prior completion came up short and was resubmitted).
+    /// write or a direct read whose prior completion came up short and was
+    /// resubmitted).
     bytes_done: usize,
     /// The hardware-queue slots the operation holds. Dropping it releases
     /// them and wakes any workers waiting on the queue, so it lives exactly
@@ -799,16 +800,9 @@ impl IORequester {
                     self.next_id,
                 )
                 .map(|()| None),
-            FsRequest::ReadDirect(read) => self
-                .backend
-                .submit_read(
-                    read.file.as_raw_fd(),
-                    read.offset,
-                    read.slab.ptr,
-                    read.slab.size(),
-                    self.next_id,
-                )
-                .map(|()| None),
+            FsRequest::ReadDirect(read) => {
+                submit_rest_of_direct_read(&mut self.backend, read, 0, self.next_id).map(|()| None)
+            }
             FsRequest::Write(write) => {
                 submit_rest_of_write(&mut self.backend, write, 0, self.next_id)
             }
@@ -1051,13 +1045,34 @@ impl IORequester {
                         continue;
                     }
                 }
+                // A direct read may complete short as well, with the rest of
+                // its range still in the file; read on from where it stopped.
+                // Zero progress means the file ends before the range does.
+                if let FsRequest::ReadDirect(read) = &request.request {
+                    let done = done + result.max(0) as usize;
+                    if result > 0 && done < read.slab.size() {
+                        submit_rest_of_direct_read(&mut self.backend, read, done, self.next_id)?;
+                        self.pending_io_requests.insert(
+                            self.next_id,
+                            InFlightFsOp {
+                                request,
+                                bytes_done: done,
+                                permit,
+                                _write_runs: None,
+                            },
+                        );
+                        self.next_id += 1;
+                        self.backend.submit()?;
+                        continue;
+                    }
+                }
                 let failure = match &request.request {
                     FsRequest::Read(_) | FsRequest::ReadDirect(_) if result < 0 => {
                         Some(std::io::Error::from_raw_os_error(-result))
                     }
                     // A direct read asks for bytes its caller knows are in
-                    // the file, so anything short of them is an error.
-                    FsRequest::ReadDirect(read) if (result as usize) < read.slab.size() => {
+                    // the file, so a file that ends short of them is an error.
+                    FsRequest::ReadDirect(read) if done + (result as usize) < read.slab.size() => {
                         Some(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             "direct read stopped short of the requested range",
@@ -1249,6 +1264,29 @@ impl IORequester {
         select.ready();
         Ok(())
     }
+}
+
+/// Put what is left of `read` after its first `bytes_done` bytes onto the
+/// backend's queue: the rest of its range, into the rest of its slab.
+fn submit_rest_of_direct_read(
+    backend: &mut IOBackend,
+    read: &FsDirectReadRequest,
+    bytes_done: usize,
+    request_id: Identifier,
+) -> std::result::Result<(), crate::io::backend::Error> {
+    assert!(
+        bytes_done < read.slab.size(),
+        "a read is resubmitted only while it has bytes left"
+    );
+    // SAFETY: `bytes_done` is inside the slab, checked just above.
+    let rest = unsafe { read.slab.ptr.add(bytes_done) };
+    backend.submit_read(
+        read.file.as_raw_fd(),
+        read.offset + bytes_done as u64,
+        rest,
+        read.slab.size() - bytes_done,
+        request_id,
+    )
 }
 
 /// Put what is left of `write` after its first `bytes_done` bytes onto the
@@ -1558,6 +1596,53 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn a_direct_read_that_comes_back_short_goes_on_from_where_it_stopped() {
+        init_test_free_pool(1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, (0..1000).map(pattern).collect::<Vec<_>>()).unwrap();
+        let file = LocalFile::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut requester = IORequester::default();
+        requester
+            .request_read_direct(
+                1,
+                2,
+                pending_direct_read(&file, &[FileRange::new(500, 1000)]),
+                &mut disabled_stats(),
+            )
+            .unwrap();
+        // The read has come back with the 500 bytes the file had; the rest of
+        // its range is written before that result is collected.
+        requester.wait().unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&(1000..1500).map(pattern).collect::<Vec<_>>())
+            .unwrap();
+
+        let mut responses = Vec::new();
+        for _ in 0..100 {
+            if !responses.is_empty() {
+                break;
+            }
+            requester.completions().unwrap();
+            responses.extend(requester.take_ready_reads());
+            if responses.is_empty() {
+                requester.wait().unwrap();
+            }
+        }
+
+        let locations = responses.pop().unwrap().response.into_locations();
+        let bytes: Vec<u8> = locations[0]
+            .bytes
+            .iter()
+            .flat_map(|run| run.iter().copied())
+            .collect();
+        assert_eq!(bytes, (500..1500).map(pattern).collect::<Vec<_>>());
     }
 
     #[test]
