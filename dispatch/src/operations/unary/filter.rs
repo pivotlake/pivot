@@ -9,8 +9,9 @@
 //! [`take`].
 //! A selection is applied by appending the surviving rows to a
 //! [`BatchAccumulator`], which coalesces survivors across input batches and
-//! emits full-size batches, so a selective filter's downstream sees a few
-//! large batches instead of a runt batch per input. Whether to coalesce at all
+//! emits them once they are worth a batch ([`MIN_SENT_ROWS`]), so a selective
+//! filter's downstream sees a few large batches instead of a runt batch per
+//! input. Whether to coalesce at all
 //! is the consumer's call, carried as a [`RowDelivery`]: an operator that acts
 //! on early rows needs them as soon as they are selected, and for it each
 //! input batch's survivors are gathered out of that batch and sent at once.
@@ -27,6 +28,19 @@ use crate::operations::unary::{Unary, UnaryFactory};
 use crate::operations::{Built, BuiltUnary};
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_buffer::{BooleanBuffer, Buffer};
+
+/// The fewest rows a coalescing filter sends on while it could still wait for
+/// more: an input batch surviving whole goes through as it is from this size,
+/// and held survivors are sent as soon as there are this many.
+///
+/// Holding out for a full batch sends batches of up to two, since a whole
+/// input lands on top of what is held. One batch is the longest stretch the
+/// consumer works without looking up, and whatever the filter still holds
+/// when its input ends waits for every worker to get out of such a stretch
+/// before it is sent at all. At half a batch both are halved, and so is the
+/// time the other workers stand idle at the end of a stage while the last few
+/// batches are worked off.
+const MIN_SENT_ROWS: usize = RECORD_BATCH_SIZE / 2;
 
 /// The row positions a filter mask keeps: true bits, with a null mask entry
 /// dropping the row (Arrow's filter semantics).
@@ -77,10 +91,11 @@ pub enum RowSelection {
 /// whether anything downstream can act on rows before the input ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowDelivery {
-    /// Coalesce survivors across input batches and emit full-size batches, so
-    /// the consumer pays its per-batch costs once per full batch rather than
-    /// once per runt. For an operator that must see the whole input anyway (a
-    /// group-by, a join, a sort), holding rows back costs nothing.
+    /// Coalesce survivors across input batches and emit them half a batch or
+    /// more at a time, so the consumer pays its per-batch costs once per
+    /// sizeable batch rather than once per runt. For an operator that must
+    /// see the whole input anyway (a group-by, a join, a sort), holding a few
+    /// rows back costs nothing.
     Coalesced,
     /// Emit each input batch's survivors as soon as they are selected. An
     /// operator that acts on early rows needs them early: a LIMIT cancels its
@@ -95,6 +110,14 @@ pub enum RowDelivery {
 /// (see [`Unary::release_held_output`]). Fewer are not worth a batch of their
 /// own to the operator below and wait for more, or for the end of the input.
 const MIN_RELEASED_ROWS: usize = RECORD_BATCH_SIZE / 8;
+
+/// An accumulator for the survivors of batches like `batch`, emitting from
+/// [`MIN_SENT_ROWS`].
+fn create_accumulator(batch: &RecordBatch, allocator: &mut SlabAllocator) -> BatchAccumulator {
+    let mut accumulator = BatchAccumulator::new(batch.schema(), allocator);
+    accumulator.set_full_batch_rows(MIN_SENT_ROWS);
+    accumulator
+}
 
 /// Factory that wraps a filter closure. `F` is the per-worker closure created by the
 /// builder passed to [`RecordBatchOperatorSpec::filter`](crate::api::RecordBatchOperatorSpec::filter).
@@ -167,7 +190,7 @@ where
         if kept == 0 {
             return Ok(());
         }
-        if kept == batch.num_rows() && batch.num_rows() >= RECORD_BATCH_SIZE / 2 {
+        if kept == batch.num_rows() && batch.num_rows() >= MIN_SENT_ROWS {
             output.send(batch)?;
             return Ok(());
         }
@@ -202,7 +225,7 @@ where
         self.flush_on_schema_change(&batch, output)?;
         let accumulator = self
             .accumulator
-            .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), &mut self.allocator));
+            .get_or_insert_with(|| create_accumulator(&batch, &mut self.allocator));
         accumulator.append_batch_by_indices_flushing::<unary::Error>(
             &batch,
             &self.scratch.positions,
@@ -244,7 +267,7 @@ where
         if kept == 0 {
             return Ok(());
         }
-        if kept == batch.num_rows() && batch.num_rows() >= RECORD_BATCH_SIZE / 2 {
+        if kept == batch.num_rows() && batch.num_rows() >= MIN_SENT_ROWS {
             output.send(batch)?;
             return Ok(());
         }
@@ -255,7 +278,7 @@ where
         self.flush_on_schema_change(&batch, output)?;
         let accumulator = self
             .accumulator
-            .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), &mut self.allocator));
+            .get_or_insert_with(|| create_accumulator(&batch, &mut self.allocator));
         accumulator.append_batch_by_mask_flushing::<unary::Error>(
             &batch,
             mask,
@@ -345,7 +368,9 @@ where
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
-    use crate::operations::unary::test_utils::{CollectSender, run_unary_to_completion};
+    use crate::operations::unary::test_utils::{
+        CollectSender, feed_unary, run_unary_to_completion,
+    };
     use arrow_array::{ArrayRef, BooleanArray, Int32Array};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -468,6 +493,22 @@ mod tests {
 
         assert!(matches!(status, WorkStatus::Pending));
         assert_eq!(output.total_rows(), 0);
+    }
+
+    #[test]
+    fn held_rows_are_sent_once_they_make_half_a_batch() {
+        init_test_free_pool(4);
+        let values: Vec<i32> = (0..RECORD_BATCH_SIZE as i32).collect();
+        let mut filter = filter_operator(
+            |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                select_by_mask(scratch, b.num_rows(), |row| row % 4 != 0)
+            },
+        );
+
+        let sent_before_finish = feed_unary(&mut filter, vec![batch(&values)]);
+
+        assert_eq!(sent_before_finish.len(), 1);
+        assert_eq!(sent_before_finish[0].num_rows(), RECORD_BATCH_SIZE * 3 / 4);
     }
 
     #[test]

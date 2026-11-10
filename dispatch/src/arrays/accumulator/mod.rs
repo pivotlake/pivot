@@ -75,6 +75,9 @@ pub struct BatchAccumulator {
     schema: SchemaRef,
     columns: Vec<Box<dyn ColumnAccumulator>>,
     len: usize,
+    /// How many accumulated rows make a batch to emit (see
+    /// [`has_full_batch`](Self::has_full_batch)).
+    full_batch_rows: usize,
     /// The positions a mask append gathers by when it keeps too few rows to
     /// copy in runs. Kept between appends so that a selective filter, whose
     /// every batch takes this path, does not allocate a position list per batch.
@@ -94,8 +97,18 @@ impl BatchAccumulator {
             schema,
             columns,
             len: 0,
+            full_batch_rows: RECORD_BATCH_SIZE,
             gather_positions: Vec::new(),
         }
+    }
+
+    /// Make `rows` accumulated rows a batch to emit, for a caller that would
+    /// rather hand rows on early than hold them until [`RECORD_BATCH_SIZE`]
+    /// of them are in. No more than that, since the room past a full batch is
+    /// sized for one input batch.
+    pub fn set_full_batch_rows(&mut self, rows: usize) {
+        assert!(rows <= RECORD_BATCH_SIZE);
+        self.full_batch_rows = rows;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -124,7 +137,7 @@ impl BatchAccumulator {
     /// accumulator has room past this point, which is what lets a whole input
     /// batch land on an almost-full one.
     pub fn has_full_batch(&self) -> bool {
-        self.len >= RECORD_BATCH_SIZE
+        self.len >= self.full_batch_rows
     }
 
     /// Append the rows of `batch` at `indices`, which must be ascending row
