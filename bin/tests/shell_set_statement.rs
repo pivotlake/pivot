@@ -19,6 +19,7 @@ fn set_and_reset_hand_back_the_variable_name_and_value() {
                 &ShellTarget::pivot(directory.path().to_str().unwrap()),
                 1,
                 32,
+                None,
                 DEFAULT_REFRESH_INTERVAL,
             )
         })

@@ -1,6 +1,7 @@
 //! Lifecycle for one embedded, in-process Pivot instance.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +9,7 @@ use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_iceberg::IcebergDatastore;
 use datastore_pivotlake::{DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, PivotlakeDatastore};
-use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
+use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, SpillDirectory};
 use object_storage::{AmbientExternalStoreFactory, ObjectStore, open_store};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
@@ -22,12 +23,15 @@ const MIB: u64 = 1024 * 1024;
 /// Omitted fields keep the production CLI defaults: all available dispatch
 /// workers and the same share of physical memory `pivot server` takes, see
 /// [`MemoryBudget::default`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShellLimits {
     /// Buffer-pool budget. `None` uses the default pool budget.
     pub memory: Option<MemoryBudget>,
     /// Dispatch worker count. `None` uses every available core.
     pub workers: Option<usize>,
+    /// Directory that a query needing more memory than the buffer pool has
+    /// spills rows to. `None` spills nothing: such a query fails instead.
+    pub spill_directory: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -177,11 +181,24 @@ impl ShellInstance {
 
         let buffers = usize::try_from(memory_bytes / BUFFER_SIZE as u64)
             .map_err(|_| ResourceLimitError::MemoryTooLarge)?;
-        Self::open_with_resources(target, workers, buffers, DEFAULT_REFRESH_INTERVAL)
+        // Opened before the pool is faulted in, so a directory that cannot be
+        // used is refused without waiting for that.
+        let spill_directory = limits
+            .spill_directory
+            .map(SpillDirectory::open)
+            .transpose()?;
+        Self::open_with_resources(
+            target,
+            workers,
+            buffers,
+            spill_directory,
+            DEFAULT_REFRESH_INTERVAL,
+        )
     }
 
-    /// Open `target` with an explicit dispatch shape and refresh cadence. This
-    /// is useful for embedding and for small black-box test instances.
+    /// Open `target` with an explicit dispatch shape, spill directory and
+    /// refresh cadence. This is useful for embedding and for small black-box
+    /// test instances. Without a spill directory the instance spills nothing.
     ///
     /// The instance reloads its tables every `refresh_interval`, the same
     /// background sweep the server runs, so data another process commits to a
@@ -194,9 +211,15 @@ impl ShellInstance {
         target: &ShellTarget,
         workers: usize,
         buffers: usize,
+        spill_directory: Option<SpillDirectory>,
         refresh_interval: Duration,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
+        let dispatch = DispatchOwner::new(Dispatch::spin_up_with_spill_directory(
+            workers,
+            buffers,
+            None,
+            spill_directory,
+        ));
         let datastore = open_datastore(target, dispatch.dispatcher(), refresh_interval)?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
         let catalog = Arc::new(

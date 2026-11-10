@@ -46,6 +46,7 @@ fn write_then_reopen(location: &str) -> Vec<i64> {
                 &ShellTarget::pivot(location),
                 1,
                 32,
+                None,
                 DEFAULT_REFRESH_INTERVAL,
             )
         })
@@ -71,6 +72,7 @@ fn write_then_reopen(location: &str) -> Vec<i64> {
                 &ShellTarget::pivot(location),
                 1,
                 32,
+                None,
                 DEFAULT_REFRESH_INTERVAL,
             )
         })

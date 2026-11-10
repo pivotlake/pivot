@@ -8,7 +8,7 @@ use std::time::Duration;
 use catalog::PivotCatalog;
 use catalog::metastore::Metastore;
 use clap::Args;
-use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
+use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, SpillDirectory};
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use tracing::{error, info};
 
@@ -20,7 +20,8 @@ use crate::server::{Config, Error, Server, raise_open_file_limit};
 #[derive(Args, Debug)]
 pub struct ServerOptions {
     /// Config file (YAML) describing this instance: its memory and worker
-    /// budgets, disk cache and log; a `server` section for the endpoint;
+    /// budgets, spill directory, disk cache and log; a `server` section for
+    /// the endpoint;
     /// `datastores`, `secrets` and `users` for what it serves; and
     /// `metastore` naming the file the server writes users it is told to
     /// create into.
@@ -146,6 +147,23 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
             cache.open()
         })
         .transpose()?;
+    // Opening the directory checks that a spill file works in it, here, once:
+    // a directory it does not work in stops the server from starting, rather
+    // than failing the first query that spills.
+    let spill_directory = match config.spill_directory {
+        Some(directory) => {
+            let spill_directory = SpillDirectory::open(directory)?;
+            info!(dir = %spill_directory.path().display(), "spilling enabled");
+            Some(spill_directory)
+        }
+        None => {
+            info!(
+                "no `spill_directory` configured: a query that needs more memory than the \
+                 buffer pool has fails instead of spilling"
+            );
+            None
+        }
+    };
     let pool_bytes = config.memory.resolve(get_total_memory() as u64)? as usize;
     // The pool is a share of *total* memory, but every one of its slots is
     // faulted in while the workers start, so what it has to fit into is what the
@@ -162,7 +180,12 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
     // Reading the executable in is disk-bound and the pool prefault is
     // memory-bound, so the two overlap instead of adding up.
     let mapped_files = std::thread::spawn(populate_mapped_files);
-    let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
+    let dispatch = Dispatch::spin_up_with_spill_directory(
+        workers,
+        pool_bytes / BUFFER_SIZE,
+        disk_cache,
+        spill_directory,
+    );
     mapped_files
         .join()
         .expect("populating mapped files panicked");

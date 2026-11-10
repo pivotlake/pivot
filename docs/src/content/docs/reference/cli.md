@@ -9,8 +9,8 @@ in an interactive SQL shell, or runs the PostgreSQL-compatible server.
 ## Usage
 
 ```sh
-pivot open [--kind pivotlake] [--memory <SIZE>] [--workers <COUNT>] <DIRECTORY | URI>
-pivot open --kind iceberg [--warehouse <WAREHOUSE>] [--memory <SIZE>] [--workers <COUNT>] <CATALOG_URI>
+pivot open [--kind pivotlake] [--memory <SIZE>] [--workers <COUNT>] [--spill-directory <DIRECTORY>] <DIRECTORY | URI>
+pivot open --kind iceberg [--warehouse <WAREHOUSE>] [--memory <SIZE>] [--workers <COUNT>] [--spill-directory <DIRECTORY>] <CATALOG_URI>
 pivot server --config <FILE>
 pivot --help
 pivot --version
@@ -36,6 +36,7 @@ Opens a single datastore and starts the [SQL shell](#sql-shell) over it.
 | `--warehouse <WAREHOUSE>` | The warehouse to serve, for an Iceberg catalog that serves several. Only valid with `--kind iceberg`. |
 | `--memory <SIZE>` | The buffer-pool budget, as a size such as `8g` or a share of memory such as `50%`. See [Memory budget](#memory-budget).<br />**Default:** `80%` |
 | `--workers <COUNT>` | The number of worker threads that execute queries. Must be at least 1.<br />**Default:** the number of available cores |
+| `--spill-directory <DIRECTORY>` | Directory where a `GROUP BY` that needs more memory than the buffer pool has writes rows out to disk. It behaves as the server's [`spill_directory`](/docs/reference/configuration/#instance-settings) key does: it has to be on a filesystem that supports direct I/O, and only one running shell or server can use a directory at a time.<br />**Default:** not set, so nothing is spilled and such a query fails |
 
 ### Datastore locations
 

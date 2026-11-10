@@ -77,6 +77,12 @@ enum PivotCommand {
         #[arg(long, value_name = "COUNT")]
         workers: Option<NonZeroUsize>,
 
+        /// Directory that a query needing more memory than the buffer pool has
+        /// spills rows to, on a filesystem that takes direct IO such as a local
+        /// disk. Without it nothing is spilled, and such a query fails.
+        #[arg(long, value_name = "DIRECTORY")]
+        spill_directory: Option<PathBuf>,
+
         /// Run COMMAND (SQL or a backslash command) and exit instead of
         /// starting the prompt. Repeatable; runs in order with every -f.
         #[arg(short = 'c', long = "command", value_name = "COMMAND")]
@@ -120,6 +126,7 @@ fn run() -> Result<(), Error> {
             warehouse,
             memory,
             workers,
+            spill_directory,
             commands,
             files,
         } => {
@@ -131,6 +138,7 @@ fn run() -> Result<(), Error> {
                 bin::shell::ShellLimits {
                     memory,
                     workers: workers.map(NonZeroUsize::get),
+                    spill_directory,
                 },
                 order_scripts(open_matches, commands, files),
             )?;

@@ -17,6 +17,7 @@ fn shell_limits_require_at_least_one_worker() {
         ShellLimits {
             memory: bytes(BUFFER_SIZE as u64),
             workers: Some(0),
+            spill_directory: None,
         },
     );
     let error = match result {
@@ -38,6 +39,7 @@ fn shell_limits_require_at_least_one_memory_slot() {
         ShellLimits {
             memory: bytes(BUFFER_SIZE as u64 - 1),
             workers: Some(1),
+            spill_directory: None,
         },
     );
     let error = match result {
@@ -55,6 +57,7 @@ fn shell_limits_reject_a_pool_larger_than_available_memory() {
         ShellLimits {
             memory: bytes(u64::MAX),
             workers: Some(1),
+            spill_directory: None,
         },
     );
     let error = match result {
@@ -83,6 +86,7 @@ fn a_table_can_be_created_in_a_relative_datastore_path() {
                 ShellLimits {
                     memory: bytes((BUFFER_SIZE * 32) as u64),
                     workers: Some(1),
+                    spill_directory: None,
                 },
             )
         })
@@ -115,6 +119,7 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
                 &ShellTarget::pivot(location),
                 1,
                 32,
+                None,
                 DEFAULT_REFRESH_INTERVAL,
             )
         })
@@ -174,6 +179,7 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
         &ShellTarget::pivot(location),
         1,
         32,
+        None,
         DEFAULT_REFRESH_INTERVAL,
     ) {
         Ok(_) => panic!("a second instance opened the locked datastore"),
@@ -193,6 +199,7 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
                 &ShellTarget::pivot(location),
                 1,
                 32,
+                None,
                 DEFAULT_REFRESH_INTERVAL,
             )
         })
