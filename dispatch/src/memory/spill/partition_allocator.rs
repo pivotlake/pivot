@@ -823,9 +823,12 @@ impl<L: Layout> PartitionAllocator<L> {
         assert!(rows > 0, "a slab must hold at least one row");
         let size = rows * self.layout.row_size();
         let align = self.layout.row_align();
+        // A slab is spilled as one compressed block inside one write, and
+        // rows that do not compress come out slightly larger than they went
+        // in.
         assert!(
-            padded_to_spill_block(size) <= BUFFER_SIZE,
-            "a slab of {rows} rows must fit in one buffer"
+            padded_to_spill_block(get_most_compressed_len(size)) <= BUFFER_SIZE,
+            "a slab of {rows} rows must fit in one buffer, and in one write once compressed"
         );
         assert!(
             SPILL_BLOCK_SIZE.is_multiple_of(align),
@@ -1019,6 +1022,16 @@ mod tests {
             .collect();
         assert_eq!(values, (0..ROWS_PER_SLAB as u64).collect::<Vec<_>>());
         assert_eq!(allocator.open_slab_len(3), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "in one write once compressed")]
+    fn a_slab_that_might_not_fit_one_write_once_compressed_is_refused() {
+        init_test_free_pool(1);
+        let mut allocator: PartitionAllocator<Fixed<u64>> =
+            PartitionAllocator::new(Fixed::new(BUFFER_SIZE), PARTITIONS);
+
+        allocator.reserve(0).write(1);
     }
 
     #[test]
