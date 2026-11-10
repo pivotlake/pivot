@@ -237,6 +237,33 @@ fn read_primitives<N: ReadLeBytes, B: ElemPtr<N>>(
     }
 }
 
+/// Whether `needle` is among the values `bytes` holds back to back in
+/// native byte order, wherever the slice starts in memory.
+///
+/// The values are compared a block at a time, with no exit inside a block,
+/// which is what lets the comparison vectorize; a hit is reported at the end
+/// of its block.
+fn contains_value<N: ArrowNativeType>(bytes: &[u8], needle: &N) -> bool {
+    const BLOCK_VALUES: usize = 16;
+    let width = mem::size_of::<N>();
+    // SAFETY: each chunk is `width` readable bytes, and any bit pattern is a
+    // valid `N`; the read does not need the chunk to be aligned.
+    let read_value = |chunk: &[u8]| unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const N) };
+    let mut blocks = bytes.chunks_exact(BLOCK_VALUES * width);
+    for block in &mut blocks {
+        let found = block
+            .chunks_exact(width)
+            .fold(false, |found, chunk| found | (read_value(chunk) == *needle));
+        if found {
+            return true;
+        }
+    }
+    blocks
+        .remainder()
+        .chunks_exact(width)
+        .any(|chunk| read_value(chunk) == *needle)
+}
+
 // The primitive [`ArrayBuilder`] now lives in `dispatch::arrays` (shared with the
 // GROUP BY output); re-exported so this module's decoders keep using it.
 pub use dispatch::arrays::PrimitiveBuilder;
@@ -322,27 +349,42 @@ where
     /// row group whose dictionary excludes a pushed-down equality constant is
     /// pruned without building the dictionary.
     ///
-    /// Fast path (the common case): a single contiguous, native-width,
-    /// `T::Native`-aligned buffer is reinterpreted as `&[T::Native]` and scanned
-    /// with the auto-vectorized [`slice::contains`] — the same scan the built
-    /// dictionary would get, minus the copy. Anything else (unaligned, split
-    /// across buffers, or a narrowed physical type) falls back to the scalar
-    /// reader.
+    /// A native-width dictionary is scanned where it lies, each buffer's run
+    /// of whole values in one vectorized pass (see [`contains_value`]); only a
+    /// value split across two buffers goes through the scalar reader. How the
+    /// page happens to be laid out in memory - where it starts, how many
+    /// buffers it spans - therefore does not change what the scan costs. A
+    /// narrowed physical type is read value by value.
     fn maybe_contains(data: &[Bytes], size: usize, needle: &T::Native) -> bool {
         let width = T::Native::PHYSICAL_SIZE;
-        if data.len() == 1 && width == mem::size_of::<T::Native>() && data[0].len() >= size * width
-        {
-            // SAFETY: `align_to` only reinterprets bytes; we only read. We trust
-            // `mid` only when `head` is empty — i.e. the buffer is `T::Native`-
-            // aligned so `mid` covers the `size` values exactly.
-            let (head, mid, _) = unsafe { data[0][..size * width].align_to::<T::Native>() };
-            if head.is_empty() {
-                return mid.contains(needle);
+        let mut position = ReaderPosition::default();
+        if width != mem::size_of::<T::Native>() {
+            let mut reader = MultiBufferReader::new(data, &mut position);
+            return (0..size).any(|_| T::Native::read_le(&mut reader) == *needle);
+        }
+        let mut values_left = size;
+        while values_left > 0 {
+            let buffer = &data[position.buffer_index];
+            let whole_values = ((buffer.len() - position.offset) / width).min(values_left);
+            if whole_values > 0 {
+                let end = position.offset + whole_values * width;
+                if contains_value(&buffer[position.offset..end], needle) {
+                    return true;
+                }
+                position.offset = end;
+                values_left -= whole_values;
+            } else if position.offset < buffer.len() {
+                let mut reader = MultiBufferReader::new(data, &mut position);
+                if T::Native::read_le(&mut reader) == *needle {
+                    return true;
+                }
+                values_left -= 1;
+            } else {
+                position.buffer_index += 1;
+                position.offset = 0;
             }
         }
-        let mut position = ReaderPosition::default();
-        let mut reader = MultiBufferReader::new(data, &mut position);
-        (0..size).any(|_| T::Native::read_le(&mut reader) == *needle)
+        false
     }
 
     fn len(&self) -> usize {
@@ -586,10 +628,35 @@ mod tests {
     }
 
     #[test]
+    fn maybe_contains_finds_a_value_in_an_unaligned_buffer() {
+        init_test_free_pool(4);
+        let values: Vec<i64> = (0..100).map(|i| i * 3).collect();
+        let mut bytes = vec![0u8; 3];
+        bytes.extend(encode_i64s(&values));
+        let data = vec![Bytes::from(bytes).slice(3..)];
+
+        let found_last = Int64Dict::maybe_contains(&data, 100, &297);
+        let found_absent = Int64Dict::maybe_contains(&data, 100, &298);
+
+        assert!(found_last);
+        assert!(!found_absent);
+    }
+
+    #[test]
+    fn maybe_contains_ignores_bytes_past_the_dictionary() {
+        init_test_free_pool(4);
+        let data = vec![Bytes::from(encode_i64s(&[10, 20, 30]))];
+
+        let found_beyond = Int64Dict::maybe_contains(&data, 2, &30);
+
+        assert!(!found_beyond);
+    }
+
+    #[test]
     fn maybe_contains_finds_value_straddling_a_buffer_boundary() {
         init_test_free_pool(4);
-        // Three i64 values split so the middle one straddles the seam — this
-        // takes the scalar-reader fallback (data.len() != 1).
+        // Three i64 values split so the middle one straddles the seam: it is
+        // read through the scalar reader, its neighbours where they lie.
         let bytes = encode_i64s(&[10, 20, 30]);
         let data = vec![
             Bytes::from(bytes[..12].to_vec()), // v0 + first half of v1
