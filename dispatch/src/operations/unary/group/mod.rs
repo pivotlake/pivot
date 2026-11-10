@@ -333,12 +333,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
         Ok(())
     }
 
-    /// Aggregates `batch` a step at a time, and before each step divides
-    /// what is left of it with the workers that have nothing to do.
+    /// Aggregates `batch`, dividing it with the workers that have nothing to
+    /// do for as long as there are any: the batch is then aggregated a step
+    /// at a time, and before each step what is left of it is divided again.
     ///
     /// A batch is otherwise aggregated in one go by the worker that took it,
     /// however many peers are waiting: near the end of the input that leaves
-    /// most of the pool watching a few workers finish theirs.
+    /// most of the pool watching a few workers finish theirs. While every
+    /// worker is busy the batch stays whole, which is the cheapest way to
+    /// aggregate it.
     fn consume_sharing(
         &mut self,
         batch: RecordBatch,
@@ -347,7 +350,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
     ) -> unary::Result<()> {
         let step_rows = K::CONSUME_STEP_ROWS;
         let mut remaining = batch;
-        while remaining.num_rows() > step_rows {
+        while remaining.num_rows() > step_rows && worker_waker().idle_workers() > 0 {
             remaining = keep_share_of_batch(remaining, step_rows, offer);
             if remaining.num_rows() <= step_rows {
                 break;
