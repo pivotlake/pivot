@@ -16,6 +16,13 @@
 //! is needed (unlike the compressed cache, whose extents are visible while their
 //! read IO is still in flight).
 //!
+//! Every page starts on a [`PAGE_ALIGNMENT`] boundary of its slot. Where a
+//! page lands otherwise depends on the sizes of the pages its worker packed
+//! before it, which differ from one cold read to the next, and a decoder
+//! that reads fixed-width values straight out of the page is slower over
+//! values that cross cache lines: the same scan would cost a different
+//! amount after every refill of the cache.
+//!
 //! Writing into a read-pinned slot is sound for the same reason it is in the
 //! compressed cache's fill path: the reserved region is not yet in the map (no
 //! reader can reach it), the bump pointer makes regions disjoint, and the worker
@@ -75,6 +82,11 @@ use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+
+/// The byte boundary every page starts on within its slot: the widest
+/// fixed-width value a page stores. A slot's size is a multiple of it, so a
+/// page that continues into the next slot is cut on the same boundary.
+const PAGE_ALIGNMENT: usize = 8;
 
 /// Identity of a cached decompressed block: the file, the byte offset of its
 /// source bytes, and their span. A page's header offset is unique within its file,
@@ -365,6 +377,7 @@ impl DecompressedCache {
             return Self::reserve_scratch(len);
         }
         let cursor = memory_ctx().decompressed_fill_cursor();
+        cursor.next_byte = cursor.next_byte.next_multiple_of(PAGE_ALIGNMENT);
         // Take every slot the page needs beyond the cursor's remainder before
         // carving any of it, so a page is either cached whole or not at all.
         let cursor_room = if cursor.is_exhausted() {
@@ -414,6 +427,7 @@ impl DecompressedCache {
     /// decodes by the ratio of the slot size to the page size.
     fn reserve_scratch(len: usize) -> Reservation {
         let cursor = memory_ctx().scratch_cursor();
+        cursor.next_byte = cursor.next_byte.next_multiple_of(PAGE_ALIGNMENT);
         let mut segments = Vec::with_capacity(1);
         let mut remaining = len;
         while remaining > 0 {
@@ -910,12 +924,24 @@ mod tests {
     }
 
     #[test]
+    fn a_page_starts_on_an_eight_byte_boundary() {
+        init_test_free_pool(4);
+        let cache = for_test(true);
+        insert_page(&cache, test_key(0), 3, 0xAA);
+
+        let views = insert_page(&cache, test_key(100), 16, 0xBB);
+
+        assert_eq!(views[0].as_ptr() as usize % 8, 0);
+        assert_eq!(views[0].len(), 16);
+    }
+
+    #[test]
     fn a_straddling_page_reads_back_its_bytes() {
         init_test_free_pool(4);
         let cache = for_test(true);
-        insert_page(&cache, test_key(0), BUFFER_SIZE - 7, 0x11); // leave a 7-byte tail
+        insert_page(&cache, test_key(0), BUFFER_SIZE - 8, 0x11); // leave an 8-byte tail
 
-        let views = insert_page(&cache, test_key(1000), 100, 0x22); // 7 + 93 across two slots
+        let views = insert_page(&cache, test_key(1000), 100, 0x22); // 8 + 92 across two slots
 
         let hit = cache.get(&test_key(1000)).unwrap();
         assert_eq!(hit.len(), 2, "two extents across the slot boundary");

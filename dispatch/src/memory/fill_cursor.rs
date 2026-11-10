@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 /// See the module doc. The bump pointer is byte-granular; the compressed cache
 /// only ever advances it in whole 4 KB blocks, the decompressed cache packs
-/// byte-exact page spans.
+/// byte-exact page spans, each started on an 8-byte boundary.
 pub struct FillCursor {
     /// The slot currently being packed, pinned. `None` before the first miss and
     /// after the owning cache's `clear`.
