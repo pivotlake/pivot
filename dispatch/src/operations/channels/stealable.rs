@@ -91,6 +91,15 @@ impl<I> Receiver<I> for StealableReceiver<I> {
         self.worker.pop()
     }
 
+    fn peers_take_offers(&self) -> bool {
+        true
+    }
+
+    fn offer_to_peers(&self, item: I) {
+        self.worker.push(item);
+        worker_waker().notify_one();
+    }
+
     /// Try to steal a message from a same-node peer worker's deque.
     /// Iterates through the node's stealers, retrying on contention.
     ///
@@ -184,6 +193,15 @@ mod tests {
         let mut endpoints = two_node_endpoints::<i64>();
 
         endpoints[0].0.send(7).unwrap();
+
+        assert_eq!(endpoints[1].1.steal(), Some(7));
+    }
+
+    #[test]
+    fn an_offered_message_can_be_stolen_by_a_sibling() {
+        let endpoints = two_node_endpoints::<i64>();
+
+        endpoints[0].1.offer_to_peers(7);
 
         assert_eq!(endpoints[1].1.steal(), Some(7));
     }

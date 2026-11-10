@@ -191,6 +191,9 @@ pub struct Worker {
     /// Last delegated-broadcast epoch this worker has fanned out (see
     /// [`WorkerWaker::finish_delegated_wake`]).
     last_seen_broadcast: u64,
+    /// Whether the waker counts this worker among those with nothing to do
+    /// (see [`WorkerWaker::idle_workers`]).
+    counted_idle: bool,
 }
 
 impl Worker {
@@ -260,6 +263,7 @@ impl Worker {
                     last_seen_ring_wake_count,
                     node_local_idx,
                     last_seen_broadcast,
+                    counted_idle: false,
                 };
                 // Notifiers must be able to interrupt this worker's blocking
                 // IO wait, not just its thread park; register the ring's wake
@@ -635,6 +639,28 @@ impl Worker {
         }
     }
 
+    /// Count this worker among those with nothing to do while a dataflow is
+    /// in flight, so that a peer holding divisible work hands part of it on.
+    /// The count holds through the spin and the park and through every pass
+    /// that again finds nothing: a peer that has just sent something wakes
+    /// every spinning worker to look for it, and they still have nothing to
+    /// do at that moment.
+    fn count_as_idle(&mut self) {
+        if !self.counted_idle && !self.data_flows.is_empty() {
+            self.waker.mark_idle();
+            self.counted_idle = true;
+        }
+    }
+
+    /// Stop counting this worker as idle once it found work, or once no
+    /// dataflow is left that a peer could be holding work of.
+    fn stop_counting_as_idle_once_working(&mut self) {
+        if self.counted_idle && (self.did_work_last_iteration || self.data_flows.is_empty()) {
+            self.waker.mark_working();
+            self.counted_idle = false;
+        }
+    }
+
     #[instrument(skip(self), fields(worker_id = %self.id))]
     pub fn run(&mut self) -> Result<()> {
         loop {
@@ -645,6 +671,7 @@ impl Worker {
                 self.fail_live_dataflows_for_shutdown();
                 return Ok(());
             }
+            self.stop_counting_as_idle_once_working();
             self.did_work_last_iteration = false;
 
             self.try_receiving_new_dataflow();
@@ -700,6 +727,7 @@ impl Worker {
                     continue;
                 }
 
+                self.count_as_idle();
                 self.clear_dirty_buffer_or_park();
             }
         }

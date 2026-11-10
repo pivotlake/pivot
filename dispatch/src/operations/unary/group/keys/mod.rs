@@ -59,6 +59,14 @@ pub trait KeyExtractor: Send + 'static {
     /// no bytes to scatter, so it never takes the radix path.
     const DEDUP_BY_HASH: bool = false;
 
+    /// How many rows of an input batch are aggregated between two looks at
+    /// whether a peer has nothing to do, in which case the rest of the batch
+    /// is divided with it (see `Group::consume_sharing`). A step should take
+    /// on the order of a hundred microseconds: the longest a peer waits for
+    /// its share, and short against the cost of slicing the batch. Keys
+    /// that are cheap to hash and compare take a whole batch per step.
+    const CONSUME_STEP_ROWS: usize = crate::RECORD_BATCH_SIZE;
+
     /// Runtime configuration threaded from the operator spec to the per-batch
     /// reader and the output columns. Most extractors are fully determined by
     /// their type and use `()`; [`RowKeyExtractor`] carries its key schema here

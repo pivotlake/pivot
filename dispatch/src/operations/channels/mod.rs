@@ -35,6 +35,8 @@ mod shared_work_queue;
 mod stealable;
 pub use node_work_queue::{NodeIdOutput, NodeWorkQueueChannelFactory, node_work_queue};
 pub use shared_work_queue::{SharedWorkQueueChannelFactory, shared_work_queue};
+#[cfg(test)]
+pub use stealable::StealableReceiver;
 pub use stealable::{StealableChannelFactory, stealable, stealable_fifo};
 
 mod mpsc;
@@ -95,6 +97,17 @@ pub trait Receiver<I> {
     /// Try to steal a message from a peer worker's queue.
     /// Returns `None` if stealing is not supported or no work is available.
     fn steal(&self) -> Option<I>;
+    /// Whether [`offer_to_peers`](Self::offer_to_peers) can be called: peers
+    /// can take a message out of this worker's queue.
+    fn peers_take_offers(&self) -> bool {
+        false
+    }
+    /// Put `item` where the first worker to look takes it, this one
+    /// included. Only for a channel whose
+    /// [`peers_take_offers`](Self::peers_take_offers) is true.
+    fn offer_to_peers(&self, _item: I) {
+        unreachable!("no peer can take a message from this channel")
+    }
 }
 
 impl<T> Sender<T> for Injector<T> {

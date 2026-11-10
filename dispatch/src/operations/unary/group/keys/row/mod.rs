@@ -91,6 +91,11 @@ use arrow_array::RecordBatch;
 pub struct RowKeyExtractor;
 
 impl KeyExtractor for RowKeyExtractor {
+    /// Every row's key columns are encoded into one byte string, hashed and
+    /// compared as such, several times the work of a fixed-width key. A
+    /// short step also keeps the encoded keys of a step within the cache.
+    const CONSUME_STEP_ROWS: usize = crate::RECORD_BATCH_SIZE / 8;
+
     type Config = RowKeySchema;
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = RowKey<'a, 'b>;

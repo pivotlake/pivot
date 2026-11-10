@@ -142,6 +142,21 @@ pub trait Unary<I, O> {
     fn consume(&mut self, object: I, sender: &mut dyn Sender<O>, io: &mut OperatorIO)
     -> Result<()>;
 
+    /// [`consume`](Self::consume) for a transform that can hand part of an
+    /// input on rather than process all of it: each piece given to `offer`
+    /// is queued as an input of its own, for whichever worker takes it first.
+    /// Called instead of `consume` whenever the input channel lets peers take
+    /// such pieces. The default processes the whole input.
+    fn consume_sharing(
+        &mut self,
+        object: I,
+        sender: &mut dyn Sender<O>,
+        io: &mut OperatorIO,
+        _offer: &mut dyn FnMut(I),
+    ) -> Result<()> {
+        self.consume(object, sender, io)
+    }
+
     /// Whether this unary is ready to accept another input. Returns `false` when
     /// backpressured (e.g. waiting for IO to complete before consuming more) or
     /// while it holds a job it is still stepping through. A unary that is not
@@ -273,6 +288,27 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
     }
 }
 
+impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
+    /// Feed `item` to the transform, letting it hand pieces of the item on
+    /// to peers where that is possible.
+    ///
+    /// It is not possible once this worker has counted itself out at the
+    /// finish barrier. The barrier opens when every worker has done so, on
+    /// the understanding that no queue holds input any more, and a transform
+    /// past the barrier drops what it is fed. A piece queued by a worker the
+    /// barrier already counted could be taken by a peer that is past it.
+    fn consume_item(&mut self, item: I, io: &mut OperatorIO) -> Result<()> {
+        if self.notified_finished || !self.receiver.peers_take_offers() {
+            return self.unary.consume(item, &mut *self.sender, io);
+        }
+        let receiver = &self.receiver;
+        self.unary
+            .consume_sharing(item, &mut *self.sender, io, &mut |piece| {
+                receiver.offer_to_peers(piece)
+            })
+    }
+}
+
 impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         // A transform that is not taking input may still have work of its own
@@ -286,7 +322,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
             Some(t) => t,
         };
 
-        self.unary.consume(item, &mut *self.sender, io)?;
+        self.consume_item(item, io)?;
 
         Ok(WorkStatus::Ran)
     }
@@ -378,7 +414,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
         }
         match self.receiver.steal() {
             Some(s) => {
-                self.unary.consume(s, &mut *self.sender, io)?;
+                self.consume_item(s, io)?;
                 Ok(WorkStatus::Ran)
             }
             None => Ok(WorkStatus::Pending),
@@ -441,6 +477,86 @@ mod tests {
         assert!(matches!(status, WorkStatus::Ran));
         assert_eq!(operator.unary.steps, 1);
         assert!(!operator.receiver.is_empty());
+    }
+
+    /// A transform that hands half of each input on and keeps the other half.
+    struct Halver {
+        consumed: Vec<u32>,
+    }
+
+    impl Unary<u32, ()> for Halver {
+        fn consume(
+            &mut self,
+            input: u32,
+            _: &mut dyn Sender<()>,
+            _: &mut OperatorIO,
+        ) -> Result<()> {
+            self.consumed.push(input);
+            Ok(())
+        }
+
+        fn consume_sharing(
+            &mut self,
+            input: u32,
+            _: &mut dyn Sender<()>,
+            _: &mut OperatorIO,
+            offer: &mut dyn FnMut(u32),
+        ) -> Result<()> {
+            offer(input / 2);
+            self.consumed.push(input - input / 2);
+            Ok(())
+        }
+    }
+
+    /// One worker's [`Halver`] behind a stealable channel holding `input`,
+    /// at a finish barrier of two workers.
+    fn halver_with_input(
+        input: u32,
+    ) -> UnaryOperator<u32, (), Halver, crate::operations::channels::StealableReceiver<u32>> {
+        use crate::operations::channels::{ChannelFactory, stealable};
+        crate::waker::install_test_worker_waker();
+        let topology = crate::numa::Topology {
+            workers_per_node: 1,
+            node_count: 1,
+        };
+        let (mut sender, receiver) = stealable::<u32>(topology)
+            .into_iter()
+            .next()
+            .unwrap()
+            .build();
+        sender.send(input).unwrap();
+        UnaryOperator::new(
+            Halver {
+                consumed: Vec::new(),
+            },
+            receiver,
+            Box::new(CollectSender::<()>::new()),
+            Arc::new(AtomicUsize::new(2)),
+        )
+    }
+
+    #[test]
+    fn a_piece_the_transform_offers_is_queued_as_an_input() {
+        let mut operator = halver_with_input(10);
+        let mut test_io = TestOperatorIO::default();
+
+        operator.run_cpu_work(&mut test_io.io()).unwrap();
+
+        assert_eq!(operator.unary.consumed, [5]);
+        assert_eq!(operator.receiver.try_recv(), Some(5));
+    }
+
+    #[test]
+    fn a_worker_counted_at_the_finish_barrier_keeps_its_input_whole() {
+        let mut operator = halver_with_input(10);
+        let mut test_io = TestOperatorIO::default();
+        let input = operator.receiver.try_recv().unwrap();
+        operator.try_finish().unwrap();
+
+        operator.consume_item(input, &mut test_io.io()).unwrap();
+
+        assert_eq!(operator.unary.consumed, [10]);
+        assert!(operator.receiver.is_empty());
     }
 
     /// Records how many buffers it was asked to spill.

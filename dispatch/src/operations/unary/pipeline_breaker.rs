@@ -37,6 +37,16 @@ pub trait Consumer<I, O> {
     /// Process one input item, optionally sending intermediate results to `sender`.
     fn consume(&mut self, object: I, sender: &mut dyn Sender<O>) -> unary::Result<()>;
 
+    /// See [`Unary::consume_sharing`]. The default processes the whole input.
+    fn consume_sharing(
+        &mut self,
+        object: I,
+        sender: &mut dyn Sender<O>,
+        _offer: &mut dyn FnMut(I),
+    ) -> unary::Result<()> {
+        self.consume(object, sender)
+    }
+
     /// Transition from consuming to outputting. Called once after all input is drained.
     fn into_outputter(self) -> unary::Result<Option<Self::Outputter>>;
 
@@ -130,6 +140,20 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
             // abandoned. That input is surplus to the result already decided, so
             // drop it. (A breaker that finishes the normal way drains first, so
             // it never reaches here.)
+            _ => Ok(()),
+        }
+    }
+
+    fn consume_sharing(
+        &mut self,
+        object: I,
+        sender: &mut dyn Sender<O>,
+        _io: &mut crate::io::OperatorIO,
+        offer: &mut dyn FnMut(I),
+    ) -> unary::Result<()> {
+        match self {
+            PipelineBreaker::Consuming(c) => c.consume_sharing(object, sender, offer),
+            // Surplus input of a breaker that finished early, as in `consume`.
             _ => Ok(()),
         }
     }

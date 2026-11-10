@@ -125,6 +125,7 @@ use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
     AggregatedTable, AggregatedTableOutput, RadixConfig,
 };
+use crate::waker::worker_waker;
 use ahash::RandomState;
 use arena::SharedArena;
 use arrow_array::RecordBatch;
@@ -332,6 +333,32 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
         Ok(())
     }
 
+    /// Aggregates `batch` a step at a time, and before each step divides
+    /// what is left of it with the workers that have nothing to do.
+    ///
+    /// A batch is otherwise aggregated in one go by the worker that took it,
+    /// however many peers are waiting: near the end of the input that leaves
+    /// most of the pool watching a few workers finish theirs.
+    fn consume_sharing(
+        &mut self,
+        batch: RecordBatch,
+        sender: &mut dyn Sender<RecordBatch>,
+        offer: &mut dyn FnMut(RecordBatch),
+    ) -> unary::Result<()> {
+        let step_rows = K::CONSUME_STEP_ROWS;
+        let mut remaining = batch;
+        while remaining.num_rows() > step_rows {
+            remaining = keep_share_of_batch(remaining, step_rows, offer);
+            if remaining.num_rows() <= step_rows {
+                break;
+            }
+            let step = remaining.slice(0, step_rows);
+            remaining = remaining.slice(step_rows, remaining.num_rows() - step_rows);
+            self.consume(step, sender)?;
+        }
+        self.consume(remaining, sender)
+    }
+
     fn spill(&mut self, spiller: &mut Spiller, count: usize) -> unary::Result<()> {
         for _ in 0..count {
             if !self.aggregated_table.spill(spiller)? {
@@ -351,6 +378,28 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
         });
         Ok(Some(self.outputter))
     }
+}
+
+/// Divides `batch` evenly between the calling worker and the node's idle
+/// workers, in pieces of at least `min_piece_rows`: offers the idle workers'
+/// pieces and returns the caller's. Returns the whole batch when no worker is
+/// idle or the batch is too short to divide.
+fn keep_share_of_batch(
+    batch: RecordBatch,
+    min_piece_rows: usize,
+    offer: &mut dyn FnMut(RecordBatch),
+) -> RecordBatch {
+    let idle_workers = worker_waker().idle_workers();
+    let pieces = (idle_workers + 1).min(batch.num_rows() / min_piece_rows);
+    if pieces < 2 {
+        return batch;
+    }
+    let piece_rows = batch.num_rows() / pieces;
+    let kept_rows = batch.num_rows() - piece_rows * (pieces - 1);
+    for piece in 0..pieces - 1 {
+        offer(batch.slice(kept_rows + piece * piece_rows, piece_rows));
+    }
+    batch.slice(0, kept_rows)
 }
 
 #[cfg(test)]
@@ -463,6 +512,35 @@ mod tests {
             "no buffer was evicted, so nothing was read back"
         );
         assert_eq!(sender.total_rows(), 400_000);
+    }
+
+    #[test]
+    fn a_batch_is_divided_evenly_with_the_idle_workers() {
+        crate::waker::install_test_worker_waker();
+        worker_waker().mark_idle();
+        let values: Vec<i32> = (0..4000).collect();
+        let mut offered_rows = Vec::new();
+
+        let kept = keep_share_of_batch(batch_with_column(&values), 1000, &mut |piece| {
+            offered_rows.push(piece.num_rows())
+        });
+
+        assert_eq!(kept.num_rows(), 2000);
+        assert_eq!(offered_rows, [2000]);
+    }
+
+    #[test]
+    fn a_batch_stays_whole_while_no_worker_is_idle() {
+        crate::waker::install_test_worker_waker();
+        let values: Vec<i32> = (0..4000).collect();
+        let mut offered_rows = Vec::new();
+
+        let kept = keep_share_of_batch(batch_with_column(&values), 1000, &mut |piece| {
+            offered_rows.push(piece.num_rows())
+        });
+
+        assert_eq!(kept.num_rows(), 4000);
+        assert!(offered_rows.is_empty());
     }
 
     #[test]

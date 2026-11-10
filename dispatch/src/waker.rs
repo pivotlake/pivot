@@ -94,6 +94,10 @@ pub struct WorkerWaker {
     parked_workers: AtomicUsize,
     /// Number of workers currently blocked in their IO ring wait.
     ring_parked_workers: AtomicUsize,
+    /// Number of workers that found nothing to run or steal and have not
+    /// found anything since, whether they are spinning, parked or looking
+    /// again.
+    idle_workers: AtomicUsize,
     slots: Box<[ParkSlot]>,
     /// Rotates [`notify_one`](Self::notify_one)'s scan start so wake-ups spread
     /// over parked workers instead of always choosing the lowest index.
@@ -111,6 +115,7 @@ impl WorkerWaker {
             ring_wake_count: AtomicU64::new(0),
             parked_workers: AtomicUsize::new(0),
             ring_parked_workers: AtomicUsize::new(0),
+            idle_workers: AtomicUsize::new(0),
             slots: (0..worker_count)
                 .map(|_| ParkSlot {
                     parked: AtomicBool::new(false),
@@ -268,6 +273,24 @@ impl WorkerWaker {
             *last_seen = epoch;
             self.notify();
         }
+    }
+
+    /// How many of the node's workers have nothing to do. A worker holding
+    /// work that can be divided reads this to decide whether to hand part of
+    /// it on.
+    pub fn idle_workers(&self) -> usize {
+        self.idle_workers.load(Ordering::Relaxed)
+    }
+
+    /// Count the calling worker as having nothing to do, until
+    /// [`mark_working`](Self::mark_working).
+    pub fn mark_idle(&self) {
+        self.idle_workers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Stop counting the calling worker as having nothing to do.
+    pub fn mark_working(&self) {
+        self.idle_workers.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Current wake count. Workers snapshot it around work passes and poll it
