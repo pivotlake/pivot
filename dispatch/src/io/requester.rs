@@ -47,8 +47,8 @@ struct InFlightFsOp {
     /// Bytes already completed by earlier submissions (nonzero only for a
     /// write whose prior completion came up short and was resubmitted).
     bytes_done: usize,
-    /// The hardware-queue slot the operation holds. Dropping it releases the
-    /// slot and wakes any workers waiting on the queue, so it lives exactly
+    /// The hardware-queue slots the operation holds. Dropping it releases
+    /// them and wakes any workers waiting on the queue, so it lives exactly
     /// as long as the operation (a resubmitted write keeps it).
     permit: InFlightPermit,
     /// The runs a vectored write on the device refers to, which the kernel
@@ -714,15 +714,22 @@ impl IORequester {
         self.ready_reads.push(request.into_response());
     }
 
-    /// Reserve a slot on the hardware queue the file's device serves this
-    /// worker with. `None` means the queue is full and the operation must
-    /// wait in the backlog; this worker is then registered for a ring wake on
-    /// the next slot release, so it can park with nothing of its own in
-    /// flight.
-    fn acquire_fs_slot(&mut self, request: &DataFlowRequest<FsRequest>) -> Option<InFlightPermit> {
+    /// Reserve the slots `request` needs on the hardware queue the file's
+    /// device serves this worker with: one for each device request the
+    /// operation becomes. `None` means the queue has no room for them and the
+    /// operation must wait in the backlog; this worker is then registered for
+    /// a ring wake on the next release of slots, so it can park with nothing
+    /// of its own in flight.
+    fn acquire_fs_slots(&mut self, request: &DataFlowRequest<FsRequest>) -> Option<InFlightPermit> {
+        let (bytes, runs) = match &request.request {
+            FsRequest::Read(read) => (read.block.len(), 1),
+            FsRequest::ReadDirect(read) => (read.slab.size(), 1),
+            FsRequest::Write(write) => (write.data.len(), write.data.count_runs()),
+        };
         let device_idx = request.request.file().device_idx();
         let queue = self.fs_queues.queue_for_device(device_idx);
-        if let Some(permit) = queue.try_acquire() {
+        let slots = queue.count_slots(bytes, runs);
+        if let Some(permit) = queue.try_acquire(slots) {
             return Some(permit);
         }
         // Register before the deciding attempt so a release between the two
@@ -730,7 +737,7 @@ impl IORequester {
         // no one needs to wake us after all.
         let worker_idx = WORKER_IDX.get();
         queue.register_waiter(worker_idx);
-        match queue.try_acquire() {
+        match queue.try_acquire(slots) {
             Some(permit) => {
                 queue.deregister_waiter(worker_idx);
                 Some(permit)
@@ -744,7 +751,7 @@ impl IORequester {
     /// does, then surfaces the error.
     fn drain_fs_backlog(&mut self) -> Result<()> {
         while let Some(request) = self.fs_backlog.pop_front() {
-            let permit = match self.acquire_fs_slot(&request) {
+            let permit = match self.acquire_fs_slots(&request) {
                 Some(permit) => permit,
                 None => {
                     self.fs_backlog.push_front(request);
@@ -761,7 +768,7 @@ impl IORequester {
     /// hardware queue is at capacity. Request-owned storage remains alive
     /// until completion.
     fn submit_fs_request_to_backend(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
-        match self.acquire_fs_slot(&request) {
+        match self.acquire_fs_slots(&request) {
             Some(permit) => self.submit_fs_request_now(request, permit),
             None => {
                 self.fs_backlog.push_back(request);

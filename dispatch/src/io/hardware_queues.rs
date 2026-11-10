@@ -1,18 +1,25 @@
 //! Bounds in-flight local-file operations by the device's real queue capacity.
 //!
 //! A submission into a saturated device queue either sleeps in the kernel's
-//! request allocation or pays an io-wq punt, so each worker holds its excess in
-//! a backlog instead of submitting it (see [`super::requester::IORequester`]).
-//! The bound itself lives here: a block device exposes its hardware queues in
-//! sysfs, each serving a fixed set of CPUs with a fixed tag budget
-//! (`queue/nr_requests`). The workers whose CPUs submit into the same hardware
-//! queue share one atomic in-flight counter capped at that budget, so together
-//! they can fill the queue exactly and never oversubscribe it.
+//! request allocation, with the submitting worker in it, or pays an io-wq
+//! punt, so each worker holds its excess in a backlog instead of submitting
+//! it (see [`super::requester::IORequester`]). The bound itself lives here: a
+//! block device exposes its hardware queues in sysfs, each serving a fixed
+//! set of CPUs with a fixed budget of requests (`queue/nr_requests`). The
+//! workers whose CPUs submit into the same hardware queue share one atomic
+//! count of the requests in flight, capped at that budget, so together they
+//! can fill the queue exactly and never oversubscribe it.
 //!
-//! A worker that finds the shared counter full parks with nothing of its own in
-//! flight, so releasing a slot must wake it: each queue records the waiting
-//! workers in an atomic bitmap and targets them through the worker waker when a
-//! slot frees.
+//! What the budget counts is device requests, not operations. The kernel cuts
+//! an operation into requests no larger than the device takes
+//! (`queue/max_sectors_kb`) and of no more separate memory runs than it takes
+//! (`queue/max_segments`), so an operation holds one slot for each request it
+//! becomes (see [`HardwareQueue::count_slots`]).
+//!
+//! A worker that finds no room for an operation parks with nothing of its own
+//! in flight, so releasing slots must wake it: each queue records the waiting
+//! workers in an atomic bitmap and targets them through the worker waker when
+//! slots free.
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
@@ -37,38 +44,69 @@ pub(crate) struct DeviceIndex(usize);
 /// One block-device hardware queue's in-flight budget, shared by every worker
 /// whose CPU submits into it.
 pub(crate) struct HardwareQueue {
-    /// The queue's tag budget (`queue/nr_requests`).
+    /// The queue's budget of requests (`queue/nr_requests`).
     capacity: usize,
-    /// Operations currently holding one of the queue's slots.
+    /// The most bytes the device takes as one request
+    /// (`queue/max_sectors_kb`).
+    largest_request_bytes: usize,
+    /// The most separate memory runs the device takes in one request
+    /// (`queue/max_segments`).
+    most_runs_per_request: usize,
+    /// Slots held by the operations in flight.
     in_flight: AtomicUsize,
-    /// Workers that found this queue full, one bit per global worker index.
+    /// Workers that found no room in this queue, one bit per global worker
+    /// index.
     /// Sized on first use from the worker pool; after that registration and
     /// release are atomic bitmap operations only.
     waiters: OnceLock<Box<[AtomicUsize]>>,
 }
 
 impl HardwareQueue {
+    /// A queue of `capacity` slots on a device with no limit on a request's
+    /// size, so that every operation takes one slot.
     pub(crate) fn with_capacity(capacity: usize) -> Arc<Self> {
+        Self::with_request_limits(capacity, usize::MAX, usize::MAX)
+    }
+
+    pub(crate) fn with_request_limits(
+        capacity: usize,
+        largest_request_bytes: usize,
+        most_runs_per_request: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             capacity,
+            largest_request_bytes,
+            most_runs_per_request,
             in_flight: AtomicUsize::new(0),
             waiters: OnceLock::new(),
         })
     }
 
-    /// Reserve one in-flight slot, or `None` if the queue is at capacity.
-    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<InFlightPermit> {
+    /// How many slots an operation of `bytes` bytes in `runs` separate memory
+    /// runs holds: one for each request the kernel cuts it into. An operation
+    /// of more requests than the queue has slots holds all of them, and has
+    /// the queue to itself.
+    pub(crate) fn count_slots(&self, bytes: usize, runs: usize) -> usize {
+        bytes
+            .div_ceil(self.largest_request_bytes)
+            .max(runs.div_ceil(self.most_runs_per_request))
+            .clamp(1, self.capacity)
+    }
+
+    /// Reserve `slots` slots, or `None` if the queue has no room for them.
+    pub(crate) fn try_acquire(self: &Arc<Self>, slots: usize) -> Option<InFlightPermit> {
         self.in_flight
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |in_flight| {
-                (in_flight < self.capacity).then_some(in_flight + 1)
+                (in_flight + slots <= self.capacity).then_some(in_flight + slots)
             })
             .ok()
             .map(|_| InFlightPermit {
                 queue: self.clone(),
+                slots,
             })
     }
 
-    /// Ask to be woken when a slot is released. The caller must retry
+    /// Ask to be woken when slots are released. The caller must retry
     /// `try_acquire` once after registering: a release between its failed
     /// attempt and the registration would otherwise go unseen forever. The
     /// retry closes that window, because a release decrements the counter
@@ -103,9 +141,9 @@ impl HardwareQueue {
             .fetch_and(!(1usize << (worker_idx % WORD_BITS)), Ordering::SeqCst);
     }
 
-    /// Return a slot and wake every waiting worker to race for it.
-    fn release(&self) {
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    /// Return `slots` slots and wake every waiting worker to race for them.
+    fn release(&self, slots: usize) {
+        self.in_flight.fetch_sub(slots, Ordering::SeqCst);
         let Some(waiters) = self.waiters.get() else {
             return;
         };
@@ -125,14 +163,16 @@ impl HardwareQueue {
     }
 }
 
-/// RAII reservation of one slot in a [`HardwareQueue`], released on drop.
+/// RAII reservation of an operation's slots in a [`HardwareQueue`], released
+/// on drop.
 pub(crate) struct InFlightPermit {
     queue: Arc<HardwareQueue>,
+    slots: usize,
 }
 
 impl Drop for InFlightPermit {
     fn drop(&mut self) {
-        self.queue.release();
+        self.queue.release(self.slots);
     }
 }
 
@@ -312,11 +352,16 @@ fn read_device_queues(device: u64) -> Option<DeviceQueues> {
     } else {
         node
     };
-    let capacity: usize = std::fs::read_to_string(disk.join("queue/nr_requests"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    let read_queue_limit = |name: &str| -> Option<usize> {
+        std::fs::read_to_string(disk.join("queue").join(name))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let capacity = read_queue_limit("nr_requests")?;
+    let largest_request_bytes = read_queue_limit("max_sectors_kb")? * 1024;
+    let most_runs_per_request = read_queue_limit("max_segments")?;
     let mut cpu_lists = Vec::new();
     for entry in std::fs::read_dir(disk.join("mq")).ok()? {
         let cpu_list = std::fs::read_to_string(entry.ok()?.path().join("cpu_list")).ok()?;
@@ -329,18 +374,34 @@ fn read_device_queues(device: u64) -> Option<DeviceQueues> {
         device,
         queues = cpu_lists.len(),
         capacity,
+        largest_request_bytes,
+        most_runs_per_request,
         "discovered the device's hardware queues"
     );
-    Some(build_device_queues(cpu_lists, capacity))
+    Some(build_device_queues(
+        cpu_lists,
+        capacity,
+        largest_request_bytes,
+        most_runs_per_request,
+    ))
 }
 
 /// Build the cpu-indexed queue map: one shared counter per hardware queue,
 /// reachable from every CPU that submits into it.
 #[cfg(target_os = "linux")]
-fn build_device_queues(queue_cpu_lists: Vec<Vec<usize>>, capacity: usize) -> DeviceQueues {
+fn build_device_queues(
+    queue_cpu_lists: Vec<Vec<usize>>,
+    capacity: usize,
+    largest_request_bytes: usize,
+    most_runs_per_request: usize,
+) -> DeviceQueues {
     let mut by_cpu = HashMap::new();
     for cpus in queue_cpu_lists {
-        let queue = HardwareQueue::with_capacity(capacity);
+        let queue = HardwareQueue::with_request_limits(
+            capacity,
+            largest_request_bytes,
+            most_runs_per_request,
+        );
         for cpu in cpus {
             by_cpu.insert(cpu, queue.clone());
         }
@@ -365,15 +426,43 @@ mod tests {
     fn a_full_queue_rejects_until_a_permit_is_released() {
         let queue = HardwareQueue::with_capacity(2);
 
-        let first = queue.try_acquire();
-        let second = queue.try_acquire();
-        let over_capacity = queue.try_acquire();
+        let first = queue.try_acquire(1);
+        let second = queue.try_acquire(1);
+        let over_capacity = queue.try_acquire(1);
         drop(first);
-        let after_release = queue.try_acquire();
+        let after_release = queue.try_acquire(1);
 
         assert!(second.is_some());
         assert!(over_capacity.is_none());
         assert!(after_release.is_some());
+    }
+
+    #[test]
+    fn an_operation_holds_a_slot_for_each_request_the_device_cuts_it_into() {
+        let queue = HardwareQueue::with_request_limits(63, 256 * 1024, 65);
+
+        let small = queue.count_slots(4096, 1);
+        let four_requests_of_bytes = queue.count_slots(1024 * 1024, 1);
+        let three_requests_of_runs = queue.count_slots(64 * 1024, 140);
+        let larger_than_the_queue = queue.count_slots(1 << 30, 1);
+
+        assert_eq!(small, 1);
+        assert_eq!(four_requests_of_bytes, 4);
+        assert_eq!(three_requests_of_runs, 3);
+        assert_eq!(larger_than_the_queue, 63);
+    }
+
+    #[test]
+    fn an_operation_of_several_requests_waits_for_all_of_its_slots() {
+        let queue = HardwareQueue::with_capacity(4);
+        let held: Vec<_> = (0..3).map(|_| queue.try_acquire(1)).collect();
+
+        let with_one_slot_free = queue.try_acquire(2);
+        drop(held);
+        let with_the_queue_free = queue.try_acquire(2);
+
+        assert!(with_one_slot_free.is_none());
+        assert!(with_the_queue_free.is_some());
     }
 
     #[test]
@@ -384,7 +473,7 @@ mod tests {
         let waker = Arc::new(WorkerWaker::new(worker_count));
         init_waker_set(WakerSet::new(vec![waker.clone()], worker_count));
         let queue = HardwareQueue::with_capacity(1);
-        let permit = queue.try_acquire().unwrap();
+        let permit = queue.try_acquire(1).unwrap();
 
         queue.register_waiter(0);
         queue.register_waiter(1);
@@ -406,7 +495,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cpus_feeding_one_hardware_queue_share_its_counter() {
-        let queues = build_device_queues(vec![vec![0, 1], vec![2, 3]], 63);
+        let queues = build_device_queues(vec![vec![0, 1], vec![2, 3]], 63, 256 * 1024, 65);
 
         let queue_of = |cpu: usize| queues.by_cpu.get(&cpu).unwrap();
 
