@@ -1,9 +1,10 @@
 //! Per-worker GROUP BY state with adaptive in-place and radix modes.
 //!
-//! Every worker starts by aggregating into hash tables. If the active table
-//! grows beyond [`SWITCH_THRESHOLD`], eligible keys switch to radix scatter.
-//! Remaining rows are partitioned by the high hash bits and aggregated during
-//! merge.
+//! Every worker starts by aggregating into hash tables. The first table to
+//! fill at [`SWITCH_THRESHOLD`] stays among them and the worker carries on in
+//! a fresh one. When that fills too, eligible keys switch to radix scatter:
+//! from then on each fill is partitioned by the high hash bits and aggregated
+//! during merge.
 //!
 //! ```text
 //! consume rows
@@ -285,6 +286,9 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     topk_bin_totals: Option<HashBinTotals>,
     /// Whether this worker has entered radix mode.
     switched_to_radix: bool,
+    /// Whether a table already filled at the switch threshold and was left
+    /// in the stack. The next one to fill there enters radix mode.
+    kept_table_at_threshold: bool,
     /// Whether rows bypass the in-place table and scatter raw, set once a
     /// post-switch fill stopped deduplicating.
     scatter_raw: bool,
@@ -331,6 +335,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             topk_aggregation_slot,
             topk_bin_totals: None,
             switched_to_radix: false,
+            kept_table_at_threshold: false,
             scatter_raw: false,
             rows_since_clear: 0,
             radix_config,
@@ -556,7 +561,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
 
     /// Grows the in-place stack or enters radix mode.
     ///
-    /// Past the switch threshold, drains the deduplicated table into the radix
+    /// The first table to fill at the switch threshold is left in the stack
+    /// and probing continues in a fresh table of the same size. Moving its
+    /// groups into the radix partitions would be an uninterrupted pass over
+    /// the whole table, and a worker's table tends to fill near the end of
+    /// its input, where the rest of the pool is already waiting for it. The
+    /// merge reads the table where it is, as it reads the smaller ones.
+    ///
+    /// Each later fill drains the deduplicated table into the radix
     /// partitions and returns `false` so the caller continues probing with the
     /// cleared table. When the drained fill deduplicated almost nothing, the
     /// worker permanently falls back to raw scatter and returns `true`: the
@@ -574,14 +586,24 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             ));
             return false;
         }
-        // On fills after the switch (the table restarted from empty), a
+        if !self.kept_table_at_threshold {
+            self.kept_table_at_threshold = true;
+            self.rows_since_clear = 0;
+            let capacity = self.tables.last().unwrap().capacity();
+            self.tables.push(HashTable::new(
+                &mut self.allocator,
+                capacity,
+                0,
+                &self.shared_context,
+            ));
+            return false;
+        }
+        // Every fill that gets here started from an empty table, so a
         // distinct count near the fill's row count means almost nothing
         // deduplicated: fall back to raw scatter rather than keep paying
-        // the probe (and drain) for it. The switch-time fill is exempt
-        // because its rows accumulated across the growing stack.
-        let almost_no_dedup = self.switched_to_radix
-            && self.tables.last().unwrap().len() * 100
-                >= self.rows_since_clear * self.radix_config.scatter_fallback_distinct_pct;
+        // the probe (and drain) for it.
+        let almost_no_dedup = self.tables.last().unwrap().len() * 100
+            >= self.rows_since_clear * self.radix_config.scatter_fallback_distinct_pct;
         self.switched_to_radix = true;
         self.rows_since_clear = 0;
         self.create_scatter_buffers();
@@ -1097,6 +1119,30 @@ mod tests {
             scatter_row_count(&output) < 2500,
             "dedup before scatter should persist across repeat-heavy fills"
         );
+    }
+
+    #[test]
+    fn the_first_table_to_fill_at_the_threshold_keeps_its_groups() {
+        init_test_free_pool(64);
+        let mut table = AggregatedTable::<IntExtractor, CountValue>::new(
+            ahash::RandomState::new(),
+            SharedArena::new(64),
+            (),
+            (),
+            SMALL_RADIX,
+            None,
+            fresh_evictor(),
+        );
+
+        // Enough unique keys to fill one table at the threshold, too few to
+        // fill a second.
+        let values: Vec<i32> = (0..150).collect();
+        consume_all(&mut table, &values);
+        let (output, _totals) = table.flush();
+
+        assert!(output.buffers.is_none(), "no group was scattered");
+        let groups_in_tables: usize = output.tables.iter().map(|table| table.len()).sum();
+        assert_eq!(groups_in_tables, 150);
     }
 
     #[test]
