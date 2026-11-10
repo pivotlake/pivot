@@ -1,25 +1,33 @@
 //! Bounds in-flight local-file operations by the device's real queue capacity.
 //!
-//! A submission into a saturated device queue either sleeps in the kernel's
-//! request allocation or pays an io-wq punt, so each worker holds its excess in
-//! a backlog instead of submitting it (see [`super::requester::IORequester`]).
-//! The bound itself lives here: a block device exposes its hardware queues in
-//! sysfs, each serving a fixed set of CPUs with a fixed tag budget
-//! (`queue/nr_requests`). The workers whose CPUs submit into the same hardware
-//! queue share one atomic in-flight counter capped at that budget, so together
-//! they can fill the queue exactly and never oversubscribe it.
+//! A submission into a saturated device queue sleeps in the kernel's request
+//! allocation, with the submitting worker in it, or pays an io-wq punt. So
+//! each worker holds its excess in a backlog instead of submitting it (see
+//! [`super::requester::IORequester`]). The bound itself lives here: a block
+//! device exposes its hardware queues in sysfs, each serving a fixed set of
+//! CPUs with a fixed budget of requests (`queue/nr_requests`). The workers
+//! whose CPUs submit into the same hardware queue share one count of the
+//! requests in flight, capped at that budget, so together they can fill the
+//! queue exactly and never oversubscribe it.
 //!
-//! A worker that finds the shared counter full parks with nothing of its own in
-//! flight, so releasing a slot must wake it: each queue records the waiting
-//! workers in an atomic bitmap and targets them through the worker waker when a
-//! slot frees.
+//! What the budget counts is device requests, not operations. The kernel cuts
+//! an operation into requests no larger than the device takes
+//! (`queue/max_sectors_kb`) and of no more separate memory runs than it takes
+//! (`queue/max_segments`), so an operation holds one slot for each request it
+//! becomes (see [`HardwareQueue::count_slots`]).
+//!
+//! A worker that finds the queue full waits in line for it. The line is first
+//! come, first served: a freed slot wakes only the worker at the front, and
+//! nobody takes a slot while a worker that asked earlier is still waiting.
+//! That holds for the worker that freed the slot too, which would otherwise
+//! reuse it for its own backlog before any waiting worker had woken, and it
+//! keeps a large operation from waiting forever behind a stream of small
+//! ones.
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 /// In-flight cap for a device whose hardware-queue topology cannot be read
 /// (non-Linux, or a device without blk-mq sysfs entries, e.g. tmpfs). Private
@@ -37,102 +45,170 @@ pub(crate) struct DeviceIndex(usize);
 /// One block-device hardware queue's in-flight budget, shared by every worker
 /// whose CPU submits into it.
 pub(crate) struct HardwareQueue {
-    /// The queue's tag budget (`queue/nr_requests`).
+    /// The queue's budget of requests (`queue/nr_requests`).
     capacity: usize,
-    /// Operations currently holding one of the queue's slots.
-    in_flight: AtomicUsize,
-    /// Workers that found this queue full, one bit per global worker index.
-    /// Sized on first use from the worker pool; after that registration and
-    /// release are atomic bitmap operations only.
-    waiters: OnceLock<Box<[AtomicUsize]>>,
+    /// The most bytes the device takes as one request
+    /// (`queue/max_sectors_kb`).
+    largest_request_bytes: usize,
+    /// The most separate memory runs the device takes in one request
+    /// (`queue/max_segments`).
+    most_runs_per_request: usize,
+    slots: Mutex<Slots>,
+}
+
+struct Slots {
+    /// Slots held by the operations in flight.
+    in_flight: usize,
+    /// The workers waiting for slots, longest wait first.
+    waiting: VecDeque<WaitingWorker>,
+}
+
+struct WaitingWorker {
+    /// The worker's global index, which is how it is woken.
+    worker_idx: usize,
+    /// The slots the operation it is waiting to submit needs.
+    slots: usize,
+}
+
+impl Slots {
+    /// The worker at the front of the line, if the free slots now cover what
+    /// it is waiting for.
+    fn find_worker_to_wake(&self, capacity: usize) -> Option<usize> {
+        self.waiting
+            .front()
+            .filter(|front| self.in_flight + front.slots <= capacity)
+            .map(|front| front.worker_idx)
+    }
 }
 
 impl HardwareQueue {
+    /// A queue of `capacity` slots on a device with no limit on a request's
+    /// size, so that every operation takes one slot.
     pub(crate) fn with_capacity(capacity: usize) -> Arc<Self> {
+        Self::with_request_limits(capacity, usize::MAX, usize::MAX)
+    }
+
+    pub(crate) fn with_request_limits(
+        capacity: usize,
+        largest_request_bytes: usize,
+        most_runs_per_request: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             capacity,
-            in_flight: AtomicUsize::new(0),
-            waiters: OnceLock::new(),
+            largest_request_bytes,
+            most_runs_per_request,
+            slots: Mutex::new(Slots {
+                in_flight: 0,
+                waiting: VecDeque::new(),
+            }),
         })
     }
 
-    /// Reserve one in-flight slot, or `None` if the queue is at capacity.
-    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<InFlightPermit> {
-        self.in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |in_flight| {
-                (in_flight < self.capacity).then_some(in_flight + 1)
-            })
-            .ok()
-            .map(|_| InFlightPermit {
-                queue: self.clone(),
-            })
+    /// How many slots an operation of `bytes` bytes in `runs` separate memory
+    /// runs holds: one for each request the kernel cuts it into. An operation
+    /// of more requests than the queue has slots holds all of them, and has
+    /// the queue to itself.
+    pub(crate) fn count_slots(&self, bytes: usize, runs: usize) -> usize {
+        bytes
+            .div_ceil(self.largest_request_bytes)
+            .max(runs.div_ceil(self.most_runs_per_request))
+            .clamp(1, self.capacity)
     }
 
-    /// Ask to be woken when a slot is released. The caller must retry
-    /// `try_acquire` once after registering: a release between its failed
-    /// attempt and the registration would otherwise go unseen forever. The
-    /// retry closes that window, because a release decrements the counter
-    /// before sweeping the waiters: a retry that still finds the queue full
-    /// ran before that decrement, so the sweep is still to come and will see
-    /// this registration.
-    pub(crate) fn register_waiter(&self, worker_idx: usize) {
-        const WORD_BITS: usize = usize::BITS as usize;
-
-        let waiters = self.waiters.get_or_init(|| {
-            let word_count = crate::waker::waker_set().worker_count().div_ceil(WORD_BITS);
-            (0..word_count).map(|_| AtomicUsize::new(0)).collect()
-        });
-        let word = worker_idx / WORD_BITS;
-        assert!(
-            word < waiters.len(),
-            "worker {worker_idx} is outside the hardware queue's worker pool"
-        );
-        waiters[word].fetch_or(1usize << (worker_idx % WORD_BITS), Ordering::SeqCst);
+    /// Reserve `slots` slots if they are free and no worker is waiting for
+    /// the queue. Unlike [`try_acquire_or_wait`](Self::try_acquire_or_wait)
+    /// the caller does not join the line when it gets `None`.
+    pub(crate) fn try_acquire(self: &Arc<Self>, slots: usize) -> Option<InFlightPermit> {
+        let mut state = self.slots.lock().unwrap();
+        if !state.waiting.is_empty() || state.in_flight + slots > self.capacity {
+            return None;
+        }
+        state.in_flight += slots;
+        Some(InFlightPermit {
+            queue: self.clone(),
+            slots,
+        })
     }
 
-    /// Drop a registration whose retry acquired a slot after all, so releases
-    /// stop waking a worker that is no longer waiting.
-    pub(crate) fn deregister_waiter(&self, worker_idx: usize) {
-        const WORD_BITS: usize = usize::BITS as usize;
-
-        let waiters = self
-            .waiters
-            .get()
-            .expect("a waiter cannot deregister before registering");
-        waiters[worker_idx / WORD_BITS]
-            .fetch_and(!(1usize << (worker_idx % WORD_BITS)), Ordering::SeqCst);
-    }
-
-    /// Return a slot and wake every waiting worker to race for it.
-    fn release(&self) {
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        let Some(waiters) = self.waiters.get() else {
-            return;
+    /// Reserve `slots` slots for worker `worker_idx`, or put it in line for
+    /// them. A worker not yet in line gets the slots only if they are free
+    /// and nobody is waiting; a worker in line gets them only from the front.
+    /// On `None` the worker stays in line, waiting for `slots`, and is woken
+    /// when it is at the front and they are free; it then calls this again.
+    pub(crate) fn try_acquire_or_wait(
+        self: &Arc<Self>,
+        worker_idx: usize,
+        slots: usize,
+    ) -> Option<InFlightPermit> {
+        let mut state = self.slots.lock().unwrap();
+        let place = state
+            .waiting
+            .iter()
+            .position(|waiting| waiting.worker_idx == worker_idx);
+        let is_its_turn = match place {
+            Some(place) => place == 0,
+            None => state.waiting.is_empty(),
         };
-        const WORD_BITS: usize = usize::BITS as usize;
-        for (word_idx, word) in waiters.iter().enumerate() {
-            let mut waiting = word.swap(0, Ordering::SeqCst);
-            if waiting == 0 {
-                continue;
+        if !is_its_turn || state.in_flight + slots > self.capacity {
+            match place {
+                Some(place) => state.waiting[place].slots = slots,
+                None => state.waiting.push_back(WaitingWorker { worker_idx, slots }),
             }
-            let wakers = crate::waker::waker_set();
-            while waiting != 0 {
-                let bit = waiting.trailing_zeros() as usize;
-                wakers.notify_worker(word_idx * WORD_BITS + bit);
-                waiting &= waiting - 1;
-            }
+            return None;
+        }
+        if place.is_some() {
+            state.waiting.pop_front();
+        }
+        state.in_flight += slots;
+        // What is still free may cover the worker now at the front.
+        let worker_to_wake = state.find_worker_to_wake(self.capacity);
+        drop(state);
+        if let Some(worker) = worker_to_wake {
+            crate::waker::waker_set().notify_worker(worker);
+        }
+        Some(InFlightPermit {
+            queue: self.clone(),
+            slots,
+        })
+    }
+
+    /// Take worker `worker_idx` out of the line, for a worker that will not
+    /// come back for the slots it was waiting for.
+    pub(crate) fn stop_waiting(&self, worker_idx: usize) {
+        let mut state = self.slots.lock().unwrap();
+        state
+            .waiting
+            .retain(|waiting| waiting.worker_idx != worker_idx);
+        let worker_to_wake = state.find_worker_to_wake(self.capacity);
+        drop(state);
+        if let Some(worker) = worker_to_wake {
+            crate::waker::waker_set().notify_worker(worker);
+        }
+    }
+
+    /// Return `slots` slots, and wake the worker at the front of the line if
+    /// they cover what it is waiting for.
+    fn release(&self, slots: usize) {
+        let mut state = self.slots.lock().unwrap();
+        state.in_flight -= slots;
+        let worker_to_wake = state.find_worker_to_wake(self.capacity);
+        drop(state);
+        if let Some(worker) = worker_to_wake {
+            crate::waker::waker_set().notify_worker(worker);
         }
     }
 }
 
-/// RAII reservation of one slot in a [`HardwareQueue`], released on drop.
+/// RAII reservation of an operation's slots in a [`HardwareQueue`], released
+/// on drop.
 pub(crate) struct InFlightPermit {
     queue: Arc<HardwareQueue>,
+    slots: usize,
 }
 
 impl Drop for InFlightPermit {
     fn drop(&mut self) {
-        self.queue.release();
+        self.queue.release(self.slots);
     }
 }
 
@@ -152,6 +228,10 @@ pub(crate) struct WorkerHardwareQueues {
     by_device: Vec<Arc<HardwareQueue>>,
     /// The private cap for devices without readable topology.
     fallback: Arc<HardwareQueue>,
+    /// The queue this worker is in line for, if it is waiting. A worker waits
+    /// only for the operation at the front of its backlog, so for one queue
+    /// at a time.
+    waiting_in: Option<Arc<HardwareQueue>>,
     /// Test override: every file resolves to this queue.
     #[cfg(test)]
     forced: Option<Arc<HardwareQueue>>,
@@ -165,9 +245,35 @@ impl WorkerHardwareQueues {
             #[cfg(target_os = "linux")]
             by_device: Vec::new(),
             fallback: HardwareQueue::with_capacity(FALLBACK_WORKER_CAPACITY),
+            waiting_in: None,
             #[cfg(test)]
             forced: None,
         }
+    }
+
+    /// Reserve `slots` slots of `queue` for the operation at the front of
+    /// this worker's backlog, or wait in line for them (see
+    /// [`HardwareQueue::try_acquire_or_wait`]).
+    pub(crate) fn try_acquire_or_wait(
+        &mut self,
+        queue: &Arc<HardwareQueue>,
+        slots: usize,
+    ) -> Option<InFlightPermit> {
+        let worker_idx = crate::worker::WORKER_IDX.get();
+        // The front of the backlog may have changed to an operation on
+        // another device since this worker got in line: it gives up its place
+        // there instead of holding up that line while it waits in this one.
+        if let Some(previous) = &self.waiting_in
+            && !Arc::ptr_eq(previous, queue)
+        {
+            previous.stop_waiting(worker_idx);
+        }
+        let permit = queue.try_acquire_or_wait(worker_idx, slots);
+        self.waiting_in = match permit {
+            Some(_) => None,
+            None => Some(queue.clone()),
+        };
+        permit
     }
 
     /// The hardware queue `device_idx` serves this worker's CPU with, or the
@@ -208,6 +314,16 @@ impl WorkerHardwareQueues {
     #[cfg(test)]
     pub(crate) fn force(&mut self, queue: Arc<HardwareQueue>) {
         self.forced = Some(queue);
+    }
+}
+
+impl Drop for WorkerHardwareQueues {
+    /// A worker that goes away while in line would hold up everyone behind
+    /// it, so it leaves the line.
+    fn drop(&mut self) {
+        if let Some(queue) = self.waiting_in.take() {
+            queue.stop_waiting(crate::worker::WORKER_IDX.get());
+        }
     }
 }
 
@@ -299,8 +415,11 @@ fn hardware_queue_for_device(device_idx: DeviceIndex, cpu: usize) -> Option<Arc<
 }
 
 /// Read `device`'s queue layout from sysfs: which CPUs feed each hardware
-/// queue (`mq/<n>/cpu_list`) and the per-queue tag budget
-/// (`queue/nr_requests`). A partition submits through its whole disk's queues.
+/// queue (`mq/<n>/cpu_list`), the per-queue budget of requests
+/// (`queue/nr_requests`), and the most one request takes in bytes
+/// (`queue/max_sectors_kb`) and in separate memory runs
+/// (`queue/max_segments`). A partition submits through its whole disk's
+/// queues.
 #[cfg(target_os = "linux")]
 fn read_device_queues(device: u64) -> Option<DeviceQueues> {
     let (major, minor) = split_device_number(device);
@@ -312,11 +431,16 @@ fn read_device_queues(device: u64) -> Option<DeviceQueues> {
     } else {
         node
     };
-    let capacity: usize = std::fs::read_to_string(disk.join("queue/nr_requests"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    let read_queue_limit = |name: &str| -> Option<usize> {
+        std::fs::read_to_string(disk.join("queue").join(name))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let capacity = read_queue_limit("nr_requests")?;
+    let largest_request_bytes = read_queue_limit("max_sectors_kb")? * 1024;
+    let most_runs_per_request = read_queue_limit("max_segments")?;
     let mut cpu_lists = Vec::new();
     for entry in std::fs::read_dir(disk.join("mq")).ok()? {
         let cpu_list = std::fs::read_to_string(entry.ok()?.path().join("cpu_list")).ok()?;
@@ -329,18 +453,34 @@ fn read_device_queues(device: u64) -> Option<DeviceQueues> {
         device,
         queues = cpu_lists.len(),
         capacity,
+        largest_request_bytes,
+        most_runs_per_request,
         "discovered the device's hardware queues"
     );
-    Some(build_device_queues(cpu_lists, capacity))
+    Some(build_device_queues(
+        cpu_lists,
+        capacity,
+        largest_request_bytes,
+        most_runs_per_request,
+    ))
 }
 
 /// Build the cpu-indexed queue map: one shared counter per hardware queue,
 /// reachable from every CPU that submits into it.
 #[cfg(target_os = "linux")]
-fn build_device_queues(queue_cpu_lists: Vec<Vec<usize>>, capacity: usize) -> DeviceQueues {
+fn build_device_queues(
+    queue_cpu_lists: Vec<Vec<usize>>,
+    capacity: usize,
+    largest_request_bytes: usize,
+    most_runs_per_request: usize,
+) -> DeviceQueues {
     let mut by_cpu = HashMap::new();
     for cpus in queue_cpu_lists {
-        let queue = HardwareQueue::with_capacity(capacity);
+        let queue = HardwareQueue::with_request_limits(
+            capacity,
+            largest_request_bytes,
+            most_runs_per_request,
+        );
         for cpu in cpus {
             by_cpu.insert(cpu, queue.clone());
         }
@@ -361,15 +501,25 @@ fn split_device_number(device: u64) -> (u64, u64) {
 mod tests {
     use super::*;
 
+    /// A waker set over `worker_count` workers of one node, installed on the
+    /// test's thread, and that node's waker to count wakes on.
+    fn install_wakers(worker_count: usize) -> Arc<crate::waker::WorkerWaker> {
+        use crate::waker::{WakerSet, WorkerWaker, init_waker_set};
+
+        let waker = Arc::new(WorkerWaker::new(worker_count));
+        init_waker_set(WakerSet::new(vec![waker.clone()], worker_count));
+        waker
+    }
+
     #[test]
     fn a_full_queue_rejects_until_a_permit_is_released() {
         let queue = HardwareQueue::with_capacity(2);
 
-        let first = queue.try_acquire();
-        let second = queue.try_acquire();
-        let over_capacity = queue.try_acquire();
+        let first = queue.try_acquire(1);
+        let second = queue.try_acquire(1);
+        let over_capacity = queue.try_acquire(1);
         drop(first);
-        let after_release = queue.try_acquire();
+        let after_release = queue.try_acquire(1);
 
         assert!(second.is_some());
         assert!(over_capacity.is_none());
@@ -377,36 +527,71 @@ mod tests {
     }
 
     #[test]
-    fn waiter_bitmap_spans_words_and_skips_deregistered_workers() {
-        use crate::waker::{WakerSet, WorkerWaker, init_waker_set};
+    fn an_operation_holds_a_slot_for_each_request_the_device_cuts_it_into() {
+        let queue = HardwareQueue::with_request_limits(63, 256 * 1024, 65);
 
-        let worker_count = usize::BITS as usize + 1;
-        let waker = Arc::new(WorkerWaker::new(worker_count));
-        init_waker_set(WakerSet::new(vec![waker.clone()], worker_count));
+        let small = queue.count_slots(4096, 1);
+        let four_requests_of_bytes = queue.count_slots(1024 * 1024, 1);
+        let three_requests_of_runs = queue.count_slots(64 * 1024, 140);
+        let larger_than_the_queue = queue.count_slots(1 << 30, 1);
+
+        assert_eq!(small, 1);
+        assert_eq!(four_requests_of_bytes, 4);
+        assert_eq!(three_requests_of_runs, 3);
+        assert_eq!(larger_than_the_queue, 63);
+    }
+
+    #[test]
+    fn a_freed_slot_goes_to_the_worker_that_has_waited_longest() {
+        let waker = install_wakers(3);
         let queue = HardwareQueue::with_capacity(1);
-        let permit = queue.try_acquire().unwrap();
+        let permit = queue.try_acquire_or_wait(0, 1).unwrap();
+        let first_in_line = queue.try_acquire_or_wait(1, 1);
+        let second_in_line = queue.try_acquire_or_wait(2, 1);
 
-        queue.register_waiter(0);
-        queue.register_waiter(1);
-        queue.register_waiter(usize::BITS as usize);
-        queue.deregister_waiter(1);
         drop(permit);
+        let out_of_turn = queue.try_acquire_or_wait(2, 1);
+        let in_turn = queue.try_acquire_or_wait(1, 1);
 
-        assert_eq!(waker.ring_wake_count(), 2);
-        assert!(
-            queue
-                .waiters
-                .get()
-                .unwrap()
-                .iter()
-                .all(|word| word.load(Ordering::SeqCst) == 0)
-        );
+        assert!(first_in_line.is_none() && second_in_line.is_none());
+        assert!(out_of_turn.is_none());
+        assert!(in_turn.is_some());
+        assert_eq!(waker.ring_wake_count(), 1, "only the front worker is woken");
+    }
+
+    #[test]
+    fn free_slots_are_not_taken_past_a_worker_waiting_for_more_of_them() {
+        install_wakers(2);
+        let queue = HardwareQueue::with_capacity(4);
+        let _held = queue.try_acquire(2).unwrap();
+        let waiting_for_the_whole_queue = queue.try_acquire_or_wait(1, 4);
+
+        let past_the_line = queue.try_acquire(1);
+
+        assert!(waiting_for_the_whole_queue.is_none());
+        assert!(past_the_line.is_none());
+    }
+
+    #[test]
+    fn a_worker_that_stops_waiting_lets_the_next_one_through() {
+        let waker = install_wakers(3);
+        let queue = HardwareQueue::with_capacity(2);
+        let _held = queue.try_acquire(1).unwrap();
+        let waiting_for_two = queue.try_acquire_or_wait(1, 2);
+        let waiting_for_one = queue.try_acquire_or_wait(2, 1);
+
+        queue.stop_waiting(1);
+        let next = queue.try_acquire_or_wait(2, 1);
+
+        assert!(waiting_for_two.is_none() && waiting_for_one.is_none());
+        assert!(next.is_some());
+        assert_eq!(waker.ring_wake_count(), 1);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn cpus_feeding_one_hardware_queue_share_its_counter() {
-        let queues = build_device_queues(vec![vec![0, 1], vec![2, 3]], 63);
+        let queues = build_device_queues(vec![vec![0, 1], vec![2, 3]], 63, 256 * 1024, 65);
 
         let queue_of = |cpu: usize| queues.by_cpu.get(&cpu).unwrap();
 
