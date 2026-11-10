@@ -164,6 +164,15 @@ pub trait Operator {
         Ok(WorkStatus::Pending)
     }
 
+    /// Send downstream the output this operator is holding back to make
+    /// larger batches of, if it holds enough to be worth a batch of its own.
+    /// Called when the worker has nothing to run or steal: the rows would
+    /// otherwise wait for more input, or for the stage to finish, while the
+    /// worker that could process them sits idle.
+    fn release_held_output(&mut self, _io: &mut OperatorIO) -> Result<WorkStatus> {
+        Ok(WorkStatus::Pending)
+    }
+
     /// A flag this operator raises to ask the `DataFlow` to abandon everything
     /// *upstream* of it, used by `LIMIT` to stop the scan once it has buffered
     /// enough rows, without disturbing operators downstream of it (e.g. a

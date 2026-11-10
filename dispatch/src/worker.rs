@@ -508,6 +508,20 @@ impl Worker {
         }
     }
 
+    /// Have the dataflows' operators send on the output they are holding
+    /// back, now that this worker has nothing else to do.
+    fn release_held_output(&mut self) {
+        for flow in self.data_flows.values_mut() {
+            #[cfg(feature = "perf")]
+            if Self::paused_for_profiling(flow) {
+                continue;
+            }
+            if let WorkStatus::Ran = flow.release_held_output(&self.io) {
+                self.did_work_last_iteration = true;
+            }
+        }
+    }
+
     /// Called when no other work is available; we either park or clean a dirty buffer.
     /// We clean dirty buffers when we have nothing else to do to help future execution.
     ///
@@ -724,6 +738,11 @@ impl Worker {
                     }
                     self.last_seen_ring_wake_count = self.waker.ring_wake_count();
                     self.last_seen_wake_count = self.waker.wake_count();
+                    continue;
+                }
+
+                self.release_held_output();
+                if self.did_work_last_iteration {
                     continue;
                 }
 

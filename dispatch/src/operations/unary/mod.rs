@@ -202,6 +202,11 @@ pub trait Unary<I, O> {
         Ok(WorkStatus::Pending)
     }
 
+    /// See [`Operator::release_held_output`]. The default holds nothing back.
+    fn release_held_output(&mut self, _sender: &mut dyn Sender<O>) -> Result<WorkStatus> {
+        Ok(WorkStatus::Pending)
+    }
+
     /// Called after all siblings have drained their input. Emit any final results
     /// (e.g. aggregation totals). Return `true` when fully done, `false` to be
     /// called again (e.g. if final output requires multiple steps).
@@ -423,6 +428,10 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
 
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         self.unary.upstream_cancel_flag()
+    }
+
+    fn release_held_output(&mut self, _io: &mut OperatorIO) -> super::Result<WorkStatus> {
+        Ok(self.unary.release_held_output(&mut *self.sender)?)
     }
 
     fn spill(&mut self, spiller: &mut Spiller, count: usize) -> super::Result<()> {

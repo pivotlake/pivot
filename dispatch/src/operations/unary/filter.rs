@@ -19,6 +19,7 @@ use crate::RECORD_BATCH_SIZE;
 use crate::api::BuildContext;
 use crate::arrays::accumulator::BatchAccumulator;
 use crate::arrays::{collect_set_positions, take};
+use crate::data_flow::WorkStatus;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
@@ -89,6 +90,11 @@ pub enum RowDelivery {
     /// read far more of the table than the query needs.
     Immediate,
 }
+
+/// The fewest held rows a filter sends on when its worker runs out of work
+/// (see [`Unary::release_held_output`]). Fewer are not worth a batch of their
+/// own to the operator below and wait for more, or for the end of the input.
+const MIN_RELEASED_ROWS: usize = RECORD_BATCH_SIZE / 8;
 
 /// Factory that wraps a filter closure. `F` is the per-worker closure created by the
 /// builder passed to [`RecordBatchOperatorSpec::filter`](crate::api::RecordBatchOperatorSpec::filter).
@@ -312,6 +318,19 @@ where
         Ok(())
     }
 
+    fn release_held_output(
+        &mut self,
+        output: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<WorkStatus> {
+        match &mut self.accumulator {
+            Some(accumulator) if accumulator.len() >= MIN_RELEASED_ROWS => {
+                output.send(accumulator.take_batch(&mut self.allocator)?)?;
+                Ok(WorkStatus::Ran)
+            }
+            _ => Ok(WorkStatus::Pending),
+        }
+    }
+
     fn finish(&mut self, output: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if let Some(accumulator) = &mut self.accumulator
             && !accumulator.is_empty()
@@ -326,7 +345,7 @@ where
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
-    use crate::operations::unary::test_utils::run_unary_to_completion;
+    use crate::operations::unary::test_utils::{CollectSender, run_unary_to_completion};
     use arrow_array::{ArrayRef, BooleanArray, Int32Array};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -412,6 +431,43 @@ mod tests {
         let got: Vec<i32> = out.iter().flat_map(i32_col).collect();
         let expected: Vec<i32> = (0..n).filter(|v| v % 1000 != 0).collect();
         assert_eq!(got, expected);
+    }
+
+    /// A filter that has consumed `rows` rows and kept every second one.
+    fn filter_holding_half_of(rows: i32) -> (impl Unary<RecordBatch, RecordBatch>, CollectSender) {
+        init_test_free_pool(4);
+        let mut filter = filter_operator(
+            |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                select_by_mask(scratch, b.num_rows(), |row| row % 2 == 0)
+            },
+        );
+        let mut output = CollectSender::new();
+        let mut test_io = crate::io::TestOperatorIO::default();
+        let values: Vec<i32> = (0..rows).collect();
+        filter
+            .consume(batch(&values), &mut output, &mut test_io.io())
+            .unwrap();
+        (filter, output)
+    }
+
+    #[test]
+    fn held_rows_worth_a_batch_are_released_on_request() {
+        let (mut filter, mut output) = filter_holding_half_of(4000);
+
+        let status = filter.release_held_output(&mut output).unwrap();
+
+        assert!(matches!(status, WorkStatus::Ran));
+        assert_eq!(output.total_rows(), 2000);
+    }
+
+    #[test]
+    fn a_few_held_rows_wait_for_more() {
+        let (mut filter, mut output) = filter_holding_half_of(100);
+
+        let status = filter.release_held_output(&mut output).unwrap();
+
+        assert!(matches!(status, WorkStatus::Pending));
+        assert_eq!(output.total_rows(), 0);
     }
 
     #[test]

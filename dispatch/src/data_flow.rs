@@ -674,6 +674,28 @@ impl DataFlow {
         })
     }
 
+    /// Have the first operator, leaf-to-root, that holds output back send it
+    /// downstream (see [`Operator::release_held_output`]). Returns
+    /// [`WorkStatus::Ran`] if one did.
+    pub fn release_held_output(&mut self, requester: &RefCell<IORequester>) -> WorkStatus {
+        self.try_run_or(WorkStatus::Ran, |d| {
+            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
+            d.graph
+                .traverse_backwards(|node_id, operator| {
+                    io.set_operator_idx(node_id);
+                    let status = operator.release_held_output(&mut io)?;
+                    match status {
+                        WorkStatus::Pending => Ok(ControlFlow::Continue(())),
+                        WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                    }
+                })
+                .map(|c| match c {
+                    ControlFlow::Continue(_) => WorkStatus::Pending,
+                    ControlFlow::Break(_) => WorkStatus::Ran,
+                })
+        })
+    }
+
     /// Attempt to steal work from peer workers, traversing root-to-leaf (upstream first
     /// so the original worker's downstream data stays hot).
     pub fn try_stealing_work(&mut self, requester: &RefCell<IORequester>) -> WorkStatus {
