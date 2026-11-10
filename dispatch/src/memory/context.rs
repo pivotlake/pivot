@@ -533,8 +533,7 @@ impl MemoryContext {
                 if let Some(buffer) = self.evict_from_dataflow_operators() {
                     return buffer;
                 }
-                if self.has_spill_writes_in_flight() {
-                    self.wait_for_a_spill_write_to_land();
+                if self.drive_io_while_nothing_can_be_reclaimed() {
                     iterations = 0;
                 }
                 continue;
@@ -580,8 +579,7 @@ impl MemoryContext {
                         if let Some(buffer) = self.evict_from_dataflow_operators() {
                             return buffer;
                         }
-                        if self.has_spill_writes_in_flight() {
-                            self.wait_for_a_spill_write_to_land();
+                        if self.drive_io_while_nothing_can_be_reclaimed() {
                             iterations = 0;
                         }
                     }
@@ -743,6 +741,35 @@ impl MemoryContext {
                 }
             }
         }
+    }
+
+    /// Let this worker's IO move on while eviction has nothing to reclaim,
+    /// as the worker's loop would on its next pass. Eviction runs inside an
+    /// operator's run, where the loop does not come round, and may stay
+    /// there for a long time.
+    ///
+    /// With spill writes of its own in flight the worker waits for one to
+    /// land, which is the one thing that gives it a slot back, and this
+    /// returns `true`. Without any it only takes the completions its ring
+    /// holds and submits the operations it is holding back. An operation
+    /// that has landed keeps its hardware-queue slots until its worker
+    /// collects it, so a worker that did not would leave the other workers
+    /// on its queues that much less room: among them the ones whose spill
+    /// writes are what frees memory on this node.
+    fn drive_io_while_nothing_can_be_reclaimed(&self) -> bool {
+        if self.has_spill_writes_in_flight() {
+            self.wait_for_a_spill_write_to_land();
+            return true;
+        }
+        // A context no IO requester was attached to has no operations.
+        if let Some(requester) = self.io_requester.get() {
+            requester
+                .try_borrow_mut()
+                .expect("eviction does not run from inside the IO requester's own calls")
+                .collect_completions()
+                .expect("collecting IO completions while evicting");
+        }
+        false
     }
 
     /// Block until one of this worker's spill writes may have landed, and

@@ -1358,9 +1358,13 @@ mod tests {
         FileRange, HttpGetRequest, HttpUploadRequest, LocalFile, OpenFile, PendingReadRequest,
         ReadRequestId, RemoteFile, open_direct_read,
     };
-    use crate::memory::{BlockKey, init_test_free_pool, memory_ctx};
+    use crate::memory::{
+        BlockKey, DataflowEvict, Evict, WriteBuffer, init_test_free_pool, memory_ctx,
+    };
+    use std::cell::{Cell, RefCell};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::rc::Rc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -1657,6 +1661,86 @@ mod tests {
         assert!(second_backlogged);
         let response = responses.pop().unwrap().response;
         assert_eq!(response.into_bytes(), vec![2u8; 4096]);
+    }
+
+    /// Two 4 KiB blocks in a file of their own, open in the compressed cache.
+    fn open_two_block_file(dir: &TempDir) -> OpenFile {
+        let path = dir.path().join("data");
+        std::fs::write(&path, [vec![1u8; 4096], vec![2u8; 4096]].concat()).unwrap();
+        let open_file =
+            OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        open_file
+    }
+
+    fn read_of_block(block: usize, open_file: &OpenFile) -> PendingReadRequest {
+        PendingReadRequest {
+            id: ReadRequestId(block),
+            open_file: open_file.clone(),
+            locations: vec![FileRange::new(block * 4096, 4096)],
+        }
+    }
+
+    /// An operator with nothing to give up the first time eviction asks it,
+    /// and `buffer` the next.
+    struct GivesUpItsBufferWhenAskedAgain {
+        was_asked: Cell<bool>,
+        buffer: RefCell<Option<WriteBuffer>>,
+    }
+
+    impl Evict for GivesUpItsBufferWhenAskedAgain {
+        fn evict(&self) -> Option<WriteBuffer> {
+            if self.was_asked.replace(true) {
+                self.buffer.borrow_mut().take()
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn a_worker_looking_for_memory_still_submits_the_reads_it_holds_back() {
+        init_test_free_pool(2);
+        let dir = tempfile::tempdir().unwrap();
+        let open_file = open_two_block_file(&dir);
+        let queue = HardwareQueue::with_capacity(1);
+        let requester = Rc::new(RefCell::new(IORequester::default()));
+        requester.borrow_mut().force_fs_queue(queue.clone());
+        memory_ctx().attach_io_requester(requester.clone());
+        for block in 0..2 {
+            requester
+                .borrow_mut()
+                .request_read_resolving(
+                    1,
+                    2,
+                    read_of_block(block, &open_file),
+                    &mut disabled_stats(),
+                )
+                .unwrap();
+        }
+        // The first read has landed and holds the queue's one slot until it is
+        // collected; the second is held back for that slot.
+        requester.borrow_mut().wait().unwrap();
+        // The cache's one slot is still being filled, so eviction has only
+        // the operator to turn to.
+        let operator: Box<dyn Evict> = Box::new(GivesUpItsBufferWhenAskedAgain {
+            was_asked: Cell::new(false),
+            buffer: RefCell::new(Some(memory_ctx().get_write_buffer(false))),
+        });
+        memory_ctx().register_dataflow_evictors(1, DataflowEvict::new(vec![Some(operator)], &[]));
+
+        let evicted = memory_ctx().evict();
+
+        let first_read_was_collected = !requester.borrow_mut().take_ready_reads().is_empty();
+        let second_read_holds_the_slot = queue.try_acquire(1).is_none();
+        memory_ctx().unregister_dataflow_evictors(1);
+        requester.borrow_mut().wait().unwrap();
+        requester.borrow_mut().completions().unwrap();
+        drop(evicted);
+        assert!(first_read_was_collected);
+        assert!(second_read_holds_the_slot);
     }
 
     #[test]
