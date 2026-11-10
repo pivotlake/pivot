@@ -47,9 +47,9 @@ struct InFlightFsOp {
     /// Bytes already completed by earlier submissions (nonzero only for a
     /// write whose prior completion came up short and was resubmitted).
     bytes_done: usize,
-    /// The hardware-queue slot the operation holds. Dropping it releases the
-    /// slot and wakes any workers waiting on the queue, so it lives exactly
-    /// as long as the operation (a resubmitted write keeps it).
+    /// The hardware-queue slots the operation holds. Dropping it releases
+    /// them and wakes the worker at the front of the queue's line, so it
+    /// lives exactly as long as the operation (a resubmitted write keeps it).
     permit: InFlightPermit,
     /// The runs a vectored write on the device refers to, which the kernel
     /// reads from here until the write completes. `None` for a read and for
@@ -722,28 +722,33 @@ impl IORequester {
         self.ready_reads.push(request.into_response());
     }
 
-    /// Reserve a slot on the hardware queue the file's device serves this
-    /// worker with. `None` means the queue is full and the operation must
-    /// wait in the backlog; this worker is then registered for a ring wake on
-    /// the next slot release, so it can park with nothing of its own in
-    /// flight.
-    fn acquire_fs_slot(&mut self, request: &DataFlowRequest<FsRequest>) -> Option<InFlightPermit> {
+    /// Reserve the slots `request` needs on the hardware queue the file's
+    /// device serves this worker with: one for each device request the
+    /// operation becomes. `None` means the operation must wait in the
+    /// backlog.
+    ///
+    /// The operation at the front of the backlog waits in the queue's line,
+    /// and this worker is ring-woken when its turn comes, so it can park with
+    /// nothing of its own in flight. An operation that would go behind others
+    /// in the backlog only takes slots nobody is waiting for: this worker's
+    /// place in a line is for its front operation.
+    fn acquire_fs_slots(
+        &mut self,
+        request: &DataFlowRequest<FsRequest>,
+        is_front_of_backlog: bool,
+    ) -> Option<InFlightPermit> {
+        let (bytes, runs) = match &request.request {
+            FsRequest::Read(read) => (read.block.len(), 1),
+            FsRequest::ReadDirect(read) => (read.slab.size(), 1),
+            FsRequest::Write(write) => (write.data.len(), write.data.count_runs()),
+        };
         let device_idx = request.request.file().device_idx();
         let queue = self.fs_queues.queue_for_device(device_idx);
-        if let Some(permit) = queue.try_acquire() {
-            return Some(permit);
-        }
-        // Register before the deciding attempt so a release between the two
-        // cannot be missed (see `register_waiter`); a successful retry means
-        // no one needs to wake us after all.
-        let worker_idx = WORKER_IDX.get();
-        queue.register_waiter(worker_idx);
-        match queue.try_acquire() {
-            Some(permit) => {
-                queue.deregister_waiter(worker_idx);
-                Some(permit)
-            }
-            None => None,
+        let slots = queue.count_slots(bytes, runs);
+        if is_front_of_backlog {
+            self.fs_queues.try_acquire_or_wait(&queue, slots)
+        } else {
+            queue.try_acquire(slots)
         }
     }
 
@@ -752,7 +757,7 @@ impl IORequester {
     /// does, then surfaces the error.
     fn drain_fs_backlog(&mut self) -> Result<()> {
         while let Some(request) = self.fs_backlog.pop_front() {
-            let permit = match self.acquire_fs_slot(&request) {
+            let permit = match self.acquire_fs_slots(&request, true) {
                 Some(permit) => permit,
                 None => {
                     self.fs_backlog.push_front(request);
@@ -762,7 +767,7 @@ impl IORequester {
             self.submit_fs_request_now(request, permit)?;
         }
         while let Some(request) = self.spill_write_backlog.pop_front() {
-            let permit = match self.acquire_fs_slot(&request) {
+            let permit = match self.acquire_fs_slots(&request, true) {
                 Some(permit) => permit,
                 None => {
                     self.spill_write_backlog.push_front(request);
@@ -784,13 +789,16 @@ impl IORequester {
         if is_spill_write && get_spill_writes_last() {
             // A spill write never goes ahead of anything already waiting.
             let nothing_waiting = self.fs_backlog.is_empty() && self.spill_write_backlog.is_empty();
-            if nothing_waiting && let Some(permit) = self.acquire_fs_slot(&request) {
+            if nothing_waiting && let Some(permit) = self.acquire_fs_slots(&request, true) {
                 return self.submit_fs_request_now(request, permit);
             }
             self.spill_write_backlog.push_back(request);
             return Ok(());
         }
-        match self.acquire_fs_slot(&request) {
+        // With nothing held back, this operation is the front of the backlog
+        // if it has to wait.
+        let is_front_of_backlog = self.fs_backlog.is_empty() && self.spill_write_backlog.is_empty();
+        match self.acquire_fs_slots(&request, is_front_of_backlog) {
             Some(permit) => self.submit_fs_request_now(request, permit),
             None => {
                 self.fs_backlog.push_back(request);

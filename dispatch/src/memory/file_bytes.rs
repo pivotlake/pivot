@@ -64,6 +64,11 @@ impl FileBytes {
         self.len == 0
     }
 
+    /// How many runs the file is held as.
+    pub fn count_runs(&self) -> usize {
+        self.runs.len()
+    }
+
     /// The runs in order. Concatenated, they are the file.
     pub fn runs(&self) -> impl Iterator<Item = &[u8]> {
         self.runs.iter().map(FrozenSlab::as_slice)
