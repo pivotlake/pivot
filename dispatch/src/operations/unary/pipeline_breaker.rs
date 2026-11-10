@@ -272,7 +272,8 @@ mod tests {
             asked: asked.clone(),
         });
         let mut test_io = TestOperatorIO::default();
-        let mut spiller = Spiller::new(test_io.io());
+        let spill_directory = crate::memory::TestSpillDirectory::new();
+        let mut spiller = test_io.spiller(&spill_directory);
         let mut sender = crate::operations::unary::test_utils::CollectSender::<()>::new();
 
         breaker.spill(&mut spiller, 1).unwrap();

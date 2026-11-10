@@ -22,7 +22,7 @@
 use crate::Identifier;
 use crate::graph::Graph;
 use crate::io::{FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse};
-use crate::memory::{DataflowEvict, Evict, Spiller, memory_ctx, spill_directory};
+use crate::memory::{DataflowEvict, Evict, SpillDirectory, Spiller, memory_ctx};
 use crate::operations::{FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::waker::waker_set;
@@ -121,20 +121,22 @@ pub enum WorkStatus {
 /// traversal steals and finishes.
 struct OperatorGraph {
     graph: Graph<OperatorNode>,
-    /// The dataflow this graph belongs to, which names its spill directory.
+    /// The dataflow this graph belongs to, which names its part of the spill
+    /// directory.
     dataflow_id: Identifier,
     /// Whether the dataflow registered its operators' evictors with the memory
     /// context, so that a dropped operator's evictor has to be removed there.
     evictors_registered: bool,
-    /// Whether this dataflow's operators have been asked to spill on this
-    /// worker, so that there may be files under the worker's spill directory
-    /// to remove. Until then nothing is removed: each removal is a path walk
-    /// through the kernel, once per retired operator and once per dropped
-    /// dataflow on every worker, and a query that never came under memory
-    /// pressure would pay for all of them. Set when the operators are asked,
-    /// not when a buffer is counted as spilled, because a spill opens its
-    /// files before its writes are issued and counted.
-    may_have_spill_files_on_this_worker: bool,
+    /// The directory this dataflow's operators have been asked to spill into
+    /// on this worker, so that there may be files of theirs under it to
+    /// remove. `None` until they are asked, and until then nothing is removed:
+    /// each removal is a path walk through the kernel, once per retired
+    /// operator and once per dropped dataflow on every worker, and a query
+    /// that never came under memory pressure would pay for all of them. Set
+    /// when the operators are asked, not when a buffer is counted as spilled,
+    /// because a spill opens its files before its writes are issued and
+    /// counted.
+    spilled_into: Option<SpillDirectory>,
 }
 
 impl OperatorGraph {
@@ -164,7 +166,7 @@ impl OperatorGraph {
             graph: Graph::from_edges(nodes, &publisher_to_subscriber),
             dataflow_id,
             evictors_registered,
-            may_have_spill_files_on_this_worker: false,
+            spilled_into: None,
         }
     }
 
@@ -175,11 +177,11 @@ impl OperatorGraph {
         if self.evictors_registered {
             memory_ctx().remove_operator_evictor(self.dataflow_id, idx);
         }
-        if !self.may_have_spill_files_on_this_worker {
+        let Some(spill_directory) = &self.spilled_into else {
             return;
-        }
+        };
         if let Err(error) =
-            spill_directory::remove_operator_directory(self.dataflow_id, WORKER_IDX.get(), idx)
+            spill_directory.remove_operator_directory(self.dataflow_id, WORKER_IDX.get(), idx)
         {
             warn!(
                 "could not remove operator {idx}'s spill files of dataflow {}: {error}",
@@ -363,8 +365,8 @@ impl Drop for DataFlow {
         if self.registered_evictors {
             memory_ctx().unregister_dataflow_evictors(self.id);
         }
-        if self.graph.may_have_spill_files_on_this_worker
-            && let Err(error) = spill_directory::remove_worker_directory(self.id, WORKER_IDX.get())
+        if let Some(spill_directory) = &self.graph.spilled_into
+            && let Err(error) = spill_directory.remove_worker_directory(self.id, WORKER_IDX.get())
         {
             warn!(
                 "could not remove dataflow {}'s spill files: {error}",
@@ -652,13 +654,21 @@ impl DataFlow {
     }
 
     /// Ask this dataflow's operators to spill up to `count` ring slots' worth of
-    /// buffers. Returns how many slots they started spilling, which is
-    /// less than `count` when the operators had less to give.
-    pub fn spill(&mut self, requester: &RefCell<IORequester>, count: usize) -> usize {
+    /// buffers into `spill_directory`. Returns how many slots they started
+    /// spilling, which is less than `count` when the operators had less to
+    /// give.
+    pub fn spill(
+        &mut self,
+        requester: &RefCell<IORequester>,
+        spill_directory: &SpillDirectory,
+        count: usize,
+    ) -> usize {
         self.try_run_or(0, |d| {
-            d.graph.may_have_spill_files_on_this_worker = true;
+            if d.graph.spilled_into.is_none() {
+                d.graph.spilled_into = Some(spill_directory.clone());
+            }
             let io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
-            let mut spiller = Spiller::new(io);
+            let mut spiller = Spiller::new(io, spill_directory);
             // The walk stops once the count is met; only the count matters here.
             let _: ControlFlow<()> = d.graph.traverse_backwards(|node_id, operator| {
                 spiller.set_operator_idx(node_id);
@@ -699,6 +709,7 @@ impl DataFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::TestSpillDirectory;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
@@ -811,6 +822,7 @@ mod tests {
 
     #[test]
     fn spill_asks_the_output_end_first_and_moves_upstream_until_met() {
+        let spill_directory = TestSpillDirectory::new();
         let asked: Vec<Arc<Mutex<Vec<usize>>>> = (0..3).map(|_| Arc::default()).collect();
         let operators: Vec<Box<dyn Operator>> = [10, 10, 3]
             .into_iter()
@@ -836,7 +848,7 @@ mod tests {
             false,
         );
 
-        let spilled = flow.spill(&RefCell::new(IORequester::default()), 5);
+        let spilled = flow.spill(&RefCell::new(IORequester::default()), &spill_directory, 5);
 
         assert_eq!(spilled, 5);
         assert_eq!(*asked[2].lock().unwrap(), [5]);
@@ -866,25 +878,25 @@ mod tests {
 
     #[test]
     fn a_dataflow_that_never_spilled_leaves_the_spill_directory_alone_when_dropped() {
-        let dataflow_id = 9_000_010;
-        let directory = spill_directory::operator_directory(dataflow_id, WORKER_IDX.get(), 0);
+        let spill_directory = TestSpillDirectory::new();
+        let dataflow_id = 10;
+        let directory = spill_directory.operator_directory(dataflow_id, WORKER_IDX.get(), 0);
         std::fs::create_dir_all(&directory).unwrap();
         let flow = dataflow_with_one_spilling_operator(dataflow_id, 1);
 
         drop(flow);
 
-        let left_alone = directory.exists();
-        std::fs::remove_dir_all(&directory).unwrap();
-        assert!(left_alone);
+        assert!(directory.exists());
     }
 
     #[test]
     fn a_dataflow_that_spilled_removes_its_spill_directory_when_dropped() {
-        let dataflow_id = 9_000_011;
-        let directory = spill_directory::operator_directory(dataflow_id, WORKER_IDX.get(), 0);
+        let spill_directory = TestSpillDirectory::new();
+        let dataflow_id = 11;
+        let directory = spill_directory.operator_directory(dataflow_id, WORKER_IDX.get(), 0);
         std::fs::create_dir_all(&directory).unwrap();
         let mut flow = dataflow_with_one_spilling_operator(dataflow_id, 1);
-        flow.spill(&RefCell::new(IORequester::default()), 1);
+        flow.spill(&RefCell::new(IORequester::default()), &spill_directory, 1);
 
         drop(flow);
 

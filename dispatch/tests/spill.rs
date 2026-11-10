@@ -1,8 +1,10 @@
-//! A GROUP BY whose scatter rows do not fit the ring: the workers have to
-//! spill buffers to disk as they consume, the memory context has to free
-//! spilled buffers when it runs out of slots, and the merge has to read the
-//! evicted rows back. Nothing here drives any of that directly; the worker
-//! loop does, from the memory watermark down.
+//! A GROUP BY whose scatter rows do not fit the ring. In a pool with a spill
+//! directory the workers have to spill buffers to disk as they consume, the
+//! memory context has to free spilled buffers when it runs out of slots, and
+//! the merge has to read the evicted rows back. Nothing here drives any of
+//! that directly; the worker loop does, from the memory watermark down. In a
+//! pool without one the workers spill nothing, and the query fails for want
+//! of memory.
 
 mod common;
 
@@ -13,7 +15,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use dispatch::{Dispatch, Distinct, IntKeyExtractor, values_input};
+use dispatch::{DataFlowError, Dispatch, Distinct, IntKeyExtractor, SpillDirectory, values_input};
 
 /// A 2MB ring slot per entry. The scatter rows of a worker sit in one slab
 /// per partition, and a buffer can be spilled only once every slab in it has
@@ -33,23 +35,43 @@ fn int64_batch(from: i64, to: i64) -> RecordBatch {
     .unwrap()
 }
 
-#[test]
-fn a_group_by_larger_than_the_ring_spills_and_reads_back() {
-    let d = DispatchGuard::new(Dispatch::spin_up(1, RING_SLOTS, None));
+/// Group `KEYS` distinct ids by id on `dispatcher`'s workers.
+fn group_distinct_ids(dispatcher: &DispatchGuard) -> Result<Vec<RecordBatch>, DataFlowError> {
     let batches: Vec<RecordBatch> = (0..KEYS)
         .step_by(ROWS_PER_BATCH as usize)
         .map(|from| int64_batch(from, (from + ROWS_PER_BATCH).min(KEYS)))
         .collect();
-
-    let results = values_input(&d, batches)
+    values_input(dispatcher, batches)
         .record_batches()
         .group_by_aggregate::<IntKeyExtractor<Int64Type>, Distinct>(vec![0], Vec::new(), None, ())
         .collect()
-        .unwrap();
+}
+
+#[test]
+fn a_group_by_larger_than_the_ring_spills_and_reads_back() {
+    let spill_root = tempfile::tempdir().unwrap();
+    let spill_directory = SpillDirectory::open(spill_root.path()).unwrap();
+    let d = DispatchGuard::new(Dispatch::spin_up_with_spill_directory(
+        1,
+        RING_SLOTS,
+        None,
+        Some(spill_directory),
+    ));
+
+    let results = group_distinct_ids(&d).unwrap();
 
     let mut ids = collect_i64s(&results, 0);
     ids.sort_unstable();
     assert_eq!(ids.len() as i64, KEYS);
     assert_eq!(ids.first(), Some(&0));
     assert_eq!(ids.last(), Some(&(KEYS - 1)));
+}
+
+#[test]
+fn a_group_by_larger_than_the_ring_fails_without_a_spill_directory() {
+    let d = DispatchGuard::new(Dispatch::spin_up(1, RING_SLOTS, None));
+
+    let failure = group_distinct_ids(&d).unwrap_err().to_string();
+
+    assert!(failure.contains("no evictable memory"), "{failure}");
 }

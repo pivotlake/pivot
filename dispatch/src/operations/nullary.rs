@@ -357,7 +357,8 @@ mod tests {
             Box::new(SharedCollectSender(items)),
         );
         let mut test_io = crate::io::TestOperatorIO::default();
-        let mut spiller = Spiller::new(test_io.io());
+        let spill_directory = crate::memory::TestSpillDirectory::new();
+        let mut spiller = test_io.spiller(&spill_directory);
 
         Operator::spill(&mut operator, &mut spiller, 2).unwrap();
 

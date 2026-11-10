@@ -16,13 +16,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod codec;
-pub(crate) mod directory;
+mod directory;
 mod layout;
 mod partition_allocator;
 mod partition_evictor;
 mod partition_tree;
 
 pub use codec::decompress_spilled_rows;
+#[cfg(test)]
+pub(crate) use directory::TestSpillDirectory;
+pub use directory::{SpillDirectory, SpillDirectoryError};
 pub use layout::{Dynamic, Fixed, Layout};
 pub use partition_allocator::{
     NO_SLAB, PartitionAllocator, PartitionContents, PartitionSlab, SlabEntry,
@@ -93,28 +96,31 @@ impl SpilledBuffer {
 }
 
 /// What an operator hands its sealed buffers to when asked to spill. It writes
-/// each partition's rows to that partition's file and records every write with
-/// the memory context, which counts the writes off as they land.
+/// each partition's rows to that partition's file under the spill directory
+/// and records every write with the memory context, which counts the writes
+/// off as they land.
 pub struct Spiller<'a> {
     io: OperatorIO<'a>,
+    spill_directory: &'a SpillDirectory,
     buffers_spilled: usize,
 }
 
 impl<'a> Spiller<'a> {
-    pub(crate) fn new(io: OperatorIO<'a>) -> Self {
+    pub(crate) fn new(io: OperatorIO<'a>, spill_directory: &'a SpillDirectory) -> Self {
         Self {
             io,
+            spill_directory,
             buffers_spilled: 0,
         }
     }
 
     /// Create the file that spilled rows of `spill_partition_id` are appended
-    /// to, under this operator's spill directory (see [`directory`]). Each
-    /// partition's file is created once; a second call for the same partition
-    /// fails. Each write names where in the file it goes, so the file grows
-    /// the same way on every platform.
+    /// to, under this operator's part of the spill directory (see
+    /// [`directory`]). Each partition's file is created once; a second call
+    /// for the same partition fails. Each write names where in the file it
+    /// goes, so the file grows the same way on every platform.
     pub fn open_spill_file(&self, spill_partition_id: usize) -> std::io::Result<LocalFile> {
-        let path = directory::partition_file_path(
+        let path = self.spill_directory.partition_file_path(
             self.io.data_flow_id(),
             WORKER_IDX.get(),
             self.io.operator_idx(),
@@ -200,7 +206,8 @@ mod tests {
     #[test]
     fn a_spilled_buffer_is_on_disk_once_each_partitions_write_has_landed() {
         init_test_free_pool(1);
-        let (dataflow, operator) = (9_000_004, 2);
+        let spill_directory = TestSpillDirectory::new();
+        let (dataflow, operator) = (4, 2);
         let requester = RefCell::new(IORequester::default());
         let mut stats = StatsCollector::disabled();
         let mut next_request_id = 0;
@@ -211,7 +218,7 @@ mod tests {
             &mut stats,
             &mut next_request_id,
         );
-        let mut spiller = Spiller::new(io);
+        let mut spiller = Spiller::new(io, &spill_directory);
         // Three one-block slabs of one buffer: two for partition 5, one for
         // partition 9.
         let mut buffer = memory_ctx().get_write_buffer(false);
@@ -274,14 +281,13 @@ mod tests {
         assert_eq!(in_flight_after_issuing, 2);
         assert!(!memory_ctx().has_spill_writes_in_flight());
         let file_len = |partition| {
-            std::fs::metadata(directory::partition_file_path(
+            let path = spill_directory.partition_file_path(
                 dataflow,
                 WORKER_IDX.get(),
                 operator,
                 partition,
-            ))
-            .unwrap()
-            .len()
+            );
+            std::fs::metadata(path).unwrap().len()
         };
         assert_eq!(file_len(5), 2 * SPILL_BLOCK_SIZE as u64);
         assert_eq!(file_len(9), SPILL_BLOCK_SIZE as u64);
@@ -297,13 +303,13 @@ mod tests {
                 .all(|&b| b == 0xAB)
         }));
         const { assert!(BUFFER_SIZE >= 3 * SPILL_BLOCK_SIZE) };
-        directory::remove_worker_directory(dataflow, WORKER_IDX.get()).unwrap();
     }
 
     #[test]
     fn a_spill_file_is_created_once_under_its_operators_directory() {
         WORKER_IDX.set(0);
-        let (dataflow, operator) = (9_000_003, 4);
+        let spill_directory = TestSpillDirectory::new();
+        let (dataflow, operator) = (3, 4);
         let requester = RefCell::new(IORequester::default());
         let mut stats = StatsCollector::disabled();
         let mut next_request_id = 0;
@@ -314,13 +320,15 @@ mod tests {
             &mut stats,
             &mut next_request_id,
         );
-        let spiller = Spiller::new(io);
+        let spiller = Spiller::new(io, &spill_directory);
 
         let opened = spiller.open_spill_file(7).is_ok();
         let again = spiller.open_spill_file(7).err().map(|error| error.kind());
-        let path = directory::partition_file_path(dataflow, 0, operator, 7);
+        let path = spill_directory.partition_file_path(dataflow, 0, operator, 7);
         let created = path.exists();
-        directory::remove_operator_directory(dataflow, 0, operator).unwrap();
+        spill_directory
+            .remove_operator_directory(dataflow, 0, operator)
+            .unwrap();
 
         assert!(opened);
         assert_eq!(again, Some(std::io::ErrorKind::AlreadyExists));

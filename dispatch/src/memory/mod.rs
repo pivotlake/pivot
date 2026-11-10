@@ -3,7 +3,7 @@
 //! There are a few targets in our memory management:
 //!     1. Hit as few page faults as possible
 //!     2. Know when we're hitting disk and when we have something cached
-//!     3. Allow spilling to disk
+//!     3. Allow spilling to disk, into a [`SpillDirectory`] the user names
 //!
 //! Memory usage is divided into two- [`WriteBuffer`]s (each 2 mb) for large allocations,
 //! regular `malloc` for either small allocations or allocations that necessitate continuous memory.
@@ -71,11 +71,13 @@ pub mod evict;
 pub use evict::{DataflowEvict, Evict};
 
 mod spill;
-pub(crate) use spill::directory as spill_directory;
+#[cfg(test)]
+pub(crate) use spill::TestSpillDirectory;
 pub use spill::{
     Dynamic, Fixed, Layout, NO_SLAB, PARTITIONS, PartitionAllocator, PartitionContents,
     PartitionEvictor, PartitionSlab, SPILL_BLOCK_SIZE, SharedPartitionEvictor, SlabEntry,
-    SpilledBuffer, SpilledSlab, Spiller, decompress_spilled_rows, padded_to_spill_block,
+    SpillDirectory, SpillDirectoryError, SpilledBuffer, SpilledSlab, Spiller,
+    decompress_spilled_rows, padded_to_spill_block,
 };
 
 #[cfg(any(test, feature = "test-util"))]

@@ -991,13 +991,12 @@ mod tests {
     use super::*;
     use crate::io::{IORequester, OperatorIO};
     use crate::memory::memory_ctx;
-    use crate::memory::{init_test_free_pool, spill_directory};
+    use crate::memory::{TestSpillDirectory, init_test_free_pool};
     use crate::operations::unary::group::keys::IntKeyExtractor;
     use crate::operations::unary::group::values::{
         AggregationKind, AggregationSlot, Compiled, CountSlot,
     };
     use crate::stats::StatsCollector;
-    use crate::worker::WORKER_IDX;
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
@@ -1161,10 +1160,11 @@ mod tests {
         assert_eq!(bucket_rows as usize, scatter_row_count(&output));
     }
 
-    /// What a `Spiller` borrows, under a dataflow id of the test's own so its
-    /// spill files clash with no other test's.
+    /// What a `Spiller` borrows, with a spill directory of the test's own so
+    /// its spill files clash with no other test's.
     struct SpillerParts {
         dataflow: usize,
+        spill_directory: TestSpillDirectory,
         requester: RefCell<IORequester>,
         stats: StatsCollector,
         next_request_id: usize,
@@ -1174,6 +1174,7 @@ mod tests {
         fn new(dataflow: usize) -> Self {
             Self {
                 dataflow,
+                spill_directory: TestSpillDirectory::new(),
                 requester: RefCell::new(IORequester::default()),
                 stats: StatsCollector::disabled(),
                 next_request_id: 0,
@@ -1188,7 +1189,7 @@ mod tests {
                 &mut self.stats,
                 &mut self.next_request_id,
             );
-            Spiller::new(io)
+            Spiller::new(io, &self.spill_directory)
         }
 
         /// Complete every spill write issued so far, as the worker would.
@@ -1205,7 +1206,6 @@ mod tests {
     impl Drop for SpillerParts {
         fn drop(&mut self) {
             self.finish_writes();
-            spill_directory::remove_worker_directory(self.dataflow, WORKER_IDX.get()).unwrap();
         }
     }
 

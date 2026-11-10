@@ -869,7 +869,7 @@ mod tests {
     use super::*;
     use crate::io::{IORequester, OperatorIO};
     use crate::memory::init_test_free_pool;
-    use crate::memory::spill::directory;
+    use crate::memory::spill::TestSpillDirectory;
     use crate::memory::spill::layout::{Dynamic, Fixed};
     use crate::memory::spill::partition_tree::PARTITIONS_PER_GROUP;
     use crate::stats::StatsCollector;
@@ -877,10 +877,11 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::atomic::Ordering;
 
-    /// What a `Spiller` borrows, under a dataflow id of the test's own so its
-    /// spill files clash with no other test's.
+    /// What a `Spiller` borrows, with a spill directory of the test's own so
+    /// its spill files clash with no other test's.
     struct SpillerParts {
         dataflow: usize,
+        spill_directory: TestSpillDirectory,
         requester: RefCell<IORequester>,
         stats: StatsCollector,
         next_request_id: usize,
@@ -890,6 +891,7 @@ mod tests {
         fn new(dataflow: usize) -> Self {
             Self {
                 dataflow,
+                spill_directory: TestSpillDirectory::new(),
                 requester: RefCell::new(IORequester::default()),
                 stats: StatsCollector::disabled(),
                 next_request_id: 0,
@@ -904,7 +906,7 @@ mod tests {
                 &mut self.stats,
                 &mut self.next_request_id,
             );
-            Spiller::new(io)
+            Spiller::new(io, &self.spill_directory)
         }
 
         /// Complete every spill write issued so far, counting each off its
@@ -919,21 +921,19 @@ mod tests {
         }
 
         fn file_len(&self, partition: usize) -> u64 {
-            std::fs::metadata(directory::partition_file_path(
+            let path = self.spill_directory.partition_file_path(
                 self.dataflow,
                 WORKER_IDX.get(),
                 0,
                 partition,
-            ))
-            .unwrap()
-            .len()
+            );
+            std::fs::metadata(path).unwrap().len()
         }
     }
 
     impl Drop for SpillerParts {
         fn drop(&mut self) {
             self.finish_writes();
-            directory::remove_worker_directory(self.dataflow, WORKER_IDX.get()).unwrap();
         }
     }
 

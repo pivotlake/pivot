@@ -333,10 +333,13 @@ impl TestOperatorIO {
         )
     }
 
-    /// A spiller over this IO. Its writes are recorded with the memory
-    /// context, as the worker's are.
-    pub fn spiller(&mut self) -> crate::memory::Spiller<'_> {
-        crate::memory::Spiller::new(self.io())
+    /// A spiller over this IO that writes under `spill_directory`. Its writes
+    /// are recorded with the memory context, as the worker's are.
+    pub fn spiller<'a>(
+        &'a mut self,
+        spill_directory: &'a crate::memory::SpillDirectory,
+    ) -> crate::memory::Spiller<'a> {
+        crate::memory::Spiller::new(self.io(), spill_directory)
     }
 
     /// Wait for every spill write in flight to land, counting each off its

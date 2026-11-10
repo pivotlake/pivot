@@ -469,7 +469,8 @@ mod tests {
             Arc::new(AtomicUsize::new(1)),
         );
         let mut test_io = TestOperatorIO::default();
-        let mut spiller = Spiller::new(test_io.io());
+        let spill_directory = crate::memory::TestSpillDirectory::new();
+        let mut spiller = test_io.spiller(&spill_directory);
 
         Operator::spill(&mut operator, &mut spiller, 3).unwrap();
 

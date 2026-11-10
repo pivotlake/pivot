@@ -85,6 +85,18 @@ impl LocalFile {
         self.file.metadata()
     }
 
+    /// Write all of `bytes` at `offset`, returning once they are written. For
+    /// a write made off the workers, which have a ring to issue theirs on.
+    pub(crate) fn write_all_at(&self, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(self.file.as_ref(), bytes, offset)
+    }
+
+    /// Fill `bytes` from `offset`, returning once they are read. For a read
+    /// made off the workers, which have a ring to issue theirs on.
+    pub(crate) fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(self.file.as_ref(), bytes, offset)
+    }
+
     #[cfg(test)]
     pub(crate) fn strong_count(&self) -> usize {
         Arc::strong_count(&self.file)
