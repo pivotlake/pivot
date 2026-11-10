@@ -3,7 +3,7 @@ use crate::WriteRequestId;
 use crate::io::{Completion, IORequester};
 use crate::memory::clock::{Clock, Owner, Sweep};
 use crate::memory::compressed_cache::CompressedCache;
-use crate::memory::decompressed_cache::DecompressedCache;
+use crate::memory::decompressed_cache::{DecompressedCache, ScratchCursor};
 use crate::memory::evict::DataflowEvict;
 use crate::memory::fill_cursor::FillCursor;
 use crate::memory::free_pool::{FreePool, PoolFactory};
@@ -21,6 +21,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// reclaimable by the CLOCK sweep. Once fewer than this remain, the rest being
 /// held by operators, the worker asks its operators to spill.
 const RECLAIMABLE_SLOTS_TARGET_PERCENT: usize = 20;
+
+/// How far the decompressed cache looks along its hand for a slot no recent
+/// query used before deciding there is none to be had for the page in hand.
+/// The hand keeps its place between searches, so successive pages cover the
+/// region between them.
+const UNUSED_SLOT_SEARCH_STEPS: usize = 64;
+
+/// How far along the compressed hand to look for a slot whose bytes the
+/// decompressed cache holds too, when the decompressed cache wants a slot.
+const REDUNDANT_SLOT_SEARCH_STEPS: usize = 16;
+
+/// The same, when eviction is about to take a slot from the decompressed
+/// tier: shorter, because eviction runs for every allocation under pressure.
+const REDUNDANT_SLOT_SEARCH_STEPS_BEFORE_EVICTING: usize = 4;
 
 thread_local! {
     static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = const { RefCell::new(None) };
@@ -62,6 +76,11 @@ pub struct MemoryContextFactory {
 }
 
 impl MemoryContextFactory {
+    /// The CLOCK shared by every context this batch of factories creates.
+    pub fn clock(&self) -> Arc<Clock> {
+        self.clock.clone()
+    }
+
     /// Build one factory per worker (global worker order) over a single shared
     /// ring, both caches, and the clock, partitioned per `layout`: each worker
     /// prefaults, acquires, and evicts only its own node's slot region, so its
@@ -122,6 +141,7 @@ impl MemoryContextFactory {
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
             compressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
             decompressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
+            scratch_cursor: UnsafeCell::new(ScratchCursor::empty()),
             layout: self.layout,
             evictors: RefCell::new(HashMap::new()),
             buffers_spilled: self.buffers_spilled,
@@ -134,6 +154,11 @@ impl MemoryContextFactory {
 }
 
 pub struct MemoryContext {
+    /// This worker's bump cursor for packing pages that are decompressed
+    /// without being cached. Same per-thread discipline as the fill cursors.
+    /// Declared first so it is dropped first: the slot it holds goes back to
+    /// the pools below as it drops.
+    scratch_cursor: UnsafeCell<ScratchCursor>,
     ring: Arc<Ring>,
     compressed_cache: Arc<CompressedCache>,
     decompressed_cache: Arc<DecompressedCache>,
@@ -242,6 +267,11 @@ impl MemoryContext {
     #[allow(clippy::mut_from_ref)] // interior mutability; per-thread, single accessor
     pub(crate) fn decompressed_fill_cursor(&self) -> &mut FillCursor {
         unsafe { &mut *self.decompressed_fill_cursor.get() }
+    }
+
+    #[allow(clippy::mut_from_ref)] // per-thread interior mutability; see the field
+    pub(crate) fn scratch_cursor(&self) -> &mut ScratchCursor {
+        unsafe { &mut *self.scratch_cursor.get() }
     }
 
     /// Return a buffer index to the pool.
@@ -364,6 +394,68 @@ impl MemoryContext {
 
     fn note_buffer_taken(&self) {
         self.took_buffer_since_pressure_check.set(true);
+        self.clock
+            .note_working_slots(self.node, self.working_slots());
+    }
+
+    /// Slots of this worker's node that are neither free nor owned by a cache:
+    /// the ones operators hold. Read from counters peers keep changing, so
+    /// approximate by a few slots.
+    fn working_slots(&self) -> usize {
+        self.layout
+            .node_slots(self.node)
+            .len()
+            .saturating_sub(self.free_slots() + self.cached_slots())
+    }
+
+    fn free_slots(&self) -> usize {
+        self.dirty_pool.free_slots() + self.zeroed_pool.free_slots()
+    }
+
+    fn cached_slots(&self) -> usize {
+        self.clock.owned_in_region(Owner::Compressed, self.node)
+            + self.clock.owned_in_region(Owner::Decompressed, self.node)
+    }
+
+    /// A slot for the decompressed cache to fill, if caching one more costs no
+    /// query anything; `None` means the page should be decompressed into
+    /// transient memory instead.
+    ///
+    /// Three sources qualify. A free slot does while the caches are below the
+    /// node's size less what recent queries needed as working memory: past
+    /// that, the free slots are the float those queries decode and aggregate
+    /// in, and a cache that fills it sends the next allocation to evict a
+    /// cached slot in exchange. A compressed slot whose pages are all
+    /// decompressed here already qualifies: it is a second copy. So does a
+    /// decompressed slot no recent query used. A slot recent queries did use
+    /// is never taken: for a scan larger than the cache that slot is as
+    /// likely as not a page the scan is about to read, and replacing it with
+    /// the page just read turns a hit into a decompression each time round.
+    pub(crate) fn take_slot_for_decompressed_cache(&self) -> Option<WriteBuffer> {
+        let node_slots = self.layout.node_slots(self.node).len();
+        if self.free_slots() > 0
+            && self.cached_slots() + self.clock.recent_working_peak(self.node) < node_slots
+        {
+            return Some(self.get_write_buffer(false));
+        }
+        if let Some(buffer) = self.take_redundant_compressed_slot(REDUNDANT_SLOT_SEARCH_STEPS) {
+            return Some(buffer);
+        }
+        let unused_slot = self.clock.find_unused_recently(
+            Owner::Decompressed,
+            self.node,
+            UNUSED_SLOT_SEARCH_STEPS,
+        )?;
+        self.decompressed_cache.reclaim(unused_slot)
+    }
+
+    /// Reclaim a compressed slot whose every page the decompressed cache holds
+    /// too, looking at most `search_steps` slots along the compressed hand.
+    fn take_redundant_compressed_slot(&self, search_steps: usize) -> Option<WriteBuffer> {
+        self.clock
+            .find_map_owned(Owner::Compressed, self.node, search_steps, |slot| {
+                self.compressed_cache.reclaim_if_redundant(slot)
+            })
     }
 
     /// Whether this worker took a buffer since the last call. Only then
@@ -421,6 +513,16 @@ impl MemoryContext {
         // operators keeping slots outside the caches are the only remaining
         // source.
         let mut tiers_exhausted: u32 = 0;
+        // Before a decompressed slot goes, see whether a compressed one can
+        // go without anything being lost: one whose pages are all
+        // decompressed too. Evicting that leaves every byte in memory, where
+        // evicting a decompressed slot costs a decompression on its next use.
+        if self.clock.preferred_victim_tier(self.node) == Owner::Decompressed
+            && let Some(buffer) =
+                self.take_redundant_compressed_slot(REDUNDANT_SLOT_SEARCH_STEPS_BEFORE_EVICTING)
+        {
+            return buffer;
+        }
         loop {
             iterations += 1;
             if panic_at.is_none() && iterations == warn_at {
@@ -517,9 +619,8 @@ impl MemoryContext {
     /// release, so the result is approximate by a few slots, which a watermark
     /// tolerates.
     pub fn slots_to_spill(&self) -> usize {
-        let free = self.dirty_pool.free_slots() + self.zeroed_pool.free_slots();
-        let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
-            + self.clock.owned_in_region(Owner::Decompressed, self.node);
+        let free = self.free_slots();
+        let cached = self.cached_slots();
         let spilled = self.buffers_spilled[self.node].load(Ordering::Relaxed);
         let target =
             self.layout.node_slots(self.node).len() * RECLAIMABLE_SLOTS_TARGET_PERCENT / 100;

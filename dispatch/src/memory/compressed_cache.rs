@@ -870,6 +870,50 @@ impl CompressedCache {
         Some(probe.take_for_reuse())
     }
 
+    /// Reclaim compressed slot `slot_idx` like [`reclaim`](Self::reclaim), but
+    /// only if nothing would be lost with it: every extent packed in it has
+    /// its pages in the decompressed cache as well. Such a slot is a second
+    /// copy of bytes already held in the form scans want them in.
+    pub(crate) fn reclaim_if_redundant(&self, slot_idx: usize) -> Option<WriteBuffer> {
+        {
+            let probe = ProbedSlot::new(memory_ctx().ring().try_write(slot_idx)?);
+            if memory_ctx().clock().owner(slot_idx) != Some(Owner::Compressed) {
+                return None;
+            }
+            // Exclusive while the probe is held, so the tenant list is complete
+            // and stable. Same lock order as `reclaim`: our maps, then the
+            // decompressed cache's.
+            let file_maps = self.file_maps.read().unwrap();
+            let redundant = self.tenants_mut(slot_idx).iter().all(|tenant| {
+                let Some(extents_lock) = file_maps.get(&tenant.open_file) else {
+                    return true;
+                };
+                let extents = extents_lock.read().unwrap();
+                // An extent re-placed into another slot is no longer this
+                // slot's to lose.
+                let Some(extent) = extents
+                    .get(&tenant.first_file_block)
+                    .filter(|extent| extent.slot_idx as usize == slot_idx)
+                else {
+                    return true;
+                };
+                memory_ctx().decompressed_cache().covers_all_but_edges(
+                    &tenant.open_file,
+                    extent.first_file_block * BLOCK_SIZE,
+                    extent.block_count as usize * BLOCK_SIZE,
+                    BLOCK_SIZE,
+                )
+            });
+            if !redundant {
+                return None;
+            }
+            // The probe releases its hold in place here; `reclaim` takes the
+            // slot again, and gives up if a reader got there first.
+            let _ = probe;
+        }
+        self.reclaim(slot_idx)
+    }
+
     /// Reinforce every cached extent overlapping the file byte range
     /// `[offset, offset + len)` - called by the decompressed cache when it
     /// evicts a block over that range, leaving these extents the last in-memory
@@ -1771,5 +1815,38 @@ mod tests {
 
         assert!(dropped >= 1);
         assert!(has_misses(&cache().get(&FD(), 0, SB)));
+    }
+
+    /// The ring slot currently holding compressed bytes; the tests using this
+    /// cache exactly one.
+    fn compressed_slot() -> usize {
+        (0..8)
+            .find(|&slot| memory_ctx().clock().owner(slot) == Some(Owner::Compressed))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_slot_whose_bytes_are_all_decompressed_too_is_reclaimed_as_redundant() {
+        init_test_free_pool(8);
+        insert_stale_compressed_slot(0);
+        let slot = compressed_slot();
+        release_fill_cursor();
+        insert_decompressed(0, BUFFER_SIZE);
+
+        let reclaimed = cache().reclaim_if_redundant(slot);
+
+        assert_eq!(reclaimed.map(|buffer| buffer.slot_idx), Some(slot));
+    }
+
+    #[test]
+    fn a_slot_holding_the_only_copy_of_its_bytes_is_not_redundant() {
+        init_test_free_pool(8);
+        insert_stale_compressed_slot(0);
+        let slot = compressed_slot();
+
+        let reclaimed = cache().reclaim_if_redundant(slot);
+
+        assert!(reclaimed.is_none());
+        assert_eq!(memory_ctx().clock().owner(slot), Some(Owner::Compressed));
     }
 }

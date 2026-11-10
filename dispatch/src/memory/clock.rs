@@ -39,14 +39,33 @@
 //! last copy climbs - the tiers settle into complements instead of dying
 //! together (which is what forces disk IO).
 //!
+//! ## Query epochs
+//!
+//! Lives say how often a slot was used, not when. A scan larger than the cache
+//! needs the second answer: every page it reads is used exactly once per
+//! query, so by lives alone a page the scan has yet to reach looks the same as
+//! one no query wants any more, and caching each freshly read page in place of
+//! such a slot throws away a hit the same scan was about to take. Each slot
+//! therefore also records the query epoch ([`Clock::begin_query_epoch`]) of its last
+//! use, and a slot used by the running query or the one before it counts as
+//! [recently used](Clock::find_unused_recently). The decompressed cache only
+//! replaces slots that are not, so a repeated scan keeps the pages it has
+//! instead of trading them among themselves, while a slot a whole query went
+//! by without touching is given up to whatever is being read now.
+//!
 //! Everything is lock-free; a little racing between the atomics is fine because
 //! eviction only needs to be approximate.
 
 use crate::env::get_env_var_with_default;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
+
+/// How many epochs back a use still counts as recent: the running query's and
+/// the one before it.
+const RECENT_EPOCHS: u32 = 1;
 
 /// Hard ceiling on any slot's accumulated lives (env `PIVOT_MAX_LIVES`,
 /// default 16).
@@ -103,6 +122,15 @@ struct Slot {
     /// Lives gained per touch: 1, or [`REINFORCE_BUMP`] once the slot's
     /// other-tier twin has died.
     bump: AtomicU8,
+    /// The query epoch in which the slot was last bound or touched.
+    used_in_epoch: AtomicU32,
+}
+
+/// The most slots a region's operators held outside the caches during one
+/// query epoch.
+struct WorkingPeak {
+    epoch: AtomicU32,
+    slots: AtomicUsize,
 }
 
 /// One CLOCK over every ring slot, swept by two per-tier hands per node
@@ -123,6 +151,12 @@ pub struct Clock {
     /// balance it must judge.
     compressed_counts: Box<[AtomicUsize]>,
     decompressed_counts: Box<[AtomicUsize]>,
+    /// Per region, the working-memory peaks of the two latest query epochs
+    /// that took slots there, one per epoch parity (see
+    /// [`note_working_slots`](Self::note_working_slots)).
+    working_peaks: Box<[[WorkingPeak; 2]]>,
+    /// The epoch of the query most recently dispatched.
+    query_epoch: AtomicU32,
 }
 
 impl Clock {
@@ -140,8 +174,18 @@ impl Clock {
                     owner: AtomicU8::new(FREE),
                     refs: AtomicU8::new(0),
                     bump: AtomicU8::new(1),
+                    used_in_epoch: AtomicU32::new(0),
                 })
                 .collect(),
+            working_peaks: (0..region_count)
+                .map(|_| {
+                    [0, 1].map(|_| WorkingPeak {
+                        epoch: AtomicU32::new(0),
+                        slots: AtomicUsize::new(0),
+                    })
+                })
+                .collect(),
+            query_epoch: AtomicU32::new(0),
             compressed_hands: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
             decompressed_hands: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
             slots_per_region,
@@ -166,6 +210,9 @@ impl Clock {
     pub fn bind(&self, slot: usize, owner: Owner) {
         self.slots[slot].refs.store(1, Relaxed);
         self.slots[slot].bump.store(1, Relaxed);
+        self.slots[slot]
+            .used_in_epoch
+            .store(self.query_epoch.load(Relaxed), Relaxed);
         self.slots[slot].owner.store(owner as u8, Relaxed);
         self.counts_of(owner)[self.region_of(slot)].fetch_add(1, Relaxed);
     }
@@ -175,6 +222,13 @@ impl Clock {
     /// that keeps being read keeps climbing; how fast is the slot's bump, the
     /// lever [`reinforce`](Self::reinforce) pulls for last-copy blocks.
     pub fn touch(&self, slot: usize) {
+        // Written only when it changes: every worker touches the slots of a
+        // hot page, and a store per touch would bounce the slot's cache line
+        // between them for nothing after the first.
+        let epoch = self.query_epoch.load(Relaxed);
+        if self.slots[slot].used_in_epoch.load(Relaxed) != epoch {
+            self.slots[slot].used_in_epoch.store(epoch, Relaxed);
+        }
         let bump = self.slots[slot].bump.load(Relaxed);
         let _ = self.slots[slot]
             .refs
@@ -306,6 +360,83 @@ impl Clock {
         } else {
             Sweep::Candidate(slot)
         }
+    }
+
+    /// Start a new query epoch. Called once per dispatched dataflow.
+    pub fn begin_query_epoch(&self) {
+        self.query_epoch.fetch_add(1, Relaxed);
+    }
+
+    fn is_recent_epoch(&self, epoch: u32) -> bool {
+        self.query_epoch.load(Relaxed).wrapping_sub(epoch) <= RECENT_EPOCHS
+    }
+
+    /// Step `tier`'s hand for `region` over at most `max_steps` slots, offering
+    /// each of the tier's slots to `take` until it accepts one. Ages nothing:
+    /// this asks whether a slot can be had without costing a query in progress
+    /// anything, and a slot that cannot keeps its lives.
+    pub fn find_map_owned<T>(
+        &self,
+        tier: Owner,
+        region: usize,
+        max_steps: usize,
+        mut take: impl FnMut(usize) -> Option<T>,
+    ) -> Option<T> {
+        let hands = match tier {
+            Owner::Compressed => &self.compressed_hands,
+            Owner::Decompressed => &self.decompressed_hands,
+        };
+        (0..max_steps).find_map(|_| {
+            let offset = hands[region].fetch_add(1, Relaxed) % self.slots_per_region;
+            let slot = region * self.slots_per_region + offset;
+            if self.owner(slot) == Some(tier) {
+                take(slot)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// [`find_map_owned`](Self::find_map_owned) for one of the tier's slots
+    /// that no recent query used (see the module doc).
+    pub fn find_unused_recently(
+        &self,
+        tier: Owner,
+        region: usize,
+        max_steps: usize,
+    ) -> Option<usize> {
+        self.find_map_owned(tier, region, max_steps, |slot| {
+            let unused = !self.is_recent_epoch(self.slots[slot].used_in_epoch.load(Relaxed));
+            unused.then_some(slot)
+        })
+    }
+
+    /// Record that `region`'s operators hold `working_slots` slots outside the
+    /// caches right now, keeping the highest figure of the current query
+    /// epoch. Two epochs' peaks are kept, by epoch parity, so the previous
+    /// query's survives the start of the next.
+    pub fn note_working_slots(&self, region: usize, working_slots: usize) {
+        let epoch = self.query_epoch.load(Relaxed);
+        let peak = &self.working_peaks[region][epoch as usize % 2];
+        // Read before writing: this runs for every slot a worker takes, and
+        // the peak moves on few of them.
+        if peak.epoch.load(Relaxed) != epoch {
+            peak.slots.store(working_slots, Relaxed);
+            peak.epoch.store(epoch, Relaxed);
+        } else if peak.slots.load(Relaxed) < working_slots {
+            peak.slots.fetch_max(working_slots, Relaxed);
+        }
+    }
+
+    /// The most slots `region`'s operators held outside the caches during the
+    /// recent query epochs: what the next query can be expected to need again.
+    pub fn recent_working_peak(&self, region: usize) -> usize {
+        self.working_peaks[region]
+            .iter()
+            .filter(|peak| self.is_recent_epoch(peak.epoch.load(Relaxed)))
+            .map(|peak| peak.slots.load(Relaxed))
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -520,5 +651,66 @@ mod tests {
             }
         }
         assert_eq!(evict(&clock, Owner::Decompressed), 0);
+    }
+
+    #[test]
+    fn a_slot_the_previous_query_used_is_not_offered_as_unused() {
+        let clock = Clock::new(2);
+        clock.bind(0, Owner::Decompressed);
+        clock.begin_query_epoch();
+
+        let unused = clock.find_unused_recently(Owner::Decompressed, 0, 2);
+
+        assert_eq!(unused, None);
+    }
+
+    #[test]
+    fn a_slot_untouched_for_a_whole_query_is_offered_as_unused() {
+        let clock = Clock::new(2);
+        clock.bind(0, Owner::Decompressed);
+        clock.bind(1, Owner::Decompressed);
+        clock.begin_query_epoch();
+        clock.touch(1);
+        clock.begin_query_epoch();
+
+        let unused = clock.find_unused_recently(Owner::Decompressed, 0, 2);
+
+        assert_eq!(unused, Some(0));
+    }
+
+    #[test]
+    fn the_search_for_an_unused_slot_takes_no_lives() {
+        let clock = Clock::new(1);
+        clock.bind(0, Owner::Decompressed);
+
+        clock.find_unused_recently(Owner::Decompressed, 0, 4);
+
+        assert_eq!(clock.refs(0), 1);
+    }
+
+    #[test]
+    fn the_working_peak_is_the_highest_of_the_recent_queries() {
+        let clock = Clock::new(8);
+        clock.note_working_slots(0, 5);
+        clock.begin_query_epoch();
+        clock.note_working_slots(0, 2);
+        clock.note_working_slots(0, 3);
+
+        let peak = clock.recent_working_peak(0);
+
+        assert_eq!(peak, 5);
+    }
+
+    #[test]
+    fn a_working_peak_older_than_the_previous_query_is_forgotten() {
+        let clock = Clock::new(8);
+        clock.note_working_slots(0, 5);
+        clock.begin_query_epoch();
+        clock.note_working_slots(0, 2);
+        clock.begin_query_epoch();
+
+        let peak = clock.recent_working_peak(0);
+
+        assert_eq!(peak, 2);
     }
 }

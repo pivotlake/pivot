@@ -196,6 +196,9 @@ pub struct DataFlowDispatcher {
     waker_set: WakerSet,
     /// Total ring slots across all nodes, used to size group-by working memory.
     buffers: usize,
+    /// The pool's cache eviction clock, told of each dataflow dispatched so it
+    /// can tell the slots recent queries used from the rest.
+    clock: Arc<memory::Clock>,
     /// Shared by every clone so arbitrary single-worker stages rotate across
     /// this pool rather than accumulating on its first worker.
     next_worker: Arc<AtomicUsize>,
@@ -237,6 +240,7 @@ impl DataFlowDispatcher {
     /// channels were built for. Returns the wakers of every node, so cancellation
     /// can wake parked workers on any node.
     pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) -> WakerSet {
+        self.clock.begin_query_epoch();
         for (worker, builder) in builders.into_iter().enumerate() {
             self.senders[worker].send(builder).unwrap();
         }
@@ -401,7 +405,9 @@ impl Dispatch {
 
         let barrier = Arc::new(Barrier::new(total_workers + 1));
         let should_exit = Arc::new(AtomicBool::new(false));
-        let mut memory_factories = MemoryContextFactory::create_for_layout(layout).into_iter();
+        let memory_factories = MemoryContextFactory::create_for_layout(layout);
+        let clock = memory_factories[0].clock();
+        let mut memory_factories = memory_factories.into_iter();
         let node_wakers: Vec<Arc<WorkerWaker>> = (0..topology.node_count)
             .map(|_| Arc::new(WorkerWaker::new(topology.workers_per_node)))
             .collect();
@@ -437,6 +443,7 @@ impl Dispatch {
                 topology,
                 waker_set: waker_set.clone(),
                 buffers: layout.total_slots(),
+                clock,
                 next_worker: Arc::new(AtomicUsize::new(0)),
                 shutdown_flag: should_exit.clone(),
                 #[cfg(feature = "perf")]

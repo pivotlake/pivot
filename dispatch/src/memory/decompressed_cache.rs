@@ -184,12 +184,10 @@ struct RegionSegment {
 pub enum Reservation {
     /// Byte ranges bump-allocated inside shared, read-pinned cache slots.
     Packed(PackedRegion),
-    /// Whole pooled slots, used when the cache is disabled or the page is empty:
-    /// never inserted, and the slots return to the pool when the views drop.
-    Transient {
-        buffers: Vec<WriteBuffer>,
-        len: usize,
-    },
+    /// Byte ranges bump-allocated inside pooled slots no cache owns, used when
+    /// the page is not to be cached: never inserted, and each slot returns to
+    /// the pool when the last view into it drops.
+    Scratch(ScratchRegion),
 }
 
 impl Reservation {
@@ -210,15 +208,66 @@ impl Reservation {
                     )
                 })
                 .collect(),
-            Reservation::Transient { buffers, .. } => {
-                buffers.iter_mut().map(|b| b.as_mut()).collect()
-            }
+            Reservation::Scratch(region) => region
+                .segments
+                .iter()
+                .map(|segment| unsafe {
+                    std::slice::from_raw_parts_mut(
+                        segment.slot.0.ptr.add(segment.offset),
+                        segment.len,
+                    )
+                })
+                .collect(),
         }
     }
 }
 
 pub struct PackedRegion {
     segments: Vec<RegionSegment>,
+}
+
+/// A pooled slot that uncached pages are decompressed into, shared by every
+/// page packed into it. Dropping the last reference returns the slot to the
+/// pool.
+pub(crate) struct ScratchSlot(WriteBuffer);
+
+// The slot is written only through disjoint bump-allocated regions, each by
+// the one reservation that owns it, and read only through views created after
+// their region was written.
+unsafe impl Sync for ScratchSlot {}
+
+/// One page's byte range within a [`ScratchSlot`], keeping the slot alive.
+struct ScratchSegment {
+    slot: Arc<ScratchSlot>,
+    offset: usize,
+    len: usize,
+}
+
+impl AsRef<[u8]> for ScratchSegment {
+    fn as_ref(&self) -> &[u8] {
+        &self.slot.0.as_slice()[self.offset..self.offset + self.len]
+    }
+}
+
+pub struct ScratchRegion {
+    segments: Vec<ScratchSegment>,
+}
+
+/// A worker's bump cursor over the scratch slot it is currently packing
+/// uncached pages into: the uncached counterpart of the cache's
+/// [`FillCursor`].
+pub(crate) struct ScratchCursor {
+    slot: Option<Arc<ScratchSlot>>,
+    next_byte: usize,
+}
+
+impl ScratchCursor {
+    pub(crate) fn empty() -> Self {
+        Self {
+            slot: None,
+            next_byte: 0,
+        }
+    }
 }
 
 /// One resolved piece of a [`get_range`](DecompressedCache::get_range) query, in
@@ -271,7 +320,7 @@ pub struct DecompressedCache {
     /// every removal path. Backs [`is_empty`](Self::is_empty).
     blocks: AtomicUsize,
     /// Kill switch (`PIVOT_DECOMPRESSED_CACHE`, default on). When off, `reserve`
-    /// hands out transient pooled slots and `get` is a no-op.
+    /// hands out scratch space and `get` is a no-op.
     enabled: bool,
 }
 
@@ -307,22 +356,42 @@ impl DecompressedCache {
     /// needed, so a page may straddle slots); each touched slot gets `key`
     /// recorded as a tenant NOW, before any map insert, so the evictor's
     /// tenant-covers-every-entry invariant holds even if decompression fails or
-    /// the dup race is lost. Disabled cache or an empty page falls back to
-    /// transient pooled slots.
+    /// the dup race is lost. A disabled cache, an empty page, or a page the
+    /// cache has no slot to spare for (see
+    /// [`take_slot_for_decompressed_cache`](crate::memory::context::MemoryContext::take_slot_for_decompressed_cache))
+    /// falls back to scratch space no cache owns.
     pub fn reserve(&self, key: &BlockKey, len: usize) -> Reservation {
         if !self.enabled || len == 0 {
-            let buffers = (0..len.div_ceil(BUFFER_SIZE))
-                .map(|_| memory_ctx().get_write_buffer(false))
-                .collect();
-            return Reservation::Transient { buffers, len };
+            return Self::reserve_scratch(len);
         }
         let cursor = memory_ctx().decompressed_fill_cursor();
+        // Take every slot the page needs beyond the cursor's remainder before
+        // carving any of it, so a page is either cached whole or not at all.
+        let cursor_room = if cursor.is_exhausted() {
+            0
+        } else {
+            BUFFER_SIZE - cursor.next_byte
+        };
+        let fresh_slots_needed = len.saturating_sub(cursor_room).div_ceil(BUFFER_SIZE);
+        let mut fresh_slots = Vec::with_capacity(fresh_slots_needed);
+        for _ in 0..fresh_slots_needed {
+            match memory_ctx().take_slot_for_decompressed_cache() {
+                Some(write_buffer) => fresh_slots.push(write_buffer),
+                // The slots already taken go back to the pool as they drop,
+                // where the scratch reservation finds them.
+                None => {
+                    drop(fresh_slots);
+                    return Self::reserve_scratch(len);
+                }
+            }
+        }
+        let mut fresh_slots = fresh_slots.into_iter();
         let mut segments = Vec::with_capacity(1);
         let mut remaining = len;
         while remaining > 0 {
             if cursor.is_exhausted() {
-                // Rotation may evict, so it must hold no map lock (it doesn't).
-                self.rotate_fill_slot(cursor);
+                let write_buffer = fresh_slots.next().expect("taken above");
+                self.rotate_fill_slot(cursor, write_buffer);
             }
             let take = remaining.min(BUFFER_SIZE - cursor.next_byte);
             let offset = cursor.next_byte;
@@ -339,10 +408,36 @@ impl DecompressedCache {
         Reservation::Packed(PackedRegion { segments })
     }
 
-    /// Point this worker's fill cursor at a fresh, empty slot: reset its tenant
-    /// list while it is held exclusively, bind it, then make it readable.
-    fn rotate_fill_slot(&self, cursor: &mut FillCursor) {
-        let write_buffer = memory_ctx().get_write_buffer(false);
+    /// Output space for a page that will not be cached, carved out of this
+    /// worker's scratch cursor. Pages are packed as tightly as cached ones are:
+    /// a pooled slot per page would multiply the memory a scan holds while it
+    /// decodes by the ratio of the slot size to the page size.
+    fn reserve_scratch(len: usize) -> Reservation {
+        let cursor = memory_ctx().scratch_cursor();
+        let mut segments = Vec::with_capacity(1);
+        let mut remaining = len;
+        while remaining > 0 {
+            if cursor.slot.is_none() || cursor.next_byte == BUFFER_SIZE {
+                let write_buffer = memory_ctx().get_write_buffer(false);
+                cursor.slot = Some(Arc::new(ScratchSlot(write_buffer)));
+                cursor.next_byte = 0;
+            }
+            let take = remaining.min(BUFFER_SIZE - cursor.next_byte);
+            segments.push(ScratchSegment {
+                slot: cursor.slot.clone().expect("set above"),
+                offset: cursor.next_byte,
+                len: take,
+            });
+            cursor.next_byte += take;
+            remaining -= take;
+        }
+        Reservation::Scratch(ScratchRegion { segments })
+    }
+
+    /// Point this worker's fill cursor at the fresh, empty slot `write_buffer`:
+    /// reset its tenant list while it is held exclusively, bind it, then make
+    /// it readable.
+    fn rotate_fill_slot(&self, cursor: &mut FillCursor, write_buffer: WriteBuffer) {
         let slot_idx = write_buffer.slot_idx;
         self.tenants_mut(slot_idx).clear();
         memory_ctx().clock().bind(slot_idx, Owner::Decompressed);
@@ -374,8 +469,8 @@ impl DecompressedCache {
         live_blocks: Arc<AtomicUsize>,
     ) -> Vec<Bytes> {
         let region = match reservation {
-            Reservation::Transient { buffers, len } => {
-                return build_transient_views(buffers, len);
+            Reservation::Scratch(region) => {
+                return region.segments.into_iter().map(Bytes::from_owner).collect();
             }
             Reservation::Packed(region) => region,
         };
@@ -490,6 +585,47 @@ impl DecompressedCache {
         }
         push_gap(&mut segments, cursor, end - cursor);
         segments
+    }
+
+    /// Whether the cached blocks cover the file byte range `[offset, offset +
+    /// len)` except for at most `edge` bytes at either end. Asked by the
+    /// compressed cache about a run it holds: a run is read in whole disk
+    /// blocks, so its first and last block reach into whatever neighbours the
+    /// pages it was read for, bytes no block here will ever account for.
+    /// A range no block overlaps at all is not covered, however short.
+    pub(crate) fn covers_all_but_edges(
+        &self,
+        open_file: &OpenFile,
+        offset: usize,
+        len: usize,
+        edge: usize,
+    ) -> bool {
+        if !self.enabled || len == 0 {
+            return false;
+        }
+        let end = offset + len;
+        let files = self.files.read().unwrap();
+        let Some(table) = files.get(open_file) else {
+            return false;
+        };
+        let table = table.read().unwrap();
+        let mut covered_to = offset;
+        let mut any_block = false;
+        if let Some((&block_offset, block)) = table.range(..offset).next_back()
+            && block_offset + block.compressed_len > offset
+        {
+            covered_to = block_offset + block.compressed_len;
+            any_block = true;
+        }
+        for (&block_offset, block) in table.range(offset..end) {
+            let leading_gap = covered_to == offset && !any_block;
+            if block_offset > covered_to && !(leading_gap && block_offset - offset <= edge) {
+                return false;
+            }
+            covered_to = covered_to.max(block_offset + block.compressed_len);
+            any_block = true;
+        }
+        any_block && covered_to + edge >= end
     }
 
     /// Reinforce every cached block overlapping the file byte range
@@ -662,19 +798,6 @@ impl DecompressedCache {
         }
         dropped
     }
-}
-
-/// Build `WriteBuffer`-backed (uncached, pooled-on-drop) views from whole
-/// buffers holding `total_len` bytes.
-fn build_transient_views(write_buffers: Vec<WriteBuffer>, total_len: usize) -> Vec<Bytes> {
-    write_buffers
-        .into_iter()
-        .enumerate()
-        .map(|(i, buffer)| {
-            let len = (total_len - i * BUFFER_SIZE).min(BUFFER_SIZE);
-            Bytes::from_owner(buffer).slice(..len)
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1128,5 +1251,74 @@ mod tests {
             shapes(&segments),
             vec![Shape::Cached(0, 5, 1), Shape::Cached(5, 5, 2)]
         );
+    }
+
+    /// A key for the block decompressed from the file bytes
+    /// `[offset, offset + span)` of `FD()`.
+    fn span_key(offset: usize, span: usize) -> BlockKey {
+        BlockKey {
+            open_file: FD(),
+            offset,
+            len: span,
+        }
+    }
+
+    #[test]
+    fn back_to_back_blocks_cover_the_range_they_span() {
+        init_test_free_pool(4);
+        let cache = for_test(true);
+        drop(insert_page(&cache, span_key(100, 50), 8, 1));
+        drop(insert_page(&cache, span_key(150, 50), 8, 2));
+
+        let covered = cache.covers_all_but_edges(&FD(), 100, 100, 0);
+
+        assert!(covered);
+    }
+
+    #[test]
+    fn a_hole_between_blocks_leaves_the_range_uncovered() {
+        init_test_free_pool(4);
+        let cache = for_test(true);
+        drop(insert_page(&cache, span_key(100, 40), 8, 1));
+        drop(insert_page(&cache, span_key(150, 50), 8, 2));
+
+        let covered = cache.covers_all_but_edges(&FD(), 100, 100, 4);
+
+        assert!(!covered);
+    }
+
+    #[test]
+    fn a_range_overhanging_its_blocks_by_less_than_the_edge_is_covered() {
+        init_test_free_pool(4);
+        let cache = for_test(true);
+        drop(insert_page(&cache, span_key(100, 100), 8, 1));
+
+        let covered = cache.covers_all_but_edges(&FD(), 96, 108, 4);
+
+        assert!(covered);
+    }
+
+    #[test]
+    fn a_range_no_block_overlaps_is_not_covered_however_short() {
+        init_test_free_pool(4);
+        let cache = for_test(true);
+        drop(insert_page(&cache, span_key(100, 100), 8, 1));
+
+        let covered = cache.covers_all_but_edges(&FD(), 0, 4, 4);
+
+        assert!(!covered);
+    }
+
+    #[test]
+    fn uncached_pages_pack_into_one_pooled_slot() {
+        init_test_free_pool(2);
+        let cache = for_test(false);
+
+        let first = insert_page(&cache, test_key(0), 8, 1);
+        let second = insert_page(&cache, test_key(8), 8, 2);
+
+        assert_eq!(first[0].as_ref(), &[1u8; 8]);
+        assert_eq!(second[0].as_ref(), &[2u8; 8]);
+        assert!(memory_ctx().pop_free_idx(false).is_some());
     }
 }
