@@ -1,26 +1,32 @@
 //! The caches this engine runs with, declared in one place.
 //!
 //! ```text
-//!   family          member                        lives (insert / touch / reinforce)   share
-//!   ──────          ──────                        ──────────────────────────────────   ─────
-//!   pages           compressed_cache              1 / 1 / 6                            30 %
-//!                   decompressed_cache            1 / 1 / 6                            70 %
-//!   dict index      dict_index_compressed_cache   2 / 3 / 8                            30 %
-//!                   dict_index_cache              2 / 3 / 8                            70 %
-//!   sparse index    sparse_index_cache            3 / 4 / 4                           100 %
+//!   family        member                      lives (insert / touch / reinforce)   share
+//!   ──────        ──────                      ──────────────────────────────────   ─────
+//!   pages         compressed_cache            1 / 1 / 6                            30 %
+//!                 decompressed_cache          1 / 1 / 6                            70 %
+//!   text index    text_index_file_cache       1 / 1 / 6                             0 %
+//!                 text_index_sparse_cache     3 / 4 / 8                           100 %
+//!                 text_index_dict_cache       2 / 3 / 8                             0 %
+//!                 text_index_postings_cache   1 / 2 / 6                             0 %
 //! ```
 //!
-//! Pages are the bulk of the ring and carry the lightest policy. The index
-//! caches are small and each entry saves far more reading than it occupies, so
-//! they get more lives at equal recency, the sparse index most of all since it
-//! is read before anything else. The sparse index has no sibling, so its
-//! reinforce value never applies and equals its touch value.
+//! Pages are the bulk of the ring and carry the lightest policy.
+//!
+//! The text index's shares are not a balance but an order. With the whole
+//! target on the sparse index it can never be over its share, and with none
+//! on the others each of them is over as soon as it holds a slot. So the
+//! sparse index is protected exactly while any other member holds anything:
+//! a file's sparse index is never given up before its dictionary blocks,
+//! which could not be found again without it. The three unprotected members
+//! then go by weight: file bytes first, since every decoded form can be
+//! rebuilt from the file; posting lists next, which are the bulk; dictionary
+//! blocks last, since each one serves every token in it.
 
 use crate::memory::cache::decompressed_page::PageCaches;
-use crate::memory::cache::dict_index::DictIndexCaches;
 use crate::memory::cache::id::CachePolicy;
 use crate::memory::cache::registry::{Caches, CachesBuilder};
-use crate::memory::cache::sparse_index::SparseIndexCaches;
+use crate::memory::cache::text_index::TextIndexCaches;
 use std::sync::Arc;
 
 /// Every cache, as the registry the evictor uses and as the typed handles the
@@ -29,8 +35,7 @@ use std::sync::Arc;
 pub struct CacheSetup {
     pub caches: Arc<Caches>,
     pub pages: PageCaches,
-    pub dict_index: DictIndexCaches,
-    pub sparse_index: SparseIndexCaches,
+    pub text_index: TextIndexCaches,
 }
 
 impl CacheSetup {
@@ -60,46 +65,52 @@ impl CacheSetup {
             ),
         });
 
-        let dict_index = builder.add_family(|family| DictIndexCaches {
-            compressed: family.add_compressed(
+        let text_index = builder.add_family(|family| TextIndexCaches {
+            file_bytes: family.add_compressed(
                 CachePolicy {
-                    name: "dict_index_compressed_cache",
-                    lives_at_insert: 2,
-                    lives_per_touch: 3,
-                    lives_at_reinforce: 8,
+                    name: "text_index_file_cache",
+                    lives_at_insert: 1,
+                    lives_per_touch: 1,
+                    lives_at_reinforce: 6,
                 },
-                30,
+                0,
             ),
-            decoded: family.add_derived(
+            sparse_index: family.add_derived(
                 CachePolicy {
-                    name: "dict_index_cache",
-                    lives_at_insert: 2,
-                    lives_per_touch: 3,
-                    lives_at_reinforce: 8,
-                },
-                70,
-                "PIVOT_DICT_INDEX_CACHE",
-            ),
-        });
-
-        let sparse_index = builder.add_family(|family| SparseIndexCaches {
-            decoded: family.add_derived(
-                CachePolicy {
-                    name: "sparse_index_cache",
+                    name: "text_index_sparse_cache",
                     lives_at_insert: 3,
                     lives_per_touch: 4,
-                    lives_at_reinforce: 4,
+                    lives_at_reinforce: 8,
                 },
                 100,
-                "PIVOT_SPARSE_INDEX_CACHE",
+                "PIVOT_TEXT_INDEX_SPARSE_CACHE",
+            ),
+            dict_blocks: family.add_derived(
+                CachePolicy {
+                    name: "text_index_dict_cache",
+                    lives_at_insert: 2,
+                    lives_per_touch: 3,
+                    lives_at_reinforce: 8,
+                },
+                0,
+                "PIVOT_TEXT_INDEX_DICT_CACHE",
+            ),
+            postings: family.add_derived(
+                CachePolicy {
+                    name: "text_index_postings_cache",
+                    lives_at_insert: 1,
+                    lives_per_touch: 2,
+                    lives_at_reinforce: 6,
+                },
+                0,
+                "PIVOT_TEXT_INDEX_POSTINGS_CACHE",
             ),
         });
 
         Self {
             caches: Arc::new(builder.build()),
             pages,
-            dict_index,
-            sparse_index,
+            text_index,
         }
     }
 }

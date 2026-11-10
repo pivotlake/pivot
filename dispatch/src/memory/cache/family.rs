@@ -1,11 +1,13 @@
 //! A family: caches holding the same bytes in different forms.
 //!
 //! ```text
-//!   family "pages"              family "dict index"          family "sparse index"
-//!   ┌──────────────┬─────────┐  ┌──────────────┬─────────┐   ┌──────────────┐
-//!   │ compressed   │ 30 %    │  │ compressed   │ 30 %    │   │ decoded 100% │
-//!   │ decompressed │ 70 %    │  │ decoded      │ 70 %    │   └──────────────┘
-//!   └──────────────┴─────────┘  └──────────────┴─────────┘
+//!   family "pages"              family "text index"
+//!   ┌──────────────┬─────────┐  ┌──────────────┬─────────┐
+//!   │ compressed   │ 30 %    │  │ file bytes   │   0 %   │
+//!   │ decompressed │ 70 %    │  │ sparse index │ 100 %   │
+//!   └──────────────┴─────────┘  │ dict blocks  │   0 %   │
+//!                               │ postings     │   0 %   │
+//!                               └──────────────┴─────────┘
 //! ```
 //!
 //! Two things follow from being in one family, and nothing else does:
@@ -14,6 +16,11 @@
 //!   family's slots is spared by the evictor while a sibling holds more than
 //!   its target. Shares are judged within the family only; the family's total
 //!   against the rest of the ring is left to recency and weight.
+//!
+//!   Shares can also state an order instead of a balance. A member with the
+//!   whole target can never be over it, and a member with none is over as
+//!   soon as it holds a slot, so a 100 / 0 split spares the first for as long
+//!   as any sibling holds anything: it is the last of the family to go.
 //! - **Reinforcement.** When a member drops an entry, every sibling's entry
 //!   over the same file range is reinforced: with one copy gone the others are
 //!   closer to being the last, and losing the last turns the next read into IO.
@@ -181,6 +188,31 @@ mod tests {
         assert!(!protected.contains(COMPRESSED));
         assert!(protected.contains(DECOMPRESSED));
         assert!(protected.contains(DECODED));
+    }
+
+    #[test]
+    fn a_member_with_the_whole_target_is_protected_while_a_sibling_holds_a_slot() {
+        let family = FamilySpec::new([(COMPRESSED, 0), (DECOMPRESSED, 100), (DECODED, 0)]);
+        let slots = |id: CacheId| match id {
+            DECOMPRESSED => 50,
+            DECODED => 1,
+            _ => 0,
+        };
+
+        let protected = family.protected_members(slots);
+
+        assert!(protected.contains(DECOMPRESSED));
+        assert!(!protected.contains(DECODED));
+    }
+
+    #[test]
+    fn a_member_with_the_whole_target_is_not_protected_once_it_is_alone() {
+        let family = FamilySpec::new([(COMPRESSED, 0), (DECOMPRESSED, 100), (DECODED, 0)]);
+        let slots = |id: CacheId| if id == DECOMPRESSED { 50 } else { 0 };
+
+        let protected = family.protected_members(slots);
+
+        assert!(protected.is_empty());
     }
 
     #[test]

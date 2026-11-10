@@ -252,7 +252,7 @@ impl FamilyBuilder<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::cache::sparse_index::SparseIndex;
+    use crate::memory::cache::decompressed_page::DecompressedPage;
 
     fn policy(name: &'static str) -> CachePolicy {
         CachePolicy {
@@ -270,7 +270,7 @@ mod tests {
         let (compressed, decoded) = builder.add_family(|family| {
             (
                 family.add_compressed(policy("compressed"), 30),
-                family.add_derived::<SparseIndex>(policy("decoded"), 70, "TEST_KILL_SWITCH"),
+                family.add_derived::<DecompressedPage>(policy("decoded"), 70, "TEST_KILL_SWITCH"),
             )
         });
         let caches = builder.build();

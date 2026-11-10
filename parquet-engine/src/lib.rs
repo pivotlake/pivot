@@ -37,6 +37,7 @@ mod external;
 pub use external::bind_read_parquet;
 
 pub(crate) mod reading;
+pub use reading::record_batch_metadata::{global_row_group, row_index};
 pub use reading::{
     ColumnDecoderError, DecodeRange, DecoderFactory, DecompressorError, DecompressorFactory,
     IndexerFactory, MaterializerFactory, RangeCutterFactory, RowGroupFetcherFactory,

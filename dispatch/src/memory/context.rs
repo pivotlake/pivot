@@ -2,8 +2,7 @@ use crate::Identifier;
 use crate::WriteRequestId;
 use crate::io::{Completion, IORequester};
 use crate::memory::cache::{
-    CacheId, CacheSet, CacheSetup, Caches, DictIndexCaches, FillCursor, PageCaches,
-    SparseIndexCaches,
+    CacheId, CacheSet, CacheSetup, Caches, FillCursor, PageCaches, TextIndexCaches,
 };
 use crate::memory::clock::{Clock, Sweep};
 use crate::memory::evict::DataflowEvict;
@@ -178,8 +177,7 @@ impl MemoryContextFactory {
             ring: self.ring,
             caches: self.caches.caches,
             page_caches: self.caches.pages,
-            dict_index_caches: self.caches.dict_index,
-            sparse_index_caches: self.caches.sparse_index,
+            text_index_caches: self.caches.text_index,
             clock: self.clock,
             dirty_pool: self.dirty_pool_factory.create_pool(),
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
@@ -203,8 +201,7 @@ pub struct MemoryContext {
     caches: Arc<Caches>,
     /// The same caches, typed, for the readers that fill and consult them.
     page_caches: PageCaches,
-    dict_index_caches: DictIndexCaches,
-    sparse_index_caches: SparseIndexCaches,
+    text_index_caches: TextIndexCaches,
     /// The CLOCK eviction policy over all ring slots, shared by every cache.
     clock: Arc<Clock>,
     dirty_pool: FreePool,
@@ -297,12 +294,8 @@ impl MemoryContext {
         &self.page_caches
     }
 
-    pub fn dict_index_caches(&self) -> &DictIndexCaches {
-        &self.dict_index_caches
-    }
-
-    pub fn sparse_index_caches(&self) -> &SparseIndexCaches {
-        &self.sparse_index_caches
+    pub fn text_index_caches(&self) -> &TextIndexCaches {
+        &self.text_index_caches
     }
 
     pub fn clock(&self) -> &Clock {

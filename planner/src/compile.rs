@@ -124,6 +124,8 @@ pub enum Error {
     },
     #[error("Unsupported haystack expression for prefix: {0:?}")]
     UnsupportedExpressionForPrefixHaystack(Expression),
+    #[error("Unsupported input expression for token matching: {0:?}")]
+    UnsupportedExpressionForTokenMatchInput(Expression),
     #[error("Unsupported pattern expression for suffix: {0:?}")]
     UnsupportedExpressionForSuffixPattern(Expression),
     #[error("Unsupported haystack expression for suffix: {0:?}")]
@@ -176,6 +178,11 @@ pub enum Error {
     CompactNotCompilable,
     #[error("VACUUM runs as its own statement and cannot be part of a query")]
     VacuumNotCompilable,
+    #[error(
+        "create_text_index runs as its own statement: \
+         SELECT create_text_index('table', 'column')"
+    )]
+    CreateTextIndexNotCompilable,
     #[error(
         "COPY FROM STDIN compiles to no dataflow; the server drives the ingest from the protocol"
     )]

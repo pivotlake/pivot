@@ -652,7 +652,17 @@ async fn system_memory_blocks_accounts_for_every_block(#[future] conn: Conn) {
     for row in &by_state {
         let state = row[0].as_ref().unwrap();
         assert!(
-            ["free", "pinned", "compressed_cache", "decompressed_cache"].contains(&state.as_str()),
+            [
+                "free",
+                "pinned",
+                "compressed_cache",
+                "decompressed_cache",
+                "text_index_file_cache",
+                "text_index_sparse_cache",
+                "text_index_dict_cache",
+                "text_index_postings_cache",
+            ]
+            .contains(&state.as_str()),
             "unexpected block state: {state}",
         );
         let blocks: i64 = row[1].as_ref().unwrap().parse().unwrap();
@@ -2035,4 +2045,27 @@ async fn query_returns_no_rows_for_an_empty_binary_result(#[future] conn: Conn) 
         .unwrap();
 
     assert!(rows.is_empty());
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn create_text_index_covers_the_rows_a_table_already_has(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_text_index", dir.path()).await;
+    let query = "SELECT id FROM people_text_index WHERE has_token(name, 'bob')";
+    let without_index = select_rows(&conn, query).await;
+
+    let created = conn
+        .simple_query("SELECT create_text_index('people_text_index', 'name')")
+        .await
+        .unwrap();
+    let with_index = select_rows(&conn, query).await;
+
+    assert!(matches!(
+        created.as_slice(),
+        [SimpleQueryMessage::CommandComplete(1)]
+    ));
+    assert_eq!(without_index, vec![vec![Some("2".into())]]);
+    assert_eq!(with_index, without_index);
 }

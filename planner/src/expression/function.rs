@@ -2,9 +2,9 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic,
-    Length, Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
-    Substring, Suffix, TemporalConvert, VariantGet,
+    Arithmetic, Concat, Contains, CreateTextIndex, DatePart, DateTrunc, Divide, FormatBytes,
+    HasTokens, IntervalArithmetic, Length, Like, NormalizedInterval, Prefix, RegexpFullMatch,
+    RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, TokenFunction, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -50,6 +50,19 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Variant,
             volatile: true,
         }),
+        // Runs as a statement (see `CreateTextIndex`); volatile so DuckDB
+        // leaves the call in the plan for the server to find.
+        "create_text_index" => Some(ScalarFunctionSignature {
+            arguments: vec![Type::Utf8, Type::Utf8],
+            return_type: Type::Int64,
+            volatile: true,
+        }),
+        // The token matchers take the text and a constant naming the tokens.
+        name if TokenFunction::from_name(name).is_some() => Some(ScalarFunctionSignature {
+            arguments: vec![Type::Utf8, Type::Utf8],
+            return_type: Type::Boolean,
+            volatile: false,
+        }),
         _ => None,
     }
 }
@@ -60,6 +73,8 @@ pub enum Function {
     Contains(Contains),
     Prefix(Prefix),
     Suffix(Suffix),
+    /// `has_token` / `has_all_tokens` / `has_any_token` against constant tokens.
+    HasTokens(HasTokens),
     /// `LIKE` / `NOT LIKE` against a constant pattern, for the patterns DuckDB's
     /// optimizer leaves alone (several wildcards, or a `_`).
     Like(Like),
@@ -90,6 +105,9 @@ pub enum Function {
     ///
     /// [`DummyScan`]: crate::operator::DummyScan
     DropCache,
+    /// `create_text_index(table, column)` — a statement in function clothing;
+    /// the server runs it instead of compiling it.
+    CreateTextIndex(CreateTextIndex),
     /// `normalized_interval(span)` — an interval carried into the canonical
     /// form its fields must take before they compare. DuckDB's binder wraps
     /// every interval it orders, compares or hashes in this.
@@ -117,6 +135,8 @@ impl Function {
                 visit(&s.haystack);
                 visit(&s.suffix);
             }
+            // The tokens are a plan-time constant, not a child expression.
+            Function::HasTokens(h) => visit(&h.input),
             Function::Like(l) => visit(&l.input),
             Function::Arithmetic(a) => {
                 visit(&a.left);
@@ -142,7 +162,7 @@ impl Function {
             Function::IntervalArithmetic(i) => visit(&i.operand),
             Function::TemporalConvert(t) => visit(&t.source),
             Function::NormalizedInterval(n) => visit(&n.input),
-            Function::DropCache => {}
+            Function::DropCache | Function::CreateTextIndex(_) => {}
             Function::VariantGet(v) => visit(&v.input),
         }
     }
@@ -163,6 +183,7 @@ impl Function {
                 visit(&mut s.haystack);
                 visit(&mut s.suffix);
             }
+            Function::HasTokens(h) => visit(&mut h.input),
             Function::Like(l) => visit(&mut l.input),
             Function::Arithmetic(a) => {
                 visit(&mut a.left);
@@ -188,7 +209,7 @@ impl Function {
             Function::IntervalArithmetic(i) => visit(&mut i.operand),
             Function::TemporalConvert(t) => visit(&mut t.source),
             Function::NormalizedInterval(n) => visit(&mut n.input),
-            Function::DropCache => {}
+            Function::DropCache | Function::CreateTextIndex(_) => {}
             Function::VariantGet(v) => visit(&mut v.input),
         }
     }
@@ -200,6 +221,7 @@ impl Display for Function {
             Function::Contains(c) => write!(f, "{c}"),
             Function::Prefix(p) => write!(f, "{p}"),
             Function::Suffix(s) => write!(f, "{s}"),
+            Function::HasTokens(h) => write!(f, "{h}"),
             Function::Like(l) => write!(f, "{l}"),
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
@@ -216,6 +238,7 @@ impl Display for Function {
             Function::TemporalConvert(c) => write!(f, "{c}"),
             Function::NormalizedInterval(n) => write!(f, "{n}"),
             Function::DropCache => write!(f, "drop_cache()"),
+            Function::CreateTextIndex(c) => write!(f, "{c}"),
             Function::VariantGet(v) => write!(f, "{v}"),
         }
     }
@@ -229,6 +252,7 @@ impl Function {
             Function::Contains(_)
             | Function::Prefix(_)
             | Function::Suffix(_)
+            | Function::HasTokens(_)
             | Function::Like(_)
             | Function::RegexpFullMatch(_) => Type::Boolean,
             // Arithmetic and the extractors carry DuckDB's bound result type.
@@ -258,6 +282,8 @@ impl Function {
             Function::VariantGet(v) => v.result_type(),
             // `drop_cache()` returns the evicted-entry count.
             Function::DropCache => Type::Int64,
+            // Bound as the count of index files built.
+            Function::CreateTextIndex(_) => Type::Int64,
         }
     }
 
@@ -266,6 +292,7 @@ impl Function {
             Function::Contains(c) => c.compile(),
             Function::Prefix(p) => p.compile(),
             Function::Suffix(s) => s.compile(),
+            Function::HasTokens(h) => h.compile(),
             Function::Like(l) => l.compile(),
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),
@@ -282,6 +309,7 @@ impl Function {
             Function::TemporalConvert(c) => c.compile(),
             Function::NormalizedInterval(n) => n.compile(),
             Function::VariantGet(v) => v.compile(),
+            Function::CreateTextIndex(_) => Err(compile::Error::CreateTextIndexNotCompilable),
             // `drop_cache()` evicts every in-memory cache *and* the on-disk cache
             // (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single

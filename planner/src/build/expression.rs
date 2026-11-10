@@ -22,10 +22,11 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Concat,
-    Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide,
-    Error, Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length, Like,
-    MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch,
-    RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, VariantGet,
+    Conjunction, ConjunctionOp, Contains, CountStar, CreateTextIndex, DatePart, DatePartKind,
+    DateTrunc, Divide, Error, Expression, FormatBytes, Function, HasTokens, InList,
+    IntervalArithmetic, IsNull, Length, Like, MaybeError, NormalizedInterval, Not,
+    NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Substring,
+    Suffix, TemporalConvert, TokenFunction, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -395,11 +396,25 @@ impl Function {
                 function_args(func, 0)?;
                 Ok(Function::DropCache)
             }
+            "create_text_index" => {
+                let params = function_args(func, 2)?;
+                let table = constant_string(Expression::from_handle(params[0])?)?;
+                let column = constant_string(Expression::from_handle(params[1])?)?;
+                Ok(Function::CreateTextIndex(CreateTextIndex::new(
+                    &table, column,
+                )))
+            }
             // `extract(<part> FROM ts)` lowers to a function named after the part
             // (`minute`, `year`, `dayofweek`, …).
-            _ => match DatePartKind::from_function_name(&name) {
-                Some(kind) => Ok(Function::DatePart(DatePart::from_handle(kind, func)?)),
-                None => Err(Error::UnsupportedScalarFunction(name)),
+            _ => match (
+                TokenFunction::from_name(&name),
+                DatePartKind::from_function_name(&name),
+            ) {
+                (Some(function), _) => {
+                    Ok(Function::HasTokens(HasTokens::from_handle(function, func)?))
+                }
+                (None, Some(kind)) => Ok(Function::DatePart(DatePart::from_handle(kind, func)?)),
+                (None, None) => Err(Error::UnsupportedScalarFunction(name)),
             },
         }
     }
@@ -438,6 +453,26 @@ impl Contains {
         Ok(Contains {
             needle: Box::new(Expression::from_handle(params[1])?),
             haystack: Box::new(Expression::from_handle(params[0])?),
+        })
+    }
+}
+
+impl HasTokens {
+    pub(crate) fn from_handle(
+        function: TokenFunction,
+        func: FunctionHandle<'_>,
+    ) -> Result<HasTokens, Error> {
+        let params = function_args(func, 2)?;
+        let tokens = constant_string(Expression::from_handle(params[1])?)?;
+        if function == TokenFunction::HasToken
+            && !dispatch::text_index::is_single_token(tokens.as_bytes())
+        {
+            return Err(Error::HasTokenNeedsOneToken(tokens));
+        }
+        Ok(HasTokens {
+            input: Box::new(Expression::from_handle(params[0])?),
+            function,
+            tokens,
         })
     }
 }

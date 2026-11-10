@@ -2,21 +2,25 @@
 //! transaction resolve derives from its snapshot, so a query's filter pushdown
 //! prunes its own view without affecting anyone else.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
+use crate::text_index::row_group_key;
 use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
+use dispatch::text_index::TextQuery;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, RowGroupFilter, RowGroupMetadata, equality_predicates,
+    materialize, prune_parquet, row_group_filter_from, scan_order_from,
+    table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use planner::expression::{CompareType, Expression};
+use planner::expression::{CompareType, Expression, Function};
 
 use super::insert_sink::build_insert_spec;
 use super::{CatalogTable, CommitAction};
@@ -27,6 +31,33 @@ use super::{CatalogTable, CommitAction};
 /// for the write path. Because the frozen snapshot copy travels with the binding,
 /// every compile-time method resolves its file set with no transaction handle.
 /// Cloned per-binding so each query accumulates its own predicates.
+/// A pushed-down `has_token` / `has_all_tokens` / `has_any_token` call on a
+/// plain column: the tokens to find in it.
+#[derive(Clone, Debug)]
+struct TokenPredicate {
+    column_idx: usize,
+    query: Arc<TextQuery>,
+}
+
+impl TokenPredicate {
+    /// The predicate `filter` is, if it is a token function over a column
+    /// whose tokens an index can answer for. Anything else is left to the
+    /// filter above the scan alone.
+    fn from_filter(filter: &Expression) -> Option<Self> {
+        let Expression::Function(Function::HasTokens(has_tokens)) = filter else {
+            return None;
+        };
+        let Expression::Ref(column) = has_tokens.input.as_ref() else {
+            return None;
+        };
+        let query = has_tokens.query();
+        query.is_answerable_from_index().then(|| Self {
+            column_idx: column.column_idx,
+            query: Arc::new(query),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct TableBinding {
     /// The qualified name this binding was resolved under, as the catalog routed
@@ -47,6 +78,10 @@ pub struct TableBinding {
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
+    /// Token predicates (`has_token` and its siblings) pushed down for this
+    /// binding, each on a plain text column. Answered from the column's text
+    /// indexes, where files have one, when the scan is compiled.
+    token_predicates: Vec<TokenPredicate>,
     /// The transaction's staging queue, shared (`Arc`) with the
     /// [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
     /// binding, so the append an INSERT compiled by this binding stages as it
@@ -80,8 +115,30 @@ impl TableBinding {
             columns,
             nullability,
             predicates: Vec::new(),
+            token_predicates: Vec::new(),
             commit_actions,
         }
+    }
+
+    /// A filter skipping the row groups of `parquet` that the text indexes
+    /// prove hold no row matching every pushed token predicate. `None` when
+    /// no predicate was pushed or no index rules anything out.
+    fn text_index_filter(&self, parquet: &ParquetTable) -> CatalogResult<Option<RowGroupFilter>> {
+        let mut without_match = HashSet::new();
+        for predicate in &self.token_predicates {
+            let column = &self.columns[predicate.column_idx].name;
+            without_match.extend(self.table.row_groups_without_match(
+                column,
+                &predicate.query,
+                parquet.row_groups(),
+            )?);
+        }
+        if without_match.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(move |row_group: &RowGroupMetadata| {
+            !without_match.contains(&row_group_key(row_group))
+        })))
     }
 
     /// This table's row groups in the captured snapshot, partition-pruned by the
@@ -176,12 +233,25 @@ impl BoundTable for TableBinding {
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
+        // Both filters are consulted as a row group is claimed, so neither
+        // shifts the row-group positions a late materialize addresses.
+        let filter = match (
+            row_group_filter_from(dynamic_filters),
+            self.text_index_filter(&parquet)?,
+        ) {
+            (Some(dynamic), Some(indexed)) => {
+                let both: RowGroupFilter =
+                    Arc::new(move |row_group| dynamic(row_group) && indexed(row_group));
+                Some(both)
+            }
+            (dynamic, indexed) => dynamic.or(indexed),
+        };
         Ok(table_input_with_filter_and_eq_predicates(
             dispatcher,
             &parquet,
             projection,
             emit_row_group_metadata,
-            row_group_filter_from(dynamic_filters),
+            filter,
             scan_order,
             Arc::new(eq_predicates),
         ))
@@ -242,6 +312,8 @@ impl BoundTable for TableBinding {
         // so this is purely an optimization and never affects correctness.
         self.predicates
             .extend(PushedPredicate::from_filter(&filter));
+        self.token_predicates
+            .extend(TokenPredicate::from_filter(&filter));
 
         Ok(false)
     }
@@ -249,7 +321,7 @@ impl BoundTable for TableBinding {
     fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         // Only sound for the whole, unfiltered table: a pushed-down predicate
         // means the scan this binding stands for excludes rows.
-        if !self.predicates.is_empty() {
+        if !self.predicates.is_empty() || !self.token_predicates.is_empty() {
             return None;
         }
         // Read the captured snapshot files, the same view a scan would see; an
@@ -260,7 +332,7 @@ impl BoundTable for TableBinding {
     fn row_count(&self) -> Option<i64> {
         // Only sound for the whole, unfiltered table: a pushed-down predicate
         // means the scan this binding stands for excludes rows.
-        if !self.predicates.is_empty() {
+        if !self.predicates.is_empty() || !self.token_predicates.is_empty() {
             return None;
         }
         // The parquet footer carries each row group's exact row count, so the

@@ -53,6 +53,10 @@ pub enum Command {
     CreateUser,
     DropTable,
     Compact,
+    /// `SELECT create_text_index(...)`, with how many index files it built.
+    CreateTextIndex {
+        files: u64,
+    },
     Vacuum,
     /// `BEGIN`, `COMMIT` or `ROLLBACK`, answered without doing anything:
     /// every statement commits individually, so there is no transaction to
@@ -73,6 +77,7 @@ impl Command {
             Self::CreateUser => "CREATE USER".to_string(),
             Self::DropTable => "DROP TABLE".to_string(),
             Self::Compact => "COMPACT".to_string(),
+            Self::CreateTextIndex { files } => format!("CREATE TEXT INDEX {files}"),
             Self::Vacuum => "VACUUM".to_string(),
             Self::Begin => "BEGIN".to_string(),
             Self::Commit => "COMMIT".to_string(),

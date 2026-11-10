@@ -12,7 +12,7 @@
 //! allocate on initialization half the system memory for [`WriteBuffer`]s, as this will be our main
 //! usage of memory. Every worker upon initialization faults in all [`WriteBuffer`]s and pushes equal
 //! amounts to local pools for use afterward. These [`WriteBuffer`]s will be used for any disk access
-//! (and subsequently saved in the [`CompressedCache`](cache::CompressedCache)) as well as large allocations.
+//! (and subsequently saved in the [`CompressedCache`]) as well as large allocations.
 //!
 //! [`WriteBuffer`]s can also be used for many miscellaneous things, such as Vectors and HashTables. It
 //! is generally preferred to use [`WriteBuffer`]s as the memory is easily accounted for. See [`SlabAllocator`].
@@ -37,9 +37,8 @@ pub use layout::RingLayout;
 pub mod cache;
 pub use cache::{
     Cache, CacheFill, CacheId, CacheKey, CacheLookup, Cached, Caches, CompressedCache,
-    DecompressedPage, DecompressedPageMeta, DictIndex, DictIndexCaches, DictIndexMeta,
-    MissingExtent, PageCaches, RingCache, Segment, SourceRange, SparseIndex, SparseIndexCaches,
-    SparseIndexMeta,
+    DecompressedPage, DecompressedPageMeta, MissingExtent, PageCaches, RingCache, Segment,
+    SourceRange, TextIndexCaches,
 };
 
 pub mod clock;

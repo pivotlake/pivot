@@ -71,6 +71,7 @@ pub mod env;
 pub mod gather_barrier;
 pub mod io;
 pub mod memory;
+pub mod text_index;
 pub mod waker;
 pub mod worker;
 

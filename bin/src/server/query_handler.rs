@@ -85,6 +85,9 @@ fn build_command_response(command: Command) -> Response {
         Command::CreateUser => Response::Execution(Tag::new("CREATE USER")),
         Command::DropTable => Response::Execution(Tag::new("DROP TABLE")),
         Command::Compact => Response::Execution(Tag::new("COMPACT")),
+        Command::CreateTextIndex { files } => {
+            Response::Execution(Tag::new("CREATE TEXT INDEX").with_rows(files as usize))
+        }
         Command::Vacuum => Response::Execution(Tag::new("VACUUM")),
         Command::Begin => Response::Execution(Tag::new("BEGIN")),
         Command::Commit => Response::Execution(Tag::new("COMMIT")),

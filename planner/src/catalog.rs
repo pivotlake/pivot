@@ -278,6 +278,21 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Build the text index of `column` for every data file of `table` that
+    /// has none, from this transaction's frozen catalog view. Returns how
+    /// many index files were built.
+    async fn create_text_index(
+        &self,
+        _datastore: &str,
+        _table: &SchemaQualifiedTableName,
+        _column: &str,
+    ) -> Result<u64> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support text indexes",
+        )
+        .into())
+    }
+
     /// Run one vacuum sweep of the datastore's latest state, respecting retention.
     /// This is independent of whether background vacuum is enabled.
     async fn vacuum(&self, _datastore: &str) -> Result<()> {

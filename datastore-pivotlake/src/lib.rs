@@ -40,6 +40,7 @@ mod table;
 /// deps, never enter a normal build.
 #[cfg(feature = "test-support")]
 pub mod test_support;
+mod text_index;
 mod vacuum;
 
 pub use binding::TableBinding;
@@ -147,6 +148,10 @@ pub enum Error {
         "table at `{location}` cannot delete `{file}`: the file sits outside the table's own storage, so it belongs to whoever the table adopted it from"
     )]
     DeletingOutsideStorage { location: String, file: String },
+    #[error("text index: {0}")]
+    TextIndex(String),
+    #[error("text index: {0}")]
+    TextIndexDataflow(#[source] DataFlowError),
     #[error("compaction actor stopped")]
     CompacterStopped,
     #[error("compaction job panicked: {0}")]
@@ -1517,6 +1522,23 @@ impl DatastoreTransaction for PivotlakeTransaction {
             .compacter()
             .compact(name.clone(), table, final_sweep)
             .await?)
+    }
+
+    async fn create_text_index(
+        &self,
+        name: &SchemaQualifiedTableName,
+        column: &str,
+    ) -> CatalogResult<u64> {
+        let table = self.snapshot.catalog_table_by_name(name).ok_or_else(|| {
+            CatalogError::Other(format!("create_text_index: no table named `{name}`").into())
+        })?;
+        let column = column.to_string();
+        // The build drives dataflows and waits on them, so it runs off the
+        // async runtime like any other blocking coordinator work.
+        let built = tokio::task::spawn_blocking(move || table.create_text_index(&column))
+            .await
+            .map_err(|error| CatalogError::Other(Box::new(error)))??;
+        Ok(built as u64)
     }
 
     async fn vacuum(&self) -> CatalogResult<()> {

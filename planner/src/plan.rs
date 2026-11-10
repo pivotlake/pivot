@@ -10,7 +10,7 @@
 //! walk of the plan finds that every revision still matches.
 use crate::catalog::CatalogTransaction;
 use crate::compile;
-use crate::expression::Expression;
+use crate::expression::{CreateTextIndex, Expression, Function};
 use crate::operator::{
     self, Compact, CopyFromStdin, Operator, OrderByDirection, SetVariable, TransactionStatement,
 };
@@ -388,6 +388,20 @@ impl Plan {
     pub fn as_compact(&self) -> Option<&Compact> {
         match &self.root.operator {
             Operator::Compact(compact) => Some(compact),
+            _ => None,
+        }
+    }
+
+    /// This plan as a `SELECT create_text_index(...)` statement, if that's
+    /// what it is: the call alone in the select list, over no table. Like
+    /// `COMPACT`, the server checks this before compiling and runs the build
+    /// coordinator-side.
+    pub fn as_create_text_index(&self) -> Option<&CreateTextIndex> {
+        let Operator::Projection(projection) = &self.root.operator else {
+            return None;
+        };
+        match projection.projections.as_slice() {
+            [Expression::Function(Function::CreateTextIndex(create))] => Some(create),
             _ => None,
         }
     }

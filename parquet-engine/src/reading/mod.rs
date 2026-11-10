@@ -31,7 +31,7 @@ pub use range_cutter::{DecodeRange, RangeCutterFactory};
 mod materializer;
 pub use materializer::MaterializerFactory;
 
-mod record_batch_metadata;
+pub(crate) mod record_batch_metadata;
 
 mod empty_projection_scan;
 
