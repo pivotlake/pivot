@@ -6,7 +6,9 @@
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, Scalar};
+use catalog::CommitQueue;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use iceberg_tables::Table as LoadedTable;
 use parquet_engine::{
     ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
@@ -17,10 +19,7 @@ use planner::catalog::{
 };
 use planner::expression::Expression;
 
-use catalog::CommitQueue;
-
 use crate::IcebergDatastore;
-use crate::table::LoadedTable;
 use crate::write::build_insert_spec;
 
 /// One reference to a table in a query. Filter pushdown finishes before the
@@ -43,7 +42,7 @@ impl std::fmt::Debug for IcebergTableBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcebergTableBinding")
             .field("reference", &self.reference)
-            .field("metadata_location", &self.table.metadata_location)
+            .field("metadata_location", &self.table.metadata_location())
             .field("filters", &self.filters)
             .finish()
     }
@@ -72,7 +71,10 @@ impl IcebergTableBinding {
         if let Some(table) = cached.as_ref() {
             return Ok(table.clone());
         }
-        let parquet = self.table.load_parquet(&self.filters)?;
+        let parquet = self
+            .table
+            .plan_scan(&self.filters)
+            .map_err(crate::Error::from)?;
         let predicates: Vec<PushedPredicate> = self
             .filters
             .iter()
@@ -137,6 +139,7 @@ impl BoundTable for IcebergTableBinding {
         _dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         Ok(build_insert_spec(
+            self.reference.schema_qualified_name(),
             &self.table,
             self.commit_actions.clone(),
             input,
@@ -148,7 +151,7 @@ impl BoundTable for IcebergTableBinding {
     }
 
     fn nullability(&self) -> Vec<bool> {
-        self.table.nullability()
+        self.table.declared_nullability()
     }
 
     fn clone_box(&self) -> Box<dyn BoundTable> {

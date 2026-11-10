@@ -5,23 +5,29 @@
 //! the same pruning keeps the deletes of the data files kept.
 
 use crate::Error;
+use crate::data_files::DataFileEntry;
 use crate::pruning::{self, FieldRange};
 use crate::store::TableStore;
 use dispatch::DataFlowDispatcher;
 use iceberg::expr::BoundPredicate;
+use iceberg::spec::ManifestEntry;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, Literal, Manifest, ManifestContentType,
     ManifestFile, ManifestList as IcebergManifestList, NestedField, PartitionSpec,
     PartitionSpecRef, SchemaRef, TableMetadata,
 };
 use iceberg::{ErrorKind, Result};
+use object_storage::ObjectPath;
 use object_storage::load_objects;
 use planner::expression::Expression;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// The snapshot's manifests, in manifest-list order: its data manifests, and
 /// the delete manifests with a file still live.
-pub(crate) struct ManifestList {
+#[derive(Clone)]
+pub struct ManifestList {
     data_manifests: Vec<ListedManifest>,
     delete_manifests: Vec<ListedManifest>,
     schema: SchemaRef,
@@ -31,56 +37,61 @@ pub(crate) struct ManifestList {
 /// The manifests a scan over some filters reads: the data manifests that may
 /// list a file holding a row satisfying every filter, and the delete
 /// manifests whose deletes may apply to such a file.
-pub(crate) struct SelectedManifests<'a> {
+pub struct SelectedManifests<'a> {
     pub data: Vec<&'a ManifestFile>,
     pub deletes: Vec<&'a ManifestFile>,
 }
 
 /// A manifest the list names, with what its entry says about the partition
 /// values of the manifest's files.
+#[derive(Clone)]
 struct ListedManifest {
     file: ManifestFile,
     partition_ranges: Vec<FieldRange>,
 }
 
 impl ManifestList {
-    /// Read the current snapshot's manifest list, of `size` bytes, and keep
-    /// its manifests in order. A table without a snapshot has none. A delete
-    /// manifest whose files were all removed carries nothing to apply and is
-    /// left out.
-    pub fn load(
-        table: &str,
-        metadata: &TableMetadata,
-        size: Option<u64>,
-        store: &TableStore,
-        dispatcher: &DataFlowDispatcher,
-    ) -> crate::Result<Self> {
-        let mut manifests = Vec::new();
-        if let Some(snapshot) = metadata.current_snapshot() {
-            let path = snapshot.manifest_list();
-            let size = size
-                .expect("a table with a current snapshot is indexed with its manifest list's size");
-            let bytes = load_objects(dispatcher, &[store.data_file(path, size)?])?
-                .pop()
-                .expect("load_objects returns one object per file")
-                .bytes;
-            let list = IcebergManifestList::parse_with_version(&bytes, metadata.format_version())
-                .map_err(|source| Error::MalformedMetadataObject {
+    /// The manifest list of a table without a snapshot: no manifests.
+    pub fn empty(metadata: &TableMetadata) -> Self {
+        Self::new(metadata, Vec::new()).expect("no manifest has a summary to misread")
+    }
+
+    /// The current snapshot's manifest list, decoded from `bytes`, its
+    /// manifests kept in order. A delete manifest whose files were all
+    /// removed carries nothing to apply and is left out.
+    pub fn parse(table: &str, metadata: &TableMetadata, bytes: &[u8]) -> crate::Result<Self> {
+        let path = metadata
+            .current_snapshot()
+            .expect("a manifest list is parsed for a table with a current snapshot")
+            .manifest_list();
+        let list = IcebergManifestList::parse_with_version(bytes, metadata.format_version())
+            .map_err(|source| Error::MalformedMetadataObject {
+                table: table.to_string(),
                 path: path.to_string(),
                 source: Box::new(source),
             })?;
-            for entry in list.consume_entries() {
-                // A delete manifest whose delete files were all removed has
-                // nothing left to apply; skipping it saves reading it.
-                if entry.content == ManifestContentType::Deletes
-                    && !entry.has_added_files()
-                    && !entry.has_existing_files()
-                {
-                    continue;
-                }
-                manifests.push(entry);
+        let mut manifests = Vec::new();
+        for entry in list.consume_entries() {
+            // A delete manifest whose delete files were all removed has
+            // nothing left to apply; skipping it saves reading it.
+            if entry.content == ManifestContentType::Deletes
+                && !entry.has_added_files()
+                && !entry.has_existing_files()
+            {
+                continue;
             }
+            manifests.push(entry);
         }
+        Self::listing(table, metadata, manifests)
+    }
+
+    /// `manifests`, the current snapshot's, kept in order with their
+    /// partition summaries read: what a commit that wrote them hands back.
+    pub(crate) fn listing(
+        table: &str,
+        metadata: &TableMetadata,
+        manifests: Vec<ManifestFile>,
+    ) -> crate::Result<Self> {
         Self::new(metadata, manifests).map_err(|source| Error::InvalidPartitionMetadata {
             table: table.to_string(),
             source: Box::new(source),
@@ -128,6 +139,12 @@ impl ManifestList {
         self.data_manifests.iter().map(|manifest| &manifest.file)
     }
 
+    /// Every manifest: the data manifests, then the delete manifests with a
+    /// file still live.
+    pub fn manifests(&self) -> impl Iterator<Item = &ManifestFile> {
+        self.data_manifests().chain(self.delete_manifests())
+    }
+
     /// The delete manifests with a file still live.
     pub fn delete_manifests(&self) -> impl Iterator<Item = &ManifestFile> {
         self.delete_manifests.iter().map(|manifest| &manifest.file)
@@ -158,8 +175,11 @@ impl ManifestList {
     }
 }
 
-/// Read and parse `manifests`, in the order given.
-pub(crate) fn read_manifests<'a>(
+/// Read and parse `manifests` of `table`, in the order given, over the pool:
+/// each read whole, at the length its manifest list records, so one read
+/// again comes from the pool's caches.
+pub fn read_manifests<'a>(
+    table: &str,
     manifests: impl IntoIterator<Item = &'a ManifestFile>,
     store: &TableStore,
     dispatcher: &DataFlowDispatcher,
@@ -175,6 +195,7 @@ pub(crate) fn read_manifests<'a>(
     for object in load_objects(dispatcher, &objects)? {
         let manifest = Manifest::parse_avro(&object.bytes).map_err(|source| {
             Error::MalformedMetadataObject {
+                table: table.to_string(),
                 path: object.file.path.as_str().to_string(),
                 source: Box::new(source),
             }
@@ -182,6 +203,43 @@ pub(crate) fn read_manifests<'a>(
         parsed.push(manifest);
     }
     Ok(parsed)
+}
+
+/// One of the current snapshot's data manifests, decoded: the manifest as
+/// parsed, for selecting its files by their recorded bounds, and its live
+/// entries as this crate records them, for a commit that rewrites them.
+pub struct DecodedManifest {
+    pub file: ManifestFile,
+    pub manifest: Arc<Manifest>,
+    pub entries: Vec<DataFileEntry>,
+}
+
+impl DecodedManifest {
+    /// This manifest without the files at `removed` (as the table names
+    /// them) and `removed_uris` (as the manifest does): a local view of a
+    /// removal this process already committed.
+    pub(crate) fn without_files(
+        &self,
+        removed: &[ObjectPath],
+        removed_uris: &HashSet<String>,
+    ) -> DecodedManifest {
+        let (entries, metadata) = Manifest::clone(&self.manifest).into_parts();
+        let kept = entries
+            .into_iter()
+            .filter(|entry| !removed_uris.contains(entry.data_file().file_path()))
+            .map(|entry| ManifestEntry::clone(&entry))
+            .collect();
+        DecodedManifest {
+            file: self.file.clone(),
+            manifest: Arc::new(Manifest::new(metadata, kept)),
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| !removed.contains(&entry.file.path))
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 /// The manifests among `manifests` whose partition summaries may match the
@@ -250,7 +308,7 @@ fn read_partition_summaries(
 }
 
 /// Where a data file is and how long, which is all a footer read needs.
-pub(crate) struct FileDescriptor {
+pub struct FileDescriptor {
     pub path: String,
     pub length: u64,
 }
@@ -266,26 +324,23 @@ impl FileDescriptor {
 
 /// The data files that some of the snapshot's manifests list, in manifest
 /// order.
-pub(crate) struct DataFiles {
-    manifests: Vec<Manifest>,
+pub struct DataFiles {
+    manifests: Vec<Arc<Manifest>>,
     schema: SchemaRef,
     partition_specs: Vec<PartitionSpecRef>,
 }
 
 impl DataFiles {
-    /// Read and parse `manifests`, data manifests, in the order given so
-    /// repeated preparations assign the same indexes. A live delete file
-    /// among them, or a file that is not Parquet, is rejected.
-    pub fn load<'a>(
+    /// The files of `manifests`, data manifests of the table `metadata`
+    /// describes, in the order given so repeated preparations assign the
+    /// same indexes. A live delete file among them, or a file that is not
+    /// Parquet, is refused.
+    pub fn new(
         table: &str,
         metadata: &TableMetadata,
-        manifests: impl IntoIterator<Item = &'a ManifestFile>,
-        store: &TableStore,
-        dispatcher: &DataFlowDispatcher,
+        manifests: Vec<Arc<Manifest>>,
     ) -> crate::Result<Self> {
-        let parsed = read_manifests(manifests, store, dispatcher)?;
-        let mut manifests = Vec::with_capacity(parsed.len());
-        for manifest in parsed {
+        for manifest in &manifests {
             for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
                 let file = entry.data_file();
                 if file.content_type() != DataContentType::Data {
@@ -301,7 +356,6 @@ impl DataFiles {
                     });
                 }
             }
-            manifests.push(manifest);
         }
         Ok(Self {
             manifests,
@@ -343,12 +397,14 @@ impl DataFiles {
 
     /// Every file the manifests list as part of the snapshot.
     pub fn iter(&self) -> impl Iterator<Item = LiveFile<'_>> {
-        self.manifests.iter().flat_map(list_live_files)
+        self.manifests
+            .iter()
+            .flat_map(|manifest| list_live_files(manifest))
     }
 }
 
 /// A data file a manifest lists as part of the snapshot.
-pub(crate) struct LiveFile<'a> {
+pub struct LiveFile<'a> {
     pub manifest: &'a Manifest,
     pub data: &'a DataFile,
 }

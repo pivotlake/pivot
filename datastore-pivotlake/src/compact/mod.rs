@@ -1,13 +1,14 @@
-//! Background compaction of a table's Parquet files.
+//! Background compaction of a table's Parquet files, whichever table format
+//! holds the table, and the datastore's other maintenance settings.
 //!
 //! Frequent writes litter a table with small files, and scans pay per file.
 //! The [`CompacterHandle`] runs two strategies, split by file size: files
 //! below half the configured target are merged as *small files*, files at
 //! least half full are candidates for *layout optimization*. Both rewrite
 //! their inputs into target-sized outputs and swap them into the table in a
-//! single log commit. A row group larger than the target stays one
-//! oversized file, since row groups are the smallest independently encoded
-//! unit. Each pass tries small files first, then layout.
+//! single commit. A row group larger than the target stays one oversized
+//! file, since row groups are the smallest independently encoded unit. Each
+//! pass tries small files first, then layout.
 //!
 //! # Small files
 //!
@@ -83,14 +84,15 @@
 //! # Merging and committing
 //!
 //! The compacter is **location-agnostic**: candidates come from the table's
-//! manifest (paths, sizes, partition values, and stats; no directory scanning), and the merge (read,
-//! upload, swap) runs through [`compact_table_files`]. A table under an `s3://`
-//! database root compacts through the exact same code path as a local one.
+//! metadata (paths, sizes, partition values, and stats; no directory
+//! scanning), and the merge (read, upload, swap) runs through
+//! [`compact_table_files`]. A table in a bucket compacts through the exact
+//! same code path as a local one.
 //!
-//! The swapped-out inputs are not deleted with the swap: a query that loaded the
-//! prior version is still reading them, and the swap's Delta `Remove` actions
-//! are their durable tombstones. The objects stay in place until the vacuum
-//! sweep ages them out.
+//! The swapped-out inputs are not deleted with the swap: a query that loaded
+//! the prior version is still reading them, and the swap's commit is their
+//! durable removal from the table. The objects stay in place until whatever
+//! vacuums the table's storage ages them out.
 //!
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
 //! decode the inputs' row groups, the encode stages repack them into full-size
@@ -99,45 +101,51 @@
 //! only drives that dataflow (from a blocking thread) and, once the uploads
 //! land, commits the swap.
 //!
-//! Crash safety comes from the table log, not from ordering tricks: a file is
-//! part of the table iff the current log version lists it. The merged files are
-//! uploaded, then swapped in for the inputs in one Delta commit (labelled a
-//! rearrangement, not a data change); a crash before the commit leaves only
-//! *orphan* objects (unlogged merged files), never a double read.
+//! Crash safety comes from the table's metadata, not from ordering tricks: a
+//! file is part of the table iff the current version lists it. The merged
+//! files are uploaded, then swapped in for the inputs in one commit (labelled
+//! a rearrangement, not a data change); a crash before the commit leaves only
+//! *orphan* objects (unlisted merged files), never a double read.
 //!
-//! Merging always writes into the table's own directory, so compacting a file
-//! the table adopted (`with_pre_existing_parquets`, which leaves the file where its owner
-//! put it) copies those rows under the database root. The adopted original is
-//! dropped from the log but never deleted: it is not the table's to delete, and
-//! the vacuum sweep only reclaims files under the table's own location. A table
-//! that adopts a directory of small files and then compacts them therefore ends
-//! up storing that data twice, once in the user's directory and once in its own.
-//! That is the price of never writing into a directory the user owns.
+//! Merging always writes into the table's own directory, so compacting a
+//! file the table adopted from elsewhere copies those rows under the table.
+//! The adopted original is dropped from the metadata but never deleted: it
+//! is not the table's to delete. A table that adopts a directory of small
+//! files and then compacts them therefore ends up storing that data twice,
+//! once where the user put it and once in its own directory. That is the
+//! price of never writing into a directory the user owns.
 //!
-//! A [`PivotlakeDatastore`] owns one [`CompacterHandle`] actor. Configured timer ticks and
-//! explicit `COMPACT` commands share its queue, so their rewrites never race in
-//! one process. A timed round reloads each table to its latest log version;
-//! commands carry the table snapshot captured by their query transaction. The
-//! actor stops before the datastore's dispatch pool shuts down.
+//! # Hosting
+//!
+//! The datastore runs one [`CompacterHandle`] actor over itself: what names
+//! its tables, finds one by identity and commits a swap. Each table reaches
+//! the compacter as a [`CatalogTable`]: a copy at one committed version the
+//! round refreshes, selects from, merges through and folds its own swaps
+//! into. Configured timer ticks and explicit `COMPACT` commands share the
+//! actor's queue, so their rewrites never race in one process. A timed
+//! round reloads each table to its latest version; commands carry the table
+//! copy captured by their query transaction. The actor stops before the
+//! datastore's dispatch pool shuts down.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use object_storage::{FileRef, ObjectPath};
+use parquet_engine::file_entry::{FileEntry, PartitionValues, scalar_values_equal};
+use planner::catalog::SchemaQualifiedTableName;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
-use crate::manifest::DeltaFileEntry;
-use crate::{CatalogTable, FileRef, PivotlakeDatastore, TableFile, scalar_values_equal};
-use object_storage::ObjectPath;
-use planner::catalog::SchemaQualifiedTableName;
+use crate::{CatalogTable, Error, PivotlakeDatastore, Result, TableFile};
 
 mod overlap;
 
 /// Rows per row group in a merged file.
-const ROW_GROUP_ROWS: usize = 128 * 1024;
+pub const ROW_GROUP_ROWS: usize = 128 * 1024;
 
 /// Default compacted-file size target. Files smaller than half this size enter
 /// small-file compaction; files at least half this size are full enough to
@@ -146,7 +154,7 @@ pub const DEFAULT_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default headroom for compression gains: a group whose input bytes only just
 /// reach the desired output size can encode to another undersized file.
-const DEFAULT_MERGE_TARGET_MULTIPLIER: f64 = 1.3;
+pub const DEFAULT_MERGE_TARGET_MULTIPLIER: f64 = 1.3;
 
 /// Default count at which a sub-target pile may take the balance-check path.
 pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 100;
@@ -156,8 +164,8 @@ pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 100;
 const FIXED_FILE_COST_BYTES: f64 = (5 * 1024 * 1024) as f64;
 const MIN_BALANCE_RATIO: f64 = 5.0;
 
-/// Default cadence for re-checking the tables' logs. Candidates only change
-/// when a flush commits a new version, so seconds-scale is plenty.
+/// Default cadence for re-checking the tables' metadata. Candidates only
+/// change when a commit lands a new version, so seconds-scale is plenty.
 pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(30);
 
 /// Default number of merges a datastore runs at once. A merge holds its whole
@@ -172,43 +180,19 @@ pub const DEFAULT_COMPACT_PARALLELISM: usize = 1;
 
 /// Default size of the clique a routine round merges, and the cap on a
 /// final sweep's connected group: one more than the bar's reciprocal, the
-/// narrowest merge that keeps the layout's scales apart. A clique merge's outputs each span about `1 / clique_size` of the
-/// inputs' range, so a leftover input holds at most `total / width` of its
-/// row groups inside any output, below the bar's `total * percent / 100 + 1`;
-/// the extra one is a full row group of slack against cut drift. Narrower
-/// merges let leftovers and outputs merge across scales (files of four row
-/// groups need only one contested group and break at width four). Wider
-/// merges settle rows in fewer rewrites but hold every input's decoded rows
-/// in memory.
+/// narrowest merge that keeps the layout's scales apart. A clique merge's
+/// outputs each span about `1 / clique_size` of the inputs' range, so a
+/// leftover input holds at most `total / width` of its row groups inside any
+/// output, below the bar's `total * percent / 100 + 1`; the extra one is a
+/// full row group of slack against cut drift. Narrower merges let leftovers
+/// and outputs merge across scales (files of four row groups need only one
+/// contested group and break at width four). Wider merges settle rows in
+/// fewer rewrites but hold every input's decoded rows in memory.
 pub const DEFAULT_LAYOUT_CLIQUE_SIZE: usize = 100 / overlap::CONTESTED_ROW_GROUP_PERCENT_BAR + 1;
-
-/// Default cadence for reloading the tables from the store. This bounds how
-/// stale a query's view of externally committed data in a shared remote store
-/// is, so it trades freshness against the store's listing traffic.
-pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default accumulated input size for a small-file merge.
 pub fn default_merge_target_bytes(target_bytes: u64) -> u64 {
     (target_bytes as f64 * DEFAULT_MERGE_TARGET_MULTIPLIER) as u64
-}
-
-/// What background maintenance a [`PivotlakeDatastore`] runs for itself once opened.
-/// The datastore spawns its own tasks from this on the ambient tokio runtime;
-/// they stop when its dispatch pool begins shutting down.
-#[derive(Clone)]
-pub struct MaintenanceConfig {
-    /// How often the datastore reloads its tables from the store (new Delta
-    /// versions and new files' footers), so externally committed data in a
-    /// shared remote store becomes visible to queries.
-    pub refresh_interval: Duration,
-    /// Compaction settings, or `None` to run no compacter (a read-only server
-    /// or a remote-store deployment where another process owns compaction).
-    pub compaction: Option<CompactionConfig>,
-    /// Vacuum settings, or `None` to run no vacuumer (a read-only server, or a
-    /// remote-store deployment where another process owns physical cleanup).
-    /// Deletes tombstoned data files and superseded commit JSONs past their
-    /// retention.
-    pub vacuum: Option<crate::vacuum::VacuumConfig>,
 }
 
 /// Tuning for a datastore's self-managed compaction loop.
@@ -228,11 +212,35 @@ pub struct CompactionConfig {
     /// Files one layout merge rewrites together, at least two; see
     /// [`DEFAULT_LAYOUT_CLIQUE_SIZE`].
     pub layout_clique_size: usize,
-    /// How often to re-check the tables' logs for newly-accumulated files.
+    /// How often to re-check the tables' metadata for newly-accumulated files.
     pub poll_interval: Duration,
 }
 
-/// Handle to the datastore's single compaction actor. Both periodic maintenance
+/// Default cadence for reloading the tables from the store. This bounds how
+/// stale a query's view of externally committed data in a shared remote store
+/// is, so it trades freshness against the store's listing traffic.
+pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// What background maintenance a [`PivotlakeDatastore`] runs for itself once opened.
+/// The datastore spawns its own tasks from this on the ambient tokio runtime;
+/// they stop when its dispatch pool begins shutting down.
+#[derive(Clone)]
+pub struct MaintenanceConfig {
+    /// How often the datastore reloads its tables from the store (new
+    /// versions and new files' footers), so externally committed data in a
+    /// shared remote store becomes visible to queries.
+    pub refresh_interval: Duration,
+    /// Compaction settings, or `None` to run no compacter (a read-only server
+    /// or a remote-store deployment where another process owns compaction).
+    pub compaction: Option<CompactionConfig>,
+    /// Vacuum settings, or `None` to run no vacuumer (a read-only server, or a
+    /// remote-store deployment where another process owns physical cleanup).
+    /// Deletes tombstoned data files and superseded commit JSONs past their
+    /// retention.
+    pub vacuum: Option<crate::vacuum::VacuumConfig>,
+}
+
+/// Handle to a datastore's single compaction actor. Both periodic maintenance
 /// and explicit `COMPACT` statements run through that actor, so two compaction
 /// rounds in one process never overlap. Within one round, selection is still
 /// serial while the rewrites it starts run concurrently.
@@ -244,7 +252,7 @@ pub struct CompacterHandle {
 /// Which pass a round runs: the routine one, which keeps every guard, or
 /// the final sweep, which drops them and settles the table.
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum CompactionPass {
+pub(crate) enum CompactionPass {
     Routine,
     Final,
 }
@@ -253,10 +261,10 @@ struct CompactionCommand {
     name: SchemaQualifiedTableName,
     table: CatalogTable,
     pass: CompactionPass,
-    result: oneshot::Sender<crate::Result<u64>>,
+    result: oneshot::Sender<Result<u64>>,
 }
 
-pub(crate) struct CompacterActor {
+pub struct CompacterActor {
     /// Output-size target; half of it is the small/layout boundary.
     target_bytes: u64,
     merge_target_bytes: u64,
@@ -266,19 +274,21 @@ pub(crate) struct CompacterActor {
     /// Files one layout merge rewrites together, at least two; see
     /// [`DEFAULT_LAYOUT_CLIQUE_SIZE`].
     layout_clique_size: usize,
-    /// How often to re-check the tables' logs, or `None` when only explicit
-    /// commands drive this actor.
+    /// How often to re-check the tables' metadata, or `None` when only
+    /// explicit commands drive this actor.
     poll_interval: Option<Duration>,
     datastore: Arc<PivotlakeDatastore>,
     commands: mpsc::UnboundedReceiver<CompactionCommand>,
     /// Each table's pair overlaps, remembered from round to round so a
     /// pass only measures the files it has not seen before (see
     /// [`overlap::OverlapCache`]).
-    overlap_caches: HashMap<uuid::Uuid, overlap::OverlapCache>,
+    overlap_caches: HashMap<Uuid, overlap::OverlapCache>,
 }
 
 impl CompacterHandle {
-    pub(crate) fn new(
+    /// The handle and the actor it drives, over `datastore`. The caller spawns
+    /// [`run`](CompacterActor::run) on its runtime.
+    pub fn new(
         target_bytes: u64,
         merge_target_bytes: u64,
         min_files: usize,
@@ -308,13 +318,13 @@ impl CompacterHandle {
     /// refreshes it to the latest version as it begins and keeps merging until
     /// nothing qualifies. `FINAL` drops the small-file guards and the
     /// contested bar and compacts each partition to one contiguous flow, see
-    /// the module docs.
-    pub(crate) async fn compact(
+    /// the crate docs.
+    pub async fn compact(
         &self,
         name: SchemaQualifiedTableName,
         table: CatalogTable,
         final_sweep: bool,
-    ) -> crate::Result<u64> {
+    ) -> Result<u64> {
         let (result, answer) = oneshot::channel();
         let pass = if final_sweep {
             CompactionPass::Final
@@ -328,8 +338,8 @@ impl CompacterHandle {
                 pass,
                 result,
             })
-            .map_err(|_| crate::Error::CompacterStopped)?;
-        answer.await.map_err(|_| crate::Error::CompacterStopped)?
+            .map_err(|_| Error::CompacterStopped)?;
+        answer.await.map_err(|_| Error::CompacterStopped)?
     }
 }
 
@@ -339,7 +349,7 @@ impl CompacterActor {
     /// each later one fires the poll interval after the previous round
     /// finished: a round runs until its tables have no candidate left, however
     /// long that takes, and the interval is the pause between rounds.
-    pub(crate) async fn run(mut self) {
+    pub async fn run(mut self) {
         let mut tick = self.poll_interval.map(|d| {
             let mut t = tokio::time::interval(d);
             t.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -375,7 +385,7 @@ impl CompacterActor {
 
     async fn compact_all(&mut self) {
         let tables = self.datastore.tables();
-        let live: HashSet<uuid::Uuid> = tables.iter().map(|(_, table)| table.id()).collect();
+        let live: HashSet<Uuid> = tables.iter().map(|(_, table)| table.id()).collect();
         self.overlap_caches.retain(|id, _| live.contains(id));
         for (name, table) in tables {
             if let Err(error) = self
@@ -397,17 +407,17 @@ impl CompacterActor {
     /// the number of passes.
     ///
     /// The round works off its one refreshed copy rather than reloading the
-    /// log per pass: each of its own merges is folded in as it commits, so
-    /// files landing meanwhile (an INSERT in this process, or another writer)
-    /// wait for the next round. Only a commit conflict, another writer having
-    /// swapped a selected file out first, reloads the copy, and the round
-    /// carries on from what it finds.
+    /// metadata per pass: each of its own merges is folded in as it commits,
+    /// so files landing meanwhile (an INSERT in this process, or another
+    /// writer) wait for the next round. Only a commit conflict, another writer
+    /// having swapped a selected file out first, reloads the copy, and the
+    /// round carries on from what it finds.
     async fn compact_table(
         &mut self,
         name: &SchemaQualifiedTableName,
         mut table: CatalogTable,
         pass: CompactionPass,
-    ) -> crate::Result<(CatalogTable, u64)> {
+    ) -> Result<(CatalogTable, u64)> {
         let mut passes = 0;
         let mut in_flight = JoinSet::new();
         let mut reserved = HashSet::new();
@@ -417,7 +427,7 @@ impl CompacterActor {
             let id = table.id();
 
             while in_flight.len() < self.max_concurrent_merges {
-                let Some((inputs, kind)) = self.next_batch(&table, pass, &reserved) else {
+                let Some((inputs, kind)) = self.next_batch(&table, pass, &reserved)? else {
                     break;
                 };
                 reserved.extend(inputs.iter().map(|file| file.path.clone()));
@@ -441,7 +451,7 @@ impl CompacterActor {
                 Some(Ok(merge)) => merge,
                 Some(Err(error)) => {
                     drain_merges(&mut in_flight).await;
-                    return Err(crate::Error::CompactionJobPanicked(error.to_string()));
+                    return Err(Error::CompactionJobPanicked(error.to_string()));
                 }
                 None => unreachable!("the set is not empty"),
             };
@@ -450,7 +460,7 @@ impl CompacterActor {
             }
             match outcome {
                 Ok(outputs) => table.apply_file_swap(&reserved_paths, outputs),
-                Err(crate::Error::CommitConflict { .. }) => {
+                Err(Error::CommitConflict { .. }) => {
                     // The merge's outputs are already deleted; reload the copy
                     // to see what the conflicting writer left and keep going.
                     if let Err(error) = table.refresh() {
@@ -475,12 +485,13 @@ impl CompacterActor {
         table: &CatalogTable,
         pass: CompactionPass,
         reserved: &HashSet<ObjectPath>,
-    ) -> Option<(Vec<FileRef>, MergeKind)> {
+    ) -> Result<Option<(Vec<FileRef>, MergeKind)>> {
         if let Some(inputs) = self.next_small_batch(table, pass, reserved) {
-            return Some((inputs, MergeKind::SmallFiles));
+            return Ok(Some((inputs, MergeKind::SmallFiles)));
         }
-        let inputs = self.next_layout_optimization(table, reserved, pass)?;
-        Some((inputs, MergeKind::LayoutOptimization))
+        Ok(self
+            .next_layout_optimization(table, reserved, pass)?
+            .map(|inputs| (inputs, MergeKind::LayoutOptimization)))
     }
 
     /// Pick one group of files below the target size from a single partition.
@@ -494,9 +505,8 @@ impl CompacterActor {
         pass: CompactionPass,
         reserved: &HashSet<ObjectPath>,
     ) -> Option<Vec<FileRef>> {
-        let mut by_partition: Vec<(Option<crate::PartitionValues>, Vec<&DeltaFileEntry>)> =
-            Vec::new();
-        for entry in table.file_entries() {
+        let mut by_partition: Vec<(Option<PartitionValues>, Vec<&FileEntry>)> = Vec::new();
+        for entry in table.entries().iter() {
             if !is_small_file(entry.file.size, self.target_bytes)
                 || reserved.contains(&entry.file.path)
             {
@@ -531,24 +541,31 @@ impl CompacterActor {
         table: &CatalogTable,
         reserved: &HashSet<ObjectPath>,
         pass: CompactionPass,
-    ) -> Option<Vec<FileRef>> {
-        table.sort_by().first()?;
+    ) -> Result<Option<Vec<FileRef>>> {
+        if table.sort_by().is_empty() {
+            return Ok(None);
+        }
 
-        let mut by_partition: Vec<(
-            Option<crate::PartitionValues>,
-            Vec<overlap::LayoutCandidate<'_>>,
-        )> = Vec::new();
-        for file in table.files() {
-            if is_small_file(file.entry.file.size, self.target_bytes) {
-                continue;
-            }
-            let candidate = overlap::LayoutCandidate::from_table_file(file, table.sort_by());
+        // A candidate is measured on its row groups' bounds, which the table
+        // reads for the large files (in memory for a format that holds every
+        // footer, once per version for one that reads them on demand).
+        let large: Vec<&FileEntry> = table
+            .entries()
+            .iter()
+            .filter(|entry| !is_small_file(entry.file.size, self.target_bytes))
+            .collect();
+        let footers = table.row_groups(&large)?;
+        let mut by_partition: Vec<(Option<PartitionValues>, Vec<overlap::LayoutCandidate<'_>>)> =
+            Vec::new();
+        for (entry, row_groups) in large.iter().zip(&footers) {
+            let candidate =
+                overlap::LayoutCandidate::from_entry(entry, row_groups, table.sort_by());
             match by_partition
                 .iter_mut()
-                .find(|(partition, _)| partition_values_equal(partition, &file.entry.partition))
+                .find(|(partition, _)| partition_values_equal(partition, &entry.partition))
             {
                 Some((_, files)) => files.push(candidate),
-                None => by_partition.push((file.entry.partition.clone(), vec![candidate])),
+                None => by_partition.push((entry.partition.clone(), vec![candidate])),
             }
         }
 
@@ -558,20 +575,26 @@ impl CompacterActor {
             .collect();
         let cache = self.overlap_caches.entry(table.id()).or_default();
         cache.observe(&partitions, table.sort_by());
-        let group = cache.select_group(reserved, pass, self.layout_clique_size)?;
+        let Some(group) = cache.select_group(reserved, pass, self.layout_clique_size) else {
+            return Ok(None);
+        };
         let files_by_path: HashMap<&str, &FileRef> = by_partition
             .iter()
             .flat_map(|(_, candidates)| candidates.iter())
             .map(|candidate| (candidate.entry.file.path.as_str(), &candidate.entry.file))
             .collect();
-        Some(
+        Ok(Some(
             group
                 .iter()
                 .map(|path| files_by_path[path.as_str()].clone())
                 .collect(),
-        )
+        ))
     }
 }
+
+/// What one merge hands back: the input paths it held reserved, beside the
+/// output files it committed or why it did not.
+type MergeOutcome = (Vec<ObjectPath>, Result<Vec<TableFile>>);
 
 /// Rewrite `inputs` into target-sized outputs and swap them into the table in
 /// one commit. Returns the input paths beside the outcome so the round can
@@ -580,17 +603,23 @@ impl CompacterActor {
 async fn compact_batch(
     datastore: Arc<PivotlakeDatastore>,
     name: SchemaQualifiedTableName,
-    id: uuid::Uuid,
+    id: Uuid,
     inputs: Vec<FileRef>,
     kind: MergeKind,
     target_bytes: u64,
-) -> (Vec<ObjectPath>, crate::Result<Vec<TableFile>>) {
+) -> MergeOutcome {
     let reserved_paths: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
     let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
     // `spawn_blocking` needs a `'static` closure, so the merge takes the
     // datastore handle rather than a borrow of it.
     let merged = match tokio::task::spawn_blocking(move || {
-        compact_table_files(&datastore, id, &inputs, ROW_GROUP_ROWS, target_bytes)
+        compact_table_files(
+            datastore.as_ref(),
+            id,
+            &inputs,
+            ROW_GROUP_ROWS,
+            target_bytes,
+        )
     })
     .await
     {
@@ -599,7 +628,7 @@ async fn compact_batch(
         Err(error) => {
             return (
                 reserved_paths,
-                Err(crate::Error::CompactionJobPanicked(error.to_string())),
+                Err(Error::CompactionJobPanicked(error.to_string())),
             );
         }
     };
@@ -622,7 +651,7 @@ async fn compact_batch(
 /// they return: a merge body runs on the blocking pool, where dropping its
 /// handle does not stop it, so a round that is giving up still waits for its
 /// own rewrites to finish before the next one selects.
-async fn drain_merges(in_flight: &mut JoinSet<(Vec<ObjectPath>, crate::Result<Vec<TableFile>>)>) {
+async fn drain_merges(in_flight: &mut JoinSet<MergeOutcome>) {
     while let Some(joined) = in_flight.join_next().await {
         match joined {
             Ok((_, Err(error))) => warn!(error = %error, "compaction merge failed"),
@@ -650,12 +679,12 @@ impl MergeKind {
 /// Integer file sizes below the mathematical half-target are genuinely small.
 /// `div_ceil` makes a five-byte target classify sizes 0, 1, and 2 as small,
 /// while an exact half is always full enough for layout work.
-fn is_small_file(size: u64, target_bytes: u64) -> bool {
+pub fn is_small_file(size: u64, target_bytes: u64) -> bool {
     size < target_bytes.div_ceil(2)
 }
 
 fn small_file_batch(
-    files: Vec<&DeltaFileEntry>,
+    files: Vec<&FileEntry>,
     merge_target_bytes: u64,
     min_files: usize,
 ) -> Option<Vec<FileRef>> {
@@ -696,10 +725,10 @@ fn small_file_batch(
 }
 
 /// Merge `inputs` of the table with identity `id` into fresh target-sized files
-/// and swap them in for the inputs, in one log commit labelled a rearrangement.
+/// and swap them in for the inputs, in one commit labelled a rearrangement.
 /// `inputs` must share one partition tuple; the caller batches them so. Returns
 /// the merged files with their footers in hand, so a caller holding its own
-/// table copy can fold the swap in without reloading the log.
+/// table copy can fold the swap in without reloading the metadata.
 ///
 /// The merge itself (decode, re-encode, upload) runs off a plain read copy of
 /// the table with no commit lock held, so it never blocks a concurrent INSERT's
@@ -714,18 +743,20 @@ fn small_file_batch(
 /// Blocking store I/O, so callers run it on the blocking pool.
 pub fn compact_table_files(
     datastore: &PivotlakeDatastore,
-    id: uuid::Uuid,
+    id: Uuid,
     inputs: &[FileRef],
     target_rows_per_group: usize,
     max_output_file_size: u64,
-) -> Result<Vec<TableFile>, crate::Error> {
+) -> Result<Vec<TableFile>> {
     let table = datastore
         .table_handle_by_id(&id)
-        .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
+        .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
     let merged = table.merge_files(inputs, target_rows_per_group, max_output_file_size)?;
 
     let outputs = merged.clone();
     let removed: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
+    // The swap goes through the datastore's one in-process write path, under
+    // the table's commit lock.
     if let Err(error) = datastore.commit_to_table(id, &removed, merged, false) {
         for file in &outputs {
             if let Err(cleanup_error) = table.delete_data_file(&file.file_ref().path) {
@@ -742,10 +773,7 @@ pub fn compact_table_files(
     Ok(outputs)
 }
 
-fn partition_values_equal(
-    left: &Option<crate::PartitionValues>,
-    right: &Option<crate::PartitionValues>,
-) -> bool {
+fn partition_values_equal(left: &Option<PartitionValues>, right: &Option<PartitionValues>) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => scalar_values_equal(left, right),
@@ -756,70 +784,20 @@ fn partition_values_equal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PivotlakeDatastore;
+    use std::sync::Arc;
+
+    use crate::file_entry::scalar_values_equal;
+    use crate::{CatalogTable, PivotlakeDatastore};
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, Scalar};
     use arrow_schema::{DataType, Field, Schema};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
+    use object_storage::ObjectPath;
     use parquet::arrow::ArrowWriter;
     use parquet_engine::ParquetTable;
     use planner::catalog::SchemaQualifiedTableName;
     use std::path::Path;
 
     const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
-
-    fn file_entry(path: &str, size: u64) -> DeltaFileEntry {
-        DeltaFileEntry::new(FileRef {
-            path: ObjectPath::new(path),
-            size,
-        })
-    }
-
-    #[test]
-    fn only_files_strictly_below_half_target_are_small() {
-        assert!(is_small_file(49, 100));
-        assert!(!is_small_file(50, 100));
-        assert!(!is_small_file(80, 100));
-
-        assert!(is_small_file(2, 5));
-        assert!(!is_small_file(3, 5));
-    }
-
-    #[test]
-    fn small_files_merge_at_configured_target() {
-        let files = [file_entry("a", 70), file_entry("b", 59), file_entry("c", 1)];
-
-        let batch = small_file_batch(files.iter().collect(), 130, 100).unwrap();
-
-        assert_eq!(
-            batch.iter().map(|file| file.size).collect::<Vec<_>>(),
-            [70, 59, 1]
-        );
-    }
-
-    #[test]
-    fn small_file_fallback_removes_largest_until_balanced() {
-        const MIB: u64 = 1024 * 1024;
-        let mut files = vec![file_entry("outlier", 500 * MIB)];
-        files.extend((0..99).map(|index| file_entry(&format!("small-{index}"), MIB)));
-
-        let batch = small_file_batch(files.iter().collect(), 2 * 1024 * MIB, 100).unwrap();
-
-        assert_eq!(batch.len(), 99, "the check continues below 100 files");
-        assert!(batch.iter().all(|file| file.path.as_str() != "outlier"));
-    }
-
-    #[test]
-    fn small_file_fallback_uses_configured_minimum() {
-        let files: Vec<_> = (0..5)
-            .map(|index| file_entry(&format!("small-{index}"), 1))
-            .collect();
-
-        let allowed = small_file_batch(files.iter().collect(), 100, 5);
-        let waiting = small_file_batch(files.iter().collect(), 100, 6);
-
-        assert_eq!(allowed.unwrap().len(), 5);
-        assert!(waiting.is_none());
-    }
 
     /// Write `values` as a small SNAPPY Parquet file (single Int64 `Timestamp`
     /// column) into `dir` under `file_name`. A table created over `dir` picks it
@@ -1173,7 +1151,7 @@ mod tests {
         datastore: Arc<PivotlakeDatastore>,
         name: SchemaQualifiedTableName,
         table: CatalogTable,
-        pass: CompactionPass,
+        final_sweep: bool,
     ) -> u64 {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1190,10 +1168,7 @@ mod tests {
                     datastore,
                 );
                 let actor = tokio::spawn(actor.run());
-                let sweeps = compacter
-                    .compact(name, table, pass == CompactionPass::Final)
-                    .await
-                    .unwrap();
+                let sweeps = compacter.compact(name, table, final_sweep).await.unwrap();
                 actor.abort();
                 sweeps
             })
@@ -1209,8 +1184,12 @@ mod tests {
         std::fs::create_dir_all(&adopted).unwrap();
         write_parquet_file(&adopted, "a.parquet", vec![1]);
         write_parquet_file(&adopted, "b.parquet", vec![2]);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1240,7 +1219,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             captured,
-            CompactionPass::Routine,
+            false,
         );
 
         assert_eq!(sweeps, 2, "one merging pass and one that finds nothing");
@@ -1260,8 +1239,12 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
         write_parquet_file(&adopted_dir, "c.parquet", vec![1_000, 1_100]);
         write_parquet_file(&adopted_dir, "d.parquet", vec![1_000, 1_100]);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1305,8 +1288,12 @@ mod tests {
         ] {
             write_parquet_file(&adopted_dir, file, rows);
         }
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1341,8 +1328,12 @@ mod tests {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let encoded = tempfile::tempdir().unwrap();
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let mut table = datastore.table_handle(&name).unwrap();
@@ -1373,7 +1364,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             table.clone(),
-            CompactionPass::Routine,
+            false,
         );
         let routine_files = datastore.table_handle(&name).unwrap().file_refs().len();
         let final_sweeps = run_command(
@@ -1381,7 +1372,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             table,
-            CompactionPass::Final,
+            true,
         );
 
         assert_eq!(routine_sweeps, 1);
@@ -1407,8 +1398,12 @@ mod tests {
         write_parquet_file_with_row_group_size(&adopted, "b.parquet", (12..32).collect(), 1);
         write_parquet_file_with_row_group_size(&adopted, "c.parquet", (100..120).collect(), 1);
         write_parquet_file_with_row_group_size(&adopted, "d.parquet", (119..139).collect(), 1);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1435,7 +1430,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             table,
-            CompactionPass::Routine,
+            false,
         );
         let after_routine = datastore.table_handle(&name).unwrap();
         let routine_files: Vec<String> = after_routine
@@ -1451,7 +1446,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             after_routine,
-            CompactionPass::Final,
+            true,
         );
 
         assert_eq!(routine_files.len(), 3);
@@ -1478,8 +1473,12 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![4, 5]);
         write_parquet_file(&adopted_dir, "c.parquet", vec![6, 7, 8, 9]);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1539,8 +1538,12 @@ mod tests {
         write_wide_parquet_file(&adopted, "b.parquet", ROWS_PER_INPUT, 29);
         write_wide_parquet_file(&adopted, "c.parquet", ROWS_PER_INPUT, 47);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1587,8 +1590,12 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
         write_parquet_file(&adopted_dir, "c.parquet", vec![1_000, 1_100]);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1631,8 +1638,12 @@ mod tests {
         write_wide_parquet_file(&adopted, "left.parquet", ROWS_PER_INPUT, 11);
         write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1683,7 +1694,8 @@ mod tests {
         );
 
         let mut ranges: Vec<(i64, i64)> = compacted
-            .file_entries()
+            .entries()
+            .iter()
             .map(|entry| {
                 let stats = entry.stats.as_ref().unwrap();
                 let scalar = |values: &std::collections::HashMap<String, ArrayRef>| {
@@ -1757,7 +1769,7 @@ mod tests {
             datastore.clone(),
             name,
             after_normal,
-            CompactionPass::Final,
+            true,
         );
         assert_eq!(final_sweeps, 1);
         assert_eq!(
@@ -1781,8 +1793,12 @@ mod tests {
         write_wide_parquet_file(&adopted, "first.parquet", ROWS_PER_INPUT, 11);
         write_wide_parquet_file(&adopted, "second.parquet", ROWS_PER_INPUT, 29);
         write_wide_parquet_file(&adopted, "third.parquet", ROWS_PER_INPUT, 47);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1811,7 +1827,8 @@ mod tests {
         assert!(outputs.iter().all(|file| file.size <= target));
         assert!(outputs.iter().all(|file| !is_small_file(file.size, target)));
         let mut ranges: Vec<(i64, i64)> = compacted
-            .file_entries()
+            .entries()
+            .iter()
             .map(|entry| {
                 let stats = entry.stats.as_ref().unwrap();
                 let scalar = |values: &std::collections::HashMap<String, ArrayRef>| {
@@ -1875,8 +1892,12 @@ mod tests {
         std::fs::create_dir_all(&adopted_dir).unwrap();
         write_parquet_file(&adopted_dir, "a.parquet", vec![0, 100]);
         write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1904,7 +1925,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             after_routine.clone(),
-            CompactionPass::Final,
+            true,
         );
 
         assert_eq!(after_routine.version(), before_version);
@@ -1941,8 +1962,12 @@ mod tests {
         write_parquet_file(&adopted, "s1.parquet", vec![2, 3]);
         write_parquet_file(&adopted, "s2.parquet", vec![8, 9]);
         write_parquet_file(&adopted, "s3.parquet", vec![14, 15]);
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1969,7 +1994,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             after_routine.clone(),
-            CompactionPass::Final,
+            true,
         );
 
         assert_eq!(after_routine.version(), before_version);
@@ -1983,7 +2008,8 @@ mod tests {
                 .all(|file| file.path.name().starts_with("pivot-"))
         );
         let mut ranges: Vec<(i64, i64)> = settled
-            .file_entries()
+            .entries()
+            .iter()
             .map(|entry| {
                 let stats = entry.stats.as_ref().unwrap();
                 let scalar = |values: &std::collections::HashMap<String, ArrayRef>| {
@@ -2025,8 +2051,12 @@ mod tests {
         write_wide_parquet_file(&adopted, "left.parquet", ROWS_PER_INPUT, 11);
         write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let table = datastore
             .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
@@ -2058,8 +2088,12 @@ mod tests {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let encoded = tempfile::tempdir().unwrap();
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
 
         // Two inputs in each partition. If batching crossed the partition
@@ -2107,7 +2141,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             table,
-            CompactionPass::Routine,
+            false,
         );
 
         // One round merges each partition's small files in turn; a second round
@@ -2121,7 +2155,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             datastore.table_handle(&name).unwrap(),
-            CompactionPass::Routine,
+            false,
         );
 
         // Reload from Delta rather than trusting the in-memory swap. Exactly one
@@ -2214,8 +2248,12 @@ mod tests {
         write_parquet_file(&adopted_dir, "a.parquet", vec![1, 2]);
         write_parquet_file(&adopted_dir, "b.parquet", vec![3]);
 
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormatKind::Delta),
+        )
+        .unwrap();
         // A relative adoption path: the files are read at `events` under the
         // store root, rather than at an absolute path of their own.
         create_table(
@@ -2247,7 +2285,7 @@ mod tests {
             datastore.clone(),
             name.clone(),
             datastore.table_handle(&name).unwrap(),
-            CompactionPass::Final,
+            true,
         );
 
         // One merged object replaced the two inputs, in the store and in the
@@ -2277,5 +2315,59 @@ mod tests {
         assert_eq!(rows, 3);
 
         dispatch.exit();
+    }
+
+    fn file_entry(path: &str, size: u64) -> FileEntry {
+        FileEntry::new(FileRef {
+            path: ObjectPath::new(path),
+            size,
+        })
+    }
+
+    #[test]
+    fn only_files_strictly_below_half_target_are_small() {
+        assert!(is_small_file(49, 100));
+        assert!(!is_small_file(50, 100));
+        assert!(!is_small_file(80, 100));
+
+        assert!(is_small_file(2, 5));
+        assert!(!is_small_file(3, 5));
+    }
+
+    #[test]
+    fn small_files_merge_at_configured_target() {
+        let files = [file_entry("a", 70), file_entry("b", 59), file_entry("c", 1)];
+
+        let batch = small_file_batch(files.iter().collect(), 130, 100).unwrap();
+
+        assert_eq!(
+            batch.iter().map(|file| file.size).collect::<Vec<_>>(),
+            [70, 59, 1]
+        );
+    }
+
+    #[test]
+    fn small_file_fallback_removes_largest_until_balanced() {
+        const MIB: u64 = 1024 * 1024;
+        let mut files = vec![file_entry("outlier", 500 * MIB)];
+        files.extend((0..99).map(|index| file_entry(&format!("small-{index}"), MIB)));
+
+        let batch = small_file_batch(files.iter().collect(), 2 * 1024 * MIB, 100).unwrap();
+
+        assert_eq!(batch.len(), 99, "the check continues below 100 files");
+        assert!(batch.iter().all(|file| file.path.as_str() != "outlier"));
+    }
+
+    #[test]
+    fn small_file_fallback_uses_configured_minimum() {
+        let files: Vec<_> = (0..5)
+            .map(|index| file_entry(&format!("small-{index}"), 1))
+            .collect();
+
+        let allowed = small_file_batch(files.iter().collect(), 100, 5);
+        let waiting = small_file_batch(files.iter().collect(), 100, 6);
+
+        assert_eq!(allowed.unwrap().len(), 5);
+        assert!(waiting.is_none());
     }
 }

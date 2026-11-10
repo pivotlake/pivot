@@ -1841,23 +1841,22 @@ name = "datastore-iceberg"
 version = "0.1.1"
 dependencies = [
  "arrow-array",
- "arrow-cast",
  "arrow-schema",
  "async-trait",
  "bytes",
  "catalog",
- "crossbeam-deque",
+ "datastore-iceberg",
  "dispatch",
  "futures",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
+ "iceberg-tables",
  "object-storage",
  "parquet",
  "parquet-engine",
  "planner",
  "reqwest 0.12.28",
- "roaring",
  "serde",
  "serde_json",
  "tempfile",
@@ -1865,9 +1864,11 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "typetag",
  "ureq",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1891,6 +1892,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "dispatch",
+ "iceberg-tables",
  "object-storage",
  "parquet",
  "parquet-engine",
@@ -2884,7 +2886,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c77bbc4372d08faa81fa36026bfe186df25b6a43"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2943,7 +2945,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c77bbc4372d08faa81fa36026bfe186df25b6a43"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2963,7 +2965,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c77bbc4372d08faa81fa36026bfe186df25b6a43"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2973,7 +2975,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c5dd13eda9fe73286e94216c644cfdd752630521"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#c77bbc4372d08faa81fa36026bfe186df25b6a43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2987,6 +2989,33 @@ dependencies = [
  "serde",
  "typetag",
  "url",
+]
+
+[[package]]
+name = "iceberg-tables"
+version = "0.1.1"
+dependencies = [
+ "arrow-array",
+ "arrow-cast",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "crossbeam-deque",
+ "dispatch",
+ "futures",
+ "iceberg",
+ "object-storage",
+ "parquet-engine",
+ "planner",
+ "roaring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "typetag",
+ "uuid",
 ]
 
 [[package]]

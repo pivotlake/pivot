@@ -46,7 +46,7 @@ use planner::catalog::Column;
 use planner::types::Type;
 use url::Url;
 
-use crate::manifest::DeltaFileEntry;
+use crate::file_entry::FileEntry;
 use object_storage::{FileRef, ObjectPath, ObjectStore, StoreConnection};
 
 #[derive(Debug, thiserror::Error)]
@@ -131,7 +131,7 @@ pub(crate) struct DeltaTableState {
     pub columns: Vec<Column>,
     pub partition_by: Vec<String>,
     pub sort_by: Vec<String>,
-    pub file_entries: Vec<DeltaFileEntry>,
+    pub file_entries: Vec<FileEntry>,
     /// The files the log retired but still remembers, each by the Unix ms its
     /// commit retired it.
     pub tombstones: HashMap<ObjectPath, u64>,
@@ -147,7 +147,7 @@ pub(crate) fn initialize_table(
     columns: &[Column],
     partition_by: &[String],
     sort_by: &[String],
-    entries: &[DeltaFileEntry],
+    entries: &[FileEntry],
 ) -> Result<Arc<Snapshot>, Error> {
     let uri = table_uri(&store.location_uri(), location)?;
     // Kernel canonicalizes the table root before writing v0, so on a local
@@ -206,8 +206,8 @@ pub(crate) fn initialize_table(
 pub(crate) fn commit_file_changes(
     engine: &DeltaEngine,
     snapshot: &Arc<Snapshot>,
-    removed: &[DeltaFileEntry],
-    added: &[DeltaFileEntry],
+    removed: &[FileEntry],
+    added: &[FileEntry],
     data_change: bool,
 ) -> Result<Option<Arc<Snapshot>>, Error> {
     let mut txn = snapshot
@@ -325,7 +325,7 @@ fn maybe_checkpoint(engine: &DeltaEngine, snapshot: Arc<Snapshot>) -> Arc<Snapsh
 /// Kernel accepts the same scan-row shape it normally produces while scanning a
 /// snapshot, so constructing those rows directly avoids rereading every active
 /// Add action merely to remove a small compaction batch.
-fn stage_removals(txn: &mut Transaction, removed: &[DeltaFileEntry]) -> Result<(), Error> {
+fn stage_removals(txn: &mut Transaction, removed: &[FileEntry]) -> Result<(), Error> {
     if removed.is_empty() {
         return Ok(());
     }
@@ -341,7 +341,7 @@ fn stage_removals(txn: &mut Transaction, removed: &[DeltaFileEntry]) -> Result<(
 /// deletion vectors or row tracking, and its catalog entries preserve the
 /// fields relevant to that supported subset: path, size, and partition values.
 fn remove_files_metadata(
-    entries: &[DeltaFileEntry],
+    entries: &[FileEntry],
 ) -> Result<Box<dyn delta_kernel::EngineData>, Error> {
     let schema: arrow_schema::Schema = delta_kernel::scan::scan_row_schema()
         .as_ref()
@@ -496,7 +496,7 @@ impl RowVisitor for RemoveTombstoneVisitor {
 /// empty for unpartitioned files), `size`, `modificationTime`; Kernel extends
 /// these to the full `Add` action and stamps `dataChange` from the transaction.
 fn add_files_metadata(
-    entries: &[DeltaFileEntry],
+    entries: &[FileEntry],
     modification_time: u64,
 ) -> Result<Box<dyn delta_kernel::EngineData>, Error> {
     let mut paths = StringBuilder::new();
@@ -586,7 +586,7 @@ fn concat_column(arrays: Vec<ArrayRef>) -> Result<ArrayRef, Error> {
 /// pass fills both: each row holds that entry's typed bound, or a null where it
 /// records none. Empty structs when nothing is bounded. Sorted column order gives
 /// the batch one stable schema.
-fn build_bounds_stats(entries: &[DeltaFileEntry]) -> Result<(ArrayRef, ArrayRef), Error> {
+fn build_bounds_stats(entries: &[FileEntry]) -> Result<(ArrayRef, ArrayRef), Error> {
     // A column's type comes from any entry that records it (all agree). One pass
     // into a BTreeMap yields the column union, each type, and a stable order.
     let mut types: std::collections::BTreeMap<&str, &ArrowDataType> = Default::default();
@@ -634,7 +634,7 @@ fn build_bounds_stats(entries: &[DeltaFileEntry]) -> Result<(ArrayRef, ArrayRef)
 
 /// Build the `nullCount` stats sub-struct: one `Long` field per column any entry
 /// has a null count for, each row that entry's count or null when it has none.
-fn build_null_count_stats(entries: &[DeltaFileEntry]) -> Result<ArrayRef, Error> {
+fn build_null_count_stats(entries: &[FileEntry]) -> Result<ArrayRef, Error> {
     let names: std::collections::BTreeSet<&str> = entries
         .iter()
         .filter_map(|entry| entry.stats.as_ref())
@@ -892,7 +892,7 @@ fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTabl
         .with_stats(StatsOptions::all_struct())
         .build()?;
     let mut files = Vec::new();
-    let mut stats_by_path: HashMap<String, crate::manifest::FileStats> = HashMap::new();
+    let mut stats_by_path: HashMap<String, parquet_engine::FileStats> = HashMap::new();
     for metadata in scan.scan_metadata(engine.kernel())? {
         let scan_metadata = metadata?;
         files = scan_metadata.visit_scan_files(files, collect_scan_file)?;
@@ -1050,7 +1050,7 @@ fn scan_file_entry(
     column_types: &HashMap<&str, &Type>,
     delta_types: &HashMap<String, DeltaDataType>,
     partition_columns: &[String],
-) -> Result<DeltaFileEntry, Error> {
+) -> Result<FileEntry, Error> {
     if file.dv_info.has_vector() {
         return Err(Error::DeletionVector(file.path));
     }
@@ -1090,7 +1090,7 @@ fn scan_file_entry(
         // a null value. Keep an empty/partial map so pruning remains soft.
         Some(values)
     };
-    Ok(DeltaFileEntry {
+    Ok(FileEntry {
         file: FileRef {
             path: ObjectPath::new(file.path),
             size,
@@ -1103,7 +1103,7 @@ fn scan_file_entry(
 }
 
 /// Read each scan file's `stats_parsed` struct out of one metadata batch and
-/// record its [`FileStats`](crate::manifest::FileStats) by path, for the loader to
+/// record its [`FileStats`](parquet_engine::FileStats) by path, for the loader to
 /// join onto the file entries. Kernel emits `stats_parsed` typed to the table's
 /// schema (min/max as the column's own type, null counts and row count as longs),
 /// so the bounds are ready to prune against a query's typed constants with no
@@ -1113,7 +1113,7 @@ fn scan_file_entry(
 fn collect_file_stats(
     data: Box<dyn EngineData>,
     live: &[bool],
-    stats_by_path: &mut HashMap<String, crate::manifest::FileStats>,
+    stats_by_path: &mut HashMap<String, parquet_engine::FileStats>,
 ) -> Result<(), Error> {
     let data: Arc<dyn EngineData> = Arc::from(data);
     let arrow = data.as_any().downcast::<ArrowEngineData>().map_err(|_| {
@@ -1146,7 +1146,7 @@ fn collect_file_stats(
         };
         stats_by_path.insert(
             path,
-            crate::manifest::FileStats {
+            parquet_engine::FileStats {
                 // Left `None` when the log recorded no `numRecords` for this file,
                 // so an unknown count is not mistaken for an empty file.
                 num_records: num_records
@@ -1512,7 +1512,7 @@ mod tests {
         let mut txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), kernel)
             .unwrap();
-        let entry = DeltaFileEntry::new(FileRef {
+        let entry = FileEntry::new(FileRef {
             path: ObjectPath::new("part-0.parquet"),
             size: 123,
         });
@@ -1572,13 +1572,13 @@ mod tests {
     fn load_reads_persisted_stats_from_the_log() {
         let dir = tempfile::tempdir().unwrap();
         let table = create_test_table(dir.path());
-        let entry = DeltaFileEntry {
+        let entry = FileEntry {
             file: FileRef {
                 path: ObjectPath::new("part-0.parquet"),
                 size: 123,
             },
             partition: None,
-            stats: Some(Arc::new(crate::manifest::FileStats {
+            stats: Some(Arc::new(parquet_engine::FileStats {
                 num_records: Some(5),
                 min_values: HashMap::from([(
                     "value".to_string(),
@@ -1707,7 +1707,7 @@ mod tests {
     fn commit_and_checkpoint_each(table: &TestTable, names: &[&str]) -> Arc<Snapshot> {
         let mut snapshot = table.snapshot.clone();
         for name in names {
-            let entry = DeltaFileEntry::new(FileRef {
+            let entry = FileEntry::new(FileRef {
                 path: ObjectPath::new(format!("{name}.parquet")),
                 size: 1,
             });
@@ -1732,7 +1732,7 @@ mod tests {
         // previous commit handed back, so no version reads the log to be written.
         let mut snapshot = table.snapshot.clone();
         for version in 1..=DEFAULT_CHECKPOINT_INTERVAL {
-            let entry = DeltaFileEntry::new(FileRef {
+            let entry = FileEntry::new(FileRef {
                 path: ObjectPath::new(format!("f{version}.parquet")),
                 size: 1,
             });
@@ -1763,7 +1763,7 @@ mod tests {
         let table = create_test_table(dir.path());
 
         // Add a file (v1), then remove it (v2).
-        let entry = DeltaFileEntry::new(FileRef {
+        let entry = FileEntry::new(FileRef {
             path: ObjectPath::new("f.parquet"),
             size: 1,
         });
@@ -1935,7 +1935,7 @@ mod tests {
         let table = create_test_table(dir.path());
         let log_dir = dir.path().join("t").join("_delta_log");
         let entry = |name: &str| {
-            DeltaFileEntry::new(FileRef {
+            FileEntry::new(FileRef {
                 path: ObjectPath::new(name),
                 size: 1,
             })
@@ -2032,7 +2032,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let table = create_test_table(dir.path());
         let entry = |name: &str| {
-            DeltaFileEntry::new(FileRef {
+            FileEntry::new(FileRef {
                 path: ObjectPath::new(name),
                 size: 1,
             })
@@ -2066,7 +2066,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let table = create_test_table(dir.path());
         let entry = |name: &str| {
-            DeltaFileEntry::new(FileRef {
+            FileEntry::new(FileRef {
                 path: ObjectPath::new(name),
                 size: 1,
             })
