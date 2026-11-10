@@ -12,7 +12,6 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, Thread};
-#[cfg(not(any(debug_assertions, feature = "unbounded-park")))]
 use std::time::Duration;
 
 thread_local! {
@@ -290,6 +289,27 @@ impl WorkerWaker {
     /// even without a notification; debug builds and builds with the
     /// `unbounded-park` feature park until notified.
     pub fn wait_if_unchanged(&self, last_seen: u64, local_idx: usize) -> u64 {
+        self.wait_if_unchanged_with(last_seen, local_idx, park)
+    }
+
+    /// Like [`wait_if_unchanged`](Self::wait_if_unchanged), but the park also
+    /// ends once `timeout` has passed, in every build. For a worker that has
+    /// work of its own scheduled for later and must wake for it unprompted.
+    pub fn wait_if_unchanged_for(
+        &self,
+        last_seen: u64,
+        local_idx: usize,
+        timeout: Duration,
+    ) -> u64 {
+        self.wait_if_unchanged_with(last_seen, local_idx, || thread::park_timeout(timeout))
+    }
+
+    fn wait_if_unchanged_with(
+        &self,
+        last_seen: u64,
+        local_idx: usize,
+        park_thread: impl FnOnce(),
+    ) -> u64 {
         let slot = &self.slots[local_idx];
         slot.parked.store(true, Ordering::SeqCst);
         self.parked_workers.fetch_add(1, Ordering::SeqCst);
@@ -301,7 +321,7 @@ impl WorkerWaker {
             }
             return self.wake_count.load(Ordering::SeqCst);
         }
-        park();
+        park_thread();
         if slot.parked.swap(false, Ordering::SeqCst) {
             self.parked_workers.fetch_sub(1, Ordering::SeqCst);
         }
@@ -531,6 +551,18 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+        assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_timed_park_returns_without_a_notification() {
+        let waker = Arc::new(WorkerWaker::new(1));
+        waker.register(0);
+        let last_seen = waker.wake_count();
+
+        let seen = waker.wait_if_unchanged_for(last_seen, 0, Duration::from_millis(1));
+
+        assert_eq!(seen, last_seen);
         assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
     }
 

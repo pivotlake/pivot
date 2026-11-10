@@ -28,7 +28,7 @@ use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
-use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
+use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker, waker_set};
 use ahash::HashMap;
 use core_affinity::CoreId;
 use std::cell::{Cell, RefCell};
@@ -39,6 +39,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 ///
 /// Dirty-buffer cleanup waits for zero to avoid competing with a running query.
 static LIVE_DATAFLOWS: AtomicUsize = AtomicUsize::new(0);
+
+/// Finished per-worker dataflows across the pool whose teardown is still to
+/// come (see [`TEARDOWN_QUIET_PERIOD`]).
+///
+/// The worker that brings it to zero wakes the pool to zero the buffers the
+/// teardowns returned: by then all of them are back in their pools.
+static RETIRED_DATAFLOWS: AtomicUsize = AtomicUsize::new(0);
 
 /// Spin budget while a **dataflow is in flight** but this worker momentarily has
 /// nothing to do (waiting on a pipeline-stage barrier / for a sibling to produce
@@ -71,7 +78,22 @@ fn in_flight_spin_limit() -> u32 {
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use std::{result, thread};
+
+/// How long a worker leaves its core idle after finishing a dataflow before it
+/// tears the dataflow's state down.
+///
+/// A finished query's result still has to travel: the thread collecting it
+/// wakes, hands it to the connection, and the client wakes to read it. Those
+/// threads are not pinned, and a thread that wakes onto a core whose worker is
+/// busy in user space waits for the scheduler to preempt the worker, which can
+/// take a whole time slice. Teardown and buffer zeroing are exactly such busy
+/// work, on every core at once, so starting them the moment the dataflow
+/// finishes adds a delay of anywhere between nothing and a slice to the query.
+/// Parked workers leave their cores idle instead, and an idle core runs a
+/// waking thread at once.
+const TEARDOWN_QUIET_PERIOD: Duration = Duration::from_millis(2);
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -142,6 +164,11 @@ pub struct Worker {
     data_flow_queue: Receiver<DataFlowBuilder>,
     /// A mapping of dataflows currently running
     data_flows: HashMap<Identifier, DataFlow>,
+    /// Finished dataflows whose state is still to be torn down.
+    retired_data_flows: Vec<DataFlow>,
+    /// When that teardown is due (see [`TEARDOWN_QUIET_PERIOD`]); `None` when
+    /// nothing is waiting for it.
+    retired_teardown_due: Option<Instant>,
     /// Did the worker do work on last iteration? This is used to decide whether the worker should
     /// do background tasks, just as cleaning
     did_work_last_iteration: bool,
@@ -223,6 +250,8 @@ impl Worker {
                     io: Rc::new(RefCell::new(IORequester::new(disk_cache))),
                     id: core.id,
                     data_flows: Default::default(),
+                    retired_data_flows: Vec::new(),
+                    retired_teardown_due: None,
                     data_flow_queue: receiver,
                     did_work_last_iteration: false,
                     should_exit,
@@ -404,9 +433,37 @@ impl Worker {
             debug!("Finished data flow {:?}", id);
             if let Some(mut flow) = self.data_flows.remove(&id) {
                 flow.stats().report();
-                drop(flow);
+                self.retired_data_flows.push(flow);
+                RETIRED_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
+                self.retired_teardown_due = Some(Instant::now() + TEARDOWN_QUIET_PERIOD);
                 self.release_live_dataflow();
             }
+        }
+    }
+
+    /// Tear down the finished dataflows once their quiet period has passed.
+    fn tear_down_retired_dataflows_when_due(&mut self) {
+        if let Some(due) = self.retired_teardown_due
+            && Instant::now() >= due
+        {
+            self.tear_down_retired_dataflows();
+        }
+    }
+
+    /// Drop every finished dataflow, returning its buffers to the pools. The
+    /// last worker of the pool to do so wakes every node's workers so they
+    /// can zero the buffers that came back to them: returning a buffer does
+    /// not wake its home worker, which may already be parked, and may be on
+    /// another node than the worker returning it.
+    fn tear_down_retired_dataflows(&mut self) {
+        let torn_down = self.retired_data_flows.len();
+        if torn_down == 0 {
+            return;
+        }
+        self.retired_data_flows.clear();
+        self.retired_teardown_due = None;
+        if RETIRED_DATAFLOWS.fetch_sub(torn_down, Ordering::Relaxed) == torn_down {
+            waker_set().notify_all();
         }
     }
 
@@ -425,21 +482,13 @@ impl Worker {
             drop(flow);
             self.release_live_dataflow();
         }
+        self.tear_down_retired_dataflows();
     }
 
-    /// Decrements the pool-wide count after a dataflow instance is dropped.
-    ///
-    /// When the count reaches zero, wake parked workers so they can zero the
-    /// query's returned buffers before the next query. Returning a buffer does
-    /// not wake its home worker, which may already be parked.
-    ///
-    /// The dataflow must be dropped before this call so all of its buffers are
-    /// in the free pools when workers wake. See
-    /// [`Self::clear_dirty_buffer_or_park`].
+    /// Decrements the pool-wide count once a dataflow instance has finished
+    /// running on this worker.
     fn release_live_dataflow(&self) {
-        if LIVE_DATAFLOWS.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.waker.notify();
-        }
+        LIVE_DATAFLOWS.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Attempt to steal work from sibling workers' channels when this worker is idle.
@@ -472,7 +521,11 @@ impl Worker {
         //
         // Ideally, we would do cleanup also when you have dataflows above a certain
         // threshold of dirty buffers - but we don't have that implemented yet.
+        //
+        // A worker still inside its quiet period zeroes nothing either: the
+        // point of the period is an idle core.
         if LIVE_DATAFLOWS.load(Ordering::Relaxed) == 0
+            && self.retired_teardown_due.is_none()
             && let Some(b) = memory_ctx().pop_dirty_buffer()
         {
             b.zero_out();
@@ -480,7 +533,11 @@ impl Worker {
             // Bound work per pass: zero one buffer, then hand
             // control back to the main loop so a newly-arrived
             // dataflow / new stealable work isn't starved behind
-            // a long cleanup run.
+            // a long cleanup run. The yield does the same for other threads:
+            // one that woke onto this core while the buffer was being zeroed
+            // (a connection with the next query, say) runs now rather than
+            // when the scheduler gets around to preempting the cleanup.
+            thread::yield_now();
             return;
         }
 
@@ -502,9 +559,17 @@ impl Worker {
             }
         }
 
-        self.last_seen_wake_count = self
-            .waker
-            .wait_if_unchanged(self.last_seen_wake_count, self.node_local_idx);
+        self.last_seen_wake_count = match self.retired_teardown_due {
+            // Sleep through the quiet period, then come back for the teardown.
+            Some(due) => self.waker.wait_if_unchanged_for(
+                self.last_seen_wake_count,
+                self.node_local_idx,
+                due.saturating_duration_since(Instant::now()),
+            ),
+            None => self
+                .waker
+                .wait_if_unchanged(self.last_seen_wake_count, self.node_local_idx),
+        };
         self.waker
             .finish_delegated_wake(&mut self.last_seen_broadcast);
     }
@@ -523,9 +588,15 @@ impl Worker {
                 true
             }
         });
+        let any_cancelled = !cancelled.is_empty();
         for id in cancelled {
             self.io.borrow_mut().cancel_dataflow(id);
             self.release_live_dataflow();
+        }
+        if any_cancelled {
+            // The cancelled dataflows' buffers are back in the pools; wake
+            // their home workers, on whichever node, to zero them.
+            waker_set().notify_all();
         }
     }
 
@@ -550,6 +621,8 @@ impl Worker {
         // or park waiting for this worker's operator to ever exist).
         while let Ok(builder) = self.data_flow_queue.try_recv() {
             debug!("Received data flow...");
+            // The new dataflow needs the buffers the finished ones still hold.
+            self.tear_down_retired_dataflows();
             match builder.build() {
                 Ok(data_flow) => {
                     LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
@@ -575,6 +648,8 @@ impl Worker {
             self.did_work_last_iteration = false;
 
             self.try_receiving_new_dataflow();
+
+            self.tear_down_retired_dataflows_when_due();
 
             self.clear_cancelled_dataflows();
 
