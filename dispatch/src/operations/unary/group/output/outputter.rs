@@ -36,6 +36,10 @@ use std::sync::{Arc, OnceLock};
 /// merging of the current ones.
 const RUNNING_JOBS_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
+/// How far above its estimated share of the groups each merge target is sized
+/// to hold before it has to grow (see the sizing in `create_partition_jobs`).
+const PARTITION_SHARE_HEADROOM: f64 = 1.1;
+
 /// The fewest partitions the merge phase ever runs with. The merge routes each
 /// row by the top `log2(partitions)` bits of its hash, and a single partition
 /// has zero such bits, which leaves no valid shift. Two near-empty jobs cost
@@ -262,7 +266,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 .next_power_of_two();
             // Start each target big enough to hold its share at MAX_LOAD_FACTOR (the
             // merge's resize threshold), so it fills without resizing mid-merge.
-            let per_partition = estimate as f64 / merge_partitions as f64;
+            // The share is the mean of an estimate: the sketch is off by a
+            // percent or two, and a partition's own count scatters around the
+            // mean by about as much again. Sized for the mean exactly, an
+            // estimate just under a power of two leaves half the targets a few
+            // entries short, and each of those regrows fourfold mid-merge.
+            let per_partition =
+                estimate as f64 * PARTITION_SHARE_HEADROOM / merge_partitions as f64;
             let capacity = ((per_partition / MAX_LOAD_FACTOR).ceil() as usize)
                 .next_power_of_two()
                 .max(DEFAULT_CAPACITY);

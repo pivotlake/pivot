@@ -57,6 +57,23 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     shared_bin_totals: Arc<SharedBinTotals>,
 }
 
+/// The seeds every group-by hashes its keys with.
+///
+/// Fixed, so that a query does the same work each time it runs: the hash of a
+/// key decides its scatter bucket, its slot and collisions in every table,
+/// and its register in the distinct-count sketch the merge is sized from. A
+/// seed drawn per query moves all of those, and the sketch's error with them,
+/// so the same query over the same data would plan its merge differently from
+/// one run to the next. The values are arbitrary; they differ from the join's
+/// so that rows a join partitioned by hash do not arrive here already
+/// clustered by the same bits.
+const GROUP_HASH_SEEDS: [u64; 4] = [
+    0x9e37_79b9_7f4a_7c15,
+    0xbf58_476d_1ce4_e5b9,
+    0x94d0_49bb_1331_11eb,
+    0x2545_f491_4f6c_dd1d,
+];
+
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
     /// Create one factory per worker of `topology`, sharing the same arena,
     /// hash state, and synchronization primitives. `key_cols` are the GROUP BY
@@ -73,7 +90,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
     ) -> impl IntoIterator<Item = GroupFactory<K, V>> {
         let key_arena = SharedArena::new(buffers);
         let value_arena = SharedArena::new(buffers);
-        let hash_state = RandomState::new();
+        let hash_state = RandomState::with_seeds(
+            GROUP_HASH_SEEDS[0],
+            GROUP_HASH_SEEDS[1],
+            GROUP_HASH_SEEDS[2],
+            GROUP_HASH_SEEDS[3],
+        );
         let injectors = Arc::new(
             (0..topology.node_count)
                 .map(|_| Injector::new())
