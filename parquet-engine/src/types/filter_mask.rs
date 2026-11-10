@@ -164,6 +164,23 @@ impl RunningFilterMask {
             physical_index: 0,
         }
     }
+    /// Consume the mask's first run if it is a skipped one and nothing has
+    /// been consumed yet, returning its length; zero otherwise. For a caller
+    /// that has a faster way past a page's skipped head than walking it.
+    pub fn take_leading_skip(&mut self) -> usize {
+        if self.physical_index != 0 {
+            return 0;
+        }
+        match self.filter_mask.get_run_type_and_run_end(0) {
+            (false, end) => {
+                self.physical_index = 1;
+                self.previous_run_end = end;
+                end
+            }
+            (true, _) => 0,
+        }
+    }
+
     /// Advance to the next run, returning `(is_kept, count)`.
     ///
     /// `false` runs return their full length. `true` runs are capped at `max_size`;
@@ -361,5 +378,27 @@ mod tests {
         let mut running = RunningFilterMask::new(mask);
 
         assert_eq!(running.next_run(100), (true, 3));
+    }
+
+    #[test]
+    fn a_skipped_head_is_taken_whole_and_the_kept_rows_follow() {
+        let mask = FilterMask::for_row_range(0, 10, &(4..10));
+        let mut running = RunningFilterMask::new(mask);
+
+        let head = running.take_leading_skip();
+
+        assert_eq!(head, 4);
+        assert_eq!(running.next_run(100), (true, 6));
+    }
+
+    #[test]
+    fn a_mask_that_starts_with_kept_rows_has_no_head_to_take() {
+        let mask = FilterMask::for_row_range(0, 10, &(0..6));
+        let mut running = RunningFilterMask::new(mask);
+
+        let head = running.take_leading_skip();
+
+        assert_eq!(head, 0);
+        assert_eq!(running.next_run(100), (true, 6));
     }
 }

@@ -292,6 +292,14 @@ impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
         }
     }
 
+    fn stream_position(&self) -> Option<ReaderPosition> {
+        Some(self.position)
+    }
+
+    fn resume_at(&mut self, position: ReaderPosition) {
+        self.position = position;
+    }
+
     fn skip(&mut self, mut size: usize) {
         while size > 0 {
             if self.position.offset >= self.data[self.position.buffer_index].len() {
@@ -376,6 +384,22 @@ mod tests {
         let arr = buf.into_array(None);
         let sv = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
         (0..sv.len()).map(|i| sv.value(i).to_string()).collect()
+    }
+
+    #[test]
+    fn a_decoder_resumed_at_anothers_position_reads_the_values_that_follow() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let page = || make_data(vec![encode_plain(&["hi", "bye", "ok", "yes"])]);
+        let mut first = PlainPageDecoder::<StringViewType>::new(page(), ReaderPosition::default());
+        first.skip(2);
+        let mut second = PlainPageDecoder::new(page(), ReaderPosition::default());
+        let mut out = ViewBuilder::with_capacity(&mut allocator, 2);
+
+        second.resume_at(first.stream_position().unwrap());
+        second.read(&mut out, 2);
+
+        assert_eq!(extract(out), vec!["ok", "yes"]);
     }
 
     #[test]

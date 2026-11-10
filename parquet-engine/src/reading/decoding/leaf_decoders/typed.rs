@@ -15,7 +15,7 @@
 
 use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::levels::decode_def_levels;
-use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
+use crate::reading::decoding::leaf_decoders::rle::{MarkedStream, PageSkipMarks, RleDecoder, Run};
 use crate::reading::decoding::leaf_decoders::{
     ArrayBuilder, DecodeEncoding, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
     LeafDecoder, LeafType, Result,
@@ -70,6 +70,28 @@ fn skip_run<L: LeafType>(decoder: &mut ValueDecoder<L>, n: usize) {
         ValueDecoder::DeltaBinaryPacked(d) => d.skip(n),
         ValueDecoder::DeltaLengthByteArray(d) => d.skip(n),
         ValueDecoder::Rle(d) => d.skip(n),
+    }
+}
+
+/// A plain decoder that walks its values, as a stream the skip marks can put
+/// back in place.
+struct MarkedPlain<'a, P: DecodePlain>(&'a mut P);
+
+impl<P: DecodePlain> MarkedStream for MarkedPlain<'_, P> {
+    fn stream_state(&self) -> (ReaderPosition, Option<Run>) {
+        let position = self
+            .0
+            .stream_position()
+            .expect("only a decoder with a stream position is marked");
+        (position, None)
+    }
+
+    fn resume_stream(&mut self, position: ReaderPosition, _run: Option<Run>) {
+        self.0.resume_at(position);
+    }
+
+    fn skip_values(&mut self, values: usize) {
+        self.0.skip(values);
     }
 }
 
@@ -253,6 +275,9 @@ pub struct TypedLeafDecoder<L: LeafType> {
     /// representation (see [`Dict::EqConstant`]). Drives row-group pruning
     /// and scan-side batch filtering once the dictionary is built.
     eq_const: Option<<L::ContiguousDict as Dict>::EqConstant>,
+    /// The column chunk's skip marks, shared with the row group's other
+    /// decoders.
+    skip_marks: Option<Arc<PageSkipMarks>>,
 }
 
 impl<L: LeafType> TypedLeafDecoder<L> {
@@ -266,6 +291,7 @@ impl<L: LeafType> TypedLeafDecoder<L> {
             read_page: None,
             dict: None,
             eq_const: None,
+            skip_marks: None,
         }
     }
 
@@ -357,9 +383,40 @@ impl<L: LeafType> TypedLeafDecoder<L> {
             None
         };
 
+        let mut decoder = self.create_decoder(page.header, page.data, position)?;
+        let mut running_filter_mask_opt = page.filter_mask.map(RunningFilterMask::new);
+        // A page whose first rows are skipped is one a range starts inside.
+        // Streams that are only entered by walking them go past that head
+        // through the shared marks. With definition levels the head's rows
+        // are not its values, so such a page takes the ordinary walk.
+        if let (Some(marks), Some(mask), None) = (
+            &self.skip_marks,
+            running_filter_mask_opt.as_mut(),
+            &def_levels,
+        ) {
+            match &mut decoder {
+                ValueDecoder::Dictionary(indices) => {
+                    let skipped_head = mask.take_leading_skip();
+                    if skipped_head > 0 {
+                        marks.skip_from_page_start(self.page_idx, indices, skipped_head);
+                    }
+                }
+                ValueDecoder::Plain(plain) if plain.stream_position().is_some() => {
+                    let skipped_head = mask.take_leading_skip();
+                    if skipped_head > 0 {
+                        marks.skip_from_page_start(
+                            self.page_idx,
+                            &mut MarkedPlain(plain),
+                            skipped_head,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
         self.read_page = Some(ReadPage {
-            decoder: self.create_decoder(page.header, page.data, position)?,
-            running_filter_mask_opt: page.filter_mask.map(RunningFilterMask::new),
+            decoder,
+            running_filter_mask_opt,
             remaining: kept,
             def_levels,
         });
@@ -369,6 +426,10 @@ impl<L: LeafType> TypedLeafDecoder<L> {
 }
 
 impl<L: LeafType> LeafDecoder for TypedLeafDecoder<L> {
+    fn share_skip_marks(&mut self, marks: Arc<PageSkipMarks>) {
+        self.skip_marks = Some(marks);
+    }
+
     fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
         self.eq_const = L::ContiguousDict::eq_constant_from_scalar(value);
     }

@@ -16,6 +16,8 @@
 use crate::reading::decoding::leaf_decoders::{ArrayBuilder, Dict};
 use bytes::Bytes;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 mod bit_pack_decoder;
 pub use bit_pack_decoder::{BitDecoderOverflow, BitPackDecoder};
@@ -37,6 +39,7 @@ unsafe fn gather_entries<D: Dict>(dict: &D, keys: &[u32], dest: &mut [D::Item]) 
 }
 
 /// A single run in the RLE/bit-packed stream.
+#[derive(Clone, Copy)]
 pub enum Run {
     Rle {
         value: u32,
@@ -343,6 +346,100 @@ pub struct RleDecoder {
     run: Option<Run>,
 }
 
+/// Where a page's index stream stands once a number of its values have been
+/// passed: enough to put another decoder of the same page there directly.
+#[derive(Clone, Copy)]
+struct SkipMark {
+    values_passed: usize,
+    position: ReaderPosition,
+    run: Option<Run>,
+}
+
+/// The skip marks of one column chunk's pages, shared by every decoder of the
+/// row group.
+///
+/// A row group's rows are cut into ranges that different workers decode, and
+/// the stream cannot be entered in the middle: a decoder starting inside a
+/// page walks the page's runs from its first value to the range's first. The
+/// ranges of a page start at a handful of rows, and each worker that takes one
+/// would make the walk again from the top. The same goes for plain
+/// variable-length values, which are found only by reading every length before
+/// them. Here the first walk to a row leaves
+/// a mark, and the next decoder starts from the nearest mark before its own
+/// row, so a page is walked about once however its ranges are dealt out.
+#[derive(Default)]
+pub struct PageSkipMarks {
+    by_page: Mutex<HashMap<usize, Vec<SkipMark>>>,
+}
+
+/// A value stream that can be put back where a [`PageSkipMarks`] mark was
+/// taken: its whole state between two values is a position in the page's
+/// bytes and, for a run-length stream, the run it stands in.
+pub trait MarkedStream {
+    fn stream_state(&self) -> (ReaderPosition, Option<Run>);
+    fn resume_stream(&mut self, position: ReaderPosition, run: Option<Run>);
+    fn skip_values(&mut self, values: usize);
+}
+
+impl MarkedStream for RleDecoder {
+    fn stream_state(&self) -> (ReaderPosition, Option<Run>) {
+        (self.position, self.run)
+    }
+
+    fn resume_stream(&mut self, position: ReaderPosition, run: Option<Run>) {
+        self.position = position;
+        self.run = run;
+    }
+
+    fn skip_values(&mut self, values: usize) {
+        self.skip(values);
+    }
+}
+
+impl PageSkipMarks {
+    /// Advance `decoder`, which stands at the first value of page `page_idx`,
+    /// past `values` values.
+    pub fn skip_from_page_start(
+        &self,
+        page_idx: usize,
+        decoder: &mut impl MarkedStream,
+        values: usize,
+    ) {
+        let nearest = self
+            .by_page
+            .lock()
+            .unwrap()
+            .get(&page_idx)
+            .and_then(|marks| {
+                marks
+                    .iter()
+                    .filter(|mark| mark.values_passed <= values)
+                    .max_by_key(|mark| mark.values_passed)
+                    .copied()
+            });
+        let mut passed = 0;
+        if let Some(mark) = nearest {
+            decoder.resume_stream(mark.position, mark.run);
+            passed = mark.values_passed;
+        }
+        if passed == values {
+            return;
+        }
+        decoder.skip_values(values - passed);
+        let (position, run) = decoder.stream_state();
+        self.by_page
+            .lock()
+            .unwrap()
+            .entry(page_idx)
+            .or_default()
+            .push(SkipMark {
+                values_passed: values,
+                position,
+                run,
+            });
+    }
+}
+
 impl RleDecoder {
     pub fn new(data: Vec<Bytes>, position: ReaderPosition, bit_width: u8) -> Self {
         Self {
@@ -585,5 +682,42 @@ mod tests {
             .take(24)
             .collect();
         assert_eq!(result, expected);
+    }
+
+    /// Three bit-packed groups of AA BB CC DD AA BB CC DD.
+    fn repeating_page() -> Vec<u8> {
+        vec![0x07, 0xE4, 0xE4, 0xE4, 0xE4, 0xE4, 0xE4]
+    }
+
+    #[test]
+    fn a_decoder_starting_from_anothers_mark_reads_the_same_values() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let marks = PageSkipMarks::default();
+        let mut first = new_decoder(repeating_page(), 2);
+        marks.skip_from_page_start(0, &mut first, 5);
+        let mut second = new_decoder(repeating_page(), 2);
+
+        marks.skip_from_page_start(0, &mut second, 14);
+        let values = push_all(&mut allocator, &mut second, &dict, 4);
+
+        assert_eq!(values, vec!["CC", "DD", "AA", "BB"]);
+    }
+
+    #[test]
+    fn marks_of_one_page_do_not_serve_another() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let marks = PageSkipMarks::default();
+        let mut on_first_page = new_decoder(repeating_page(), 2);
+        marks.skip_from_page_start(0, &mut on_first_page, 6);
+        let mut on_second_page = new_decoder(repeating_page(), 2);
+
+        marks.skip_from_page_start(1, &mut on_second_page, 1);
+        let values = push_all(&mut allocator, &mut on_second_page, &dict, 3);
+
+        assert_eq!(values, vec!["BB", "CC", "DD"]);
     }
 }

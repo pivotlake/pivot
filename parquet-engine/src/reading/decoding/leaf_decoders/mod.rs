@@ -42,7 +42,7 @@ mod levels;
 mod primitive;
 pub use primitive::{PrimitiveLeafDecoder, TimestampMicrosecondLeafDecoder};
 
-mod rle;
+pub(crate) mod rle;
 
 mod typed;
 pub use typed::TypedLeafDecoder;
@@ -126,6 +126,11 @@ pub trait LeafDecoder {
     /// Reads through a dictionary built for this leaf.
     fn adopt_dictionary(&mut self, dictionary: SharedDictionary);
 
+    /// Shares the column chunk's skip marks with this decoder (see
+    /// [`PageSkipMarks`](rle::PageSkipMarks)). A decoder that has no use for
+    /// them ignores them.
+    fn share_skip_marks(&mut self, _marks: std::sync::Arc<rle::PageSkipMarks>) {}
+
     /// Forgets every page, the one being read included, and expects the
     /// next pages from `page_idx` on: the decoder is about to read rows
     /// that do not follow the ones it has emitted.
@@ -197,6 +202,18 @@ pub trait DecodePlain {
 
     /// Advances past `size` values without decoding them.
     fn skip(&mut self, size: usize);
+
+    /// Where the decoder stands in the page's bytes, for a decoder that has
+    /// to read every value before the one it wants and whose state between
+    /// values is that position alone. `None`, the default, for one that
+    /// skips by arithmetic and has nothing to gain from a mark.
+    fn stream_position(&self) -> Option<ReaderPosition> {
+        None
+    }
+
+    /// Puts the decoder at a position [`stream_position`](Self::stream_position)
+    /// returned for the same page.
+    fn resume_at(&mut self, _position: ReaderPosition) {}
 }
 
 /// Reads values stored in one of the encodings besides PLAIN and the

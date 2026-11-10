@@ -10,6 +10,7 @@
 use crate::reading::decoding::ScanEqualityPredicate;
 use crate::reading::decoding::column_decoder::{ColumnDecoder, Error, Result, create_leaf_decoder};
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
+use crate::reading::decoding::leaf_decoders::rle::PageSkipMarks;
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
 use crate::reading::record_batch_metadata::with_row_index;
 use crate::types::filter_mask::FilterMask;
@@ -55,6 +56,8 @@ pub(crate) struct DecodePlan {
     pub prunable: Vec<PrunableColumn>,
     /// The pushed-down equality constant each prunable leaf's decoder gets.
     eq_constants: Vec<(usize, Scalar<ArrayRef>)>,
+    /// Per leaf read, the skip marks every decoder of the row group shares.
+    skip_marks: Vec<Arc<PageSkipMarks>>,
 }
 
 impl DecodePlan {
@@ -101,6 +104,11 @@ impl DecodePlan {
             .map(|decoder| decoder.output_field().clone())
             .collect();
         Ok(Self {
+            skip_marks: plan
+                .file_leaves
+                .iter()
+                .map(|_| Arc::new(PageSkipMarks::default()))
+                .collect(),
             leaf_fields: plan
                 .file_leaves
                 .iter()
@@ -134,6 +142,9 @@ impl DecodePlan {
             .collect::<Result<Vec<_>>>()?;
         for (leaf, constant) in &self.eq_constants {
             leaf_decoders[*leaf].set_eq_constant(constant);
+        }
+        for (decoder, marks) in leaf_decoders.iter_mut().zip(&self.skip_marks) {
+            decoder.share_skip_marks(marks.clone());
         }
         Ok(leaf_decoders)
     }
