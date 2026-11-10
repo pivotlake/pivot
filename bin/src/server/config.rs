@@ -1,8 +1,8 @@
 //! The config file: one YAML file describing a whole instance.
 //!
-//! The top level is the instance: its memory and worker budgets, refresh
-//! cadence, disk cache and log. `server` is [`ServerConfig`] below: the
-//! endpoint.
+//! The top level is the instance: its memory and worker budgets, spill
+//! directory, refresh cadence, disk cache and log. `server` is
+//! [`ServerConfig`] below: the endpoint.
 //! `datastores`, `secrets` and `users` are the operator's entries, a
 //! [`MetastoreConfig`] written at the top level of the file: read at startup
 //! and never rewritten by the server. `metastore` is [`MetastoreStore`]: the
@@ -13,6 +13,7 @@
 //! ```yaml
 //! memory: 32g
 //! workers: 16
+//! spill_directory: /var/lib/pivot/spill
 //! datastore_refresh_interval: 30s
 //! log: info
 //! disk_cache:
@@ -89,6 +90,10 @@ pub struct Config {
     pub memory: MemoryBudget,
     /// Number of dispatch worker threads. Defaults to the machine's core count.
     pub workers: Option<usize>,
+    /// Directory that a query needing more memory than the buffer pool has
+    /// spills rows to. Omit it and nothing is spilled: such a query fails
+    /// instead. The server checks at startup that spill files work in it.
+    pub spill_directory: Option<PathBuf>,
     /// How often every datastore brings itself up to date with its store:
     /// the tables it has, and each table's committed files. For shared remote
     /// stores, this bounds how stale a query's view of another process's
@@ -123,6 +128,7 @@ struct RawConfig {
     #[serde(default)]
     memory: MemoryBudget,
     workers: Option<usize>,
+    spill_directory: Option<PathBuf>,
     #[serde(default = "default_datastore_refresh_interval")]
     datastore_refresh_interval: Interval,
     disk_cache: Option<DiskCacheConfig>,
@@ -152,6 +158,7 @@ impl From<RawConfig> for Config {
         Self {
             memory: raw.memory,
             workers: raw.workers,
+            spill_directory: raw.spill_directory,
             datastore_refresh_interval: raw.datastore_refresh_interval,
             disk_cache: raw.disk_cache,
             log: raw.log,
@@ -337,7 +344,8 @@ mod tests {
     #[test]
     fn one_file_configures_both_the_instance_and_its_data() {
         let config = from_yaml_with(
-            "memory: 32g\nworkers: 8\ndatastore_refresh_interval: 5s\nserver:\n  bind: 0.0.0.0:5433\n",
+            "memory: 32g\nworkers: 8\nspill_directory: /var/lib/pivot/spill\n\
+             datastore_refresh_interval: 5s\nserver:\n  bind: 0.0.0.0:5433\n",
         )
         .unwrap();
         let metastore = DiskMetastore::open(
@@ -354,6 +362,10 @@ mod tests {
         );
         assert_eq!(config.workers, Some(8));
         assert_eq!(
+            config.spill_directory,
+            Some(PathBuf::from("/var/lib/pivot/spill"))
+        );
+        assert_eq!(
             config.datastore_refresh_interval.as_duration(),
             Duration::from_secs(5)
         );
@@ -368,6 +380,7 @@ mod tests {
         assert_eq!(config.server.bind, "127.0.0.1:5432".parse().unwrap());
         assert_eq!(config.memory, MemoryBudget::Percent(80));
         assert_eq!(config.workers, None);
+        assert_eq!(config.spill_directory, None);
         assert_eq!(
             config.datastore_refresh_interval.as_duration(),
             DEFAULT_REFRESH_INTERVAL

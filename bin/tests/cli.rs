@@ -17,6 +17,7 @@ fn open_help_lists_resource_limits() {
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("--memory <SIZE>"), "{stdout}");
     assert!(stdout.contains("--workers <COUNT>"), "{stdout}");
+    assert!(stdout.contains("--spill-directory <DIRECTORY>"), "{stdout}");
 }
 
 #[test]
@@ -230,6 +231,55 @@ fn open_rejects_a_missing_script_file() {
         stderr.contains("pivot: /nonexistent/script.sql: No such file"),
         "{stderr}"
     );
+}
+
+#[test]
+fn open_takes_a_spill_directory_and_creates_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let spill_directory = directory.path().join("spill");
+
+    let output = open_command(
+        &directory.path().join("data"),
+        &[
+            "--spill-directory",
+            spill_directory.to_str().unwrap(),
+            "-c",
+            "SELECT 1",
+        ],
+    )
+    .output()
+    .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(spill_directory.is_dir());
+}
+
+#[test]
+fn open_refuses_a_spill_directory_that_cannot_be_used() {
+    let directory = tempfile::tempdir().unwrap();
+    let occupied = directory.path().join("occupied");
+    fs::write(&occupied, "a file, where a directory is wanted").unwrap();
+    let spill_directory = occupied.join("spill");
+
+    let output = open_command(
+        &directory.path().join("data"),
+        &[
+            "--spill-directory",
+            spill_directory.to_str().unwrap(),
+            "-c",
+            "SELECT 1",
+        ],
+    )
+    .output()
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let refusal = format!(
+        "spill directory `{}` cannot be used: creating the directory: ",
+        spill_directory.display()
+    );
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr.contains(&refusal), "{stderr}");
 }
 
 #[test]

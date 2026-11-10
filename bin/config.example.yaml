@@ -12,6 +12,16 @@
 # Dispatch worker threads. Defaults to the machine's core count.
 # workers: 16
 
+# Directory that a query needing more memory than the buffer pool has spills
+# rows to. Leave it out and nothing is spilled: such a query fails instead.
+# Spill files are opened with direct IO, so put the directory on a local disk
+# (tmpfs before Linux 6.6 and some overlay and network filesystems refuse
+# direct IO). The server creates it if needed, checks at startup that a spill
+# file works there, and does not start if it does not. Give each server a
+# directory of its own: the server locks it while it runs, and at startup
+# removes the spill files a server that stopped without cleaning up left there.
+# spill_directory: /var/lib/pivot/spill
+
 # How often each datastore brings itself up to date with its store: the
 # tables it has, and each table's committed files. For shared remote stores,
 # this bounds how stale a query's view of another process's commits can be;

@@ -52,6 +52,7 @@ datastore, or more than one, is marked as the default.
 # Instance settings
 # memory: 80%
 # workers: <core count>
+# spill_directory: <not set>
 # datastore_refresh_interval: 30s
 # log: info
 
@@ -130,6 +131,7 @@ all of them out.
 | --- | --- | --- |
 | `memory` | `80%` | Buffer-pool budget: a [size](#sizes-and-intervals) such as `32g`, or a percentage of the machine's physical memory. A percentage holds back a 4 GiB reserve for allocations outside the pool, so `80%` on a 64 GiB machine is a 47 GiB pool. Pivot checks that the budget fits available memory before starting. |
 | `workers` | Machine core count | Dispatch worker threads. Must be at least one. |
+| `spill_directory` | Not set | Directory where a `GROUP BY` that needs more memory than the buffer pool has writes rows out to disk. Without it nothing is spilled, and such a query fails instead. Spill files are opened with direct I/O, so the directory has to be on a filesystem that supports it: a local disk does, while tmpfs before Linux 6.6 and some overlay and network filesystems do not. Pivot creates the directory if needed, checks at startup that a spill file can be written and read back there, and refuses to start if it cannot. Each running server or shell needs a directory of its own: Pivot locks it while it runs, refuses to start on one that is already in use, and at startup removes the spill files that a process which stopped without cleaning up left in it. |
 | `datastore_refresh_interval` | `30s` | How often each datastore brings itself up to date with its store: the tables it has and each table's committed files. For a shared remote store, this bounds how stale a query's view of another process's commits can be. This process's own commits are visible immediately. |
 | `log` | `info` | What the server logs to stdout. A level for everything, such as `info` or `debug`, or per-target levels such as `info,dispatch=debug`. |
 

@@ -65,6 +65,8 @@ pub enum Error {
     #[error(transparent)]
     DiskCache(#[from] crate::server::config::DiskCacheError),
     #[error(transparent)]
+    SpillDirectory(#[from] dispatch::SpillDirectoryError),
+    #[error(transparent)]
     LogFilter(#[from] crate::logging::FilterError),
     #[error("worker watcher panic: {0}")]
     WorkerWatcherPanic(JoinError),

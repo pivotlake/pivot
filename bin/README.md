@@ -30,6 +30,16 @@ physical memory such as `50%`. Pivot checks the budget against memory currently
 available before faulting in the pool, and exits with an error instead of
 risking an OOM kill when it does not fit.
 
+A query that needs more memory than the pool has fails unless the shell is given
+a directory to spill to:
+
+```sh
+pivot open ./pivot-data --spill-directory /var/tmp/pivot-spill
+```
+
+The directory has to be on a filesystem that takes direct IO, such as a local
+disk, and only one running shell or server can use it at a time.
+
 ## Datastore directory
 
 Every `pivot open` invocation requires the path of one local pivotlake datastore.
@@ -109,6 +119,7 @@ where `CREATE USER` lands.
 ```yaml
 memory: 32g                 # default 80%: that share of total RAM minus 4 GiB
 workers: 16                 # default: number of cores
+spill_directory: /var/lib/pivot/spill  # where queries short of memory spill; omitted means no spilling
 datastore_refresh_interval: 30s  # default 30s
 log: info                   # default; or debug, or per-target directives
 disk_cache:                 # cache S3 reads on local disk; omitted means no cache

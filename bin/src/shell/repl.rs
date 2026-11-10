@@ -580,6 +580,7 @@ mod tests {
                     ShellLimits {
                         memory: Some("64m".parse().unwrap()),
                         workers: Some(1),
+                        spill_directory: None,
                     },
                 )
             })

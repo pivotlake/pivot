@@ -27,6 +27,7 @@ async fn vacuum_in_shell_reclaims_expired_files_and_dropped_tables() {
         &ShellTarget::pivot(directory.path().to_str().unwrap()),
         1,
         32,
+        None,
         DEFAULT_REFRESH_INTERVAL,
     )
     .unwrap();
@@ -114,6 +115,7 @@ async fn vacuum_reports_unsupported_forms_and_cleanup_errors() {
         &ShellTarget::pivot(directory.path().to_str().unwrap()),
         1,
         32,
+        None,
         DEFAULT_REFRESH_INTERVAL,
     )
     .unwrap();
