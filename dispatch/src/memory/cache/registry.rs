@@ -6,14 +6,16 @@
 //!   ├── caches[id]    Arc<dyn RingCache>      what the evictor reclaims from
 //!   ├── policies[id]  CachePolicy             name, lives at insert, lives per touch
 //!   ├── compressed[id] Option<Arc<CompressedCache>>   typed handle, for the IO path
-//!   ├── families[f]   FamilySpec              members and their target shares
+//!   ├── families[f]   FamilySpec              the caches holding one kind of data
 //!   └── family_of[id] f                       which family a cache belongs to
 //! ```
 //!
 //! Built once at startup through [`CachesBuilder`] and shared by every worker's
-//! memory context. The hot path through here is
-//! [`reclaim`](Caches::reclaim): reclaim from the owning cache, then reinforce
-//! its siblings over whatever it dropped.
+//! memory context. The hot paths through here are
+//! [`reclaim`](Caches::reclaim), which reclaims from the owning cache and then
+//! reinforces its siblings over whatever it dropped, and
+//! [`weaken_siblings`](Caches::weaken_siblings), which a cache calls when it
+//! serves a read.
 
 use crate::io::OpenFile;
 use crate::memory::WriteBuffer;
@@ -21,8 +23,8 @@ use crate::memory::cache::cached::Cached;
 use crate::memory::cache::compressed::CompressedCache;
 use crate::memory::cache::derived_cache::Cache;
 use crate::memory::cache::family::FamilySpec;
-use crate::memory::cache::id::{CacheId, CachePolicy, CacheSet};
-use crate::memory::cache::ring_cache::RingCache;
+use crate::memory::cache::id::{CacheId, CachePolicy};
+use crate::memory::cache::ring_cache::{RingCache, SourceRange};
 use std::sync::Arc;
 
 pub struct Caches {
@@ -75,21 +77,6 @@ impl Caches {
         &self.families[self.family_of[id.index()]]
     }
 
-    /// The caches the evictor should step over in a region whose members hold
-    /// `slots_of(id)` slots each: the union of every family's protected members.
-    pub fn protected_members(&self, slots_of: impl Fn(CacheId) -> usize) -> CacheSet {
-        let mut protected = CacheSet::EMPTY;
-        for family in &self.families {
-            let family_protected = family.protected_members(&slots_of);
-            for member in family.members() {
-                if family_protected.contains(member) {
-                    protected.insert(member);
-                }
-            }
-        }
-        protected
-    }
-
     /// Reclaim `slot` from cache `id`, then reinforce its siblings over every
     /// range that died with it. The reinforcement runs after the cache has
     /// released its locks (its `reclaim` contract), so no cache ever holds a
@@ -104,6 +91,17 @@ impl Caches {
             }
         }
         Some(reclaimed.buffer)
+    }
+
+    /// Cache `id` served a read of `range`: weaken the copies of it that the
+    /// siblings hold. Call with none of `id`'s locks held, for the same reason
+    /// [`reclaim`](Self::reclaim) reinforces only after the cache let go.
+    pub fn weaken_siblings(&self, id: CacheId, range: &SourceRange) {
+        for sibling in self.family_of(id).siblings_of(id) {
+            if self.policy(sibling).lives_lost_per_sibling_touch > 0 {
+                self.cache(sibling).weaken_range(range);
+            }
+        }
     }
 
     /// A local descriptor was (re)opened: it may now name a different file
@@ -132,8 +130,8 @@ impl Caches {
 /// ```text
 ///   let mut builder = CachesBuilder::new(slot_count);
 ///   let pages = builder.add_family(|family| PageCaches {
-///       compressed: family.add_compressed(compressed_policy, 30),
-///       decompressed: family.add_derived(decompressed_policy, 70, "KILL_SWITCH"),
+///       compressed: family.add_compressed(compressed_policy),
+///       decompressed: family.add_derived(decompressed_policy, "KILL_SWITCH"),
 ///   });
 ///   let caches = builder.build();
 /// ```
@@ -161,8 +159,7 @@ impl CachesBuilder {
 
     /// Add one family. `declare` adds the family's members through the
     /// [`FamilyBuilder`] it is handed and returns whatever it assembled from
-    /// their handles, which is passed back to the caller. The members' target
-    /// shares must sum to 100.
+    /// their handles, which is passed back to the caller.
     pub fn add_family<Handles>(
         &mut self,
         declare: impl FnOnce(&mut FamilyBuilder) -> Handles,
@@ -200,35 +197,28 @@ impl CachesBuilder {
 /// The members of one family, while it is being added to a [`CachesBuilder`].
 pub struct FamilyBuilder<'a> {
     builder: &'a mut CachesBuilder,
-    members: Vec<(CacheId, u8)>,
+    members: Vec<CacheId>,
 }
 
 impl FamilyBuilder<'_> {
-    /// Add a cache of raw file bytes that should hold `target_share_pct` of
-    /// the family's slots.
-    pub fn add_compressed(
-        &mut self,
-        policy: CachePolicy,
-        target_share_pct: u8,
-    ) -> Arc<CompressedCache> {
+    /// Add a cache of raw file bytes.
+    pub fn add_compressed(&mut self, policy: CachePolicy) -> Arc<CompressedCache> {
         let id = self.builder.next_id();
         let cache = Arc::new(CompressedCache::new(id, self.builder.slot_count));
-        self.register_member(policy, target_share_pct, cache.clone(), Some(cache.clone()));
+        self.register_member(policy, cache.clone(), Some(cache.clone()));
         cache
     }
 
-    /// Add a cache of the derived form `V` that should hold
-    /// `target_share_pct` of the family's slots. `kill_switch` names the
+    /// Add a cache of the derived form `V`. `kill_switch` names the
     /// environment variable that disables it.
     pub fn add_derived<V: Cached>(
         &mut self,
         policy: CachePolicy,
-        target_share_pct: u8,
         kill_switch: &str,
     ) -> Arc<Cache<V>> {
         let id = self.builder.next_id();
         let cache = Arc::new(Cache::new(id, self.builder.slot_count, kill_switch));
-        self.register_member(policy, target_share_pct, cache.clone(), None);
+        self.register_member(policy, cache.clone(), None);
         cache
     }
 
@@ -237,11 +227,10 @@ impl FamilyBuilder<'_> {
     fn register_member(
         &mut self,
         policy: CachePolicy,
-        target_share_pct: u8,
         cache: Arc<dyn RingCache>,
         compressed: Option<Arc<CompressedCache>>,
     ) {
-        self.members.push((cache.id(), target_share_pct));
+        self.members.push(cache.id());
         self.builder.family_of.push(self.builder.families.len());
         self.builder.policies.push(policy);
         self.builder.compressed.push(compressed);
@@ -260,6 +249,7 @@ mod tests {
             lives_at_insert: 1,
             lives_per_touch: 1,
             lives_at_reinforce: 1,
+            lives_lost_per_sibling_touch: 0,
         }
     }
 
@@ -269,8 +259,8 @@ mod tests {
 
         let (compressed, decoded) = builder.add_family(|family| {
             (
-                family.add_compressed(policy("compressed"), 30),
-                family.add_derived::<SparseIndex>(policy("decoded"), 70, "TEST_KILL_SWITCH"),
+                family.add_compressed(policy("compressed")),
+                family.add_derived::<SparseIndex>(policy("decoded"), "TEST_KILL_SWITCH"),
             )
         });
         let caches = builder.build();
@@ -286,20 +276,12 @@ mod tests {
     fn caches_added_to_different_families_are_not_siblings() {
         let mut builder = CachesBuilder::new(4);
 
-        let first = builder.add_family(|family| family.add_compressed(policy("first"), 100));
-        let second = builder.add_family(|family| family.add_compressed(policy("second"), 100));
+        let first = builder.add_family(|family| family.add_compressed(policy("first")));
+        let second = builder.add_family(|family| family.add_compressed(policy("second")));
         let caches = builder.build();
 
         assert_ne!(first.id(), second.id());
         assert!(!caches.family_of(first.id()).contains(second.id()));
         assert_eq!(caches.name(second.id()), "second");
-    }
-
-    #[test]
-    #[should_panic(expected = "sum to 100")]
-    fn a_family_whose_shares_do_not_sum_to_one_hundred_is_rejected() {
-        let mut builder = CachesBuilder::new(4);
-
-        builder.add_family(|family| family.add_compressed(policy("lonely"), 30));
     }
 }

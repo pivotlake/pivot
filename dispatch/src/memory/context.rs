@@ -2,8 +2,7 @@ use crate::Identifier;
 use crate::WriteRequestId;
 use crate::io::{Completion, IORequester};
 use crate::memory::cache::{
-    CacheId, CacheSet, CacheSetup, Caches, DictIndexCaches, FillCursor, PageCaches,
-    SparseIndexCaches,
+    CacheId, CacheSetup, Caches, DictIndexCaches, FillCursor, PageCaches, SparseIndexCaches,
 };
 use crate::memory::clock::{Clock, Sweep};
 use crate::memory::evict::DataflowEvict;
@@ -216,8 +215,8 @@ pub struct MemoryContext {
     /// How ring slots map to nodes and home workers (shared by all contexts).
     layout: RingLayout,
     /// Each dataflow's operators that keep ring slots outside the caches and can
-    /// give them back, keyed by dataflow id. Consulted only after both caches
-    /// have swept their whole region without finding a slot nobody holds. A
+    /// give them back, keyed by dataflow id. Consulted only after the sweep
+    /// has been round its whole region without finding a slot nobody holds. A
     /// `RefCell` because the context is reached through a shared reference; it
     /// is per worker thread, so the borrow never contends.
     evictors: RefCell<HashMap<Identifier, DataflowEvict>>,
@@ -466,22 +465,16 @@ impl MemoryContext {
 
     /// Evict a ring slot via the shared CLOCK and return it writable.
     ///
-    /// One hand sweeps this worker's region over every cache's slots. Each
-    /// revolution starts by asking the registry which caches are protected
-    /// right now (a family member under its target share while a sibling is
-    /// over), and the hand steps over those without aging them. Any other
-    /// slot spends a life or, at zero, is reclaimed from the cache that owns
-    /// it, which then reinforces its siblings over what it dropped.
-    ///
-    /// A revolution that neither aged nor reclaimed anything means every
-    /// eligible slot is pinned by a reader: protection is lifted for the rest
-    /// of this eviction so the protected caches can give. The next eviction
-    /// starts protected again.
+    /// One hand sweeps this worker's region over every cache's slots. A slot
+    /// it passes spends a life or, at zero, is reclaimed from the cache that
+    /// owns it, which then reinforces its siblings over what it dropped. A
+    /// slot at zero that a reader has pinned cannot be reclaimed, and the hand
+    /// moves on to age the rest.
     ///
     /// While readers hold every cached slot of this region the hand is not
     /// moved at all, and the registered [`Evict`](crate::memory::evict::Evict)
     /// operators are asked at once. They are asked, too, each time the hand
-    /// has been round with protection lifted and no cache gave a slot.
+    /// has been round and no cache gave a slot.
     pub(crate) fn evict(&self) -> WriteBuffer {
         // Livelock guard. When a query's working set exceeds the ring, every
         // worker spins here finding nothing evictable (near-100% CPU, ~0 forward
@@ -496,8 +489,6 @@ impl MemoryContext {
         let max_lives = self.clock.max_lives() as u64;
         let warn_at = (2 * max_lives + 2) * ring_len;
         let mut panic_at: Option<u64> = None;
-        let mut protected = CacheSet::EMPTY;
-        let mut protection_lifted = false;
         let mut aged_this_revolution: u64 = 0;
         // A full drain is the most revolutions the hand needs to reach any
         // victim: one per life a slot can hold, plus the revolution that finds
@@ -537,20 +528,9 @@ impl MemoryContext {
                 continue;
             }
 
-            if ticks.is_multiple_of(ring_len) {
-                // The counts are shared with peer workers, so the answer is as
-                // approximate as any CLOCK decision; one revolution is the
-                // right granularity to re-ask at.
-                protected = if protection_lifted {
-                    CacheSet::EMPTY
-                } else {
-                    self.caches
-                        .protected_members(|cache| self.clock.owned_in_region(cache, self.node))
-                };
-            }
             ticks += 1;
 
-            let step = self.clock.sweep(self.node, &protected);
+            let step = self.clock.sweep(self.node);
             if let Sweep::Candidate { slot, cache } = step
                 && let Some(write_buffer) = self.caches.reclaim(cache, slot)
             {
@@ -561,29 +541,20 @@ impl MemoryContext {
             }
             if ticks.is_multiple_of(ring_len) {
                 // A revolution that aged nothing cannot produce a victim by
-                // going on: every eligible slot is at zero and pinned, or the
-                // eligible caches hold nothing here. A full drain without a
-                // victim means the same, however much was aged on the way.
+                // going on: every cached slot here is at zero and held. A
+                // full drain without a victim means the same, however much
+                // was aged on the way. Either way the operators keeping slots
+                // outside the caches are the only remaining source.
                 let nothing_left_to_drain = aged_this_revolution == 0;
                 let drained = ticks.is_multiple_of(drain);
                 if nothing_left_to_drain || drained {
-                    if protection_lifted {
-                        // Every cache was eligible and none gave, so the
-                        // operators keeping slots outside the caches are the
-                        // only remaining source.
-                        if let Some(buffer) = self.evict_from_dataflow_operators() {
-                            return buffer;
-                        }
-                        if self.has_spill_writes_in_flight() {
-                            self.wait_for_a_spill_write_to_land();
-                            iterations = 0;
-                        }
+                    if let Some(buffer) = self.evict_from_dataflow_operators() {
+                        return buffer;
                     }
-                    // Lift protection, and keep it lifted: the protected slots
-                    // may need a revolution or two of aging of their own before
-                    // one gives. If nothing anywhere gives, the guard above
-                    // ends it.
-                    protection_lifted = true;
+                    if self.has_spill_writes_in_flight() {
+                        self.wait_for_a_spill_write_to_land();
+                        iterations = 0;
+                    }
                 }
                 aged_this_revolution = 0;
             }

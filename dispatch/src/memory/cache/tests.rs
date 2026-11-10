@@ -1,5 +1,5 @@
 //! The generic cache and the caches together: packing, lookups, reclaim,
-//! share protection, reinforcement, and eviction across families. Every test
+//! reinforcement, weakening, and eviction across families. Every test
 //! installs its own single-worker memory context with the standard setup.
 
 use super::*;
@@ -517,47 +517,57 @@ fn get_range_has_no_gap_between_adjacent_hits() {
 // -- the caches together --
 
 #[test]
-fn evict_takes_decompressed_while_compressed_is_under_target() {
-    init_test_free_pool(16);
-    insert_compressed(0, 4096);
-    release_cursor(compressed());
-    for i in 0..10 {
-        insert_decompressed_slot((10 + i) * 4096, 4096); // compressed is 1 of 11: 9%
-    }
-
-    memory_ctx().evict();
-
-    assert!(
-        !compressed_has_misses(0, 4096),
-        "the protected extent survives"
-    );
-    assert_eq!(clock().owned(decompressed().id()), 9);
-}
-
-#[test]
-fn evict_takes_compressed_while_over_its_target_share() {
+fn evict_takes_a_page_read_once_before_the_compressed_bytes_under_it() {
     init_test_free_pool(8);
     insert_compressed(0, 4096);
     release_cursor(compressed());
-    insert_decompressed_slot(10 * 4096, 4096); // 1 of each: compressed 50%, over target
+    insert_decompressed_slot(0, 4096);
+
+    memory_ctx().evict();
+
+    assert_eq!(clock().owned(decompressed().id()), 0);
+    assert!(!compressed_has_misses(0, 4096), "the source outlasted it");
+}
+
+#[test]
+fn evict_takes_the_compressed_bytes_under_a_page_that_keeps_being_read() {
+    init_test_free_pool(8);
+    let source_slot = insert_compressed(0, 4096);
+    release_cursor(compressed());
+    insert_decompressed_slot(0, 4096);
+    for _ in 0..clock().lives(source_slot) {
+        decompressed().get(&key_in(&FD(), 0, 4096)).unwrap();
+    }
 
     memory_ctx().evict();
 
     assert_eq!(clock().owned(compressed().id()), 0);
-    assert_eq!(clock().owned(decompressed().id()), 1);
+    assert!(decompressed().get(&key_in(&FD(), 0, 4096)).is_some());
 }
 
-/// The protected cache's slots are all pinned by readers, so a revolution
-/// finds nothing to take. Protection then lifts for a revolution and the
-/// other cache gives, instead of the ring looking exhausted.
+/// A slot out of lives that a reader has pinned cannot be taken: the hand
+/// passes over it and keeps ageing the rest until one of them gives.
 #[test]
-fn working_memory_takes_protected_slots_when_everything_else_is_pinned() {
-    init_test_free_pool(128);
-    for slot_number in 0..30 {
-        insert_compressed_slot(slot_number); // 30 of 100: exactly on target
-    }
+fn evict_passes_over_a_pinned_slot_and_takes_one_that_still_had_lives() {
+    init_test_free_pool(8);
+    let pinned_slot = insert_compressed(0, BUFFER_SIZE);
     release_cursor(compressed());
-    let _pinned: Vec<DecompressedPage> = (0..70)
+    let _reader = memory_ctx().ring().try_read(pinned_slot).unwrap();
+    let ageing_slot = insert_compressed_slot(1); // holds more lives
+    release_cursor(compressed());
+
+    let evicted = memory_ctx().evict();
+
+    assert_eq!(evicted.slot_idx, ageing_slot);
+    assert_eq!(clock().owner(pinned_slot), Some(compressed().id()));
+}
+
+/// Every cached slot but one is pinned by a reader, however few lives it
+/// holds: working memory comes from the one that is not.
+#[test]
+fn working_memory_takes_the_only_slot_no_reader_holds() {
+    init_test_free_pool(8);
+    let _pinned: Vec<DecompressedPage> = (0..3)
         .map(|i| {
             insert_decompressed_slot((100 + i) * BUFFER_SIZE, 4096);
             decompressed()
@@ -565,97 +575,32 @@ fn working_memory_takes_protected_slots_when_everything_else_is_pinned() {
                 .unwrap()
         })
         .collect();
+    let unpinned_slot = insert_compressed_slot(0);
+    release_cursor(compressed());
     let _working_memory = take_every_free_slot();
 
-    let _buffer = memory_ctx().get_write_buffer(true);
+    let buffer = memory_ctx().get_write_buffer(true);
 
-    assert_eq!(clock().owned(compressed().id()), 29);
-}
-
-/// The unprotected cache has a slot with lives to spend beside a pinned
-/// zero-life one: the hand keeps aging it and takes it once drained, and the
-/// protected cache is left alone the whole time.
-#[test]
-fn an_ageing_slot_gives_way_before_protection_is_lifted() {
-    init_test_free_pool(8);
-    let pinned_slot = insert_compressed(0, BUFFER_SIZE);
-    release_cursor(compressed());
-    let _reader = memory_ctx().ring().try_read(pinned_slot).unwrap();
-    insert_compressed_slot(1); // a second compressed slot, holding more lives
-    release_cursor(compressed());
-    insert_decompressed_slot(10 * 4096, 4096); // compressed 2 of 3: over target
-
-    drop(memory_ctx().evict());
-
-    assert_eq!(
-        clock().owned(compressed().id()),
-        1,
-        "the ageing slot gave way"
-    );
-    assert_eq!(
-        clock().owned(decompressed().id()),
-        1,
-        "the protected cache was left alone"
-    );
-    assert_eq!(clock().owner(pinned_slot), Some(compressed().id()));
-}
-
-/// Every slot of the unprotected cache is pinned by readers and nothing else of
-/// it is left to age, so a revolution finds nothing. That lifts protection, and
-/// the protected cache gives instead of the ring looking exhausted, within a
-/// few revolutions rather than a full drain of the lives ceiling.
-#[test]
-fn a_revolution_of_pinned_candidates_lifts_protection() {
-    init_test_free_pool(8);
-    let ring_len = memory_ctx().ring().len();
-    let mut readers = Vec::new();
-    for offset in [0, BUFFER_SIZE] {
-        let slot = insert_compressed(offset, BUFFER_SIZE);
-        release_cursor(compressed());
-        readers.push(memory_ctx().ring().try_read(slot).unwrap());
-    }
-    for i in 0..3 {
-        insert_decompressed_slot((10 + i) * 4096, 4096); // compressed 2 of 5: over target
-    }
-    let compressed_lives = (0..ring_len)
-        .filter(|&slot| clock().owner(slot) == Some(compressed().id()))
-        .map(|slot| clock().lives(slot) as usize)
-        .max()
-        .unwrap();
-    let hand_before = clock().hand_position(0);
-
-    drop(memory_ctx().evict());
-
-    assert_eq!(
-        clock().owned(compressed().id()),
-        2,
-        "the pinned slots survive"
-    );
-    assert_eq!(
-        clock().owned(decompressed().id()),
-        2,
-        "the protected cache gave"
-    );
-    // One revolution per compressed life, one that finds them all pinned and
-    // lifts protection, then at most a decompressed slot's single life plus
-    // the revolution that takes it.
-    assert!(clock().hand_position(0) - hand_before <= (compressed_lives + 3) * ring_len);
+    assert_eq!(buffer.slot_idx, unpinned_slot);
+    assert_eq!(clock().owned(decompressed().id()), 3);
 }
 
 #[test]
 fn evicting_a_compressed_extent_reinforces_its_decompressed_twin() {
     init_test_free_pool(8);
-    insert_compressed(0, 4096);
+    let source_slot = insert_compressed(0, 4096);
     release_cursor(compressed());
     let twin_slot = insert_decompressed_slot(0, 4096); // same file range
-    assert_eq!(clock().lives(twin_slot), 1);
+    let lives_before = clock().lives(twin_slot);
 
-    memory_ctx().evict(); // compressed at 50% is the one to go
+    memory_ctx()
+        .caches()
+        .reclaim(compressed().id(), source_slot)
+        .unwrap();
 
-    assert_eq!(clock().owned(compressed().id()), 0);
     assert_eq!(
         clock().lives(twin_slot),
-        1 + lives_at_reinforce(decompressed())
+        lives_before + lives_at_reinforce(decompressed())
     );
 }
 
@@ -679,6 +624,47 @@ fn evicting_a_decompressed_page_reinforces_its_compressed_source() {
 }
 
 #[test]
+fn reading_a_decompressed_page_again_weakens_its_compressed_source() {
+    init_test_free_pool(8);
+    let source_slot = insert_compressed(0, 4096);
+    release_cursor(compressed());
+    insert_decompressed_slot(0, 4096);
+    let lives_before = clock().lives(source_slot);
+
+    decompressed().get(&key_in(&FD(), 0, 4096)).unwrap();
+
+    assert_eq!(clock().lives(source_slot), lives_before - 1);
+}
+
+#[test]
+fn a_run_of_decompressed_hits_weakens_the_compressed_slot_under_it_once() {
+    init_test_free_pool(8);
+    let source_slot = insert_compressed(0, 8192);
+    release_cursor(compressed());
+    insert_page(decompressed(), key_in(&FD(), 0, 4096), 64, 1);
+    insert_page(decompressed(), key_in(&FD(), 4096, 4096), 64, 2);
+    let lives_before = clock().lives(source_slot);
+
+    let segments = decompressed().get_range(&FD(), 0, 8192);
+
+    assert_eq!(segments.len(), 2);
+    assert_eq!(clock().lives(source_slot), lives_before - 1);
+}
+
+#[test]
+fn reading_compressed_bytes_leaves_the_decompressed_page_its_lives() {
+    init_test_free_pool(8);
+    insert_compressed(0, 4096);
+    release_cursor(compressed());
+    let page_slot = insert_decompressed_slot(0, 4096);
+    let lives_before = clock().lives(page_slot);
+
+    compressed().get(&FD(), 0, 4096);
+
+    assert_eq!(clock().lives(page_slot), lives_before);
+}
+
+#[test]
 fn a_heavier_cache_outlives_a_lighter_one_at_equal_recency() {
     init_test_free_pool(8);
     let sparse = &memory_ctx().sparse_index_caches().decoded;
@@ -698,63 +684,18 @@ fn a_heavier_cache_outlives_a_lighter_one_at_equal_recency() {
     assert_eq!(clock().owner(sparse_slot), Some(sparse.id()));
 }
 
-/// Protection is computed from whatever counts the caller supplies, which the
-/// evictor makes its own region's: a family over target in one region and
-/// under in another protects different members in each.
 #[test]
-fn protection_is_judged_by_the_counts_of_the_region_being_swept() {
-    init_test_free_pool(1);
-    let caches = memory_ctx().caches();
-    let compressed_heavy_region = |id: CacheId| {
-        if id == compressed().id() {
-            3
-        } else if id == decompressed().id() {
-            1
-        } else {
-            0
-        }
-    };
-    let decompressed_heavy_region = |id: CacheId| {
-        if id == compressed().id() {
-            1
-        } else if id == decompressed().id() {
-            3
-        } else {
-            0
-        }
-    };
-
-    let first = caches.protected_members(compressed_heavy_region);
-    let second = caches.protected_members(decompressed_heavy_region);
-
-    assert!(first.contains(decompressed().id()));
-    assert!(!first.contains(compressed().id()));
-    assert!(second.contains(compressed().id()));
-    assert!(!second.contains(decompressed().id()));
-}
-
-#[test]
-fn share_protection_stays_inside_the_family() {
-    init_test_free_pool(16);
-    // Pages: compressed far over its share, so decompressed is protected.
-    insert_compressed(0, 4096);
-    release_cursor(compressed());
-    let dict = &memory_ctx().dict_index_caches().decoded;
-    dict.insert(key_in(&FD(), 0, 1), |fill| {
-        fill.get_bytes(8);
-        Ok::<_, Infallible>(DictIndexMeta)
-    })
-    .unwrap();
+fn reading_a_page_leaves_another_familys_cache_its_lives() {
+    init_test_free_pool(8);
+    let dict = &memory_ctx().dict_index_caches().compressed;
+    let lookups = dict.get(&FD(), 0, 4096);
+    lookups[0].missing_extent().unwrap().commit();
+    let dict_slot = cursor_slot(dict.as_ref());
     release_cursor(dict.as_ref());
+    insert_decompressed_slot(0, 4096); // the same file range, in the pages family
+    let lives_before = clock().lives(dict_slot);
 
-    let protected = memory_ctx()
-        .caches()
-        .protected_members(|id| clock().owned_in_region(id, 0));
+    decompressed().get(&key_in(&FD(), 0, 4096)).unwrap();
 
-    assert!(protected.contains(decompressed().id()));
-    assert!(
-        !protected.contains(dict.id()),
-        "another family's shares are not its business"
-    );
-    assert!(!protected.contains(compressed().id()));
+    assert_eq!(clock().lives(dict_slot), lives_before);
 }

@@ -5,9 +5,9 @@
 //!                              Caches (registry)
 //!                ┌─────────────────────┴─────────────────────┐
 //!                │ caches[CacheId] ──▶ dyn RingCache          │
-//!                │ families ──▶ [(CacheId, share)] …          │
+//!                │ families ──▶ [CacheId] …                   │
 //!                └─────────────────────┬─────────────────────┘
-//!          reclaim(id, slot) / reinforce siblings / invalidate / clear
+//!     reclaim(id, slot) / reinforce and weaken siblings / invalidate / clear
 //!                                      │
 //!        ┌─────────────────────────────┼──────────────────────────────┐
 //!        ▼                             ▼                              ▼
@@ -20,7 +20,7 @@
 //!   shared underneath:  FileMap (what is cached, per file)
 //!                       SlotTenants (what is in a slot)
 //!                       FillCursor + CacheFill (where this worker packs the next entry)
-//!                       Clock (one hand per region; policies and shares decide who goes)
+//!                       Clock (one hand; the lives each slot holds decide who goes)
 //! ```
 //!
 //! Two kinds of cache. [`CompressedCache`] holds file bytes as read, published
@@ -29,9 +29,10 @@
 //! once complete. Both implement [`RingCache`], which is all the evictor sees.
 //!
 //! A *family* groups the caches holding the same bytes in different forms.
-//! Within a family the caches are balanced by target share and reinforce each
-//! other when one drops a copy; across families, slots compete on recency and
-//! each cache's [`CachePolicy`] weight alone. See [`family`] and [`clock`].
+//! Within a family the caches reinforce each other when one drops a copy and
+//! weaken each other when one is read, which settles, piece by piece, which
+//! form of the data stays; across families, slots compete on recency and each
+//! cache's [`CachePolicy`] weight alone. See [`family`] and [`clock`].
 //!
 //! [`setup`] declares the families this engine runs with.
 
@@ -59,7 +60,7 @@ pub use dict_index::{DictIndex, DictIndexCaches, DictIndexMeta};
 pub use family::FamilySpec;
 pub use fill::CacheFill;
 pub use fill_cursor::FillCursor;
-pub use id::{CacheId, CachePolicy, CacheSet};
+pub use id::{CacheId, CachePolicy};
 pub use registry::Caches;
 pub use ring_cache::{Reclaimed, RingCache, SourceRange};
 pub use setup::CacheSetup;

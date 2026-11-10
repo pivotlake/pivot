@@ -14,13 +14,13 @@
 //!
 //! Each NUMA region has a single hand that sweeps every slot in it, whatever
 //! cache owns it, so slots of different caches are compared on one scale:
-//! lives left. A slot free of any cache, or owned by a cache the evictor has
-//! asked to protect this revolution, is stepped over without its counter
-//! being touched. Any other slot spends one life; one with none left is the
-//! victim. The sweep is per region so eviction only ever frees slots the
-//! evicting worker may acquire (node-local memory, see
-//! [`RingLayout`](super::RingLayout)); touches are global, since any worker's
-//! hit may land on any slot.
+//! lives left. A slot free of any cache is stepped over. Any other slot
+//! spends one life; one with none left is the victim. Nothing else decides
+//! who goes: how a cache fares against the others, its own siblings
+//! included, is entirely a matter of how many lives its slots hold. The sweep
+//! is per region so eviction only ever frees slots the evicting worker may
+//! acquire (node-local memory, see [`RingLayout`](super::RingLayout));
+//! touches are global, since any worker's hit may land on any slot.
 //!
 //! ## Weights
 //!
@@ -38,11 +38,19 @@
 //! eviction pressure drains it, so the last copy of hot bytes effectively
 //! stops being a victim; once cold, it drains like anything else.
 //!
+//! ## Weakening
+//!
+//! The opposite signal: when a copy is read, the other copies of the same
+//! bytes in its family lose their cache's `lives_lost_per_sibling_touch`. A
+//! copy that is being read is staying, which makes the others redundant, so
+//! they drain first; a copy whose sibling is never read keeps its lives and
+//! is still there to be reinforced when the sibling goes.
+//!
 //! Everything is lock-free; a little racing between the atomics is fine
 //! because eviction only needs to be approximate.
 
 use crate::env::get_env_var_with_default;
-use crate::memory::cache::{CacheId, CachePolicy, CacheSet};
+use crate::memory::cache::{CacheId, CachePolicy};
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicUsize;
@@ -57,7 +65,7 @@ const NO_OWNER: u8 = 0;
 /// What one step of a region's hand did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sweep {
-    /// The slot is owned by no cache or by a protected one: stepped over.
+    /// The slot is owned by no cache: stepped over.
     Skipped,
     /// The slot spent one of its lives.
     Aged,
@@ -72,6 +80,7 @@ struct Lives {
     at_insert: u8,
     per_touch: u8,
     at_reinforce: u8,
+    lost_per_sibling_touch: u8,
 }
 
 /// How many of one region's cached slots readers hold. Kept on cache lines of
@@ -96,11 +105,11 @@ pub struct Clock {
     /// `r * slots_per_region..(r + 1) * slots_per_region`.
     hands: Box<[AtomicUsize]>,
     slots_per_region: usize,
-    /// Slots each cache owns in each region, `[cache][region]`, maintained by
+    /// Slots owned by any cache in each region, maintained by
     /// [`bind`](Self::bind) and [`release`](Self::release), the two functions
-    /// every ownership change goes through. Per region because that is the
-    /// balance an evictor sweeping one region can act on.
-    owned: Box<[Box<[AtomicUsize]>]>,
+    /// every ownership change goes through. Per region because that is what
+    /// an evictor sweeping one region can take from.
+    cached: Box<[AtomicUsize]>,
     /// Of the slots counted above, how many at least one reader holds, per
     /// region. Eviction cannot take such a slot until its last reader lets go,
     /// so a region whose every cached slot is pinned has nothing to give
@@ -135,10 +144,7 @@ impl Clock {
                 .collect(),
             hands: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
             slots_per_region,
-            owned: policies
-                .iter()
-                .map(|_| (0..region_count).map(|_| AtomicUsize::new(0)).collect())
-                .collect(),
+            cached: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
             pinned: (0..region_count).map(|_| PinnedCount::default()).collect(),
             lives: policies
                 .iter()
@@ -146,6 +152,7 @@ impl Clock {
                     at_insert: policy.lives_at_insert,
                     per_touch: policy.lives_per_touch,
                     at_reinforce: policy.lives_at_reinforce,
+                    lost_per_sibling_touch: policy.lives_lost_per_sibling_touch,
                 })
                 .collect(),
         }
@@ -162,7 +169,7 @@ impl Clock {
         self.slots[slot].lives.store(lives.at_insert, Relaxed);
         self.slots[slot].bump.store(lives.per_touch, Relaxed);
         self.slots[slot].owner.store(cache.to_owner_byte(), Relaxed);
-        self.owned[cache.index()][self.region_of(slot)].fetch_add(1, Relaxed);
+        self.cached[self.region_of(slot)].fetch_add(1, Relaxed);
     }
 
     /// Mark a slot used again: gain its bump's worth of lives, up to
@@ -192,10 +199,26 @@ impl Clock {
         self.touch(slot);
     }
 
+    /// A sibling copy of the slot's bytes was read: take its cache's
+    /// `lives_lost_per_sibling_touch` from it, down to zero. Fire-and-forget
+    /// like [`reinforce`](Self::reinforce): a slot released meanwhile has no
+    /// owner and loses nothing.
+    pub fn weaken(&self, slot: usize) {
+        let Some(cache) = self.owner(slot) else {
+            return;
+        };
+        let lost = self.lives[cache.index()].lost_per_sibling_touch;
+        let _ = self.slots[slot]
+            .lives
+            .fetch_update(Relaxed, Relaxed, |lives| {
+                (lost > 0 && lives > 0).then(|| lives.saturating_sub(lost))
+            });
+    }
+
     /// Return a slot to no owner: never a victim.
     pub fn release(&self, slot: usize) {
-        if let Some(cache) = self.owner(slot) {
-            self.owned[cache.index()][self.region_of(slot)].fetch_sub(1, Relaxed);
+        if self.owner(slot).is_some() {
+            self.cached[self.region_of(slot)].fetch_sub(1, Relaxed);
         }
         self.slots[slot].owner.store(NO_OWNER, Relaxed);
     }
@@ -204,25 +227,18 @@ impl Clock {
         CacheId::from_owner_byte(self.slots[slot].owner.load(Relaxed))
     }
 
-    /// Slots `cache` owns over the whole ring.
+    /// Slots `cache` owns over the whole ring - test-only visibility for
+    /// asserting what an eviction took.
+    #[cfg(test)]
     pub fn owned(&self, cache: CacheId) -> usize {
-        self.owned[cache.index()]
-            .iter()
-            .map(|count| count.load(Relaxed))
-            .sum()
-    }
-
-    /// Slots `cache` owns in `region`.
-    pub fn owned_in_region(&self, cache: CacheId, region: usize) -> usize {
-        self.owned[cache.index()][region].load(Relaxed)
+        (0..self.slots.len())
+            .filter(|&slot| self.owner(slot) == Some(cache))
+            .count()
     }
 
     /// Slots any cache owns in `region`.
     pub fn cached_in_region(&self, region: usize) -> usize {
-        self.owned
-            .iter()
-            .map(|per_region| per_region[region].load(Relaxed))
-            .sum()
+        self.cached[region].load(Relaxed)
     }
 
     /// Count `slot` as pinned, if a cache owns it. For the ring to call when
@@ -267,19 +283,16 @@ impl Clock {
         *MAX_LIVES
     }
 
-    /// Advance `region`'s hand one slot. A slot owned by no cache, or by one
-    /// in `protected`, is stepped over untouched; any other spends a life, or
-    /// is the victim if it has none. Only sweeps `region`'s slots, so the
-    /// caller is never handed another node's memory.
-    pub fn sweep(&self, region: usize, protected: &CacheSet) -> Sweep {
+    /// Advance `region`'s hand one slot. A slot owned by no cache is stepped
+    /// over; any other spends a life, or is the victim if it has none. Only
+    /// sweeps `region`'s slots, so the caller is never handed another node's
+    /// memory.
+    pub fn sweep(&self, region: usize) -> Sweep {
         let offset = self.hands[region].fetch_add(1, Relaxed) % self.slots_per_region;
         let slot = region * self.slots_per_region + offset;
         let Some(cache) = self.owner(slot) else {
             return Sweep::Skipped;
         };
-        if protected.contains(cache) {
-            return Sweep::Skipped;
-        }
         // Decrement while positive; an already-zero counter is the victim.
         let had_a_life = self.slots[slot]
             .lives
@@ -293,7 +306,7 @@ impl Clock {
     }
 
     /// How many steps `region`'s hand has taken in total - test-only
-    /// visibility for bounding an eviction's sweep.
+    /// visibility for asserting whether an eviction swept at all.
     #[cfg(test)]
     pub fn hand_position(&self, region: usize) -> usize {
         self.hands[region].load(Relaxed)
@@ -315,6 +328,7 @@ mod tests {
     const HEAVY: CacheId = CacheId::new(1);
 
     const LIGHT_REINFORCE: u8 = 6;
+    const HEAVY_LOSS: u8 = 2;
 
     fn policies() -> Vec<CachePolicy> {
         vec![
@@ -323,12 +337,14 @@ mod tests {
                 lives_at_insert: 1,
                 lives_per_touch: 1,
                 lives_at_reinforce: LIGHT_REINFORCE,
+                lives_lost_per_sibling_touch: 0,
             },
             CachePolicy {
                 name: "heavy",
                 lives_at_insert: 3,
                 lives_per_touch: 4,
                 lives_at_reinforce: 10,
+                lives_lost_per_sibling_touch: HEAVY_LOSS,
             },
         ]
     }
@@ -337,10 +353,10 @@ mod tests {
         Clock::new(len, &policies())
     }
 
-    /// Sweep region 0 with nothing protected until a victim turns up.
+    /// Sweep region 0 until a victim turns up.
     fn evict(clock: &Clock) -> (usize, CacheId) {
         loop {
-            if let Sweep::Candidate { slot, cache } = clock.sweep(0, &CacheSet::EMPTY) {
+            if let Sweep::Candidate { slot, cache } = clock.sweep(0) {
                 return (slot, cache);
             }
         }
@@ -350,7 +366,7 @@ mod tests {
     fn a_free_slot_is_never_a_victim() {
         let clock = clock(1);
 
-        assert_eq!(clock.sweep(0, &CacheSet::EMPTY), Sweep::Skipped);
+        assert_eq!(clock.sweep(0), Sweep::Skipped);
     }
 
     #[test]
@@ -374,22 +390,6 @@ mod tests {
 
         assert_eq!((slot, cache), (1, LIGHT));
         assert_eq!(clock.lives(0), 1, "the heavy slot was aged twice meanwhile");
-    }
-
-    #[test]
-    fn a_protected_slot_is_neither_aged_nor_taken() {
-        let clock = clock(2);
-        clock.bind(0, LIGHT);
-        clock.bind(1, HEAVY);
-        let mut protected = CacheSet::EMPTY;
-        protected.insert(LIGHT);
-
-        for _ in 0..10 {
-            clock.sweep(0, &protected);
-        }
-
-        assert_eq!(clock.lives(0), 1, "protected slots keep their lives");
-        assert_eq!(clock.lives(1), 0);
     }
 
     #[test]
@@ -418,16 +418,15 @@ mod tests {
     }
 
     #[test]
-    fn binding_and_releasing_track_the_per_cache_counts() {
+    fn releasing_a_slot_leaves_it_with_no_owner() {
         let clock = clock(2);
         clock.bind(0, LIGHT);
         clock.bind(1, HEAVY);
 
         clock.release(0);
 
-        assert_eq!(clock.owned(LIGHT), 0);
-        assert_eq!(clock.owned(HEAVY), 1);
-        assert_eq!(clock.cached_in_region(0), 1);
+        assert_eq!(clock.owner(0), None);
+        assert_eq!(clock.owner(1), Some(HEAVY));
     }
 
     #[test]
@@ -459,17 +458,36 @@ mod tests {
     fn reinforce_grants_extra_sweeps_immediately() {
         let clock = clock(1);
         clock.bind(0, LIGHT);
-        clock.sweep(0, &CacheSet::EMPTY); // its one insert-time life, spent
+        clock.sweep(0); // its one insert-time life, spent
 
         clock.reinforce(0);
 
         for _ in 0..LIGHT_REINFORCE {
-            assert_eq!(clock.sweep(0, &CacheSet::EMPTY), Sweep::Aged);
+            assert_eq!(clock.sweep(0), Sweep::Aged);
         }
-        assert!(matches!(
-            clock.sweep(0, &CacheSet::EMPTY),
-            Sweep::Candidate { slot: 0, .. }
-        ));
+        assert_eq!(
+            clock.sweep(0),
+            Sweep::Candidate {
+                slot: 0,
+                cache: LIGHT
+            }
+        );
+    }
+
+    #[test]
+    fn weakening_takes_the_owners_own_loss_and_stops_at_zero() {
+        let clock = clock(2);
+        clock.bind(0, LIGHT); // loses nothing to a sibling's reads
+        clock.bind(1, HEAVY); // starts with 3
+
+        clock.weaken(0);
+        clock.weaken(1);
+        let heavy_lives_after_one = clock.lives(1);
+        clock.weaken(1);
+
+        assert_eq!(clock.lives(0), 1);
+        assert_eq!(heavy_lives_after_one, 3 - HEAVY_LOSS);
+        assert_eq!(clock.lives(1), 0);
     }
 
     #[test]
@@ -507,8 +525,8 @@ mod tests {
         for _ in 0..4 {
             clock.touch(0);
             clock.touch(1);
-            clock.sweep(0, &CacheSet::EMPTY);
-            clock.sweep(0, &CacheSet::EMPTY);
+            clock.sweep(0);
+            clock.sweep(0);
         }
 
         assert!(clock.lives(0) > 8, "last copy should climb");
@@ -534,7 +552,7 @@ mod tests {
         clock.bind(0, LIGHT);
         clock.release(0);
 
-        assert_eq!(clock.sweep(0, &CacheSet::EMPTY), Sweep::Skipped);
+        assert_eq!(clock.sweep(0), Sweep::Skipped);
     }
 
     #[test]
@@ -544,7 +562,7 @@ mod tests {
         clock.bind(3, LIGHT);
 
         for _ in 0..8 {
-            if let Sweep::Candidate { slot, .. } = clock.sweep(1, &CacheSet::EMPTY) {
+            if let Sweep::Candidate { slot, .. } = clock.sweep(1) {
                 assert!(slot >= 2);
             }
         }

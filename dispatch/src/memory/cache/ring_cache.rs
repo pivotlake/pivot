@@ -54,6 +54,10 @@ pub trait RingCache: Send + Sync {
     /// than ordinary entries under the same pressure.
     fn reinforce_range(&self, range: &SourceRange);
 
+    /// A sibling's copy of `range` was read: weaken every slot of this cache
+    /// holding bytes of it, so a copy made redundant by one in use goes first.
+    fn weaken_range(&self, range: &SourceRange);
+
     /// Drop every entry of `file`, because a reopened descriptor may now name
     /// different bytes. Slots stay bound and recycle lazily through the clock.
     fn invalidate(&self, file: &OpenFile);

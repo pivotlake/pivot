@@ -33,8 +33,8 @@
 //!
 //! Every family that keeps raw bytes has its own `CompressedCache`, so the
 //! bytes a dictionary index was decoded from live in the dictionary family's
-//! compressed cache, balanced against the decoded form by that family's
-//! shares. A read names the compressed cache it fills by [`CacheId`].
+//! compressed cache, weighed against the decoded form by that family's
+//! policies. A read names the compressed cache it fills by [`CacheId`].
 
 mod extent;
 mod lookup;
@@ -350,6 +350,20 @@ impl CompressedCache {
         })
     }
 
+    /// Call `visit` with the slot of every extent overlapping `range`.
+    fn visit_slots_overlapping(&self, range: &SourceRange, visit: impl Fn(usize)) {
+        if range.len == 0 {
+            return;
+        }
+        let first_file_block = range.offset / BLOCK_SIZE;
+        let last_file_block = (range.end() - 1) / BLOCK_SIZE;
+        self.files.with_table(&range.file, |table| {
+            for extent in table.overlapping(first_file_block, last_file_block) {
+                visit(extent.slot_idx as usize);
+            }
+        });
+    }
+
     #[cfg(test)]
     pub(crate) fn holds_file(&self, open_file: &OpenFile) -> bool {
         self.files.contains_file(open_file)
@@ -373,16 +387,12 @@ impl RingCache for CompressedCache {
     /// Slot granularity, so a multi-tenant slot's other extents shelter under
     /// the same reinforcement.
     fn reinforce_range(&self, range: &SourceRange) {
-        if range.len == 0 {
-            return;
-        }
-        let first_file_block = range.offset / BLOCK_SIZE;
-        let last_file_block = (range.end() - 1) / BLOCK_SIZE;
-        self.files.with_table(&range.file, |table| {
-            for extent in table.overlapping(first_file_block, last_file_block) {
-                memory_ctx().clock().reinforce(extent.slot_idx as usize);
-            }
-        });
+        self.visit_slots_overlapping(range, |slot| memory_ctx().clock().reinforce(slot));
+    }
+
+    /// Slot granularity too: the slot's other extents weaken with it.
+    fn weaken_range(&self, range: &SourceRange) {
+        self.visit_slots_overlapping(range, |slot| memory_ctx().clock().weaken(slot));
     }
 
     /// Start `file` over with an empty table, so the next lookup misses. The

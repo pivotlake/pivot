@@ -186,14 +186,25 @@ impl<V: Cached> Cache<V> {
         if !self.enabled {
             return None;
         }
-        self.files
+        let value = self
+            .files
             .with_table(&key.file, |table| {
                 table
                     .get(&key.offset)
                     .filter(|entry| entry.span == key.span)
                     .and_then(Entry::pin_and_rebuild)
             })
-            .flatten()
+            .flatten()?;
+        self.weaken_sibling_copies(&key.file, key.offset, key.span);
+        Some(value)
+    }
+
+    /// This cache just served `[offset, offset + span)` of `file`: the other
+    /// forms of those bytes are the redundant ones now. Called with the file's
+    /// table lock released.
+    fn weaken_sibling_copies(&self, file: &OpenFile, offset: usize, span: usize) {
+        let range = SourceRange::new(file.clone(), offset, span);
+        memory_ctx().caches().weaken_siblings(self.id, &range);
     }
 
     /// Resolve `[offset, offset + len)` of `file` into segments in file order:
@@ -218,11 +229,58 @@ impl<V: Cached> Cache<V> {
                 }
             }
         });
-        segments.finish()
+        let segments = segments.finish();
+        self.weaken_sibling_copies_of_hits(file, &segments);
+        segments
+    }
+
+    /// One weakening per unbroken run of hits, so a sibling slot under a run
+    /// of small entries pays once for the read, not once per entry.
+    fn weaken_sibling_copies_of_hits(&self, file: &OpenFile, segments: &[Segment<V>]) {
+        let mut run: Option<(usize, usize)> = None;
+        for segment in segments {
+            match (segment, &mut run) {
+                (Segment::Cached { offset, span, .. }, Some((start, len)))
+                    if *start + *len == *offset =>
+                {
+                    *len += span;
+                }
+                (Segment::Cached { offset, span, .. }, _) => {
+                    if let Some((start, len)) = run.replace((*offset, *span)) {
+                        self.weaken_sibling_copies(file, start, len);
+                    }
+                }
+                (Segment::Gap { .. }, _) => {}
+            }
+        }
+        if let Some((start, len)) = run {
+            self.weaken_sibling_copies(file, start, len);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.load(Ordering::Relaxed) == 0
+    }
+
+    /// Call `visit` with the slot of every extent of every entry overlapping
+    /// `range`.
+    fn visit_slots_overlapping(&self, range: &SourceRange, visit: impl Fn(usize)) {
+        if !self.enabled || range.len == 0 {
+            return;
+        }
+        self.files.with_table(&range.file, |table| {
+            // An entry starting before the range may still reach into it.
+            let reaching_in = table
+                .range(..range.offset)
+                .next_back()
+                .filter(|(entry_offset, entry)| **entry_offset + entry.span > range.offset);
+            let starting_inside = table.range(range.offset..range.end());
+            for (_, entry) in reaching_in.into_iter().chain(starting_inside) {
+                for extent in &entry.extents {
+                    visit(extent.slot as usize);
+                }
+            }
+        });
     }
 
     /// Drop every entry of `slot` still placed there, returning their source
@@ -284,24 +342,11 @@ impl<V: Cached> RingCache for Cache<V> {
     }
 
     fn reinforce_range(&self, range: &SourceRange) {
-        if !self.enabled || range.len == 0 {
-            return;
-        }
-        self.files.with_table(&range.file, |table| {
-            // An entry starting before the range may still reach into it.
-            if let Some((&entry_offset, entry)) = table.range(..range.offset).next_back()
-                && entry_offset + entry.span > range.offset
-            {
-                for extent in &entry.extents {
-                    memory_ctx().clock().reinforce(extent.slot as usize);
-                }
-            }
-            for (_, entry) in table.range(range.offset..range.end()) {
-                for extent in &entry.extents {
-                    memory_ctx().clock().reinforce(extent.slot as usize);
-                }
-            }
-        });
+        self.visit_slots_overlapping(range, |slot| memory_ctx().clock().reinforce(slot));
+    }
+
+    fn weaken_range(&self, range: &SourceRange) {
+        self.visit_slots_overlapping(range, |slot| memory_ctx().clock().weaken(slot));
     }
 
     fn invalidate(&self, file: &OpenFile) {

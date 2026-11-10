@@ -1,6 +1,5 @@
-//! Naming a cache: its [`CacheId`], the [`CachePolicy`] that says how hard its
-//! slots are to drop, and [`CacheSet`], a small set of ids the evictor passes
-//! around.
+//! Naming a cache: its [`CacheId`] and the [`CachePolicy`] that says how hard
+//! its slots are to drop.
 
 /// Index of one cache in the [`Caches`](super::Caches) registry.
 ///
@@ -53,26 +52,13 @@ pub struct CachePolicy {
     /// being the last one climbs while equally hot backed copies sink. Only
     /// meaningful for a cache with siblings.
     pub lives_at_reinforce: u8,
-}
-
-/// A set of [`CacheId`]s, as a bitmask.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub struct CacheSet(u128);
-
-impl CacheSet {
-    pub const EMPTY: Self = Self(0);
-
-    pub fn insert(&mut self, id: CacheId) {
-        self.0 |= 1 << id.index();
-    }
-
-    pub fn contains(&self, id: CacheId) -> bool {
-        self.0 & (1 << id.index()) != 0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0 == 0
-    }
+    /// Lives a slot loses each time a sibling cache's copy of the same bytes
+    /// is read. A read served by the sibling shows that copy is in use and
+    /// staying, so this one is the redundant one and should be the first to
+    /// go; a copy whose sibling is never read keeps its lives and is still
+    /// there when the sibling is dropped. Zero for a cache that should not
+    /// yield this way; only meaningful for a cache with siblings.
+    pub lives_lost_per_sibling_touch: u8,
 }
 
 #[cfg(test)]
@@ -87,16 +73,5 @@ mod tests {
 
         assert_eq!(CacheId::from_owner_byte(byte), Some(id));
         assert_eq!(CacheId::from_owner_byte(0), None);
-    }
-
-    #[test]
-    fn a_set_reports_only_the_ids_inserted() {
-        let mut set = CacheSet::EMPTY;
-
-        set.insert(CacheId::new(2));
-
-        assert!(set.contains(CacheId::new(2)));
-        assert!(!set.contains(CacheId::new(1)));
-        assert!(!set.is_empty());
     }
 }
