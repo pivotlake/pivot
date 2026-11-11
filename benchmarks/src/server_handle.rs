@@ -170,6 +170,7 @@ server:
 {workers_line}{memory_line}datastores:
   default:
     kind: pivotlake
+    table_format: delta
     location: {data_dir}
     default: true
     compact: false
