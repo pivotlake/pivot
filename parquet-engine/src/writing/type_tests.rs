@@ -309,6 +309,28 @@ fn assert_reads_back_as(values: ArrayRef, expected: &DataType) {
     assert_eq!(schema.field(0).data_type(), expected);
 }
 
+/// The writer records string bounds whole and says so, which is what lets a
+/// reader answer the column's MIN and MAX from the footer alone.
+#[test]
+fn string_bounds_are_flagged_exact() {
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
+    let case = Case {
+        name: "names".to_string(),
+        values: Arc::new(StringViewArray::from(vec!["apple", "zebra crossing"])),
+        encoding: PLAIN,
+    };
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("data.parquet");
+    std::fs::write(&path, write_cases(&dispatch, &[case])).unwrap();
+
+    let table = ParquetTable::from_files(dispatch.dispatcher(), &[path], &[]).unwrap();
+    let (min, max) = table.column_min_max(0).unwrap();
+
+    let expected: ArrayRef = Arc::new(StringViewArray::from(vec!["apple", "zebra crossing"]));
+    assert_eq!(min.into_inner().as_ref(), expected.slice(0, 1).as_ref());
+    assert_eq!(max.into_inner().as_ref(), expected.slice(1, 1).as_ref());
+}
+
 /// A timestamp column says so on the leaf, so another engine reads microseconds
 /// rather than the count's bare integer.
 #[test]

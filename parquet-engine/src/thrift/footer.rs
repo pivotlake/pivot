@@ -239,6 +239,11 @@ thrift_struct!(
         4: optional i64 distinct_count;
         5: optional binary max_value;
         6: optional binary min_value;
+        /// Whether `max_value` is the chunk's real maximum rather than only an
+        /// upper bound on it (a writer may truncate a long value).
+        7: optional bool is_max_value_exact;
+        /// Whether `min_value` is the chunk's real minimum, on the same terms.
+        8: optional bool is_min_value_exact;
     }
 );
 

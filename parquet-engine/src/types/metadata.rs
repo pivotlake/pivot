@@ -31,6 +31,11 @@ pub(crate) struct FileLeafStatistics {
     pub(crate) min: Option<ArrayRef>,
     /// Upper bounds, on the same terms as `min`.
     pub(crate) max: Option<ArrayRef>,
+    /// Whether each row group's lower bound is a value the row group really
+    /// holds, rather than only a bound below every value.
+    pub(crate) min_is_exact: Vec<bool>,
+    /// Whether each row group's upper bound is exact, on the same terms.
+    pub(crate) max_is_exact: Vec<bool>,
     pub(crate) null_counts: Vec<Option<i64>>,
     pub(crate) distinct_counts: Vec<Option<i64>>,
 }
@@ -43,6 +48,8 @@ pub struct ColumnStatistics<'a> {
     row_group: usize,
     min: Option<&'a ArrayRef>,
     max: Option<&'a ArrayRef>,
+    min_is_exact: bool,
+    max_is_exact: bool,
     pub null_count: Option<i64>,
     pub distinct_count: Option<i64>,
 }
@@ -58,6 +65,17 @@ impl<'a> ColumnStatistics<'a> {
     /// This row group's upper bound, on the same terms as [`Self::min`].
     pub fn max(&self) -> Option<Scalar<ArrayRef>> {
         self.bound(self.max)
+    }
+
+    /// This row group's smallest value, or `None` where the lower bound is
+    /// missing or only bounds the values from below.
+    pub fn exact_min(&self) -> Option<Scalar<ArrayRef>> {
+        self.min().filter(|_| self.min_is_exact)
+    }
+
+    /// This row group's largest value, on the same terms as [`Self::exact_min`].
+    pub fn exact_max(&self) -> Option<Scalar<ArrayRef>> {
+        self.max().filter(|_| self.max_is_exact)
     }
 
     /// Slice this row group's own value out of a leaf's column of bounds.
@@ -267,6 +285,8 @@ impl RowGroupMetadata {
             row_group: self.file_row_group_idx,
             min: leaf.min.as_ref(),
             max: leaf.max.as_ref(),
+            min_is_exact: leaf.min_is_exact[self.file_row_group_idx],
+            max_is_exact: leaf.max_is_exact[self.file_row_group_idx],
             null_count: leaf.null_counts[self.file_row_group_idx],
             distinct_count: leaf.distinct_counts[self.file_row_group_idx],
         })

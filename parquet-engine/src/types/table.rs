@@ -170,9 +170,10 @@ impl ParquetTable {
     }
 
     /// The `column`'s lower and upper bound over every row group, folded from
-    /// the row-group statistics, or `None` when any row group lacks a bound
-    /// (or the table has none): only a complete set of bounds answers a
-    /// query's MIN/MAX without a scan. A bound held by a row group handed
+    /// the row-group statistics, or `None` when any row group lacks an exact
+    /// bound (or the table has none): only a complete set of bounds that are
+    /// values the column really holds answers a query's MIN/MAX without a
+    /// scan. A bound held by a row group handed
     /// deleted rows is no bound either, as the rows holding it may be the
     /// deleted ones; a row group handed none has none. The scalars carry the
     /// column's physical storage type.
@@ -186,7 +187,7 @@ impl ParquetTable {
         let mut max: Option<(Scalar<ArrayRef>, &RowGroupMetadata)> = None;
         for row_group in &self.row_groups {
             let stats = row_group.column_statistics(column)?;
-            let (group_min, group_max) = (stats.min()?, stats.max()?);
+            let (group_min, group_max) = (stats.exact_min()?, stats.exact_max()?);
             min = Some(match min {
                 Some(held) if !scalar_lt(&group_min, &held.0) => held,
                 _ => (group_min, row_group),
@@ -380,6 +381,8 @@ fn absent_leaf_statistics(row_counts: &[i64]) -> FileLeafStatistics {
     FileLeafStatistics {
         min: None,
         max: None,
+        min_is_exact: vec![false; row_counts.len()],
+        max_is_exact: vec![false; row_counts.len()],
         null_counts: row_counts.iter().map(|rows| Some(*rows)).collect(),
         distinct_counts: row_counts.iter().map(|_| Some(0)).collect(),
     }
@@ -513,7 +516,8 @@ fn data_pages_all_dictionary(encoding_stats: Option<&[PageEncodingStats]>) -> bo
 /// which follows the column's physical storage rather than its arrow type.
 ///
 /// Prefer the modern `min_value` / `max_value` fields and fall back to the
-/// legacy `min` / `max` only when those aren't populated. Returns `None` when no
+/// legacy `min` / `max` only when those aren't populated. The legacy pair
+/// carries no exactness flag. Returns `None` when no
 /// row group recorded anything for the leaf.
 fn decode_leaf_statistics(
     chunks: Vec<Option<Statistics>>,
@@ -522,18 +526,30 @@ fn decode_leaf_statistics(
 ) -> Option<FileLeafStatistics> {
     let mut min_bytes = Vec::with_capacity(chunks.len());
     let mut max_bytes = Vec::with_capacity(chunks.len());
+    let mut min_is_exact = Vec::with_capacity(chunks.len());
+    let mut max_is_exact = Vec::with_capacity(chunks.len());
     let mut null_counts = Vec::with_capacity(chunks.len());
     let mut distinct_counts = Vec::with_capacity(chunks.len());
     let mut recorded = false;
     for chunk in chunks {
         let (min, max, null_count, distinct_count) = match chunk {
-            Some(stats) => (
-                stats.min_value.or(stats.min),
-                stats.max_value.or(stats.max),
-                stats.null_count,
-                stats.distinct_count,
-            ),
-            None => (None, None, None, None),
+            Some(stats) => {
+                let min_exact_flag = stats.min_value.as_ref().and(stats.is_min_value_exact);
+                let max_exact_flag = stats.max_value.as_ref().and(stats.is_max_value_exact);
+                min_is_exact.push(is_bound_exact(min_exact_flag, data_type));
+                max_is_exact.push(is_bound_exact(max_exact_flag, data_type));
+                (
+                    stats.min_value.or(stats.min),
+                    stats.max_value.or(stats.max),
+                    stats.null_count,
+                    stats.distinct_count,
+                )
+            }
+            None => {
+                min_is_exact.push(false);
+                max_is_exact.push(false);
+                (None, None, None, None)
+            }
         };
         recorded |=
             min.is_some() || max.is_some() || null_count.is_some() || distinct_count.is_some();
@@ -548,9 +564,32 @@ fn decode_leaf_statistics(
     Some(FileLeafStatistics {
         min: decode_bounds(&min_bytes, data_type, physical_type),
         max: decode_bounds(&max_bytes, data_type, physical_type),
+        min_is_exact,
+        max_is_exact,
         null_counts,
         distinct_counts,
     })
+}
+
+/// Whether a recorded bound of type `data_type` is a value the chunk really
+/// holds, given the footer's exactness flag for it (`None` when the writer set
+/// none).
+///
+/// Writers truncate long string and binary bounds, so those are exact only
+/// when the flag says so. A float bound never is: the statistics leave NaN out
+/// and do not tell `-0.0` from `0.0`. Every other type is fixed-width and
+/// recorded whole, so its bound is exact unless the writer says otherwise.
+fn is_bound_exact(exact_flag: Option<bool>, data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => false,
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView => exact_flag == Some(true),
+        _ => exact_flag != Some(false),
+    }
 }
 
 /// One leaf's bound for every row group as a single array, in file order, null
@@ -1078,6 +1117,70 @@ mod tests {
             .expect("the first row group holds both bounds");
         assert_eq!((int64_bound(min), int64_bound(max)), (1, 9));
         assert!(deleted_in_first.column_min_max(0).is_none());
+    }
+
+    /// A one-row-group table of `values`, whose writer cut each string
+    /// statistic down to `statistics_truncate_length` bytes.
+    fn string_table(
+        values: &[&str],
+        statistics_truncate_length: Option<usize>,
+    ) -> (TempDir, ParquetTable) {
+        let values: ArrayRef = Arc::new(StringViewArray::from(values.to_vec()));
+        let batch = RecordBatch::try_from_iter([("v", values)]).unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("data.parquet");
+        let props = WriterProperties::builder()
+            .set_statistics_truncate_length(statistics_truncate_length)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let table = ParquetTable::from_files(test_dispatcher(), &[path], &[]).unwrap();
+        (dir, table)
+    }
+
+    fn string_bound(bound: Scalar<ArrayRef>) -> String {
+        bound
+            .into_inner()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .value(0)
+            .to_string()
+    }
+
+    #[test]
+    fn a_truncated_string_bound_is_no_bound() {
+        let (_dir, table) = string_table(&["apple", "zebra crossing"], Some(2));
+
+        let min_max = table.column_min_max(0);
+
+        assert!(min_max.is_none());
+    }
+
+    #[test]
+    fn string_bounds_flagged_exact_are_the_column_min_max() {
+        let (_dir, table) = string_table(&["apple", "zebra crossing"], None);
+
+        let (min, max) = table.column_min_max(0).unwrap();
+
+        assert_eq!(
+            (string_bound(min), string_bound(max)),
+            ("apple".to_string(), "zebra crossing".to_string())
+        );
+    }
+
+    #[test]
+    fn a_float_bound_is_no_bound() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![1.5, f64::NAN]));
+        let batch = RecordBatch::try_from_iter([("v", values)]).unwrap();
+        let (_dir, table) = write_parquet(&batch, EnabledStatistics::Chunk);
+
+        let min_max = table.column_min_max(0);
+
+        assert!(min_max.is_none());
     }
 
     #[test]

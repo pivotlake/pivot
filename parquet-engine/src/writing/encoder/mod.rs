@@ -135,6 +135,9 @@ fn leaf_statistics(leaf: &Leaf) -> Statistics {
         // Absent rows: the leaf spans every row, but stores only the present.
         null_count: Some((leaf.rows() - leaf.values.len()) as i64),
         distinct_count: None,
+        // The bounds are recorded whole, never truncated.
+        is_max_value_exact: max_value.as_ref().map(|_| true),
+        is_min_value_exact: min_value.as_ref().map(|_| true),
         min_value,
         max_value,
     }
