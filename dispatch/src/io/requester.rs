@@ -801,9 +801,7 @@ impl IORequester {
                 )
                 .map(|()| None),
             FsRequest::ReadDirect(read) => self.submit_rest_of_direct_read(read, 0).map(|()| None),
-            FsRequest::Write(write) => {
-                submit_rest_of_write(&mut self.backend, write, 0, self.next_id)
-            }
+            FsRequest::Write(write) => self.submit_rest_of_write(write, 0),
         };
         let write_runs = match queued {
             Ok(write_runs) => write_runs,
@@ -851,6 +849,55 @@ impl IORequester {
             read.slab.size() - bytes_done,
             self.next_id,
         )
+    }
+
+    /// Put what is left of `write` after its first `bytes_done` bytes onto the
+    /// backend's queue as one operation, under the next request id: every
+    /// remaining run at once, as far as a single write takes them. Returns the
+    /// array of runs the operation refers to, when it is a vectored one, which
+    /// has to be kept until it completes.
+    fn submit_rest_of_write(
+        &mut self,
+        write: &FsWriteRequest,
+        bytes_done: usize,
+    ) -> std::result::Result<Option<WriteRuns>, crate::io::backend::Error> {
+        let mut bytes_queued = 0;
+        let runs: Box<[libc::iovec]> = write
+            .data
+            .runs_from(bytes_done)
+            .take(MOST_RUNS_PER_WRITE)
+            .take_while(|run| {
+                bytes_queued += run.len();
+                bytes_queued <= crate::io::backend::MAX_IO_OP_LEN || bytes_queued == run.len()
+            })
+            .map(|run| libc::iovec {
+                iov_base: run.as_ptr() as *mut libc::c_void,
+                iov_len: run.len(),
+            })
+            .collect();
+        let offset = write.offset + bytes_done as u64;
+        match &*runs {
+            [] => unreachable!("a write is resubmitted only while it has bytes left"),
+            [only] => {
+                self.backend.submit_write(
+                    write.file.as_raw_fd(),
+                    offset,
+                    only.iov_base as *const u8,
+                    only.iov_len,
+                    self.next_id,
+                )?;
+                Ok(None)
+            }
+            _ => {
+                self.backend.submit_write_vectored(
+                    write.file.as_raw_fd(),
+                    offset,
+                    &runs,
+                    self.next_id,
+                )?;
+                Ok(Some(WriteRuns(runs)))
+            }
+        }
     }
 
     /// Submit a read for a remote region, served from the on-disk cache where
@@ -1050,8 +1097,7 @@ impl IORequester {
                 if let FsRequest::Write(write) = &request.request {
                     let done = done + result.max(0) as usize;
                     if result > 0 && done < write.data.len() {
-                        let write_runs =
-                            submit_rest_of_write(&mut self.backend, write, done, self.next_id)?;
+                        let write_runs = self.submit_rest_of_write(write, done)?;
                         self.pending_io_requests.insert(
                             self.next_id,
                             InFlightFsOp {
@@ -1284,50 +1330,6 @@ impl IORequester {
         select.recv(self.http.completion_receiver());
         select.ready();
         Ok(())
-    }
-}
-
-/// Put what is left of `write` after its first `bytes_done` bytes onto the
-/// backend's queue as one operation: every remaining run at once, as far as a
-/// single write takes them. Returns the array of runs the operation refers
-/// to, when it is a vectored one, which has to be kept until it completes.
-fn submit_rest_of_write(
-    backend: &mut IOBackend,
-    write: &FsWriteRequest,
-    bytes_done: usize,
-    request_id: Identifier,
-) -> std::result::Result<Option<WriteRuns>, crate::io::backend::Error> {
-    let mut bytes_queued = 0;
-    let runs: Box<[libc::iovec]> = write
-        .data
-        .runs_from(bytes_done)
-        .take(MOST_RUNS_PER_WRITE)
-        .take_while(|run| {
-            bytes_queued += run.len();
-            bytes_queued <= crate::io::backend::MAX_IO_OP_LEN || bytes_queued == run.len()
-        })
-        .map(|run| libc::iovec {
-            iov_base: run.as_ptr() as *mut libc::c_void,
-            iov_len: run.len(),
-        })
-        .collect();
-    let offset = write.offset + bytes_done as u64;
-    match &*runs {
-        [] => unreachable!("a write is resubmitted only while it has bytes left"),
-        [only] => {
-            backend.submit_write(
-                write.file.as_raw_fd(),
-                offset,
-                only.iov_base as *const u8,
-                only.iov_len,
-                request_id,
-            )?;
-            Ok(None)
-        }
-        _ => {
-            backend.submit_write_vectored(write.file.as_raw_fd(), offset, &runs, request_id)?;
-            Ok(Some(WriteRuns(runs)))
-        }
     }
 }
 
