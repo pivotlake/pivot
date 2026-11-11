@@ -6,6 +6,7 @@ members = [
     "catalog",
     "datastore-iceberg",
     "datastore-pivotlake",
+    "iceberg-tables",
     "dispatch",
     "duckdb-planner",
     "metastore-disk",
@@ -29,6 +30,7 @@ publish = false
 catalog = { path = "catalog" }
 datastore-iceberg = { path = "datastore-iceberg" }
 datastore-pivotlake = { path = "datastore-pivotlake" }
+iceberg-tables = { path = "iceberg-tables" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore-disk = { path = "metastore-disk" }

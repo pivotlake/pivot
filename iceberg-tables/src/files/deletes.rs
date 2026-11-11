@@ -9,11 +9,10 @@ use dispatch::DataFlowDispatcher;
 use dispatch::io::FileRange;
 use iceberg::delete_vector::DeleteVector;
 use iceberg::spec::{DataContentType, DataFileFormat, Manifest};
-use object_storage::{FileSlice, load_file_slices};
+use object_storage::{DataFile, FileSlice, load_file_slices};
 use roaring::RoaringTreemap;
 
-use crate::manifests::FileDescriptor;
-use crate::store::TableStore;
+use crate::metadata::layout::TableLocation;
 use crate::{Error, Result};
 
 /// What a delete manifest entry records of a deletion vector: where its blob
@@ -35,14 +34,14 @@ struct DeletionVectorMetadata {
 /// from it.
 pub(crate) fn read_deletion_vectors(
     manifests: Vec<Manifest>,
-    files: &[FileDescriptor],
-    store: &TableStore,
+    files: &[DataFile],
+    location: &TableLocation,
     dispatcher: &DataFlowDispatcher,
 ) -> Result<Vec<Option<RoaringTreemap>>> {
     let by_data_file = locate_deletion_vectors(manifests)?;
     let metadata: Vec<Option<&DeletionVectorMetadata>> = files
         .iter()
-        .map(|file| by_data_file.get(&file.path))
+        .map(|file| by_data_file.get(file.file.path.as_str()))
         .collect();
     let mut blobs = Vec::new();
     for (metadata, file) in metadata.iter().zip(files) {
@@ -52,7 +51,7 @@ pub(crate) fn read_deletion_vectors(
         let end = metadata.offset.checked_add(metadata.length);
         if end.is_none_or(|end| end > metadata.puffin_size) {
             return Err(Error::DeletionVector {
-                file: file.path.clone(),
+                file: file.file.path.to_string(),
                 message: format!(
                     "its blob at offset {} of {} bytes is past the end of `{}`",
                     metadata.offset, metadata.length, metadata.puffin_path
@@ -60,7 +59,7 @@ pub(crate) fn read_deletion_vectors(
             });
         }
         blobs.push(FileSlice {
-            file: store.data_file(&metadata.puffin_path, metadata.puffin_size)?,
+            file: location.data_file(&metadata.puffin_path, metadata.puffin_size)?,
             range: FileRange::new(metadata.offset as usize, metadata.length as usize),
         });
     }
@@ -76,7 +75,7 @@ pub(crate) fn read_deletion_vectors(
             let blob = loaded.next().expect("one read per deletion vector").bytes;
             let deleted =
                 DeleteVector::deserialize(&blob).map_err(|source| Error::DeletionVector {
-                    file: file.path.clone(),
+                    file: file.file.path.to_string(),
                     message: source.to_string(),
                 })?;
             Ok(Some(deleted.into_treemap()))

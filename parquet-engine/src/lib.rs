@@ -10,7 +10,9 @@
 //!   reuse.
 //!
 //! [`types`] (the table, row-group metadata, pages, requests), [`pushdown`]
-//! (static filter pushdown shared by catalog and external bindings), and
+//! (static filter pushdown shared by catalog and external bindings),
+//! [`table_binding`] (the binding of a query to a catalog table kept in
+//! Parquet files, shared by the datastores), and
 //! [`row_group_stats`] (min/max elimination shared by static and dynamic
 //! filters) are common to both.
 
@@ -41,6 +43,9 @@ pub(crate) fn http_readahead() -> usize {
 pub const PARQUET_FIELD_ID_METADATA_KEY: &str = "PARQUET:field_id";
 
 mod external;
+/// One data file as a table's metadata tracks it, and the file-level pruning
+/// a query's pushed predicates do before any footer is read.
+pub mod file_entry;
 pub use external::bind_read_parquet;
 
 pub(crate) mod reading;
@@ -57,10 +62,14 @@ pub use writing::aggregate_file_stats;
 
 mod metadata;
 pub use metadata::{FileRowGroups, create_load_and_stage_spec};
-pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
+pub use metadata::{
+    estimate_footer_heap_bytes, file_row_groups_from_metadata, load_file_row_groups,
+};
 
 mod pushdown;
+mod table_binding;
 pub use pushdown::{PushedPredicate, equality_predicates, prune_parquet};
+pub use table_binding::{ParquetBackedTable, ParquetTableBinding, ScanPlan};
 
 mod row_group_stats;
 pub use row_group_stats::{

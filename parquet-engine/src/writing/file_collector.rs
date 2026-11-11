@@ -69,6 +69,10 @@ pub(super) struct FileCollectorFactory {
     /// Batch columns, at the end, that key the partition and are not written.
     unwritten_trailing_columns: usize,
     order_by: Arc<[OrderBy]>,
+    /// The columns every run arrives in order of, which the merge by
+    /// `order_by` then leaves each file in; empty when the runs arrive in no
+    /// such order.
+    sorted_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
@@ -78,11 +82,15 @@ pub(super) struct FileCollectorFactory {
 
 /// One collector per worker. The last `unwritten_trailing_columns` of the
 /// batch columns key the partition without being written: a file's partition
-/// values are read before they are dropped from its batches.
+/// values are read before they are dropped from its batches. `sorted_by`
+/// names the columns of `order_by` when every run arrives in their order,
+/// and is empty otherwise: what each file is then reported sorted by.
+#[allow(clippy::too_many_arguments)] // one call per write pipeline; each piece is needed
 pub(super) fn factories(
     partition_column_names: Arc<[String]>,
     unwritten_trailing_columns: usize,
     order_by: Arc<[OrderBy]>,
+    sorted_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
@@ -108,6 +116,7 @@ pub(super) fn factories(
             partition_column_names: partition_column_names.clone(),
             unwritten_trailing_columns,
             order_by: order_by.clone(),
+            sorted_by: sorted_by.clone(),
             target_rows_per_group,
             target_in_memory_bytes_per_file,
             max_file_size,
@@ -125,6 +134,7 @@ impl UnaryFactory<SortedPartitionRun, FileOrderInput> for FileCollectorFactory {
             partition_column_names: self.partition_column_names,
             unwritten_trailing_columns: self.unwritten_trailing_columns,
             order_by: self.order_by,
+            sorted_by: self.sorted_by,
             target_rows_per_group: self.target_rows_per_group,
             target_in_memory_bytes_per_file: self.target_in_memory_bytes_per_file,
             max_file_size: self.max_file_size,
@@ -202,6 +212,9 @@ pub(super) struct FileCollector {
     /// Batch columns, at the end, that key the partition and are not written.
     unwritten_trailing_columns: usize,
     order_by: Arc<[OrderBy]>,
+    /// What each emitted file is reported sorted by; see
+    /// [`FileCollectorFactory`].
+    sorted_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
@@ -320,6 +333,7 @@ impl FileCollector {
             base_row_group_id,
             assembly_worker: (file_id as usize) % self.topology.total_workers(),
             partition: partition_values,
+            sorted_by: self.sorted_by.clone(),
             target_rows_per_group: self.target_rows_per_group,
             max_file_size: self.max_file_size,
         };

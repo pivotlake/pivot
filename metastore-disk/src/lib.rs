@@ -20,18 +20,22 @@
 //! is the operator's, and the metastore file is the server's own to rewrite
 //! (which is exactly serialising its section back out).
 //!
-//! `kind` selects the datastore implementation: `pivot`, or `iceberg` for the
-//! read-only tables of an Iceberg REST catalog. A `pivot` datastore's storage
-//! backend is chosen from `location`: a plain path (or `file://`) opens a local
-//! store, an `s3://` URI opens an S3 store, a `gs://` URI opens a Google Cloud
-//! Storage store. An `iceberg` datastore names its catalog by `uri` (and
-//! `warehouse`, when the catalog serves several), names the `iceberg` secret it
-//! authenticates to the catalog with by `secret`, and reads the tables' files
-//! from wherever the catalog says they are; it asks the catalog what it holds
-//! on the same refresh interval a `pivot` datastore rereads its store on. A
-//! datastore carries no credentials
-//! of its own; they come from the `secrets` section below, storage secrets
-//! matched to the files' locations and catalog secrets named by the datastore.
+//! `kind` selects the datastore implementation: `pivotlake` (also accepted as
+//! `pivot`), or `iceberg` for the tables of an Iceberg REST catalog.
+//! A `pivotlake` datastore's storage backend is chosen from `location`: a
+//! plain path (or `file://`) opens a local store, an `s3://` URI opens an S3
+//! store, a `gs://` URI opens a Google Cloud Storage store. Its tables are
+//! kept in the table format the database records: `table_format` names the one a
+//! database that does not exist yet is created in (`iceberg` unless it says
+//! `delta`), and an existing database keeps the format it was created in. An
+//! `iceberg` datastore names its catalog by `uri` (and `warehouse`, when the
+//! catalog serves several), names the `iceberg` secret it authenticates to
+//! the catalog with by `secret`, and reads the tables' files from wherever
+//! the catalog says they are; it asks the catalog what it holds on the same
+//! refresh interval a `pivotlake` datastore rereads its store on. A datastore
+//! carries no credentials of its own; they come from the `secrets` section
+//! below, storage secrets matched to the files' locations and catalog secrets
+//! named by the datastore.
 //!
 //! Exactly one datastore must set `default = true`; it becomes the current
 //! database, so unqualified table names and DDL resolve against it. Its name is
@@ -151,7 +155,7 @@ use datastore_iceberg::{IcebergCatalogAuth, IcebergCatalogConfig, IcebergDatasto
 use datastore_pivotlake::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
     DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, MaintenanceConfig,
-    PivotlakeDatastore, VacuumConfig, default_merge_target_bytes,
+    PivotlakeDatastore, TableFormat, VacuumConfig, default_merge_target_bytes,
 };
 use dispatch::DataFlowDispatcher;
 use object_storage::{
@@ -319,7 +323,12 @@ impl DiskMetastore {
                             compaction: config.compaction(),
                             vacuum: config.vacuum(),
                         };
-                        PivotlakeDatastore::from_store(store, dispatcher, Some(maintenance))?
+                        PivotlakeDatastore::from_store(
+                            store,
+                            dispatcher,
+                            Some(maintenance),
+                            config.table_format,
+                        )?
                     }
                     DatastoreConfig::Iceberg(config) => IcebergDatastore::open(
                         &config.catalog_config(name, &self.secrets)?,
@@ -677,15 +686,16 @@ impl DatastoreConfig {
     }
 }
 
-/// The read-only tables of an Iceberg REST catalog. The catalog is named by
-/// `uri` and authenticated to with the `iceberg` secret `secret` names, when it
-/// requires one; the tables' files are read from the locations the catalog
-/// reports, with the credentials the catalog vends or those of the storage
-/// secret scoped to each location.
+/// An Iceberg datastore: the tables of a REST catalog, read and written
+/// through it. The catalog
+/// is authenticated to with the `iceberg` secret `secret` names, when it
+/// requires one, and the tables' files are read from and written to the locations the
+/// catalog reports, with the credentials the catalog vends or those of the
+/// storage secret scoped to each location.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IcebergDatastoreConfig {
-    /// The catalog's base URI, such as `https://catalog.example.com/api`.
+    /// The REST catalog's base URI, such as `https://catalog.example.com/api`.
     uri: String,
     /// The warehouse to serve, when the catalog serves several.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -717,6 +727,7 @@ impl IcebergDatastoreConfig {
             .transpose()
     }
 
+    /// The REST catalog configuration of this entry.
     fn catalog_config(&self, datastore: &str, secrets: &Secrets) -> Result<IcebergCatalogConfig> {
         Ok(IcebergCatalogConfig {
             uri: self.uri.clone(),
@@ -735,6 +746,12 @@ impl IcebergDatastoreConfig {
 #[serde(deny_unknown_fields)]
 pub struct PivotlakeDatastoreConfig {
     location: String,
+    /// The table format a database that does not exist yet at `location` is
+    /// created in: `iceberg` (the default) or `delta` (also spelled
+    /// `deltalake`). An existing database keeps the format it was created
+    /// in, recorded in its index; naming the other one fails at open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    table_format: Option<TableFormat>,
     /// Marks this datastore as the default: the current database, the target of
     /// unqualified table names and DDL. Exactly one datastore must set it.
     #[serde(rename = "default", default)]
@@ -1129,6 +1146,32 @@ secrets:
             "none"
         );
         assert_eq!(store.default_datastore_name(), "lake");
+    }
+
+    #[test]
+    fn a_pivotlake_datastore_names_the_table_format_of_a_new_database() {
+        let yaml = "datastores:\n  hot:\n    kind: pivotlake\n    location: /tmp/hot\n    table_format: delta\n    default: true\n  lake:\n    kind: pivotlake\n    location: /tmp/lake\n    table_format: deltalake\n  new:\n    kind: pivotlake\n    location: /tmp/new\n";
+
+        let store = from_yaml(yaml).unwrap();
+
+        assert_eq!(
+            datastore(&store, "hot").table_format,
+            Some(TableFormat::Delta)
+        );
+        assert_eq!(
+            datastore(&store, "lake").table_format,
+            Some(TableFormat::Delta)
+        );
+        assert_eq!(datastore(&store, "new").table_format, None);
+    }
+
+    #[test]
+    fn an_unknown_table_format_is_rejected() {
+        let yaml = "datastores:\n  hot:\n    kind: pivotlake\n    location: /tmp/hot\n    table_format: hudi\n    default: true\n";
+
+        let result = from_yaml(yaml);
+
+        assert!(matches!(result, Err(Error::Parse { .. })));
     }
 
     #[test]

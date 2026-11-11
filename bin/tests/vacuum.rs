@@ -6,6 +6,9 @@ use arrow_array::Int64Array;
 use bin::execution::{Command, ExecuteOptions, StatementOutput};
 use bin::shell::{ShellInstance, ShellTarget};
 use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivotlake::test_support::{
+    commit_external_replace, live_data_file_names, set_table_property,
+};
 
 fn find_table_dir(root: &Path, table: &str) -> PathBuf {
     let manifest: serde_json::Value =
@@ -21,10 +24,79 @@ fn age_file(path: &Path) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn vacuum_expires_an_iceberg_tables_snapshots_and_deletes_only_what_they_used() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().to_str().unwrap();
+    let instance = ShellInstance::open_with_resources(
+        &ShellTarget::pivot_with_table_format(
+            root,
+            Some(datastore_pivotlake::TableFormat::Iceberg),
+        ),
+        1,
+        32,
+        None,
+        DEFAULT_REFRESH_INTERVAL,
+    )
+    .unwrap();
+    let executor = instance.executor();
+    for sql in [
+        "CREATE TABLE events (id BIGINT)",
+        "INSERT INTO events VALUES (1)",
+    ] {
+        executor
+            .execute(sql.into(), ExecuteOptions::default())
+            .await
+            .unwrap();
+    }
+    let table_dir = find_table_dir(directory.path(), "events");
+    let table_directory = table_dir.file_name().unwrap().to_str().unwrap();
+    let retired = live_data_file_names(root, table_directory).unwrap()[0].clone();
+    let bytes = fs::read(table_dir.join(&retired)).unwrap();
+    commit_external_replace(root, table_directory, &[&retired], "b.parquet", &bytes, 1).unwrap();
+    let window = "history.expire.max-snapshot-age-ms";
+    set_table_property(root, table_directory, window, "1").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let stray = table_dir.join("stray.parquet");
+    fs::write(&stray, b"named by no metadata").unwrap();
+    age_file(&stray);
+
+    executor
+        .execute("VACUUM".into(), ExecuteOptions::default())
+        .await
+        .unwrap();
+
+    assert!(!table_dir.join(&retired).exists());
+    assert!(table_dir.join("b.parquet").exists());
+    assert!(stray.exists(), "a file no metadata names is not reclaimed");
+    let rows = executor
+        .execute(
+            "SELECT count(*) FROM events".into(),
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+    let StatementOutput::Rows { batches, .. } = rows.output else {
+        panic!("expected rows")
+    };
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn vacuum_in_shell_reclaims_expired_files_and_dropped_tables() {
     let directory = tempfile::tempdir().unwrap();
     let instance = ShellInstance::open_with_resources(
-        &ShellTarget::pivot(directory.path().to_str().unwrap()),
+        &ShellTarget::pivot_with_table_format(
+            directory.path().to_str().unwrap(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        ),
         1,
         32,
         None,
@@ -112,7 +184,10 @@ async fn vacuum_in_shell_reclaims_expired_files_and_dropped_tables() {
 async fn vacuum_reports_unsupported_forms_and_cleanup_errors() {
     let directory = tempfile::tempdir().unwrap();
     let instance = ShellInstance::open_with_resources(
-        &ShellTarget::pivot(directory.path().to_str().unwrap()),
+        &ShellTarget::pivot_with_table_format(
+            directory.path().to_str().unwrap(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        ),
         1,
         32,
         None,

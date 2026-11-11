@@ -612,20 +612,6 @@ impl DecompressedCache {
         self.blocks.load(Ordering::Relaxed) == 0
     }
 
-    /// Drop every block belonging to `open_file` (e.g. when its fd is reopened) so a
-    /// stale block can't serve a later read. The slots stay `Decompressed` with
-    /// stale tenants and are recycled lazily by the clock (via
-    /// [`reclaim`](Self::reclaim), whose identity guard skips them).
-    pub fn invalidate(&self, open_file: &OpenFile) {
-        if !self.enabled {
-            return;
-        }
-        if let Some(table) = self.files.write().unwrap().remove(open_file) {
-            self.blocks
-                .fetch_sub(table.into_inner().unwrap().len(), Ordering::Relaxed);
-        }
-    }
-
     /// Drop every cached block, returning how many were dropped. Releases this
     /// worker's fill cursor, then eagerly recycles every slot it can take
     /// exclusively, using the same guarded purge as [`reclaim`](Self::reclaim)
@@ -686,7 +672,7 @@ mod tests {
 
     /// A fresh, independent local file (distinct cache key bucket).
     fn new_file() -> OpenFile {
-        OpenFile::Local(LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap())
+        OpenFile::Local(LocalFile::new(tempfile::tempfile().unwrap()).unwrap())
     }
 
     fn key_for(open_file: &OpenFile) -> BlockKey {
@@ -923,13 +909,12 @@ mod tests {
     }
 
     #[test]
-    fn reclaiming_a_stale_orphan_spares_the_reinserted_block() {
+    fn reclaiming_a_stale_orphan_spares_the_block_published_elsewhere() {
         init_test_free_pool(4);
         let cache = for_test(true);
-        insert_page(&cache, test_key(0), 64, 0xAA);
+        drop(cache.reserve(&test_key(0), 64)); // never published: its tenant is stale
         let orphan_slot = cursor_slot();
-        cache.invalidate(&FD()); // the block is gone; its tenant is now stale
-        release_cursor(&cache); // force the re-insert into a fresh slot
+        release_cursor(&cache); // force the insert into a fresh slot
         insert_page(&cache, test_key(0), 64, 0xBB);
         release_cursor(&cache);
 
@@ -943,7 +928,7 @@ mod tests {
         );
         assert!(
             cache.get(&test_key(0)).is_some(),
-            "the re-inserted block at the same key must survive"
+            "the block published at the same key must survive"
         );
     }
 
@@ -984,24 +969,9 @@ mod tests {
 
         insert_page(&cache, test_key(0), 8, 0);
         assert!(!cache.is_empty());
-        cache.invalidate(&FD());
+        cache.clear();
 
         assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn invalidate_drops_only_the_matching_location() {
-        init_test_free_pool(4);
-        let cache = for_test(true);
-        let a = new_file();
-        let b = new_file();
-        insert_page(&cache, key_for(&a), 8, 0);
-        insert_page(&cache, key_for(&b), 8, 0);
-
-        cache.invalidate(&a);
-
-        assert!(cache.get(&key_for(&a)).is_none());
-        assert!(cache.get(&key_for(&b)).is_some());
     }
 
     #[test]

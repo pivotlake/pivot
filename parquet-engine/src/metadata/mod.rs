@@ -23,6 +23,7 @@
 //! for the `CREATE TABLE` transaction.
 
 mod fetcher;
+mod footer_heap_bytes;
 mod writer;
 
 use crate::types::columns::TableColumns;
@@ -34,6 +35,7 @@ use dispatch::{
     UnaryFactory, fan_in,
 };
 use fetcher::FileRowGroupsFetcher;
+pub use footer_heap_bytes::estimate_footer_heap_bytes;
 use object_storage::file_injector::FileInjectorFactory;
 use object_storage::{DataFile, DataFileLocation, FileRef, ObjectPath};
 use roaring::RoaringTreemap;
@@ -55,17 +57,16 @@ impl FileRowGroups {
     /// Record the rows the file's row-level deletes removed, `deleted` by
     /// position in the file, on the row groups that may hold them, so a scan
     /// drops them. Each shares the bitmap as decoded, so no position is
-    /// visited. Only for row groups fresh from the footer read, which nothing
-    /// shares yet.
+    /// visited. A row group something else holds too, a cache of footers or
+    /// another plan, is left as it is: the deleted rows go on a copy of it,
+    /// which takes its place here.
     pub fn mark_deleted_rows(&mut self, deleted: RoaringTreemap) {
         let deleted = Arc::new(deleted);
         for row_group in &mut self.row_groups {
             if deleted.range_cardinality(containers_covering(&row_group.file_positions())) == 0 {
                 continue;
             }
-            Arc::get_mut(row_group)
-                .expect("row groups fresh from the footer read are not shared")
-                .deleted_rows = Some(deleted.clone());
+            Arc::make_mut(row_group).deleted_rows = Some(deleted.clone());
         }
     }
 }
@@ -276,6 +277,22 @@ mod tests {
             deleted_per_row_group(&file),
             vec![Some(vec![1]), None, Some(vec![3])]
         );
+    }
+
+    #[test]
+    fn deleted_rows_marked_on_shared_row_groups_stay_off_the_ones_shared() {
+        let container = 1 << 16;
+        let shared = file_of_row_groups(&[container, container]);
+        let mut marked = FileRowGroups {
+            file: shared.file.clone(),
+            row_groups: shared.row_groups.clone(),
+        };
+
+        marked.mark_deleted_rows([1].into_iter().collect());
+
+        assert_eq!(deleted_per_row_group(&marked), vec![Some(vec![1]), None]);
+        assert_eq!(deleted_per_row_group(&shared), vec![None, None]);
+        assert!(Arc::ptr_eq(&marked.row_groups[1], &shared.row_groups[1]));
     }
 
     #[test]

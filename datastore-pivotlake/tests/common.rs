@@ -187,7 +187,7 @@ pub fn current_parquet(
         .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
         .expect("table exists");
     table.refresh().expect("manifest reload");
-    table.build_scan_view(&[], &[]).expect("build scan view")
+    table.plan_scan(&[]).expect("plan scan")
 }
 
 /// Where `name` keeps its own storage under a database rooted at
@@ -326,9 +326,12 @@ pub fn write_parquet_files(
         })
         .collect();
 
-    let datastore =
-        datastore_pivotlake::PivotlakeDatastore::open(&database_root.to_string_lossy(), dispatch)
-            .unwrap();
+    let datastore = datastore_pivotlake::PivotlakeDatastore::open_with_format(
+        &database_root.to_string_lossy(),
+        dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let creation = datastore.clone().begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {

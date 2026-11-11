@@ -11,7 +11,6 @@ use crate::types::columns::TableColumns;
 use crate::types::metadata::RowGroupMetadata;
 use crate::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
 use dispatch::io::{FileRange, OpenFile, OperatorIO, ReadRequestId, ReadResponse};
-use dispatch::memory::memory_ctx;
 use dispatch::{Sender, Unary};
 use object_storage::{DataFile, FileRef};
 use std::collections::HashMap;
@@ -72,15 +71,6 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
         } = file;
         let size = file_ref.size as usize;
         let open_file = source.open_read(file_ref.size).map_err(crate::op_err)?;
-
-        // This is the one registration point for a newly-opened descriptor.
-        // It prevents stale cache entries from an equal, reused fd serving the
-        // new file. Later logical ranges must not call `open_entry`, because it
-        // intentionally clears the file's old extent map.
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
-
         let request = FooterRead::new(file_ref, open_file, size);
         let range = request.probe_range();
         self.request_region(request, range, io)
@@ -176,11 +166,8 @@ impl FooterRead {
             &bytes[start..bytes.len() - 8]
         };
 
-        Ok(FooterProgress::Done(row_groups_from_footer(
-            footer,
-            self.open_file.clone(),
-            table_columns,
-        )?))
+        let row_groups = row_groups_from_footer(footer, self.open_file.clone(), table_columns)?;
+        Ok(FooterProgress::Done(row_groups))
     }
 }
 

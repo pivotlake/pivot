@@ -10,7 +10,6 @@ use crate::file_slice_injector::FileSliceInjectorFactory;
 use crate::{DataFile, FileRef, ObjectPath};
 use dispatch::BuildContext;
 use dispatch::io::{FileRange, OperatorIO, ReadRequestId, ReadResponse};
-use dispatch::memory::memory_ctx;
 use dispatch::{Built, BuiltUnary};
 use dispatch::{
     DataFlowDispatcher, OperatorSpec, RootUnaryOperatorFactory, Sender, Unary, UnaryFactory,
@@ -154,11 +153,6 @@ impl Unary<FileSlice, LoadedObject> for ObjectFetcher {
         let open_file = source
             .open_read(file.size)
             .map_err(|error| dispatch::UnaryError::Operator(Box::new(error)))?;
-        // Register the freshly opened descriptor, so a reused fd cannot serve
-        // stale extents of whatever it named before.
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
         // One range, however large: the ring tiles it into cache slots
         // itself, as it does a column chunk of any size.
         let id = io.read(open_file, [range])?;

@@ -808,6 +808,7 @@ fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
         None,
         Arc::from([]),
         Arc::from(["key".to_string()]),
+        true,
         3,
         usize::MAX,
     )
