@@ -150,7 +150,7 @@ impl ColumnDecoder {
         extract: Option<&VariantExtract>,
         read: &OutputRead,
         leaf_positions: Vec<usize>,
-        leaf_fields: &[FieldRef],
+        leaf_fields: &[&FieldRef],
         fields: &Fields,
     ) -> Result<Self> {
         let column_name = fields[column].name();

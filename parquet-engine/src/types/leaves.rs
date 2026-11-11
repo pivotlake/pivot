@@ -15,7 +15,11 @@ use crate::types::metadata::QueryRowGroupMetadata;
 /// Returns the primitive descendants of `fields` in depth-first order.
 ///
 /// This is the same order that Parquet uses for column chunks.
-pub fn leaf_fields(fields: &Fields) -> Vec<FieldRef> {
+///
+/// The leaves are borrowed from `fields`: every row group of every scan asks
+/// for them, on every worker at once, and a clone of each would have all of
+/// the workers writing the reference counts of the same few fields.
+pub fn leaf_fields(fields: &Fields) -> Vec<&FieldRef> {
     let mut leaves = Vec::new();
     for field in fields {
         push_leaf_fields(field, &mut leaves);
@@ -23,12 +27,12 @@ pub fn leaf_fields(fields: &Fields) -> Vec<FieldRef> {
     leaves
 }
 
-fn push_leaf_fields(field: &FieldRef, leaves: &mut Vec<FieldRef>) {
+fn push_leaf_fields<'a>(field: &'a FieldRef, leaves: &mut Vec<&'a FieldRef>) {
     match field.data_type() {
         DataType::Struct(children) => children
             .iter()
             .for_each(|child| push_leaf_fields(child, leaves)),
-        _ => leaves.push(field.clone()),
+        _ => leaves.push(field),
     }
 }
 
