@@ -1048,7 +1048,10 @@ async fn global_min_max_answers_from_metadata(#[future] conn: Conn) {
 /// The unfiltered global MIN/MAX short-circuits to parquet row-group stats and
 /// never reads a data page, so it leaves the compressed cache empty. Proven by
 /// clearing the cache (of any footer-load residue), running the aggregate, and
-/// finding nothing to evict afterwards.
+/// finding nothing to evict afterwards. This suite's database keeps its
+/// tables as Delta Lake, whose tables hold every footer in memory, so the
+/// aggregate reads nothing at all; an Iceberg table reads its files' footers
+/// through the cache for the same aggregate, which its own suite covers.
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
