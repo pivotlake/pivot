@@ -328,6 +328,24 @@ const fn byte_width(bit_width: u8) -> u8 {
     bit_width.div_ceil(8)
 }
 
+/// Reads the unsigned LEB128 varint at `offset` in `bytes`, returning it with
+/// the offset just past it, or `None` when `bytes` ends inside the varint.
+#[inline(always)]
+fn read_varint_at(bytes: &[u8], mut offset: usize) -> Option<(u32, usize)> {
+    let mut value = 0u32;
+    let mut shift = 0;
+    loop {
+        let byte = *bytes.get(offset)?;
+        offset += 1;
+        value |= ((byte & 0x7F) as u32) << shift;
+        // A 32-bit varint ends at its fifth byte at the latest.
+        if byte & 0x80 == 0 || shift == 28 {
+            return Some((value, offset));
+        }
+        shift += 7;
+    }
+}
+
 /// Stateful decoder for Parquet's RLE/bit-packed hybrid encoding.
 ///
 /// Lazily parses [`Run`] headers on demand and supports incremental
@@ -360,16 +378,97 @@ impl RleDecoder {
     fn get_or_set_next_run(&mut self) -> Run {
         match self.run.take() {
             Some(r) => r,
-            None => Run::parse_from_header(
+            None => self.parse_next_run(),
+        }
+    }
+
+    /// Parses the header of the next run in the stream.
+    ///
+    /// A column of short runs opens one every few values, so the header is
+    /// read straight off the current buffer whenever the longest header (a
+    /// five byte varint and a four byte repeated value) lies inside it. Only
+    /// a header near the buffer's end goes through the cross-buffer reader.
+    #[inline(always)]
+    fn parse_next_run(&mut self) -> Run {
+        const LONGEST_HEADER_BYTES: usize = 9;
+        let buffer_holding_header = self
+            .data
+            .get(self.position.buffer_index)
+            .filter(|buffer| self.position.offset + LONGEST_HEADER_BYTES <= buffer.len());
+        let Some(buffer) = buffer_holding_header else {
+            return Run::parse_from_header(
                 self.bit_width,
                 &mut MultiBufferReader::new(&self.data, &mut self.position),
-            ),
+            );
+        };
+        let bytes: &[u8] = buffer;
+        let (header, value_offset) = read_varint_at(bytes, self.position.offset)
+            .expect("the longest header lies inside the buffer");
+        if header & 1 == 1 {
+            self.position.offset = value_offset;
+            return Run::BitPacked {
+                remaining_in_run: (header >> 1) as usize * 8,
+                partial: [0; 7],
+                partial_count: 0,
+            };
         }
+        let value_bytes = byte_width(self.bit_width) as usize;
+        let value_word =
+            u32::from_le_bytes(bytes[value_offset..value_offset + 4].try_into().unwrap());
+        let value = if value_bytes == 4 {
+            value_word
+        } else {
+            value_word & ((1u32 << (8 * value_bytes)) - 1)
+        };
+        self.position.offset = value_offset + value_bytes;
+        Run::Rle {
+            value,
+            count: (header >> 1) as usize,
+        }
+    }
+
+    /// Steps over the runs that lie wholly within the next `size` values and
+    /// wholly within the current buffer, reading only their headers. Returns
+    /// how many values that passed.
+    ///
+    /// A skip into a large page crosses thousands of runs it never decodes,
+    /// so each one costs a header parse on the buffer's own bytes and an
+    /// offset bump. The run the skip ends inside, and one that reaches into
+    /// the next buffer, are left for the caller to open.
+    fn skip_whole_runs(&mut self, size: usize) -> usize {
+        let Some(buffer) = self.data.get(self.position.buffer_index) else {
+            return 0;
+        };
+        let buffer: &[u8] = buffer;
+        let rle_value_bytes = byte_width(self.bit_width) as usize;
+        let mut offset = self.position.offset;
+        let mut skipped_values = 0;
+        while let Some((header, payload_offset)) = read_varint_at(buffer, offset) {
+            let (run_values, payload_bytes) = if header & 1 == 0 {
+                ((header >> 1) as usize, rle_value_bytes)
+            } else {
+                let groups = (header >> 1) as usize;
+                (groups * 8, groups * self.bit_width as usize)
+            };
+            if run_values > size - skipped_values || payload_offset + payload_bytes > buffer.len() {
+                break;
+            }
+            skipped_values += run_values;
+            offset = payload_offset + payload_bytes;
+        }
+        self.position.offset = offset;
+        skipped_values
     }
 
     /// Advances past `size` values without producing output.
     pub fn skip(&mut self, mut size: usize) {
         while size > 0 {
+            if self.run.is_none() {
+                size -= self.skip_whole_runs(size);
+                if size == 0 {
+                    break;
+                }
+            }
             let run = self.get_or_set_next_run();
             let (skipped, run) = run.skip(&self.data, self.bit_width, &mut self.position, size);
             self.run = run;
@@ -560,6 +659,69 @@ mod tests {
         assert_eq!(head, vec!["AA", "BB", "CC"]);
         assert_eq!(middle, vec!["CC", "DD"]);
         assert_eq!(tail, vec!["AA", "BB", "CC", "DD"]);
+    }
+
+    /// Runs whose headers sit well inside a buffer, of both kinds, decode the
+    /// same as runs that end a buffer.
+    #[test]
+    fn runs_decode_from_headers_inside_a_long_buffer() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        // Five BB, one bit-packed group, three CC, four DD, then bytes no
+        // run is read from.
+        let mut data = vec![10, 1, 0x03, 0xE4, 0xE4, 6, 2, 8, 3];
+        data.extend_from_slice(&[0xFF; 16]);
+        let mut dec = new_decoder(data, 2);
+
+        let result = push_all(&mut allocator, &mut dec, &dict, 20);
+
+        let expected = [
+            "BB", "BB", "BB", "BB", "BB", "AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD", "CC",
+            "CC", "CC", "DD", "DD", "DD", "DD",
+        ];
+        assert_eq!(result, expected);
+    }
+
+    /// A repeated value wider than one byte is read whole from inside a
+    /// long buffer.
+    #[test]
+    fn two_byte_repeated_values_decode_inside_a_long_buffer() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        // Bit width 9: three CC then four DD, each value in two bytes.
+        let mut data = vec![6, 2, 0, 8, 3, 0];
+        data.extend_from_slice(&[0xFF; 16]);
+        let mut dec = new_decoder(data, 9);
+
+        let result = push_all(&mut allocator, &mut dec, &dict, 7);
+
+        assert_eq!(result, vec!["CC", "CC", "CC", "DD", "DD", "DD", "DD"]);
+    }
+
+    /// A skip that passes whole runs of both kinds, a run split across two
+    /// buffers, and ends inside a run leaves the decoder at the right value.
+    #[test]
+    fn skip_passes_whole_runs_of_both_kinds() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        // Five BB, one bit-packed group, three CC, then one bit-packed group
+        // whose bytes straddle the buffers, then four DD.
+        let data = make_data_multi_buffer(vec![
+            vec![10, 1, 0x03, 0xE4, 0xE4, 6, 2, 0x03, 0xE4],
+            vec![0xE4, 8, 3],
+        ]);
+        let mut dec = RleDecoder::new(data, ReaderPosition::default(), 2);
+
+        dec.skip(14);
+        let inside_rle_run = push_all(&mut allocator, &mut dec, &dict, 2);
+        dec.skip(8);
+        let tail = push_all(&mut allocator, &mut dec, &dict, 3);
+
+        assert_eq!(inside_rle_run, vec!["CC", "CC"]);
+        assert_eq!(tail, vec!["DD", "DD", "DD"]);
     }
 
     /// Regression: after handling a buffer-boundary overflow, the decoder must
