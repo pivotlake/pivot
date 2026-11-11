@@ -2,9 +2,8 @@
 //! transaction resolve derives from its snapshot, so a query's filter pushdown
 //! prunes its own view without affecting anyone else.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
 use arrow_array::{ArrayRef, Scalar};
 use catalog::CommitQueue;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
@@ -16,7 +15,7 @@ use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use planner::expression::{CompareType, Expression};
+use planner::expression::Expression;
 
 use super::insert_sink::build_insert_spec;
 use super::{CatalogTable, PivotlakeDatastore};
@@ -43,10 +42,16 @@ pub struct TableBinding {
     /// Per-column footer-derived nullability, in `columns` order (see
     /// [`CatalogTable::nullability`](super::table::CatalogTable)).
     nullability: Vec<bool>,
-    /// Single-column predicates pushed down for this binding (recorded here
-    /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
-    /// `compile`); applied as a filter when the scan is compiled.
-    predicates: Vec<PushedPredicate>,
+    /// The filters pushed down for this binding. The table's format selects
+    /// files by them whole; the single-column comparisons among them prune
+    /// row groups and feed the scan's equality checks.
+    filters: Vec<Expression>,
+    /// The row groups a scan of this binding reads, once something asked
+    /// for them: statistics, scanning and late materialization, the last
+    /// compiled from a clone of this binding, reuse the one load. The table
+    /// itself holds no file's footer, so this is where a plan kept for a
+    /// later execution keeps the footers it reads.
+    cached_pruned_parquet: Arc<Mutex<Option<Arc<ParquetTable>>>>,
     /// The transaction's staging queue, shared (`Arc`) with the
     /// [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
     /// binding, so the append an INSERT compiled by this binding stages as it
@@ -59,7 +64,7 @@ impl std::fmt::Debug for TableBinding {
         f.debug_struct("TableBinding")
             .field("reference", &self.reference)
             .field("id", &self.table.id())
-            .field("predicates", &self.predicates)
+            .field("filters", &self.filters)
             .finish_non_exhaustive()
     }
 }
@@ -71,65 +76,40 @@ impl TableBinding {
         reference: TableReference,
         table: CatalogTable,
         commit_actions: CommitQueue<PivotlakeDatastore>,
-    ) -> Self {
+    ) -> CatalogResult<Self> {
         let columns = table.columns();
-        let nullability = table.nullability();
-        Self {
+        let nullability = table
+            .nullability()
+            .map_err(|e| CatalogError::Other(Box::new(e)))?;
+        Ok(Self {
             reference,
             table,
             columns,
             nullability,
-            predicates: Vec::new(),
+            filters: Vec::new(),
+            cached_pruned_parquet: Arc::default(),
             commit_actions,
+        })
+    }
+
+    /// The row groups a scan of this binding reads: those of the files the
+    /// pushed filters cannot rule out in the captured snapshot, less the
+    /// ones their own statistics rule out. Planned by whatever asks first
+    /// and kept on a successful load, so a scan and its late materialize
+    /// address the same global row-group indices and no footer is read
+    /// twice.
+    fn load_pruned_parquet(&self) -> CatalogResult<Arc<ParquetTable>> {
+        let mut cached = self.cached_pruned_parquet.lock().unwrap();
+        if let Some(parquet) = cached.as_ref() {
+            return Ok(Arc::clone(parquet));
         }
-    }
-
-    /// This table's row groups in the captured snapshot, partition-pruned by the
-    /// pushed equality predicates. Pure in-memory; the snapshot copy is
-    /// immutable, so a scan and its late materialize (same filters) build
-    /// identical views addressing the same global row-group indices.
-    fn resolve_files(&self) -> CatalogResult<Arc<ParquetTable>> {
-        let partition_filters: Vec<PartitionEqFilter> =
-            self.partition_filter_candidates().collect();
-        let stat_filters: Vec<ColumnStatFilter> = self.stat_filter_candidates().collect();
-        self.table
-            .build_scan_view(&partition_filters, &stat_filters)
-            .map_err(|e| CatalogError::Other(Box::new(e)))
-    }
-
-    /// This binding's pushed equality predicates as partition-filter candidates:
-    /// the column name and the typed scalar. The catalog intersects these with
-    /// the table's partition columns, so yielding every equality predicate (not
-    /// just ones on partition columns, which the binding can't tell apart) is fine;
-    /// a non-partition column prunes no files.
-    fn partition_filter_candidates(&self) -> impl Iterator<Item = PartitionEqFilter> + '_ {
-        self.predicates
-            .iter()
-            .filter(|p| matches!(p.compare_type, CompareType::Equal))
-            .filter_map(|p| {
-                Some(PartitionEqFilter {
-                    column: self.columns.get(p.column_idx)?.name.clone(),
-                    value: p.value.clone(),
-                })
-            })
-    }
-
-    /// This binding's pushed predicates as file-level stat-filter candidates: a
-    /// plain top-level column comparison (no variant path) paired with its typed
-    /// constant. Variant paths are excluded — their stats live in a shredded leaf,
-    /// pruned per row group, not in the file's column stats. A column the file's
-    /// stats don't bound simply prunes no files.
-    fn stat_filter_candidates(&self) -> impl Iterator<Item = ColumnStatFilter> + '_ {
-        self.predicates
-            .iter()
-            .filter(|p| p.path.is_empty())
-            .filter_map(|p| {
-                Some(ColumnStatFilter {
-                    column: self.columns.get(p.column_idx)?.name.clone(),
-                    compare_type: p.compare_type,
-                    value: p.value.clone(),
-                })
-            })
+        let selected = self
+            .table
+            .plan_scan(&self.filters)
+            .map_err(|e| CatalogError::Other(Box::new(e)))?;
+        let parquet = Arc::new(self.pruned_parquet(&selected));
+        *cached = Some(Arc::clone(&parquet));
+        Ok(parquet)
     }
 }
 
@@ -162,17 +142,15 @@ impl BoundTable for TableBinding {
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        // The captured snapshot copy hands back the file set this query was
-        // bound against, partition-pruned. All in-memory: the background
-        // refresh already materialized every footer.
-        let current = self.resolve_files()?;
+        // The file set this query was bound against, less what the pushed
+        // predicates rule out by partition, by file bounds and by row-group
+        // statistics.
+        let parquet = self.load_pruned_parquet()?;
 
         // A variant path predicate reaches its shredded typed leaf only in the
         // files that shred it, so each row group resolves the path itself.
-        let eq_predicates = equality_predicates(&self.predicates);
+        let eq_predicates = equality_predicates(&self.pushed_predicates());
 
-        // Prune the row groups by the pushed-down predicates' stats.
-        let parquet = Arc::new(self.pruned_parquet(&current));
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
@@ -227,12 +205,7 @@ impl BoundTable for TableBinding {
         // [`compile_scan`](BoundTable::compile_scan) applies. Re-reading from a
         // view that kept even one row group the scan dropped shifts every later
         // index and silently returns another row group's rows.
-        let current = self.resolve_files()?;
-        Ok(materialize(
-            input,
-            Arc::new(self.pruned_parquet(&current)),
-            projection,
-        ))
+        Ok(materialize(input, self.load_pruned_parquet()?, projection))
     }
 
     fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
@@ -240,49 +213,42 @@ impl BoundTable for TableBinding {
         // equality/dictionary pruning) happens in `compile`, once the row-group
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
-        self.predicates
-            .extend(PushedPredicate::from_filter(&filter));
+        self.filters.push(filter);
+        // What was planned for fewer filters is not this binding's view.
+        self.cached_pruned_parquet = Arc::default();
 
         Ok(false)
     }
 
     fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
-        // Only sound for the whole, unfiltered table: a pushed-down predicate
+        // Only sound for the whole, unfiltered table: a pushed-down filter
         // means the scan this binding stands for excludes rows.
-        if !self.predicates.is_empty() {
+        if !self.filters.is_empty() {
             return None;
         }
-        // Read the captured snapshot files, the same view a scan would see; an
-        // unresolvable view means "scan".
-        self.resolve_files().ok()?.column_min_max(column)
+        // Exact extrema come from the row groups a scan would read; an
+        // unresolvable view means "scan", which reports what is wrong.
+        self.load_pruned_parquet().ok()?.column_min_max(column)
     }
 
     fn row_count(&self) -> Option<i64> {
-        // Only sound for the whole, unfiltered table: a pushed-down predicate
+        // Only sound for the whole, unfiltered table: a pushed-down filter
         // means the scan this binding stands for excludes rows.
-        if !self.predicates.is_empty() {
+        if !self.filters.is_empty() {
             return None;
         }
-        // The parquet footer carries each row group's exact row count, so the
-        // table's count is their sum, with no data pages read.
-        let parquet = self.resolve_files().ok()?;
-        Some(parquet.total_rows())
+        // What the captured snapshot's metadata counts; a count it cannot
+        // give means "scan", which also reports what is wrong.
+        let rows = self.table.count_rows().ok()??;
+        i64::try_from(rows).ok()
     }
 
     fn estimate_row_count(&self) -> Option<u64> {
         // A planning estimate wants the base table's full size: pushed
         // predicates and partition pruning deliberately don't apply, since the
-        // cost model accounts for filter selectivity itself. Build the whole
-        // (unfiltered) view over the captured snapshot and sum the footers'
-        // row-group counts.
-        let parquet = self.table.build_scan_view(&[], &[]).ok()?;
-        Some(
-            parquet
-                .row_groups()
-                .iter()
-                .map(|rg| rg.num_rows as u64)
-                .sum(),
-        )
+        // cost model accounts for filter selectivity itself. The captured
+        // snapshot's metadata has the count.
+        self.table.total_rows().ok()
     }
 }
 
@@ -294,6 +260,15 @@ impl TableBinding {
     /// (kept) — never wrong, just unoptimized. No footer I/O. Exposed so pruning
     /// can be asserted directly.
     pub fn pruned_parquet(&self, parquet: &ParquetTable) -> ParquetTable {
-        prune_parquet(parquet, &self.predicates)
+        prune_parquet(parquet, &self.pushed_predicates())
+    }
+
+    /// The single-column constant comparisons among the pushed filters: what
+    /// a row group's statistics can be tested against.
+    fn pushed_predicates(&self) -> Vec<PushedPredicate> {
+        self.filters
+            .iter()
+            .flat_map(PushedPredicate::from_filter)
+            .collect()
     }
 }

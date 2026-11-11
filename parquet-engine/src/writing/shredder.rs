@@ -258,6 +258,7 @@ mod tests {
                     file_id: 0,
                     row_group_count: 1,
                     partition: None,
+                    sorted_by: Arc::default(),
                     max_file_size: None,
                 }),
             }),

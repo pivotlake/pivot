@@ -14,17 +14,92 @@ fn find_table_dir(root: &Path, table: &str) -> PathBuf {
 }
 
 fn age_file(path: &Path) {
+    age_file_by(path, Duration::from_secs(5 * 3600));
+}
+
+fn age_file_by(path: &Path, age: Duration) {
     File::open(path)
         .unwrap()
-        .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(5 * 3600)))
+        .set_times(FileTimes::new().set_modified(SystemTime::now() - age))
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vacuum_sweeps_an_iceberg_tables_directory_for_unused_files_past_the_safety_delay() {
+    let directory = tempfile::tempdir().unwrap();
+    let instance = ShellInstance::open_with_resources(
+        &ShellTarget::pivot_with_table_format(
+            directory.path().to_str().unwrap(),
+            Some(datastore_pivotlake::TableFormatKind::Iceberg),
+        ),
+        1,
+        32,
+        None,
+        DEFAULT_REFRESH_INTERVAL,
+    )
+    .unwrap();
+    let executor = instance.executor();
+    for sql in [
+        "CREATE TABLE events (id BIGINT)",
+        "INSERT INTO events VALUES (1)",
+    ] {
+        executor
+            .execute(sql.into(), ExecuteOptions::default())
+            .await
+            .unwrap();
+    }
+    let table_dir = find_table_dir(directory.path(), "events");
+    fs::create_dir_all(table_dir.join("data")).unwrap();
+    let old_stray = table_dir.join("data/old.bin");
+    let young_stray = table_dir.join("data/young.bin");
+    fs::write(&old_stray, b"stray").unwrap();
+    fs::write(&young_stray, b"stray").unwrap();
+    let one_hour = Duration::from_secs(3600);
+    age_file_by(
+        &old_stray,
+        datastore_pivotlake::UNUSED_OBJECT_SAFETY_DELAY + one_hour,
+    );
+    age_file_by(
+        &young_stray,
+        datastore_pivotlake::UNUSED_OBJECT_SAFETY_DELAY - one_hour,
+    );
+
+    executor
+        .execute("VACUUM".into(), ExecuteOptions::default())
+        .await
+        .unwrap();
+
+    assert!(!old_stray.exists());
+    assert!(young_stray.exists());
+    let rows = executor
+        .execute(
+            "SELECT count(*) FROM events".into(),
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+    let StatementOutput::Rows { batches, .. } = rows.output else {
+        panic!("expected rows")
+    };
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn vacuum_in_shell_reclaims_expired_files_and_dropped_tables() {
     let directory = tempfile::tempdir().unwrap();
     let instance = ShellInstance::open_with_resources(
-        &ShellTarget::pivot(directory.path().to_str().unwrap()),
+        &ShellTarget::pivot_with_table_format(
+            directory.path().to_str().unwrap(),
+            Some(datastore_pivotlake::TableFormatKind::Delta),
+        ),
         1,
         32,
         None,
@@ -112,7 +187,10 @@ async fn vacuum_in_shell_reclaims_expired_files_and_dropped_tables() {
 async fn vacuum_reports_unsupported_forms_and_cleanup_errors() {
     let directory = tempfile::tempdir().unwrap();
     let instance = ShellInstance::open_with_resources(
-        &ShellTarget::pivot(directory.path().to_str().unwrap()),
+        &ShellTarget::pivot_with_table_format(
+            directory.path().to_str().unwrap(),
+            Some(datastore_pivotlake::TableFormatKind::Delta),
+        ),
         1,
         32,
         None,

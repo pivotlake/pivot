@@ -32,6 +32,8 @@ pub(crate) struct FileAssemblyInfo {
     pub(crate) file_id: FileId,
     pub(crate) row_group_count: usize,
     pub(crate) partition: Option<crate::PartitionValues>,
+    /// What the file's rows are in order of; see [`AssembledFile::sorted_by`].
+    pub(crate) sorted_by: Arc<[String]>,
     /// Compressed row-group body target for compaction output; Parquet headers
     /// and footers are excluded. `None` for INSERT. An individually oversized
     /// row group remains one file.
@@ -47,6 +49,11 @@ pub struct AssembledFile {
     /// Retained to avoid parsing the footer immediately after writing it.
     pub metadata: crate::thrift::footer::FileMetaData,
     pub partition: Option<crate::PartitionValues>,
+    /// The columns the file's rows are in order of, each ascending with NULLs
+    /// first, as the stages that ordered them report it: an INSERT's sort
+    /// columns, and a compaction's when every row it merged arrived in their
+    /// order. Empty for a file whose rows are in no such order.
+    pub sorted_by: Arc<[String]>,
 }
 
 /// Shared routing and schema information for every column chunk in one row
@@ -69,6 +76,8 @@ pub(crate) struct FilePlan {
     pub(crate) base_row_group_id: RowGroupId,
     pub(crate) assembly_worker: usize,
     pub(crate) partition: Option<crate::PartitionValues>,
+    /// What the file's rows are in order of; see [`AssembledFile::sorted_by`].
+    pub(crate) sorted_by: Arc<[String]>,
     pub(crate) target_rows_per_group: usize,
     pub(crate) max_file_size: Option<usize>,
 }

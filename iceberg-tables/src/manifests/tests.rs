@@ -2,13 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::*;
+use crate::file_index::{FileIndex, IndexedFile, SortKeyEncoder};
+use crate::layout::TableLocation;
 use arrow_array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
     Int64Array, Scalar, StringViewArray, TimestampMicrosecondArray,
 };
 use iceberg::spec::{
     DataContentType, DataFileBuilder, DataFileFormat, FieldSummary, FormatVersion, Literal,
-    ManifestContentType, ManifestEntry, ManifestMetadata, ManifestStatus, NestedField,
+    Manifest, ManifestContentType, ManifestEntry, ManifestMetadata, ManifestStatus, NestedField,
     PartitionSpec, PrimitiveType, Schema, Struct, Transform as IcebergTransform, Type,
 };
 use planner::expression::{
@@ -51,12 +53,13 @@ fn double_predicate(compare_type: CompareType, value: f64) -> Vec<Expression> {
     predicate(compare_type, Arc::new(Float64Array::from(vec![value])))
 }
 
-/// A one-row data file named `path` whose metrics describe field 1.
+/// A one-row data file named `path` at the root of its store, whose metrics
+/// describe field 1.
 fn file(path: &str) -> DataFileBuilder {
     let mut builder = DataFileBuilder::default();
     builder
         .content(DataContentType::Data)
-        .file_path(path.into())
+        .file_path(format!("/{path}"))
         .file_format(DataFileFormat::Parquet)
         .file_size_in_bytes(1)
         .record_count(1);
@@ -118,27 +121,124 @@ fn partitioned_by(schema: &SchemaRef, spec_id: i32, transform: IcebergTransform)
         .unwrap()
 }
 
-/// The data files of `manifests`, in a table of `current` whose partition
-/// specs are the ones the manifests were written under.
-fn data_files(current: &SchemaRef, manifests: &[Manifest]) -> DataFiles {
-    DataFiles {
-        manifests: manifests.to_vec(),
-        schema: current.clone(),
-        partition_specs: manifests
-            .iter()
-            .map(|manifest| Arc::new(manifest.metadata().partition_spec.clone()))
-            .collect(),
-    }
+/// The metadata of a table whose current schema is the first of `schemas`,
+/// each under its position as its id, and that lists `partition_specs`.
+fn table_metadata(schemas: &[SchemaRef], partition_specs: &[PartitionSpec]) -> TableMetadata {
+    let schemas: Vec<Schema> = schemas
+        .iter()
+        .enumerate()
+        .map(|(schema_id, schema)| {
+            Schema::clone(schema)
+                .into_builder()
+                .with_schema_id(schema_id as i32)
+                .build()
+                .unwrap()
+        })
+        .collect();
+    serde_json::from_value(serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+        "location": "file:///table",
+        "last-sequence-number": 0,
+        "last-updated-ms": 0,
+        "last-column-id": 2,
+        "schemas": schemas,
+        "current-schema-id": 0,
+        "partition-specs": partition_specs,
+        "default-spec-id": partition_specs[0].spec_id(),
+        "last-partition-id": 1000,
+        "sort-orders": [{"order-id": 0, "fields": []}],
+        "default-sort-order-id": 0,
+    }))
+    .unwrap()
 }
 
-/// The paths of the files of `manifests` that `filters` keep.
-fn selected(current: &SchemaRef, manifests: &[Manifest], filters: &[Expression]) -> Vec<String> {
-    data_files(current, manifests)
-        .select(filters)
-        .unwrap()
+/// The names of the files of `manifests` that `filters` keep, in the order
+/// of the file index they are selected from (by partition, then by name):
+/// that of a table of `current` whose data manifests they are, in order, and
+/// whose partition specs are the ones the manifests were written under.
+fn select_files(
+    current: &SchemaRef,
+    manifests: &[Manifest],
+    filters: &[Expression],
+) -> iceberg::Result<Vec<String>> {
+    let mut schemas = vec![current.clone()];
+    let mut partition_specs: Vec<PartitionSpec> = Vec::new();
+    for manifest in manifests {
+        let metadata = manifest.metadata();
+        if !schemas.contains(&metadata.schema) {
+            schemas.push(metadata.schema.clone());
+        }
+        if !partition_specs.contains(&metadata.partition_spec) {
+            partition_specs.push(metadata.partition_spec.clone());
+        }
+    }
+    let table_metadata = table_metadata(&schemas, &partition_specs);
+    let directory = tempfile::tempdir().unwrap();
+    let store: Arc<dyn object_storage::ObjectStore> =
+        Arc::new(object_storage::LocalStore::new(directory.path()).unwrap());
+    let location = TableLocation::new(store, object_storage::ObjectPath::new("table")).unwrap();
+    let encoder = SortKeyEncoder::new(&table_metadata, &[], &[]).unwrap();
+    let listed: Vec<ManifestFile> = manifests
+        .iter()
+        .enumerate()
+        .map(|(position, manifest)| {
+            manifest_entry(manifest.metadata().partition_spec.spec_id(), position, None)
+        })
+        .collect();
+    let listed: Vec<&ManifestFile> = listed.iter().collect();
+
+    let index = FileIndex::advance(None, &listed, |files| {
+        files
+            .iter()
+            .map(|file| {
+                let position = listed
+                    .iter()
+                    .position(|listed| listed.manifest_path == file.manifest_path)
+                    .unwrap();
+                let manifest = &manifests[position];
+                let schema_id = schemas
+                    .iter()
+                    .position(|schema| schema == &manifest.metadata().schema)
+                    .unwrap();
+                let entries = manifest
+                    .entries()
+                    .iter()
+                    .map(|entry| ManifestEntry {
+                        sequence_number: Some(position as i64),
+                        ..ManifestEntry::clone(entry)
+                    })
+                    .collect();
+                let manifest = Manifest::new(
+                    ManifestMetadata {
+                        schema_id: schema_id as i32,
+                        ..manifest.metadata().clone()
+                    },
+                    entries,
+                );
+                IndexedFile::collect_live_files(
+                    "table",
+                    file,
+                    manifest,
+                    &encoder,
+                    &table_metadata,
+                    &location,
+                )
+            })
+            .collect()
+    })
+    .unwrap();
+
+    Ok(index
+        .select(&table_metadata, filters)?
         .into_iter()
-        .map(|file| file.path)
-        .collect()
+        .map(|file| file.file.path.as_str().trim_start_matches('/').to_string())
+        .collect())
+}
+
+/// The names of the files of `manifests` that `filters` keep.
+fn selected(current: &SchemaRef, manifests: &[Manifest], filters: &[Expression]) -> Vec<String> {
+    select_files(current, manifests, filters).unwrap()
 }
 
 #[test]
@@ -198,7 +298,7 @@ fn a_column_added_after_a_manifest_was_written_is_null() {
 }
 
 #[test]
-fn only_live_non_empty_files_are_selected_in_manifest_order() {
+fn only_live_non_empty_files_are_selected() {
     let schema = schema(1, "id", PrimitiveType::Long);
     let empty = file("empty").record_count(0).build().unwrap();
     let entries = vec![
@@ -372,7 +472,7 @@ fn an_or_with_a_side_metadata_cannot_answer_keeps_every_file() {
 
     let kept = selected(&schema, &manifests, &[ten_or_null]);
 
-    assert_eq!(kept, ["ten", "twenty", "thirty"]);
+    assert_eq!(kept, ["ten", "thirty", "twenty"]);
 }
 
 #[test]
@@ -451,6 +551,19 @@ fn manifest_entry(spec_id: i32, row: usize, partitions: Option<Vec<FieldSummary>
     }
 }
 
+/// The manifest-list entry of a delete manifest, otherwise as
+/// [`manifest_entry`] makes one.
+fn delete_manifest_entry(
+    spec_id: i32,
+    row: usize,
+    partitions: Option<Vec<FieldSummary>>,
+) -> ManifestFile {
+    ManifestFile {
+        content: ManifestContentType::Deletes,
+        ..manifest_entry(spec_id, row, partitions)
+    }
+}
+
 /// The summary of a partition field holding one value, or only NULLs.
 fn summary(bytes: Option<Vec<u8>>) -> FieldSummary {
     FieldSummary {
@@ -517,19 +630,19 @@ fn evolved_table() -> TableMetadata {
 }
 
 #[test]
-fn a_manifest_is_pruned_by_the_partition_summaries_of_its_own_spec() {
+fn a_delete_manifest_is_pruned_by_the_partition_summaries_of_its_own_spec() {
     let metadata = evolved_table();
     let integer = |value: i32| summary(Some(value.to_le_bytes().to_vec()));
     let region = || summary(Some(b"west".to_vec()));
     // Day 18263 is 2020-01-02, in month 600.
     let manifests = vec![
-        manifest_entry(0, 0, Some(vec![region(), integer(600)])),
-        manifest_entry(1, 1, Some(vec![integer(18_263)])),
-        manifest_entry(2, 2, Some(vec![integer(601), region()])),
-        manifest_entry(1, 3, Some(vec![integer(18_262)])),
-        manifest_entry(3, 4, None),
-        manifest_entry(0, 5, None),
-        manifest_entry(0, 6, Some(vec![region(), summary(None)])),
+        delete_manifest_entry(0, 0, Some(vec![region(), integer(600)])),
+        delete_manifest_entry(1, 1, Some(vec![integer(18_263)])),
+        delete_manifest_entry(2, 2, Some(vec![integer(601), region()])),
+        delete_manifest_entry(1, 3, Some(vec![integer(18_262)])),
+        delete_manifest_entry(3, 4, None),
+        delete_manifest_entry(0, 5, None),
+        delete_manifest_entry(0, 6, Some(vec![region(), summary(None)])),
     ];
     let list = ManifestList::new(&metadata, manifests).unwrap();
     let before_day_18263 = predicate(
@@ -539,15 +652,13 @@ fn a_manifest_is_pruned_by_the_partition_summaries_of_its_own_spec() {
         ])),
     );
 
-    let selected = list.select(&before_day_18263).unwrap();
+    let selected = list.select_delete_manifests(&before_day_18263).unwrap();
 
     let paths: Vec<_> = selected
-        .data
         .iter()
         .map(|manifest| &manifest.manifest_path)
         .collect();
     let lengths: Vec<_> = selected
-        .data
         .iter()
         .map(|manifest| manifest.manifest_length)
         .collect();
@@ -561,17 +672,15 @@ fn a_manifest_is_pruned_by_the_partition_summaries_of_its_own_spec() {
         ]
     );
     assert_eq!(lengths, [100, 103, 104, 105]);
-    assert_eq!(list.select(&[]).unwrap().data.len(), 7);
+    assert_eq!(list.select_delete_manifests(&[]).unwrap().len(), 7);
 }
 
 #[test]
-fn delete_manifests_are_listed_apart_and_pruned_like_data_manifests() {
+fn delete_manifests_are_listed_apart_from_data_manifests() {
     let metadata = evolved_table();
     let integer = |value: i32| summary(Some(value.to_le_bytes().to_vec()));
-    let mut deletes_of_day_18263 = manifest_entry(1, 1, Some(vec![integer(18_263)]));
-    deletes_of_day_18263.content = ManifestContentType::Deletes;
-    let mut deletes_of_day_18262 = manifest_entry(1, 3, Some(vec![integer(18_262)]));
-    deletes_of_day_18262.content = ManifestContentType::Deletes;
+    let deletes_of_day_18263 = delete_manifest_entry(1, 1, Some(vec![integer(18_263)]));
+    let deletes_of_day_18262 = delete_manifest_entry(1, 3, Some(vec![integer(18_262)]));
     let manifests = vec![
         manifest_entry(3, 0, None),
         deletes_of_day_18263,
@@ -585,7 +694,7 @@ fn delete_manifests_are_listed_apart_and_pruned_like_data_manifests() {
         ])),
     );
 
-    let selected = list.select(&before_day_18263).unwrap();
+    let selected = list.select_delete_manifests(&before_day_18263).unwrap();
 
     let paths = |manifests: &[&ManifestFile]| -> Vec<String> {
         manifests
@@ -593,8 +702,7 @@ fn delete_manifests_are_listed_apart_and_pruned_like_data_manifests() {
             .map(|manifest| manifest.manifest_path.clone())
             .collect()
     };
-    assert_eq!(paths(&selected.data), ["manifest-0.avro"]);
-    assert_eq!(paths(&selected.deletes), ["manifest-3.avro"]);
+    assert_eq!(paths(&selected), ["manifest-3.avro"]);
     assert_eq!(list.data_manifests().count(), 1);
     assert_eq!(list.delete_manifests().count(), 2);
     assert_eq!(list.row_count(), Some(3));
@@ -818,7 +926,7 @@ fn an_in_list_longer_than_the_limit_keeps_every_file() {
 
     let kept = selected(&schema, &manifests, &[in_many_other_values]);
 
-    assert_eq!(kept, ["ten", "twenty", "thirty"]);
+    assert_eq!(kept, ["ten", "thirty", "twenty"]);
 }
 
 #[test]
@@ -851,7 +959,7 @@ fn a_constant_on_the_left_keeps_every_file() {
 
     let kept = selected(&schema, &manifests, &[hundred_equals_id]);
 
-    assert_eq!(kept, ["ten", "twenty", "thirty"]);
+    assert_eq!(kept, ["ten", "thirty", "twenty"]);
 }
 
 #[test]
@@ -866,7 +974,7 @@ fn a_filter_the_column_type_cannot_read_leaves_the_others_to_prune() {
 
     let kept = selected(&schema, &manifests, &[equals_text, above_fifteen]);
 
-    assert_eq!(kept, ["twenty", "thirty"]);
+    assert_eq!(kept, ["thirty", "twenty"]);
 }
 
 #[test]
@@ -939,12 +1047,12 @@ fn a_date_before_the_epoch_also_keeps_the_month_after_its_own() {
 }
 
 #[test]
-fn a_manifest_of_a_spec_the_table_does_not_list_is_kept() {
+fn a_delete_manifest_of_a_spec_the_table_does_not_list_is_kept() {
     let metadata = evolved_table();
     let day = |value: i32| summary(Some(value.to_le_bytes().to_vec()));
     let manifests = vec![
-        manifest_entry(1, 0, Some(vec![day(18_264)])),
-        manifest_entry(99, 1, Some(vec![day(18_264)])),
+        delete_manifest_entry(1, 0, Some(vec![day(18_264)])),
+        delete_manifest_entry(99, 1, Some(vec![day(18_264)])),
     ];
     let list = ManifestList::new(&metadata, manifests).unwrap();
     let before_day_18263 = predicate(
@@ -954,10 +1062,9 @@ fn a_manifest_of_a_spec_the_table_does_not_list_is_kept() {
         ])),
     );
 
-    let selected = list.select(&before_day_18263).unwrap();
+    let selected = list.select_delete_manifests(&before_day_18263).unwrap();
 
     let paths: Vec<_> = selected
-        .data
         .iter()
         .map(|manifest| &manifest.manifest_path)
         .collect();
@@ -982,7 +1089,7 @@ fn a_partition_tuple_that_does_not_match_its_spec_is_an_error() {
     let spec = partitioned_by(&schema, 0, IcebergTransform::Identity);
     let manifests = [manifest(&schema, spec, vec![without_a_value])];
 
-    let selected = data_files(&schema, &manifests).select(&long_predicate(CompareType::Equal, 5));
+    let selected = select_files(&schema, &manifests, &long_predicate(CompareType::Equal, 5));
 
     assert!(selected.is_err());
 }
@@ -1000,4 +1107,44 @@ fn a_wide_or_is_checked_like_a_narrow_one() {
     let kept = selected(&schema, &manifests, &[twenty_or_many_others]);
 
     assert_eq!(kept, ["twenty"]);
+}
+
+#[test]
+fn files_of_several_schemas_are_each_read_as_their_own_schema_recorded_them() {
+    let current = schema(1, "id", PrimitiveType::Long);
+    let narrow = schema(1, "id", PrimitiveType::Int);
+    let other = schema(2, "other", PrimitiveType::Long);
+    let manifests = [
+        manifest(
+            &narrow,
+            unpartitioned(&narrow),
+            vec![
+                file_holding("a narrow three", Datum::int(3)),
+                file_holding("c narrow nine", Datum::int(9)),
+            ],
+        ),
+        manifest(
+            &current,
+            unpartitioned(&current),
+            vec![
+                file_holding("b wide three", Datum::long(3)),
+                file_holding("d wide nine", Datum::long(9)),
+            ],
+        ),
+        manifest(
+            &other,
+            unpartitioned(&other),
+            vec![file("e without the column").build().unwrap()],
+        ),
+    ];
+
+    let above_four = selected(
+        &current,
+        &manifests,
+        &long_predicate(CompareType::Greater, 4),
+    );
+    let below_four = selected(&current, &manifests, &long_predicate(CompareType::Less, 4));
+
+    assert_eq!(above_four, ["c narrow nine", "d wide nine"]);
+    assert_eq!(below_four, ["a narrow three", "b wide three"]);
 }

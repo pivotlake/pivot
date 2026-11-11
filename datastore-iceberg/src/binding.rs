@@ -6,7 +6,9 @@
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, Scalar};
+use catalog::CommitQueue;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use iceberg_tables::Table as LoadedTable;
 use parquet_engine::{
     ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
@@ -17,10 +19,7 @@ use planner::catalog::{
 };
 use planner::expression::Expression;
 
-use catalog::CommitQueue;
-
 use crate::IcebergDatastore;
-use crate::table::LoadedTable;
 use crate::write::build_insert_spec;
 
 /// One reference to a table in a query. Filter pushdown finishes before the
@@ -30,8 +29,11 @@ use crate::write::build_insert_spec;
 pub(crate) struct IcebergTableBinding {
     reference: TableReference,
     table: Arc<LoadedTable>,
-    /// The filters pushed into this scan. Manifests and data files are pruned
-    /// by them, row groups and dictionaries by the comparisons among them.
+    /// Whether each column may hold a NULL in some live file of the bound
+    /// snapshot, as the table's file index counts it.
+    nullability: Vec<bool>,
+    /// The filters pushed into this scan. Data files are pruned by them, row
+    /// groups and dictionaries by the comparisons among them.
     filters: Vec<Expression>,
     /// Statistics, scanning, and late materialization reuse this binding's load.
     cached_pruned_parquet: Arc<Mutex<Option<Arc<ParquetTable>>>>,
@@ -43,25 +45,29 @@ impl std::fmt::Debug for IcebergTableBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcebergTableBinding")
             .field("reference", &self.reference)
-            .field("metadata_location", &self.table.metadata_location)
+            .field("metadata_location", &self.table.metadata_location())
             .field("filters", &self.filters)
             .finish()
     }
 }
 
 impl IcebergTableBinding {
+    /// A binding over `table` with no filters pushed yet. Reads the table's
+    /// file index, which the first binding of a table version builds.
     pub(crate) fn new(
         reference: TableReference,
         table: Arc<LoadedTable>,
         commit_actions: CommitQueue<IcebergDatastore>,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        let nullability = table.nullability()?;
+        Ok(Self {
             reference,
             table,
+            nullability,
             filters: Vec::new(),
             cached_pruned_parquet: Arc::default(),
             commit_actions,
-        }
+        })
     }
 
     /// The row groups a scan reads: those of the files the pushed filters
@@ -72,7 +78,10 @@ impl IcebergTableBinding {
         if let Some(table) = cached.as_ref() {
             return Ok(table.clone());
         }
-        let parquet = self.table.load_parquet(&self.filters)?;
+        let parquet = self
+            .table
+            .plan_scan(&self.filters)
+            .map_err(crate::Error::from)?;
         let predicates: Vec<PushedPredicate> = self
             .filters
             .iter()
@@ -148,7 +157,7 @@ impl BoundTable for IcebergTableBinding {
     }
 
     fn nullability(&self) -> Vec<bool> {
-        self.table.nullability()
+        self.nullability.clone()
     }
 
     fn clone_box(&self) -> Box<dyn BoundTable> {

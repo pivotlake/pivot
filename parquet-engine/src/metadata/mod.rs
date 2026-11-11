@@ -25,6 +25,8 @@
 mod fetcher;
 mod writer;
 
+pub use fetcher::count_parsed_footers;
+
 use crate::types::columns::TableColumns;
 use crate::types::metadata::RowGroupMetadata;
 use dispatch::BuildContext;

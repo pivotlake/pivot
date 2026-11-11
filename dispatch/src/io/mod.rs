@@ -57,21 +57,64 @@ pub use disk_cache::{DiskCache, clear_disk_cache};
 
 pub mod http;
 
-/// A local file descriptor together with the block-device index resolved when
-/// it was opened. Cloning this wrapper keeps the descriptor alive without
-/// repeating the device lookup on the I/O submission path.
+/// Which file a local file handle reads: its device and inode. Two handles
+/// opened on one file are equal, so what the caches hold for a file serves
+/// every later open of it.
+///
+/// Which file it is stands for what the file holds, because every file read
+/// through the caches is treated as immutable: a table's data files are
+/// written once, each under a new name, local metadata is published by a
+/// rename or a link, and no table format rewrites a data file in place. A
+/// file overwritten in place keeps its identity, so what the caches hold for
+/// it keeps being served.
+///
+/// A file the caches hold something for is kept open by them: each cache
+/// keys what it holds for a file by a handle to it, and so does each record
+/// of where those bytes lie. Its inode is therefore never handed to a new
+/// file while they hold anything for it, deleted or not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LocalFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl LocalFileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// A local file descriptor together with which file it reads and the
+/// block-device index, both resolved when it was opened. Cloning this wrapper
+/// keeps the descriptor alive without repeating either lookup on the I/O
+/// submission path.
 #[derive(Clone)]
 pub struct LocalFile {
     file: Arc<File>,
+    identity: LocalFileIdentity,
     device_idx: hardware_queues::DeviceIndex,
 }
 
 impl LocalFile {
-    /// Wrap a newly opened file and register its block device once.
+    /// Wrap a newly opened file, reading its attributes once: they identify
+    /// it to the caches and name the block device its requests queue on.
     pub fn new(file: File) -> std::io::Result<Self> {
-        let file = Arc::new(file);
-        let device_idx = hardware_queues::register_file_device(&file)?;
-        Ok(Self { file, device_idx })
+        let metadata = file.metadata()?;
+        let device_idx = hardware_queues::register_file_device(&metadata)?;
+        Ok(Self {
+            file: Arc::new(file),
+            identity: LocalFileIdentity::of(&metadata),
+            device_idx,
+        })
+    }
+
+    /// Which file this handle reads.
+    pub fn identity(&self) -> LocalFileIdentity {
+        self.identity
     }
 
     pub(crate) fn device_idx(&self) -> hardware_queues::DeviceIndex {
@@ -116,11 +159,12 @@ impl AsRawFd for LocalFile {
 ///
 /// This is also the key the [`CompressedCache`](crate::memory::compressed_cache::CompressedCache)
 /// uses to bucket 2 MB regions, so it must be cheap to `Hash`/`Eq` — the
-/// cache's pin re-check runs on every hit. `Local` compares the raw fd (an
-/// `i32`; stable while the `LocalFile` is held, and holding it in the key means
-/// a cached file's fd can never be closed and reused under the cache); `Remote`
-/// carries an [`Arc<RemoteFile>`] that compares equal to every other open of
-/// the same object.
+/// cache's pin re-check runs on every hit. `Local` compares the file's
+/// [`LocalFileIdentity`], so every open of one file keys the same
+/// regions (and holding the handle in the key means a cached file's inode can
+/// never be freed and reused under the cache); `Remote` carries an
+/// [`Arc<RemoteFile>`] that compares equal to every other open of the same
+/// object.
 #[derive(Clone)]
 pub enum OpenFile {
     Local(LocalFile),
@@ -129,7 +173,7 @@ pub enum OpenFile {
 
 impl PartialEq for LocalFile {
     fn eq(&self, other: &Self) -> bool {
-        self.as_raw_fd() == other.as_raw_fd()
+        self.identity == other.identity
     }
 }
 
@@ -158,7 +202,7 @@ impl Hash for OpenFile {
         match self {
             OpenFile::Local(file) => {
                 0u8.hash(state);
-                file.as_raw_fd().hash(state);
+                file.identity.hash(state);
             }
             OpenFile::Remote(remote) => {
                 1u8.hash(state);

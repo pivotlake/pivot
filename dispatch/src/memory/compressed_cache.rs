@@ -46,6 +46,7 @@
 //! fragments are fine.
 
 use crate::io::OpenFile;
+use crate::memory::FileBytes;
 use crate::memory::clock::Owner;
 use crate::memory::context::memory_ctx;
 use crate::memory::fill_cursor::FillCursor;
@@ -706,7 +707,7 @@ impl CompressedCache {
         file_block: usize,
         requested_blocks: usize,
     ) -> Option<Extent> {
-        // Fast path: the file's map already exists (`open_entry` registered it), so
+        // Fast path: the file's map already exists (an earlier extent created it), so
         // register under the cheap outer read lock, which blocks a concurrent prune
         // from dropping the file mid-registration. The read guard is a named binding
         // so it drops at the block's end - a thread can't hold this `RwLock` for read
@@ -922,31 +923,42 @@ impl CompressedCache {
         }
     }
 
-    /// Register a [`OpenFile`] (a local fd or a remote object) so its extents can
-    /// be cached. A local fd clears any extents from a previous registration of
-    /// an equal file (a reused fd number) by dropping its extent map - the next
-    /// lookup then misses. The orphaned tenants in their slots self-clean on
-    /// eviction (their extent is gone, so the per-slot guard skips them). A
-    /// remote object keeps what is cached: a reopen of it equals the earlier
-    /// open, since a `RemoteFile` is keyed by the object it names.
-    pub fn open_entry(&self, open_file: OpenFile) {
-        // Only a local fd can name a different file when reopened (a reused fd
-        // number), so only it starts over. A remote object is keyed by its own
-        // identity: resetting it would drop what the last open cached. Its map
-        // is created on its first cached extent.
-        if matches!(open_file, OpenFile::Local(_)) {
-            // Drop any decompressed pages cached under this (possibly reused) file
-            // for the same reason the compressed map is reset below: a reopened fd
-            // may now name a different file, so its old pages must not serve a
-            // later read.
-            memory_ctx().decompressed_cache().invalidate(&open_file);
-            // The `file_maps` write lock serializes with
-            // `try_add_extent_for_location`'s read, so a racing miss either sees
-            // the fresh empty map or has its extent dropped here.
-            self.file_maps
-                .write()
-                .unwrap()
-                .insert(open_file, Default::default());
+    /// Cache what `file` holds from `offset` to its end, `file` being every
+    /// byte of `open_file` as a writer just wrote it, so the first read of
+    /// that stretch (a Parquet file's footer above all) is served from here
+    /// and not from storage. The stretch starts on the block `offset` falls
+    /// in. A block already cached, or being read by another worker, is left
+    /// as it is.
+    pub fn store_written_tail(&self, open_file: &OpenFile, file: &FileBytes, offset: usize) {
+        let start = offset / BLOCK_SIZE * BLOCK_SIZE;
+        if start >= file.len() {
+            return;
+        }
+        for lookup in self.get(open_file, start, file.len() - start) {
+            let Some(missing) = lookup.missing() else {
+                continue;
+            };
+            if !missing.fill_owner() {
+                continue;
+            }
+            let end = (missing.file_offset() + missing.len()).min(file.len());
+            let mut written = missing.file_offset();
+            while written < end {
+                let run = file.run_at(written);
+                let count = run.len().min(end - written);
+                // SAFETY: the missing extent's region is this fill's alone
+                // until it is committed, and `count` stays within both the
+                // run and the extent.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        run.as_ptr(),
+                        missing.dest().add(written - missing.file_offset()),
+                        count,
+                    );
+                }
+                written += count;
+            }
+            missing.commit_prefix(end - missing.file_offset());
         }
     }
 
@@ -1043,7 +1055,7 @@ mod tests {
 
     /// A fresh, independent local file (distinct cache bucket).
     fn new_file() -> OpenFile {
-        OpenFile::Local(LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap())
+        OpenFile::Local(LocalFile::new(tempfile::tempfile().unwrap()).unwrap())
     }
 
     fn cache() -> &'static CompressedCache {
@@ -1205,7 +1217,6 @@ mod tests {
     #[test]
     fn miss_then_fill_then_hit() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
 
         let miss = cache().get(&FD(), 0, 10);
         assert!(has_misses(&miss), "fresh range should miss");
@@ -1217,6 +1228,58 @@ mod tests {
         assert_pattern(&assemble(hit), 0);
     }
 
+    /// Open `path` anew for reading.
+    fn open_local(path: &std::path::Path) -> OpenFile {
+        OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn the_tail_of_a_written_file_is_read_back_without_a_miss() {
+        init_test_free_pool(8);
+        let content: Vec<u8> = (0..3 * SB + 100).map(|offset| offset as u8).collect();
+        let mut allocator = crate::memory::SlabAllocator::new(false);
+        let mut file = FileBytes::new();
+        for part in content.chunks(SB + 7) {
+            let mut run = allocator.get_slab_of_size(part.len(), false);
+            run.as_mut_slice().copy_from_slice(part);
+            file.push_slab(run);
+        }
+
+        cache().store_written_tail(&FD(), &file, 2 * SB + 50);
+        let tail = cache().get(&FD(), 2 * SB + 50, SB + 50);
+
+        assert!(!has_misses(&tail));
+        assert_eq!(assemble(tail), content[2 * SB + 50..]);
+        assert!(has_misses(&cache().get(&FD(), 0, SB)));
+    }
+
+    #[test]
+    fn a_second_open_of_an_unchanged_file_hits_what_the_first_cached() {
+        init_test_free_pool(8);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), vec![7u8; SB]).unwrap();
+        fill_pattern(&cache().get(&open_local(file.path()), 0, SB));
+
+        let reopened = cache().get(&open_local(file.path()), 0, SB);
+
+        assert!(!has_misses(&reopened));
+        assert_pattern(&assemble(reopened), 0);
+    }
+
+    #[test]
+    fn a_file_overwritten_in_place_is_served_what_was_cached_before() {
+        init_test_free_pool(8);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), vec![7u8; SB]).unwrap();
+        fill_pattern(&cache().get(&open_local(file.path()), 0, SB));
+
+        std::fs::write(file.path(), vec![9u8; 2 * SB]).unwrap();
+        let overwritten = cache().get(&open_local(file.path()), 0, SB);
+
+        assert!(!has_misses(&overwritten));
+        assert_pattern(&assemble(overwritten), 0);
+    }
+
     #[test]
     fn an_unwinding_reclaim_leaves_the_slot_cached_and_out_of_the_pool() {
         // Poison the outer map lock so reclaim unwinds mid-probe; the slot the
@@ -1224,7 +1287,6 @@ mod tests {
         // handed out as scratch memory under two owners). The pool's only slot
         // becomes the fill slot, so a leak into the pool is directly visible.
         init_test_free_pool(1);
-        cache().open_entry(FD());
         let miss = cache().get(&FD(), 0, 10);
         fill_pattern(&miss);
         drop(miss);
@@ -1255,7 +1317,6 @@ mod tests {
     #[test]
     fn coalesces_contiguous_missing_blocks_into_one_extent() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
 
         // Three blocks, none present → one freshly packed extent.
         let miss = cache().get(&FD(), 0, 2 * SB + 1);
@@ -1268,7 +1329,6 @@ mod tests {
     #[test]
     fn partial_validity_only_reports_the_holes() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
 
         // Fill block 0 only.
         let first = cache().get(&FD(), 0, 10);
@@ -1286,7 +1346,6 @@ mod tests {
     #[test]
     fn consecutive_misses_pack_into_one_slot() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
 
         // Two disjoint reads of the same file pack contiguously into the fill slot.
         let a = cache().get(&FD(), 0, 10);
@@ -1309,8 +1368,6 @@ mod tests {
         init_test_free_pool(8);
         let a = new_file();
         let b = new_file();
-        cache().open_entry(a.clone());
-        cache().open_entry(b.clone());
 
         let ra = cache().get(&a, 0, SB);
         let rb = cache().get(&b, 0, SB);
@@ -1325,7 +1382,6 @@ mod tests {
     #[test]
     fn a_read_past_the_fill_buffer_uses_a_new_slot() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
 
         // One read spanning more than a whole slot (513 blocks) splits at the 2 MB
         // boundary into two extents in two slots.
@@ -1343,7 +1399,6 @@ mod tests {
     #[test]
     fn overlap_dedup_only_fetches_the_holes() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
 
         // Cache blocks 0..=3.
         let first = cache().get(&FD(), 0, 4 * SB);
@@ -1361,7 +1416,6 @@ mod tests {
     #[test]
     fn hit_reassembles_bytes_across_lookups() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         let miss = cache().get(&FD(), SB - 5, SB + 10);
         fill_pattern(&miss);
         drop(miss);
@@ -1375,7 +1429,6 @@ mod tests {
     #[test]
     fn hit_returns_the_exact_requested_byte_range() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         let miss = cache().get(&FD(), 0, SB);
         fill_pattern(&miss);
         drop(miss);
@@ -1389,7 +1442,6 @@ mod tests {
     #[test]
     fn committed_bytes_serve_an_overlapping_later_lookup() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         let first = cache().get(&FD(), 0, 2 * SB);
         fill_pattern(&first);
         drop(first);
@@ -1403,7 +1455,6 @@ mod tests {
     #[test]
     fn into_data_yields_the_freshly_filled_range() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
 
         let miss = cache().get(&FD(), 10, SB);
         fill_pattern(&miss);
@@ -1416,7 +1467,6 @@ mod tests {
     #[test]
     fn interleaved_gaps_split_then_fill_to_a_full_hit() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, 1)); // sub-block 0
         fill_pattern(&cache().get(&FD(), 2 * SB, 2 * SB + 1)); // sub-block 2
 
@@ -1431,7 +1481,6 @@ mod tests {
     #[test]
     fn a_partially_cached_range_keeps_the_cached_bytes() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, 1)); // sub-block 0
 
         let m = cache().get(&FD(), 0, 2 * SB);
@@ -1448,7 +1497,6 @@ mod tests {
     #[test]
     fn get_assembles_a_range_spanning_cached_and_uncached_lookups() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         // Cache [0, SB); leave [SB, 2*SB) uncached.
         fill_pattern(&cache().get(&FD(), 0, SB));
 
@@ -1460,20 +1508,8 @@ mod tests {
     }
 
     #[test]
-    fn reopening_a_file_forgets_its_cached_extents() {
-        init_test_free_pool(8);
-        cache().open_entry(FD());
-        fill_pattern(&cache().get(&FD(), 0, SB));
-
-        cache().open_entry(FD());
-
-        assert!(has_misses(&cache().get(&FD(), 0, SB)));
-    }
-
-    #[test]
     fn get_write_buffer_evicts_compressed_data_when_the_pool_is_empty() {
         init_test_free_pool(1);
-        cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, SB));
         release_fill_cursor();
 
@@ -1489,7 +1525,6 @@ mod tests {
     #[test]
     fn evict_does_not_steal_a_slot_from_the_free_pool() {
         init_test_free_pool(2);
-        cache().open_entry(FD());
         // A real cached extent binds a slot; its set ref_bit makes the CLOCK hand skip
         // it once, so the evictor reaches a slot that is still in the pool.
         fill_pattern(&cache().get(&FD(), 0, SB));
@@ -1512,7 +1547,6 @@ mod tests {
         init_test_free_pool(16);
         let files: Vec<OpenFile> = (0..3).map(|_| new_file()).collect();
         for f in &files {
-            cache().open_entry(f.clone());
             fill_pattern(&cache().get(f, 0, SB)); // all pack into one fill slot
         }
         release_fill_cursor();
@@ -1533,7 +1567,6 @@ mod tests {
     #[test]
     fn a_recycled_slot_makes_stale_placements_miss() {
         init_test_free_pool(4);
-        cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, SB));
         release_fill_cursor();
 
@@ -1548,7 +1581,6 @@ mod tests {
     fn reading_a_file_after_its_entry_was_pruned_does_not_panic() {
         init_test_free_pool(8);
         let f = new_file();
-        cache().open_entry(f.clone());
         fill_pattern(&cache().get(&f, 0, SB));
         release_fill_cursor();
 
@@ -1571,7 +1603,6 @@ mod tests {
     #[test]
     fn evict_takes_decompressed_while_compressed_is_under_target() {
         init_test_free_pool(16);
-        cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, SB)); // 1 compressed slot
         release_fill_cursor();
         for i in 0..10 {
@@ -1593,7 +1624,6 @@ mod tests {
     #[test]
     fn a_tier_still_ageing_keeps_the_sweep_despite_a_pinned_candidate() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         let lookups = cache().get(&FD(), 0, BUFFER_SIZE);
         let missing = lookups[0].missing().unwrap();
         let pinned_slot = missing.extent.slot_idx as usize;
@@ -1634,7 +1664,6 @@ mod tests {
     fn a_revolution_of_pinned_candidates_hands_the_sweep_to_the_other_tier() {
         init_test_free_pool(8);
         let ring_len = memory_ctx().ring().len();
-        cache().open_entry(FD());
         let mut readers = Vec::new();
         for offset in [0, BUFFER_SIZE] {
             let lookups = cache().get(&FD(), offset, BUFFER_SIZE);
@@ -1679,7 +1708,6 @@ mod tests {
     #[test]
     fn evict_takes_compressed_while_over_its_target_share() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, SB));
         release_fill_cursor();
         insert_decompressed(10 * SB, SB); // 1 of each: share 50%, over target
@@ -1699,7 +1727,6 @@ mod tests {
     #[test]
     fn working_memory_takes_stale_compressed_pages_when_every_decompressed_page_is_pinned() {
         init_test_free_pool(128);
-        cache().open_entry(FD());
         // 30 of 100 cached slots: exactly the compressed tier's default target share.
         for slot_number in 0..30 {
             insert_stale_compressed_slot(slot_number);
@@ -1722,7 +1749,6 @@ mod tests {
     #[test]
     fn evicting_a_compressed_extent_reinforces_its_decompressed_twin() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, SB));
         release_fill_cursor();
         // Same file range as the compressed extent: its decompressed twin.
@@ -1743,7 +1769,6 @@ mod tests {
     #[test]
     fn evicting_a_decompressed_block_reinforces_its_compressed_source() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         let lookups = cache().get(&FD(), 0, SB);
         fill_pattern(&lookups);
         let source_slot = lookups[0].missing().unwrap().extent.slot_idx as usize;
@@ -1764,7 +1789,6 @@ mod tests {
     #[test]
     fn clear_forgets_everything_and_re_reads() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, SB));
 
         let dropped = cache().clear();

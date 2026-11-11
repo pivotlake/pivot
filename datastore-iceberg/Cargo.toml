@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "A read-only Iceberg datastore: tables of a REST catalog, read through Pivot's Parquet engine and object caches."
+description = "An Iceberg datastore over the tables of a REST catalog: read through Pivot's Parquet engine and object caches, appended to through the catalog's own commit, maintained by the catalog."
 
 [dependencies]
 planner = { workspace = true }
@@ -13,7 +13,6 @@ dispatch = { workspace = true }
 object-storage = { workspace = true }
 parquet-engine = { workspace = true }
 arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
 thiserror = { workspace = true }
 # Keep decimal bounds exact when rendering catalog statistics as JSON numbers.
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -24,45 +23,56 @@ tracing = { workspace = true }
 # none; the background refresh is a timer task on the ambient runtime.
 # `sync` for the lock an OAuth2 session renews its token under.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync"] }
-# The bitmap type a decoded deletion vector hands over to the parquet engine.
-roaring = { workspace = true }
-# A transaction's staged writes, and the files an INSERT's workers upload.
-crossbeam-deque = { workspace = true }
-# Casting a column to the Arrow type its partition transform takes.
-arrow-cast = { workspace = true }
-# The iceberg crate reads and writes a commit's manifests through a storage
-# of this crate's over Pivot's stores. The crate's storage traits are
-# object-safe through typetag, which asks every implementation to serialize,
-# and the crate hands bytes over and takes paths back as `bytes` and streams.
+# The catalog client builds each table's file IO from a storage factory of
+# this crate's over Pivot's stores. The crate's storage traits are
+# object-safe through typetag, which asks every implementation to serialize.
 typetag = "0.2"
 serde = { workspace = true }
-bytes = { workspace = true }
-futures = "0.3"
 # Spec metadata and the REST catalog client. Every file a query reads goes
 # through Pivot's ring and caches, not the crate's storage layer.
 # Pinned to our fork's branch off the 0.11.x release branch, the first with
 # the format version 3 deletion-vector work, plus the commits making its
-# `delete_vector` module public (apache/iceberg-rust#3461) and handing out a
-# vector's bitmap, until a release carries them.
+# `delete_vector` module public (apache/iceberg-rust#3461), handing out a
+# vector's bitmap, backporting the transaction action that replaces data
+# files (apache/iceberg-rust#3046), merging small manifests on commit when
+# asked, keeping a branch's retention and a snapshot's place in time across
+# commits, and letting a catalog name the metadata log entries a commit
+# drops, until a release carries them.
 iceberg = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
 iceberg-catalog-rest = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
+# The Iceberg table model, store and column plumbing shared with the pivotlake
+# datastore.
+iceberg-tables = { workspace = true }
+uuid = { version = "1" }
 # The REST client's reqwest carries no TLS backend of its own; a catalog behind
 # https needs one.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
+[features]
+# Re-export the reusable MinIO/fake-gcs harness alongside managed-table test
+# helpers.
+test-support = ["object-storage/test-support"]
+
 [dev-dependencies]
+# The storage tests hand the crate's file IO bytes to write.
+bytes = { workspace = true }
+# The REST tests read a table back through the crate's own scan, a stream.
+futures = "0.3"
+# Self-dependency to turn on `test-support` for this crate's own integration
+# tests.
+datastore-iceberg = { path = ".", features = ["test-support"] }
 # The integration tests stand up a real REST catalog (apache/iceberg-rest-fixture)
 # in Docker, backed by the MinIO the object-storage harness starts, and write
 # tables into it through the iceberg crate's own writer and S3 storage.
 object-storage = { workspace = true, features = ["test-support"] }
 iceberg-storage-opendal = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector", default-features = false, features = ["opendal-s3"] }
+tracing-subscriber = { workspace = true }
 testcontainers = { version = "0.24", features = ["blocking"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
-# A directory for the storage tests to write a table's objects under.
-tempfile = { workspace = true }
 parquet = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 ureq = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
 url = { workspace = true }
+tempfile = { workspace = true }

@@ -50,18 +50,34 @@ fn dispatcher() -> DataFlowDispatcher {
 /// guard next to the datastore makes its storage lifetime explicit.
 fn empty_datastore() -> (TempDir, Arc<PivotlakeDatastore>) {
     let database = TempDir::new().unwrap();
-    let datastore =
-        PivotlakeDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &database.path().to_string_lossy(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormatKind::Delta),
+    )
+    .unwrap();
     (database, datastore)
 }
 
-/// Entries written to a datastore other than its process-lifetime lock.
+/// Entries written to a datastore other than what opening it writes: its
+/// process-lifetime lock, and its manifest with the lock the manifest is
+/// updated under.
 fn durable_datastore_entries(database: &Path) -> Vec<std::ffi::OsString> {
+    const WRITTEN_AT_OPEN: [&str; 3] = [
+        ".pivot.lock",
+        "_pivot_manifest.json",
+        "_pivot_manifest.json.lock",
+    ];
     std::fs::read_dir(database)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
-        .filter(|name| name != ".pivot.lock")
+        .filter(|name| !WRITTEN_AT_OPEN.iter().any(|written| name == written))
         .collect()
+}
+
+/// The bytes of a datastore's manifest as storage holds them.
+fn read_manifest(database: &Path) -> Vec<u8> {
+    std::fs::read(database.join("_pivot_manifest.json")).unwrap()
 }
 
 /// Create a table, mirroring how the server runs `CREATE TABLE`: execute the
@@ -250,6 +266,7 @@ fn create_table_succeeds_with_valid_path() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
 }
@@ -258,6 +275,7 @@ fn create_table_succeeds_with_valid_path() {
 fn create_table_is_durable_and_visible_only_after_commit() {
     let (dir, columns) = three_row_table();
     let (database, datastore) = empty_datastore();
+    let manifest_at_open = read_manifest(database.path());
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(create_request("t", dir.path(), columns))
@@ -275,9 +293,11 @@ fn create_table_is_durable_and_visible_only_after_commit() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_none()
     );
     assert!(durable_datastore_entries(database.path()).is_empty());
+    assert_eq!(read_manifest(database.path()), manifest_at_open);
 
     commit_datastore_transaction(transaction).unwrap();
 
@@ -289,6 +309,7 @@ fn create_table_is_durable_and_visible_only_after_commit() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
     assert!(
@@ -304,6 +325,7 @@ fn create_table_is_durable_and_visible_only_after_commit() {
 fn rolling_back_create_table_discards_the_staged_creation() {
     let (dir, columns) = three_row_table();
     let (database, datastore) = empty_datastore();
+    let manifest_at_open = read_manifest(database.path());
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(create_request("t", dir.path(), columns))
@@ -323,10 +345,12 @@ fn rolling_back_create_table_discards_the_staged_creation() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_none()
     );
     assert!(!dir.path().join("_delta_log").exists());
     assert!(durable_datastore_entries(database.path()).is_empty());
+    assert_eq!(read_manifest(database.path()), manifest_at_open);
 }
 
 #[test]
@@ -388,6 +412,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
     assert!(current_parquet(&datastore, "t").row_groups().is_empty());
@@ -398,9 +423,13 @@ fn opening_an_unwritable_database_fails() {
     // Opening takes and records the datastore lock before loading catalog state,
     // so an unwritable root is rejected immediately.
     let bogus = "/definitely/not/a/real/path/for/datastore/tests";
-    let err = PivotlakeDatastore::open(bogus, &dispatcher())
-        .unwrap_err()
-        .to_string();
+    let err = PivotlakeDatastore::open_with_format(
+        bogus,
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormatKind::Delta),
+    )
+    .unwrap_err()
+    .to_string();
 
     let err_lower = err.to_lowercase();
     assert!(
@@ -512,7 +541,8 @@ fn pushdown_filter_always_returns_false() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     let pushed = table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
@@ -532,7 +562,8 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
 
     table
@@ -722,7 +753,8 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     first
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
@@ -736,7 +768,8 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     assert_eq!(row_group_count(&datastore, "t", &second), 3);
 }
 
@@ -754,7 +787,8 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_eq_filter(0, int_constant(999)))
         .unwrap();
@@ -775,7 +809,8 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -794,7 +829,8 @@ fn pushdown_filter_eq_returns_false() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     let pushed = table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -814,7 +850,8 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_neq_filter(0, int_constant(999)))
         .unwrap();
@@ -1451,7 +1488,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         },
     )];
     // A losing compacter clones the table out at the version where the inputs
-    // are present, before the winning swap lands.
+    // are present, before the winning swap is committed.
     let mut loser = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
@@ -1462,7 +1499,12 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     winner.refresh().unwrap();
     // The two inputs under the paths the table records them by: the adopted file
     // absolutely, the appended one relative to the table's own location.
-    let removed: Vec<ObjectPath> = winner.file_refs().into_iter().map(|f| f.path).collect();
+    let removed: Vec<ObjectPath> = winner
+        .file_refs()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
     winner.replace_data_files(&removed, &added).unwrap();
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh and returns a typed commit-conflict error.
@@ -1489,7 +1531,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 
 /// A writer's copy carries its own Delta snapshot forward across commits: each
 /// commit rides the snapshot the previous one produced, so the copy commits
-/// again and again with no reload in between and every commit lands exactly one
+/// again and again with no reload in between and every commit is exactly one
 /// version on.
 #[test]
 fn one_copy_commits_repeatedly_without_reloading_between_commits() {
@@ -1511,7 +1553,7 @@ fn one_copy_commits_repeatedly_without_reloading_between_commits() {
 
     assert_eq!(table.version(), start + 3);
     assert_eq!(
-        table.file_refs().len(),
+        table.file_refs().unwrap().len(),
         4,
         "the seed file plus three appends"
     );
@@ -1542,7 +1584,7 @@ fn a_refresh_advances_a_copy_onto_another_copys_commit() {
     );
     assert!(reader.refresh().unwrap(), "the refresh advances us onto it");
     assert_eq!(reader.version(), start + 1);
-    assert_eq!(reader.file_refs().len(), 2);
+    assert_eq!(reader.file_refs().unwrap().len(), 2);
     assert!(
         !reader.refresh().unwrap(),
         "a current copy does not advance"
@@ -1580,7 +1622,7 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
     assert!(reader.refresh().is_err());
     assert_eq!(reader.version(), version, "the copy stays at its version");
     assert_eq!(
-        reader.file_refs().len(),
+        reader.file_refs().unwrap().len(),
         1,
         "with the files of that version"
     );
@@ -1608,7 +1650,7 @@ fn compact_table_files_merges_small_files_into_one() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
     table.refresh().unwrap();
-    let inputs = table.file_refs();
+    let inputs = table.file_refs().unwrap();
     assert_eq!(inputs.len(), 2, "two inserts wrote two files");
     let merged = datastore_pivotlake::compact_table_files(
         &datastore,
@@ -1639,7 +1681,7 @@ fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
     table.refresh().unwrap();
-    let inputs = table.file_refs();
+    let inputs = table.file_refs().unwrap();
 
     // Replace the Delta log directory with a file so the data upload succeeds
     // but creating the next commit version fails.
@@ -1685,7 +1727,8 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -1705,13 +1748,22 @@ fn reopened_database_restores_appended_files_from_manifest() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            &dispatcher(),
+            Some(datastore_pivotlake::TableFormatKind::Delta),
+        )
+        .unwrap();
         create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
         let new_file = write_ids(data_dir.path(), "later.parquet", &[40]);
         append(&datastore, "t", &new_file);
     }
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormatKind::Delta),
+    )
+    .unwrap();
     assert_eq!(current_parquet(&reopened, "t").row_groups().len(), 4);
 }
 
@@ -1722,8 +1774,12 @@ fn reopened_database_restores_sort_by() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            &dispatcher(),
+            Some(datastore_pivotlake::TableFormatKind::Delta),
+        )
+        .unwrap();
         let mut request = create_request("t", data_dir.path(), columns);
         request
             .options
@@ -1731,7 +1787,12 @@ fn reopened_database_restores_sort_by() {
         create_table(&datastore, request).unwrap();
     }
 
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormatKind::Delta),
+    )
+    .unwrap();
 
     assert_eq!(
         reopened
@@ -1748,7 +1809,12 @@ fn reopened_database_restores_sort_by() {
 fn unlogged_leftover_file_is_invisible_after_swap() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormatKind::Delta),
+    )
+    .unwrap();
     create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
 
     // "Compact" the adopted file into merged.parquet but crash before deleting
@@ -1756,7 +1822,12 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     let mut table = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
-    let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
+    let inputs: Vec<ObjectPath> = table
+        .file_refs()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
     let added = vec![datastore_pivotlake::DeltaFileEntry::new(
         datastore_pivotlake::FileRef {
@@ -1768,7 +1839,12 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
 
     drop(table);
     drop(datastore);
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormatKind::Delta),
+    )
+    .unwrap();
     let parquet = current_parquet(&reopened, "t");
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the committed merged file is read");
@@ -1827,7 +1903,8 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     assert_eq!(row_group_count(&datastore, "t", &table), 6);
 
     table
@@ -2132,7 +2209,8 @@ fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<PivotlakeDatastore>, Tab
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("docs"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     (database, datastore, binding)
 }
 

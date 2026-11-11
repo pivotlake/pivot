@@ -612,8 +612,8 @@ impl DecompressedCache {
         self.blocks.load(Ordering::Relaxed) == 0
     }
 
-    /// Drop every block belonging to `open_file` (e.g. when its fd is reopened) so a
-    /// stale block can't serve a later read. The slots stay `Decompressed` with
+    /// Drop every block belonging to `open_file` so a stale block can't serve a
+    /// later read. The slots stay `Decompressed` with
     /// stale tenants and are recycled lazily by the clock (via
     /// [`reclaim`](Self::reclaim), whose identity guard skips them).
     pub fn invalidate(&self, open_file: &OpenFile) {
@@ -686,7 +686,7 @@ mod tests {
 
     /// A fresh, independent local file (distinct cache key bucket).
     fn new_file() -> OpenFile {
-        OpenFile::Local(LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap())
+        OpenFile::Local(LocalFile::new(tempfile::tempfile().unwrap()).unwrap())
     }
 
     fn key_for(open_file: &OpenFile) -> BlockKey {
