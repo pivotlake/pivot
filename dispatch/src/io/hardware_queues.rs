@@ -303,14 +303,13 @@ fn device_registry() -> &'static Mutex<DeviceRegistry> {
     &REGISTRY
 }
 
-/// Register the block device behind `file`, returning the compact index all of
-/// that file's requests will carry. This is the only `metadata().dev()` call in
-/// the file's lifetime.
+/// Register the block device behind the file `metadata` describes, returning
+/// the compact index all of that file's requests will carry.
 #[cfg(target_os = "linux")]
-pub(crate) fn register_file_device(file: &std::fs::File) -> std::io::Result<DeviceIndex> {
+pub(crate) fn register_file_device(metadata: &std::fs::Metadata) -> std::io::Result<DeviceIndex> {
     use std::os::unix::fs::MetadataExt;
 
-    let device = file.metadata()?.dev();
+    let device = metadata.dev();
     let mut registry = device_registry().lock().unwrap();
     if let Some(&device_idx) = registry.by_device.get(&device) {
         return Ok(device_idx);
@@ -331,7 +330,7 @@ pub(crate) fn register_file_device(file: &std::fs::File) -> std::io::Result<Devi
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn register_file_device(_file: &std::fs::File) -> std::io::Result<DeviceIndex> {
+pub(crate) fn register_file_device(_metadata: &std::fs::Metadata) -> std::io::Result<DeviceIndex> {
     Ok(DeviceIndex(0))
 }
 

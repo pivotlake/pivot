@@ -29,15 +29,17 @@ use crate::RowGroupMetadata;
 
 /// Upload assembled Parquet files over the ring and push every completion onto
 /// `uploaded_files`. INSERT and compaction prepare files through different front
-/// halves of the write pipeline and share this storage-facing tail.
+/// halves of the write pipeline and share this storage-facing tail. Files are
+/// written into `directory` of `store`, and each is reported by its path
+/// relative to that directory, with the store and the directory themselves.
 /// `on_start` runs once, when the dataflow is built and before any file can
 /// land: an INSERT stages the pending insert its transaction commits there;
 /// compaction, which commits its files itself, has nothing to run.
 pub fn upload_files_spec<OF>(
+    uploaded_files: UploadedFiles,
     store: Arc<dyn ObjectStore>,
-    location: ObjectPath,
+    directory: ObjectPath,
     declared_columns: Arc<[Column]>,
-    uploaded_files: Arc<Injector<UploadedFile>>,
     on_start: Option<Box<dyn FnOnce() + Send>>,
     encoded: OperatorSpec<AssembledFile, OF>,
 ) -> RecordBatchOperatorSpec
@@ -51,21 +53,21 @@ where
     // separate fan-in is needed.
     let rows = Arc::new(AtomicUsize::new(0));
     let remaining_workers = Arc::new(AtomicUsize::new(workers));
+    // Every file the write uploads names the one directory through this.
+    let directory = Arc::new(directory);
     // One factory per worker, but only the first runs `on_start`.
     let mut on_start = on_start;
     let uploads = encoded.chain(
         stealable::<AssembledFile>(topology).into_iter().collect(),
         (0..workers)
-            .map(|_| {
-                UploadFactory::new(
-                    store.clone(),
-                    location.clone(),
-                    declared_columns.clone(),
-                    uploaded_files.clone(),
-                    on_start.take(),
-                    rows.clone(),
-                    remaining_workers.clone(),
-                )
+            .map(|_| UploadFactory {
+                declared_columns: declared_columns.clone(),
+                uploaded_files: uploaded_files.clone(),
+                store: Arc::clone(&store),
+                directory: Arc::clone(&directory),
+                on_start: on_start.take(),
+                rows: rows.clone(),
+                remaining_workers: remaining_workers.clone(),
             })
             .collect(),
     );
@@ -74,32 +76,63 @@ where
 
 /// One finished upload waiting to be committed, drained from `uploaded_files` by
 /// whoever owns it (a statement's transaction, or compaction): the file's
-/// path under the directory it was written to, with its size, the partition
-/// values its rows share (`None` for an unpartitioned write), and the row
-/// groups its footer records.
+/// path relative to the directory it was written into, with its size, the
+/// partition values its rows share (`None` for an unpartitioned write), and
+/// the row groups its footer records, and the columns its rows are in order
+/// of, as the write pipeline reports them
+/// ([`AssembledFile::sorted_by`](super::AssembledFile::sorted_by)). It
+/// carries the place it was written, the store and the directory in it, so
+/// whoever holds it records it or removes it with nothing else in hand.
 pub struct UploadedFile {
     pub file: FileRef,
     pub partition: Option<crate::PartitionValues>,
     pub row_groups: Vec<Arc<RowGroupMetadata>>,
+    pub sorted_by: Arc<[String]>,
+    store: Arc<dyn ObjectStore>,
+    /// Shared by every file of one write.
+    directory: Arc<ObjectPath>,
+}
+
+impl UploadedFile {
+    /// The store the file was written to.
+    pub fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
+    /// The directory the file was written into, which its path is relative
+    /// to.
+    pub fn directory(&self) -> &ObjectPath {
+        &self.directory
+    }
+
+    /// Delete the file, never recorded, from where it was written. Best
+    /// effort: a file that cannot be removed is logged and left behind,
+    /// unreferenced.
+    pub fn delete(&self) {
+        let key = self.directory.resolve(&self.file.path);
+        if let Err(error) = self.store.delete(&key) {
+            tracing::warn!(
+                file = %key.as_str(),
+                %error,
+                "could not remove the uploaded file of a write that did not land"
+            );
+        }
+    }
 }
 
 /// The files one write uploaded, waiting for whoever owns the write to
-/// record them in its table format or remove them. Shared between the upload
-/// sink, which pushes each file as it lands, and the owner, which takes them
-/// all at commit or discard.
+/// record them in its table format or remove them. Shared between the
+/// upload sink, which pushes each file as it lands, and the owner, which
+/// takes them all at commit or discard.
 #[derive(Clone, Default)]
 pub struct UploadedFiles {
     queue: Arc<Injector<UploadedFile>>,
 }
 
 impl UploadedFiles {
+    /// No files yet.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// The queue the upload sink pushes onto.
-    pub fn queue(&self) -> Arc<Injector<UploadedFile>> {
-        Arc::clone(&self.queue)
     }
 
     /// Every file uploaded so far, in the order they landed, leaving the
@@ -115,41 +148,24 @@ impl UploadedFiles {
         }
     }
 
-    /// Delete every file uploaded so far from `store`, under `location`, the
-    /// directory the sink wrote them to. For a write that will not be
-    /// recorded: nothing names the files, so no reader can be holding one.
-    pub fn delete_from(&self, store: &dyn ObjectStore, location: &ObjectPath) {
-        delete_uploaded_files(store, location, &self.take());
-    }
-}
-
-/// Delete `files`, uploaded under `location` and never recorded, from
-/// `store`. Best effort: a file that cannot be removed is logged and left
-/// behind, unreferenced.
-pub fn delete_uploaded_files(
-    store: &dyn ObjectStore,
-    location: &ObjectPath,
-    files: &[UploadedFile],
-) {
-    for uploaded in files {
-        let key = location.resolve(&uploaded.file.path);
-        if let Err(error) = store.delete(&key) {
-            tracing::warn!(
-                file = %key.as_str(),
-                %error,
-                "could not remove the uploaded file of a write that did not land"
-            );
+    /// Delete every file uploaded so far from where it was written
+    /// ([`UploadedFile::delete`]). For a write that will not be recorded:
+    /// nothing names the files, so no reader can be holding one.
+    pub fn delete_all(&self) {
+        for uploaded in self.take() {
+            uploaded.delete();
         }
     }
 }
 
 pub(super) struct UploadFactory {
-    store: Arc<dyn ObjectStore>,
-    location: ObjectPath,
     /// The table's declared column types, reconciled with each uploaded file's
     /// footer when its row groups are built.
     declared_columns: Arc<[Column]>,
-    uploaded_files: Arc<Injector<UploadedFile>>,
+    uploaded_files: UploadedFiles,
+    /// Where the files are written: the store, and the directory in it.
+    store: Arc<dyn ObjectStore>,
+    directory: Arc<ObjectPath>,
     /// Run once when this factory builds its operator. Held by one worker's
     /// factory only.
     on_start: Option<Box<dyn FnOnce() + Send>>,
@@ -162,28 +178,6 @@ pub(super) struct UploadFactory {
     remaining_workers: Arc<AtomicUsize>,
 }
 
-impl UploadFactory {
-    pub fn new(
-        store: Arc<dyn ObjectStore>,
-        location: ObjectPath,
-        declared_columns: Arc<[Column]>,
-        uploaded_files: Arc<Injector<UploadedFile>>,
-        on_start: Option<Box<dyn FnOnce() + Send>>,
-        rows: Arc<AtomicUsize>,
-        remaining_workers: Arc<AtomicUsize>,
-    ) -> Self {
-        Self {
-            store,
-            location,
-            declared_columns,
-            uploaded_files,
-            on_start,
-            rows,
-            remaining_workers,
-        }
-    }
-}
-
 impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
     type Unary = Upload;
 
@@ -194,10 +188,10 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
             on_start();
         }
         Built::new(Upload {
-            store: self.store,
-            location: self.location,
             declared_columns: self.declared_columns,
             uploaded_files: self.uploaded_files,
+            store: self.store,
+            directory: self.directory,
             rows: self.rows,
             remaining_workers: self.remaining_workers,
             in_flight: HashMap::new(),
@@ -209,20 +203,23 @@ struct PendingUpload {
     file: object_storage::FileRef,
     key: ObjectPath,
     partition: Option<crate::PartitionValues>,
+    sorted_by: Arc<[String]>,
     /// The footer metadata the writer produced for this file, used to record its
     /// row groups once the upload lands (no re-parsing the file we just wrote).
     metadata: crate::thrift::footer::FileMetaData,
 }
 
 pub(super) struct Upload {
-    store: Arc<dyn ObjectStore>,
-    location: ObjectPath,
     /// The table's declared column types, reconciled with each uploaded file's
     /// footer when its row groups are built (see [`UploadFactory`]).
     declared_columns: Arc<[Column]>,
-    /// Shared queue of finished uploads: each is pushed here for its owner (a
-    /// statement's transaction, or compaction) to drain and commit.
-    uploaded_files: Arc<Injector<UploadedFile>>,
+    /// The shared queue of finished uploads: each is pushed there for its
+    /// owner (a statement's transaction, or compaction) to drain and commit.
+    uploaded_files: UploadedFiles,
+    /// Where the files are written, the store and the directory in it,
+    /// which each finished upload is stamped with.
+    store: Arc<dyn ObjectStore>,
+    directory: Arc<ObjectPath>,
     /// Running total of inserted rows, shared by every worker (see
     /// [`UploadFactory`]). Added to as completions land; read once at `finish`.
     rows: Arc<AtomicUsize>,
@@ -263,10 +260,13 @@ impl Upload {
         // Data-file IO is complete, but publication belongs to the statement's
         // transaction. Its commit drains this queue and appends every file to
         // Delta only after the whole dataflow has succeeded.
-        self.uploaded_files.push(UploadedFile {
+        self.uploaded_files.queue.push(UploadedFile {
             file: pending.file,
             partition: pending.partition,
             row_groups: loaded.row_groups,
+            sorted_by: pending.sorted_by,
+            store: Arc::clone(&self.store),
+            directory: Arc::clone(&self.directory),
         });
         // Relaxed: the finish barrier (AcqRel on the sibling counter) publishes
         // this add to whichever worker reads the total.
@@ -283,7 +283,7 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
         io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
-        let key = self.location.resolve(&path);
+        let key = self.directory.resolve(&path);
         let data = Arc::new(encoded.bytes);
         // The write/upload request below shares this `Arc`, so its address keys
         // the in-flight entry a later completion resolves against.
@@ -316,6 +316,7 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
                 file,
                 key,
                 partition: encoded.partition,
+                sorted_by: encoded.sorted_by,
                 metadata: encoded.metadata,
             },
         );

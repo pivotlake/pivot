@@ -308,7 +308,6 @@ fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
     let url = Url::parse(&format!("{scheme}://127.0.0.1:{port}/obj")).unwrap();
     let remote = Arc::new(RemoteFile::open(url, None, 1_000_000_000_000).unwrap());
     let loc = OpenFile::Remote(remote.clone());
-    memory_ctx().caches().invalidate_reopened_file(&loc);
 
     let mut requester = IORequester::with_http_config(client_config());
     let mut stats = StatsCollector::disabled();

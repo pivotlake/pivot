@@ -245,6 +245,7 @@ mod tests {
                 base_row_group_id: 0,
                 assembly_worker: 0,
                 partition: None,
+                sorted_by: Arc::from(["key".to_string()]),
                 target_rows_per_group: 1_000,
                 max_file_size: None,
             },

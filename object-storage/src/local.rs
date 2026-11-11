@@ -6,11 +6,43 @@ use super::{
     StoreConnection, StoreError,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The local-filesystem backend: keys are paths under `root`.
 #[derive(Debug)]
 pub struct LocalStore {
     root: PathBuf,
+}
+
+/// Distinguishes the temp files one process has in flight, so two writes of
+/// one key never share a staging file.
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A staging path beside `target` that no other writer, in this process or
+/// another, is using: dot-prefixed so a listing by name prefix never sees it,
+/// and unique by process id and an in-process counter.
+fn unique_temp_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    target.with_file_name(format!(".{name}.{}-{counter}.tmp", std::process::id()))
+}
+
+/// Write `data` to a fresh staging file beside `target`, creating the parent
+/// directory, and hand back the staging path to publish by rename or link.
+fn stage_bytes(target: &Path, key: &ObjectPath, data: &[u8]) -> Result<PathBuf> {
+    let io_error = |source| StoreError::Io {
+        key: key.to_string(),
+        source,
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error)?;
+    }
+    let staged = unique_temp_path(target);
+    std::fs::write(&staged, data).map_err(io_error)?;
+    Ok(staged)
 }
 
 impl LocalStore {
@@ -92,23 +124,40 @@ impl ObjectStore for LocalStore {
 
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let path = self.path_for(key);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+        // Write a staging file and rename over the target, so a concurrent
+        // reader sees the old or new file whole — never a half-written one.
+        let staged = stage_bytes(&path, key, data)?;
+        std::fs::rename(&staged, &path).map_err(|source| {
+            let _ = std::fs::remove_file(&staged);
+            StoreError::Io {
                 key: key.to_string(),
                 source,
-            })?;
-        }
-        // Write a sibling temp file and rename over the target, so a concurrent
-        // reader sees the old or new file whole — never a half-written one.
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, data).map_err(|source| StoreError::Io {
-            key: key.to_string(),
-            source,
-        })?;
-        std::fs::rename(&tmp, &path).map_err(|source| StoreError::Io {
-            key: key.to_string(),
-            source,
+            }
         })
+    }
+
+    /// Publish by hard link instead of rename: linking a new name to the
+    /// staged inode fails with `AlreadyExists` when the name is taken, which is
+    /// the atomic "create only if absent" the filesystem offers, and the name
+    /// appears with the whole object behind it. The staging file is removed
+    /// whether the link landed or not.
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
+        let path = self.path_for(key);
+        let staged = stage_bytes(&path, key, data)?;
+        let linked = std::fs::hard_link(&staged, &path);
+        let _ = std::fs::remove_file(&staged);
+        match linked {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(StoreError::VersionConflict {
+                    key: key.to_string(),
+                })
+            }
+            Err(source) => Err(StoreError::Io {
+                key: key.to_string(),
+                source,
+            }),
+        }
     }
 
     /// Read-modify-write under an exclusive advisory lock, so two writers —
@@ -161,13 +210,14 @@ impl ObjectStore for LocalStore {
         }
     }
 
-    fn list_with_name_prefix(
+    fn list_filtered(
         &self,
-        prefix: &ObjectPath,
+        directory: &ObjectPath,
         name_prefix: &str,
+        after: Option<&str>,
     ) -> Result<DirectoryListing> {
-        let dir = self.path_for(prefix);
-        let entries = match std::fs::read_dir(&dir) {
+        let path = self.path_for(directory);
+        let entries = match std::fs::read_dir(&path) {
             Ok(e) => e,
             // A not-yet-created directory lists as empty, not an error.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -175,7 +225,7 @@ impl ObjectStore for LocalStore {
             }
             Err(source) => {
                 return Err(StoreError::Io {
-                    key: prefix.to_string(),
+                    key: directory.to_string(),
                     source,
                 });
             }
@@ -184,17 +234,17 @@ impl ObjectStore for LocalStore {
         let mut prefixes = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|source| StoreError::Io {
-                key: prefix.to_string(),
+                key: directory.to_string(),
                 source,
             })?;
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if !name.starts_with(name_prefix) {
+            if !name.starts_with(name_prefix) || after.is_some_and(|after| name.as_str() <= after) {
                 continue;
             }
             let file_type = entry.file_type().map_err(|source| StoreError::Io {
-                key: prefix.join(&name).to_string(),
+                key: directory.join(&name).to_string(),
                 source,
             })?;
             if file_type.is_dir() {
@@ -202,14 +252,14 @@ impl ObjectStore for LocalStore {
                 continue;
             }
             let meta = entry.metadata().map_err(|source| StoreError::Io {
-                key: prefix.to_string(),
+                key: directory.to_string(),
                 source,
             })?;
             if !meta.is_file() {
                 continue;
             }
             let modified = meta.modified().map_err(|source| StoreError::Io {
-                key: prefix.to_string(),
+                key: directory.to_string(),
                 source,
             })?;
             let modified_unix_ms = modified

@@ -18,7 +18,8 @@ set -uo pipefail
 # local run-all and the CI matrix follow. Every workspace member is listed, so a
 # change to one cannot pass CI without its own tests, lints and docs running.
 CRATES=(dispatch planner duckdb-planner catalog datastore-pivotlake datastore-iceberg
-        metastore-disk object-storage parquet-engine benchmarks bin)
+        iceberg-tables table-file-index metastore-disk object-storage parquet-engine
+        benchmarks bin)
 CHECKS=(fmt clippy test doc)
 
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"

@@ -23,8 +23,8 @@
 
 use super::{
     DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
-    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, object_key,
-    parse_iso8601_millis, percent_encode,
+    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, encode_child_key,
+    object_key, parse_iso8601_millis, percent_encode,
 };
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -392,26 +392,27 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn list_with_name_prefix(
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
+        self.put_if_version(key, data, None)
+    }
+
+    fn list_filtered(
         &self,
-        prefix: &ObjectPath,
+        directory: &ObjectPath,
         name_prefix: &str,
+        after: Option<&str>,
     ) -> Result<DirectoryListing> {
-        let object_prefix = object_key(&self.prefix, prefix);
-        let encoded_prefix = if object_prefix.is_empty() {
-            percent_encode(name_prefix)
-        } else {
-            format!(
-                "{}%2F{}",
-                percent_encode(&object_prefix),
-                percent_encode(name_prefix)
-            )
-        };
+        let object_prefix = object_key(&self.prefix, directory);
+        let encoded_prefix = encode_child_key(&object_prefix, name_prefix);
         let mut continuation: Option<String> = None;
         let mut objects = Vec::new();
         let mut prefixes = Vec::new();
         loop {
             let mut query = format!("list-type=2&prefix={encoded_prefix}&delimiter=%2F");
+            if let Some(after) = after {
+                query.push_str("&start-after=");
+                query.push_str(&encode_child_key(&object_prefix, after));
+            }
             if let Some(token) = &continuation {
                 query.push_str("&continuation-token=");
                 query.push_str(&percent_encode(token));
@@ -755,7 +756,7 @@ mod tests {
                 .unwrap();
 
         let error = store
-            .list_with_name_prefix(&ObjectPath::default(), "part")
+            .list_filtered(&ObjectPath::default(), "part", None)
             .unwrap_err();
 
         assert!(
