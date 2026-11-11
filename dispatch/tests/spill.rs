@@ -73,5 +73,5 @@ fn a_group_by_larger_than_the_ring_fails_without_a_spill_directory() {
 
     let failure = group_distinct_ids(&d).unwrap_err().to_string();
 
-    assert!(failure.contains("no evictable memory"), "{failure}");
+    assert!(failure.contains("no spill directory set"), "{failure}");
 }

@@ -248,6 +248,9 @@ impl Worker {
                 debug!("Initializing memory context for worker {:?}", idx);
                 init_memory_context(memory_context_factory.create_memory_ctx());
                 memory_ctx().attach_io_requester(worker.io.clone());
+                if worker.spill_directory.is_some() {
+                    memory_ctx().record_spill_directory_set();
+                }
                 debug!("Pre-faulting for worker {:?}", idx);
                 memory_ctx().prefault_buffers();
                 worker

@@ -184,6 +184,7 @@ impl MemoryContextFactory {
             own_buffers_spilled: Cell::new(0),
             spill_pressure: self.spill_pressure,
             io_requester: OnceCell::new(),
+            has_spill_directory: Cell::new(false),
             spill_writes_in_flight: RefCell::new(HashMap::new()),
             node: self.node,
             took_buffer_since_pressure_check: Cell::new(false),
@@ -231,6 +232,10 @@ pub struct MemoryContext {
     /// that eviction can wait for spill writes to land when nothing else can
     /// be reclaimed. Shared with the worker, which drives it.
     io_requester: OnceCell<Rc<RefCell<IORequester>>>,
+    /// Whether this worker was given a directory to spill into, told by the
+    /// worker once it has started. Read only to say why an eviction that
+    /// found nothing failed.
+    has_spill_directory: Cell<bool>,
     /// Every spill write in flight on this worker, pointing at the in-flight
     /// count of each spilled buffer it carries rows of. A count that reaches
     /// zero tells the buffer's evictor the whole buffer is on disk. Keyed by
@@ -513,10 +518,14 @@ impl MemoryContext {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 panic_at = Some(iterations + ring_len);
             } else if panic_at.is_some_and(|limit| iterations >= limit) {
+                let cause = if self.has_spill_directory.get() {
+                    "cache exhausted by an oversized working set"
+                } else {
+                    "cache exhausted by an oversized working set, and no spill directory set"
+                };
                 panic!(
                     "evict: still no evictable memory after sleeping ({iterations} \
-                     iterations) — aborting query (cache exhausted by an oversized \
-                     working set)"
+                     iterations) — aborting query ({cause})"
                 );
             }
 
@@ -697,6 +706,11 @@ impl MemoryContext {
         self.io_requester
             .set(requester)
             .unwrap_or_else(|_| panic!("the worker attached its IO requester twice"));
+    }
+
+    /// Record that the worker was given a directory to spill into.
+    pub fn record_spill_directory_set(&self) {
+        self.has_spill_directory.set(true);
     }
 
     /// Note a spill write issued by `dataflow` that carries rows of the
