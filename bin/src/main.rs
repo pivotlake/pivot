@@ -8,6 +8,7 @@ use bin::memory::MemoryBudget;
 use bin::network::Bandwidth;
 use bin::shell::{ShellInput, ShellTarget};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use datastore_pivotlake::TableFormat;
 
 #[derive(Parser, Debug)]
 #[command(name = "pivot", about = "Pivot command-line tools", version)]
@@ -23,8 +24,7 @@ enum DatastoreKind {
     /// Also accepted as `pivot`, the kind's name before it was renamed.
     #[value(alias = "pivot")]
     Pivotlake,
-    /// The tables of an Iceberg REST catalog at an http(s) URI, read and
-    /// appended to.
+    /// The tables of an Iceberg REST catalog at an http(s) URI, read and written through it.
     Iceberg,
 }
 
@@ -37,13 +37,11 @@ enum PivotCommand {
     /// URI: s3://bucket/prefix (s3:// also spelled s3a://), gs://bucket/prefix,
     /// or file:///path.
     ///
-    /// An Iceberg datastore (--kind iceberg) is named by its REST catalog's
-    /// http(s) base URI and serves the catalog's tables, reading them and
-    /// appending to them with INSERT; each
-    /// namespace is a schema. The catalog is
-    /// authenticated to with PIVOT_ICEBERG_TOKEN (a bearer token) or
-    /// PIVOT_ICEBERG_CREDENTIAL (an OAuth2 client_id:client_secret, refined by
-    /// the optional PIVOT_ICEBERG_OAUTH2_SERVER_URI and
+    /// An Iceberg datastore (--kind iceberg) is a REST catalog at an http(s)
+    /// URI, whose tables are read and written through it; each namespace is a schema.
+    /// The catalog is authenticated to with PIVOT_ICEBERG_TOKEN (a bearer
+    /// token) or PIVOT_ICEBERG_CREDENTIAL (an OAuth2 client_id:client_secret,
+    /// refined by the optional PIVOT_ICEBERG_OAUTH2_SERVER_URI and
     /// PIVOT_ICEBERG_OAUTH2_SCOPE), or with nothing when neither is set. The
     /// tables' files are read from wherever the catalog says they are, with the
     /// credentials the catalog vends or those of the environment below.
@@ -57,14 +55,19 @@ enum PivotCommand {
     /// GOOGLE_APPLICATION_CREDENTIALS, then the gcloud login file, then the
     /// instance metadata server.
     Open {
-        /// Local directory or object-store URI holding the datastore, or the
-        /// Iceberg REST catalog's URI with --kind iceberg.
+        /// Local directory or object-store URI holding the datastore, or an
+        /// Iceberg REST catalog's http(s) URI with --kind iceberg.
         #[arg(value_name = "DATASTORE_LOCATION")]
         datastore_location: String,
 
         /// Which datastore implementation the location names.
         #[arg(long, value_enum, default_value_t = DatastoreKind::Pivotlake)]
         kind: DatastoreKind,
+
+        /// The table format a pivotlake database that does not exist yet is
+        /// created in: iceberg (the default) or delta (also spelled deltalake).
+        #[arg(long, value_name = "FORMAT")]
+        table_format: Option<TableFormat>,
 
         /// The warehouse to serve, for an Iceberg catalog that serves several.
         #[arg(long, value_name = "WAREHOUSE")]
@@ -132,6 +135,7 @@ fn run() -> Result<(), Error> {
         PivotCommand::Open {
             datastore_location,
             kind,
+            table_format,
             warehouse,
             memory,
             workers,
@@ -145,7 +149,7 @@ fn run() -> Result<(), Error> {
                 .expect("clap parsed the open subcommand");
             bin::network::limit_remote_reads_to_network_bandwidth(network_bandwidth);
             bin::shell::run_with_limits(
-                build_shell_target(kind, datastore_location, warehouse)?,
+                build_shell_target(kind, datastore_location, table_format, warehouse)?,
                 bin::shell::ShellLimits {
                     memory,
                     workers: workers.map(NonZeroUsize::get),
@@ -190,11 +194,12 @@ fn order_scripts(
     scripts.into_iter().map(|(_, script)| script).collect()
 }
 
-/// What `pivot open` opens, from its arguments. A pivotlake datastore has no
-/// warehouse to name.
+/// What `pivot open` opens, from its arguments. Only a REST catalog has a
+/// warehouse to name; only a pivotlake database has a table format.
 fn build_shell_target(
     kind: DatastoreKind,
     datastore_location: String,
+    table_format: Option<TableFormat>,
     warehouse: Option<String>,
 ) -> Result<ShellTarget, Box<dyn std::error::Error>> {
     match kind {
@@ -202,9 +207,17 @@ fn build_shell_target(
             if warehouse.is_some() {
                 return Err("--warehouse applies only to --kind iceberg".into());
             }
-            Ok(ShellTarget::pivot(datastore_location))
+            Ok(ShellTarget::pivot_with_table_format(
+                datastore_location,
+                table_format,
+            ))
         }
-        DatastoreKind::Iceberg => Ok(ShellTarget::iceberg(datastore_location, warehouse)?),
+        DatastoreKind::Iceberg => {
+            if table_format.is_some() {
+                return Err("--table-format applies only to --kind pivotlake".into());
+            }
+            Ok(ShellTarget::iceberg(datastore_location, warehouse)?)
+        }
     }
 }
 

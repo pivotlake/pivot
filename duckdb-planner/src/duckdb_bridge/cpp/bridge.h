@@ -205,6 +205,10 @@ BridgeLogicalType lo_create_column_type(const LogicalOperator &op, size_t index)
 size_t lo_create_option_count(const LogicalOperator &op);
 rust::String lo_create_option_key(const LogicalOperator &op, size_t index);
 rust::String lo_create_option_value(const LogicalOperator &op, size_t index);
+size_t lo_create_partition_key_count(const LogicalOperator &op);
+rust::String lo_create_partition_key(const LogicalOperator &op, size_t index);
+size_t lo_create_sort_key_count(const LogicalOperator &op);
+rust::String lo_create_sort_key(const LogicalOperator &op, size_t index);
 bool lo_create_if_not_exists(const LogicalOperator &op);
 bool lo_create_or_replace(const LogicalOperator &op);
 bool lo_create_temporary(const LogicalOperator &op);

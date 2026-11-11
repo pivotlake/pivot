@@ -1,9 +1,41 @@
 //! A [`catalog::datastore::Datastore`] over the tables of an Iceberg REST
-//! catalog: it reads them, and appends to them with `INSERT`.
+//! catalog: every table the catalog lists is read, and written to by INSERT,
+//! COPY, CREATE TABLE and DROP TABLE. The Iceberg tables Pivot keeps in its
+//! own directories live in the `pivotlake` datastore; both are built on the
+//! `iceberg-tables` crate.
 //!
 //! The catalog is the only source of table identity: namespaces are the
 //! datastore's schemas (single-level namespaces only, as a Pivot schema is one
 //! identifier), and a table is what the catalog last reported it to be.
+//!
+//! # Writing
+//!
+//! An INSERT writes its Parquet files under the table's data path through
+//! Pivot's own store, with the credentials the catalog vended for the table
+//! when the statement was bound, cut by the table's partition spec (a
+//! transform of a column, a day or a bucket, is computed per row and
+//! recorded as the file's partition value). The commit is the
+//! `iceberg-tables` crate's, the one the pivotlake datastore commits its own
+//! Iceberg tables with: the table is brought to the version the catalog has
+//! current, an append snapshot is built on it, its manifests written through
+//! Pivot's stores and small ones merged unless the table's
+//! `commit.manifest-merge.enabled` is `false`, and one `updateTable` adds
+//! the snapshot and moves `main` onto it, provided `main` still names that
+//! version's snapshot; a commit that loses that race is built again on the
+//! winner.
+//! The table's entry in the index is replaced with the table as committed,
+//! so the session reads its own writes before the next refresh. CREATE TABLE
+//! registers a format version 3 table through the catalog, which assigns its
+//! location; DROP TABLE unregisters it and leaves its files, as `DROP TABLE`
+//! without `PURGE` does in every engine.
+//!
+//! Nothing here maintains a catalog table: compaction, snapshot expiry and
+//! vacuum are the catalog's own, since other engines may share the table.
+//!
+//! A write is refused, naming the reason, where this writer cannot honour the
+//! table's shape: a partition field whose key cannot be computed (a source
+//! that is not a column, a transform the spec crate cannot evaluate for its
+//! type), a format version below 2, a column type Pivot cannot represent.
 //!
 //! # Freshness
 //!
@@ -13,26 +45,52 @@
 //! background, the way the pivotlake datastore refreshes its own tables, so a
 //! query never waits on the catalog and reads a snapshot at most one interval
 //! old. A table created or committed to between refreshes is seen at the next
-//! one. What is indexed is small (kilobytes per table). Binding reads the
-//! manifest list; preparing a scan lazily reads selected manifests and footers
-//! through the ring's caches. Those objects are not indexed.
+//! one. What a refresh indexes is small (kilobytes per table): no manifest
+//! list, manifest or footer is read for a table no query names.
+//!
+//! A query that names a table builds it from the table's entry: its
+//! manifest list is read over the ring and parsed, and no manifest. The
+//! table is the query's own and goes with it; what the query learns of the
+//! table stays in the process's file metadata cache, which a table
+//! addresses under a key computed from itself, so every table built for
+//! the same table, read the same way, finds it, whichever entry it was
+//! built from. A scan indexes the partitions its filters keep, one record
+//! per live file, from the data manifests that hold a file of them, and
+//! selects its files from those; the indexes are held in that cache, so
+//! the manifests one query decoded for a partition are decoded by none
+//! after it. A query's binding takes the row groups of the files it selects
+//! and keeps them for as long as its plan is kept. A file's footer is read
+//! and parsed for the first binding that selects the file, through the
+//! entry's store, and the row groups it produced are then held, with that
+//! open of the file, in the same cache, where the bindings after it and
+//! the table's later versions take them as they are. A refresh enters the
+//! table anew, and a query over the new entry finds what the queries
+//! before it cached, so a partition's index is brought to the new version
+//! by the manifests that joined the manifest list since, and by none when
+//! the snapshot is the same. A table created again under the name, or one
+//! whose schema, partition spec or sort order changed, finds nothing of
+//! what was cached before it. A commit enters the version it produced.
 //!
 //! Every bind of one query resolves against the same index, so a refresh landing
 //! mid-query does not move a table under it.
 //!
 //! # Reading through the ring
 //!
-//! Manifest lists and manifests are read as whole objects over the io_uring
-//! ring ([`object_storage::load_objects`]), and deletion vectors as their
-//! blob's range of its Puffin file, so they pass through the compressed cache
-//! and the disk cache exactly as data does: a restarted server finds them on
-//! local disk. A filtered query reads only the manifests whose
-//! partition summaries admit its predicates, and only the footers of the files
-//! whose partition values and column bounds do. Data files are Parquet, read
-//! by the same engine that reads every other datastore, with row-group
-//! pruning, late materialization and dynamic filters. Columns are matched to
-//! each file by Parquet field id, so renamed columns read correctly and a column added after
-//! a file was written reads as NULL for that file.
+//! A query reads a table through the `iceberg-tables` crate's
+//! [`Table`](iceberg_tables::Table), the same code the pivotlake datastore
+//! reads its own Iceberg tables with; this crate supplies the catalog it
+//! loads the table's metadata from. Manifest lists and manifests are read as
+//! whole objects over the io_uring ring ([`object_storage::load_objects`]),
+//! and deletion vectors as their blob's range of its Puffin file, so they
+//! pass through the compressed cache and the disk cache exactly as data
+//! does: a restarted server finds them on local disk. A filtered query reads
+//! only the footers of the files whose partition values and column bounds
+//! admit its predicates, and only the delete manifests whose partition
+//! summaries do. Data files are Parquet, read by the same engine that reads
+//! every other datastore, with row-group pruning, late materialization and
+//! dynamic filters. Columns are matched to each file by Parquet field id, so renamed
+//! columns read correctly and a column added after a file was written reads
+//! as NULL for that file.
 //!
 //! Bounds are taken as recorded: Iceberg and Parquet leave NaNs out of theirs,
 //! so a range filter on a floating-point column can skip a file or row group
@@ -54,22 +112,6 @@
 //! is in. The managed catalogs keep a table in one bucket; a table split
 //! across buckets is refused rather than read through the wrong store.
 //!
-//! # Writing
-//!
-//! An `INSERT` writes Parquet files under the table's data path through the
-//! store the catalog vended credentials for, partitioned the way the table's
-//! partition spec says (a transform of a column, a day or a bucket, is
-//! computed per row and recorded as the file's partition value), with each
-//! column under its Iceberg field id. The transaction's commit records the
-//! files in a manifest of their own, writes a manifest list naming it ahead
-//! of the current snapshot's manifests, and asks the catalog to add the
-//! snapshot and move `main` onto it, on the condition that `main` has not
-//! moved since the commit was built; when it has, the commit is built again
-//! on the winner. The table at the landed version replaces the index's entry
-//! at once, so the next query sees the rows before the background refresh
-//! does. Tables are created and dropped through the catalog itself, and
-//! maintained by it: nothing here compacts, expires or vacuums.
-//!
 //! # What is refused
 //!
 //! A table is refused, with an error naming the reason, rather than served
@@ -77,23 +119,19 @@
 //! other than deletion vectors (position-delete and equality-delete files are
 //! not applied), data files that are not Parquet, and a column whose Iceberg
 //! type has no Pivot type or whose initial default would require synthesizing
-//! values for older files. An `INSERT` is refused into a format version 1
-//! table (its manifests carry no sequence numbers), and into a table whose
-//! partition spec names a field after a column or a transform its source
-//! column's type does not take.
+//! values for older files.
 
 mod binding;
-mod columns;
-mod datum;
-mod deletes;
-mod describe;
+mod commit;
 pub mod env;
-mod manifests;
-mod pruning;
 mod rest_catalog;
 mod storage;
-mod store;
-mod table;
+mod table_store;
+/// The object-store test harness, re-exported for this crate's integration
+/// tests. Gated behind the `test-support` feature so it never enters a
+/// normal build.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod write;
 
 pub use crate::rest_catalog::{IcebergCatalogAuth, IcebergCatalogConfig};
@@ -104,136 +142,93 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use catalog::StagedCommit;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
-use dispatch::DataFlowDispatcher;
+use catalog::{CommitAction, CommitQueue, StagedCommit};
+use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use iceberg::table::Table;
 use iceberg::{Catalog, ErrorKind};
 use iceberg_catalog_rest::RestCatalog;
-use object_storage::ExternalStoreFactory;
+use object_storage::{ExternalStoreFactory, ObjectStore};
+use parquet_engine::ParquetTableBinding;
 use planner::catalog::{
-    BoundTable, Error as CatalogError, Result as CatalogResult, SchemaQualifiedTableName,
-    TableReference, TableRevision,
+    BoundTable, CreateTableRequest, DropTableRequest, Error as CatalogError,
+    Result as CatalogResult, SchemaQualifiedTableName, TableCreation, TableDrop, TableReference,
+    TableRevision,
 };
 
-use crate::binding::IcebergTableBinding;
-use crate::rest_catalog::block_on;
+use crate::binding::BoundIcebergTable;
+use crate::commit::RestMetadataStore;
 use crate::storage::PivotStorageFactory;
-use crate::store::TableStore;
-use crate::table::{LoadedTable, fetch_manifest_list_size, open_table_store};
+
+use iceberg_tables::block_on;
+use iceberg_tables::{
+    IndexedFile, MetadataFile, MetadataStore, Table as LoadedTable, TableLocation,
+    check_partition_terms,
+};
+
+use crate::table_store::{fetch_manifest_list_size, open_table_store};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Iceberg REST catalog: {0}")]
     Catalog(#[from] Box<iceberg::Error>),
-    #[error("table `{table}` is staged in the catalog and has no metadata location yet")]
-    StagedTable { table: String },
     #[error("table `{table}` could not be indexed at the last refresh: {message}")]
     TableUnavailable { table: String, message: String },
-    #[error("table `{table}` is encrypted; encrypted tables are not read")]
-    EncryptedTable { table: String },
-    #[error(
-        "table `{table}` column `{column}` has Iceberg type `{iceberg_type}`, which Pivot cannot represent"
-    )]
-    UnsupportedColumnType {
-        table: String,
-        column: String,
-        iceberg_type: String,
-    },
-    #[error(
-        "table `{table}` column `{column}` has initial default {default}; a column absent from a file is only read as NULL, so the table is not served"
-    )]
-    UnsupportedColumnDefault {
-        table: String,
-        column: String,
-        default: String,
-    },
-    #[error(
-        "delete file `{file}` is not a deletion vector; only deletion vectors are applied, so the table is not served"
-    )]
-    DeleteFile { file: String },
-    #[error("the deletion vector for `{file}` is invalid: {message}")]
-    DeletionVector { file: String, message: String },
-    #[error("table `{table}` data file `{file}` is {format}; only Parquet data files are read")]
-    NonParquetFile {
-        table: String,
-        file: String,
-        format: String,
-    },
-    #[error("table `{table}` metadata object `{path}` is not in the store")]
-    MissingMetadataObject { table: String, path: String },
-    #[error("table `{table}` partition metadata is invalid: {source}")]
-    InvalidPartitionMetadata {
-        table: String,
-        #[source]
-        source: Box<iceberg::Error>,
-    },
-    #[error("metadata object `{path}` does not parse: {source}")]
-    MalformedMetadataObject {
-        path: String,
-        #[source]
-        source: Box<iceberg::Error>,
-    },
-    #[error("file location `{path}` names no supported store: {message}")]
-    UnsupportedLocation { path: String, message: String },
+    #[error("table `{0}` already exists")]
+    TableExists(String),
+    #[error("table `{0}` does not exist")]
+    TableNotFound(String),
+    #[error("schema `{0}` does not exist")]
+    SchemaNotFound(String),
+    #[error("`{option}` is not a table option; a catalog table takes no options")]
+    UnknownOption { option: String },
+    #[error("SORTED BY column `{column}` is not a declared column of the table")]
+    UnknownSortColumn { column: String },
     #[error(
         "`{location}` is outside `{root}`, the root the table's file IO was opened on; a table's files must all live in one bucket"
     )]
     LocationOutsideRoot { location: String, root: String },
-    #[error(
-        "table `{table}` file `{file}` is outside `{root}`, where the table's metadata lives; a table's files must all live in one bucket"
-    )]
-    FileOutsideTableStore {
-        table: String,
-        file: String,
-        root: String,
-    },
+    /// An error from the shared table crate: mapping a schema's field ids
+    /// onto the declared columns, locating a file under the table's store.
+    #[error(transparent)]
+    Tables(#[from] iceberg_tables::Error),
+    #[error("table `{table}` metadata object `{path}` is not in the store")]
+    MissingMetadataObject { table: String, path: String },
     #[error("table `{table}` was vended an S3 access key without its secret key, or the reverse")]
     IncompleteVendedCredentials { table: String },
-    #[error(transparent)]
-    Store(#[from] object_storage::StoreError),
-    #[error("reading table metadata over the pool: {0}")]
-    Load(#[from] dispatch::DataFlowError),
-    #[error("Iceberg metadata: {0}")]
-    Metadata(Box<iceberg::Error>),
-    #[error(
-        "table `{table}` is Iceberg format version {version}; only format versions 2 and 3 are written"
-    )]
-    UnsupportedFormatVersion { table: String, version: u8 },
-    #[error(
-        "table `{table}` partition field `{field}` has no source among the table's columns, so its files cannot be partitioned"
-    )]
-    UnsupportedPartitionSource { table: String, field: String },
-    #[error(
-        "table `{table}` partition field `{field}` is named like a column, so its key could not be told from the column's values"
-    )]
-    PartitionFieldNamedLikeColumn { table: String, field: String },
-    #[error(
-        "table `{table}` partition field `{field}` applies `{transform}`, which cannot be computed for its source column: {message}"
-    )]
-    UnsupportedPartitionTransform {
-        table: String,
-        field: String,
-        transform: String,
-        message: String,
-    },
     #[error(
         "table `{table}` was dropped and created again while the insert ran; its files were written for the previous table"
     )]
     TableRecreated { table: String },
-    #[error("data file `{file}` has no statistics to record")]
-    MissingFileStats { file: String },
-    #[error("data file `{file}` cannot be recorded: {message}")]
-    InvalidDataFile { file: String, message: String },
-}
-
-impl Error {
-    fn metadata(error: iceberg::Error) -> Self {
-        Error::Metadata(Box::new(error))
-    }
+    #[error(
+        "table `{table}` partition spec id changed from {bound} to {current} while the insert ran; its files were cut by the previous spec"
+    )]
+    PartitionSpecChanged {
+        table: String,
+        bound: i32,
+        current: i32,
+    },
+    #[error(transparent)]
+    Store(#[from] object_storage::StoreError),
+    #[error("reading table metadata over the pool: {0}")]
+    Load(#[from] dispatch::DataFlowError),
+    #[error("metadata json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    ParquetTable(#[from] parquet_engine::ParquetTableError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether the commit this error ended may have succeeded. The table may
+    /// then reference the files the commit wrote, so none may be deleted.
+    pub fn may_have_committed(&self) -> bool {
+        matches!(self, Self::Tables(error) if error.may_have_committed())
+    }
+}
 
 impl From<Error> for CatalogError {
     fn from(error: Error) -> Self {
@@ -250,6 +245,10 @@ pub struct IcebergDatastore {
     /// expires. The file IO of every table it loads goes over the stores
     /// `store_factory` opens or the credentials the catalog vended.
     catalog: Arc<RestCatalog>,
+    /// The catalog as the keeper of its tables' metadata versions: the one
+    /// store every table this datastore loads refreshes from and commits
+    /// through.
+    metadata_store: Arc<dyn MetadataStore>,
     /// The catalog's URI, which stands in for a data path: every file location
     /// a table reports is absolute.
     catalog_uri: String,
@@ -270,9 +269,9 @@ pub struct IcebergDatastore {
     index: RwLock<Arc<DatastoreIndex>>,
     /// How often the background refresh asks the catalog again.
     refresh_interval: Duration,
-    /// The refresh task [`start`](Datastore::start) spawned, so
-    /// [`abort`](Datastore::abort) can stop it on shutdown.
-    refresh_task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// The tasks [`start`](Datastore::start) spawned, so
+    /// [`abort`](Datastore::abort) can stop them on shutdown.
+    maintenance_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 /// The datastore's index, built from one answer of the catalog and shaped as
@@ -289,6 +288,11 @@ impl DatastoreIndex {
     fn table_entry(&self, name: &SchemaQualifiedTableName) -> Option<&Result<TableEntry, String>> {
         self.schemas.get(&name.schema)?.tables.get(&name.table)
     }
+
+    /// Whether the catalog lists the table `name`, loadable or not.
+    fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
+        self.table_entry(name).is_some()
+    }
 }
 
 /// One schema's tables. A table the catalog listed but that could not be
@@ -300,14 +304,17 @@ struct SchemaEntry {
     tables: HashMap<String, Result<TableEntry, String>>,
 }
 
-/// One table's entry in the index: the table as the catalog returned it, with
-/// what a load needs that the response does not say: the store its files are
-/// read through, opened with the credentials the catalog vended, and the size
-/// of the current snapshot's manifest list.
+/// One table's entry in the index: the table's metadata and where it is, as
+/// the catalog last answered or as a commit of this process left it, with
+/// what building the table needs that the answer does not say: the store
+/// its files are read through, opened with the credentials the catalog
+/// vended, and the size of the current snapshot's manifest list.
 #[derive(Clone)]
 struct TableEntry {
-    table: Table,
-    store: TableStore,
+    metadata_file: MetadataFile,
+    /// Opened on the root of the metadata location the table was at when
+    /// it was entered.
+    store: Arc<dyn ObjectStore>,
     /// Iceberg names the manifest list without a length, and a ring read needs
     /// one, so the store is asked once, at refresh, and the answer kept here
     /// rather than asked again by every query. Ugly, but off the query path.
@@ -321,25 +328,42 @@ struct TableEntry {
 struct DifferentTable;
 
 impl TableEntry {
-    /// Where this entry's version stands against `other`'s. The catalog
-    /// numbers a table's snapshots in commit order and the number never
-    /// decreases, so a higher last sequence number is later, and an equal
-    /// one is the same commit or a metadata change on top of it.
+    /// The entry of `table`, the version a commit of this process just
+    /// produced: read through its store, with the size of its manifest
+    /// list as the load of that version read it.
+    fn of_version(table: &LoadedTable) -> Self {
+        Self {
+            metadata_file: table.metadata_file().as_ref().clone(),
+            store: Arc::clone(table.location().store()),
+            manifest_list_size: table.manifest_list_size(),
+        }
+    }
+
+    /// Where this entry's version stands against `other`'s, by
+    /// [`version`](Self::version): a later commit is greater, as is a
+    /// metadata change on top of the same commit.
     fn compare_version(&self, other: &TableEntry) -> Result<Ordering, DifferentTable> {
-        let (mine, theirs) = (self.table.metadata(), other.table.metadata());
-        if mine.uuid() != theirs.uuid() {
+        if self.metadata_file.metadata.uuid() != other.metadata_file.metadata.uuid() {
             return Err(DifferentTable);
         }
-        Ok(mine
-            .last_sequence_number()
-            .cmp(&theirs.last_sequence_number()))
+        Ok(self.version().cmp(&other.version()))
     }
 
     fn manifest_list_path(&self) -> Option<&str> {
-        self.table
-            .metadata()
+        self.metadata_file
+            .metadata
             .current_snapshot()
             .map(|snapshot| snapshot.manifest_list())
+    }
+
+    /// Where this entry's version stands among the table's, which orders two
+    /// answers of the catalog about it: a later commit has a higher sequence
+    /// number, and a metadata change without a commit a later update time.
+    fn version(&self) -> (i64, i64) {
+        (
+            self.metadata_file.metadata.last_sequence_number(),
+            self.metadata_file.metadata.last_updated_ms(),
+        )
     }
 }
 
@@ -368,13 +392,14 @@ impl IcebergDatastore {
         let file_io_factory = Arc::new(PivotStorageFactory::new(store_factory.clone()));
         let catalog = Arc::new(config.build_client(file_io_factory)?);
         let datastore = Self {
+            metadata_store: Arc::new(RestMetadataStore::new(catalog.clone())),
             catalog,
             catalog_uri: config.uri.clone(),
             store_factory,
             dispatcher: dispatcher.clone(),
             index: RwLock::new(Arc::new(DatastoreIndex::default())),
             refresh_interval,
-            refresh_task: Mutex::new(None),
+            maintenance_tasks: Mutex::new(Vec::new()),
         };
         datastore.refresh()?;
         Ok(Arc::new(datastore))
@@ -385,7 +410,7 @@ impl IcebergDatastore {
     /// committed to while the answer was in flight keeps the committed
     /// version, which is later than the answer's.
     pub fn refresh(&self) -> Result<()> {
-        let mut fetched = self.fetch_index(&self.catalog)?;
+        let mut fetched = self.fetch_index()?;
         let mut index = self.index.write().unwrap();
         for (schema, held_schema) in &index.schemas {
             let Some(fetched_schema) = fetched.schemas.get_mut(schema) else {
@@ -410,37 +435,9 @@ impl IcebergDatastore {
         Ok(())
     }
 
-    /// The client the catalog is asked through.
-    pub(crate) fn catalog(&self) -> Arc<RestCatalog> {
-        self.catalog.clone()
-    }
-
-    /// The table `name` as the index holds it now, or `None` when the catalog
-    /// no longer lists it or would not hand it over.
-    pub(crate) fn current_table(&self, name: &SchemaQualifiedTableName) -> Option<Table> {
-        let index = self.index();
-        let entry = index.table_entry(name)?.as_ref().ok()?;
-        Some(entry.table.clone())
-    }
-
-    /// Publish `table`, at the version a commit of this process just landed,
-    /// into the index with the store the commit wrote through, so the next
-    /// query sees the version before the background refresh does. An entry
-    /// already at that version or later (a refresh got there first, perhaps
-    /// with a metadata change on top of the commit) stands, as does one of a
-    /// table created again under the name since the commit was built.
-    pub(crate) fn publish_table(
-        &self,
-        name: &SchemaQualifiedTableName,
-        table: Table,
-        store: TableStore,
-        manifest_list_size: u64,
-    ) {
-        let entry = TableEntry {
-            table,
-            store,
-            manifest_list_size: Some(manifest_list_size),
-        };
+    /// Replace the table `name`'s entry with `entry`, the version a commit
+    /// just produced, so the next query sees it before the next refresh.
+    pub(crate) fn publish_entry(&self, name: &SchemaQualifiedTableName, entry: TableEntry) {
         let mut index = self.index.write().unwrap();
         let held = index.table_entry(name).and_then(|held| held.as_ref().ok());
         if held.is_some_and(|held| held.compare_version(&entry) != Ok(Ordering::Less)) {
@@ -456,15 +453,15 @@ impl IcebergDatastore {
         *index = Arc::new(updated);
     }
 
-    /// The index as `catalog` would have it now: a schema per top-level
+    /// The index as the catalog would have it now: a schema per top-level
     /// namespace, and every table of theirs. Namespaces nested below the top
     /// level are not schemas of this datastore and are not listed.
-    fn fetch_index(&self, catalog: &RestCatalog) -> Result<DatastoreIndex> {
+    fn fetch_index(&self) -> Result<DatastoreIndex> {
         let previous = self.index();
         let mut index = DatastoreIndex::default();
-        let namespaces = block_on(catalog.list_namespaces(None)).map_err(Box::new)?;
+        let namespaces = block_on(self.catalog.list_namespaces(None)).map_err(Box::new)?;
         for namespace in namespaces {
-            let listed = block_on(catalog.list_tables(&namespace)).map_err(Box::new)?;
+            let listed = block_on(self.catalog.list_tables(&namespace)).map_err(Box::new)?;
             // Listed under no parent, the namespace is a top-level one: a
             // single identifier, which is its schema name.
             let schema = namespace
@@ -474,7 +471,7 @@ impl IcebergDatastore {
             let mut tables = HashMap::new();
             for ident in listed {
                 let name = SchemaQualifiedTableName::new(schema.clone(), ident.name.clone());
-                let entry = match block_on(catalog.load_table(&ident)) {
+                let entry = match block_on(self.catalog.load_table(&ident)) {
                     Ok(table) => self
                         .build_table_entry(&name, table, previous.table_entry(&name))
                         .map_err(|error| error.to_string()),
@@ -510,16 +507,22 @@ impl IcebergDatastore {
     }
 
     /// `table`'s entry: with its store, opened now from the credentials the
-    /// catalog just vended, and its manifest list's size, the one `previous`
+    /// catalog just vended, its manifest list's size, the one `previous`
     /// learned when the snapshot is the one it entered, else asked of the
-    /// store now.
+    /// store now. Nothing of the table is read.
     fn build_table_entry(
         &self,
         name: &SchemaQualifiedTableName,
         table: Table,
         previous: Option<&Result<TableEntry, String>>,
     ) -> Result<TableEntry> {
-        let store = open_table_store(name, &table, &*self.store_factory)?;
+        let metadata_file = MetadataFile::try_from(&table)?;
+        let store = open_table_store(
+            name,
+            table.file_io().config().props(),
+            &metadata_file.location,
+            &*self.store_factory,
+        )?;
         let path = table
             .metadata()
             .current_snapshot()
@@ -527,12 +530,12 @@ impl IcebergDatastore {
         let unchanged = previous
             .and_then(|previous| previous.as_ref().ok())
             .filter(|previous| path.is_some() && previous.manifest_list_path() == path);
-        let manifest_list_size = match unchanged {
-            Some(previous) => previous.manifest_list_size,
-            None => fetch_manifest_list_size(name, &table, &store)?,
+        let manifest_list_size = match unchanged.and_then(|previous| previous.manifest_list_size) {
+            Some(size) => Some(size),
+            None => fetch_manifest_list_size(name, &metadata_file, &*store)?,
         };
         Ok(TableEntry {
-            table,
+            metadata_file,
             store,
             manifest_list_size,
         })
@@ -545,7 +548,12 @@ impl IcebergDatastore {
     }
 
     /// The table `name` as `index` has it, its schema being the namespace,
-    /// loaded; or `None` when the catalog listed no such table.
+    /// built for the caller; or `None` when the catalog listed no such
+    /// table. Every table built for it, from this entry or from another of
+    /// the table read the same way, finds in the process's cache the
+    /// partitions the others indexed: an index is brought to this version
+    /// by the manifests that joined and left the manifest list, and only
+    /// those are read.
     fn load_table(
         &self,
         index: &DatastoreIndex,
@@ -558,31 +566,47 @@ impl IcebergDatastore {
             table: name.to_string(),
             message: message.clone(),
         })?;
-        let loaded = LoadedTable::load(
-            name,
-            &entry.table,
-            entry.store.clone(),
-            entry.manifest_list_size,
-            &self.dispatcher,
-        )?;
-        Ok(Some(Arc::new(loaded)))
+        let table = self.load_entry(name, entry)?;
+        Ok(Some(Arc::new(table)))
     }
 
-    /// Every table `index` has that the catalog handed over, loaded. A table
-    /// the catalog lists but would not hand over (Unity Catalog lists its
+    /// The table `name` at the version `entry` holds: its manifest list is
+    /// read, over the ring when its size is known, and parsed under the
+    /// entry's metadata.
+    fn load_entry(
+        &self,
+        name: &SchemaQualifiedTableName,
+        entry: &TableEntry,
+    ) -> Result<LoadedTable> {
+        let location = TableLocation::of_catalog_table(
+            &name.to_string(),
+            Arc::clone(&entry.store),
+            &entry.metadata_file,
+        )?;
+        let loaded = LoadedTable::at(
+            &self.dispatcher,
+            Arc::clone(&self.metadata_store),
+            location,
+            name,
+            entry.metadata_file.clone(),
+            entry.manifest_list_size,
+        )?;
+        Ok(loaded)
+    }
+
+    /// Every table `index` has that the catalog handed over. A table the
+    /// catalog lists but would not hand over (Unity Catalog lists its
     /// `information_schema` views, which are not Iceberg tables) is not
     /// served, so it is not listed; a query naming it reports why.
-    fn load_all_tables(&self, index: &DatastoreIndex) -> Result<Vec<Arc<LoadedTable>>> {
+    fn load_all_tables(&self, index: &DatastoreIndex) -> Result<Vec<LoadedTable>> {
         let mut tables = Vec::new();
         for (schema, schema_entry) in &index.schemas {
             for (table, entry) in &schema_entry.tables {
-                if entry.is_err() {
+                let Ok(entry) = entry else {
                     continue;
-                }
+                };
                 let name = SchemaQualifiedTableName::new(schema.clone(), table.clone());
-                if let Some(loaded) = self.load_table(index, &name)? {
-                    tables.push(loaded);
-                }
+                tables.push(self.load_entry(&name, entry)?);
             }
         }
         Ok(tables)
@@ -611,10 +635,15 @@ impl Datastore for IcebergDatastore {
     }
 
     /// Refresh the index every `refresh_interval`, on the ambient runtime. A
-    /// refresh that fails is logged and the index kept, so an
-    /// unreachable catalog degrades to stale tables rather than none.
+    /// refresh that fails is logged and the index kept, so an unreachable
+    /// catalog degrades to stale tables rather than none.
+    ///
+    /// The task holds the datastore weakly: the index keeps the statistics
+    /// of the files this process committed, which live in the workers' ring
+    /// and must be released by their owner's thread, never by an aborted
+    /// task's drop on a runtime thread.
     fn start(self: Arc<Self>) {
-        let datastore = Arc::clone(&self);
+        let datastore = Arc::downgrade(&self);
         let interval = self.refresh_interval;
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
@@ -624,9 +653,13 @@ impl Datastore for IcebergDatastore {
             tick.tick().await;
             loop {
                 tick.tick().await;
+                // The datastore is let go of across the wait, so the task
+                // never keeps it alive.
+                let Some(datastore) = datastore.upgrade() else {
+                    return;
+                };
                 // The refresh blocks on catalog calls, so it runs off the
                 // reactor.
-                let datastore = Arc::clone(&datastore);
                 match tokio::task::spawn_blocking(move || datastore.refresh()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
@@ -638,11 +671,14 @@ impl Datastore for IcebergDatastore {
                 }
             }
         });
-        *self.refresh_task.lock().unwrap() = Some(task.abort_handle());
+        self.maintenance_tasks
+            .lock()
+            .unwrap()
+            .push(task.abort_handle());
     }
 
     fn abort(&self) {
-        if let Some(task) = self.refresh_task.lock().unwrap().take() {
+        for task in self.maintenance_tasks.lock().unwrap().drain(..) {
             task.abort();
         }
     }
@@ -650,11 +686,15 @@ impl Datastore for IcebergDatastore {
 
 /// One query's view of the catalog: the index as it was when the query began,
 /// which every schema check and bind of the query resolves against, so a
-/// refresh landing mid-query moves nothing under it. A table is loaded the
-/// first time the query touches it and kept for the query's lifetime, so a
-/// plan's scan and its late materialize see the same load, and a table the
-/// query names twice is loaded once. The writes its statements stage wait
-/// on `staged` for its commit.
+/// refresh landing mid-query moves nothing under it. A table is built the
+/// first time the query touches it, from its entry in that index, and held
+/// for the query's lifetime, so its manifest list is read once however many
+/// times the query binds it, and a plan's scan and its late materialize see
+/// the same table.
+///
+/// What the query writes is staged on the transaction as commit actions
+/// (the files an INSERT uploaded, the tables it created or dropped) and
+/// is applied at commit, in the order it was staged.
 pub struct IcebergTransaction {
     datastore: Arc<IcebergDatastore>,
     index: Arc<DatastoreIndex>,
@@ -667,6 +707,123 @@ impl std::fmt::Debug for IcebergTransaction {
         f.debug_struct("IcebergTransaction")
             .field("datastore", &self.datastore)
             .finish_non_exhaustive()
+    }
+}
+
+/// One table creation resolved by a transaction and waiting for it to commit.
+#[derive(Clone)]
+struct PendingTableCreation {
+    name: SchemaQualifiedTableName,
+    columns: Vec<planner::catalog::Column>,
+    /// The terms the table is partitioned by, in order, each a column or a
+    /// transform of one.
+    partition_by: Vec<String>,
+    sort_by: Vec<String>,
+    /// Whether the statement used `IF NOT EXISTS`, so the commit treats a
+    /// table that appeared since resolution as a success rather than an error.
+    if_not_exists: bool,
+}
+
+impl CommitAction<IcebergDatastore> for PendingTableCreation {
+    /// Register the table through the catalog, then refresh the index, which
+    /// is shaped by what the catalog lists.
+    fn apply(self: Box<Self>, datastore: &IcebergDatastore) -> CatalogResult<()> {
+        match write::create_table(
+            &datastore.catalog,
+            &self.name,
+            &self.columns,
+            &self.partition_by,
+            &self.sort_by,
+        ) {
+            Ok(()) => {}
+            Err(Error::Catalog(error))
+                if self.if_not_exists && error.kind() == ErrorKind::TableAlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(datastore.refresh()?)
+    }
+
+    /// A table creation writes nothing before its commit.
+    fn discard(self: Box<Self>) {}
+}
+
+/// One table drop resolved by a transaction and waiting for it to commit.
+#[derive(Clone)]
+struct PendingTableDrop {
+    name: SchemaQualifiedTableName,
+    /// Whether the statement used `IF EXISTS`, so the commit treats a table
+    /// that vanished since resolution as a success rather than an error.
+    if_exists: bool,
+}
+
+impl CommitAction<IcebergDatastore> for PendingTableDrop {
+    /// Unregister the table through the catalog, leaving its files, then
+    /// refresh the index, which is shaped by what the catalog lists.
+    fn apply(self: Box<Self>, datastore: &IcebergDatastore) -> CatalogResult<()> {
+        write::drop_table(&datastore.catalog, &self.name, self.if_exists)?;
+        Ok(datastore.refresh()?)
+    }
+
+    /// A table drop writes nothing before its commit.
+    fn discard(self: Box<Self>) {}
+}
+
+/// A dataflow that stages `action` on the transaction's queue when it runs
+/// and emits no rows: one nullary per worker, of which only the first
+/// carries the action, so the catalog changes when the statement runs rather
+/// than when it is planned.
+fn staging_spec<T: CommitAction<IcebergDatastore> + Clone + 'static>(
+    dispatcher: &DataFlowDispatcher,
+    commit_actions: &CommitQueue<IcebergDatastore>,
+    action: T,
+) -> RecordBatchOperatorSpec {
+    let mut carried = Some(action);
+    let factories: Vec<_> = (0..dispatcher.worker_count())
+        .map(|_| {
+            let carried = carried.take();
+            let commit_actions = commit_actions.clone();
+            OneShotNullaryFactory::new(move || {
+                if let Some(action) = carried {
+                    commit_actions.push(Box::new(action));
+                }
+                None
+            })
+        })
+        .collect();
+    RecordBatchOperatorSpec::from_nullary(dispatcher, factories)
+}
+
+/// A resolved `CREATE TABLE` for a catalog table, staged when its dataflow
+/// runs.
+struct IcebergTableCreation {
+    commit_actions: CommitQueue<IcebergDatastore>,
+    creation: PendingTableCreation,
+}
+
+impl TableCreation for IcebergTableCreation {
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
+        Ok(staging_spec(
+            dispatcher,
+            &self.commit_actions,
+            self.creation.clone(),
+        ))
+    }
+}
+
+/// A resolved `DROP TABLE` for a catalog table, staged when its dataflow
+/// runs.
+struct IcebergTableDrop {
+    commit_actions: CommitQueue<IcebergDatastore>,
+    drop: PendingTableDrop,
+}
+
+impl TableDrop for IcebergTableDrop {
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
+        Ok(staging_spec(
+            dispatcher,
+            &self.commit_actions,
+            self.drop.clone(),
+        ))
     }
 }
 
@@ -705,11 +862,85 @@ impl DatastoreTransaction for IcebergTransaction {
             schema: name.schema.clone(),
             table: name.table.clone(),
         };
-        Ok(Some(Box::new(IcebergTableBinding::new(
+        Ok(Some(Box::new(ParquetTableBinding::new(
             reference,
-            table,
-            self.staged.queue(),
+            BoundIcebergTable::new(table, self.staged.queue()),
         ))))
+    }
+
+    /// Resolve a `CREATE TABLE` against the catalog as the query sees it: the
+    /// statement must give no option, the namespace must exist, the name
+    /// must be free unless `IF NOT EXISTS`, each `PARTITIONED BY` term must
+    /// be a column or a transform of one that an INSERT can compute, and
+    /// each `SORTED BY` column must be a declared column.
+    fn bind_create_table(
+        &self,
+        request: CreateTableRequest,
+    ) -> CatalogResult<Box<dyn TableCreation>> {
+        let name = request.schema_qualified_name();
+        // A catalog assigns the table's location, and adopting files is not
+        // offered, so a catalog table takes no option.
+        if let Some(option) = request.options.keys().min() {
+            return Err(Error::UnknownOption {
+                option: option.clone(),
+            }
+            .into());
+        }
+        if !self.index.schemas.contains_key(&name.schema) {
+            return Err(Error::SchemaNotFound(name.schema).into());
+        }
+        if !request.if_not_exists && self.index.contains_table(&name) {
+            return Err(Error::TableExists(name.to_string()).into());
+        }
+        check_partition_terms(&name.to_string(), &request.columns, &request.partitioned_by)
+            .map_err(Error::from)?;
+        if let Some(column) = request.find_undeclared_sort_column() {
+            return Err(Error::UnknownSortColumn {
+                column: column.to_string(),
+            }
+            .into());
+        }
+        Ok(Box::new(IcebergTableCreation {
+            commit_actions: self.staged.queue(),
+            creation: PendingTableCreation {
+                name,
+                columns: request.columns,
+                partition_by: request.partitioned_by,
+                sort_by: request.sorted_by,
+                if_not_exists: request.if_not_exists,
+            },
+        }))
+    }
+
+    fn bind_drop_table(&self, request: DropTableRequest) -> CatalogResult<Box<dyn TableDrop>> {
+        let name = request.schema_qualified_name();
+        if !request.if_exists {
+            if !self.index.schemas.contains_key(&name.schema) {
+                return Err(Error::SchemaNotFound(name.schema).into());
+            }
+            if !self.index.contains_table(&name) {
+                return Err(Error::TableNotFound(name.to_string()).into());
+            }
+        }
+        Ok(Box::new(IcebergTableDrop {
+            commit_actions: self.staged.queue(),
+            drop: PendingTableDrop {
+                name,
+                if_exists: request.if_exists,
+            },
+        }))
+    }
+
+    /// Commit what the query staged, in the order it was staged. A read-only
+    /// transaction staged nothing and returns inline; a writing one commits its
+    /// changes on the blocking pool, since every step blocks on the catalog
+    /// or the store.
+    async fn commit(&self) -> CatalogResult<()> {
+        self.staged.commit().await
+    }
+
+    fn rollback(&self) {
+        self.staged.rollback();
     }
 
     fn table_revision(
@@ -720,23 +951,15 @@ impl DatastoreTransaction for IcebergTransaction {
     }
 
     fn tables(&self) -> CatalogResult<Vec<DatastoreTableMetadata>> {
-        let tables = self.datastore.load_all_tables(&self.index)?;
-        let mut memo = self.loaded_tables.lock().unwrap();
-        let described = tables
-            .into_iter()
+        let described = self
+            .datastore
+            .load_all_tables(&self.index)?
+            .iter()
             .map(|table| {
-                memo.insert(table.name.clone(), Some(table.clone()));
-                crate::describe::describe_table(&table)
+                let name_file = |file: &IndexedFile| file.data.file_path().to_string();
+                Ok(table.describe(table.name().clone(), table.uuid().to_string(), &name_file)?)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(described)
-    }
-
-    async fn commit(&self) -> CatalogResult<()> {
-        self.staged.commit().await
-    }
-
-    fn rollback(&self) {
-        self.staged.rollback();
     }
 }

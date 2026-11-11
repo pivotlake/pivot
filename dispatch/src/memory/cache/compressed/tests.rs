@@ -20,7 +20,7 @@ fn shared_file() -> OpenFile {
 
 /// A fresh, independent local file (distinct bucket).
 fn new_file() -> OpenFile {
-    OpenFile::Local(LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap())
+    OpenFile::Local(LocalFile::new(tempfile::tempfile().unwrap()).unwrap())
 }
 
 fn cache() -> &'static CompressedCache {
@@ -118,7 +118,6 @@ fn a_committed_fill_survives_its_owner_being_dropped() {
 #[test]
 fn miss_then_fill_then_hit() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
 
     let miss = cache().get(&shared_file(), 0, 10);
     assert!(has_misses(&miss), "fresh range should miss");
@@ -136,7 +135,6 @@ fn an_unwinding_reclaim_leaves_the_slot_cached_and_out_of_the_pool() {
     // cache still references must not fall into the free pool. The pool's
     // only slot becomes the fill slot, so a leak into the pool is visible.
     init_test_free_pool(1);
-    cache().invalidate(&shared_file());
     let miss = cache().get(&shared_file(), 0, 10);
     fill_pattern(&miss);
     let slot = slot_of(miss[0].missing_extent().unwrap());
@@ -157,7 +155,6 @@ fn an_unwinding_reclaim_leaves_the_slot_cached_and_out_of_the_pool() {
 #[test]
 fn coalesces_contiguous_missing_blocks_into_one_extent() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
 
     let miss = cache().get(&shared_file(), 0, 2 * BLOCK_SIZE + 1);
 
@@ -170,7 +167,6 @@ fn coalesces_contiguous_missing_blocks_into_one_extent() {
 #[test]
 fn partial_validity_only_reports_the_holes() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     let first = cache().get(&shared_file(), 0, 10);
     fill_pattern(&first);
     drop(first);
@@ -186,7 +182,6 @@ fn partial_validity_only_reports_the_holes() {
 #[test]
 fn consecutive_misses_pack_into_one_slot() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
 
     let a = cache().get(&shared_file(), 0, 10);
     let b = cache().get(&shared_file(), 50 * BLOCK_SIZE, 50 * BLOCK_SIZE + 10);
@@ -216,7 +211,6 @@ fn unrelated_files_pack_into_one_slot() {
 #[test]
 fn a_read_past_the_fill_buffer_uses_a_new_slot() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
 
     let miss = cache().get(&shared_file(), 0, BLOCKS_PER_SLOT * BLOCK_SIZE + 1);
 
@@ -232,7 +226,6 @@ fn a_read_past_the_fill_buffer_uses_a_new_slot() {
 #[test]
 fn overlap_dedup_only_fetches_the_holes() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     let first = cache().get(&shared_file(), 0, 4 * BLOCK_SIZE);
     fill_pattern(&first);
     drop(first);
@@ -248,7 +241,6 @@ fn overlap_dedup_only_fetches_the_holes() {
 #[test]
 fn hit_reassembles_bytes_across_lookups() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     let miss = cache().get(&shared_file(), BLOCK_SIZE - 5, BLOCK_SIZE + 10);
     fill_pattern(&miss);
     drop(miss);
@@ -262,7 +254,6 @@ fn hit_reassembles_bytes_across_lookups() {
 #[test]
 fn hit_returns_the_exact_requested_byte_range() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     let miss = cache().get(&shared_file(), 0, BLOCK_SIZE);
     fill_pattern(&miss);
     drop(miss);
@@ -276,7 +267,6 @@ fn hit_returns_the_exact_requested_byte_range() {
 #[test]
 fn committed_bytes_serve_an_overlapping_later_lookup() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     let first = cache().get(&shared_file(), 0, 2 * BLOCK_SIZE);
     fill_pattern(&first);
     drop(first);
@@ -290,7 +280,6 @@ fn committed_bytes_serve_an_overlapping_later_lookup() {
 #[test]
 fn into_data_yields_the_freshly_filled_range() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
 
     let miss = cache().get(&shared_file(), 10, BLOCK_SIZE);
     fill_pattern(&miss);
@@ -303,7 +292,6 @@ fn into_data_yields_the_freshly_filled_range() {
 #[test]
 fn interleaved_gaps_split_then_fill_to_a_full_hit() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     fill_pattern(&cache().get(&shared_file(), 0, 1));
     fill_pattern(&cache().get(&shared_file(), 2 * BLOCK_SIZE, 2 * BLOCK_SIZE + 1));
 
@@ -318,7 +306,6 @@ fn interleaved_gaps_split_then_fill_to_a_full_hit() {
 #[test]
 fn a_partially_cached_range_keeps_the_cached_bytes() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     fill_pattern(&cache().get(&shared_file(), 0, 1));
 
     let m = cache().get(&shared_file(), 0, 2 * BLOCK_SIZE);
@@ -333,7 +320,6 @@ fn a_partially_cached_range_keeps_the_cached_bytes() {
 #[test]
 fn get_assembles_a_range_spanning_cached_and_uncached_lookups() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     fill_pattern(&cache().get(&shared_file(), 0, BLOCK_SIZE)); // [0, BLOCK_SIZE) cached, [BLOCK_SIZE, 2*BLOCK_SIZE) not
 
     let parts = cache().get(&shared_file(), 0, 2 * BLOCK_SIZE);
@@ -344,22 +330,8 @@ fn get_assembles_a_range_spanning_cached_and_uncached_lookups() {
 }
 
 #[test]
-fn reopening_a_file_forgets_its_cached_extents() {
-    init_test_free_pool(8);
-    cache().invalidate(&shared_file());
-    fill_pattern(&cache().get(&shared_file(), 0, BLOCK_SIZE));
-
-    memory_ctx()
-        .caches()
-        .invalidate_reopened_file(&shared_file());
-
-    assert!(has_misses(&cache().get(&shared_file(), 0, BLOCK_SIZE)));
-}
-
-#[test]
 fn get_write_buffer_evicts_compressed_data_when_the_pool_is_empty() {
     init_test_free_pool(1);
-    cache().invalidate(&shared_file());
     fill_pattern(&cache().get(&shared_file(), 0, BLOCK_SIZE));
     release_fill_cursor();
 
@@ -374,7 +346,6 @@ fn get_write_buffer_evicts_compressed_data_when_the_pool_is_empty() {
 #[test]
 fn evict_does_not_steal_a_slot_from_the_free_pool() {
     init_test_free_pool(2);
-    cache().invalidate(&shared_file());
     fill_pattern(&cache().get(&shared_file(), 0, BLOCK_SIZE));
     release_fill_cursor();
 
@@ -405,19 +376,8 @@ fn evicting_a_slot_drops_all_tenant_extents() {
 }
 
 #[test]
-fn reopening_a_file_nothing_is_cached_of_keeps_no_handle_to_it() {
-    init_test_free_pool(4);
-    let file = new_file();
-
-    cache().invalidate(&file);
-
-    assert!(!cache().holds_file(&file));
-}
-
-#[test]
 fn a_recycled_slot_makes_stale_placements_miss() {
     init_test_free_pool(4);
-    cache().invalidate(&shared_file());
     fill_pattern(&cache().get(&shared_file(), 0, BLOCK_SIZE));
     release_fill_cursor();
 
@@ -444,7 +404,6 @@ fn reading_a_file_after_its_entry_was_pruned_does_not_panic() {
 #[test]
 fn clear_forgets_everything_and_re_reads() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     fill_pattern(&cache().get(&shared_file(), 0, BLOCK_SIZE));
 
     let dropped = cache().clear();
@@ -456,7 +415,6 @@ fn clear_forgets_everything_and_re_reads() {
 #[test]
 fn a_hit_is_a_zero_copy_view_of_the_slot() {
     init_test_free_pool(8);
-    cache().invalidate(&shared_file());
     let miss = cache().get(&shared_file(), 0, BLOCK_SIZE);
     let dest = miss[0].missing_extent().unwrap().dest();
     fill_pattern(&miss);

@@ -376,6 +376,10 @@ pub mod ffi {
         fn lo_create_option_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_create_option_key(op: &LogicalOperator, index: usize) -> Result<String>;
         fn lo_create_option_value(op: &LogicalOperator, index: usize) -> Result<String>;
+        fn lo_create_partition_key_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_create_partition_key(op: &LogicalOperator, index: usize) -> Result<String>;
+        fn lo_create_sort_key_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_create_sort_key(op: &LogicalOperator, index: usize) -> Result<String>;
         fn lo_create_if_not_exists(op: &LogicalOperator) -> Result<bool>;
         fn lo_create_or_replace(op: &LogicalOperator) -> Result<bool>;
         fn lo_create_temporary(op: &LogicalOperator) -> Result<bool>;

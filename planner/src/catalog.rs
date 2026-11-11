@@ -127,6 +127,13 @@ pub struct TableRevision {
 /// ([`CatalogTransaction::bind_create_table`], which routes to the target
 /// datastore).
 ///
+/// `partitioned_by` is the terms of the statement's `PARTITIONED BY (...)`
+/// clause, in the order written, each a column or a transform of one
+/// (`day(ts)`, `bucket(16, id)`): what the new table's files are partitioned
+/// by. `sorted_by` is the columns of its `SORTED BY (...)` clause, in the
+/// order written: what the files are sorted by, each column ascending with
+/// NULLs first. Each is empty for a statement without its clause.
+///
 /// `options` carries the `WITH (...)` clause verbatim so the target datastore
 /// implementation can decide what to do with backend-specific keys.
 ///
@@ -142,6 +149,8 @@ pub struct CreateTableRequest {
     pub schema_name: Option<String>,
     pub name: String,
     pub columns: Vec<Column>,
+    pub partitioned_by: Vec<String>,
+    pub sorted_by: Vec<String>,
     pub options: HashMap<String, String>,
     pub if_not_exists: bool,
 }
@@ -156,6 +165,16 @@ impl CreateTableRequest {
                 .unwrap_or(crate::DEFAULT_SCHEMA_NAME),
             self.name.clone(),
         )
+    }
+
+    /// The first `sorted_by` column that is not among `columns`, if there is
+    /// one: a table's files are sorted by columns of the table, so a
+    /// datastore refuses a request that has one.
+    pub fn find_undeclared_sort_column(&self) -> Option<&str> {
+        self.sorted_by
+            .iter()
+            .find(|name| !self.columns.iter().any(|column| &column.name == *name))
+            .map(String::as_str)
     }
 }
 
@@ -278,8 +297,10 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
-    /// Run one vacuum sweep of the datastore's latest state, respecting retention.
-    /// This is independent of whether background vacuum is enabled.
+    /// Run the SQL `VACUUM` command on the datastore's latest state: its
+    /// routine cleanup, respecting retention, and a sweep of each table's
+    /// storage for objects the table does not use. Only this command sweeps;
+    /// it is independent of whether background vacuum is enabled.
     async fn vacuum(&self, _datastore: &str) -> Result<()> {
         Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "this catalog does not support VACUUM",

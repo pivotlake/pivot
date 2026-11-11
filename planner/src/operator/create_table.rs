@@ -34,11 +34,18 @@ impl fmt::Display for CreateTable {
             .map(|(k, v)| format!("{k:?}: {v:?}"))
             .collect::<Vec<_>>()
             .join(", ");
-        write!(
-            f,
-            "CreateTable({}, [{columns}], options: {{{options_str}}})",
-            self.request.name
-        )
+        write!(f, "CreateTable({}, [{columns}]", self.request.name)?;
+        // A clause the statement does not have is left out.
+        let clauses = [
+            ("partitioned_by", &self.request.partitioned_by),
+            ("sorted_by", &self.request.sorted_by),
+        ];
+        for (clause, keys) in clauses {
+            if !keys.is_empty() {
+                write!(f, ", {clause}: [{}]", keys.join(", "))?;
+            }
+        }
+        write!(f, ", options: {{{options_str}}})")
     }
 }
 

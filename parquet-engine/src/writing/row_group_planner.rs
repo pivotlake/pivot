@@ -87,6 +87,7 @@ fn emit_column_chunk_jobs(
         file_id: plan.file_id,
         row_group_count,
         partition: plan.partition.clone(),
+        sorted_by: plan.sorted_by.clone(),
         max_file_size: plan.max_file_size,
     });
 

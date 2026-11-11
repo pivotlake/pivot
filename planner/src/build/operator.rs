@@ -431,6 +431,8 @@ impl CreateTable {
                         })
                     })
                     .collect::<Result<Vec<_>, OperatorError>>()?,
+                partitioned_by: view.partitioned_by()?,
+                sorted_by: view.sorted_by()?,
                 options: view.options()?.into_iter().collect(),
                 if_not_exists: view.if_not_exists()?,
             },

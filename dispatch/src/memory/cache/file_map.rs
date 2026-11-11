@@ -92,17 +92,6 @@ impl<Table: Default> FileMap<Table> {
         write(table.get_mut().unwrap())
     }
 
-    /// Take `file`'s table out entirely, so later lookups miss until
-    /// something is cached again. Serializes with every concurrent writer, so
-    /// a racing insert either lands in a fresh table or is dropped here.
-    pub fn remove(&self, file: &OpenFile) -> Option<Table> {
-        self.files
-            .write()
-            .unwrap()
-            .remove(file)
-            .map(|table| table.into_inner().unwrap())
-    }
-
     /// Drop `file`'s entry if its table is empty, re-checking under the outer
     /// write lock so a concurrent insert that just refilled it is kept.
     pub fn prune_if_empty(&self, file: &OpenFile, is_empty: impl Fn(&Table) -> bool) {
