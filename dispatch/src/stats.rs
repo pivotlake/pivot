@@ -103,14 +103,16 @@ pub struct StatsCollector {
     /// `Some` only when stats are on.
     stats: Option<DataFlowStats>,
     /// Where [`report`](Self::report) ships the tally for the handle to fold.
-    tx: mpsc::Sender<DataFlowStats>,
+    /// `None` once reported: the handle waits for every worker's sender to
+    /// close, so the sender must not outlive the report.
+    tx: Option<mpsc::Sender<DataFlowStats>>,
 }
 
 impl StatsCollector {
     pub(crate) fn new(tx: mpsc::Sender<DataFlowStats>, enabled: bool) -> Self {
         Self {
             stats: enabled.then(DataFlowStats::default),
-            tx,
+            tx: Some(tx),
         }
     }
 
@@ -118,7 +120,10 @@ impl StatsCollector {
     #[cfg(any(test, feature = "test-util"))]
     pub fn disabled() -> Self {
         let (tx, _rx) = mpsc::channel();
-        Self { stats: None, tx }
+        Self {
+            stats: None,
+            tx: Some(tx),
+        }
     }
 
     /// Whether collection is on, so a caller can skip a clock read it would only
@@ -204,10 +209,33 @@ impl StatsCollector {
         }
     }
 
-    /// Ship this worker's tally for the handle to fold (a no-op when off).
-    pub fn report(&self) {
+    /// Ship this worker's tally for the handle to fold, and close this
+    /// worker's end of the channel. The handle's fold returns when every
+    /// worker's end has closed, so closing here, rather than when the dataflow
+    /// is dropped, keeps the query's result from waiting on the teardown of the
+    /// dataflow's state. Later calls do nothing.
+    pub fn report(&mut self) {
+        let Some(tx) = self.tx.take() else {
+            return;
+        };
         if let Some(stats) = self.stats {
-            let _ = self.tx.send(stats);
+            let _ = tx.send(stats);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reporting_closes_the_workers_end_of_the_channel() {
+        let (tx, rx) = mpsc::channel();
+        let mut collector = StatsCollector::new(tx, true);
+
+        collector.report();
+
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
     }
 }
