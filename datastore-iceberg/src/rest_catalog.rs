@@ -1,16 +1,15 @@
 //! What reaches the REST catalog: its configuration, the one client built
-//! from it for the life of the datastore, the OAuth2 session that keeps that
-//! client's token current, and blocking on the client's calls.
+//! from it for the life of the datastore, and the OAuth2 session that keeps
+//! that client's token current.
 //!
 //! The Iceberg REST client is async. Every caller of this datastore runs on a
 //! blocking thread (a query is planned on the blocking pool), so each catalog
-//! call blocks on the ambient runtime, or on a runtime of this crate's own when
-//! there is none (a sync test, a standalone tool).
+//! call blocks on the ambient runtime, or on a runtime of the table crate's
+//! own when there is none (a sync test, a standalone tool).
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -19,6 +18,7 @@ use iceberg::{CatalogBuilder, ErrorKind};
 use iceberg_catalog_rest::{
     AuthManager, AuthSession, HttpClient, HttpRequest, RestCatalog, RestCatalogBuilder,
 };
+use iceberg_tables::block_on;
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
@@ -376,31 +376,6 @@ impl IssuedToken {
         now < self.renew_at
     }
 }
-
-/// Drive `future` to completion from a blocking thread: on the ambient
-/// multi-thread runtime when there is one, else on [`CATALOG_RUNTIME`]. A
-/// single-thread ambient runtime (a current-thread test) cannot be blocked on
-/// from inside itself, so it is declined in favour of the crate's own.
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| handle.block_on(future))
-        }
-        _ => CATALOG_RUNTIME.block_on(future),
-    }
-}
-
-/// The runtime the catalog client runs on when the process has no
-/// multi-thread runtime of its own. A `static` so it is never dropped
-/// (dropping an owned runtime inside an async context panics). Two workers:
-/// the client's requests are few and sequential.
-static CATALOG_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("build the Iceberg catalog runtime")
-});
 
 #[cfg(test)]
 mod tests {

@@ -11,9 +11,11 @@
 //!    retained Arrow data each partition has pending.
 //!
 //! Compaction replaces those two stages: its selected files already share one
-//! known partition, and every decoded batch retains its source file's sort
+//! known partition, and every decoded batch retains its source file's row
 //! order. It wraps each batch as a run without partitioning, sorting, or copying,
 //! then collects all selected runs into one file without a memory-size cutoff.
+//! Its outputs are therefore in sort order exactly when every source file
+//! was, which only its caller knows.
 //!
 //! Both paths share the remainder:
 //!
@@ -161,10 +163,13 @@ pub fn encode_record_batches_spec(
             stealable::<SortedPartitionRun>(topology)
                 .into_iter()
                 .collect(),
+            // Every run was sorted by the stage above, so each file's merge
+            // leaves it in the order of the sort columns.
             file_collector::factories(
                 partition_column_names,
                 unwritten_trailing_columns,
                 order_by.into(),
+                sort_column_names,
                 target_rows_per_group,
                 target_in_memory_bytes_per_file,
                 None,
@@ -180,17 +185,29 @@ pub fn encode_record_batches_spec(
 /// form one ordered output stream, split at target-sized row-group boundaries;
 /// sorted tables still use the downstream k-way merge to combine
 /// overlapping source-file runs.
+///
+/// The merge orders nothing a source file left unordered. `sources_are_sorted`
+/// says whether every source file's rows are in the order of
+/// `sort_column_names`, ascending with NULLs first: the outputs are reported
+/// sorted by those columns only then.
+#[allow(clippy::too_many_arguments)] // one call per compaction merge; each piece is needed
 pub fn encode_compaction_batches_spec(
     spec: RecordBatchOperatorSpec,
     schema: SchemaRef,
     partition: Option<crate::PartitionValues>,
     partition_column_names: Arc<[String]>,
     sort_column_names: Arc<[String]>,
+    sources_are_sorted: bool,
     target_rows_per_group: usize,
     max_file_size: usize,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
     let spec = unshred_batches_spec(spec);
     let order_by = sort_order(&schema, &sort_column_names);
+    let sorted_by = if sources_are_sorted {
+        sort_column_names
+    } else {
+        Arc::default()
+    };
     let (dispatcher, heads) = spec.into_parts();
     let worker_count = heads.len();
     let file_collector_worker = dispatcher.next_worker();
@@ -211,6 +228,7 @@ pub fn encode_compaction_batches_spec(
                 partition_column_names,
                 0,
                 order_by.into(),
+                sorted_by,
                 target_rows_per_group,
                 usize::MAX,
                 Some(max_file_size),

@@ -59,7 +59,12 @@ fn make_datastore() -> (TempDir, Arc<PivotlakeDatastore>) {
         .unwrap();
     writer.close().unwrap();
 
-    let datastore = PivotlakeDatastore::open(&dir.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &dir.path().to_string_lossy(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let mut options = HashMap::new();
     options.insert(
         "with_pre_existing_parquets".to_string(),
