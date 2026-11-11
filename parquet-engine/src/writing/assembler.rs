@@ -142,6 +142,7 @@ impl Unary<EncodedLeafChunk, AssembledFile> for FileAssembler {
                 bytes,
                 metadata,
                 partition: context.file_info.partition.clone(),
+                sorted_by: context.file_info.sorted_by.clone(),
             })?;
         }
         Ok(())
@@ -565,6 +566,7 @@ mod tests {
                 file_id,
                 row_group_count: 1,
                 partition: None,
+                sorted_by: Arc::default(),
                 max_file_size: None,
             }),
         })

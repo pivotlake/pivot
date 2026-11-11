@@ -282,6 +282,83 @@ fn open_refuses_a_spill_directory_that_cannot_be_used() {
     assert!(stderr.contains(&refusal), "{stderr}");
 }
 
+/// The index of the database at `datastore`: what records its table format
+/// and where each of its tables is kept.
+fn read_database_index(datastore: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(datastore.join("_pivot_manifest.json")).unwrap()).unwrap()
+}
+
+/// Open a database that does not exist yet with `arguments`, and hand back
+/// the table format it was created in.
+fn create_database_with(arguments: &[&str]) -> String {
+    let directory = tempfile::tempdir().unwrap();
+    let datastore = directory.path().join("db");
+    let output = open_command(&datastore, &[arguments, &["-c", "SELECT 1"]].concat())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let index = read_database_index(&datastore);
+    index["table_format"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn open_takes_the_table_format_of_a_new_database_with_its_alias() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let unnamed = create_database_with(&[]);
+    let delta = create_database_with(&["--table-format", "delta"]);
+    let aliased = create_database_with(&["--table-format", "deltalake"]);
+    let iceberg = create_database_with(&["--table-format", "iceberg"]);
+    let unknown = open_command(
+        &directory.path().join("db"),
+        &["--table-format", "hudi", "-c", "SELECT 1"],
+    )
+    .output()
+    .unwrap();
+
+    assert_eq!(unnamed, "iceberg");
+    assert_eq!(delta, "delta");
+    assert_eq!(aliased, "delta");
+    assert_eq!(iceberg, "iceberg");
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(!unknown.status.success(), "{unknown:?}");
+    assert!(stderr.contains("--table-format"), "{stderr}");
+}
+
+#[test]
+fn a_format_reaches_the_pivotlake_target_and_is_refused_for_a_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let datastore = directory.path().join("lake");
+
+    let created = open_command(
+        &datastore,
+        &["--table-format", "delta", "-c", "CREATE TABLE t (a BIGINT)"],
+    )
+    .output()
+    .unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["open", "--kind", "iceberg", "--table-format", "iceberg"])
+        .arg("https://catalog.example.com/api")
+        .output()
+        .unwrap();
+
+    assert!(created.status.success(), "{created:?}");
+    let index = read_database_index(&datastore);
+    let table_directories = index["table_locations"].as_object().unwrap();
+    let table_directory = table_directories.values().next().unwrap().as_str().unwrap();
+    assert_eq!(index["table_format"], "delta");
+    assert!(datastore.join(table_directory).join("_delta_log").is_dir());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "pivot accepted --table-format for a catalog"
+    );
+    assert!(
+        stderr.contains("--table-format applies only to --kind pivotlake"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn server_command_runs_until_terminated() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
