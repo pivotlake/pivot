@@ -1,0 +1,26 @@
+[package]
+name = "table-file-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The live data files of a table's partitions, held once whatever format keeps the table: an ordered index of a partition's files, the encoding of a file's place on the table's sort key, and the process-wide cache of partition indexes and file footers."
+
+[dependencies]
+object-storage = { workspace = true }
+# The row groups a cached footer holds, and what they take in memory.
+parquet-engine = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+# Casting a bound to the type its sort column is encoded in.
+arrow-cast = { workspace = true }
+# A file's place on the table's sort key is kept as a row whose bytes order
+# as the key does.
+arrow-row = { workspace = true }
+# A partition's index is a persistent ordered map: the next version's shares
+# every node a commit did not touch.
+imbl = { workspace = true }
+# The cache looks every footer a scan takes up by its file's path.
+ahash = { workspace = true }
+# The cache finds a held key by a borrowed view of it.
+hashbrown = { workspace = true }

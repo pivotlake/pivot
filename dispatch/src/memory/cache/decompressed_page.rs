@@ -43,7 +43,7 @@ impl DecompressedPageMeta {
 
 /// One page's membership in a caller-supplied residency count: counted on
 /// creation, uncounted on drop, so the count tracks residency exactly through
-/// every removal path (eviction, invalidation, clear, a lost insert race).
+/// every removal path (eviction, clear, a lost insert race).
 struct LivePage(Arc<AtomicUsize>);
 
 impl LivePage {

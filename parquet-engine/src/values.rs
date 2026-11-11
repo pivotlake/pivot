@@ -84,7 +84,10 @@ pub fn pivot_scalar(array: &ArrayRef, row: usize) -> Scalar<ArrayRef> {
     Scalar::new(value)
 }
 
-/// A file's partition tuple: column name to the typed value carried by every row.
+/// A file's partition tuple: the name of each partition key to the typed
+/// value every row of the file shares. A key is a column of the file, or a
+/// value a table format computes from one (the day of a timestamp), named as
+/// the format names it.
 pub type PartitionValues = HashMap<String, Scalar<ArrayRef>>;
 
 /// Parquet statistics aggregated over every row group in one file.
