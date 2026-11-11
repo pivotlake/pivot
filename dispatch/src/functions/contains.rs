@@ -176,6 +176,75 @@ mod tests {
         assert!(result.value(2));
     }
 
+    /// Four long values in one data buffer, to be searched a slice at a time.
+    fn shared_buffer_values() -> StringViewArray {
+        StringViewArray::from_iter_values([
+            "first long value holding a needle here",
+            "second long value holding nothing at all",
+            "third long value, again with a needle",
+            "fourth long value that ends in needle",
+        ])
+    }
+
+    fn run_on_slice(
+        contains: &mut Contains,
+        array: &StringViewArray,
+        rows: [usize; 2],
+    ) -> Vec<bool> {
+        let result = contains.run(&array.slice(rows[0], rows[1] - rows[0]));
+        (0..result.len()).map(|i| result.value(i)).collect()
+    }
+
+    #[test]
+    fn later_rows_of_a_searched_buffer_are_searched_too() {
+        let array = shared_buffer_values();
+        let mut contains = Contains::new("needle");
+
+        let head = run_on_slice(&mut contains, &array, [0, 2]);
+        let tail = run_on_slice(&mut contains, &array, [2, 4]);
+
+        assert_eq!(head, vec![true, false]);
+        assert_eq!(tail, vec![true, true]);
+    }
+
+    #[test]
+    fn rows_before_the_searched_part_of_a_buffer_are_searched_too() {
+        let array = shared_buffer_values();
+        let mut contains = Contains::new("needle");
+
+        let tail = run_on_slice(&mut contains, &array, [2, 4]);
+        let head = run_on_slice(&mut contains, &array, [0, 2]);
+
+        assert_eq!(tail, vec![true, true]);
+        assert_eq!(head, vec![true, false]);
+    }
+
+    #[test]
+    fn rows_past_a_gap_in_the_searched_buffer_are_searched_too() {
+        let array = shared_buffer_values();
+        let mut contains = Contains::new("needle");
+
+        let first = run_on_slice(&mut contains, &array, [0, 1]);
+        let last = run_on_slice(&mut contains, &array, [3, 4]);
+        let middle = run_on_slice(&mut contains, &array, [1, 3]);
+
+        assert_eq!(first, vec![true]);
+        assert_eq!(last, vec![true]);
+        assert_eq!(middle, vec![false, true]);
+    }
+
+    #[test]
+    fn empty_needle_matches_rows_searched_a_slice_at_a_time() {
+        let array = shared_buffer_values();
+        let mut contains = Contains::new("");
+
+        let head = run_on_slice(&mut contains, &array, [0, 2]);
+        let tail = run_on_slice(&mut contains, &array, [2, 4]);
+
+        assert_eq!(head, vec![true, true]);
+        assert_eq!(tail, vec![true, true]);
+    }
+
     #[test]
     fn reuses_buffer_offsets_across_calls() {
         let array = StringViewArray::from_iter_values([
