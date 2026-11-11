@@ -86,6 +86,19 @@ thread_local! {
 }
 
 /// The node group of the current worker thread.
+/// Lets a thread that is waiting for this worker's core run now.
+///
+/// Workers are pinned and never block while they have work, and the scheduler
+/// may leave a thread that wakes onto a busy worker's core waiting until the
+/// next tick. When a dataflow finishes, the threads that carry its result to
+/// the client wake while every worker is still freeing the dataflow's state
+/// and zeroing the buffers it returned. That work is not urgent, so the
+/// worker offers its core between the pieces of it. With nothing waiting the
+/// call returns at once.
+fn yield_core_to_waiting_threads() {
+    std::thread::yield_now();
+}
+
 pub fn current_node() -> usize {
     NODE_IDX.get()
 }
@@ -409,7 +422,9 @@ impl Worker {
             debug!("Finished data flow {:?}", id);
             if let Some(mut flow) = self.data_flows.remove(&id) {
                 flow.stats().report();
+                yield_core_to_waiting_threads();
                 drop(flow);
+                yield_core_to_waiting_threads();
                 self.release_live_dataflow();
             }
         }
@@ -481,6 +496,7 @@ impl Worker {
             && let Some(b) = memory_ctx().pop_dirty_buffer()
         {
             b.zero_out();
+            yield_core_to_waiting_threads();
 
             // Bound work per pass: zero one buffer, then hand
             // control back to the main loop so a newly-arrived
