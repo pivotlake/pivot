@@ -15,7 +15,6 @@
 //! [`reclaim`](Caches::reclaim): reclaim from the owning cache, then reinforce
 //! its siblings over whatever it dropped.
 
-use crate::io::OpenFile;
 use crate::memory::WriteBuffer;
 use crate::memory::cache::cached::Cached;
 use crate::memory::cache::compressed::CompressedCache;
@@ -104,20 +103,6 @@ impl Caches {
             }
         }
         Some(reclaimed.buffer)
-    }
-
-    /// Drop everything every cache holds of a local file that was just
-    /// (re)opened: its descriptor may now name a different file than an
-    /// equal, earlier descriptor did, so nothing cached under it may serve a
-    /// later read. A remote object is keyed by its own identity and keeps
-    /// what it cached.
-    pub fn invalidate_reopened_file(&self, file: &OpenFile) {
-        if !matches!(file, OpenFile::Local(_)) {
-            return;
-        }
-        for cache in &self.caches {
-            cache.invalidate(file);
-        }
     }
 
     /// Drop everything from every cache; the total entries dropped.

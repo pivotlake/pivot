@@ -17,7 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{ArrowPrimitiveType, Float64Type, Int64Type};
-use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow_array::{
+    ArrayRef, Float64Array, Int64Array, RecordBatch, Scalar, StringArray, TimestampMicrosecondArray,
+};
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{Datastore, PivotCatalog};
 use datastore_iceberg::{IcebergCatalogConfig, IcebergDatastore};
@@ -30,7 +32,7 @@ use iceberg::spec::{
     ManifestList, ManifestListWriter, ManifestWriterBuilder, NestedField, NestedFieldRef,
     NullOrder, Operation, PartitionKey, PrimitiveLiteral, PrimitiveType, Schema, Snapshot,
     SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Struct, Summary,
-    Transform, Type, UnboundPartitionSpec,
+    Transform, Type, UnboundPartitionSpec, VariantType,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -49,8 +51,10 @@ use object_storage::{
     AmbientExternalStoreFactory, ExternalStoreFactory, ObjectStore, StoreError, test_support,
 };
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use planner::Planner;
-use planner::catalog::{CatalogTransaction, SchemaQualifiedTableName};
+use planner::catalog::{BoundTable, CatalogTransaction, SchemaQualifiedTableName};
+use planner::expression::{Compare, CompareType, Expression, Ref};
 use testcontainers::core::{
     CmdWaitFor, ContainerPort, ExecCommand, Host, IntoContainerPort, Mount, WaitFor,
 };
@@ -651,6 +655,19 @@ impl Harness {
         .expect("update the table's schema");
     }
 
+    /// Set `table`'s property `key` to `value`, as an engine's `ALTER TABLE
+    /// ... SET TBLPROPERTIES` does.
+    fn set_property(&self, namespace: &NamespaceIdent, table: &str, key: &str, value: &str) {
+        let loaded = self.load(namespace, table);
+        let transaction = Transaction::new(&loaded);
+        let transaction = transaction
+            .update_table_properties()
+            .set(key.to_string(), value.to_string())
+            .apply(transaction)
+            .unwrap();
+        self.block_on(transaction.commit(&self.writer)).unwrap();
+    }
+
     fn set_partition_spec(
         &self,
         namespace: &NamespaceIdent,
@@ -686,14 +703,29 @@ impl Harness {
         properties: HashMap<String, String>,
         store_factory: Arc<dyn ExternalStoreFactory>,
     ) -> (TestCatalog, Planner) {
+        self.pivot_over(self.open_datastore(properties, store_factory))
+    }
+
+    /// A datastore over the fixture, with `properties` passed to the REST
+    /// client and `store_factory` opening the roots no credentials were
+    /// vended for.
+    fn open_datastore(
+        &self,
+        properties: HashMap<String, String>,
+        store_factory: Arc<dyn ExternalStoreFactory>,
+    ) -> Arc<IcebergDatastore> {
         let config = IcebergCatalogConfig {
             uri: self.catalog_uri.clone(),
             properties,
             ..IcebergCatalogConfig::default()
         };
-        let datastore =
-            IcebergDatastore::open(&config, store_factory, self.dispatcher(), REFRESH_INTERVAL)
-                .expect("open the iceberg datastore");
+        IcebergDatastore::open(&config, store_factory, self.dispatcher(), REFRESH_INTERVAL)
+            .expect("open the iceberg datastore")
+    }
+
+    /// A Pivot catalog serving `datastore`, with its background refresh
+    /// started.
+    fn pivot_over(&self, datastore: Arc<IcebergDatastore>) -> (TestCatalog, Planner) {
         let catalog = PivotCatalog::new(
             HashMap::from([(DATASTORE.to_string(), datastore as Arc<dyn Datastore>)]),
             DATASTORE.to_string(),
@@ -780,9 +812,9 @@ impl Harness {
         }
     }
 
-    /// Run a writing statement through to its commit: what an INSERT needs
-    /// that a query does not. The commit lands on the harness runtime, since
-    /// it hops to the blocking pool.
+    /// Run a writing statement through to its commit: what an INSERT, a
+    /// CREATE TABLE or a DROP TABLE needs that a query does not. The commit
+    /// lands on the harness runtime, since it hops to the blocking pool.
     fn execute(
         &self,
         catalog: &PivotCatalog,
@@ -842,6 +874,33 @@ impl Harness {
         })
     }
 
+    /// The shredded leaves of each live data file of `table`, by their path
+    /// in the file's schema: each file's sorted, and the files sorted by
+    /// theirs.
+    fn shredded_leaves(&self, namespace: &NamespaceIdent, table: &str) -> Vec<Vec<String>> {
+        let loaded = self.load(namespace, table);
+        let mut files: Vec<Vec<String>> = self
+            .live_data_files(namespace, table)
+            .iter()
+            .map(|file| {
+                let input = loaded.file_io().new_input(file.file_path()).unwrap();
+                let bytes = self.block_on(input.read()).unwrap();
+                let footer = SerializedFileReader::new(bytes).unwrap();
+                let schema = footer.metadata().file_metadata().schema_descr();
+                let mut leaves: Vec<String> = schema
+                    .columns()
+                    .iter()
+                    .map(|leaf| leaf.path().string())
+                    .filter(|path| path.ends_with("typed_value"))
+                    .collect();
+                leaves.sort();
+                leaves
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
     /// The `id`s the iceberg crate's own scan of `table` reads under
     /// `predicate`: planned from the manifests and read through the writer's
     /// file IO, so what this datastore recorded about each file is read back
@@ -888,6 +947,10 @@ impl Harness {
             .collect()
     }
 
+    fn object_exists(&self, namespace: &NamespaceIdent, table: &str, location: &str) -> bool {
+        let loaded = self.load(namespace, table);
+        self.block_on(loaded.file_io().exists(location)).unwrap()
+    }
     /// Run `sql`, a writing statement, on `transaction` without committing
     /// it: its files are uploaded and its commit action staged.
     fn stage(&self, planner: &mut Planner, transaction: &Arc<dyn CatalogTransaction>, sql: &str) {
@@ -1168,6 +1231,78 @@ fn rows_spark_deleted_by_deletion_vector_are_not_read() {
     }
 }
 
+/// An INSERT into a table Spark deleted from by deletion vector appends to
+/// it: the snapshot it adds lists the delete manifest as it was, so the
+/// deleted row stays deleted.
+#[test]
+fn an_insert_into_a_table_with_a_deletion_vector_keeps_the_delete() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.v3_namespace("dv_appended", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    harness.spark_sql(
+        "ALTER TABLE dv_appended.orders SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
+         DELETE FROM dv_appended.orders WHERE id = 2;",
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO dv_appended.orders VALUES (3, 'cy', 3.0)",
+        )
+        .unwrap();
+    let sql = "SELECT id FROM dv_appended.orders ORDER BY id";
+    let rows = harness.query(&catalog, &mut planner, sql);
+    let (reopened_catalog, mut reopened_planner) = harness.pivot();
+    let rows_as_committed = harness.query(&reopened_catalog, &mut reopened_planner, sql);
+
+    assert_eq!(int64_column(&rows, 0), [Some(1), Some(3)]);
+    assert_eq!(int64_column(&rows_as_committed, 0), [Some(1), Some(3)]);
+}
+
+/// A scan marks the rows a deletion vector deletes on row groups of its
+/// own, and the footer kept for the scans after it stays as the file has
+/// it: once the table is rolled back to the snapshot before the delete, the
+/// same file reads with every row.
+#[test]
+fn a_file_scanned_with_a_deletion_vector_reads_whole_at_a_version_without_it() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.v3_namespace("dv_undone", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2, 3], &["ann", "bob", "cy"], &[1.0, 2.0, 3.0]),
+    );
+    let appended = harness
+        .load(&namespace, "orders")
+        .metadata()
+        .current_snapshot()
+        .unwrap()
+        .snapshot_id();
+    harness.spark_sql(
+        "ALTER TABLE dv_undone.orders SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
+         DELETE FROM dv_undone.orders WHERE id = 2;",
+    );
+    let (catalog, mut planner) = harness.pivot();
+    let sql = "SELECT id FROM dv_undone.orders ORDER BY id";
+    let with_the_delete = harness.query(&catalog, &mut planner, sql);
+
+    harness.spark_sql(&format!(
+        "CALL c.system.rollback_to_snapshot('dv_undone.orders', {appended})"
+    ));
+    let rolled_back = harness.query_until(&catalog, &mut planner, sql, |batches| {
+        total_rows(batches) == 3
+    });
+
+    assert_eq!(int64_column(&with_the_delete, 0), [Some(1), Some(3)]);
+    assert_eq!(int64_column(&rolled_back, 0), [Some(1), Some(2), Some(3)]);
+}
+
 /// Spark compacts a table deleted from by deletion vector: the rewritten
 /// file holds the live rows only and the vector is removed, which leaves a
 /// delete manifest with nothing live in the manifest list. The datastore
@@ -1391,6 +1526,48 @@ fn renamed_and_added_columns_read_by_field_id() {
         ]
     );
     assert_eq!(int64_column(&batches, 2), [None, None, Some(7)]);
+}
+
+/// A footer is kept as it was reconciled with the columns the table
+/// declared when a query read it. A query after the schema changed reads
+/// the same file by the columns declared now.
+#[test]
+fn a_file_read_before_a_schema_change_reads_by_the_new_columns_after_it() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("reshaped", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    let (catalog, mut planner) = harness.pivot();
+    let before = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT customer FROM reshaped.orders ORDER BY id",
+    );
+
+    // `customer` becomes `buyer`, `amount` is dropped, and `score` is added.
+    let evolved = schema(
+        1,
+        vec![
+            field(1, "id", PrimitiveType::Long),
+            field(2, "buyer", PrimitiveType::String),
+            field(4, "score", PrimitiveType::Long),
+        ],
+    );
+    harness.set_schema(&namespace, "orders", &evolved);
+    let after = harness.query_until(
+        &catalog,
+        &mut planner,
+        "SELECT buyer, score FROM reshaped.orders ORDER BY id",
+        |batches| total_rows(batches) == 2,
+    );
+
+    let customers = [Some("ann".to_string()), Some("bob".to_string())];
+    assert_eq!(string_column(&before, 0), customers);
+    assert_eq!(string_column(&after, 0), customers);
+    assert_eq!(int64_column(&after, 1), [None, None]);
 }
 
 #[test]
@@ -2157,7 +2334,7 @@ fn concurrent_clones_share_one_metadata_load() {
     assert_eq!(
         paths.iter().filter(|path| path.ends_with(".avro")).count(),
         1,
-        "{paths:?}"
+        "the clones read the table's one manifest once between them: {paths:?}"
     );
 }
 
@@ -2498,7 +2675,7 @@ fn a_bucket_partition_prunes_files_by_the_constants_bucket() {
             .filter(|path| path.ends_with(".avro"))
             .count(),
         2,
-        "{equal_reads:?}"
+        "the list and the manifest of the constant's bucket: {equal_reads:?}"
     );
     assert_eq!(
         equal_reads
@@ -2642,6 +2819,48 @@ fn partition_values_prune_files_with_overlapping_bounds_in_one_manifest() {
 }
 
 #[test]
+fn a_scan_of_many_partitions_reads_the_one_manifest_recording_their_files_once() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "many_partitions",
+        "orders",
+        orders_schema(),
+        1,
+        "id",
+        Transform::Identity,
+    );
+    let (writer, mut writer_planner) = harness.pivot();
+    let orders: Vec<String> = (0..40).map(|id| format!("({id}, 'ann', 1.0)")).collect();
+    let insert = format!(
+        "INSERT INTO many_partitions.orders VALUES {}",
+        orders.join(", ")
+    );
+    harness
+        .execute(&writer, &mut writer_planner, &insert)
+        .unwrap();
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM many_partitions.orders WHERE id >= 0 AND id < 40",
+    );
+    let reads = reads.take();
+
+    assert_eq!(total_rows(&rows), 40);
+    assert_eq!(
+        harness.manifest_list(&namespace, "orders").entries().len(),
+        1
+    );
+    assert_eq!(
+        reads.iter().filter(|path| path.ends_with(".avro")).count(),
+        2,
+        "the manifest list and the manifest, each read once: {reads:?}"
+    );
+}
+
+#[test]
 fn separate_bindings_keep_their_own_filters() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("independent", "orders", orders_schema());
@@ -2667,7 +2886,7 @@ fn separate_bindings_keep_their_own_filters() {
 }
 
 #[test]
-fn overlapping_bindings_reload_metadata_and_keep_independent_row_group_filters() {
+fn overlapping_bindings_share_the_file_index_and_keep_independent_row_group_filters() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("overlapping", "orders", orders_schema());
     for ids in [[1, 2], [3, 4]] {
@@ -2704,12 +2923,12 @@ fn overlapping_bindings_reload_metadata_and_keep_independent_row_group_filters()
             .filter(|path| path.ends_with(".parquet"))
             .count(),
         4,
-        "{reads:?}"
+        "each reference reads the footers of both files: {reads:?}"
     );
     assert_eq!(
         reads.iter().filter(|path| path.ends_with(".avro")).count(),
-        5,
-        "{reads:?}"
+        3,
+        "one list and both manifests, read once: {reads:?}"
     );
 }
 
@@ -2719,8 +2938,6 @@ fn floating_point_predicates_prune_files_without_nans() {
     let namespace = harness.namespace("float_files", "orders", orders_schema());
     harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
     harness.append(&namespace, "orders", orders(&[3], &["bob"], &[3.0]));
-    let reads = ReadLog::default();
-    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
 
     for (predicate, expected) in [
         ("= 1", 1),
@@ -2730,7 +2947,10 @@ fn floating_point_predicates_prune_files_without_nans() {
         ("> 2", 3),
         (">= 3", 3),
     ] {
-        reads.take();
+        // A catalog of its own per predicate: one holds the footers its
+        // earlier queries read.
+        let reads = ReadLog::default();
+        let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
         let rows = harness.query(
             &catalog,
             &mut planner,
@@ -2751,7 +2971,7 @@ fn floating_point_predicates_prune_files_without_nans() {
 }
 
 #[test]
-fn floating_partition_summaries_prune_manifests_without_nans() {
+fn floating_partition_values_prune_files_without_nans() {
     let Some(harness) = harness() else { return };
     let namespace = harness.partitioned_namespace(
         "float_partitions",
@@ -2785,8 +3005,8 @@ fn floating_partition_summaries_prune_manifests_without_nans() {
     assert_eq!(int64_column(&rows, 0), [Some(3)]);
     assert_eq!(
         paths.iter().filter(|path| path.ends_with(".avro")).count(),
-        2,
-        "{paths:?}"
+        3,
+        "one list and both manifests: {paths:?}"
     );
     assert_eq!(
         paths
@@ -2875,7 +3095,7 @@ fn a_table_without_a_snapshot_preserves_its_empty_scan_schema() {
 }
 
 #[test]
-fn an_unfiltered_count_reads_only_the_manifest_list() {
+fn an_unfiltered_count_reads_no_data_file() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("count_metadata", "orders", orders_schema());
     harness.append(
@@ -2894,8 +3114,10 @@ fn an_unfiltered_count_reads_only_the_manifest_list() {
     let reads = reads.take();
 
     assert_eq!(int64_column(&count, 0), [Some(2)]);
-    assert_eq!(reads.len(), 1, "{reads:?}");
-    assert!(reads[0].ends_with(".avro"));
+    assert!(
+        reads.iter().all(|path| path.ends_with(".avro")),
+        "{reads:?}"
+    );
 }
 
 #[test]
@@ -3057,7 +3279,7 @@ fn promoted_partition_bounds_skip_older_files_before_reading_their_footers() {
             .filter(|path| path.ends_with(".avro"))
             .count(),
         2,
-        "{objects:?}"
+        "the list and the manifest of the partition the filter keeps: {objects:?}"
     );
     assert_eq!(
         objects
@@ -3128,7 +3350,8 @@ fn one_metadata_batch_reads_month_day_and_unpartitioned_files_together() {
         r#"SELECT id FROM mixed_layouts.events WHERE "at" < TIMESTAMP '2020-01-02 00:00:00' ORDER BY id"#);
     assert_eq!(int64_column(&before, 0), [Some(1), Some(4), Some(5)]);
     let before_reads = reads.take();
-    // One manifest list plus the matching month, day and unpartitioned manifests.
+    // One manifest list plus the three manifests whose partitions may hold
+    // a row before the bound.
     assert_eq!(
         before_reads
             .iter()
@@ -3157,11 +3380,12 @@ fn an_in_list_and_an_or_read_only_the_files_they_can_match() {
     for id in [1, 3, 5] {
         harness.append(&namespace, "orders", orders(&[id], &["ann"], &[1.0]));
     }
-    let reads = ReadLog::default();
-    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
 
     for predicate in ["id IN (1, 5)", "id = 1 OR id = 5"] {
-        reads.take();
+        // A catalog of its own per predicate: one holds the footers its
+        // earlier queries read.
+        let reads = ReadLog::default();
+        let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
         let rows = harness.query(
             &catalog,
             &mut planner,
@@ -3216,6 +3440,113 @@ fn a_timestamp_column_compared_with_a_timestamptz_constant_prunes_files() {
         1,
         "{paths:?}"
     );
+}
+
+#[test]
+fn create_table_registers_a_v3_table_with_pivots_logical_types() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("made", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE made.readings (tiny TINYINT, big BIGINT, name VARCHAR) WITH (partition_by = 'name', sort_by = 'big')",
+        )
+        .unwrap();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO made.readings VALUES (7, 70, 'a'), (8, 80, 'b')",
+        )
+        .unwrap();
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT tiny, big FROM made.readings WHERE name = 'b'",
+    );
+
+    let table = harness.load(&namespace, "readings");
+    let metadata = table.metadata();
+    assert_eq!(metadata.format_version(), FormatVersion::V3);
+    let names: Vec<&str> = metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(names, ["tiny", "big", "name"]);
+    let tiny_id = metadata.current_schema().field_id_by_name("tiny").unwrap();
+    assert_eq!(
+        metadata.properties()["pivot.logical-types"],
+        format!(r#"{{"{tiny_id}":"Int8"}}"#)
+    );
+    assert_eq!(
+        metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["name"]
+    );
+    assert_eq!(metadata.default_sort_order().fields.len(), 1);
+    assert_eq!(rows[0].column(0).data_type(), &arrow_schema::DataType::Int8);
+    assert_eq!(int64_column(&rows, 1), [Some(80)]);
+}
+
+#[test]
+fn create_table_refuses_a_duplicate_unless_asked_not_to() {
+    let Some(harness) = harness() else { return };
+    harness.namespace("twice", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    let duplicate = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE twice.orders (id BIGINT)",
+        )
+        .unwrap_err();
+    let tolerated = harness.execute(
+        &catalog,
+        &mut planner,
+        "CREATE TABLE IF NOT EXISTS twice.orders (id BIGINT)",
+    );
+
+    assert!(duplicate.contains("already exists"), "{duplicate}");
+    assert!(tolerated.is_ok(), "{tolerated:?}");
+}
+
+#[test]
+fn drop_table_unregisters_the_table_and_leaves_its_files() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("dropped", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let file = harness.live_data_files(&namespace, "orders")[0]
+        .file_path()
+        .to_string();
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(&catalog, &mut planner, "DROP TABLE dropped.orders")
+        .unwrap();
+
+    let gone = harness.block_on(
+        harness
+            .writer
+            .load_table(&TableIdent::new(namespace.clone(), "orders".to_string())),
+    );
+    assert!(gone.is_err(), "the catalog still lists the table");
+    let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM dropped.orders");
+    assert!(error.contains("orders"), "{error}");
+    // The harness opens its file IO through a table of the namespace, so
+    // the dropped table's file is looked for through a sibling.
+    harness.create_table(&namespace, "sibling", orders_schema());
+    assert!(harness.object_exists(&namespace, "sibling", &file));
 }
 
 #[test]
@@ -3532,6 +3863,47 @@ fn an_insert_into_a_table_partitioned_by_bucket_records_each_files_bucket() {
 }
 
 #[test]
+fn a_commit_built_on_the_catalogs_current_version_is_its_successor() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("succeeded", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    let datastore = catalog.get_datastore(DATASTORE).unwrap().clone();
+    let built_on = harness.load(&namespace, "orders");
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO succeeded.orders VALUES (1, 'ann', 1.0)",
+        )
+        .unwrap();
+
+    let current = harness.load(&namespace, "orders");
+    assert_eq!(
+        Some(
+            current
+                .metadata()
+                .metadata_log()
+                .last()
+                .unwrap()
+                .metadata_file
+                .as_str()
+        ),
+        built_on.metadata_location()
+    );
+    let tables = datastore.begin_transaction().tables().unwrap();
+    let committed = tables
+        .iter()
+        .find(|table| table.name == SchemaQualifiedTableName::new("succeeded", "orders"))
+        .expect("the committed table is held");
+    assert_eq!(committed.files.len(), 1);
+    assert_eq!(
+        committed.files[0].path,
+        harness.live_data_files(&namespace, "orders")[0].file_path()
+    );
+}
+
+#[test]
 fn a_commit_that_lost_the_race_is_rebuilt_on_the_winner() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("raced", "orders", orders_schema());
@@ -3647,7 +4019,7 @@ fn an_insert_refuses_a_format_version_one_table() {
 }
 
 #[test]
-fn several_inserts_in_one_transaction_land_as_snapshots_in_statement_order() {
+fn several_inserts_in_one_transaction_commit_as_snapshots_in_statement_order() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("several", "orders", orders_schema());
     let (catalog, mut planner) = harness.pivot();
@@ -3682,7 +4054,7 @@ fn several_inserts_in_one_transaction_land_as_snapshots_in_statement_order() {
 }
 
 /// The commit applies the statements' actions in order and stops at the
-/// first that fails: what landed before it stays, and the files of the rest
+/// first that fails: what was committed before it stays, and the files of the rest
 /// are removed, since no snapshot names them.
 #[test]
 fn a_failing_commit_action_keeps_the_earlier_ones_and_discards_the_rest() {
@@ -3926,6 +4298,122 @@ fn year_month_and_hour_partitions_record_the_crates_value_of_each_row() {
     }
 }
 
+/// The start of a year, a month, a day and an hour on each side of the
+/// epoch, and the epoch, in microseconds after it and in order.
+fn list_unit_starts() -> Vec<i64> {
+    let unit_starts = [
+        "1969-01-01T00:00:00",
+        "1969-12-01T00:00:00",
+        "1969-12-31T00:00:00",
+        "1969-12-31T23:00:00",
+        "1970-01-01T00:00:00",
+        "2001-01-01T00:00:00",
+        "2001-03-01T00:00:00",
+        "2001-03-15T00:00:00",
+        "2001-03-15T07:00:00",
+    ];
+    unit_starts
+        .iter()
+        .map(|start| {
+            let start = Datum::timestamp_from_str(start).unwrap();
+            let PrimitiveLiteral::Long(micros) = *start.literal() else {
+                panic!("a timestamp is held as a long, not {start:?}");
+            };
+            micros
+        })
+        .collect()
+}
+
+/// The instant `micros` after the epoch, as a SQL constant.
+fn write_timestamp(micros: i64) -> String {
+    format!("TIMESTAMP '{}'", Datum::timestamp_micros(micros))
+}
+
+/// What a query asks of `at`: as SQL, and as the same comparison of a row's
+/// instant.
+type TimeCondition = (String, Box<dyn Fn(i64) -> bool>);
+
+/// What a query asks of `at` against `bounds`, instants in order: an
+/// equality with each and an open range below it, and the three bounded
+/// ranges between each two.
+fn list_time_conditions(bounds: &[i64]) -> Vec<TimeCondition> {
+    let mut conditions: Vec<TimeCondition> = Vec::new();
+    for (position, &low) in bounds.iter().enumerate() {
+        let low_sql = write_timestamp(low);
+        conditions.push((
+            format!(r#""at" = {low_sql}"#),
+            Box::new(move |at| at == low),
+        ));
+        conditions.push((format!(r#""at" < {low_sql}"#), Box::new(move |at| at < low)));
+        for &high in &bounds[position + 1..] {
+            let high_sql = write_timestamp(high);
+            conditions.push((
+                format!(r#""at" >= {low_sql} AND "at" < {high_sql}"#),
+                Box::new(move |at| low <= at && at < high),
+            ));
+            conditions.push((
+                format!(r#""at" > {low_sql} AND "at" <= {high_sql}"#),
+                Box::new(move |at| low < at && at <= high),
+            ));
+            conditions.push((
+                format!(r#""at" BETWEEN {low_sql} AND {high_sql}"#),
+                Box::new(move |at| low <= at && at <= high),
+            ));
+        }
+    }
+    conditions
+}
+
+/// A time filter returns the rows it holds for and no other, whichever time
+/// transform cut the table's files: the rows sit on the starts of years,
+/// months, days and hours and one microsecond to either side, where a
+/// partition value or a bound rounded the wrong way loses or adds a row.
+#[test]
+fn a_time_filter_returns_exactly_the_rows_it_holds_for_under_every_time_transform() {
+    let Some(harness) = harness() else { return };
+    let unit_starts = list_unit_starts();
+    let instants: Vec<i64> = unit_starts
+        .iter()
+        .flat_map(|start| [start - 1, *start, start + 1])
+        .collect();
+    let rows: Vec<String> = (0..)
+        .zip(&instants)
+        .map(|(id, at)| format!("({id}, {})", write_timestamp(*at)))
+        .collect();
+    let conditions = list_time_conditions(&unit_starts);
+    for (transform, name) in [
+        (Transform::Year, "year"),
+        (Transform::Month, "month"),
+        (Transform::Day, "day"),
+        (Transform::Hour, "hour"),
+    ] {
+        let table = format!("edges_by_{name}.events");
+        harness.partitioned_namespace(
+            &format!("edges_by_{name}"),
+            "events",
+            events_schema(),
+            2,
+            &format!("at_{name}"),
+            transform,
+        );
+        let (catalog, mut planner) = harness.pivot();
+        let insert = format!("INSERT INTO {table} VALUES {}", rows.join(", "));
+        harness.execute(&catalog, &mut planner, &insert).unwrap();
+
+        for (condition, holds_for) in &conditions {
+            let select = format!("SELECT id FROM {table} WHERE {condition} ORDER BY id");
+            let returned = harness.query(&catalog, &mut planner, &select);
+
+            let expected: Vec<Option<i64>> = (0..)
+                .zip(&instants)
+                .filter(|(_, at)| holds_for(**at))
+                .map(|(id, _)| Some(id))
+                .collect();
+            assert_eq!(int64_column(&returned, 0), expected, "{name}: {condition}");
+        }
+    }
+}
+
 #[test]
 fn a_truncate_partition_records_each_rows_prefix() {
     let Some(harness) = harness() else { return };
@@ -3997,11 +4485,54 @@ fn rows_inside_a_written_file_follow_the_tables_sort_order() {
         )
         .unwrap();
 
-    assert_eq!(harness.live_data_files(&namespace, "orders").len(), 1);
+    let files = harness.live_data_files(&namespace, "orders");
+    let table = harness.load(&namespace, "orders");
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files[0].sort_order_id().map(i64::from),
+        Some(table.metadata().default_sort_order_id())
+    );
     assert_eq!(
         harness.scan_ids_in_read_order(&namespace, "orders", Predicate::AlwaysTrue),
         [2, 3, 1]
     );
+}
+
+#[test]
+fn a_file_written_into_a_table_sorted_descending_records_the_unsorted_order() {
+    let Some(harness) = harness() else { return };
+    let schema = orders_schema();
+    let sort_order = SortOrder::builder()
+        .with_order_id(1)
+        .with_sort_field(SortField {
+            source_id: 2,
+            transform: Transform::Identity,
+            direction: SortDirection::Descending,
+            null_order: NullOrder::Last,
+        })
+        .build(&schema)
+        .unwrap();
+    let creation = TableCreation::builder()
+        .name("orders".to_string())
+        .schema(schema)
+        .sort_order(sort_order)
+        .build();
+    let namespace = harness.namespace_for("sorted_descending", creation);
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO sorted_descending.orders VALUES (1, 'cy', 1.0), (2, 'ann', 2.0)",
+        )
+        .unwrap();
+
+    let files = harness.live_data_files(&namespace, "orders");
+    let table = harness.load(&namespace, "orders");
+    assert_eq!(files.len(), 1);
+    assert_ne!(table.metadata().default_sort_order_id(), 0);
+    assert_eq!(files[0].sort_order_id(), Some(0));
 }
 
 #[test]
@@ -4152,4 +4683,602 @@ fn a_commit_onto_a_table_whose_partition_spec_changed_since_the_insert_was_bound
     let table = harness.load(&namespace, "orders");
     assert!(table.metadata().current_snapshot().is_none());
     assert!(harness.data_objects(&namespace, "orders").is_empty());
+}
+
+/// The manifests among `paths`, objects a query read: the Avro objects other
+/// than manifest lists.
+fn list_manifests_among(paths: &[String]) -> Vec<&String> {
+    paths
+        .iter()
+        .filter(|path| path.ends_with(".avro"))
+        .filter(|path| !path.rsplit('/').next().unwrap().starts_with("snap-"))
+        .collect()
+}
+
+/// The manifest lists among `paths`, objects a query read.
+fn list_manifest_lists_among(paths: &[String]) -> Vec<&String> {
+    paths
+        .iter()
+        .filter(|path| path.ends_with(".avro"))
+        .filter(|path| path.rsplit('/').next().unwrap().starts_with("snap-"))
+        .collect()
+}
+
+#[test]
+fn a_column_binds_nullable_only_once_a_live_file_holds_a_null_in_it() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("observed_nulls", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let (catalog, _) = harness.pivot();
+    let reference = planner::catalog::TableReference {
+        datastore: DATASTORE.to_string(),
+        schema: "observed_nulls".to_string(),
+        table: "orders".to_string(),
+    };
+    let bind_nullability = || {
+        let transaction = catalog.begin_transaction();
+        let binding = transaction.bind_table(&reference).unwrap().unwrap();
+        binding.nullability()
+    };
+    let without_a_customer = RecordBatch::try_new(
+        Arc::new(schema_to_arrow_schema(&orders_schema()).unwrap()),
+        vec![
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+            Arc::new(Float64Array::from(vec![2.0])),
+        ],
+    )
+    .unwrap();
+
+    let without_nulls = bind_nullability();
+    harness.append(&namespace, "orders", without_a_customer);
+    let deadline = Instant::now() + REFRESH_TIMEOUT;
+    let mut with_a_null = bind_nullability();
+    while with_a_null == without_nulls && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        with_a_null = bind_nullability();
+    }
+
+    assert_eq!(without_nulls, [false, false, false]);
+    assert_eq!(with_a_null, [false, true, false]);
+}
+
+/// One row of [`orders_schema`] whose customer is NULL.
+fn order_without_a_customer(id: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(schema_to_arrow_schema(&orders_schema()).unwrap()),
+        vec![
+            Arc::new(Int64Array::from(vec![id])),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+            Arc::new(Float64Array::from(vec![1.0])),
+        ],
+    )
+    .unwrap()
+}
+
+/// A namespace `name` whose table `orders` is partitioned by `id`: the
+/// partition `id = 1` holds a customer, the partition `id = 2` a NULL one,
+/// each written by a commit of its own.
+fn create_orders_with_a_null_customer_in_one_partition(
+    harness: &Harness,
+    name: &str,
+) -> NamespaceIdent {
+    let namespace = harness.partitioned_namespace(
+        name,
+        "orders",
+        orders_schema(),
+        1,
+        "id",
+        Transform::Identity,
+    );
+    for (id, batch) in [
+        (1, orders(&[1], &["ann"], &[1.0])),
+        (2, order_without_a_customer(2)),
+    ] {
+        harness.append_to_partition(
+            &namespace,
+            "orders",
+            batch,
+            Some(vec![Some(Literal::long(id))]),
+            WriterProperties::default(),
+        );
+    }
+    namespace
+}
+
+/// A binding of `schema.orders` as a query starts with it, no filter pushed.
+fn bind_orders(catalog: &PivotCatalog, schema: &str) -> Box<dyn BoundTable> {
+    bind(catalog, schema, "orders")
+}
+
+/// A binding of `schema.table` as a query starts with it, no filter pushed.
+fn bind(catalog: &PivotCatalog, schema: &str, table: &str) -> Box<dyn BoundTable> {
+    let reference = planner::catalog::TableReference {
+        datastore: DATASTORE.to_string(),
+        schema: schema.to_string(),
+        table: table.to_string(),
+    };
+    catalog
+        .begin_transaction()
+        .bind_table(&reference)
+        .unwrap()
+        .unwrap()
+}
+
+/// The filter `id = value` over [`orders_schema`].
+fn id_equals(value: i64) -> Expression {
+    Expression::Compare(Compare {
+        left: Box::new(Expression::Ref(Ref {
+            column_idx: 0,
+            return_type: planner::types::Type::Int64,
+            name: None,
+        })),
+        right: Box::new(Expression::Constant(Scalar::new(
+            Arc::new(Int64Array::from(vec![value])) as ArrayRef,
+        ))),
+        compare_type: CompareType::Equal,
+        return_type: planner::types::Type::Boolean,
+    })
+}
+
+#[test]
+fn a_filter_that_keeps_only_partitions_without_nulls_binds_the_column_as_not_nullable() {
+    let Some(harness) = harness() else { return };
+    create_orders_with_a_null_customer_in_one_partition(&harness, "kept_nulls");
+    let (catalog, _) = harness.pivot();
+    let mut filtered = bind_orders(&catalog, "kept_nulls");
+    filtered.pushdown_filter(id_equals(1)).unwrap();
+
+    let nullability_of_the_partition = filtered.nullability();
+    let nullability_of_the_table = bind_orders(&catalog, "kept_nulls").nullability();
+
+    assert_eq!(nullability_of_the_partition, [false, false, false]);
+    assert_eq!(nullability_of_the_table, [false, true, false]);
+}
+
+#[test]
+fn asking_a_filtered_binding_for_nullability_reads_what_its_scan_reads_and_no_more() {
+    let Some(harness) = harness() else { return };
+    create_orders_with_a_null_customer_in_one_partition(&harness, "nullability_reads");
+    let reads = ReadLog::default();
+    let (catalog, _) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let mut filtered = bind_orders(&catalog, "nullability_reads");
+    filtered.pushdown_filter(id_equals(1)).unwrap();
+    reads.take();
+
+    let nullability = filtered.nullability();
+    let nullability_reads = reads.take();
+    filtered
+        .compile_scan(
+            harness.dispatcher(),
+            dispatch::Projection::columns(vec![0, 1]),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+    let scan_reads = reads.take();
+
+    assert_eq!(nullability, [false, false, false]);
+    assert_eq!(
+        list_manifests_among(&nullability_reads).len(),
+        1,
+        "the manifest of the kept partition alone: {nullability_reads:?}"
+    );
+    assert_eq!(
+        nullability_reads
+            .iter()
+            .filter(|path| path.ends_with(".parquet"))
+            .count(),
+        1,
+        "{nullability_reads:?}"
+    );
+    assert!(scan_reads.is_empty(), "{scan_reads:?}");
+}
+
+#[test]
+fn a_required_column_binds_as_not_nullable_with_nothing_read() {
+    let Some(harness) = harness() else { return };
+    let keys_schema = schema(0, vec![field(1, "id", PrimitiveType::Long)]);
+    let namespace = harness.namespace("required_keys", "orders", keys_schema.clone());
+    harness.append(
+        &namespace,
+        "orders",
+        RecordBatch::try_new(
+            Arc::new(schema_to_arrow_schema(&keys_schema).unwrap()),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap(),
+    );
+    create_orders_with_a_null_customer_in_one_partition(&harness, "required_and_optional");
+    let reads = ReadLog::default();
+    let (catalog, _) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let required_alone = bind_orders(&catalog, "required_keys");
+    let required_and_optional = bind_orders(&catalog, "required_and_optional");
+    reads.take();
+
+    let nullability_of_the_required = required_alone.nullability();
+    let required_reads = reads.take();
+    let nullability_with_an_optional = required_and_optional.nullability();
+
+    assert_eq!(nullability_of_the_required, [false]);
+    assert!(required_reads.is_empty(), "{required_reads:?}");
+    assert_eq!(nullability_with_an_optional, [false, true, false]);
+}
+
+#[test]
+fn a_binding_whose_scan_failed_to_load_binds_its_optional_columns_nullable_until_a_load_succeeds() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("unloaded_nulls", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let reads = ReadLog::default();
+    let (catalog, _) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let binding = bind_orders(&catalog, "unloaded_nulls");
+    reads.fail_next_footer();
+
+    let nullability_after_a_failed_load = binding.nullability();
+    let nullability_after_a_load = binding.nullability();
+
+    assert_eq!(nullability_after_a_failed_load, [false, true, true]);
+    assert_eq!(nullability_after_a_load, [false, false, false]);
+}
+
+#[test]
+fn a_query_after_a_refresh_of_an_unchanged_table_reads_no_manifest() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("steady", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    harness.append(&namespace, "orders", orders(&[2], &["bob"], &[2.0]));
+    let reads = ReadLog::default();
+    let datastore = harness.open_datastore(HashMap::new(), Arc::new(reads.clone()));
+    let (catalog, mut planner) = harness.pivot_over(datastore.clone());
+    let sql = "SELECT id FROM steady.orders ORDER BY id";
+
+    let first = harness.query(&catalog, &mut planner, sql);
+    let first_reads = reads.take();
+    datastore.refresh().unwrap();
+    let second = harness.query(&catalog, &mut planner, sql);
+    let second_reads = reads.take();
+
+    assert_eq!(int64_column(&first, 0), [Some(1), Some(2)]);
+    assert_eq!(int64_column(&second, 0), [Some(1), Some(2)]);
+    assert_eq!(
+        list_manifests_among(&first_reads).len(),
+        2,
+        "{first_reads:?}"
+    );
+    assert!(
+        list_manifests_among(&second_reads).is_empty(),
+        "{second_reads:?}"
+    );
+}
+
+#[test]
+fn a_second_query_over_an_entry_reads_its_manifest_list_again_and_no_manifest() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("requeried", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    harness.append(&namespace, "orders", orders(&[2], &["bob"], &[2.0]));
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let sql = "SELECT id FROM requeried.orders ORDER BY id";
+
+    let first = harness.query(&catalog, &mut planner, sql);
+    let first_reads = reads.take();
+    let second = harness.query(&catalog, &mut planner, sql);
+    let second_reads = reads.take();
+
+    assert_eq!(int64_column(&first, 0), [Some(1), Some(2)]);
+    assert_eq!(int64_column(&second, 0), [Some(1), Some(2)]);
+    assert_eq!(
+        list_manifests_among(&first_reads).len(),
+        2,
+        "{first_reads:?}"
+    );
+    assert_eq!(
+        list_manifest_lists_among(&second_reads).len(),
+        1,
+        "{second_reads:?}"
+    );
+    assert!(
+        list_manifests_among(&second_reads).is_empty(),
+        "{second_reads:?}"
+    );
+}
+
+#[test]
+fn a_table_created_again_under_its_name_is_read_from_its_own_manifests() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("remade", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let reads = ReadLog::default();
+    let datastore = harness.open_datastore(HashMap::new(), Arc::new(reads.clone()));
+    let (catalog, mut planner) = harness.pivot_over(datastore.clone());
+    let sql = "SELECT id FROM remade.orders ORDER BY id";
+    harness.query(&catalog, &mut planner, sql);
+    harness.drop_table(&namespace, "orders");
+    harness.create_table(&namespace, "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[7], &["new"], &[7.0]));
+    datastore.refresh().unwrap();
+    reads.take();
+
+    let remade = harness.query(&catalog, &mut planner, sql);
+    let remade_reads = reads.take();
+
+    assert_eq!(int64_column(&remade, 0), [Some(7)]);
+    assert_eq!(
+        list_manifests_among(&remade_reads).len(),
+        1,
+        "{remade_reads:?}"
+    );
+}
+
+#[test]
+fn a_query_after_a_new_snapshot_reads_only_the_manifests_that_joined() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("advancing", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    harness.append(&namespace, "orders", orders(&[2], &["bob"], &[2.0]));
+    let reads = ReadLog::default();
+    let (catalog, mut planner) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let sql = "SELECT id FROM advancing.orders ORDER BY id";
+    harness.query(&catalog, &mut planner, sql);
+    reads.take();
+
+    harness.append(&namespace, "orders", orders(&[3], &["cy"], &[3.0]));
+    let after = harness.query_until(&catalog, &mut planner, sql, |batches| {
+        total_rows(batches) == 3
+    });
+    let reads = reads.take();
+
+    assert_eq!(int64_column(&after, 0), [Some(1), Some(2), Some(3)]);
+    assert_eq!(list_manifests_among(&reads).len(), 1, "{reads:?}");
+}
+
+/// Create `schema.events (id BIGINT, kind VARCHAR, doc VARIANT)` through
+/// Pivot with the table options `options`, and insert each of `inserts`, a
+/// `VALUES` list, as a statement of its own, so each lands in files of its
+/// own.
+fn create_events(
+    harness: &Harness,
+    catalog: &PivotCatalog,
+    planner: &mut Planner,
+    schema: &str,
+    options: &str,
+    inserts: &[&str],
+) {
+    let create =
+        format!("CREATE TABLE {schema}.events (id BIGINT, kind VARCHAR, doc VARIANT) {options}");
+    harness.execute(catalog, planner, &create).unwrap();
+    for rows in inserts {
+        let insert = format!("INSERT INTO {schema}.events VALUES {rows}");
+        harness.execute(catalog, planner, &insert).unwrap();
+    }
+}
+
+#[test]
+fn a_variant_field_reads_from_files_that_shredded_different_fields() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("shredded", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    create_events(
+        &harness,
+        &catalog,
+        &mut planner,
+        "shredded",
+        "",
+        &[
+            r#"(1, 'x', '{"a": 10}'), (2, 'x', '{"tags": [1]}')"#,
+            r#"(3, 'y', '{"b": "s"}'), (4, 'y', NULL), (5, 'y', '{"b": "t"}')"#,
+        ],
+    );
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT doc.a FROM shredded.events ORDER BY id",
+    );
+
+    assert_eq!(
+        string_column(&rows, 0),
+        [Some("10".to_string()), None, None, None, None]
+    );
+    assert_eq!(
+        harness.shredded_leaves(&namespace, "events"),
+        [
+            ["doc.typed_value.a.typed_value"],
+            ["doc.typed_value.b.typed_value"]
+        ]
+    );
+}
+
+#[test]
+fn typed_and_nested_variant_extracts_read_from_files_that_shredded_different_fields() {
+    let Some(harness) = harness() else { return };
+    harness.namespace("typed", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    create_events(
+        &harness,
+        &catalog,
+        &mut planner,
+        "typed",
+        "",
+        &[
+            r#"(1, 'x', '{"a": 10, "owner": {"id": 7}}'), (2, 'x', '{"tags": [1, 2]}')"#,
+            r#"(3, 'y', '{"b": "s", "owner": {"id": 9}}'), (4, 'y', NULL), (5, 'y', '{"a": 50.5}')"#,
+        ],
+    );
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT CAST(doc.a AS DOUBLE), CAST(doc.owner.id AS BIGINT), CAST(doc.tags AS VARCHAR)
+         FROM typed.events ORDER BY id",
+    );
+
+    assert_eq!(
+        float64_column(&rows, 0),
+        [Some(10.0), None, None, None, Some(50.5)]
+    );
+    assert_eq!(int64_column(&rows, 1), [Some(7), None, Some(9), None, None]);
+    assert_eq!(
+        string_column(&rows, 2),
+        [None, Some("[1,2]".to_string()), None, None, None]
+    );
+}
+
+#[test]
+fn a_scan_handed_a_variant_extract_emits_the_field_alone() {
+    let Some(harness) = harness() else { return };
+    harness.namespace("extracted", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    create_events(
+        &harness,
+        &catalog,
+        &mut planner,
+        "extracted",
+        "",
+        &[r#"(1, 'x', '{"a": 10, "b": "s"}'), (2, 'x', '{"b": "t"}')"#],
+    );
+    let binding = bind(&catalog, "extracted", "events");
+    let extract_of_a = dispatch::Projection::columns_with_extracts(
+        vec![2],
+        vec![Some(dispatch::VariantExtract {
+            path: vec!["a".to_string()],
+            as_type: Some(arrow_schema::DataType::Int64),
+        })],
+    );
+
+    let scanned = binding
+        .compile_scan(harness.dispatcher(), extract_of_a, Vec::new(), false)
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert!(binding.applies_variant_extracts());
+    assert_eq!(int64_column(&scanned, 0), [Some(10), None]);
+}
+
+#[test]
+fn a_variant_extract_reads_under_a_filter_on_a_partitioned_table() {
+    let Some(harness) = harness() else { return };
+    harness.namespace("bykind", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    create_events(
+        &harness,
+        &catalog,
+        &mut planner,
+        "bykind",
+        "WITH (partition_by = 'kind')",
+        &[
+            r#"(1, 'click', '{"a": 10}'), (2, 'view', '{"a": 20}'), (3, 'click', '{"b": 1}')"#,
+            r#"(4, 'click', '{"a": 40}'), (5, 'view', NULL)"#,
+        ],
+    );
+
+    let clicks = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id, CAST(doc.a AS BIGINT) FROM bykind.events
+         WHERE kind = 'click' AND id > 1 ORDER BY id",
+    );
+
+    assert_eq!(int64_column(&clicks, 0), [Some(3), Some(4)]);
+    assert_eq!(int64_column(&clicks, 1), [None, Some(40)]);
+}
+
+#[test]
+fn a_filter_on_a_variant_field_keeps_the_rows_that_hold_the_value() {
+    let Some(harness) = harness() else { return };
+    harness.namespace("matched", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    create_events(
+        &harness,
+        &catalog,
+        &mut planner,
+        "matched",
+        "",
+        &[
+            r#"(1, 'x', '{"a": 40}'), (2, 'x', '{"a": 7}')"#,
+            r#"(3, 'y', '{"b": 1}'), (4, 'y', '{"a": 40, "b": 2}'), (5, 'y', NULL)"#,
+        ],
+    );
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM matched.events WHERE CAST(doc.a AS BIGINT) = 40 ORDER BY id",
+    );
+
+    assert_eq!(int64_column(&rows, 0), [Some(1), Some(4)]);
+}
+
+#[test]
+fn a_variant_extract_is_null_for_a_file_that_predates_the_column() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.v3_namespace("late_docs", "orders", orders_schema());
+    harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
+    let mut fields = orders_schema().as_struct().fields().to_vec();
+    fields.push(Arc::new(NestedField::optional(
+        4,
+        "doc",
+        Type::Variant(VariantType),
+    )));
+    harness.set_schema(&namespace, "orders", &schema(1, fields));
+    let (catalog, mut planner) = harness.pivot();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            r#"INSERT INTO late_docs.orders VALUES (2, 'bob', 2.0, '{"a": 5}')"#,
+        )
+        .unwrap();
+
+    let rows = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT CAST(doc.a AS BIGINT), CAST(doc AS VARCHAR) FROM late_docs.orders ORDER BY id",
+    );
+
+    assert_eq!(int64_column(&rows, 0), [None, Some(5)]);
+    assert_eq!(
+        string_column(&rows, 1),
+        [None, Some(r#"{"a":5}"#.to_string())]
+    );
+}
+
+#[test]
+fn create_table_registers_a_variant_column_as_one_variant_field() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("declared", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    create_events(&harness, &catalog, &mut planner, "declared", "", &[]);
+
+    let table = harness.load(&namespace, "events");
+    let metadata = table.metadata();
+    let doc = metadata.current_schema().field_by_name("doc").unwrap();
+    assert_eq!(*doc.field_type, Type::Variant(VariantType));
+    assert_eq!(metadata.last_column_id(), 3);
+    assert!(!metadata.properties().contains_key("pivot.logical-types"));
+}
+
+#[test]
+fn a_table_whose_property_names_a_variant_is_refused() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("recorded", "orders", orders_schema());
+    harness.set_property(
+        &namespace,
+        "orders",
+        "pivot.logical-types",
+        r#"{"2":"Variant"}"#,
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM recorded.orders");
+    harness.drop_table(&namespace, "orders");
+
+    assert!(
+        error.contains("pivot.logical-types") && error.contains("Variant"),
+        "{error}"
+    );
 }

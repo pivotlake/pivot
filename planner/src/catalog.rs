@@ -278,8 +278,10 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
-    /// Run one vacuum sweep of the datastore's latest state, respecting retention.
-    /// This is independent of whether background vacuum is enabled.
+    /// Run the SQL `VACUUM` command on the datastore's latest state: its
+    /// routine cleanup, respecting retention, and a sweep of each table's
+    /// storage for objects the table does not use. Only this command sweeps;
+    /// it is independent of whether background vacuum is enabled.
     async fn vacuum(&self, _datastore: &str) -> Result<()> {
         Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "this catalog does not support VACUUM",
