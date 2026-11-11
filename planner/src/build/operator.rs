@@ -6,6 +6,7 @@
 //! [`expression`](super::expression).
 
 use std::any::Any;
+use std::collections::HashMap;
 
 use arrow_array::{Scalar, new_null_array};
 use dispatch::RowDelivery;
@@ -19,7 +20,7 @@ use duckdb_planner::handle::{
     CreateTable as CreateTableView, CreateUser as CreateUserView, Distinct as DistinctView,
     Drop as DropView, Expression as DuckExpression, Filter as FilterView, Insert as InsertView,
     Limit as LimitView, OrderBy as OrderByView, OrderKey, Projection as ProjectionView,
-    Reset as ResetView, Set as SetView, TableFunctionScan as TableFunctionScanView,
+    Reset as ResetView, Set as SetView, SortedByKey, TableFunctionScan as TableFunctionScanView,
     TableScan as TableScanView, TopN as TopNView, Unnest as UnnestView,
     UnnestedList as UnnestedListView, Values as ValuesView,
 };
@@ -27,7 +28,7 @@ use duckdb_planner::handle::{
 use super::{BuildCtx, build_scan_columns};
 use crate::catalog::{
     BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DropTableRequest,
-    DuckDBTableAdapter,
+    DuckDBTableAdapter, PARTITION_BY_OPTION, SORT_BY_OPTION, split_partition_terms,
 };
 use crate::dynamic_filter::JoinFilterScanInfo;
 use crate::expression::{Error as ExpressionError, Expression, Ref};
@@ -416,6 +417,56 @@ impl DropTable {
 
 impl CreateTable {
     pub(crate) fn from_handle(view: CreateTableView<'_>) -> Result<CreateTable, OperatorError> {
+        let mut options: HashMap<String, String> = view.options()?.into_iter().collect();
+        // A clause names what a table option names, so it reaches the
+        // datastore as that option, and a statement gives one of the two.
+        let refuse_both = |named: &str, clause: &str, option: &str| {
+            OperatorError::InvalidStatement(format!(
+                "CREATE TABLE names its {named} twice, by {clause} and by the `{option}` option; give one of them"
+            ))
+        };
+        let partitioned_by = view.partitioned_by()?;
+        if !partitioned_by.is_empty() {
+            if options.contains_key(PARTITION_BY_OPTION) {
+                return Err(refuse_both(
+                    "partitioning",
+                    "PARTITIONED BY",
+                    PARTITION_BY_OPTION,
+                ));
+            }
+            let terms = partitioned_by.join(", ");
+            // The option separates its terms by the commas outside
+            // parentheses, so a key that reads back as other terms has no
+            // spelling in it.
+            if split_partition_terms(&terms) != partitioned_by {
+                return Err(OperatorError::InvalidStatement(format!(
+                    "PARTITIONED BY ({terms}) names a key the `{PARTITION_BY_OPTION}` option has no spelling for; a key is a column or a transform of one"
+                )));
+            }
+            options.insert(PARTITION_BY_OPTION.to_string(), terms);
+        }
+        // The clause's grammar takes no direction and no NULL ordering, so a
+        // key that is a column is what the option names: the column,
+        // ascending with NULLs first.
+        let sorted_by = view.sorted_by()?;
+        if !sorted_by.is_empty() {
+            if options.contains_key(SORT_BY_OPTION) {
+                return Err(refuse_both("sorting", "SORTED BY", SORT_BY_OPTION));
+            }
+            let columns = sorted_by
+                .into_iter()
+                .map(|key| match key {
+                    // The option separates its columns by commas.
+                    SortedByKey::Column(column) if !column.contains(',') => Ok(column),
+                    SortedByKey::Column(key) | SortedByKey::Expression(key) => {
+                        Err(OperatorError::InvalidStatement(format!(
+                            "SORTED BY key `{key}` is not a column the `{SORT_BY_OPTION}` option can name; a table is sorted by columns, each ascending with NULLs first"
+                        )))
+                    }
+                })
+                .collect::<Result<Vec<String>, OperatorError>>()?;
+            options.insert(SORT_BY_OPTION.to_string(), columns.join(", "));
+        }
         Ok(CreateTable {
             request: CreateTableRequest {
                 datastore_name: view.datastore()?,
@@ -431,7 +482,7 @@ impl CreateTable {
                         })
                     })
                     .collect::<Result<Vec<_>, OperatorError>>()?,
-                options: view.options()?.into_iter().collect(),
+                options,
                 if_not_exists: view.if_not_exists()?,
             },
             or_replace: view.or_replace()?,

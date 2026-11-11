@@ -40,7 +40,9 @@
 #include "duckdb/planner/operator/logical_vacuum.hpp"
 #include "duckdb/planner/operator/logical_create_user.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -966,6 +968,73 @@ rust::String lo_create_option_key(const LogicalOperator &op, size_t index) {
 
 rust::String lo_create_option_value(const LogicalOperator &op, size_t index) {
 	return rust::String::lossy(create_table_option_to_string(create_option_at(op, index).second));
+}
+
+// An argument of a `PARTITIONED BY` transform as the `partition_by` table
+// option spells it: a column by its name, a number by its digits. Any other
+// expression is rendered as DuckDB writes it, for the datastore to refuse by
+// name.
+static string partition_key_argument_to_term(duckdb::ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == duckdb::ExpressionClass::COLUMN_REF) {
+		return expr.Cast<duckdb::ColumnRefExpression>().GetColumnName();
+	}
+	if (expr.GetExpressionClass() == duckdb::ExpressionClass::CONSTANT) {
+		auto &value = expr.Cast<duckdb::ConstantExpression>().value;
+		if (value.type().IsNumeric()) {
+			return value.ToString();
+		}
+	}
+	return expr.ToString();
+}
+
+// A `PARTITIONED BY` key as the `partition_by` table option spells a term: a
+// column by its name, and a transform by its name over its arguments. DuckDB's
+// own rendering of a call quotes a name that is a keyword, as `day` and `year`
+// are, which the option does not. Any other expression is rendered as DuckDB
+// writes it, for the datastore to refuse by name.
+static string partition_key_to_term(duckdb::ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == duckdb::ExpressionClass::COLUMN_REF) {
+		return expr.Cast<duckdb::ColumnRefExpression>().GetColumnName();
+	}
+	if (expr.GetExpressionClass() == duckdb::ExpressionClass::FUNCTION) {
+		auto &function = expr.Cast<duckdb::FunctionExpression>();
+		if (!function.is_operator && function.schema.empty()) {
+			duckdb::vector<string> arguments;
+			for (auto &argument : function.children) {
+				arguments.push_back(partition_key_argument_to_term(*argument));
+			}
+			return function.function_name + "(" + duckdb::StringUtil::Join(arguments, ", ") + ")";
+		}
+	}
+	return expr.ToString();
+}
+
+size_t lo_create_partition_key_count(const LogicalOperator &op) {
+	return create_table_info(op).partition_keys.size();
+}
+
+rust::String lo_create_partition_key(const LogicalOperator &op, size_t index) {
+	return rust::String::lossy(partition_key_to_term(*create_table_info(op).partition_keys[index]));
+}
+
+size_t lo_create_sort_key_count(const LogicalOperator &op) {
+	return create_table_info(op).sort_keys.size();
+}
+
+// Whether the `SORTED BY` key at `index` is a column, which is all the
+// `sort_by` table option names.
+bool lo_create_sort_key_is_column(const LogicalOperator &op, size_t index) {
+	return create_table_info(op).sort_keys[index]->GetExpressionClass() == duckdb::ExpressionClass::COLUMN_REF;
+}
+
+// The `SORTED BY` key at `index`: a column by its name, any other expression
+// as DuckDB writes it.
+rust::String lo_create_sort_key(const LogicalOperator &op, size_t index) {
+	auto &key = *create_table_info(op).sort_keys[index];
+	if (key.GetExpressionClass() == duckdb::ExpressionClass::COLUMN_REF) {
+		return rust::String::lossy(key.Cast<duckdb::ColumnRefExpression>().GetColumnName());
+	}
+	return rust::String::lossy(key.ToString());
 }
 
 bool lo_create_if_not_exists(const LogicalOperator &op) {

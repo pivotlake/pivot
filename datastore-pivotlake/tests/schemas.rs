@@ -114,7 +114,12 @@ fn a_new_datastore_defines_only_the_default_schema() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
 
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
 
     assert!(datastore.contains_schema("main"));
     assert!(!datastore.contains_schema("analytics"));
@@ -124,12 +129,22 @@ fn a_new_datastore_defines_only_the_default_schema() {
 fn created_schema_survives_a_reopen() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
 
     create_schema(&dispatch, &datastore, "analytics").unwrap();
 
     drop(datastore);
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     assert!(reopened.contains_schema("analytics"));
 }
 
@@ -137,7 +152,12 @@ fn created_schema_survives_a_reopen() {
 fn creating_an_existing_schema_is_rejected() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create_schema(&dispatch, &datastore, "analytics").unwrap();
 
     let error = create_schema(&dispatch, &datastore, "analytics").unwrap_err();
@@ -158,7 +178,12 @@ fn creating_an_existing_schema_is_rejected() {
 fn creating_an_existing_schema_if_not_exists_succeeds_once() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create_schema(&dispatch, &datastore, "analytics").unwrap();
 
     create_schema_if_not_exists(&dispatch, &datastore, "analytics").unwrap();
@@ -174,7 +199,12 @@ fn creating_an_existing_schema_if_not_exists_succeeds_once() {
 fn rolling_back_a_create_schema_discards_the_staged_schema() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_schema(CreateSchemaRequest {
@@ -193,7 +223,12 @@ fn rolling_back_a_create_schema_discards_the_staged_schema() {
     commit_datastore_transaction(transaction).unwrap();
     assert!(!datastore.contains_schema("analytics"));
     drop(datastore);
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     assert!(!reopened.contains_schema("analytics"));
 }
 
@@ -201,9 +236,19 @@ fn rolling_back_a_create_schema_discards_the_staged_schema() {
 fn a_second_local_datastore_is_rejected() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let _datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let _datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
 
-    let error = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap_err();
+    let error = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap_err();
 
     assert!(error.to_string().contains("already in use"));
     assert!(error.to_string().contains(&std::process::id().to_string()));
@@ -218,8 +263,18 @@ fn a_refresh_picks_up_a_schema_another_process_created() {
         return;
     };
     let dispatch = dispatch(1);
-    let datastore = PivotlakeDatastore::open(&backend.root, &dispatch).unwrap();
-    let other_process = PivotlakeDatastore::open(&backend.root, &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &backend.root,
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
+    let other_process = PivotlakeDatastore::open_with_format(
+        &backend.root,
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create_schema(&dispatch, &datastore, "analytics").unwrap();
     assert!(!other_process.contains_schema("analytics"));
 
@@ -233,7 +288,12 @@ fn a_refresh_picks_up_a_schema_another_process_created() {
 fn creating_a_table_in_an_unknown_schema_is_rejected() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
 
     let error = create_table(
         &dispatch,
@@ -253,7 +313,12 @@ fn creating_a_table_in_an_unknown_schema_is_rejected() {
 fn same_table_name_in_two_schemas_resolves_separately() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create_schema(&dispatch, &datastore, "analytics").unwrap();
 
     create_table(&dispatch, &datastore, create_table_request(None, "events")).unwrap();
@@ -286,7 +351,12 @@ fn same_table_name_in_two_schemas_resolves_separately() {
 fn a_table_is_stored_at_its_identity() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create_schema(&dispatch, &datastore, "analytics").unwrap();
 
     // The same table name in two schemas: neither name appears in a path, so
@@ -317,7 +387,12 @@ fn a_table_is_stored_at_its_identity() {
 fn a_manifest_omitting_its_optional_fields_loads() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create_table(&dispatch, &datastore, create_table_request(None, "events")).unwrap();
 
     // A document with no `schemas` key at all, and a schema entry with neither
@@ -333,7 +408,12 @@ fn a_manifest_omitting_its_optional_fields_loads() {
         serde_json::to_vec(&serde_json::json!({ "version": 1 })).unwrap(),
     )
     .unwrap();
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     assert!(reopened.contains_schema("main"));
     drop(reopened);
 
@@ -351,7 +431,12 @@ fn a_manifest_omitting_its_optional_fields_loads() {
     )
     .unwrap();
 
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     assert!(reopened.contains_schema("analytics"));
     assert!(
         reopened
@@ -361,6 +446,7 @@ fn a_manifest_omitting_its_optional_fields_loads() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("events")
             )
+            .unwrap()
             .is_some()
     );
 }
@@ -375,7 +461,12 @@ fn concurrent_schema_and_table_creates_all_reach_the_manifest() {
 
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
 
     std::thread::scope(|scope| {
         for i in 0..CREATES {
@@ -394,7 +485,12 @@ fn concurrent_schema_and_table_creates_all_reach_the_manifest() {
     });
 
     drop(datastore);
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let transaction = reopened.clone().begin_transaction();
     for i in 0..CREATES {
         assert!(
@@ -407,6 +503,7 @@ fn concurrent_schema_and_table_creates_all_reach_the_manifest() {
                     DEFAULT_DATASTORE_NAME,
                     &SchemaQualifiedTableName::in_default_schema(format!("t_{i}"))
                 )
+                .unwrap()
                 .is_some(),
             "t_{i} was lost from the manifest"
         );
@@ -421,7 +518,12 @@ fn concurrent_schema_and_table_creates_all_reach_the_manifest() {
 fn compiling_a_create_schema_does_not_stage_it() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let transaction = datastore.clone().begin_transaction();
 
     let _spec = transaction

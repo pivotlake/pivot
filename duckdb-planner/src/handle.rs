@@ -884,6 +884,15 @@ impl<'plan> Drop<'plan> {
     }
 }
 
+/// One key of a `CREATE TABLE` statement's `SORTED BY (...)` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortedByKey {
+    /// A column, by its name.
+    Column(String),
+    /// Any other expression, as DuckDB writes it.
+    Expression(String),
+}
+
 impl<'plan> CreateTable<'plan> {
     pub fn name(self) -> Result<String> {
         Ok(ffi::lo_create_table_name(self.raw)?)
@@ -921,6 +930,32 @@ impl<'plan> CreateTable<'plan> {
                     ffi::lo_create_option_key(self.raw, i)?,
                     ffi::lo_create_option_value(self.raw, i)?,
                 ))
+            })
+            .collect()
+    }
+
+    /// The terms of the statement's `PARTITIONED BY (...)` clause, in the
+    /// order written, each spelled as the `partition_by` table option spells
+    /// a term; none when the statement has no such clause.
+    pub fn partitioned_by(self) -> Result<Vec<String>> {
+        (0..ffi::lo_create_partition_key_count(self.raw)?)
+            .map(|i| Ok(ffi::lo_create_partition_key(self.raw, i)?))
+            .collect()
+    }
+
+    /// The keys of the statement's `SORTED BY (...)` clause, in the order
+    /// written; none when the statement has no such clause. The clause's
+    /// grammar takes bare expressions, so a key carries no direction and no
+    /// NULL ordering.
+    pub fn sorted_by(self) -> Result<Vec<SortedByKey>> {
+        (0..ffi::lo_create_sort_key_count(self.raw)?)
+            .map(|i| {
+                let key = ffi::lo_create_sort_key(self.raw, i)?;
+                Ok(if ffi::lo_create_sort_key_is_column(self.raw, i)? {
+                    SortedByKey::Column(key)
+                } else {
+                    SortedByKey::Expression(key)
+                })
             })
             .collect()
     }
