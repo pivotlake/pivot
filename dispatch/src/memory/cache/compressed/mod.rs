@@ -392,13 +392,6 @@ impl RingCache for CompressedCache {
         });
     }
 
-    /// Drop `file`'s table, so the next lookup misses and the cache keeps no
-    /// handle to a file it holds nothing of. The orphaned tenants in their
-    /// slots self-clean on eviction.
-    fn invalidate(&self, file: &OpenFile) {
-        self.files.remove(file);
-    }
-
     /// Sound only while no query is in flight: it recycles bound slots, which
     /// must not race a reader holding a pin (a slot another worker is still
     /// filling is left intact; its extents are already dropped, so it serves

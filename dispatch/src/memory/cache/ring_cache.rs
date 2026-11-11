@@ -54,10 +54,6 @@ pub trait RingCache: Send + Sync {
     /// than ordinary entries under the same pressure.
     fn reinforce_range(&self, range: &SourceRange);
 
-    /// Drop every entry of `file`, because a reopened descriptor may now name
-    /// different bytes. Slots stay bound and recycle lazily through the clock.
-    fn invalidate(&self, file: &OpenFile);
-
     /// Drop every entry and recycle every slot that can be taken exclusively,
     /// returning how many entries were dropped. Backs `drop_cache()`.
     fn clear(&self) -> usize;
