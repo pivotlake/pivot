@@ -75,6 +75,11 @@ impl<V> Gathering<V> {
 pub(super) struct FileAssembler {
     chunks_by_row_group: HashMap<RowGroupId, Gathering<EncodedLeafChunk>>,
     row_groups_by_file: HashMap<FileId, Gathering<AssembledRowGroup>>,
+    /// Holds the magic and footer of every file this worker assembles, so those
+    /// few bytes share ring buffers instead of pinning one per piece until the
+    /// file is released. Initialized on first use so an inactive assembler holds
+    /// no ring buffer.
+    allocator: Option<SlabAllocator>,
 }
 
 impl Unary<EncodedLeafChunk, AssembledFile> for FileAssembler {
@@ -123,7 +128,15 @@ impl Unary<EncodedLeafChunk, AssembledFile> for FileAssembler {
         } = self.row_groups_by_file.remove(&file_id).unwrap();
         // Parallel encoding may complete row groups out of order.
         groups.sort_by_key(|group| group.row_group_id);
-        let files = build_files(&context.schema, groups, context.file_info.max_file_size)?;
+        let allocator = self
+            .allocator
+            .get_or_insert_with(|| SlabAllocator::new(false));
+        let files = build_files(
+            &context.schema,
+            groups,
+            context.file_info.max_file_size,
+            allocator,
+        )?;
         for (bytes, metadata) in files {
             sender.send(AssembledFile {
                 bytes,
@@ -171,6 +184,7 @@ fn build_files(
     schema: &SchemaRef,
     groups: Vec<AssembledRowGroup>,
     target_size: Option<usize>,
+    allocator: &mut SlabAllocator,
 ) -> WriteResult<Vec<(FileBytes, FileMetaData)>> {
     let ranges = match target_size {
         Some(target_size) if !groups.is_empty() => {
@@ -185,7 +199,10 @@ fn build_files(
     let mut groups = groups.into_iter();
     ranges
         .into_iter()
-        .map(|range| build_file(schema, groups.by_ref().take(range.len()).collect()))
+        .map(|range| {
+            let file_groups = groups.by_ref().take(range.len()).collect();
+            build_file(schema, file_groups, allocator)
+        })
         .collect()
 }
 
@@ -275,12 +292,14 @@ fn linear_partitions(weights: &[usize], parts: usize) -> Vec<Range<usize>> {
 /// group's column offsets to its position in the file. Returns the bytes and the
 /// footer metadata just written into them, so a consumer that needs the file's
 /// row-group metadata can take it directly instead of parsing the footer back.
+/// The magic and footer are carved from `allocator`.
 fn build_file(
     schema: &SchemaRef,
     groups: Vec<AssembledRowGroup>,
+    allocator: &mut SlabAllocator,
 ) -> WriteResult<(FileBytes, FileMetaData)> {
     let mut out = FileBytes::new();
-    out.push_slab(run_of(PARQUET_MAGIC)?);
+    out.push_slab(run_of(PARQUET_MAGIC, allocator));
 
     let mut row_groups = Vec::with_capacity(groups.len());
     let mut num_rows = 0i64;
@@ -331,7 +350,7 @@ fn build_file(
         created_by: Some("pivotdb".to_string()),
         column_orders: Some(vec![ColumnOrder::TYPE_ORDER; leaf_count]),
     };
-    write_footer(&mut out, &file_meta)?;
+    write_footer(&mut out, &file_meta, allocator)?;
     Ok((out, file_meta))
 }
 
@@ -466,21 +485,25 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
 
 /// Write the trailing footer: `[FileMetaData][u32 LE footer length][PAR1]`. It
 /// is one more run of the file, small enough to build in one piece.
-fn write_footer(out: &mut FileBytes, file_meta: &FileMetaData) -> WriteResult<()> {
+fn write_footer(
+    out: &mut FileBytes,
+    file_meta: &FileMetaData,
+    allocator: &mut SlabAllocator,
+) -> WriteResult<()> {
     let mut footer = Vec::new();
     file_meta.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut footer))?;
     footer.extend_from_slice(&(footer.len() as u32).to_le_bytes());
     footer.extend_from_slice(PARQUET_MAGIC);
-    out.push_slab(run_of(&footer)?);
+    out.push_slab(run_of(&footer, allocator));
     Ok(())
 }
 
 /// A run holding a copy of `bytes`, for the small pieces of a file that are not
 /// pages: the leading magic, and the footer.
-fn run_of(bytes: &[u8]) -> WriteResult<Slab> {
-    let mut run = SlabAllocator::new(false).get_slab_of_size(bytes.len(), false);
+fn run_of(bytes: &[u8], allocator: &mut SlabAllocator) -> Slab {
+    let mut run = allocator.get_slab_of_size(bytes.len(), false);
     run.as_mut_slice().copy_from_slice(bytes);
-    Ok(run)
+    run
 }
 
 #[cfg(test)]
@@ -497,12 +520,18 @@ mod tests {
     use arrow_buffer::NullBuffer;
     use arrow_schema::{Field, Fields, Schema};
     use dispatch::Dispatch;
+    use dispatch::test_utils::feed_unary;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::sync::Arc;
 
     fn context(schema: &SchemaRef) -> Arc<RowGroupContext> {
+        file_context(schema, 0)
+    }
+
+    /// The context of the only row group of file `file_id`.
+    fn file_context(schema: &SchemaRef, file_id: FileId) -> Arc<RowGroupContext> {
         Arc::new(RowGroupContext {
-            row_group_id: 0,
+            row_group_id: file_id,
             assembly_worker: 0,
             schema: schema.clone(),
             leaf_count: schema
@@ -511,7 +540,7 @@ mod tests {
                 .map(|field| leaves::count_leaves(field))
                 .sum(),
             file_info: Arc::new(FileAssemblyInfo {
-                file_id: 0,
+                file_id,
                 row_group_count: 1,
                 partition: None,
                 max_file_size: None,
@@ -557,6 +586,35 @@ mod tests {
         assert!(ranges.iter().all(|range| !range.is_empty()));
     }
 
+    /// A finished file stays in ring memory until it is uploaded, so the magic
+    /// and footer of many small files have to share ring buffers: sixteen
+    /// one-row files are all alive at once here in a ring of four buffers.
+    #[test]
+    fn many_small_files_stay_alive_in_a_few_ring_buffers() {
+        dispatch::memory::init_test_free_pool(4);
+        let field = Field::new("n", DataType::Int64, false);
+        let schema = Arc::new(Schema::new(vec![field.clone()]));
+        let mut page_allocator = SlabAllocator::new(false);
+        let chunks: Vec<EncodedLeafChunk> = (0..16)
+            .map(|file_id| {
+                let values: ArrayRef = Arc::new(Int64Array::from(vec![file_id as i64]));
+                let leaf = leaves::to_parquet_leaves(&field, &values)
+                    .unwrap()
+                    .remove(0);
+                EncodedLeafChunk {
+                    context: file_context(&schema, file_id),
+                    leaf_index: 0,
+                    leaf: encode_leaf(leaf, &mut page_allocator).unwrap(),
+                }
+            })
+            .collect();
+        let mut assembler = FileAssembler::default();
+
+        let files: Vec<AssembledFile> = feed_unary(&mut assembler, chunks);
+
+        assert_eq!(files.len(), 16);
+    }
+
     /// Encode a batch the way the pipeline does: convert each column to Parquet
     /// leaves and encode them (dictionary or PLAIN, the encoder's choice), then
     /// `AssembledRowGroup::new` and `build_file`. Returns the bytes of a
@@ -585,7 +643,7 @@ mod tests {
                         }
                     }
                     let group = AssembledRowGroup::new(0, chunks).unwrap();
-                    build_file(&schema, vec![group])
+                    build_file(&schema, vec![group], &mut allocator)
                         .unwrap()
                         .0
                         .runs()
