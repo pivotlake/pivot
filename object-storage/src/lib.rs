@@ -90,8 +90,8 @@ pub struct ListedObject {
 }
 
 /// One level of an object-store namespace. `objects` are the files directly
-/// under the requested prefix; `prefixes` are its immediate child prefixes,
-/// each named relative to that same requested prefix.
+/// under the requested directory; `prefixes` are its immediate child
+/// directories, each named relative to that same requested directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirectoryListing {
     pub objects: Vec<ListedObject>,
@@ -219,7 +219,7 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// ask for one object's metadata directly overrides it.
     fn object_size(&self, key: &ObjectPath) -> Result<Option<u64>> {
         let directory = key.parent().unwrap_or_default();
-        let listing = self.list_with_name_prefix(&directory, key.name())?;
+        let listing = self.list_filtered(&directory, key.name(), None)?;
         Ok(listing
             .objects
             .into_iter()
@@ -233,6 +233,16 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// single writer (a table's data files); a shared mutable document goes
     /// through [`update`](Self::update) instead.
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
+
+    /// Create `key` with `data` only if no object exists at it yet, failing
+    /// with [`StoreError::VersionConflict`] otherwise. Of any number of writers
+    /// racing to create one key exactly one succeeds, which makes a key that
+    /// every writer derives the same way (the next numbered version of a
+    /// table's metadata) a commit point: landing it *is* winning the race.
+    /// A remote backend sends the create conditionally (`If-None-Match: *`,
+    /// `ifGenerationMatch=0`); a local one publishes the whole object under the
+    /// name atomically, so a concurrent reader never sees it half-written.
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
 
     /// Atomically read-modify-write the object at `key`, so no concurrent
     /// update through this method — from this or any other process — is ever
@@ -257,19 +267,25 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// the caller's goal (key absent) is already met.
     fn delete(&self, key: &ObjectPath) -> Result<()>;
 
-    /// List one level under `prefix`: direct objects and immediate child
-    /// prefixes, all named relative to `prefix`.
-    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing> {
-        self.list_with_name_prefix(prefix, "")
+    /// List everything directly under `directory`: its objects and its
+    /// immediate child directories, all named relative to `directory`.
+    fn list(&self, directory: &ObjectPath) -> Result<DirectoryListing> {
+        self.list_filtered(directory, "", None)
     }
 
-    /// [`list`](Self::list), narrowed to children whose own name starts with
-    /// `name_prefix`. A remote backend pushes the narrowing into the request,
-    /// so a narrow listing does not page through the whole directory.
-    fn list_with_name_prefix(
+    /// The entries directly under `directory` whose own name starts with
+    /// `name_prefix` and, when a cursor `after` is given, sorts strictly
+    /// after it (byte order, the order every backend lists in), all named
+    /// relative to `directory`. A remote backend pushes the name prefix and
+    /// the cursor (`start-after`, `startOffset`) into the request, so a
+    /// narrow listing does not page through the whole directory, and a
+    /// directory holding thousands of numbered objects is read from a known
+    /// recent one without paging through the rest.
+    fn list_filtered(
         &self,
-        prefix: &ObjectPath,
+        directory: &ObjectPath,
         name_prefix: &str,
+        after: Option<&str>,
     ) -> Result<DirectoryListing>;
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
@@ -524,6 +540,22 @@ pub(crate) fn object_key(prefix: &str, key: &ObjectPath) -> String {
     }
 }
 
+/// The percent-encoded in-bucket key of the child `name` of the listing root
+/// `object_prefix` (an [`object_key`]), as a remote listing's `prefix` and
+/// cursor parameters spell it. `name` may be a partial name: the listing's
+/// name prefix, or the name a cursor starts after.
+pub(crate) fn encode_child_key(object_prefix: &str, name: &str) -> String {
+    if object_prefix.is_empty() {
+        percent_encode(name)
+    } else {
+        format!(
+            "{}%2F{}",
+            percent_encode(object_prefix),
+            percent_encode(name)
+        )
+    }
+}
+
 /// Percent-encode one object-key component for a URL path segment or query
 /// value per RFC 3986: unreserved characters pass through, everything else
 /// (including `/`) is escaped.
@@ -579,6 +611,10 @@ mod tests {
             unreachable!()
         }
 
+        fn put_if_absent(&self, _: &ObjectPath, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+
         fn update(
             &self,
             _: &ObjectPath,
@@ -591,17 +627,20 @@ mod tests {
             unreachable!()
         }
 
-        fn list_with_name_prefix(
+        fn list_filtered(
             &self,
-            prefix: &ObjectPath,
+            directory: &ObjectPath,
             name_prefix: &str,
+            after: Option<&str>,
         ) -> Result<DirectoryListing> {
-            assert_eq!(prefix, &self.directory);
+            assert_eq!(directory, &self.directory);
             Ok(DirectoryListing {
                 objects: self
                     .objects
                     .iter()
-                    .filter(|(name, _)| name.starts_with(name_prefix))
+                    .filter(|(name, _)| {
+                        name.starts_with(name_prefix) && after.is_none_or(|after| *name > after)
+                    })
                     .map(|(name, size)| ListedObject {
                         file: FileRef {
                             path: ObjectPath::new(*name),

@@ -52,7 +52,7 @@ server:
 # It is the current database, so unqualified names such as `main.events` resolve
 # against it.
 datastores:
-  # `kind` selects the datastore implementation (only `pivot` today). The storage backend is
+  # `kind` selects the datastore implementation: `pivotlake` or `iceberg`. The storage backend is
   # inferred from `location`: a local path here, an S3 URI for `warm` below.
   default:
     kind: pivotlake
@@ -60,8 +60,10 @@ datastores:
     default: true
 
   # Other entries are attached as databases and can be queried with three-part
-  # names such as `warm.main.events`. Compaction is on by default; run it in
-  # only one process per datastore (set `compact: false` on the others).
+  # names such as `warm.main.events`. A pivotlake datastore compacts itself by
+  # default; run compaction in only one process per datastore (set
+  # `compact: false` on the others). An `iceberg` datastore takes no `compact*`
+  # keys: Pivot does not compact the tables of a REST catalog.
   warm:
     kind: pivotlake
     location: s3://example-bucket/warm/

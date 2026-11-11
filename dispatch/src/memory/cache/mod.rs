@@ -7,7 +7,7 @@
 //!                │ caches[CacheId] ──▶ dyn RingCache          │
 //!                │ families ──▶ [(CacheId, share)] …          │
 //!                └─────────────────────┬─────────────────────┘
-//!          reclaim(id, slot) / reinforce siblings / invalidate / clear
+//!                reclaim(id, slot) / reinforce siblings / clear
 //!                                      │
 //!        ┌─────────────────────────────┤
 //!        ▼                             ▼
