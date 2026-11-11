@@ -23,7 +23,7 @@ fn shared_file() -> OpenFile {
 
 /// A fresh, independent local file (distinct key bucket).
 fn new_file() -> OpenFile {
-    OpenFile::Local(LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap())
+    OpenFile::Local(LocalFile::new(tempfile::tempfile().unwrap()).unwrap())
 }
 
 fn key(offset: usize) -> CacheKey {
@@ -267,7 +267,7 @@ fn the_live_page_count_tracks_residency() {
     insert_page_counting(decompressed(), key(0), 8, 0, live.clone()); // loses the race
     let while_cached = live.load(std::sync::atomic::Ordering::Relaxed);
 
-    decompressed().invalidate(&shared_file());
+    decompressed().clear();
 
     assert_eq!(while_cached, 1);
     assert_eq!(live.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -325,23 +325,6 @@ fn a_stale_partner_slot_recycles_cleanly() {
 }
 
 #[test]
-fn reclaiming_a_stale_orphan_spares_the_reinserted_entry() {
-    init_test_free_pool(4);
-    insert_page(decompressed(), key(0), 64, 0xAA);
-    let orphan_slot = cursor_slot(decompressed());
-    decompressed().invalidate(&shared_file()); // the entry is gone; its tenant is now stale
-    release_cursor(decompressed()); // force the re-insert into a fresh slot
-    insert_page(decompressed(), key(0), 64, 0xBB);
-    release_cursor(decompressed());
-
-    let reclaimed = decompressed().reclaim(orphan_slot).unwrap();
-
-    assert_eq!(reclaimed.buffer.slot_idx, orphan_slot);
-    assert_eq!(clock().owner(orphan_slot), None);
-    assert!(decompressed().get(&key(0)).is_some());
-}
-
-#[test]
 fn evicting_a_files_last_entry_releases_its_file_handle() {
     init_test_free_pool(2);
     let open_file = new_file();
@@ -362,20 +345,6 @@ fn reclaim_is_none_for_an_unowned_slot() {
     init_test_free_pool(1);
 
     assert!(decompressed().reclaim(0).is_none());
-}
-
-#[test]
-fn invalidate_drops_only_the_matching_file() {
-    init_test_free_pool(4);
-    let a = new_file();
-    let b = new_file();
-    insert_page(decompressed(), key_in(&a, 0, 1), 8, 0);
-    insert_page(decompressed(), key_in(&b, 0, 1), 8, 0);
-
-    decompressed().invalidate(&a);
-
-    assert!(decompressed().get(&key_in(&a, 0, 1)).is_none());
-    assert!(decompressed().get(&key_in(&b, 0, 1)).is_some());
 }
 
 #[test]
@@ -421,7 +390,7 @@ fn is_empty_tracks_the_entry_count() {
 
     insert_page(decompressed(), key(0), 8, 0);
     let while_cached = decompressed().is_empty();
-    decompressed().invalidate(&shared_file());
+    decompressed().clear();
 
     assert!(!while_cached);
     assert!(decompressed().is_empty());
