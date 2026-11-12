@@ -409,7 +409,15 @@ impl Worker {
             debug!("Finished data flow {:?}", id);
             if let Some(mut flow) = self.data_flows.remove(&id) {
                 flow.stats().report();
+                // The threads that carry the result to the client wake about
+                // now, while every worker is busy freeing the dataflow's
+                // state. A thread that wakes onto a busy worker's core can
+                // wait until the next scheduler tick, so offer the core
+                // before and after the drop. With nothing waiting the call
+                // returns at once.
+                thread::yield_now();
                 drop(flow);
+                thread::yield_now();
                 self.release_live_dataflow();
             }
         }
@@ -481,6 +489,8 @@ impl Worker {
             && let Some(b) = memory_ctx().pop_dirty_buffer()
         {
             b.zero_out();
+            // Zeroing is not urgent: let a thread waiting for this core run.
+            thread::yield_now();
 
             // Bound work per pass: zero one buffer, then hand
             // control back to the main loop so a newly-arrived
