@@ -148,8 +148,7 @@ pub struct RangeColumn {
 pub struct DecodeRange(Box<RangeContents>);
 
 struct RangeContents {
-    metadata: QueryRowGroupMetadata,
-    plan: Arc<DecodePlan>,
+    row_group: Arc<RangeRowGroup>,
     /// The rows to decode, counted the way the decoder emits them: row group
     /// rows for a whole row group, surviving rows for an index selection.
     rows: Range<u32>,
@@ -157,10 +156,18 @@ struct RangeContents {
     index: usize,
     /// One entry per decoded leaf, in decode order.
     columns: Vec<RangeColumn>,
-    /// The cursors the row group's decoders reached at its range starts,
-    /// shared by all of its ranges.
-    start_cursors: Arc<RangeStartCursors>,
-    /// The row group's ranges still to decode, shared by all of them.
+}
+
+/// What the ranges of one row group share. A range holds it through a
+/// single handle, so cutting a range and finishing one each touch one
+/// reference count, and that count belongs to the row group: none of it is
+/// shared with the workers decoding the scan's other row groups.
+struct RangeRowGroup {
+    metadata: QueryRowGroupMetadata,
+    plan: Arc<DecodePlan>,
+    /// The cursors the row group's decoders reached at its range starts.
+    start_cursors: RangeStartCursors,
+    /// The row group's ranges still to decode.
     ranges_left: Arc<AtomicUsize>,
     /// The scan's count of row groups claimed but not yet decoded, released
     /// with the row group's last range.
@@ -169,11 +176,11 @@ struct RangeContents {
 
 impl DecodeRange {
     pub fn metadata(&self) -> &QueryRowGroupMetadata {
-        &self.0.metadata
+        &self.0.row_group.metadata
     }
 
     pub(crate) fn plan(&self) -> &Arc<DecodePlan> {
-        &self.0.plan
+        &self.0.row_group.plan
     }
 
     pub fn rows(&self) -> Range<u32> {
@@ -189,21 +196,22 @@ impl DecodeRange {
         self.0.index
     }
 
-    pub fn start_cursors(&self) -> &Arc<RangeStartCursors> {
-        &self.0.start_cursors
+    pub fn start_cursors(&self) -> &RangeStartCursors {
+        &self.0.row_group.start_cursors
     }
 
     /// The counter of the row group's ranges still to decode; zero once
     /// every range is decoded, on whichever worker.
     pub fn ranges_left(&self) -> &Arc<AtomicUsize> {
-        &self.0.ranges_left
+        &self.0.row_group.ranges_left
     }
 
     /// Records the range as decoded, and the row group with it when this was
     /// its last range.
     pub fn decoded(self) {
-        if self.0.ranges_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0
+        let row_group = &self.0.row_group;
+        if row_group.ranges_left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            row_group
                 .outstanding_row_groups
                 .fetch_sub(1, Ordering::Relaxed);
         }
@@ -227,17 +235,13 @@ struct ColumnPages {
 
 /// The pages of one row group as they arrive, and the ranges cut from them.
 pub(crate) struct RowGroupPages {
-    metadata: QueryRowGroupMetadata,
-    plan: Arc<DecodePlan>,
+    row_group: Arc<RangeRowGroup>,
     columns: Vec<ColumnPages>,
     /// The decode ranges, in decoded-row terms (see [`DecodeRange::rows`]).
     ranges: Vec<Range<u32>>,
     /// Per range, how many row group rows every column must have contiguous
     /// pages for before the range can be decoded.
     rows_needed: Vec<u32>,
-    start_cursors: Arc<RangeStartCursors>,
-    ranges_left: Arc<AtomicUsize>,
-    outstanding_row_groups: Arc<AtomicUsize>,
 }
 
 impl RowGroupPages {
@@ -277,19 +281,21 @@ impl RowGroupPages {
             })
             .collect();
         Self {
-            metadata,
-            plan,
+            row_group: Arc::new(RangeRowGroup {
+                metadata,
+                plan,
+                start_cursors: RangeStartCursors::new(&ranges),
+                ranges_left: Arc::new(AtomicUsize::new(ranges.len())),
+                outstanding_row_groups,
+            }),
             columns,
-            ranges_left: Arc::new(AtomicUsize::new(ranges.len())),
-            start_cursors: Arc::new(RangeStartCursors::new(&ranges)),
             ranges,
             rows_needed,
-            outstanding_row_groups,
         }
     }
 
     pub(crate) fn metadata(&self) -> &QueryRowGroupMetadata {
-        &self.metadata
+        &self.row_group.metadata
     }
 
     pub(crate) fn range_count(&self) -> usize {
@@ -356,7 +362,10 @@ impl RowGroupPages {
     pub(crate) fn cut_range(&mut self, index: usize) -> DecodeRange {
         let rows = self.ranges[index].clone();
         let last_range = index + 1 == self.ranges.len();
-        let whole_row_group = matches!(self.metadata.selection(), RowSelection::Indices(_));
+        let whole_row_group = matches!(
+            self.row_group.metadata.selection(),
+            RowSelection::Indices(_)
+        );
         let columns = self
             .columns
             .iter_mut()
@@ -379,14 +388,10 @@ impl RowGroupPages {
             })
             .collect();
         DecodeRange(Box::new(RangeContents {
-            metadata: self.metadata.clone(),
-            plan: self.plan.clone(),
+            row_group: self.row_group.clone(),
             rows,
             index,
             columns,
-            start_cursors: self.start_cursors.clone(),
-            ranges_left: self.ranges_left.clone(),
-            outstanding_row_groups: self.outstanding_row_groups.clone(),
         }))
     }
 
