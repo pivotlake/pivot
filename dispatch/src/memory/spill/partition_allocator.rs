@@ -121,21 +121,6 @@ struct PackedSlab<'a> {
     slab: &'a FrozenSlab,
 }
 
-/// Have `write` count as in flight for `spilled_buffer`, which it carries
-/// rows of, unless it already does.
-fn count_write_against_buffer(write: &mut SpillWrite, spilled_buffer: &SpilledBuffer) {
-    let already_counted = write
-        .buffers_writes_in_flight
-        .iter()
-        .any(|counted| Arc::ptr_eq(counted, &spilled_buffer.writes_in_flight));
-    if !already_counted {
-        spilled_buffer.writes_in_flight.count_issued_write();
-        write
-            .buffers_writes_in_flight
-            .push(spilled_buffer.writes_in_flight.clone());
-    }
-}
-
 /// The slab a partition is appending into, and where it came from, so that
 /// once full it can be recorded against its buffer. How far it is filled is
 /// kept in the partition's [`RowCursor`].
@@ -748,7 +733,7 @@ impl<L: Layout> PartitionAllocator<L> {
         write.rows.push_slab(compressed_rows);
         for packed_slab in packed_slabs {
             let spilled_buffer = &mut spilled_buffers[packed_slab.spilled_buffer_idx];
-            count_write_against_buffer(&mut write, spilled_buffer);
+            write.count_against_buffer(spilled_buffer);
             spilled_buffer.slabs.push(SpilledSlab {
                 spill_partition_id: partition,
                 file_offset: write.offset + packed_slab.start as u64,
