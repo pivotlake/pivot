@@ -317,6 +317,10 @@ impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
             }
         }
     }
+
+    fn resume_position(&self) -> Option<ReaderPosition> {
+        Some(self.position)
+    }
 }
 #[cfg(test)]
 mod tests {

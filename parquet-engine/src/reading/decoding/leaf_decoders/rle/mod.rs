@@ -37,6 +37,7 @@ unsafe fn gather_entries<D: Dict>(dict: &D, keys: &[u32], dest: &mut [D::Item]) 
 }
 
 /// A single run in the RLE/bit-packed stream.
+#[derive(Clone)]
 pub enum Run {
     Rle {
         value: u32,
@@ -370,6 +371,27 @@ impl RleDecoder {
             buffer: Box::new([0; 1024]),
             run: None,
         }
+    }
+
+    /// A decoder over `data` that reads on from the
+    /// [`cursor`](Self::cursor) another decoder of the same page reached.
+    pub fn resume(
+        data: Vec<Bytes>,
+        bit_width: u8,
+        position: ReaderPosition,
+        run: Option<Run>,
+    ) -> Self {
+        Self {
+            run,
+            ..Self::new(data, position, bit_width)
+        }
+    }
+
+    /// Where the next value is read from, for [`resume`](Self::resume): the
+    /// stream position, the indices' bit width, and the run that value is
+    /// inside when the position is past the run's header.
+    pub fn cursor(&self) -> (ReaderPosition, u8, Option<Run>) {
+        (self.position, self.bit_width, self.run.clone())
     }
 
     /// Returns the current in-progress run, or parses the next one from the

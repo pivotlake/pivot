@@ -18,7 +18,7 @@ use arrow_array::types::{ArrowPrimitiveType, TimestampMicrosecondType};
 use arrow_array::{ArrayRef, RecordBatch, Scalar, TimestampMicrosecondArray};
 use arrow_buffer::ArrowNativeType;
 
-use super::{BuiltDictionary, SharedDictionary};
+use super::{BuiltDictionary, PageCursor, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::{
     DecodePlain, DeltaPacking, Dict, DictFromBytes, DictFromVecBytes, LeafDecoder, LeafType,
     Result, TypedLeafDecoder, Unsupported,
@@ -282,6 +282,10 @@ where
         let mut reader = MultiBufferReader::new(&self.data, &mut self.position);
         reader.skip(size * T::Native::PHYSICAL_SIZE);
     }
+
+    fn resume_position(&self) -> Option<ReaderPosition> {
+        Some(self.position)
+    }
 }
 
 /// [`Dict`] implementation for fixed-width primitives, generic over the
@@ -468,6 +472,18 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
 
     fn restart_at_page(&mut self, page_idx: usize) {
         self.inner.restart_at_page(page_idx);
+    }
+
+    fn open_page_cursor(&self) -> Option<PageCursor> {
+        self.inner.open_page_cursor()
+    }
+
+    fn resume_page(&mut self, page: DecompressedPage, cursor: &PageCursor) {
+        self.inner.resume_page(page, cursor);
+    }
+
+    fn skip_rows(&mut self, rows: usize) {
+        self.inner.skip_rows(rows);
     }
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {

@@ -10,7 +10,9 @@
 use crate::reading::decoding::ScanEqualityPredicate;
 use crate::reading::decoding::column_decoder::{ColumnDecoder, Error, Result, create_leaf_decoder};
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
-use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
+use crate::reading::range_cutter::row_group_pages::{
+    DecodeRange, LeafCursors, PageContent, StoredPage,
+};
 use crate::reading::record_batch_metadata::with_row_index;
 use crate::types::filter_mask::FilterMask;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
@@ -244,17 +246,11 @@ impl RowGroupDecoder {
         self.live_in_range = self.live_rows_of(&rows);
         self.next_row = rows.start as usize;
         self.end_row = rows.end as usize;
+        if !continues {
+            self.reposition_at(&range);
+        }
         for leaf in 0..self.leaf_decoders.len() {
-            let pages = &range.column(leaf).pages;
-            if !continues {
-                let first = pages
-                    .first()
-                    .expect("a ready range has pages in every column")
-                    .idx;
-                self.leaf_decoders[leaf].restart_at_page(first);
-                self.next_page[leaf] = first;
-            }
-            for page in pages {
+            for page in &range.column(leaf).pages {
                 if page.idx < self.next_page[leaf] {
                     continue;
                 }
@@ -267,15 +263,111 @@ impl RowGroupDecoder {
         Ok(())
     }
 
-    /// Gives back the range once every row of it is emitted.
+    /// Readies every leaf for the pages of `range`, whose rows do not follow
+    /// the rows this decoder emitted last.
+    ///
+    /// A leaf restarts at the range's first page, and when the range starts
+    /// inside that page the rows before it are skipped as the page is read.
+    /// The skip is shorter wherever a decoder of the row group recorded its
+    /// cursor at a range start inside the page: the leaf resumes from the
+    /// latest such cursor and skips only the ranges between it and `range`,
+    /// recording its own cursors at each range start it passes for the
+    /// decoders that come after.
+    fn reposition_at(&mut self, range: &DecodeRange) {
+        let start_cursors = range.start_cursors();
+        let cursors_apply = matches!(self.metadata.selection(), RowSelection::All);
+        let resumed_from: Vec<Option<usize>> = (0..self.leaf_decoders.len())
+            .map(|leaf| {
+                let first = range
+                    .column(leaf)
+                    .pages
+                    .first()
+                    .expect("a ready range has pages in every column");
+                let cursor = (cursors_apply && first.first_row < range.rows().start)
+                    .then(|| start_cursors.find_latest(leaf, range.index(), first.first_row))
+                    .flatten();
+                match cursor {
+                    Some((cursor_range, cursor)) => {
+                        let page = self.page_at_cursor(leaf, first);
+                        self.leaf_decoders[leaf].resume_page(page, cursor);
+                        self.next_page[leaf] = first.idx + 1;
+                        Some(cursor_range)
+                    }
+                    None => {
+                        self.leaf_decoders[leaf].restart_at_page(first.idx);
+                        self.next_page[leaf] = first.idx;
+                        None
+                    }
+                }
+            })
+            .collect();
+        let Some(earliest) = resumed_from.iter().flatten().copied().min() else {
+            return;
+        };
+        for passed in earliest..range.index() {
+            let passed_rows =
+                (start_cursors.first_row(passed + 1) - start_cursors.first_row(passed)) as usize;
+            let skips = |leaf: usize| resumed_from[leaf].is_some_and(|from| from <= passed);
+            for leaf in (0..self.leaf_decoders.len()).filter(|&leaf| skips(leaf)) {
+                self.leaf_decoders[leaf].skip_rows(passed_rows);
+            }
+            if !start_cursors.is_recorded_at(passed + 1) {
+                let cursors = (0..self.leaf_decoders.len())
+                    .map(|leaf| {
+                        skips(leaf)
+                            .then(|| self.leaf_decoders[leaf].open_page_cursor())
+                            .flatten()
+                    })
+                    .collect();
+                start_cursors.record(passed + 1, cursors);
+            }
+        }
+    }
+
+    /// Gives back the range once every row of it is emitted, recording
+    /// where each leaf stands for the decoder of the range that follows.
     pub fn finish_range(&mut self) -> DecodeRange {
         assert!(
             self.exhausted(),
             "a range is finished once its rows are emitted"
         );
-        self.range
+        let range = self
+            .range
             .take()
-            .expect("a range is finished once, after being attached")
+            .expect("a range is finished once, after being attached");
+        let next = range.index() + 1;
+        if matches!(self.metadata.selection(), RowSelection::All)
+            && !range.start_cursors().is_recorded_at(next)
+        {
+            let cursors: LeafCursors = self
+                .leaf_decoders
+                .iter()
+                .map(|leaf| leaf.open_page_cursor())
+                .collect();
+            if cursors.iter().any(Option::is_some) {
+                range.start_cursors().record(next, cursors);
+            }
+        }
+        range
+    }
+
+    /// The stored page for a leaf decoder to resume inside, at a cursor.
+    fn page_at_cursor(&self, leaf: usize, page: &StoredPage) -> DecompressedPage {
+        let PageContent::Data(data) = &page.content else {
+            panic!("a cursor lies inside a page with rows to decode")
+        };
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: self.metadata.clone(),
+            column_idx: leaf,
+            idx: page.idx,
+            first_row: page.first_row,
+            data: DecompressedPageType::Data(DataPage {
+                header: data.header.clone(),
+                data: data.data.clone(),
+                filter_mask: None,
+            }),
+        }
     }
 
     /// The stored page as the leaf decoder takes it. The first page of a

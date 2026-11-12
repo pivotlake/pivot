@@ -887,4 +887,61 @@ pub(crate) mod tests {
         assert_eq!(first, expected_first);
         assert_eq!(second, (16_384..32_768).collect::<Vec<i32>>());
     }
+
+    /// One page over four ranges. The first worker decodes the first range;
+    /// the second worker then takes the third, two ranges into the page and
+    /// one past where the first worker stopped.
+    #[test]
+    fn a_range_past_the_one_another_worker_stopped_at_decodes_its_own_rows() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 50_000);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let mut ranges = cut(&table, row_number_pages(&metadata, 50_000, 50_000));
+        let third = ranges.remove(2);
+        ranges.truncate(1);
+
+        run_unary_to_completion(new_decoder(8192), ranges);
+        let second_worker = run_unary_to_completion(new_decoder(8192), vec![third]);
+
+        let second: Vec<i32> = second_worker
+            .iter()
+            .flat_map(|b| extract_i32s(b, 0))
+            .collect();
+        assert_eq!(second, (32_768..49_152).collect::<Vec<i32>>());
+    }
+
+    /// The same hand-over inside a dictionary encoded page, whose indices
+    /// are read on from the middle of the run stream.
+    #[test]
+    fn a_range_past_the_one_another_worker_stopped_at_decodes_its_own_dictionary_entries() {
+        init_test_free_pool(4);
+        let table = string_and_i32_table(40_000, true);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let entries = ["MAIL", "SHIP", "RAIL"];
+        let keys: Vec<u8> = (0..40_000).map(|row| (row % 3) as u8).collect();
+        let row_numbers: Vec<i32> = (0..40_000).collect();
+        let pages = vec![
+            make_dict_page(metadata.clone(), 0, &entries),
+            make_rle_data_page(metadata.clone(), 0, &keys, 0),
+            make_data_page(metadata, 1, encode_i32s(&row_numbers), 40_000, 0, 0),
+        ];
+        let mut ranges = cut(&table, pages);
+        let third = ranges.remove(2);
+        ranges.truncate(1);
+
+        run_unary_to_completion(new_decoder(8192), ranges);
+        let second_worker = run_unary_to_completion(new_decoder(8192), vec![third]);
+
+        let strings: Vec<String> = second_worker
+            .iter()
+            .flat_map(|b| extract_strings(b, 0))
+            .collect();
+        let numbers: Vec<i32> = second_worker
+            .iter()
+            .flat_map(|b| extract_i32s(b, 1))
+            .collect();
+        let expected_strings: Vec<&str> = (32_768..40_000).map(|row| entries[row % 3]).collect();
+        assert_eq!(strings, expected_strings);
+        assert_eq!(numbers, (32_768..40_000).collect::<Vec<i32>>());
+    }
 }

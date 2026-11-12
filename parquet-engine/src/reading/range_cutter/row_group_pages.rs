@@ -9,14 +9,14 @@
 //! long as a job holds it.
 
 use crate::reading::decoding::DecodePlan;
-use crate::reading::decoding::leaf_decoders::SharedDictionary;
+use crate::reading::decoding::leaf_decoders::{PageCursor, SharedDictionary};
 use crate::thrift::general::Encoding;
 use crate::thrift::headers::DataPageHeader;
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use crate::types::page::DataPage;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// Rows per decode range. A range is the unit another worker can take over,
 /// and a worker taking one over skips into its first page of every column,
@@ -67,6 +67,72 @@ impl StoredPage {
     }
 }
 
+/// The cursor each decoded leaf of a row group is read from at one row, for
+/// the leaves that had one to give.
+pub type LeafCursors = Box<[Option<PageCursor>]>;
+
+/// Where the decoders of a row group stood, leaf by leaf, at the first row
+/// of each of its ranges.
+///
+/// A decoder that takes on a range out of order has to reach the range's
+/// first row inside a page some other decoder is reading or has read. Each
+/// decoder records the cursors it holds whenever it stands at the first row
+/// of a range, so the next one to need that row, or a row shortly after it,
+/// reads on from there instead of from the page's first value.
+pub struct RangeStartCursors {
+    /// The first row of each range.
+    first_rows: Box<[u32]>,
+    /// Per range, the cursor of each decoded leaf at the range's first row,
+    /// for the leaves that had one to give. Written once, by whichever
+    /// decoder stood there first.
+    cursors: Box<[OnceLock<LeafCursors>]>,
+}
+
+impl RangeStartCursors {
+    fn new(ranges: &[Range<u32>]) -> Self {
+        Self {
+            first_rows: ranges.iter().map(|range| range.start).collect(),
+            cursors: ranges.iter().map(|_| OnceLock::new()).collect(),
+        }
+    }
+
+    pub fn first_row(&self, range: usize) -> u32 {
+        self.first_rows[range]
+    }
+
+    /// Whether some decoder has recorded its cursors at the first row of
+    /// `range`, or `range` is past the row group's last.
+    pub fn is_recorded_at(&self, range: usize) -> bool {
+        self.cursors
+            .get(range)
+            .is_none_or(|cursors| cursors.get().is_some())
+    }
+
+    /// Records the cursors a decoder holds at the first row of `range`, one
+    /// entry per decoded leaf. Kept only when it is the first record there.
+    pub fn record(&self, range: usize, cursors: LeafCursors) {
+        let _ = self.cursors[range].set(cursors);
+    }
+
+    /// The latest range, no later than `range`, whose first row is at or
+    /// after `earliest_row` and has a cursor of `leaf` recorded, with that
+    /// cursor.
+    pub fn find_latest(
+        &self,
+        leaf: usize,
+        range: usize,
+        earliest_row: u32,
+    ) -> Option<(usize, &PageCursor)> {
+        (0..=range)
+            .rev()
+            .take_while(|&candidate| self.first_rows[candidate] >= earliest_row)
+            .find_map(|candidate| {
+                let cursor = self.cursors[candidate].get()?[leaf].as_ref()?;
+                Some((candidate, cursor))
+            })
+    }
+}
+
 /// What a range decodes one leaf from.
 pub struct RangeColumn {
     /// The leaf's dictionary, built once by the cutter, when its chunk has
@@ -87,8 +153,13 @@ struct RangeContents {
     /// The rows to decode, counted the way the decoder emits them: row group
     /// rows for a whole row group, surviving rows for an index selection.
     rows: Range<u32>,
+    /// The range's place among the row group's ranges.
+    index: usize,
     /// One entry per decoded leaf, in decode order.
     columns: Vec<RangeColumn>,
+    /// The cursors the row group's decoders reached at its range starts,
+    /// shared by all of its ranges.
+    start_cursors: Arc<RangeStartCursors>,
     /// The row group's ranges still to decode, shared by all of them.
     ranges_left: Arc<AtomicUsize>,
     /// The scan's count of row groups claimed but not yet decoded, released
@@ -111,6 +182,15 @@ impl DecodeRange {
 
     pub fn column(&self, leaf: usize) -> &RangeColumn {
         &self.0.columns[leaf]
+    }
+
+    /// The range's place among the row group's ranges, in row order.
+    pub fn index(&self) -> usize {
+        self.0.index
+    }
+
+    pub fn start_cursors(&self) -> &Arc<RangeStartCursors> {
+        &self.0.start_cursors
     }
 
     /// The counter of the row group's ranges still to decode; zero once
@@ -155,6 +235,7 @@ pub(crate) struct RowGroupPages {
     /// Per range, how many row group rows every column must have contiguous
     /// pages for before the range can be decoded.
     rows_needed: Vec<u32>,
+    start_cursors: Arc<RangeStartCursors>,
     ranges_left: Arc<AtomicUsize>,
     outstanding_row_groups: Arc<AtomicUsize>,
 }
@@ -200,6 +281,7 @@ impl RowGroupPages {
             plan,
             columns,
             ranges_left: Arc::new(AtomicUsize::new(ranges.len())),
+            start_cursors: Arc::new(RangeStartCursors::new(&ranges)),
             ranges,
             rows_needed,
             outstanding_row_groups,
@@ -300,7 +382,9 @@ impl RowGroupPages {
             metadata: self.metadata.clone(),
             plan: self.plan.clone(),
             rows,
+            index,
             columns,
+            start_cursors: self.start_cursors.clone(),
             ranges_left: self.ranges_left.clone(),
             outstanding_row_groups: self.outstanding_row_groups.clone(),
         }))

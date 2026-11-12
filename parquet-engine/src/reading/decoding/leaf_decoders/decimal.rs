@@ -24,7 +24,7 @@ use arrow_array::types::{Decimal64Type, Decimal128Type, DecimalType};
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 
-use super::{BuiltDictionary, SharedDictionary};
+use super::{BuiltDictionary, PageCursor, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::primitive::ElemPtr;
 use crate::reading::decoding::leaf_decoders::{
     DecodeEncoding, DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, Error,
@@ -226,6 +226,10 @@ impl<T: DecimalCarrier, S: DecimalStorage> DecodePlain for DecimalPlainDecoder<T
         let mut reader = MultiBufferReader::new(&self.data, &mut self.position);
         reader.skip(size * S::PHYSICAL_SIZE);
     }
+
+    fn resume_position(&self) -> Option<ReaderPosition> {
+        Some(self.position)
+    }
 }
 
 /// [`Dict`] implementation for decimals, generic over the buffer holding the
@@ -408,6 +412,18 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
 
     fn restart_at_page(&mut self, page_idx: usize) {
         self.inner.restart_at_page(page_idx);
+    }
+
+    fn open_page_cursor(&self) -> Option<PageCursor> {
+        self.inner.open_page_cursor()
+    }
+
+    fn resume_page(&mut self, page: DecompressedPage, cursor: &PageCursor) {
+        self.inner.resume_page(page, cursor);
+    }
+
+    fn skip_rows(&mut self, rows: usize) {
+        self.inner.skip_rows(rows);
     }
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {

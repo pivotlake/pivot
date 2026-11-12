@@ -9,7 +9,7 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
-use arrow_array::{BooleanArray, Int32Array, RunArray};
+use arrow_array::{Array, BooleanArray, Int32Array, RunArray};
 use std::cmp::min;
 use std::ops::Range;
 
@@ -164,6 +164,11 @@ impl RunningFilterMask {
             physical_index: 0,
         }
     }
+    /// Whether no skipped row lies between the cursor and the mask's end.
+    pub fn rest_is_kept(&self) -> bool {
+        self.previous_run_end == self.filter_mask.filters.len()
+    }
+
     /// Advance to the next run, returning `(is_kept, count)`.
     ///
     /// `false` runs return their full length. `true` runs are capped at `max_size`;

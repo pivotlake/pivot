@@ -18,7 +18,7 @@ use crate::reading::decoding::leaf_decoders::levels::decode_def_levels;
 use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::reading::decoding::leaf_decoders::{
     ArrayBuilder, DecodeEncoding, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
-    LeafDecoder, LeafType, Result,
+    LeafDecoder, LeafType, PageCursor, Result, ValuesCursor,
 };
 use crate::thrift::general::Encoding;
 use crate::thrift::headers::DataPageHeader;
@@ -40,6 +40,44 @@ pub enum ValueDecoder<L: LeafType> {
     DeltaBinaryPacked(L::DeltaBinaryPacked),
     DeltaLengthByteArray(L::DeltaLengthByteArray),
     Rle(L::Rle),
+}
+
+impl<L: LeafType> ValueDecoder<L> {
+    /// Where the next value is read from, for the encodings a decoder can
+    /// read on from a position alone.
+    fn cursor(&self) -> Option<ValuesCursor> {
+        match self {
+            ValueDecoder::Plain(plain) => plain.resume_position().map(ValuesCursor::Plain),
+            ValueDecoder::Dictionary(indices) => {
+                let (position, bit_width, run) = indices.cursor();
+                Some(ValuesCursor::Dictionary {
+                    position,
+                    bit_width,
+                    run,
+                })
+            }
+            ValueDecoder::DeltaBinaryPacked(_)
+            | ValueDecoder::DeltaLengthByteArray(_)
+            | ValueDecoder::Rle(_) => None,
+        }
+    }
+
+    /// A decoder of the page held in `data` that reads on from `cursor`.
+    fn resume(data: Vec<Bytes>, cursor: &ValuesCursor) -> Self {
+        match cursor {
+            ValuesCursor::Plain(position) => ValueDecoder::Plain(L::Plain::new(data, *position)),
+            ValuesCursor::Dictionary {
+                position,
+                bit_width,
+                run,
+            } => ValueDecoder::Dictionary(RleDecoder::resume(
+                data,
+                *bit_width,
+                *position,
+                run.clone(),
+            )),
+        }
+    }
 }
 
 /// Decode `n` values into `builder` (a dictionary page looks each index up in
@@ -537,6 +575,51 @@ impl<L: LeafType> LeafDecoder for TypedLeafDecoder<L> {
 
         let null_buffer = validity.map(|v| v.into_buffer());
         Ok(builder.into_array(null_buffer))
+    }
+
+    fn open_page_cursor(&self) -> Option<PageCursor> {
+        let read_page = self.read_page.as_ref()?;
+        let every_row_ahead_is_a_value = read_page.def_levels.is_none()
+            && read_page
+                .running_filter_mask_opt
+                .as_ref()
+                .is_none_or(|mask| mask.rest_is_kept());
+        if read_page.remaining == 0 || !every_row_ahead_is_a_value {
+            return None;
+        }
+        Some(PageCursor {
+            page_idx: self.page_idx,
+            rows_left: read_page.remaining,
+            values: read_page.decoder.cursor()?,
+        })
+    }
+
+    fn resume_page(&mut self, page: DecompressedPage, cursor: &PageCursor) {
+        assert_eq!(page.idx, cursor.page_idx, "a cursor resumes its own page");
+        let DecompressedPageType::Data(data) = page.data else {
+            panic!("a cursor lies inside a data page")
+        };
+        self.pages.clear();
+        self.page_idx = page.idx;
+        self.read_page = Some(ReadPage {
+            decoder: ValueDecoder::resume(data.data, &cursor.values),
+            running_filter_mask_opt: None,
+            remaining: cursor.rows_left,
+            def_levels: None,
+        });
+    }
+
+    fn skip_rows(&mut self, rows: usize) {
+        let read_page = self
+            .read_page
+            .as_mut()
+            .expect("rows are skipped in the page being read");
+        assert!(
+            read_page.running_filter_mask_opt.is_none() && read_page.def_levels.is_none(),
+            "rows are skipped in a resumed page, whose rows are all values"
+        );
+        skip_run(&mut read_page.decoder, rows);
+        read_page.remaining -= rows;
     }
 }
 

@@ -98,6 +98,31 @@ pub enum BuiltDictionary {
     Pruned,
 }
 
+/// A place inside a data page where its remaining rows can be read from,
+/// reached by one decoder and usable by any other decoder of the leaf.
+#[derive(Clone)]
+pub struct PageCursor {
+    /// The page's index within its column chunk.
+    pub page_idx: usize,
+    /// How many rows of the page lie from the cursor on.
+    pub rows_left: usize,
+    pub(crate) values: ValuesCursor,
+}
+
+/// Where a page's value stream is read from next.
+#[derive(Clone)]
+pub(crate) enum ValuesCursor {
+    /// A PLAIN page: the byte the next value starts at.
+    Plain(ReaderPosition),
+    /// A dictionary encoded page: the stream position, and the run the next
+    /// index is inside when the position is past that run's header.
+    Dictionary {
+        position: ReaderPosition,
+        bit_width: u8,
+        run: Option<rle::Run>,
+    },
+}
+
 /// Object-safe interface for decoding a single Parquet leaf column from
 /// decompressed pages into Arrow arrays.
 ///
@@ -133,6 +158,26 @@ pub trait LeafDecoder {
 
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
+
+    /// Where the page being read is read from next, for another decoder of
+    /// the leaf to [resume](Self::resume_page) there. `None` when no page is
+    /// partly read, or when the position alone does not let another decoder
+    /// read on: the page holds nulls or skipped rows ahead, or its encoding
+    /// carries state from the values before.
+    fn open_page_cursor(&self) -> Option<PageCursor> {
+        None
+    }
+
+    /// Forgets every page and reads `page` from `cursor` on, a cursor some
+    /// decoder of the leaf reached in that page.
+    fn resume_page(&mut self, _page: DecompressedPage, _cursor: &PageCursor) {
+        unreachable!("only a leaf that hands out page cursors is resumed from one")
+    }
+
+    /// Advances past the next `rows` rows of the page being read.
+    fn skip_rows(&mut self, _rows: usize) {
+        unreachable!("only a leaf that hands out page cursors skips rows of a page")
+    }
 
     /// Installs a pushed-down equality constant. A constant whose type does
     /// not match the column is ignored (the query's `Filter` still applies
@@ -197,6 +242,11 @@ pub trait DecodePlain {
 
     /// Advances past `size` values without decoding them.
     fn skip(&mut self, size: usize);
+
+    /// The position a decoder created with [`new`](Self::new) over the same
+    /// page reads this decoder's next value from. `None` when the next value
+    /// does not start on a byte.
+    fn resume_position(&self) -> Option<ReaderPosition>;
 }
 
 /// Reads values stored in one of the encodings besides PLAIN and the

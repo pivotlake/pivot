@@ -91,6 +91,10 @@ impl DecodePlain for BooleanPlainDecoder {
     fn skip(&mut self, size: usize) {
         self.advance(size);
     }
+
+    fn resume_position(&self) -> Option<ReaderPosition> {
+        (self.bit == 0).then_some(self.position)
+    }
 }
 
 /// The run an RLE page's cursor is in.
