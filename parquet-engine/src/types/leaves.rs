@@ -3,7 +3,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use ahash::HashMap;
 use arrow_array::{Array, ArrayRef, BinaryViewArray, Datum, StructArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::{DataType, Field, FieldRef, Fields};
@@ -226,15 +225,17 @@ pub(crate) struct LeafPlan {
 /// column. Reading that leaf once and letting each output fold its own view
 /// costs one decode instead of four.
 pub(crate) fn plan_leaves(reads: &[OutputRead]) -> LeafPlan {
+    // A row group reads a handful of leaves and is planned on the scan's hot
+    // path, so the leaves seen so far are searched in place.
     let mut file_leaves: Vec<usize> = Vec::new();
-    let mut position_of: HashMap<usize, usize> = HashMap::default();
     let output_positions = reads
         .iter()
         .map(|read| {
             read.leaf_sources()
                 .into_iter()
                 .map(|leaf| {
-                    *position_of.entry(leaf).or_insert_with(|| {
+                    let seen = file_leaves.iter().position(|&planned| planned == leaf);
+                    seen.unwrap_or_else(|| {
                         file_leaves.push(leaf);
                         file_leaves.len() - 1
                     })
