@@ -60,6 +60,22 @@ pub struct SpillWrite {
     buffers_writes_in_flight: Vec<Arc<WritesInFlight>>,
 }
 
+impl SpillWrite {
+    /// Count this write as in flight for `spilled_buffer`, which it carries
+    /// rows of, unless it already is.
+    fn count_against_buffer(&mut self, spilled_buffer: &SpilledBuffer) {
+        let already_counted = self
+            .buffers_writes_in_flight
+            .iter()
+            .any(|counted| Arc::ptr_eq(counted, &spilled_buffer.writes_in_flight));
+        if !already_counted {
+            spilled_buffer.writes_in_flight.count_issued_write();
+            self.buffers_writes_in_flight
+                .push(spilled_buffer.writes_in_flight.clone());
+        }
+    }
+}
+
 /// How many of a spilled buffer's writes have yet to land. The spilling
 /// worker counts each write as it issues it and counts it off as it lands; the
 /// buffer can be evicted once none is left.
