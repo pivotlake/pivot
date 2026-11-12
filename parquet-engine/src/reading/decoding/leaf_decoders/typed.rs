@@ -18,7 +18,7 @@ use crate::reading::decoding::leaf_decoders::levels::decode_def_levels;
 use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::reading::decoding::leaf_decoders::{
     ArrayBuilder, DecodeEncoding, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
-    LeafDecoder, LeafType, PageCursor, Result, ValuesCursor,
+    LeafDecoder, LeafType, PageCursor, Result, ValuesCursor, take_rows,
 };
 use crate::thrift::general::Encoding;
 use crate::thrift::headers::DataPageHeader;
@@ -100,6 +100,29 @@ fn decode_run<D, L>(
     }
 }
 
+/// Decode, of the next `rows` values, those at the ascending offsets `kept`
+/// into `builder`, advancing past all `rows`.
+fn decode_selected<D, L>(
+    decoder: &mut ValueDecoder<L>,
+    builder: &mut L::Builder,
+    dict: Option<&D>,
+    rows: usize,
+    kept: &[u32],
+) where
+    D: Dict<Builder = L::Builder, Item = <L::Builder as ArrayBuilder>::Element>,
+    L: LeafType,
+{
+    match decoder {
+        ValueDecoder::Plain(p) => p.read_selected(builder, rows, kept),
+        ValueDecoder::Dictionary(r) => {
+            r.read_selected(builder, dict.expect("No dict available!"), rows, kept)
+        }
+        ValueDecoder::DeltaBinaryPacked(d) => d.read_selected(builder, rows, kept),
+        ValueDecoder::DeltaLengthByteArray(d) => d.read_selected(builder, rows, kept),
+        ValueDecoder::Rle(d) => d.read_selected(builder, rows, kept),
+    }
+}
+
 /// Advance past `n` values without decoding them (a filtered-out run).
 fn skip_run<L: LeafType>(decoder: &mut ValueDecoder<L>, n: usize) {
     match decoder {
@@ -174,6 +197,41 @@ impl<L: LeafType> ReadPage<L> {
             }
         }
         self.remaining -= builder.len() - current_len;
+    }
+
+    /// Decodes, of the page's next `rows` rows, those at the ascending
+    /// offsets `kept` into `builder`, and advances past all `rows`.
+    ///
+    /// The page holds no nulls, and no skipped rows past the ones it starts
+    /// with: the only mask such a page carries is the one that starts it
+    /// inside the page, whose skipped rows are passed first.
+    pub fn read_selected_into<D>(
+        &mut self,
+        dict: Option<&D>,
+        builder: &mut L::Builder,
+        rows: usize,
+        kept: &[u32],
+    ) where
+        D: Dict<Builder = L::Builder, Item = <L::Builder as ArrayBuilder>::Element>,
+    {
+        assert!(
+            self.def_levels.is_none(),
+            "a page with nulls is not read by selection"
+        );
+        if let Some(mut mask) = self.running_filter_mask_opt.take() {
+            while !mask.rest_is_kept() {
+                let (is_kept, run) = mask.next_run(0);
+                assert!(
+                    !is_kept || mask.rest_is_kept(),
+                    "a page read by selection skips rows only where it starts"
+                );
+                if !is_kept {
+                    skip_run(&mut self.decoder, run);
+                }
+            }
+        }
+        decode_selected(&mut self.decoder, builder, dict, rows, kept);
+        self.remaining -= rows;
     }
 
     /// Like [`read_into`](Self::read_into) but for a page with nulls: each
@@ -575,6 +633,73 @@ impl<L: LeafType> LeafDecoder for TypedLeafDecoder<L> {
 
         let null_buffer = validity.map(|v| v.into_buffer());
         Ok(builder.into_array(null_buffer))
+    }
+
+    /// A nullable leaf takes the default: its pages interleave nulls with the
+    /// value stream, which a selection cannot step through by value offsets.
+    fn read_selected(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        rows: usize,
+        kept: &[u32],
+    ) -> Result<ArrayRef> {
+        if self.max_def_level > 0 {
+            let every_row = self.read(allocator, rows)?;
+            return Ok(take_rows(&every_row, kept));
+        }
+        let mut builder = L::Builder::with_capacity(allocator, kept.len());
+        match self.dict.as_deref() {
+            Some(DictStorage::Contiguous(d)) => d.register_onto(&mut builder),
+            Some(DictStorage::Scattered(d)) => d.register_onto(&mut builder),
+            None => {}
+        }
+        let mut kept_ahead = kept;
+        let mut passed = 0;
+        // The kept offsets of a page past the first are counted from the
+        // page's own first row among `rows`.
+        let mut kept_in_later_page = Vec::new();
+        while passed < rows {
+            if self
+                .read_page
+                .as_ref()
+                .is_some_and(|read_page| read_page.remaining == 0)
+            {
+                self.read_page = None;
+                self.page_idx += 1;
+            }
+            if self.read_page.is_none() && self.create_next_read_page()?.is_none() {
+                return Err(Error::NoPagesReady);
+            }
+            let read_page = self.read_page.as_mut().unwrap();
+            let rows_in_page = (rows - passed).min(read_page.remaining);
+            let kept_count =
+                kept_ahead.partition_point(|&offset| (offset as usize) < passed + rows_in_page);
+            let (kept_in_page, kept_after) = kept_ahead.split_at(kept_count);
+            kept_ahead = kept_after;
+            let kept_in_page = if passed == 0 {
+                kept_in_page
+            } else {
+                kept_in_later_page.clear();
+                kept_in_later_page.extend(kept_in_page.iter().map(|offset| offset - passed as u32));
+                kept_in_later_page.as_slice()
+            };
+            match self.dict.as_deref() {
+                Some(DictStorage::Contiguous(d)) => {
+                    read_page.read_selected_into(Some(d), &mut builder, rows_in_page, kept_in_page)
+                }
+                Some(DictStorage::Scattered(d)) => {
+                    read_page.read_selected_into(Some(d), &mut builder, rows_in_page, kept_in_page)
+                }
+                None => read_page.read_selected_into(
+                    None::<&L::ContiguousDict>,
+                    &mut builder,
+                    rows_in_page,
+                    kept_in_page,
+                ),
+            }
+            passed += rows_in_page;
+        }
+        Ok(builder.into_array(None))
     }
 
     fn open_page_cursor(&self) -> Option<PageCursor> {

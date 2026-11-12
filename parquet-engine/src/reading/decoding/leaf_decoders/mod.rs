@@ -159,6 +159,20 @@ pub trait LeafDecoder {
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
 
+    /// Decodes, of the next `rows` rows, those at the ascending offsets
+    /// `kept` into an Arrow array, and advances past all `rows`. A decoder
+    /// whose pages let it step over the rows between decodes only the kept
+    /// ones; this default decodes them all and keeps the ones asked for.
+    fn read_selected(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        rows: usize,
+        kept: &[u32],
+    ) -> Result<ArrayRef> {
+        let every_row = self.read(allocator, rows)?;
+        Ok(take_rows(&every_row, kept))
+    }
+
     /// Where the page being read is read from next, for another decoder of
     /// the leaf to [resume](Self::resume_page) there. `None` when no page is
     /// partly read, or when the position alone does not let another decoder
@@ -196,6 +210,13 @@ pub trait LeafDecoder {
     fn fast_filter_record_batch(&self, batch: RecordBatch, _column: usize) -> RecordBatch {
         batch
     }
+}
+
+/// The rows of `array` at the ascending offsets `kept`.
+pub(crate) fn take_rows(array: &ArrayRef, kept: &[u32]) -> ArrayRef {
+    let offsets = arrow_array::UInt32Array::from(kept.to_vec());
+    arrow_select::take::take(array, &offsets, None)
+        .expect("every kept offset lies inside the decoded rows")
 }
 
 // `ArrayBuilder` (and the primitive builder) now live in `dispatch::arrays` so the
@@ -247,6 +268,57 @@ pub trait DecodePlain {
     /// page reads this decoder's next value from. `None` when the next value
     /// does not start on a byte.
     fn resume_position(&self) -> Option<ReaderPosition>;
+
+    /// Decodes, of the next `rows` values, those at the ascending offsets
+    /// `kept` into `builder`, and advances past all `rows`.
+    fn read_selected(&mut self, builder: &mut Self::Builder, rows: usize, kept: &[u32])
+    where
+        Self: Sized,
+    {
+        read_selected_run_by_run(self, builder, rows, kept);
+    }
+}
+
+/// [`DecodePlain::read_selected`] for any PLAIN decoder: reads each run of
+/// adjacent kept values and skips the values between the runs.
+pub(crate) fn read_selected_run_by_run<P: DecodePlain>(
+    plain: &mut P,
+    builder: &mut P::Builder,
+    rows: usize,
+    kept: &[u32],
+) {
+    visit_kept_runs(rows, kept, |is_kept, length| {
+        if is_kept {
+            plain.read(builder, length)
+        } else {
+            plain.skip(length)
+        }
+    });
+}
+
+/// Splits `rows` consecutive values into the alternating runs to skip and to
+/// keep that the ascending offsets `kept` of the values to keep describe, and
+/// hands each run to `visit` in order as whether it is kept and its length.
+pub(crate) fn visit_kept_runs(rows: usize, kept: &[u32], mut visit: impl FnMut(bool, usize)) {
+    let mut visited = 0;
+    let mut kept_ahead = kept;
+    while let Some((&first, _)) = kept_ahead.split_first() {
+        let first = first as usize;
+        let run = kept_ahead
+            .iter()
+            .enumerate()
+            .take_while(|&(nth, &offset)| offset as usize == first + nth)
+            .count();
+        if first > visited {
+            visit(false, first - visited);
+        }
+        visit(true, run);
+        visited = first + run;
+        kept_ahead = &kept_ahead[run..];
+    }
+    if rows > visited {
+        visit(false, rows - visited);
+    }
 }
 
 /// Reads values stored in one of the encodings besides PLAIN and the
@@ -267,6 +339,18 @@ pub trait DecodeEncoding: Sized {
     /// Advances past `size` values. A delta decoder still decodes them,
     /// because each delta is relative to the one before it.
     fn skip(&mut self, size: usize);
+
+    /// Decodes, of the next `rows` values, those at the ascending offsets
+    /// `kept` into `builder`, and advances past all `rows`.
+    fn read_selected(&mut self, builder: &mut Self::Builder, rows: usize, kept: &[u32]) {
+        visit_kept_runs(rows, kept, |is_kept, length| {
+            if is_kept {
+                self.read(builder, length)
+            } else {
+                self.skip(length)
+            }
+        });
+    }
 }
 
 /// The decoder a [`LeafType`] names for an encoding it does not read. It has

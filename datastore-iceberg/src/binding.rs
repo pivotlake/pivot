@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, materialize, prune_parquet, row_group_filter_from,
+    scan_comparisons, scan_order_from, table_input_with_filter_and_comparisons,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
@@ -101,16 +101,16 @@ impl BoundTable for IcebergTableBinding {
             .iter()
             .flat_map(PushedPredicate::from_filter)
             .collect();
-        let eq_predicates = equality_predicates(&predicates);
+        let comparisons = scan_comparisons(&predicates);
         let scan_order = scan_order_from(&dynamic_filters);
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_filter_and_comparisons(
             dispatcher,
             &self.load_pruned_parquet()?,
             projection,
             emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
             scan_order,
-            Arc::new(eq_predicates),
+            Arc::new(comparisons),
         ))
     }
 

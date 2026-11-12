@@ -18,7 +18,7 @@ pub(crate) mod row_group_pages;
 pub use row_group_pages::DecodeRange;
 
 use crate::reading::decoding::leaf_decoders::{BuiltDictionary, LeafDecoder};
-use crate::reading::decoding::{DecodePlan, ScanEqualityPredicate, WorkerAllocator};
+use crate::reading::decoding::{DecodePlan, ScanComparison, WorkerAllocator};
 use crate::types::page::{DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
 use ahash::{HashMap, HashSet};
@@ -34,7 +34,7 @@ pub struct RangeCutterFactory {
     /// Which columns are decoded.
     pub projection: Projection,
     /// Pushed-down equality predicates for dictionary pruning (may be empty).
-    pub eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    pub comparisons: Arc<Vec<ScanComparison>>,
     /// This worker's claimed-but-not-yet-cut row-group count, shared with
     /// its fetcher; decremented as row groups are cut or pruned so the
     /// fetcher's claim backpressure releases (see `RowGroupFetcher`).
@@ -55,7 +55,7 @@ impl UnaryFactory<DecompressedPage, DecodeRange> for RangeCutterFactory {
     fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
         Built::new(RangeCutter::new(
             self.projection,
-            self.eq_predicates,
+            self.comparisons,
             self.pending_row_groups,
             self.outstanding_row_groups,
             self.allocator,
@@ -77,7 +77,7 @@ struct OpenRowGroup {
 /// [`DecodeRange`]s.
 pub struct RangeCutter {
     projection: Projection,
-    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    comparisons: Arc<Vec<ScanComparison>>,
     /// Slab allocator for the dictionaries built here, the worker's own.
     allocator: Arc<WorkerAllocator>,
     open: HashMap<usize, OpenRowGroup>,
@@ -91,14 +91,14 @@ pub struct RangeCutter {
 impl RangeCutter {
     pub fn new(
         projection: Projection,
-        eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+        comparisons: Arc<Vec<ScanComparison>>,
         pending_row_groups: Arc<AtomicUsize>,
         outstanding_row_groups: Arc<AtomicUsize>,
         allocator: Arc<WorkerAllocator>,
     ) -> Self {
         Self {
             projection,
-            eq_predicates,
+            comparisons,
             allocator,
             open: HashMap::default(),
             closed: HashSet::default(),
@@ -171,7 +171,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
         }
         if !self.open.contains_key(&row_group_index) {
             let plan = Arc::new(
-                DecodePlan::new(&metadata, &self.projection, &self.eq_predicates)
+                DecodePlan::new(&metadata, &self.projection, &self.comparisons)
                     .map_err(crate::op_err)?,
             );
             let leaf_decoders = plan
@@ -301,10 +301,11 @@ mod tests {
         }
     }
 
-    fn i32_eq_predicate(value: i32) -> ScanEqualityPredicate {
-        ScanEqualityPredicate {
+    fn i32_eq_predicate(value: i32) -> ScanComparison {
+        ScanComparison {
             column_idx: 0,
             path: Vec::new(),
+            operator: planner::expression::CompareType::Equal,
             value: Scalar::new(Arc::new(Int32Array::from(vec![value])) as ArrayRef),
         }
     }

@@ -1750,7 +1750,7 @@ fn scan_pushed_bare_extract_yields_a_subvariant() {
 fn scan_pushed_extract_filters_by_an_equality_constant() {
     use arrow_array::Scalar;
     use dispatch::VariantExtract;
-    use parquet_engine::{ScanEqualityPredicate, table_input_with_filter_and_eq_predicates};
+    use parquet_engine::{ScanComparison, table_input_with_filter_and_comparisons};
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let dispatch = dispatch(1);
@@ -1777,13 +1777,14 @@ fn scan_pushed_extract_filters_by_an_equality_constant() {
             as_type: Some(DataType::Utf8View),
         })],
     );
-    let predicate = ScanEqualityPredicate {
+    let predicate = ScanComparison {
         column_idx: 0,
         path: vec!["name".to_string()],
+        operator: planner::expression::CompareType::Equal,
         value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
     };
 
-    let results = table_input_with_filter_and_eq_predicates(
+    let results = table_input_with_filter_and_comparisons(
         &dispatch,
         &table,
         projection,
@@ -1810,7 +1811,7 @@ fn scan_pushed_extract_filters_by_an_equality_constant() {
 fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
     use arrow_array::Scalar;
     use dispatch::VariantExtract;
-    use parquet_engine::{ScanEqualityPredicate, table_input_with_filter_and_eq_predicates};
+    use parquet_engine::{ScanComparison, table_input_with_filter_and_comparisons};
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let dispatch = dispatch(1);
@@ -1836,13 +1837,14 @@ fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
             as_type: Some(DataType::Utf8View),
         })],
     );
-    let predicate = ScanEqualityPredicate {
+    let predicate = ScanComparison {
         column_idx: 0,
         path: vec!["name".to_string()],
+        operator: planner::expression::CompareType::Equal,
         value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
     };
 
-    let results = table_input_with_filter_and_eq_predicates(
+    let results = table_input_with_filter_and_comparisons(
         &dispatch,
         &table,
         projection,
@@ -1868,7 +1870,7 @@ fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
 fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
     use arrow_array::Scalar;
     use dispatch::VariantExtract;
-    use parquet_engine::{ScanEqualityPredicate, table_input_with_filter_and_eq_predicates};
+    use parquet_engine::{ScanComparison, table_input_with_filter_and_comparisons};
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let dispatch = dispatch(1);
@@ -1896,13 +1898,14 @@ fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
             as_type: Some(DataType::Utf8),
         })],
     );
-    let predicate = ScanEqualityPredicate {
+    let predicate = ScanComparison {
         column_idx: 0,
         path: vec!["name".to_string()],
+        operator: planner::expression::CompareType::Equal,
         value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
     };
 
-    let results = table_input_with_filter_and_eq_predicates(
+    let results = table_input_with_filter_and_comparisons(
         &dispatch,
         &table,
         projection,

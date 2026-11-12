@@ -36,6 +36,40 @@ unsafe fn gather_entries<D: Dict>(dict: &D, keys: &[u32], dest: &mut [D::Item]) 
     }
 }
 
+/// Whether every key of `bit_width` bits indexes inside `dict`: keys are
+/// bounded by the bit width, so when the dictionary is at least that large
+/// no key can be out of range.
+fn keys_fit_dictionary<D: Dict>(bit_width: u8, dict: &D) -> bool {
+    (1u64 << bit_width) as usize <= dict.len()
+}
+
+/// Appends `dict`'s entry for each of `keys` to `builder`.
+///
+/// Unless the keys are known to be in range (see [`keys_fit_dictionary`]),
+/// one max-scan (auto-vectorized) checks them all up front: slab-backed
+/// dictionaries index with no per-element bounds check, so out-of-range keys
+/// must be impossible by the time the lookup loop runs.
+#[inline(always)]
+fn append_entries<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+    builder: &mut B,
+    dict: &D,
+    keys: &[u32],
+    keys_in_range: bool,
+) {
+    if !keys_in_range {
+        let max = keys.iter().copied().max().unwrap_or(0);
+        assert!(
+            keys.is_empty() || (max as usize) < dict.len(),
+            "dictionary key {max} out of range ({} entries)",
+            dict.len()
+        );
+    }
+    let dest = builder.spare_mut(keys.len());
+    // SAFETY: every key is < dict.len() - by the bit-width bound or the
+    // max-scan assert above.
+    unsafe { gather_entries(dict, keys, dest) };
+}
+
 /// A single run in the RLE/bit-packed stream.
 #[derive(Clone)]
 pub enum Run {
@@ -227,13 +261,7 @@ impl Run {
                 partial,
                 partial_count,
             } => {
-                // Keys are bounded by the bit width; when the dictionary is
-                // at least that large no key can be out of range. Otherwise
-                // one max-scan per chunk (auto-vectorized) checks the whole
-                // chunk up front: slab-backed dictionaries index with no
-                // per-element bounds check, so out-of-range keys must be
-                // impossible by the time the lookup loop runs.
-                let keys_in_range = (1u64 << bit_width) as usize <= dict.len();
+                let keys_in_range = keys_fit_dictionary(bit_width, dict);
                 let (_, leftover) = decode_bitpacked(
                     remaining_in_run,
                     partial,
@@ -244,23 +272,21 @@ impl Run {
                     position,
                     limit,
                     |scratch, count| {
-                        let keys = &scratch[..count];
-                        if !keys_in_range {
-                            let max = keys.iter().copied().max().unwrap_or(0);
-                            assert!(
-                                (max as usize) < dict.len(),
-                                "dictionary key {max} out of range ({} entries)",
-                                dict.len()
-                            );
-                        }
-                        let dest = builder.spare_mut(count);
-                        // SAFETY: every key is < dict.len() - by the bit-width
-                        // bound or the max-scan assert above.
-                        unsafe { gather_entries(dict, keys, dest) };
+                        append_entries(builder, dict, &scratch[..count], keys_in_range)
                     },
                 );
                 leftover
             }
+        }
+    }
+
+    /// How many values the run still holds.
+    fn values_left(&self) -> usize {
+        match self {
+            Run::Rle { count, .. } => *count,
+            Run::BitPacked {
+                remaining_in_run, ..
+            } => *remaining_in_run,
         }
     }
 
@@ -495,6 +521,87 @@ impl RleDecoder {
             let (skipped, run) = run.skip(&self.data, self.bit_width, &mut self.position, size);
             self.run = run;
             size -= skipped;
+        }
+    }
+
+    /// Decodes, of the next `rows` values, those at the ascending offsets
+    /// `kept`, looking up each index in `dict` and pushing the result into
+    /// `builder`, and advances past all `rows`.
+    ///
+    /// The kept offsets are followed by one cursor that only moves forward,
+    /// as the runs and the chunks of a bit-packed run do. A repeated run
+    /// looks its entry up once for however many kept offsets fall inside it.
+    /// A bit-packed run with no kept offset is stepped over without being
+    /// unpacked, and one with some is unpacked a chunk at a time, each
+    /// chunk's kept keys moved to its front and looked up in one pass.
+    pub fn read_selected<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+        &mut self,
+        builder: &mut B,
+        dict: &D,
+        rows: usize,
+        kept: &[u32],
+    ) {
+        let keys_in_range = keys_fit_dictionary(self.bit_width, dict);
+        let mut kept_ahead = kept;
+        let mut offset = 0;
+        while offset < rows {
+            let run = self.get_or_set_next_run();
+            let taken = run.values_left().min(rows - offset);
+            let run_end = offset + taken;
+            let kept_in_run = kept_ahead
+                .iter()
+                .take_while(|&&kept_offset| (kept_offset as usize) < run_end)
+                .count();
+            let (mut kept_here, kept_after) = kept_ahead.split_at(kept_in_run);
+            kept_ahead = kept_after;
+            self.run = match run {
+                Run::Rle { value, count } => {
+                    if kept_in_run > 0 {
+                        builder.push(&dict.entry(value as usize), kept_in_run);
+                    }
+                    (count > taken).then_some(Run::Rle {
+                        value,
+                        count: count - taken,
+                    })
+                }
+                bit_packed if kept_in_run == 0 => {
+                    bit_packed
+                        .skip(&self.data, self.bit_width, &mut self.position, taken)
+                        .1
+                }
+                Run::BitPacked {
+                    remaining_in_run,
+                    partial,
+                    partial_count,
+                } => {
+                    let mut chunk_offset = offset;
+                    decode_bitpacked(
+                        remaining_in_run,
+                        partial,
+                        partial_count,
+                        &mut self.buffer,
+                        &self.data,
+                        self.bit_width,
+                        &mut self.position,
+                        taken,
+                        |keys, count| {
+                            let chunk_end = chunk_offset + count;
+                            let mut gathered = 0;
+                            while let Some((&kept_offset, rest)) = kept_here.split_first()
+                                && (kept_offset as usize) < chunk_end
+                            {
+                                keys[gathered] = keys[kept_offset as usize - chunk_offset];
+                                gathered += 1;
+                                kept_here = rest;
+                            }
+                            append_entries(builder, dict, &keys[..gathered], keys_in_range);
+                            chunk_offset = chunk_end;
+                        },
+                    )
+                    .1
+                }
+            };
+            offset = run_end;
         }
     }
 
@@ -769,5 +876,44 @@ mod tests {
             .take(24)
             .collect();
         assert_eq!(result, expected);
+    }
+
+    /// A bit-packed run of sixteen indices, then an index repeated five
+    /// times: the kept offsets fall inside both runs.
+    #[test]
+    fn values_at_kept_offsets_decode_out_of_bit_packed_and_repeated_runs() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["a", "b", "c"]);
+        let mut data = vec![(2 << 1) | 1];
+        data.extend((0..16u8).map(|offset| offset % 3));
+        data.extend([5 << 1, 2]);
+        let mut decoder = new_decoder(data, 8);
+        let mut builder = ViewBuilder::with_capacity(&mut allocator, 5);
+        dict.register_onto(&mut builder);
+
+        decoder.read_selected(&mut builder, &dict, 21, &[1, 7, 15, 16, 20]);
+
+        assert_eq!(extract_strings(builder), vec!["b", "b", "a", "c", "c"]);
+    }
+
+    /// Reading on after a selection continues at the row past the ones it
+    /// covered, inside the run it stopped in.
+    #[test]
+    fn a_read_after_a_selection_continues_past_the_rows_it_covered() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["a", "b", "c"]);
+        let mut data = vec![(2 << 1) | 1];
+        data.extend((0..16u8).map(|offset| offset % 3));
+        let mut decoder = new_decoder(data, 8);
+        let mut selected = ViewBuilder::with_capacity(&mut allocator, 1);
+        dict.register_onto(&mut selected);
+
+        decoder.read_selected(&mut selected, &dict, 5, &[4]);
+        let rest = push_all(&mut allocator, &mut decoder, &dict, 3);
+
+        assert_eq!(extract_strings(selected), vec!["b"]);
+        assert_eq!(rest, vec!["c", "a", "b"]);
     }
 }

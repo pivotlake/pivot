@@ -20,8 +20,8 @@ use arrow_buffer::ArrowNativeType;
 
 use super::{BuiltDictionary, PageCursor, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::{
-    DecodePlain, DeltaPacking, Dict, DictFromBytes, DictFromVecBytes, LeafDecoder, LeafType,
-    Result, TypedLeafDecoder, Unsupported,
+    ArrayBuilder, DecodePlain, DeltaPacking, Dict, DictFromBytes, DictFromVecBytes, LeafDecoder,
+    LeafType, Result, TypedLeafDecoder, Unsupported, read_selected_run_by_run,
 };
 use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::page::DecompressedPage;
@@ -286,6 +286,29 @@ where
     fn resume_position(&self) -> Option<ReaderPosition> {
         Some(self.position)
     }
+
+    /// Values stored at their native width in the current buffer are loaded
+    /// straight from their offsets; the rows between cost nothing.
+    fn read_selected(&mut self, builder: &mut PrimitiveBuilder<T>, rows: usize, kept: &[u32]) {
+        let width = T::Native::PHYSICAL_SIZE;
+        let buffer = &self.data[self.position.buffer_index];
+        let rows_lie_in_buffer = self.position.offset + rows * width <= buffer.len();
+        if !rows_lie_in_buffer || width != mem::size_of::<T::Native>() {
+            return read_selected_run_by_run(self, builder, rows, kept);
+        }
+        assert!(
+            kept.last().is_none_or(|&last| (last as usize) < rows),
+            "a kept offset lies among the rows read"
+        );
+        let values = unsafe { buffer.as_ptr().add(self.position.offset) };
+        for (slot, &offset) in builder.spare_mut(kept.len()).iter_mut().zip(kept) {
+            // SAFETY: `offset < rows`, and all `rows` values lie in `buffer`.
+            *slot = unsafe {
+                std::ptr::read_unaligned(values.add(offset as usize * width) as *const T::Native)
+            };
+        }
+        self.position.offset += rows * width;
+    }
 }
 
 /// [`Dict`] implementation for fixed-width primitives, generic over the
@@ -488,6 +511,19 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
         let array = self.inner.read(allocator, size)?;
+        Ok(Arc::new(attach_timestamp_timezone(
+            array,
+            self.timezone.clone(),
+        )))
+    }
+
+    fn read_selected(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        rows: usize,
+        kept: &[u32],
+    ) -> Result<ArrayRef> {
+        let array = self.inner.read_selected(allocator, rows, kept)?;
         Ok(Arc::new(attach_timestamp_timezone(
             array,
             self.timezone.clone(),

@@ -9,8 +9,8 @@ use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, materialize, prune_parquet, row_group_filter_from,
+    scan_comparisons, scan_order_from, table_input_with_filter_and_comparisons,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
@@ -169,21 +169,21 @@ impl BoundTable for TableBinding {
 
         // A variant path predicate reaches its shredded typed leaf only in the
         // files that shred it, so each row group resolves the path itself.
-        let eq_predicates = equality_predicates(&self.predicates);
+        let comparisons = scan_comparisons(&self.predicates);
 
         // Prune the row groups by the pushed-down predicates' stats.
         let parquet = Arc::new(self.pruned_parquet(&current));
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_filter_and_comparisons(
             dispatcher,
             &parquet,
             projection,
             emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
             scan_order,
-            Arc::new(eq_predicates),
+            Arc::new(comparisons),
         ))
     }
 

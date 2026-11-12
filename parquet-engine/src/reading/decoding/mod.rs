@@ -19,6 +19,7 @@ use dispatch::arrays::accumulator::BatchAccumulator;
 use dispatch::memory::SlabAllocator;
 use dispatch::{Built, BuiltUnary};
 use dispatch::{Unary, UnaryFactory};
+use planner::expression::CompareType;
 use row_group_decoder::DecodedBatch;
 use std::sync::{Arc, Mutex};
 
@@ -31,12 +32,20 @@ mod row_group_decoder;
 pub(crate) use row_group_decoder::DecodePlan;
 pub use row_group_decoder::RowGroupDecoder;
 
-/// A pushed-down equality predicate (`column == value`) used for dictionary
-/// pruning at scan time. When a row group's dictionary for the compared column
-/// excludes `value` (and the column chunk is fully dictionary encoded), the row
-/// group can emit no rows and is dropped without decoding its data pages.
+/// A pushed-down comparison of a column against a constant
+/// (`column <operator> value`) that the scan applies where it saves decoding.
+/// The query's own filter still applies it to every row the scan emits.
+///
+/// An equality prunes by dictionary: when a row group's dictionary for the
+/// compared column excludes `value` (and the column chunk is fully dictionary
+/// encoded), the row group can emit no rows and is dropped without decoding
+/// its data pages.
+///
+/// Any comparison of a plain column gates the decode of the row group's
+/// other columns: where it rejects most of a batch's rows, only the rows it
+/// passes are decoded (see [`RowGroupDecoder`]).
 #[derive(Clone, Debug)]
-pub struct ScanEqualityPredicate {
+pub struct ScanComparison {
     /// The top-level column the comparison reads, indexing the table's full
     /// schema. For a variant path this is the variant column.
     pub column_idx: usize,
@@ -45,6 +54,7 @@ pub struct ScanEqualityPredicate {
     /// comparison. A path predicate applies to the shredded typed leaf that
     /// path resolves to in each file.
     pub path: Vec<String>,
+    pub operator: CompareType,
     pub value: Scalar<ArrayRef>,
 }
 
@@ -238,8 +248,9 @@ impl Decoder {
         Ok(())
     }
 
-    /// Emits one batch of the active range, retiring the range once its
-    /// rows are all emitted. Returns whether a batch was sent.
+    /// Emits the next batch of the active range, retiring the range once its
+    /// rows are all read. Returns whether the range moved on: a batch was
+    /// sent, or the range's last rows were read and made none.
     fn produce_batch(
         &mut self,
         sender: &mut dyn Sender<RecordBatch>,
@@ -247,15 +258,13 @@ impl Decoder {
         let Some(decoder) = self.active.as_mut() else {
             return Ok(false);
         };
-        let Some(DecodedBatch { batch, live_rows }) = self
+        let read = self
             .allocator
             .with(|allocator| decoder.try_read(allocator))
-            .map_err(crate::op_err)?
-        else {
-            return Ok(false);
-        };
+            .map_err(crate::op_err)?;
         let group = decoder.row_group_index();
-        if decoder.exhausted() {
+        let range_read = decoder.exhausted();
+        if range_read {
             let mut decoder = self.active.take().unwrap();
             decoder.finish_range().decoded();
             self.idle.push(decoder);
@@ -264,6 +273,9 @@ impl Decoder {
             // still hold.
             self.idle.retain(|idle| !idle.row_group_done());
         }
+        let Some(DecodedBatch { batch, live_rows }) = read else {
+            return Ok(range_read);
+        };
         match live_rows {
             Some(live_rows) => self.hold_live_rows(&batch, &live_rows, group, sender)?,
             None => {
@@ -535,10 +547,11 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn string_eq_predicate(column_idx: usize, value: &str) -> ScanEqualityPredicate {
-        ScanEqualityPredicate {
+    pub(crate) fn string_eq_predicate(column_idx: usize, value: &str) -> ScanComparison {
+        ScanComparison {
             column_idx,
             path: Vec::new(),
+            operator: planner::expression::CompareType::Equal,
             value: Scalar::new(
                 Arc::new(arrow_array::StringViewArray::from(vec![value])) as ArrayRef
             ),
@@ -559,11 +572,11 @@ pub(crate) mod tests {
     /// assertion.
     pub(crate) fn new_cutter(
         table: &Arc<ParquetTable>,
-        eq_predicates: Vec<ScanEqualityPredicate>,
+        comparisons: Vec<ScanComparison>,
     ) -> RangeCutter {
         RangeCutter::new(
             Projection::all_from_schema(table.schema()),
-            Arc::new(eq_predicates),
+            Arc::new(comparisons),
             Arc::new(AtomicUsize::new(usize::MAX / 2)),
             Arc::new(AtomicUsize::new(usize::MAX / 2)),
             Arc::new(WorkerAllocator::new()),
@@ -584,9 +597,9 @@ pub(crate) mod tests {
         table: &Arc<ParquetTable>,
         pages: Vec<DecompressedPage>,
         batch_size: usize,
-        eq_predicates: Vec<ScanEqualityPredicate>,
+        comparisons: Vec<ScanComparison>,
     ) -> Vec<RecordBatch> {
-        let ranges = run_unary_to_completion(new_cutter(table, eq_predicates), pages);
+        let ranges = run_unary_to_completion(new_cutter(table, comparisons), pages);
         run_unary_to_completion(new_decoder(batch_size), ranges)
     }
 
@@ -968,5 +981,119 @@ pub(crate) mod tests {
         let expected_strings: Vec<&str> = (32_768..40_000).map(|row| entries[row % 3]).collect();
         assert_eq!(strings, expected_strings);
         assert_eq!(numbers, (32_768..40_000).collect::<Vec<i32>>());
+    }
+
+    /// `column <operator> value` over an `i32` column.
+    fn i32_comparison(column_idx: usize, operator: CompareType, value: i32) -> ScanComparison {
+        ScanComparison {
+            column_idx,
+            path: Vec::new(),
+            operator,
+            value: Scalar::new(Arc::new(Int32Array::from(vec![value])) as ArrayRef),
+        }
+    }
+
+    /// Two `i32` columns of `rows` rows, one page each: the first holds
+    /// `first_column` of the row number, the second the row number.
+    fn value_and_row_number_pages(
+        metadata: &QueryRowGroupMetadata,
+        rows: i32,
+        first_column: impl Fn(i32) -> i32,
+    ) -> Vec<DecompressedPage> {
+        let values: Vec<i32> = (0..rows).map(first_column).collect();
+        let row_numbers: Vec<i32> = (0..rows).collect();
+        vec![
+            make_data_page(
+                metadata.clone(),
+                0,
+                encode_i32s(&values),
+                rows as usize,
+                0,
+                0,
+            ),
+            make_data_page(
+                metadata.clone(),
+                1,
+                encode_i32s(&row_numbers),
+                rows as usize,
+                0,
+                0,
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_comparison_few_rows_pass_emits_only_those_rows_of_every_column() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a", "b"]), 10_000);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let pages = value_and_row_number_pages(&metadata, 10_000, |row| row % 10);
+        let comparison = i32_comparison(0, CompareType::Equal, 3);
+
+        let out = decode(&table, pages, 8192, vec![comparison]);
+
+        let values: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 0)).collect();
+        let row_numbers: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
+        let passing_rows: Vec<i32> = (0..10_000).filter(|row| row % 10 == 3).collect();
+        assert_eq!(values, vec![3; 1_000]);
+        assert_eq!(row_numbers, passing_rows);
+    }
+
+    #[test]
+    fn a_comparison_most_rows_pass_emits_every_row() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a", "b"]), 10_000);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let pages = value_and_row_number_pages(&metadata, 10_000, |row| row % 2);
+        let comparison = i32_comparison(0, CompareType::NotEqual, 5);
+
+        let out = decode(&table, pages, 8192, vec![comparison]);
+
+        let row_numbers: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
+        assert_eq!(row_numbers, (0..10_000).collect::<Vec<i32>>());
+    }
+
+    /// The first batch's rows all fail the comparison, the second batch's
+    /// all pass it.
+    #[test]
+    fn rows_that_all_fail_a_comparison_make_no_batch() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a", "b"]), 16_384);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let pages = value_and_row_number_pages(&metadata, 16_384, |row| (row >= 8_192) as i32);
+        let comparison = i32_comparison(0, CompareType::Equal, 1);
+
+        let out = decode(&table, pages, 8192, vec![comparison]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            extract_i32s(&out[0], 1),
+            (8_192..16_384).collect::<Vec<i32>>()
+        );
+    }
+
+    #[test]
+    fn a_comparison_picks_its_passing_rows_out_of_a_dictionary_encoded_column() {
+        init_test_free_pool(4);
+        let table = string_and_i32_table(9_000, true);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let entries = ["MAIL", "SHIP", "RAIL"];
+        let keys: Vec<u8> = (0..9_000).map(|row| (row % 3) as u8).collect();
+        let values: Vec<i32> = (0..9_000).map(|row| row % 10).collect();
+        let pages = vec![
+            make_dict_page(metadata.clone(), 0, &entries),
+            make_rle_data_page(metadata.clone(), 0, &keys, 0),
+            make_data_page(metadata, 1, encode_i32s(&values), 9_000, 0, 0),
+        ];
+        let comparison = i32_comparison(1, CompareType::Equal, 7);
+
+        let out = decode(&table, pages, 8192, vec![comparison]);
+
+        let strings: Vec<String> = out.iter().flat_map(|b| extract_strings(b, 0)).collect();
+        let expected: Vec<&str> = (0..9_000)
+            .filter(|row| row % 10 == 7)
+            .map(|row| entries[row % 3])
+            .collect();
+        assert_eq!(strings, expected);
     }
 }

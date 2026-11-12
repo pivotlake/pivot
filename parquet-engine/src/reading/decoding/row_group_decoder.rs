@@ -6,10 +6,14 @@
 //! decoder stopped goes on from the page it has open; any other range
 //! repositions it, which costs a skip into the range's first page of every
 //! column.
+//!
+//! A pushed-down comparison of a plain column gates the decode of the rest:
+//! each batch decodes the compared leaves first, and where the comparisons
+//! reject most of its rows the other leaves decode only the rows that pass.
 
-use crate::reading::decoding::ScanEqualityPredicate;
+use crate::reading::decoding::ScanComparison;
 use crate::reading::decoding::column_decoder::{ColumnDecoder, Error, Result, create_leaf_decoder};
-use crate::reading::decoding::leaf_decoders::LeafDecoder;
+use crate::reading::decoding::leaf_decoders::{LeafDecoder, take_rows};
 use crate::reading::range_cutter::row_group_pages::{
     DecodeRange, LeafCursors, PageContent, StoredPage,
 };
@@ -19,10 +23,12 @@ use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
-use arrow_array::{ArrayRef, RecordBatch, Scalar};
+use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
-use arrow_schema::{FieldRef, Fields, Schema, SchemaRef};
+use arrow_ord::cmp;
+use arrow_schema::{DataType, FieldRef, Fields, Schema, SchemaRef};
 use dispatch::memory::SlabAllocator;
+use planner::expression::CompareType;
 use std::cmp::min;
 use std::ops::Range;
 use std::sync::Arc;
@@ -37,6 +43,57 @@ pub(crate) struct PrunableColumn {
     /// The leaf whose dictionary decides the pruning.
     pub leaf: usize,
 }
+
+/// A pushed-down comparison evaluated on a decoded leaf, so that the row
+/// group's other leaves decode only the rows it passes.
+pub(crate) struct Gate {
+    /// The decoded leaf the comparison reads.
+    leaf: usize,
+    operator: CompareType,
+    /// The constant compared against, of the leaf's own type.
+    value: Scalar<ArrayRef>,
+}
+
+impl Gate {
+    /// A bit per row of `leaf_rows`, set where the comparison holds. A null
+    /// passes no comparison.
+    fn find_passing_rows(&self, leaf_rows: &ArrayRef) -> BooleanBuffer {
+        let compare = match self.operator {
+            CompareType::Equal => cmp::eq,
+            CompareType::NotEqual => cmp::neq,
+            CompareType::Less => cmp::lt,
+            CompareType::Greater => cmp::gt,
+            CompareType::LessEqual => cmp::lt_eq,
+            CompareType::GreaterEqual => cmp::gt_eq,
+        };
+        let passes =
+            compare(leaf_rows, &self.value).expect("a gate's constant has its leaf's type");
+        match passes.nulls() {
+            Some(nulls) => passes.values() & nulls.inner(),
+            None => passes.values().clone(),
+        }
+    }
+}
+
+/// Whether a comparison of `leaf_type` values means to the decoder what it
+/// means to the query's filter, which decides the rows for real: integers,
+/// dates, timestamps and strings order one way everywhere.
+fn compares_like_the_query(leaf_type: &DataType) -> bool {
+    leaf_type.is_integer()
+        || matches!(
+            leaf_type,
+            DataType::Boolean
+                | DataType::Date32
+                | DataType::Timestamp(_, _)
+                | DataType::Utf8View
+                | DataType::BinaryView
+        )
+}
+
+/// The most of a batch's rows, in percent, its gates may pass for the other
+/// leaves to decode by selection. A batch that keeps more decodes whole:
+/// picking out most of the rows costs more than decoding all of them.
+const MOST_PASSING_PERCENT_TO_SELECT: usize = 35;
 
 /// How a row group's projected columns decode: which leaves are read, one
 /// view per output column, and the leaves whose dictionaries can prune the
@@ -57,13 +114,15 @@ pub(crate) struct DecodePlan {
     pub prunable: Vec<PrunableColumn>,
     /// The pushed-down equality constant each prunable leaf's decoder gets.
     eq_constants: Vec<(usize, Scalar<ArrayRef>)>,
+    /// The pushed-down comparisons the decoders evaluate themselves.
+    gates: Vec<Gate>,
 }
 
 impl DecodePlan {
     pub fn new(
         row_group_metadata: &QueryRowGroupMetadata,
         projection: &Projection,
-        eq_predicates: &[ScanEqualityPredicate],
+        comparisons: &[ScanComparison],
     ) -> Result<Self> {
         // Expand projected columns into this file's leaves. Variant layouts can
         // differ between files, so each row group resolves them independently,
@@ -95,24 +154,27 @@ impl DecodePlan {
             &plan.file_leaves,
             row_group_metadata.columns(),
             projection,
-            eq_predicates,
+            comparisons,
         );
+        let leaf_fields: Vec<FieldRef> = plan
+            .file_leaves
+            .iter()
+            .map(|&leaf| leaves[leaf].clone())
+            .collect();
+        let gates = plan_gates(&column_decoders, &leaf_fields, projection, comparisons);
 
         let output_fields: Fields = column_decoders
             .iter()
             .map(|decoder| decoder.output_field().clone())
             .collect();
         Ok(Self {
-            leaf_fields: plan
-                .file_leaves
-                .iter()
-                .map(|&leaf| leaves[leaf].clone())
-                .collect(),
+            leaf_fields,
             file_leaves: plan.file_leaves,
             column_decoders,
             schema: Arc::new(Schema::new(output_fields)),
             prunable,
             eq_constants,
+            gates,
         })
     }
 
@@ -175,6 +237,11 @@ pub struct RowGroupDecoder {
     /// by their position inside the row group, so every row has to stay in
     /// place.
     filter_batches: bool,
+    /// Whether the attached range's batches still try their gates. A batch
+    /// the gates pass most of ends the trying for the rest of its range:
+    /// neighbouring rows tend to pass alike, and each try costs a comparison
+    /// over the batch.
+    gating_range: bool,
 }
 
 /// The most page bytes a batch spans, across the leaves it decodes, before
@@ -243,6 +310,7 @@ impl RowGroupDecoder {
             ranges_left: range.ranges_left().clone(),
             add_row_group_metadata,
             filter_batches,
+            gating_range: false,
             metadata,
         })
     }
@@ -281,6 +349,7 @@ impl RowGroupDecoder {
         self.live_in_range = self.live_rows_of(&rows);
         self.next_row = rows.start as usize;
         self.end_row = rows.end as usize;
+        self.gating_range = !self.plan.gates.is_empty();
         if !continues {
             self.reposition_at(&range);
         }
@@ -479,34 +548,20 @@ impl RowGroupDecoder {
     /// rows, `Ok(None)` if more pages are needed, or an error if decoding
     /// fails.
     pub fn try_read(&mut self, allocator: &mut SlabAllocator) -> Result<Option<DecodedBatch>> {
-        let size = min(self.batch_size, self.end_row - self.next_row);
-        let available = min(
-            self.leaf_decoders
-                .iter()
-                .map(|leaf| leaf.available())
-                .min()
-                .unwrap(),
-            size,
-        );
-
-        if size > 0 && available > 0 {
-            // Every distinct leaf is decoded once; the output columns then fold
-            // their own views of the result, so two extracts over one variant
-            // column share the decode instead of repeating it.
-            let decoded = self
-                .leaf_decoders
-                .iter_mut()
-                .map(|leaf| leaf.read(allocator, available).map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?;
-            let columns = self
-                .plan
-                .column_decoders
-                .iter()
-                .map(|decoder| decoder.read(&decoded))
-                .collect::<Result<Vec<_>>>()?;
-            let record_batch = RecordBatch::try_new(self.plan.schema.clone(), columns)?;
+        loop {
+            let size = min(self.batch_size, self.end_row - self.next_row);
+            let available = min(
+                self.leaf_decoders
+                    .iter()
+                    .map(|leaf| leaf.available())
+                    .min()
+                    .unwrap(),
+                size,
+            );
+            if size == 0 || available == 0 {
+                return Ok(None);
+            }
             let first_row = self.next_row;
-            self.next_row += available;
             // The rows the table format deleted are named by the batch's
             // bits rather than dropped here, for the parent to copy the rest
             // into full batches.
@@ -514,6 +569,28 @@ impl RowGroupDecoder {
                 let live = live.slice(live.len() - (self.end_row - first_row), available);
                 (live.count_set_bits() < available).then_some(live)
             });
+            // Every distinct leaf is decoded once; the output columns then fold
+            // their own views of the result, so two extracts over one variant
+            // column share the decode instead of repeating it. The gates drop
+            // rows only where a batch may drop rows at all.
+            let decoded = if self.gating_range && self.filter_batches && live_rows.is_none() {
+                self.read_rows_passing_gates(allocator, available)?
+            } else {
+                Some(self.read_every_row(allocator, available)?)
+            };
+            self.next_row += available;
+            // Rows that all fail the gates make no batch; the rows after
+            // them are read next.
+            let Some(decoded) = decoded else {
+                continue;
+            };
+            let columns = self
+                .plan
+                .column_decoders
+                .iter()
+                .map(|decoder| decoder.read(&decoded))
+                .collect::<Result<Vec<_>>>()?;
+            let record_batch = RecordBatch::try_new(self.plan.schema.clone(), columns)?;
             // Give each column carrying a pushed-down equality constant a
             // chance to drop rows that provably fail it, before the batch
             // travels any further. Dictionary encoded string columns filter it
@@ -532,11 +609,106 @@ impl RowGroupDecoder {
             } else {
                 record_batch
             };
-            Ok(Some(DecodedBatch { batch, live_rows }))
-        } else {
-            Ok(None)
+            return Ok(Some(DecodedBatch { batch, live_rows }));
         }
     }
+
+    /// Decodes the next `rows` rows of every leaf.
+    fn read_every_row(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        rows: usize,
+    ) -> Result<Vec<ArrayRef>> {
+        self.leaf_decoders
+            .iter_mut()
+            .map(|leaf| leaf.read(allocator, rows).map_err(Into::into))
+            .collect()
+    }
+
+    /// Reads the next `rows` rows through the gates: decodes the gates'
+    /// leaves, and where the gates pass few enough of the rows decodes the
+    /// other leaves for those rows only, returning every leaf cut down to
+    /// them, or `None` when no row passes. Rows the gates pass most of are
+    /// decoded whole, and so is the rest of the range.
+    fn read_rows_passing_gates(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        rows: usize,
+    ) -> Result<Option<Vec<ArrayRef>>> {
+        let mut gate_leaf_rows: Vec<Option<ArrayRef>> = vec![None; self.leaf_decoders.len()];
+        let mut passing: Option<BooleanBuffer> = None;
+        for gate in &self.plan.gates {
+            if gate_leaf_rows[gate.leaf].is_none() {
+                gate_leaf_rows[gate.leaf] =
+                    Some(self.leaf_decoders[gate.leaf].read(allocator, rows)?);
+            }
+            let passing_gate = gate.find_passing_rows(gate_leaf_rows[gate.leaf].as_ref().unwrap());
+            passing = Some(match passing {
+                Some(passing_earlier_gates) => &passing_earlier_gates & &passing_gate,
+                None => passing_gate,
+            });
+        }
+        let passing = passing.expect("a gated range has a gate");
+        if passing.count_set_bits() * 100 > rows * MOST_PASSING_PERCENT_TO_SELECT {
+            self.gating_range = false;
+            let every_row = gate_leaf_rows
+                .into_iter()
+                .zip(&mut self.leaf_decoders)
+                .map(|(gate_rows, leaf)| match gate_rows {
+                    Some(gate_rows) => Ok(gate_rows),
+                    None => leaf.read(allocator, rows).map_err(Into::into),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Some(every_row));
+        }
+        let kept: Vec<u32> = passing.set_indices().map(|row| row as u32).collect();
+        let kept_rows = gate_leaf_rows
+            .into_iter()
+            .zip(&mut self.leaf_decoders)
+            .map(|(gate_rows, leaf)| match gate_rows {
+                Some(gate_rows) => Ok(take_rows(&gate_rows, &kept)),
+                None => leaf
+                    .read_selected(allocator, rows, &kept)
+                    .map_err(Into::into),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((!kept.is_empty()).then_some(kept_rows))
+    }
+}
+
+/// The pushed-down comparisons the row group's decoders can evaluate
+/// themselves, each on the decoded leaf it reads.
+///
+/// A comparison gates only when its column is emitted as exactly one decoded
+/// leaf unchanged, so the leaf's rows are the values the query compares; when
+/// the leaf's type compares the same way here as in the query's filter; and
+/// when its constant is of that type.
+fn plan_gates(
+    column_decoders: &[ColumnDecoder],
+    leaf_fields: &[FieldRef],
+    projection: &Projection,
+    comparisons: &[ScanComparison],
+) -> Vec<Gate> {
+    comparisons
+        .iter()
+        .filter(|comparison| comparison.path.is_empty())
+        .filter_map(|comparison| {
+            let output_idx = projection.column_indices.iter().enumerate().position(
+                |(output_idx, &column)| {
+                    column == comparison.column_idx && projection.extract_at(output_idx).is_none()
+                },
+            )?;
+            let leaf = column_decoders[output_idx].untransformed_leaf()?;
+            let leaf_type = leaf_fields[leaf].data_type();
+            let comparable = compares_like_the_query(leaf_type)
+                && comparison.value.get().0.data_type() == leaf_type;
+            comparable.then(|| Gate {
+                leaf,
+                operator: comparison.operator,
+                value: comparison.value.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Decides which output columns the row group can be pruned by, and the
@@ -564,7 +736,7 @@ fn prunable_columns(
     file_leaves: &[usize],
     column_chunks: &[ColumnChunkMeta],
     projection: &Projection,
-    eq_predicates: &[ScanEqualityPredicate],
+    comparisons: &[ScanComparison],
 ) -> (Vec<PrunableColumn>, Vec<(usize, Scalar<ArrayRef>)>) {
     let mut prunable = Vec::new();
     let mut eq_constants = Vec::new();
@@ -578,10 +750,9 @@ fn prunable_columns(
             .extract_at(output_idx)
             .map(|extract| extract.path.as_slice())
             .unwrap_or_default();
-        let Some(predicate) = eq_predicates
-            .iter()
-            .find(|p| p.column_idx == column && p.path == path)
-        else {
+        let Some(predicate) = comparisons.iter().find(|p| {
+            matches!(p.operator, CompareType::Equal) && p.column_idx == column && p.path == path
+        }) else {
             continue;
         };
         if !column_chunks[file_leaves[leaf]].data_pages_all_dictionary {
