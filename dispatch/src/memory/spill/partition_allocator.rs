@@ -640,6 +640,7 @@ impl<L: Layout> PartitionAllocator<L> {
             }
             spilled_buffers.push(SpilledBuffer {
                 writes_in_flight: Arc::new(AtomicUsize::new(0)),
+                buffers_spilled_by_worker: memory_ctx().share_own_buffers_spilled(),
                 buffer,
                 slabs: Vec::new(),
                 partition_group_slot: partition_group_slot_idx,

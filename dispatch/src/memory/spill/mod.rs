@@ -81,6 +81,10 @@ pub struct SpilledSlab {
 pub struct SpilledBuffer {
     /// Counted down by the worker as each of the buffer's writes lands.
     writes_in_flight: Arc<AtomicUsize>,
+    /// The count, kept by the worker that spilled this buffer, of the buffers
+    /// it spilled that are still held. Whichever worker releases this buffer
+    /// counts it off.
+    buffers_spilled_by_worker: Arc<AtomicUsize>,
     buffer: Arc<WriteBuffer>,
     slabs: Vec<SpilledSlab>,
     /// The tree node the buffer was allocated from, which is where the
@@ -263,6 +267,7 @@ mod tests {
         spiller.spill(writes, 1).unwrap();
         let spilled = SpilledBuffer {
             writes_in_flight: buffer_writes_in_flight,
+            buffers_spilled_by_worker: memory_ctx().share_own_buffers_spilled(),
             buffer: buffer.clone(),
             partition_group_slot: 0,
             slabs: vec![first, second, third]

@@ -181,7 +181,7 @@ impl MemoryContextFactory {
             layout: self.layout,
             evictors: RefCell::new(HashMap::new()),
             buffers_spilled: self.buffers_spilled,
-            own_buffers_spilled: Cell::new(0),
+            own_buffers_spilled: Arc::new(AtomicUsize::new(0)),
             spill_pressure: self.spill_pressure,
             io_requester: OnceCell::new(),
             spill_writes_in_flight: RefCell::new(HashMap::new()),
@@ -219,10 +219,12 @@ pub struct MemoryContext {
     /// node's workers, so a slot one worker is already spilling is not asked
     /// for again by another.
     buffers_spilled: Arc<[AtomicUsize]>,
-    /// The slots this worker itself has handed over for spilling and still
-    /// holds. Only this worker's eviction can take those back, so they are
-    /// what tells one worker's need to spill apart from its siblings'.
-    own_buffers_spilled: Cell<usize>,
+    /// The slots this worker itself has handed over for spilling and that are
+    /// still held. They are what tells one worker's need to spill apart from
+    /// its siblings'. Every one of those buffers carries a handle on the
+    /// count, because a sibling that takes the buffer back counts it off from
+    /// its own thread.
+    own_buffers_spilled: Arc<AtomicUsize>,
     /// Per node, whether the last worker to count the node's reclaimable
     /// slots found it short of them. A worker that took no buffer reads only
     /// this to learn that its siblings have run the node short.
@@ -604,10 +606,10 @@ impl MemoryContext {
     /// because eviction can take them once their write lands, so the slots
     /// that are none of these are the ones operators still hold.
     ///
-    /// A spilled slot can be taken back only by the worker that spilled it, so
-    /// this worker's own spilled slots are added on top of the node's. A worker
+    /// This worker's own spilled slots are added on top of the node's. A worker
     /// that holds many sees no shortfall and one that holds few sees it first,
-    /// which sends each new spill to the worker with the fewest.
+    /// which sends each new spill to the worker with the fewest and keeps the
+    /// node's spilled slots spread evenly over its workers.
     ///
     /// Nothing is asked for until the reclaimable slots are below where
     /// spilling starts (see [`get_reclaimable_slots_start_percent`]), which may
@@ -618,7 +620,8 @@ impl MemoryContext {
     ///
     /// Whether the node as a whole is short is published to its other workers
     /// (see [`is_pressure_check_due`](Self::is_pressure_check_due)). That
-    /// leaves out this worker's own spilled slots, which only it can count.
+    /// leaves out this worker's own spilled slots, which tell only this worker
+    /// whether it is its turn to spill.
     pub fn slots_to_spill(&self) -> usize {
         let free = self.dirty_pool.free_slots() + self.zeroed_pool.free_slots();
         let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
@@ -629,31 +632,46 @@ impl MemoryContext {
         let target = slots * get_reclaimable_slots_target_percent() / 100;
         let node_reclaimable = free + cached + spilled;
         self.publish_spill_pressure(node_reclaimable < start);
-        let reclaimable = node_reclaimable + self.own_buffers_spilled.get();
+        let reclaimable = node_reclaimable + self.own_buffers_spilled.load(Ordering::Relaxed);
         if reclaimable >= start {
             return 0;
         }
         (target - reclaimable).div_ceil(self.layout.topology().workers_per_node)
     }
 
-    /// Count `count` more of this node's slots as spilled, so that
-    /// [`slots_to_spill`](Self::slots_to_spill) stops asking for them.
+    /// Count `count` more of this node's slots as spilled, by this worker, so
+    /// that [`slots_to_spill`](Self::slots_to_spill) stops asking for them.
     pub fn record_buffers_spilled(&self, count: usize) {
         self.buffers_spilled[self.node].fetch_add(count, Ordering::Relaxed);
-        self.own_buffers_spilled
-            .set(self.own_buffers_spilled.get() + count);
+        self.own_buffers_spilled.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// A handle on this worker's count of the slots it spilled, for each
+    /// spilled buffer to carry to whichever worker releases it (see
+    /// [`record_spilled_buffers_released`](Self::record_spilled_buffers_released)).
+    pub fn share_own_buffers_spilled(&self) -> Arc<AtomicUsize> {
+        self.own_buffers_spilled.clone()
     }
 
     /// Note that `count` spilled slots have been released, so they are no
     /// longer counted as spilled: once free, the pools count them instead.
-    pub fn record_spilled_buffers_released(&self, count: usize) {
+    /// `buffers_spilled_by_worker` is the count of the worker that spilled
+    /// them, which may be a sibling of the one releasing them.
+    pub fn record_spilled_buffers_released(
+        &self,
+        count: usize,
+        buffers_spilled_by_worker: &AtomicUsize,
+    ) {
         let before = self.buffers_spilled[self.node].fetch_sub(count, Ordering::Relaxed);
         assert!(
             before >= count,
             "released more spilled buffers than were spilled"
         );
-        self.own_buffers_spilled
-            .set(self.own_buffers_spilled.get() - count);
+        let before = buffers_spilled_by_worker.fetch_sub(count, Ordering::Relaxed);
+        assert!(
+            before >= count,
+            "released more spilled buffers than their worker spilled"
+        );
     }
 
     /// Make `evictors` reachable from this worker's eviction for as long as the
@@ -1059,7 +1077,8 @@ mod tests {
         let shortfall = memory_ctx().slots_to_spill();
         memory_ctx().record_buffers_spilled(shortfall);
         let while_spilled = memory_ctx().slots_to_spill();
-        memory_ctx().record_spilled_buffers_released(shortfall);
+        memory_ctx()
+            .record_spilled_buffers_released(shortfall, &memory_ctx().share_own_buffers_spilled());
         let after_release = memory_ctx().slots_to_spill();
 
         assert_eq!(shortfall, 15);
@@ -1077,7 +1096,7 @@ mod tests {
         let shortfall = memory_ctx().slots_to_spill();
 
         assert_eq!(shortfall, 0);
-        memory_ctx().record_spilled_buffers_released(5);
+        memory_ctx().record_spilled_buffers_released(5, &memory_ctx().share_own_buffers_spilled());
     }
 
     #[test]
