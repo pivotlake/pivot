@@ -68,7 +68,7 @@ mod context;
 pub use context::{MemoryContextFactory, has_memory_context, init_memory_context, memory_ctx};
 
 pub mod evict;
-pub use evict::{DataflowEvict, Evict};
+pub use evict::{DataflowEvict, Evict, Evicted};
 
 mod spill;
 #[cfg(test)]
@@ -76,7 +76,7 @@ pub(crate) use spill::TestSpillDirectory;
 pub use spill::{
     Dynamic, Fixed, Layout, NO_SLAB, PARTITIONS, PartitionAllocator, PartitionContents,
     PartitionEvictor, PartitionSlab, SPILL_BLOCK_SIZE, SharedPartitionEvictor, SlabEntry,
-    SpillDirectory, SpillDirectoryError, SpilledBuffer, SpilledSlab, Spiller,
+    SpillDirectory, SpillDirectoryError, SpilledBuffer, SpilledSlab, Spiller, WritesInFlight,
     decompress_spilled_rows, padded_to_spill_block,
 };
 
