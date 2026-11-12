@@ -691,7 +691,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         };
         let spilled_buffers = buffers.spill(spiller, count)?;
         let spilled = spilled_buffers.len();
-        let mut evictor = self.evictor.borrow_mut();
+        let mut evictor = self.evictor.lock_own();
         for spilled_buffer in spilled_buffers {
             evictor.push(spilled_buffer);
         }
@@ -740,7 +740,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         // rows are read from when it gets to the partition.
         let spilled = self
             .evictor
-            .borrow_mut()
+            .lock_own()
             .spilled_slabs_by_partition(self.radix_config.partitions);
         let scattered = self
             .buffers
@@ -1033,12 +1033,6 @@ mod tests {
         }
     }
 
-    fn fresh_evictor() -> SharedPartitionEvictor {
-        std::rc::Rc::new(std::cell::RefCell::new(
-            crate::memory::PartitionEvictor::new(),
-        ))
-    }
-
     fn scatter_row_count(output: &AggregatedTableOutput<IntExtractor, CountValue>) -> usize {
         let layout = ScatterLayout::<CountValue>::new::<i32, 0>(&());
         let buffers = output.buffers.as_ref().expect("worker switched");
@@ -1063,7 +1057,7 @@ mod tests {
             (),
             SMALL_RADIX,
             None,
-            fresh_evictor(),
+            SharedPartitionEvictor::create_without_siblings(),
         );
 
         // Unique keys make every post-switch fill 100% distinct, tripping the
@@ -1089,7 +1083,7 @@ mod tests {
             (),
             SMALL_RADIX,
             None,
-            fresh_evictor(),
+            SharedPartitionEvictor::create_without_siblings(),
         );
 
         // Each key repeats twice back to back, so every fill dedups half its
@@ -1114,7 +1108,7 @@ mod tests {
             (),
             SMALL_RADIX,
             Some(0),
-            fresh_evictor(),
+            SharedPartitionEvictor::create_without_siblings(),
         );
 
         // Deduplicating fills drain into buffers; every drained partial and
@@ -1141,7 +1135,7 @@ mod tests {
             (),
             SMALL_RADIX,
             Some(0),
-            fresh_evictor(),
+            SharedPartitionEvictor::create_without_siblings(),
         );
 
         // Unique keys make every post-switch fill 100% distinct: the worker
@@ -1212,7 +1206,7 @@ mod tests {
     #[test]
     fn a_spilled_scatter_buffer_still_hands_its_rows_to_the_merge() {
         init_test_free_pool(64);
-        let evictor = fresh_evictor();
+        let evictor = SharedPartitionEvictor::create_without_siblings();
         let mut table = AggregatedTable::<IntExtractor, CountValue>::new(
             ahash::RandomState::new(),
             SharedArena::new(64),
@@ -1234,9 +1228,9 @@ mod tests {
 
         let in_place: usize = output.tables.iter().map(|table| table.len()).sum();
         let scatter_rows = scatter_row_count(&output);
-        let evicted_while_read = evictor.borrow_mut().evict();
+        let evicted_while_read = evictor.lock_own().evict();
         drop(output);
-        let evicted_after = evictor.borrow_mut().evict();
+        let evicted_after = evictor.lock_own().evict();
 
         assert_eq!(spilled, 1);
         assert_eq!(in_place + scatter_rows, 400_000);

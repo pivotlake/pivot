@@ -8,6 +8,9 @@
 //! the first buffer, in spill order, whose writes have all landed and that no
 //! merge job is reading.
 //!
+//! A worker whose own evictor has no such buffer takes one from the evictor of
+//! another worker on its node (see [`SharedPartitionEvictor`]).
+//!
 //! The evictor is the one holder of its buffers. The merge gets weak handles
 //! to the spilled slabs ([`spilled_slabs_by_partition`]), upgrades the ones it
 //! reads for as long as it reads them, and falls back to the partition file
@@ -20,10 +23,9 @@ use crate::memory::evict::Evict;
 use crate::memory::spill::partition_tree::PartitionTree;
 use crate::memory::spill::{SpilledBuffer, SpilledSlab};
 use crate::memory::{WriteBuffer, memory_ctx};
-use std::cell::RefCell;
+use crate::numa::Topology;
 use std::ops::ControlFlow;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 /// Spilled buffers awaiting eviction, each under the partition group slot it
 /// was allocated from, and the slabs of the buffers already evicted, whose
@@ -33,11 +35,78 @@ pub struct PartitionEvictor {
     evicted: Vec<SpilledSlab>,
 }
 
-/// The evictor as the operator and the memory context share it. The two never
-/// hold it at the same time: the operator pushes into it between allocations,
-/// and the memory context evicts from it inside an allocation, when the
-/// operator holds no borrow.
-pub type SharedPartitionEvictor = Rc<RefCell<PartitionEvictor>>;
+/// One worker's evictor as its operator and its memory context share it,
+/// together with the evictors of the other workers on its node.
+///
+/// A spilled buffer whose writes have landed is as good a slot to any worker
+/// of the node as to the one that spilled it, and that one may not need a slot
+/// for a while. So a worker whose own evictor has no buffer to give takes one
+/// from a sibling's.
+///
+/// Each evictor is behind a lock that is held only for a push, an eviction or
+/// the listing of its slabs. A worker that finds one held spins until it is
+/// let go instead of sleeping, so the time workers lose to each other is spent
+/// on the CPU, in [`lock_spinning`](Self::lock_spinning), and not hidden in a
+/// wait. The operator and the memory context of one worker never hold its
+/// evictor at the same time: the operator locks it between allocations, and
+/// the memory context evicts from it inside an allocation.
+#[derive(Clone)]
+pub struct SharedPartitionEvictor {
+    own: Arc<Mutex<PartitionEvictor>>,
+    /// The evictors of the other workers on this worker's node, starting with
+    /// the worker after this one, so that workers short of slots at the same
+    /// time start with different siblings.
+    siblings: Arc<[Arc<Mutex<PartitionEvictor>>]>,
+}
+
+impl SharedPartitionEvictor {
+    /// An evictor for each worker of `topology`, in worker order, each knowing
+    /// the evictors of the other workers on its node.
+    pub fn create_for_workers(topology: Topology) -> Vec<Self> {
+        let evictors: Vec<Arc<Mutex<PartitionEvictor>>> = (0..topology.total_workers())
+            .map(|_| Arc::new(Mutex::new(PartitionEvictor::new())))
+            .collect();
+        (0..topology.total_workers())
+            .map(|worker| {
+                let node_workers = topology.node_siblings(worker);
+                let siblings = (worker + 1..node_workers.end)
+                    .chain(node_workers.start..worker)
+                    .map(|sibling| evictors[sibling].clone())
+                    .collect();
+                Self {
+                    own: evictors[worker].clone(),
+                    siblings,
+                }
+            })
+            .collect()
+    }
+
+    /// The evictor of a worker that has no siblings.
+    pub fn create_without_siblings() -> Self {
+        Self::create_for_workers(Topology::single_node(1))
+            .pop()
+            .expect("one worker has one evictor")
+    }
+
+    /// Lock this worker's own evictor, to push into it, evict from it or list
+    /// its slabs.
+    pub fn lock_own(&self) -> MutexGuard<'_, PartitionEvictor> {
+        Self::lock_spinning(&self.own)
+    }
+
+    /// Lock `evictor`, spinning for as long as another worker holds it.
+    fn lock_spinning(evictor: &Mutex<PartitionEvictor>) -> MutexGuard<'_, PartitionEvictor> {
+        loop {
+            match evictor.try_lock() {
+                Ok(guard) => return guard,
+                Err(TryLockError::WouldBlock) => std::hint::spin_loop(),
+                Err(TryLockError::Poisoned(_)) => {
+                    panic!("a worker panicked while it held a partition evictor")
+                }
+            }
+        }
+    }
+}
 
 impl PartitionEvictor {
     pub fn new() -> Self {
@@ -153,8 +222,18 @@ impl Drop for PartitionEvictor {
 }
 
 impl Evict for SharedPartitionEvictor {
+    /// Give up a buffer of this worker's, or, when it has none to give, the
+    /// first one a sibling has. This worker's evictor is let go of before a
+    /// sibling's is locked, so two workers taking from each other never wait
+    /// on one another while holding their own.
     fn evict(&self) -> Option<WriteBuffer> {
-        self.borrow_mut().evict()
+        let own = self.lock_own().evict();
+        if own.is_some() {
+            return own;
+        }
+        self.siblings
+            .iter()
+            .find_map(|sibling| Self::lock_spinning(sibling).evict())
     }
 }
 
@@ -270,12 +349,71 @@ mod tests {
     #[test]
     fn the_shared_handle_evicts_through_the_evict_trait() {
         init_test_free_pool(1);
-        let shared: SharedPartitionEvictor = Rc::new(RefCell::new(PartitionEvictor::new()));
-        shared.borrow_mut().push(spilled(5, 0));
+        let shared = SharedPartitionEvictor::create_without_siblings();
+        shared.lock_own().push(spilled(5, 0));
         let handle: Box<dyn Evict> = Box::new(shared.clone());
 
         let evicted = handle.evict();
 
         assert!(evicted.is_some());
+    }
+
+    #[test]
+    fn a_worker_with_no_buffer_of_its_own_takes_a_siblings() {
+        init_test_free_pool(1);
+        let mut workers = SharedPartitionEvictor::create_for_workers(Topology::single_node(2));
+        let (sibling, worker) = (workers.remove(1), workers.remove(0));
+        let on_disk = spilled(0, 0);
+        let slot_idx = on_disk.buffer.slot_idx;
+        sibling.lock_own().push(on_disk);
+
+        let evicted = worker.evict();
+        let left_with_the_sibling = sibling.evict();
+
+        assert_eq!(evicted.map(|buffer| buffer.slot_idx), Some(slot_idx));
+        assert!(left_with_the_sibling.is_none());
+    }
+
+    #[test]
+    fn a_workers_own_buffer_is_taken_before_a_siblings() {
+        init_test_free_pool(2);
+        let mut workers = SharedPartitionEvictor::create_for_workers(Topology::single_node(2));
+        let (sibling, worker) = (workers.remove(1), workers.remove(0));
+        let own = spilled(0, 0);
+        let own_slot_idx = own.buffer.slot_idx;
+        sibling.lock_own().push(spilled(0, 0));
+        worker.lock_own().push(own);
+
+        let evicted = worker.evict();
+
+        assert_eq!(evicted.map(|buffer| buffer.slot_idx), Some(own_slot_idx));
+    }
+
+    #[test]
+    fn a_siblings_buffer_is_left_while_its_writes_are_in_flight() {
+        init_test_free_pool(1);
+        let mut workers = SharedPartitionEvictor::create_for_workers(Topology::single_node(2));
+        let (sibling, worker) = (workers.remove(1), workers.remove(0));
+        sibling.lock_own().push(spilled(0, 1));
+
+        let evicted = worker.evict();
+
+        assert!(evicted.is_none());
+    }
+
+    #[test]
+    fn a_worker_takes_nothing_from_a_worker_on_another_node() {
+        init_test_free_pool(1);
+        let two_nodes = Topology {
+            workers_per_node: 1,
+            node_count: 2,
+        };
+        let mut workers = SharedPartitionEvictor::create_for_workers(two_nodes);
+        let (on_other_node, worker) = (workers.remove(1), workers.remove(0));
+        on_other_node.lock_own().push(spilled(0, 0));
+
+        let evicted = worker.evict();
+
+        assert!(evicted.is_none());
     }
 }

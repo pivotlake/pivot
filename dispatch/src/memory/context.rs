@@ -181,7 +181,6 @@ impl MemoryContextFactory {
             layout: self.layout,
             evictors: RefCell::new(HashMap::new()),
             buffers_spilled: self.buffers_spilled,
-            own_buffers_spilled: Cell::new(0),
             spill_pressure: self.spill_pressure,
             io_requester: OnceCell::new(),
             spill_writes_in_flight: RefCell::new(HashMap::new()),
@@ -219,10 +218,6 @@ pub struct MemoryContext {
     /// node's workers, so a slot one worker is already spilling is not asked
     /// for again by another.
     buffers_spilled: Arc<[AtomicUsize]>,
-    /// The slots this worker itself has handed over for spilling and still
-    /// holds. Only this worker's eviction can take those back, so they are
-    /// what tells one worker's need to spill apart from its siblings'.
-    own_buffers_spilled: Cell<usize>,
     /// Per node, whether the last worker to count the node's reclaimable
     /// slots found it short of them. A worker that took no buffer reads only
     /// this to learn that its siblings have run the node short.
@@ -604,11 +599,6 @@ impl MemoryContext {
     /// because eviction can take them once their write lands, so the slots
     /// that are none of these are the ones operators still hold.
     ///
-    /// A spilled slot can be taken back only by the worker that spilled it, so
-    /// this worker's own spilled slots are added on top of the node's. A worker
-    /// that holds many sees no shortfall and one that holds few sees it first,
-    /// which sends each new spill to the worker with the fewest.
-    ///
     /// Nothing is asked for until the reclaimable slots are below where
     /// spilling starts (see [`get_reclaimable_slots_start_percent`]), which may
     /// be lower than the target the shortfall is then measured against. The counts
@@ -616,9 +606,8 @@ impl MemoryContext {
     /// release, so the result is approximate by a few slots, which a watermark
     /// tolerates.
     ///
-    /// Whether the node as a whole is short is published to its other workers
-    /// (see [`is_pressure_check_due`](Self::is_pressure_check_due)). That
-    /// leaves out this worker's own spilled slots, which only it can count.
+    /// Whether the node is short is published to its other workers (see
+    /// [`is_pressure_check_due`](Self::is_pressure_check_due)).
     pub fn slots_to_spill(&self) -> usize {
         let free = self.dirty_pool.free_slots() + self.zeroed_pool.free_slots();
         let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
@@ -627,9 +616,8 @@ impl MemoryContext {
         let slots = self.layout.node_slots(self.node).len();
         let start = slots * get_reclaimable_slots_start_percent() / 100;
         let target = slots * get_reclaimable_slots_target_percent() / 100;
-        let node_reclaimable = free + cached + spilled;
-        self.publish_spill_pressure(node_reclaimable < start);
-        let reclaimable = node_reclaimable + self.own_buffers_spilled.get();
+        let reclaimable = free + cached + spilled;
+        self.publish_spill_pressure(reclaimable < start);
         if reclaimable >= start {
             return 0;
         }
@@ -640,8 +628,6 @@ impl MemoryContext {
     /// [`slots_to_spill`](Self::slots_to_spill) stops asking for them.
     pub fn record_buffers_spilled(&self, count: usize) {
         self.buffers_spilled[self.node].fetch_add(count, Ordering::Relaxed);
-        self.own_buffers_spilled
-            .set(self.own_buffers_spilled.get() + count);
     }
 
     /// Note that `count` spilled slots have been released, so they are no
@@ -652,8 +638,6 @@ impl MemoryContext {
             before >= count,
             "released more spilled buffers than were spilled"
         );
-        self.own_buffers_spilled
-            .set(self.own_buffers_spilled.get() - count);
     }
 
     /// Make `evictors` reachable from this worker's eviction for as long as the
@@ -1065,19 +1049,6 @@ mod tests {
         assert_eq!(shortfall, 15);
         assert_eq!(while_spilled, 0);
         assert_eq!(after_release, 15);
-    }
-
-    #[test]
-    fn a_workers_own_spilled_slots_count_again_toward_its_target() {
-        // 128 slots, so spilling starts under 12 reclaimable. 4 free and 5
-        // spilled make 9; the worker's own 5 counted again make 14.
-        init_test_free_pool(4);
-        memory_ctx().record_buffers_spilled(5);
-
-        let shortfall = memory_ctx().slots_to_spill();
-
-        assert_eq!(shortfall, 0);
-        memory_ctx().record_spilled_buffers_released(5);
     }
 
     #[test]
