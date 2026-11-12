@@ -350,6 +350,16 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
 
     pub(crate) fn make_test_table(schema: SchemaRef, num_rows: i64) -> Arc<ParquetTable> {
+        make_test_table_of_chunk_bytes(schema, num_rows, 0)
+    }
+
+    /// A one-row-group table whose every column chunk holds `chunk_bytes`
+    /// of pages.
+    fn make_test_table_of_chunk_bytes(
+        schema: SchemaRef,
+        num_rows: i64,
+        chunk_bytes: i64,
+    ) -> Arc<ParquetTable> {
         let num_cols = schema.fields().len();
         let file = dispatch::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap();
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
@@ -361,7 +371,7 @@ pub(crate) mod tests {
                     dictionary_page_offset: None,
                     data_page_offset: 0,
                     total_compressed_size: 0,
-                    total_uncompressed_size: 0,
+                    total_uncompressed_size: chunk_bytes,
                     max_def_level: 0,
                     physical_type: 0,
                     fixed_len_byte_width: None,
@@ -733,6 +743,21 @@ pub(crate) mod tests {
         assert_eq!(extract_i32s(&out[0], 0), vec![10, 20]);
         assert_eq!(extract_i32s(&out[1], 0), vec![30, 40]);
         assert_eq!(extract_i32s(&out[2], 0), vec![50]);
+    }
+
+    /// A row group whose rows take many page bytes leaves in batches of
+    /// fewer rows than the batch size asked for.
+    #[test]
+    fn wide_rows_leave_in_smaller_batches() {
+        init_test_free_pool(4);
+        let table = make_test_table_of_chunk_bytes(i32_schema(&["a"]), 16_384, 16_384 * 100);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+        let pages = row_number_pages(&metadata, 16_384, 16_384);
+
+        let batches = decode(&table, pages, 8192, Vec::new());
+
+        let batch_rows: Vec<usize> = batches.iter().map(|batch| batch.num_rows()).collect();
+        assert_eq!(batch_rows, vec![4096; 4]);
     }
 
     #[test]

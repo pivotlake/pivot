@@ -177,6 +177,40 @@ pub struct RowGroupDecoder {
     filter_batches: bool,
 }
 
+/// The most page bytes a batch spans, across the leaves it decodes, before
+/// it is cut to fewer rows. The operators after the scan read a batch's
+/// values through its views into the pages, and a batch of wide values that
+/// spans more than a worker's cache holds has those bytes fetched from memory
+/// a second time.
+const BATCH_PAGE_BYTES: usize = 512 * 1024;
+
+/// The fewest rows a batch is cut to on account of its width: below this the
+/// per-batch cost of every operator outweighs what a narrower span saves.
+const MIN_BATCH_ROWS: usize = 2048;
+
+/// How many rows a batch of this row group holds: `max_rows`, halved while
+/// a batch would span more than [`BATCH_PAGE_BYTES`] of the decoded leaves'
+/// pages, down to [`MIN_BATCH_ROWS`].
+fn choose_batch_rows(
+    plan: &DecodePlan,
+    metadata: &QueryRowGroupMetadata,
+    max_rows: usize,
+) -> usize {
+    let row_group_rows = metadata.num_rows().max(1) as usize;
+    let column_chunks = metadata.columns();
+    let page_bytes: usize = plan
+        .file_leaves
+        .iter()
+        .map(|&leaf| column_chunks[leaf].total_uncompressed_size.max(0) as usize)
+        .sum();
+    let bytes_per_row = page_bytes / row_group_rows;
+    let mut rows = max_rows;
+    while rows / 2 >= MIN_BATCH_ROWS && rows * bytes_per_row > BATCH_PAGE_BYTES {
+        rows /= 2;
+    }
+    rows
+}
+
 impl RowGroupDecoder {
     /// A decoder for the row group of `range`, ready to take it on, reading
     /// through the dictionaries the range carries. Every range of a row
@@ -188,6 +222,7 @@ impl RowGroupDecoder {
     ) -> Result<Self> {
         let metadata = range.metadata().clone();
         let plan = range.plan().clone();
+        let batch_size = choose_batch_rows(&plan, &metadata, batch_size);
         let filter_batches =
             !add_row_group_metadata && !matches!(metadata.selection(), RowSelection::Indices(_));
         let mut leaf_decoders = plan.create_leaf_decoders(&metadata)?;
