@@ -96,7 +96,8 @@ pub use gather_barrier::GatherBarrier;
 #[cfg(any(test, feature = "test-util"))]
 pub use io::TestOperatorIO;
 pub use io::{
-    FileRange, FsRequest, HttpRequest, OperatorIO, ReadData, ReadRequestId, ReadResponse,
+    ASSUMED_NETWORK_BITS_PER_SECOND, FileRange, FsRequest, HttpRequest, OperatorIO, ReadData,
+    ReadRequestId, ReadResponse, limit_network_receive_rate,
 };
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
