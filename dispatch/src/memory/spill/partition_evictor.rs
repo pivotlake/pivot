@@ -9,7 +9,9 @@
 //! merge job is reading.
 //!
 //! A worker whose own evictor has no such buffer takes one from the evictor of
-//! another worker on its node (see [`SharedPartitionEvictor`]).
+//! another worker on its node, and when every buffer on the node is still
+//! being written it is woken once one of them can be taken (see
+//! [`SharedPartitionEvictor`]).
 //!
 //! The evictor is the one holder of its buffers. The merge gets weak handles
 //! to the spilled slabs ([`spilled_slabs_by_partition`]), upgrades the ones it
@@ -19,13 +21,14 @@
 //!
 //! [`spilled_slabs_by_partition`]: PartitionEvictor::spilled_slabs_by_partition
 
-use crate::memory::evict::Evict;
+use crate::memory::evict::{Evict, Evicted};
 use crate::memory::spill::partition_tree::PartitionTree;
+use crate::memory::spill::waiting_workers::WaitingWorkers;
 use crate::memory::spill::{SpilledBuffer, SpilledSlab};
 use crate::memory::{WriteBuffer, memory_ctx};
 use crate::numa::Topology;
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 
 /// Spilled buffers awaiting eviction, each under the partition group slot it
 /// was allocated from, and the slabs of the buffers already evicted, whose
@@ -33,6 +36,9 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 pub struct PartitionEvictor {
     tree: PartitionTree<Vec<SpilledBuffer>>,
     evicted: Vec<SpilledSlab>,
+    /// The workers of this evictor's node that are waiting for a buffer, to
+    /// wake when one of this evictor's can be taken or all of them go away.
+    waiting_workers: Arc<WaitingWorkers>,
 }
 
 /// One worker's evictor as its operator and its memory context share it,
@@ -50,32 +56,57 @@ pub struct PartitionEvictor {
 /// wait. The operator and the memory context of one worker never hold its
 /// evictor at the same time: the operator locks it between allocations, and
 /// the memory context evicts from it inside an allocation.
+///
+/// A worker that finds no buffer to take, while some buffer on the node still
+/// has writes in flight, has nothing to do until one of those lands. It
+/// records itself with the node's [`WaitingWorkers`] and says it will be woken
+/// (see [`Evicted::NothingUntilWoken`]). It is woken when a buffer's last
+/// write lands, and when an evictor goes away with its buffers, as a failed
+/// dataflow's does, since the writes it was waiting for may never be counted
+/// off. A buffer whose rows are on disk but which a merge job is reading does
+/// not count: nothing wakes a worker when the job lets go of it.
 #[derive(Clone)]
 pub struct SharedPartitionEvictor {
+    /// The worker this evictor belongs to, as a global worker index.
+    worker: usize,
     own: Arc<Mutex<PartitionEvictor>>,
     /// The evictors of the other workers on this worker's node, starting with
     /// the worker after this one, so that workers short of slots at the same
-    /// time start with different siblings.
-    siblings: Arc<[Arc<Mutex<PartitionEvictor>>]>,
+    /// time start with different siblings. Each is held weakly, so that it
+    /// goes away, and frees its buffers, with its own worker's operator.
+    siblings: Arc<[Weak<Mutex<PartitionEvictor>>]>,
+    waiting_workers: Arc<WaitingWorkers>,
 }
 
 impl SharedPartitionEvictor {
     /// An evictor for each worker of `topology`, in worker order, each knowing
     /// the evictors of the other workers on its node.
     pub fn create_for_workers(topology: Topology) -> Vec<Self> {
+        let nodes_waiting_workers: Vec<Arc<WaitingWorkers>> = (0..topology.node_count)
+            .map(|node| {
+                let first_worker = node * topology.workers_per_node;
+                Arc::new(WaitingWorkers::new(topology.node_siblings(first_worker)))
+            })
+            .collect();
         let evictors: Vec<Arc<Mutex<PartitionEvictor>>> = (0..topology.total_workers())
-            .map(|_| Arc::new(Mutex::new(PartitionEvictor::new())))
+            .map(|worker| {
+                let waiting_workers =
+                    nodes_waiting_workers[topology.node_of_worker(worker)].clone();
+                Arc::new(Mutex::new(PartitionEvictor::new(waiting_workers)))
+            })
             .collect();
         (0..topology.total_workers())
             .map(|worker| {
                 let node_workers = topology.node_siblings(worker);
                 let siblings = (worker + 1..node_workers.end)
                     .chain(node_workers.start..worker)
-                    .map(|sibling| evictors[sibling].clone())
+                    .map(|sibling| Arc::downgrade(&evictors[sibling]))
                     .collect();
                 Self {
+                    worker,
                     own: evictors[worker].clone(),
                     siblings,
+                    waiting_workers: nodes_waiting_workers[topology.node_of_worker(worker)].clone(),
                 }
             })
             .collect()
@@ -106,18 +137,51 @@ impl SharedPartitionEvictor {
             }
         }
     }
+
+    /// Take the first buffer this worker's evictor can give up or, when it has
+    /// none, the first one a sibling's can. When there is none to take, says
+    /// whether any buffer on the node still has writes in flight. This
+    /// worker's evictor is let go of before a sibling's is locked, so two
+    /// workers taking from each other never wait on one another while holding
+    /// their own.
+    fn take_from_node(&self) -> ControlFlow<WriteBuffer, bool> {
+        let mut has_writes_in_flight = {
+            let mut own = self.lock_own();
+            if let Some(buffer) = own.evict() {
+                return ControlFlow::Break(buffer);
+            }
+            own.has_writes_in_flight()
+        };
+        for sibling in self.siblings.iter() {
+            // A sibling whose operator is gone took its buffers with it.
+            let Some(sibling) = sibling.upgrade() else {
+                continue;
+            };
+            let mut evictor = Self::lock_spinning(&sibling);
+            if let Some(buffer) = evictor.evict() {
+                return ControlFlow::Break(buffer);
+            }
+            has_writes_in_flight |= evictor.has_writes_in_flight();
+        }
+        ControlFlow::Continue(has_writes_in_flight)
+    }
 }
 
 impl PartitionEvictor {
-    pub fn new() -> Self {
+    pub fn new(waiting_workers: Arc<WaitingWorkers>) -> Self {
         Self {
             tree: PartitionTree::new(Vec::new),
             evicted: Vec::new(),
+            waiting_workers,
         }
     }
 
-    /// Keep `spilled` until it is evicted.
+    /// Keep `spilled` until it is evicted, and have its last write wake the
+    /// workers waiting for a buffer when it lands.
     pub fn push(&mut self, spilled: SpilledBuffer) {
+        spilled
+            .writes_in_flight
+            .wake_when_landed(self.waiting_workers.clone());
         self.tree
             .node_mut(spilled.partition_group_slot)
             .push(spilled);
@@ -175,6 +239,16 @@ impl PartitionEvictor {
         Some(write_buffer)
     }
 
+    /// Whether any buffer kept here still has a write in flight, and so will
+    /// become evictable without anything else having to happen.
+    pub fn has_writes_in_flight(&self) -> bool {
+        self.tree
+            .nodes()
+            .iter()
+            .flatten()
+            .any(|spilled| !spilled.is_on_disk())
+    }
+
     /// Every spilled slab, by partition, for the merge: the slab's handle
     /// upgrades for as long as its buffer is resident, and the slab's rows are
     /// at the given offset of the partition's file for when it is not. Slabs
@@ -199,16 +273,12 @@ impl PartitionEvictor {
     }
 }
 
-impl Default for PartitionEvictor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for PartitionEvictor {
     /// An evictor dropped while still holding spilled buffers, as a failed
     /// dataflow's is, frees them with it; they stop counting as spilled, or
     /// the memory context would go on seeing slots to reclaim that are gone.
+    /// A worker waiting for one of them is woken to look again: their writes
+    /// may never be counted off now, so nothing else would wake it.
     fn drop(&mut self) {
         let mut held = 0;
         let _: ControlFlow<()> = self.tree.walk_spill_order(|_, spilled_buffers| {
@@ -217,23 +287,35 @@ impl Drop for PartitionEvictor {
         });
         if held > 0 {
             memory_ctx().record_spilled_buffers_released(held);
+            self.waiting_workers.wake_all();
         }
     }
 }
 
 impl Evict for SharedPartitionEvictor {
     /// Give up a buffer of this worker's, or, when it has none to give, the
-    /// first one a sibling has. This worker's evictor is let go of before a
-    /// sibling's is locked, so two workers taking from each other never wait
-    /// on one another while holding their own.
-    fn evict(&self) -> Option<WriteBuffer> {
-        let own = self.lock_own().evict();
-        if own.is_some() {
-            return own;
+    /// first one a sibling has. When there is none to take but some are still
+    /// being written, this worker is recorded as waiting and the node is
+    /// looked over once more before the answer says it will be woken (see
+    /// [`WaitingWorkers::register`]).
+    fn evict(&self) -> Evicted {
+        match self.take_from_node() {
+            ControlFlow::Break(buffer) => return Evicted::Buffer(buffer),
+            ControlFlow::Continue(false) => return Evicted::Nothing,
+            ControlFlow::Continue(true) => {}
         }
-        self.siblings
-            .iter()
-            .find_map(|sibling| Self::lock_spinning(sibling).evict())
+        self.waiting_workers.register(self.worker);
+        match self.take_from_node() {
+            ControlFlow::Break(buffer) => {
+                self.waiting_workers.deregister(self.worker);
+                Evicted::Buffer(buffer)
+            }
+            ControlFlow::Continue(false) => {
+                self.waiting_workers.deregister(self.worker);
+                Evicted::Nothing
+            }
+            ControlFlow::Continue(true) => Evicted::NothingUntilWoken,
+        }
     }
 }
 
@@ -241,8 +323,9 @@ impl Evict for SharedPartitionEvictor {
 mod tests {
     use super::*;
     use crate::io::FileRange;
+    use crate::memory::spill::WritesInFlight;
     use crate::memory::{Slab, init_test_free_pool};
-    use std::sync::atomic::AtomicUsize;
+    use crate::waker::worker_waker;
 
     /// A spilled buffer with one 1KB slab of partition 0, filed under
     /// `partition_group_slot`, with `writes_in_flight` of its writes still to
@@ -252,8 +335,10 @@ mod tests {
         memory_ctx().record_buffers_spilled(1);
         let buffer = Arc::new(memory_ctx().get_write_buffer(false));
         let slab = Slab::new(buffer.ptr, 1024, buffer.clone()).freeze();
+        let issued = Arc::new(WritesInFlight::new());
+        (0..writes_in_flight).for_each(|_| issued.count_issued_write());
         SpilledBuffer {
-            writes_in_flight: Arc::new(AtomicUsize::new(writes_in_flight)),
+            writes_in_flight: issued,
             slabs: vec![SpilledSlab {
                 spill_partition_id: 0,
                 file_offset: 0,
@@ -268,7 +353,8 @@ mod tests {
     #[test]
     fn nothing_is_evicted_while_a_buffers_writes_are_in_flight() {
         init_test_free_pool(1);
-        let mut evictor = PartitionEvictor::new();
+        let shared = SharedPartitionEvictor::create_without_siblings();
+        let mut evictor = shared.lock_own();
         evictor.push(spilled(0, 1));
 
         let evicted = evictor.evict();
@@ -279,7 +365,8 @@ mod tests {
     #[test]
     fn an_evicted_slabs_handle_no_longer_upgrades_but_still_says_where_its_rows_are() {
         init_test_free_pool(2);
-        let mut evictor = PartitionEvictor::new();
+        let shared = SharedPartitionEvictor::create_without_siblings();
+        let mut evictor = shared.lock_own();
         evictor.push(spilled(0, 0));
         evictor.push(spilled(0, 1));
 
@@ -301,7 +388,8 @@ mod tests {
     #[test]
     fn a_buffer_whose_writes_landed_is_given_up_whole() {
         init_test_free_pool(1);
-        let mut evictor = PartitionEvictor::new();
+        let shared = SharedPartitionEvictor::create_without_siblings();
+        let mut evictor = shared.lock_own();
         let on_disk = spilled(0, 0);
         let slot_idx = on_disk.buffer.slot_idx;
         evictor.push(on_disk);
@@ -316,7 +404,8 @@ mod tests {
     #[test]
     fn eviction_takes_a_deeper_slot_before_the_root() {
         init_test_free_pool(2);
-        let mut evictor = PartitionEvictor::new();
+        let shared = SharedPartitionEvictor::create_without_siblings();
+        let mut evictor = shared.lock_own();
         let at_root = spilled(0, 0);
         let at_right_child = spilled(2, 0);
         let (root_slot, child_slot) = (at_root.buffer.slot_idx, at_right_child.buffer.slot_idx);
@@ -333,7 +422,8 @@ mod tests {
     #[test]
     fn a_buffer_whose_slab_a_reader_holds_is_not_evicted_until_it_is_let_go() {
         init_test_free_pool(1);
-        let mut evictor = PartitionEvictor::new();
+        let shared = SharedPartitionEvictor::create_without_siblings();
+        let mut evictor = shared.lock_own();
         evictor.push(spilled(0, 0));
         let handle = evictor.spilled_slabs_by_partition(1).remove(0).remove(0);
 
@@ -353,7 +443,7 @@ mod tests {
         shared.lock_own().push(spilled(5, 0));
         let handle: Box<dyn Evict> = Box::new(shared.clone());
 
-        let evicted = handle.evict();
+        let evicted = handle.evict().into_buffer();
 
         assert!(evicted.is_some());
     }
@@ -367,11 +457,11 @@ mod tests {
         let slot_idx = on_disk.buffer.slot_idx;
         sibling.lock_own().push(on_disk);
 
-        let evicted = worker.evict();
+        let evicted = worker.evict().into_buffer();
         let left_with_the_sibling = sibling.evict();
 
         assert_eq!(evicted.map(|buffer| buffer.slot_idx), Some(slot_idx));
-        assert!(left_with_the_sibling.is_none());
+        assert!(matches!(left_with_the_sibling, Evicted::Nothing));
     }
 
     #[test]
@@ -384,13 +474,13 @@ mod tests {
         sibling.lock_own().push(spilled(0, 0));
         worker.lock_own().push(own);
 
-        let evicted = worker.evict();
+        let evicted = worker.evict().into_buffer();
 
         assert_eq!(evicted.map(|buffer| buffer.slot_idx), Some(own_slot_idx));
     }
 
     #[test]
-    fn a_siblings_buffer_is_left_while_its_writes_are_in_flight() {
+    fn a_worker_is_told_it_will_be_woken_while_a_siblings_writes_are_in_flight() {
         init_test_free_pool(1);
         let mut workers = SharedPartitionEvictor::create_for_workers(Topology::single_node(2));
         let (sibling, worker) = (workers.remove(1), workers.remove(0));
@@ -398,7 +488,67 @@ mod tests {
 
         let evicted = worker.evict();
 
-        assert!(evicted.is_none());
+        assert!(matches!(evicted, Evicted::NothingUntilWoken));
+    }
+
+    #[test]
+    fn a_waiting_worker_is_woken_when_a_siblings_last_write_lands() {
+        init_test_free_pool(1);
+        let mut workers = SharedPartitionEvictor::create_for_workers(Topology::single_node(2));
+        let (sibling, worker) = (workers.remove(1), workers.remove(0));
+        let being_written = spilled(0, 2);
+        let writes_in_flight = being_written.writes_in_flight.clone();
+        sibling.lock_own().push(being_written);
+        let wakes_before = worker_waker().ring_wake_count();
+
+        let while_written = worker.evict();
+        writes_in_flight.count_off_landed_write();
+        let wakes_with_a_write_left = worker_waker().ring_wake_count();
+        writes_in_flight.count_off_landed_write();
+        let wakes_once_landed = worker_waker().ring_wake_count();
+        let once_landed = worker.evict();
+
+        assert!(matches!(while_written, Evicted::NothingUntilWoken));
+        assert_eq!(wakes_with_a_write_left, wakes_before);
+        assert_eq!(wakes_once_landed, wakes_before + 1);
+        assert!(matches!(once_landed, Evicted::Buffer(_)));
+    }
+
+    #[test]
+    fn a_waiting_worker_is_woken_when_the_sibling_it_waits_for_goes_away() {
+        init_test_free_pool(1);
+        let mut workers = SharedPartitionEvictor::create_for_workers(Topology::single_node(2));
+        let (sibling, worker) = (workers.remove(1), workers.remove(0));
+        sibling.lock_own().push(spilled(0, 1));
+        let wakes_before = worker_waker().ring_wake_count();
+
+        let while_written = worker.evict();
+        drop(sibling);
+        let wakes_once_gone = worker_waker().ring_wake_count();
+        let once_gone = worker.evict();
+
+        assert!(matches!(while_written, Evicted::NothingUntilWoken));
+        assert_eq!(wakes_once_gone, wakes_before + 1);
+        assert!(matches!(once_gone, Evicted::Nothing));
+    }
+
+    #[test]
+    fn a_worker_is_not_told_to_wait_for_a_buffer_a_reader_holds() {
+        init_test_free_pool(1);
+        let mut workers = SharedPartitionEvictor::create_for_workers(Topology::single_node(2));
+        let (sibling, worker) = (workers.remove(1), workers.remove(0));
+        sibling.lock_own().push(spilled(0, 0));
+        let handle = sibling
+            .lock_own()
+            .spilled_slabs_by_partition(1)
+            .remove(0)
+            .remove(0);
+
+        let held = handle.slab.upgrade();
+        let evicted = worker.evict();
+
+        assert!(held.is_some());
+        assert!(matches!(evicted, Evicted::Nothing));
     }
 
     #[test]
@@ -414,6 +564,6 @@ mod tests {
 
         let evicted = worker.evict();
 
-        assert!(evicted.is_none());
+        assert!(matches!(evicted, Evicted::Nothing));
     }
 }

@@ -12,8 +12,9 @@ use crate::OperatorIO;
 use crate::io::{IORequesterError, LocalFile, OpenFile};
 use crate::memory::{FileBytes, WeakSlab, WriteBuffer, memory_ctx};
 use crate::worker::WORKER_IDX;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use waiting_workers::WaitingWorkers;
 
 mod codec;
 mod directory;
@@ -21,6 +22,7 @@ mod layout;
 mod partition_allocator;
 mod partition_evictor;
 mod partition_tree;
+mod waiting_workers;
 
 pub use codec::decompress_spilled_rows;
 #[cfg(test)]
@@ -55,7 +57,56 @@ pub struct SpillWrite {
     rows: FileBytes,
     /// The in-flight write count of each buffer the rows come from. Each
     /// already counts this write, and is counted down when it lands.
-    buffers_writes_in_flight: Vec<Arc<AtomicUsize>>,
+    buffers_writes_in_flight: Vec<Arc<WritesInFlight>>,
+}
+
+/// How many of a spilled buffer's writes have yet to land. The spilling
+/// worker counts each write as it issues it and counts it off as it lands; the
+/// buffer can be evicted once none is left.
+pub struct WritesInFlight {
+    count: AtomicUsize,
+    /// The workers to wake when the last write lands: the ones waiting for a
+    /// buffer of the evictor this buffer was handed to. Unset until then,
+    /// because nobody can wait for a buffer that no evictor holds yet.
+    waiting_workers: OnceLock<Arc<WaitingWorkers>>,
+}
+
+impl WritesInFlight {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            waiting_workers: OnceLock::new(),
+        }
+    }
+
+    fn count_issued_write(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Count off a write that has landed and, if it was the buffer's last,
+    /// wake the workers waiting for a buffer to evict. The count is taken down
+    /// before the workers are looked for, as their registration relies on (see
+    /// [`WaitingWorkers::register`]).
+    pub fn count_off_landed_write(&self) {
+        let before = self.count.fetch_sub(1, Ordering::SeqCst);
+        assert!(before > 0, "a spill write landed that no buffer counted");
+        if before == 1
+            && let Some(waiting_workers) = self.waiting_workers.get()
+        {
+            waiting_workers.wake_all();
+        }
+    }
+
+    pub fn load(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// Have the buffer's last write wake `waiting_workers` when it lands.
+    fn wake_when_landed(&self, waiting_workers: Arc<WaitingWorkers>) {
+        if self.waiting_workers.set(waiting_workers).is_err() {
+            panic!("a spilled buffer was handed to an evictor twice");
+        }
+    }
 }
 
 /// A slab of a spilled buffer: where its rows are in memory, for as long as
@@ -80,7 +131,7 @@ pub struct SpilledSlab {
 /// ring slot, which may happen once `writes_in_flight` reaches zero.
 pub struct SpilledBuffer {
     /// Counted down by the worker as each of the buffer's writes lands.
-    writes_in_flight: Arc<AtomicUsize>,
+    writes_in_flight: Arc<WritesInFlight>,
     buffer: Arc<WriteBuffer>,
     slabs: Vec<SpilledSlab>,
     /// The tree node the buffer was allocated from, which is where the
@@ -91,7 +142,7 @@ pub struct SpilledBuffer {
 impl SpilledBuffer {
     /// Whether every write of this buffer has landed.
     pub fn is_on_disk(&self) -> bool {
-        self.writes_in_flight.load(Ordering::Acquire) == 0
+        self.writes_in_flight.load() == 0
     }
 }
 
@@ -193,10 +244,10 @@ mod tests {
     /// with nothing left in flight never returns.
     fn complete_spill_writes(
         requester: &RefCell<IORequester>,
-        buffer_writes_in_flight: &AtomicUsize,
+        buffer_writes_in_flight: &WritesInFlight,
     ) {
         let mut requester = requester.borrow_mut();
-        while buffer_writes_in_flight.load(Ordering::Acquire) > 0 {
+        while buffer_writes_in_flight.load() > 0 {
             requester.wait().unwrap();
             requester.collect_completions().unwrap();
             memory_ctx().complete_landed_spill_writes(&mut requester);
@@ -244,7 +295,9 @@ mod tests {
             slab_at(SPILL_BLOCK_SIZE),
             slab_at(2 * SPILL_BLOCK_SIZE),
         );
-        let buffer_writes_in_flight = Arc::new(AtomicUsize::new(2));
+        let buffer_writes_in_flight = Arc::new(WritesInFlight::new());
+        buffer_writes_in_flight.count_issued_write();
+        buffer_writes_in_flight.count_issued_write();
         let writes = vec![
             SpillWrite {
                 file: spiller.open_spill_file(5).unwrap(),
@@ -275,7 +328,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let in_flight_after_issuing = spilled.writes_in_flight.load(Ordering::Acquire);
+        let in_flight_after_issuing = spilled.writes_in_flight.load();
         complete_spill_writes(&requester, &spilled.writes_in_flight);
 
         assert_eq!(in_flight_after_issuing, 2);

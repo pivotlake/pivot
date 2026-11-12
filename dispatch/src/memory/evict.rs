@@ -21,9 +21,31 @@ use std::ops::ControlFlow;
 /// left to hand out. `evict` runs inside the context's own eviction, so it must
 /// only release memory the operator already holds, never allocate or register.
 pub trait Evict {
-    /// Give up one slot that is no longer needed in memory, or `None` when
-    /// every slot this operator keeps is still in use.
-    fn evict(&self) -> Option<WriteBuffer>;
+    /// Give up one slot that is no longer needed in memory, or say why not.
+    fn evict(&self) -> Evicted;
+}
+
+/// What an operator answers when asked for a slot.
+pub enum Evicted {
+    /// A slot that is no longer needed in memory.
+    Buffer(WriteBuffer),
+    /// No slot right now, but one is on its way, and the worker that asked
+    /// will be woken, out of its ring wait if it is in one, when there may be
+    /// one to take. The worker can block until then instead of asking again.
+    NothingUntilWoken,
+    /// Every slot the operator keeps is still in use, and nothing will tell
+    /// the worker when that changes.
+    Nothing,
+}
+
+impl Evicted {
+    /// The slot given up, if one was.
+    pub fn into_buffer(self) -> Option<WriteBuffer> {
+        match self {
+            Evicted::Buffer(buffer) => Some(buffer),
+            Evicted::NothingUntilWoken | Evicted::Nothing => None,
+        }
+    }
 }
 
 /// One dataflow's evictors, laid out like its operator graph so that eviction
@@ -58,19 +80,26 @@ impl DataflowEvict {
         *self.graph.node_mut(operator_idx) = None;
     }
 
-    /// Ask the operators in order for a slot and return the first one offered,
-    /// or `None` when no operator has a slot to spare right now.
-    pub fn evict(&mut self) -> Option<WriteBuffer> {
+    /// Ask the operators in order for a slot and return the first one offered.
+    /// When no operator has a slot to spare right now, the answer says whether
+    /// any of them will wake the worker for one.
+    pub fn evict(&mut self) -> Evicted {
+        let mut is_woken_later = false;
         let Ok(outcome) = self.graph.traverse_backwards(|_, evictor| {
-            let offered = evictor.as_ref().and_then(|evictor| evictor.evict());
+            let offered = evictor.as_ref().map(|evictor| evictor.evict());
             Ok::<_, Infallible>(match offered {
-                Some(buffer) => ControlFlow::Break(buffer),
-                None => ControlFlow::Continue(()),
+                Some(Evicted::Buffer(buffer)) => ControlFlow::Break(buffer),
+                Some(Evicted::NothingUntilWoken) => {
+                    is_woken_later = true;
+                    ControlFlow::Continue(())
+                }
+                Some(Evicted::Nothing) | None => ControlFlow::Continue(()),
             })
         });
         match outcome {
-            ControlFlow::Break(buffer) => Some(buffer),
-            ControlFlow::Continue(()) => None,
+            ControlFlow::Break(buffer) => Evicted::Buffer(buffer),
+            ControlFlow::Continue(()) if is_woken_later => Evicted::NothingUntilWoken,
+            ControlFlow::Continue(()) => Evicted::Nothing,
         }
     }
 }
@@ -86,9 +115,12 @@ pub(crate) struct HandOverEvictor {
 
 #[cfg(test)]
 impl Evict for HandOverEvictor {
-    fn evict(&self) -> Option<WriteBuffer> {
+    fn evict(&self) -> Evicted {
         self.log.borrow_mut().push(self.label);
-        self.buffer.borrow_mut().take()
+        match self.buffer.borrow_mut().take() {
+            Some(buffer) => Evicted::Buffer(buffer),
+            None => Evicted::Nothing,
+        }
     }
 }
 
@@ -127,7 +159,7 @@ mod tests {
             &[(0, 1), (1, 2)],
         );
 
-        let evicted = evictors.evict();
+        let evicted = evictors.evict().into_buffer();
 
         assert_eq!(evicted.map(|buffer| buffer.slot_idx), Some(output_slot));
         assert_eq!(*log.borrow(), ["output"]);
@@ -146,7 +178,7 @@ mod tests {
             &[(0, 1)],
         );
 
-        let evicted = evictors.evict();
+        let evicted = evictors.evict().into_buffer();
 
         assert!(evicted.is_some());
         assert_eq!(*log.borrow(), ["output", "scan"]);
