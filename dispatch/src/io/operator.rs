@@ -146,6 +146,14 @@ impl<'a> OperatorIO<'a> {
         Ok(id)
     }
 
+    /// Count `bytes` against this worker's read-ahead budget until the
+    /// returned charge is dropped. For an operator that issues its reads when
+    /// asked to saturate the available IO, which only a worker with a budget
+    /// asks.
+    pub fn charge_read_ahead(&self, bytes: usize) -> crate::io::ReadAheadCharge {
+        self.requester.charge_read_ahead(bytes)
+    }
+
     /// Write `data` to a local file or remote object.
     pub fn write(
         &mut self,
@@ -188,6 +196,18 @@ impl Default for TestOperatorIO {
 
 #[cfg(any(test, feature = "test-util"))]
 impl TestOperatorIO {
+    /// A handle whose worker has a read-ahead budget of `budget_bytes`.
+    pub fn with_read_ahead_budget(budget_bytes: usize) -> Self {
+        let mut test_io = Self::default();
+        test_io.requester.force_read_ahead_budget(budget_bytes);
+        test_io
+    }
+
+    /// Whether the worker has asked for less than its read-ahead budget.
+    pub fn has_read_ahead_room(&self) -> bool {
+        self.requester.has_read_ahead_room()
+    }
+
     pub fn io(&mut self) -> OperatorIO<'_> {
         OperatorIO::new(
             &mut self.requester,
