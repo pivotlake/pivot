@@ -73,7 +73,8 @@ pub use regexp::{RegexpFullMatch, RegexpReplace};
 pub use regexp_jit::RegexpJitReplace;
 pub use substring::Substring;
 pub use suffix::Suffix;
-pub use time_bucket::{BucketGrid, MICROS_PER_DAY, TimeBucket, count_epoch_months};
+pub(crate) use time_bucket::count_epoch_months;
+pub use time_bucket::{BucketGrid, TimeBucket};
 pub use variant_get::{JsonPath, VariantGet};
 
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
@@ -104,6 +105,8 @@ pub enum Error {
     },
     #[error("Unsupported interval arithmetic: {0}")]
     UnsupportedInterval(String),
+    #[error("Invalid time_bucket call: {0}")]
+    InvalidTimeBucket(String),
     #[error("Unsupported expression type: {0:?}")]
     UnsupportedExpressionType(ExpressionType),
     /// A sort key whose null placement the binder left unresolved.
