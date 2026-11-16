@@ -17,6 +17,8 @@
 //!
 //! [`get_bytes`](CacheFill::get_bytes) may split across slots, so raw page
 //! bytes pack tightly and a page larger than a slot still fits.
+//! [`get_contiguous_bytes`](CacheFill::get_contiguous_bytes) never splits, at
+//! the cost of the slot tail it sometimes leaves behind.
 //!
 //! Writing into a reader-pinned slot is sound because a carved region is not
 //! yet in any map (no reader can reach it), the bump pointer keeps regions
@@ -113,6 +115,25 @@ impl<'a> CacheFill<'a> {
             slabs.push(slab);
         }
         slabs
+    }
+
+    /// `len` bytes in one piece, for a form that is searched in place and so
+    /// cannot lie across a slot boundary. Starts a fresh slot when the current
+    /// one's tail is too short, leaving that tail unused.
+    pub fn get_contiguous_bytes(&mut self, len: usize) -> Slab {
+        assert!(
+            len <= BUFFER_SIZE,
+            "{len} contiguous bytes do not fit in one slot"
+        );
+        match &mut self.region {
+            FillRegion::Packed { .. } => {
+                if self.cursor().is_exhausted() || self.cursor().remaining() < len {
+                    self.rotate();
+                }
+                self.carve(len)
+            }
+            FillRegion::Transient { .. } => self.carve_transient_slab(len),
+        }
     }
 
     /// The slabs carved so far, in order, with their extents. Consumes the

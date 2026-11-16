@@ -427,6 +427,31 @@ fn is_empty_tracks_the_entry_count() {
     assert!(decompressed().is_empty());
 }
 
+#[test]
+fn contiguous_bytes_never_straddle_a_slot() {
+    init_test_free_pool(4);
+    let filler = decompressed().insert(key_in(&shared_file(), 0, 1), |fill| {
+        fill.get_contiguous_bytes(BUFFER_SIZE - 100);
+        Ok::<_, Infallible>(DecompressedPageMeta::new(header(0), counter()))
+    });
+    let first_slot = cursor_slot(decompressed());
+
+    let page = decompressed()
+        .insert(key_in(&shared_file(), 1, 1), |fill| {
+            fill.get_contiguous_bytes(1024);
+            Ok::<_, Infallible>(DecompressedPageMeta::new(header(0), counter()))
+        })
+        .unwrap();
+
+    assert_eq!(filler.unwrap().data.len(), 1);
+    assert_eq!(page.data.len(), 1);
+    assert_ne!(
+        cursor_slot(decompressed()),
+        first_slot,
+        "rotated rather than split"
+    );
+}
+
 // -- get_range --
 
 #[derive(Debug, PartialEq, Eq)]
