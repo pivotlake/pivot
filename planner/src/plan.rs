@@ -13,6 +13,7 @@ use crate::compile;
 use crate::expression::Expression;
 use crate::operator::{
     self, Compact, CopyFromStdin, Operator, OrderByDirection, SetVariable, TransactionStatement,
+    Window, WindowRowLimit,
 };
 use crate::types::Type;
 use dispatch::{GroupLimit, RowDelivery};
@@ -252,6 +253,87 @@ impl PlanNode {
     /// The nearest consumer decides, so each operator that cares imposes its
     /// choice on the subtree beneath it: under `Limit → Aggregate → Filter`
     /// the aggregate is what the filter feeds, and it still wants batches.
+    /// Move the conditions of filters that limit a window function, such as
+    /// `row_number() <= 1000`, into the [`Window`] node that computes it.
+    ///
+    /// `QUALIFY row_number() OVER (...) <= 1000` arrives as a filter above
+    /// the window. Left there, the window would sort and number every row
+    /// before the filter dropped most of them. Inside the window the limit
+    /// lets each worker drop rows as it receives them.
+    ///
+    /// A condition moves when [`Window::read_row_limit`] reads it as a limit
+    /// on a column, and that column is a function of a window reached from
+    /// the filter through projections only. A window holds one limit, so a
+    /// second such condition on a different function of the same window
+    /// stays in the filter. A filter left with no conditions is removed.
+    pub(crate) fn move_row_limits_into_windows(&mut self) {
+        for child in &mut self.inputs {
+            child.move_row_limits_into_windows();
+        }
+        let Operator::Filter(filter) = &mut self.operator else {
+            return;
+        };
+        let input = &mut self.inputs[0];
+        filter.conditions.retain(|condition| {
+            let Some((column_idx, limit)) = Window::read_row_limit(condition) else {
+                return true;
+            };
+            let Some((window, function_index)) = input.find_window_function(column_idx) else {
+                return true;
+            };
+            match &mut window.row_limit {
+                None => {
+                    window.row_limit = Some(WindowRowLimit {
+                        function_index,
+                        limit,
+                    });
+                    false
+                }
+                Some(existing) if existing.function_index == function_index => {
+                    existing.limit = existing.limit.min(limit);
+                    false
+                }
+                Some(_) => true,
+            }
+        });
+        if filter.conditions.is_empty() {
+            let input = self.inputs.remove(0);
+            *self = input;
+        }
+    }
+
+    /// Find the window function that produces output column `column_idx` of
+    /// this node, looking through projections that pass the column along
+    /// unchanged. Returns the window and the function's position in it.
+    /// Only a function a row limit can apply to is returned (see
+    /// [`counts_up_from_one`](crate::operator::WindowFunction::counts_up_from_one)).
+    ///
+    /// The search does not continue below a window: a limit on a lower
+    /// window's function would remove rows the upper window still has to
+    /// count.
+    fn find_window_function(&mut self, column_idx: usize) -> Option<(&mut Window, usize)> {
+        match &mut self.operator {
+            Operator::Window(window) => {
+                let input_width = self.inputs[0]
+                    .output_types()
+                    .expect("the window's input was typed when the window was built")
+                    .len();
+                let function_index = column_idx.checked_sub(input_width)?;
+                let function = window.functions.get(function_index)?;
+                function
+                    .counts_up_from_one()
+                    .then_some((window, function_index))
+            }
+            Operator::Projection(projection) => {
+                let Expression::Ref(passed_column) = projection.projections.get(column_idx)? else {
+                    return None;
+                };
+                self.inputs[0].find_window_function(passed_column.column_idx)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn annotate_filter_delivery(&mut self) {
         self.annotate_filter_delivery_below(RowDelivery::Coalesced);
     }
@@ -264,9 +346,10 @@ impl PlanNode {
         // transparent (a projection, a materialize) and passes the choice on.
         let below = match &self.operator {
             Operator::Limit(_) | Operator::TopN(_) => RowDelivery::Immediate,
-            Operator::Aggregate(_) | Operator::Join(_) | Operator::OrderBy(_) => {
-                RowDelivery::Coalesced
-            }
+            Operator::Aggregate(_)
+            | Operator::Join(_)
+            | Operator::OrderBy(_)
+            | Operator::Window(_) => RowDelivery::Coalesced,
             _ => consumer,
         };
         for child in &mut self.inputs {

@@ -68,9 +68,9 @@ use crate::operations::{
     JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
     NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory,
     OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
-    UnaryOperatorFactory, UnnestFactory, WideCell, copy_out, create_join_factories,
-    create_normalizing_join_factories, create_normalizing_order_by_factories,
-    create_range_join_factories,
+    UnaryOperatorFactory, UnnestFactory, WideCell, WindowFactory, WindowSpec, copy_out,
+    create_join_factories, create_normalizing_join_factories,
+    create_normalizing_order_by_factories, create_range_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -623,6 +623,25 @@ impl RecordBatchOperatorSpec {
         let topology = self.dispatcher.topology();
         let mut result = self.unary(OrderByFactory::create_for_workers(order_by, topology));
         result.stream_ordered = true;
+        result
+    }
+
+    /// SQL window functions: append one column per function of `spec` to
+    /// every row.
+    ///
+    /// The whole input is consumed first. Rows are split into hash buckets on
+    /// the partition keys, each bucket is sorted and evaluated on its own, and
+    /// buckets are emitted as they finish, so the output has no overall order.
+    /// See the `operations::unary::window` module.
+    pub fn window(self, spec: WindowSpec) -> Self {
+        let topology = self.dispatcher.topology();
+        let arena_buffers = self.dispatcher.buffers;
+        let mut result = self.unary(WindowFactory::create_for_workers(
+            spec,
+            topology,
+            arena_buffers,
+        ));
+        result.stream_ordered = false;
         result
     }
 

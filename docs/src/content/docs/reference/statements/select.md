@@ -28,6 +28,7 @@ SELECT [DISTINCT] expression [AS alias] [, ...]
 [WHERE condition]
 [GROUP BY expression [, ...]]
 [HAVING condition]
+[QUALIFY condition]
 [ORDER BY expression [ASC | DESC] [, ...]]
 [LIMIT count]
 [OFFSET count];
@@ -187,6 +188,21 @@ ORDER BY column_count DESC;
 
 See [aggregate functions](/docs/reference/functions/aggregates/) for the
 supported aggregates and their result types.
+
+## Window functions
+
+A window function such as `row_number() OVER (PARTITION BY team ORDER BY
+score)` computes a value for each row from the rows of its partition.
+`QUALIFY` filters on such a value, after the window functions are computed.
+
+```sql
+SELECT team, score
+FROM scores
+QUALIFY row_number() OVER (PARTITION BY team ORDER BY score DESC) <= 3;
+```
+
+See [window functions](/docs/reference/functions/window/) for the supported
+functions.
 
 ## Ordering and limits
 

@@ -92,6 +92,7 @@ mod normalizer;
 mod order_by;
 mod order_by_limit;
 mod unnest;
+mod window;
 
 pub use copy_out::copy_out;
 pub(crate) use join::create_join_factories;
@@ -113,6 +114,7 @@ pub use order_by::{
 };
 pub use order_by_limit::{OrderBy, OrderByLimitFactory};
 pub use unnest::UnnestFactory;
+pub use window::{WindowFactory, WindowFunction, WindowRowLimit, WindowSpec};
 
 #[derive(Debug, Error)]
 pub enum Error {

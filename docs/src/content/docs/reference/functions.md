@@ -12,6 +12,12 @@ restrictions. Function names are case-insensitive.
 counts, sums, averages, and other summaries: `avg`, `count`, `first`, `min`,
 `max`, and `sum`.
 
+## Window functions
+
+[Window functions](/docs/reference/functions/window/) compute a value for each
+row from the other rows of its partition: `row_number`, `rank`, `dense_rank`,
+`percent_rank`, `lag`, `lead`, and a running `sum`.
+
 ## Scalar functions
 
 - [Strings and regular expressions](/docs/reference/functions/strings/) - search, measure, slice, and replace text.
