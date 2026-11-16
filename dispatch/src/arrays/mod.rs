@@ -29,7 +29,9 @@ use arrow::array::ArrayData;
 use arrow::compute::kernels::interleave::interleave;
 use arrow::compute::take as arrow_take;
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, StructArray, UInt32Array, make_array};
+use arrow_array::{
+    Array, ArrayRef, StructArray, UInt32Array, downcast_primitive_array, make_array,
+};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_schema::{ArrowError, DataType};
 
@@ -169,21 +171,25 @@ fn take_via_arrow(column: &ArrayRef, indices: &[u32]) -> Result<ArrayRef, ArrowE
 /// more heap than its leaves would as flat columns. Anything else
 /// (dictionaries, lists) goes through Arrow's interleave kernel instead. The
 /// chunks must share one data type.
-pub fn take_chunked(
+///
+/// The chunks may be owned arrays or references to them, so a caller that
+/// gathers from arrays it only borrows does not have to clone them.
+pub fn take_chunked<Chunk: AsRef<dyn Array>>(
     allocator: &mut SlabAllocator,
-    chunks: &[ArrayRef],
+    chunks: &[Chunk],
     mapping: &[(u32, u32)],
 ) -> Result<ArrayRef, ArrowError> {
-    let data: Vec<ArrayData> = chunks.iter().map(|chunk| chunk.to_data()).collect();
-    let data_type = data[0].data_type();
+    let chunks: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
+    let chunks = chunks.as_slice();
+    let data_type = chunks[0].data_type();
     match data_type {
         DataType::Utf8View | DataType::BinaryView => {
-            let (views, data_buffers) = gather_chunked_views(allocator, &data, mapping);
+            let (views, data_buffers) = gather_chunked_views(allocator, chunks, mapping);
             let out = ArrayData::builder(data_type.clone())
                 .len(mapping.len())
                 .add_buffer(views)
                 .add_buffers(data_buffers)
-                .nulls(taken_validity_chunked(allocator, &data, mapping));
+                .nulls(taken_validity_chunked(allocator, chunks, mapping));
             // SAFETY: each view is either inline, rebuilt over the block its
             // value's bytes were just copied into, or the empty view of a row
             // the bitmap marks null.
@@ -195,7 +201,7 @@ pub fn take_chunked(
                 .iter()
                 .map(|child_chunks| take_chunked(allocator, child_chunks, mapping))
                 .collect::<Result<Vec<_>, _>>()?;
-            let nulls = taken_validity_chunked(allocator, &data, mapping);
+            let nulls = taken_validity_chunked(allocator, chunks, mapping);
             Ok(Arc::new(StructArray::try_new(
                 fields.clone(),
                 gathered,
@@ -204,17 +210,17 @@ pub fn take_chunked(
         }
         dt => {
             let values = match dt.primitive_width() {
-                Some(1) => gather_chunked::<u8>(allocator, &data, mapping),
-                Some(2) => gather_chunked::<u16>(allocator, &data, mapping),
-                Some(4) => gather_chunked::<u32>(allocator, &data, mapping),
-                Some(8) => gather_chunked::<u64>(allocator, &data, mapping),
-                Some(16) => gather_chunked::<u128>(allocator, &data, mapping),
+                Some(1) => gather_chunked::<u8>(allocator, chunks, mapping),
+                Some(2) => gather_chunked::<u16>(allocator, chunks, mapping),
+                Some(4) => gather_chunked::<u32>(allocator, chunks, mapping),
+                Some(8) => gather_chunked::<u64>(allocator, chunks, mapping),
+                Some(16) => gather_chunked::<u128>(allocator, chunks, mapping),
                 _ => return interleave_via_arrow(chunks, mapping),
             };
             let out = ArrayData::builder(dt.clone())
                 .len(mapping.len())
                 .add_buffer(values)
-                .nulls(taken_validity_chunked(allocator, &data, mapping));
+                .nulls(taken_validity_chunked(allocator, chunks, mapping));
             // SAFETY: a fixed-width array is a single values buffer plus its
             // validity, and both gather verbatim per taken row.
             Ok(make_array(unsafe { out.build_unchecked() }))
@@ -252,7 +258,8 @@ pub fn concat_chunks(
             Ok(make_array(unsafe { out.build_unchecked() }))
         }
         DataType::Struct(fields) => {
-            let children = struct_children(chunks, fields.len());
+            let chunks: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
+            let children = struct_children(&chunks, fields.len());
             let concatenated = children
                 .iter()
                 .map(|child_chunks| concat_chunks(allocator, child_chunks))
@@ -288,7 +295,7 @@ pub fn concat_chunks(
 /// child: `children[i]` holds child `i` of every chunk, in chunk order. A
 /// sliced struct chunk hands out children already sliced with it, so a row
 /// number of the chunk is the same row of each child.
-fn struct_children(chunks: &[ArrayRef], field_count: usize) -> Vec<Vec<ArrayRef>> {
+fn struct_children(chunks: &[&dyn Array], field_count: usize) -> Vec<Vec<ArrayRef>> {
     (0..field_count)
         .map(|child| {
             chunks
@@ -406,7 +413,7 @@ fn concat_via_arrow(chunks: &[ArrayRef]) -> Result<ArrayRef, ArrowError> {
 /// source chunk is all-valid (so null-free columns cost nothing here).
 fn taken_validity_chunked(
     allocator: &mut SlabAllocator,
-    chunks: &[ArrayData],
+    chunks: &[&dyn Array],
     mapping: &[(u32, u32)],
 ) -> Option<NullBuffer> {
     if chunks.iter().all(|chunk| chunk.null_count() == 0) {
@@ -429,15 +436,26 @@ fn taken_validity_chunked(
 
 fn gather_chunked<T: Copy>(
     allocator: &mut SlabAllocator,
-    chunks: &[ArrayData],
+    chunks: &[&dyn Array],
     mapping: &[(u32, u32)],
 ) -> Buffer {
     let slab = allocator.create_slab_buffer::<T>(mapping.len(), false);
+    // Each chunk's first value. A primitive array hands out its values
+    // directly. Any other fixed-width array is read through its `ArrayData`,
+    // whose buffer 0 holds `offset + len` values of `T` and shares the
+    // chunk's memory, so the pointer outlives the `ArrayData`.
     let sources: Vec<*const T> = chunks
         .iter()
-        // SAFETY (of the `add`): buffer 0 of each chunk holds `offset + len`
-        // values of `T`, so the offset stays within its allocation.
-        .map(|chunk| unsafe { (chunk.buffers()[0].as_ptr() as *const T).add(chunk.offset()) })
+        .map(|&chunk| {
+            downcast_primitive_array!(
+                chunk => { chunk.values().as_ptr() as *const T }
+                _ => {
+                    let data = chunk.to_data();
+                    // SAFETY: the offset stays within the buffer's allocation.
+                    unsafe { (data.buffers()[0].as_ptr() as *const T).add(data.offset()) }
+                }
+            )
+        })
         .collect();
     // SAFETY: every mapping pair names a valid row of the chunk it points at,
     // and the slab holds `mapping.len()` slots. Unaligned reads tolerate
@@ -461,19 +479,25 @@ fn gather_chunked<T: Copy>(
 /// array's data buffers.
 fn gather_chunked_views(
     allocator: &mut SlabAllocator,
-    chunks: &[ArrayData],
+    chunks: &[&dyn Array],
     mapping: &[(u32, u32)],
 ) -> (Buffer, Vec<Buffer>) {
     let slab = allocator.create_slab_buffer::<u128>(mapping.len(), false);
     let mut blocks: Vec<DataBlock> = Vec::new();
     let mut open_block_idx = None;
+    // Each chunk's first view, the buffers its views point into, and its
+    // validity.
     let sources: Vec<(*const u128, &[Buffer], Option<&NullBuffer>)> = chunks
         .iter()
-        // SAFETY (of the `add`): buffer 0 of a view array holds `offset + len`
-        // views, so the offset stays within its allocation.
-        .map(|chunk| {
-            let views = unsafe { (chunk.buffers()[0].as_ptr() as *const u128).add(chunk.offset()) };
-            (views, &chunk.buffers()[1..], chunk.nulls())
+        .map(|chunk| match chunk.data_type() {
+            DataType::Utf8View => {
+                let chunk = chunk.as_string_view();
+                (chunk.views().as_ptr(), chunk.data_buffers(), chunk.nulls())
+            }
+            _ => {
+                let chunk = chunk.as_binary_view();
+                (chunk.views().as_ptr(), chunk.data_buffers(), chunk.nulls())
+            }
         })
         .collect();
     for (out_idx, &(chunk, row)) in mapping.iter().enumerate() {
@@ -506,15 +530,14 @@ fn gather_chunked_views(
 }
 
 fn interleave_via_arrow(
-    chunks: &[ArrayRef],
+    chunks: &[&dyn Array],
     mapping: &[(u32, u32)],
 ) -> Result<ArrayRef, ArrowError> {
-    let sources: Vec<&dyn Array> = chunks.iter().map(|chunk| chunk.as_ref()).collect();
     let indices: Vec<(usize, usize)> = mapping
         .iter()
         .map(|&(chunk, row)| (chunk as usize, row as usize))
         .collect();
-    interleave(&sources, &indices)
+    interleave(chunks, &indices)
 }
 
 #[cfg(test)]
