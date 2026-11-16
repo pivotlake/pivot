@@ -142,6 +142,10 @@ pub enum Error {
         #[source]
         source: pcre2::Error,
     },
+    #[error("window functions over a VARIANT column are not supported")]
+    UnsupportedWindowOverVariant,
+    #[error("sum over a window is not supported for a {0:?} argument")]
+    UnsupportedWindowSumArgument(crate::types::Type),
     #[error("CREATE TABLE does not support OR REPLACE yet")]
     UnsupportedCreateTableOrReplace,
     #[error("CREATE TEMPORARY TABLE is not supported yet")]
@@ -341,6 +345,9 @@ impl PlanNode {
                 o.compile(inputs.remove(0), self.inputs[0].output_nullability())
             }
             crate::Operator::Unnest(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Window(o) => {
+                o.compile(inputs.remove(0), &self.inputs[0].output_types()?)
+            }
             crate::Operator::Materialize(o) => o.compile(inputs.remove(0)),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {

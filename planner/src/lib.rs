@@ -252,6 +252,8 @@ impl Planner {
         root.annotate_group_topn();
         // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.
         root.annotate_group_limit();
+        // Hand a filter's limit on a window function to the window below it.
+        root.move_row_limits_into_windows();
         // Let filters under a LIMIT or Top-N deliver rows as they are selected.
         root.annotate_filter_delivery();
         let requires_rebind = planned.requires_rebind();

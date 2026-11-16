@@ -34,7 +34,7 @@ use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
     Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
     JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
-    TopN, TransactionStatement, Unnest, Values,
+    TopN, TransactionStatement, Unnest, Values, Window,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -186,6 +186,10 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::OrderBy(o) => Operator::OrderBy(OrderBy::from_handle(o)?),
         DuckOperator::TopN(t) => Operator::TopN(TopN::from_handle(t, ctx)?),
         DuckOperator::Limit(l) => Operator::Limit(Limit::from_handle(l)?),
+        DuckOperator::Window(w) => {
+            let child = inputs.pop().expect("a window reads a child's rows");
+            return Window::from_handle(w, child);
+        }
         DuckOperator::TableScan(scan) => {
             // The pushdown lift is a walk-level transform (it wraps the scan in a
             // Filter below), so it stays here rather than in `Input::from_handle`.

@@ -140,7 +140,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A single sort-key specification: which column, sort direction, and null ordering.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderBy {
     column_idx: usize,
     descending: bool,

@@ -247,6 +247,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_UNNEST => Operator::Unnest(Unnest { raw: self.raw }),
             L::LOGICAL_ORDER_BY => Operator::OrderBy(OrderBy { raw: self.raw }),
             L::LOGICAL_TOP_N => Operator::TopN(TopN { raw: self.raw }),
+            L::LOGICAL_WINDOW => Operator::Window(Window { raw: self.raw }),
             L::LOGICAL_LIMIT => Operator::Limit(Limit { raw: self.raw }),
             L::LOGICAL_GET if ffi::lo_get_has_table(self.raw)? => {
                 Operator::TableScan(TableScan { raw: self.raw })
@@ -301,6 +302,8 @@ pub enum Operator<'plan> {
     Unnest(Unnest<'plan>),
     OrderBy(OrderBy<'plan>),
     TopN(TopN<'plan>),
+    /// Window functions computed over the child's rows.
+    Window(Window<'plan>),
     Limit(Limit<'plan>),
     /// A base-table scan (`LOGICAL_GET` over a table).
     TableScan(TableScan<'plan>),
@@ -387,6 +390,9 @@ define_handles! { ffi::LogicalOperator;
     OrderBy,
     /// A `LogicalTopN`: ORDER BY + LIMIT, optionally a dynamic-filter producer.
     TopN,
+    /// A `LogicalWindow`: window expressions whose results are appended to
+    /// the child's columns.
+    Window,
     /// A `LogicalLimit`: a bare `LIMIT`/`OFFSET` with no ORDER BY.
     Limit,
     /// A `LogicalGet` over a base table.
@@ -606,6 +612,121 @@ impl<'plan> Unnest<'plan> {
                     element_type: bound_type_from_logical_type(ffi::lo_unnest_element_type(
                         self.raw, i,
                     )?)?,
+                })
+            })
+            .collect()
+    }
+}
+
+impl<'plan> Window<'plan> {
+    /// The window expressions, in the order their result columns follow the
+    /// child's columns.
+    pub fn expressions(self) -> Result<Vec<WindowExpr<'plan>>> {
+        (0..ffi::lo_window_expr_count(self.raw)?)
+            .map(|i| {
+                Ok(WindowExpr {
+                    raw: ffi::lo_window_expr(self.raw, i)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A window frame that starts at the partition's first row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunningFrame {
+    /// `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`: the frame ends at
+    /// the current row.
+    ThroughCurrentRow,
+    /// `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, which is the
+    /// default frame: the frame ends at the last row that ties with the
+    /// current row on the order keys.
+    ThroughTies,
+}
+
+/// One window expression of a [`Window`]: a function and the `OVER` clause it
+/// is computed under (DuckDB's `BoundWindowExpression`).
+#[derive(Clone, Copy)]
+pub struct WindowExpr<'plan> {
+    raw: &'plan ffi::Expression,
+}
+
+impl<'plan> WindowExpr<'plan> {
+    /// Which window function this is, as one of DuckDB's `WINDOW_*`
+    /// expression types (`WINDOW_ROW_NUMBER`, `WINDOW_RANK`, ...).
+    pub fn function_type(self) -> Result<ExpressionType> {
+        Ok(ExpressionType::from_u8(ffi::expr_type(self.raw)?))
+    }
+
+    /// The `PARTITION BY` expressions.
+    pub fn partitions(self) -> Result<Vec<Expr<'plan>>> {
+        (0..ffi::expr_window_partition_count(self.raw)?)
+            .map(|i| {
+                Ok(Expr {
+                    raw: ffi::expr_window_partition(self.raw, i)?,
+                })
+            })
+            .collect()
+    }
+
+    /// How many ordering keys are written inside the function call itself,
+    /// as in `rank(ORDER BY x) OVER (...)`. Such an ordering replaces the
+    /// `OVER` clause's ordering for this function.
+    pub fn argument_order_count(self) -> Result<usize> {
+        Ok(ffi::expr_window_argument_order_count(self.raw)?)
+    }
+
+    /// The function's arguments. For `lag` and `lead` these are the value,
+    /// then the offset and the default when they were written.
+    pub fn arguments(self) -> Result<Vec<Expr<'plan>>> {
+        (0..ffi::expr_window_argument_count(self.raw)?)
+            .map(|i| {
+                Ok(Expr {
+                    raw: ffi::expr_window_argument(self.raw, i)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the function was written with `IGNORE NULLS`.
+    pub fn ignores_nulls(self) -> Result<bool> {
+        Ok(ffi::expr_window_ignores_nulls(self.raw)?)
+    }
+
+    /// The aggregate's name when this is an aggregate used as a window
+    /// function, such as `sum(x) OVER (...)`.
+    pub fn aggregate_name(self) -> Result<Option<String>> {
+        let name = ffi::expr_window_aggregate_name(self.raw)?;
+        Ok((!name.is_empty()).then_some(name))
+    }
+
+    /// Whether the expression has a `DISTINCT` or a `FILTER` clause.
+    pub fn is_distinct_or_filtered(self) -> Result<bool> {
+        Ok(ffi::expr_window_is_distinct_or_filtered(self.raw)?)
+    }
+
+    /// The frame, when it runs from the partition's first row to the current
+    /// row and excludes nothing. `None` for any other frame.
+    pub fn running_frame(self) -> Result<Option<RunningFrame>> {
+        Ok(match ffi::expr_window_running_frame(self.raw)? {
+            1 => Some(RunningFrame::ThroughCurrentRow),
+            2 => Some(RunningFrame::ThroughTies),
+            _ => None,
+        })
+    }
+
+    /// The `ORDER BY` keys inside `OVER`.
+    pub fn order_keys(self) -> Result<Vec<OrderKey<'plan>>> {
+        (0..ffi::expr_window_order_count(self.raw)?)
+            .map(|i| {
+                Ok(OrderKey {
+                    direction: OrderType::from_u8(ffi::expr_window_order_direction(self.raw, i)?),
+                    null_order: OrderByNullType::from_u8(ffi::expr_window_order_null_order(
+                        self.raw, i,
+                    )?),
+                    expression: Expr {
+                        raw: ffi::expr_window_order_expr(self.raw, i)?,
+                    },
                 })
             })
             .collect()
@@ -1288,6 +1409,12 @@ impl<'plan> Expr<'plan> {
     /// The type the expression evaluates to, whatever its kind.
     pub fn return_type(self) -> Result<BoundLogicalType> {
         bound_type_from_logical_type(ffi::expr_return_type(self.raw)?)
+    }
+
+    /// Whether this expression and `other` compute the same value from the
+    /// same inputs.
+    pub fn equals(self, other: Expr<'_>) -> Result<bool> {
+        Ok(ffi::expr_equals(self.raw, other.raw)?)
     }
 
     /// Dispatch on the expression's [`ExpressionType`] into a typed [`Expression`]

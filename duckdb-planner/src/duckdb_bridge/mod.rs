@@ -273,6 +273,36 @@ pub mod ffi {
         fn lo_aggregate_expr_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_aggregate_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
 
+        // ---- Window ----
+        /// A `LogicalWindow`'s window expressions, one per output column it
+        /// appends to its child's columns. Each is a `BoundWindowExpression`;
+        /// `expr_type` tells which function it is.
+        fn lo_window_expr_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_window_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
+        /// The `PARTITION BY` expressions of a window expression.
+        fn expr_window_partition_count(expr: &Expression) -> Result<usize>;
+        fn expr_window_partition(expr: &Expression, index: usize) -> Result<&Expression>;
+        /// The `ORDER BY` keys inside a window expression's `OVER` clause.
+        fn expr_window_order_count(expr: &Expression) -> Result<usize>;
+        fn expr_window_order_direction(expr: &Expression, index: usize) -> Result<u8>;
+        fn expr_window_order_null_order(expr: &Expression, index: usize) -> Result<u8>;
+        fn expr_window_order_expr(expr: &Expression, index: usize) -> Result<&Expression>;
+        /// How many ordering keys are written inside the function call itself,
+        /// as in `rank(ORDER BY x) OVER (...)`.
+        fn expr_window_argument_order_count(expr: &Expression) -> Result<usize>;
+        /// The function's arguments. For `lag` and `lead` these are the value,
+        /// then the offset and the default when they were written.
+        fn expr_window_argument_count(expr: &Expression) -> Result<usize>;
+        fn expr_window_argument(expr: &Expression, index: usize) -> Result<&Expression>;
+        fn expr_window_ignores_nulls(expr: &Expression) -> Result<bool>;
+        /// The aggregate's name for an aggregate used as a window function,
+        /// and an empty string for the dedicated window functions.
+        fn expr_window_aggregate_name(expr: &Expression) -> Result<String>;
+        fn expr_window_is_distinct_or_filtered(expr: &Expression) -> Result<bool>;
+        /// 1 for a frame from the partition's first row to the current row,
+        /// 2 for one that ends at the current row's last tie, 0 otherwise.
+        fn expr_window_running_frame(expr: &Expression) -> Result<u8>;
+
         // ---- Distinct ----
         /// Whether the node is `DISTINCT ON (...)` rather than a plain
         /// `DISTINCT` over the whole row.
@@ -619,6 +649,10 @@ pub mod ffi {
             logical_type: &LogicalType,
             index: usize,
         ) -> Result<&LogicalType>;
+
+        /// Whether two bound expressions compute the same value from the same
+        /// inputs (DuckDB's `Expression::Equals`).
+        fn expr_equals(left: &Expression, right: &Expression) -> Result<bool>;
 
         // BoundAggregateExpression
         fn expr_aggregate_name(expr: &Expression) -> Result<String>;

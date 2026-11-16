@@ -40,6 +40,7 @@ mod top_n;
 mod transaction;
 mod unnest;
 mod values;
+mod window;
 
 pub use aggregate::Aggregate;
 pub use compact::Compact;
@@ -68,6 +69,7 @@ pub use top_n::TopN;
 pub use transaction::TransactionStatement;
 pub use unnest::{Unnest, UnnestedList};
 pub use values::Values;
+pub use window::{Window, WindowFunction, WindowRowLimit};
 
 use crate::compile;
 use crate::expression::{self, Expression};
@@ -146,6 +148,8 @@ pub enum Operator {
     /// Each input row repeated once per element of a list written out in the
     /// query (see [`Unnest`]).
     Unnest(Unnest),
+    /// Window functions sharing one `OVER` clause (see [`Window`]).
+    Window(Window),
 }
 
 impl Operator {
@@ -218,6 +222,12 @@ impl Operator {
             Operator::Unnest(unnest) => {
                 let mut types = inputs[0].clone();
                 types.extend(unnest.element_types());
+                Ok(types)
+            }
+            // A window appends one column per function to its input.
+            Operator::Window(window) => {
+                let mut types = inputs[0].clone();
+                types.extend(window.function_types(&inputs[0])?);
                 Ok(types)
             }
             // Statements, not queries: no result columns.
@@ -322,6 +332,11 @@ impl Operator {
                 nullable.extend(unnest.element_nullability(&inputs[0]));
                 nullable
             }
+            Operator::Window(window) => {
+                let mut nullable = inputs[0].clone();
+                nullable.extend(window.function_nullability());
+                nullable
+            }
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)
@@ -370,6 +385,7 @@ impl fmt::Display for Operator {
             Operator::CteScan(c) => write!(f, "{c}"),
             Operator::Distinct(d) => write!(f, "{d}"),
             Operator::Unnest(u) => write!(f, "{u}"),
+            Operator::Window(w) => write!(f, "{w}"),
         }
     }
 }

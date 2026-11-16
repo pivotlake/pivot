@@ -74,6 +74,16 @@ impl fmt::Display for Input {
 }
 
 impl Input {
+    /// Whether the scan reads no column of its table. A query that only needs
+    /// the table's row count gets one placeholder column from DuckDB, which
+    /// the scan declares but does not emit: its batches have no columns.
+    pub(crate) fn reads_no_column(&self) -> bool {
+        matches!(
+            self.columns.as_slice(),
+            [Expression::Ref(column)] if column.column_idx == usize::MAX
+        )
+    }
+
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
