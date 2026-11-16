@@ -201,7 +201,9 @@ impl PlanNode {
                         // Don't push top-k onto a slot whose `sort_key` isn't ordered:
                         // a string extreme (raw `ArenaKey`/StringView header bits) or a
                         // float aggregate (the cell holds `f64` bits, so the widened
-                        // sort key is not numerically ordered). A per-partition top-k
+                        // sort key is not numerically ordered). An `ANY_VALUE` cell
+                        // holds whatever its column's type stores, so it never
+                        // takes the pushdown. A per-partition top-k
                         // would keep the wrong rows; leave it to the full `TopN` sort
                         // above (only the pushdown is skipped).
                         use crate::expression::AggregateFunc;
@@ -216,6 +218,7 @@ impl PlanNode {
                                 x.argument.result_type().ok(),
                                 Some(Type::Float32 | Type::Float64)
                             ),
+                            Some(Expression::AggregateFunc(AggregateFunc::AnyValue(_))) => true,
                             _ => false,
                         };
                         if !unordered_sort_key {

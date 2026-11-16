@@ -63,6 +63,9 @@ pub enum AggregateFunc {
     /// first. DuckDB emits it when it needs *a* value rather than a fold, most
     /// notably in the single-row guard it plans around every scalar subquery.
     First(NumericAggregate),
+    /// `ANY_VALUE(col)`: one non-NULL value of the column, NULL only when the
+    /// column has none. Which non-NULL value is unspecified.
+    AnyValue(NumericAggregate),
 }
 
 impl AggregateFunc {
@@ -76,7 +79,8 @@ impl AggregateFunc {
             | AggregateFunc::Max(a)
             | AggregateFunc::Count(a)
             | AggregateFunc::CountDistinct(a)
-            | AggregateFunc::First(a) => &a.return_type,
+            | AggregateFunc::First(a)
+            | AggregateFunc::AnyValue(a) => &a.return_type,
         }
     }
 
@@ -92,7 +96,8 @@ impl AggregateFunc {
             | AggregateFunc::Max(a)
             | AggregateFunc::Count(a)
             | AggregateFunc::CountDistinct(a)
-            | AggregateFunc::First(a) => Some(a.argument.as_ref()),
+            | AggregateFunc::First(a)
+            | AggregateFunc::AnyValue(a) => Some(a.argument.as_ref()),
         }
         .into_iter()
     }
@@ -108,7 +113,8 @@ impl AggregateFunc {
             | AggregateFunc::Max(a)
             | AggregateFunc::Count(a)
             | AggregateFunc::CountDistinct(a)
-            | AggregateFunc::First(a) => Some(a.argument.as_mut()),
+            | AggregateFunc::First(a)
+            | AggregateFunc::AnyValue(a) => Some(a.argument.as_mut()),
         }
         .into_iter()
     }
@@ -125,6 +131,7 @@ impl Display for AggregateFunc {
             AggregateFunc::Count(a) => write!(f, "count({})", a.argument),
             AggregateFunc::CountDistinct(a) => write!(f, "count(distinct {})", a.argument),
             AggregateFunc::First(a) => write!(f, "first({})", a.argument),
+            AggregateFunc::AnyValue(a) => write!(f, "any_value({})", a.argument),
         }
     }
 }

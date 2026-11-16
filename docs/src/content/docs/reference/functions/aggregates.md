@@ -11,11 +11,33 @@ for grouping and `HAVING`.
 
 | Function | Result |
 | --- | --- |
+| [any_value](#any_value) | One non-NULL input value. |
 | [avg](#avg) | Arithmetic mean. |
 | [count](#count) | Row count or count of values. |
 | [first](#first) | One input value. |
 | [min and max](#min-and-max) | Smallest or largest value. |
 | [sum](#sum) | Sum of numeric values. |
+
+## any_value
+
+```sql
+any_value(expression)
+```
+
+Returns one non-NULL input value, or NULL when every input value is NULL.
+Which value is returned is unspecified, so do not use it to choose the earliest
+or latest row. Unlike [first](#first), it never returns a NULL while the group
+has a non-NULL value, and it can be used with `GROUP BY`.
+
+```sql
+SELECT region, any_value(city) AS city
+FROM (VALUES ('eu', NULL), ('eu', 'Oslo'), ('us', 'Reno')) AS input(region, city)
+GROUP BY region;
+-- eu: Oslo, us: Reno
+```
+
+With `GROUP BY`, `any_value` accepts booleans, strings, `SMALLINT`, `INTEGER`,
+`BIGINT`, `REAL`, `DOUBLE`, decimals, dates, and timestamps.
 
 ## avg
 

@@ -12,7 +12,8 @@ use super::super::super::{
     U128Max, U128Min, U128Sum,
 };
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use arrow_array::{RecordBatch, StringViewArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{BooleanArray, RecordBatch, StringViewArray};
 use arrow_schema::DataType;
 use std::array;
 use std::sync::Arc;
@@ -36,6 +37,11 @@ pub enum OperationReader<'b> {
     U128Max(U128Reader<'b>),
     StrMin(&'b StringViewArray),
     StrMax(&'b StringViewArray),
+    AnyValueI64(I64Reader<'b>),
+    AnyValueF64(F64Reader<'b>),
+    AnyValueU128(U128Reader<'b>),
+    AnyValueStr(&'b StringViewArray),
+    AnyValueBool(&'b BooleanArray),
 }
 
 impl<'b> OperationReader<'b> {
@@ -66,7 +72,25 @@ impl<'b> OperationReader<'b> {
                 OperationReader::F64Max,
                 OperationReader::U128Max,
             ),
+            AnyValue => Self::bind_any_value(batch, descriptor.column),
             First => unreachable!("the planner rejects FIRST inside a GROUP BY"),
+        }
+    }
+
+    /// Binds a column for `ANY_VALUE`: a boolean or string column to its own
+    /// reader, a numeric one to the reader for its value family.
+    fn bind_any_value(batch: &'b RecordBatch, column: usize) -> Self {
+        let array = batch.column(column);
+        match array.data_type() {
+            DataType::Boolean => OperationReader::AnyValueBool(array.as_boolean()),
+            DataType::Utf8View => OperationReader::AnyValueStr(StrRead::bind(batch, column)),
+            _ => Self::bind_numeric(
+                batch,
+                column,
+                OperationReader::AnyValueI64,
+                OperationReader::AnyValueF64,
+                OperationReader::AnyValueU128,
+            ),
         }
     }
 
@@ -199,7 +223,57 @@ impl<'b> OperationReader<'b> {
                     StrMax::<A>::seed(StrRead::read(array, row_index), worker_context)
                 }
             }
+            OperationReader::AnyValueI64(reader) => {
+                if ONLY_ADDITIVE {
+                    unreachable!()
+                } else {
+                    A::from(reader.read(row_index))
+                }
+            }
+            OperationReader::AnyValueF64(reader) => {
+                if ONLY_ADDITIVE {
+                    unreachable!()
+                } else {
+                    A::from_f64(reader.read(row_index))
+                }
+            }
+            OperationReader::AnyValueU128(reader) => {
+                if ONLY_ADDITIVE {
+                    unreachable!()
+                } else {
+                    A::from_i128(reader.read(row_index))
+                }
+            }
+            OperationReader::AnyValueStr(array) => {
+                if ONLY_ADDITIVE {
+                    unreachable!()
+                } else {
+                    A::from_key(worker_context.push(StrRead::read(array, row_index)))
+                }
+            }
+            OperationReader::AnyValueBool(array) => {
+                if ONLY_ADDITIVE {
+                    unreachable!()
+                } else {
+                    // Safety: the group operator only passes row indices inside the batch.
+                    A::from(unsafe { array.value_unchecked(row_index) } as i64)
+                }
+            }
         }
+    }
+
+    /// Whether this operation keeps the value a slot already holds, so only a
+    /// slot that holds none reads its input row.
+    #[inline(always)]
+    fn keeps_stored_value(&self) -> bool {
+        matches!(
+            self,
+            OperationReader::AnyValueI64(_)
+                | OperationReader::AnyValueF64(_)
+                | OperationReader::AnyValueU128(_)
+                | OperationReader::AnyValueStr(_)
+                | OperationReader::AnyValueBool(_)
+        )
     }
 
     /// Whether this operation's seen bit is always set: a count renders `0`
@@ -213,7 +287,8 @@ impl<'b> OperationReader<'b> {
     /// fold's identity, absorbed by any later fold (`0` for a sum or count,
     /// the width's extreme for `MIN`/`MAX`). A string extreme's cell is the
     /// default empty view, guarded by the seen bit so it is never resolved
-    /// through the arena.
+    /// through the arena. An `ANY_VALUE` cell is likewise the default until
+    /// its seen bit sets.
     #[inline(always)]
     pub(in super::super) fn empty<
         A: IntCell + StringCell + F64Cell + WideCell,
@@ -229,14 +304,21 @@ impl<'b> OperationReader<'b> {
             OperationReader::F64Sum(_) => F64Sum::<A>::empty(),
             OperationReader::F64Min(_) => F64Min::<A>::empty(),
             OperationReader::F64Max(_) => F64Max::<A>::empty(),
-            OperationReader::StrMin(_) | OperationReader::StrMax(_) => A::default(),
+            OperationReader::StrMin(_)
+            | OperationReader::StrMax(_)
+            | OperationReader::AnyValueI64(_)
+            | OperationReader::AnyValueF64(_)
+            | OperationReader::AnyValueU128(_)
+            | OperationReader::AnyValueStr(_)
+            | OperationReader::AnyValueBool(_) => A::default(),
         }
     }
 
     /// Folds one valid row into an existing cell of a tracking run. A string
     /// extreme whose slot has not seen a value yet re-seeds instead of
-    /// updating: its unseen cell holds no arena key to resolve; every other
-    /// operation folds normally (identity cells absorb).
+    /// updating: its unseen cell holds no arena key to resolve. An `ANY_VALUE`
+    /// keeps a seen cell untouched and stores the row's value in an unseen
+    /// one. Every other operation folds normally (identity cells absorb).
     #[inline(always)]
     pub(in super::super) fn update_seen<
         A: IntCell + StringCell + F64Cell + WideCell,
@@ -276,6 +358,13 @@ impl<'b> OperationReader<'b> {
                         worker_context,
                         shared,
                     )
+                }
+            }
+            _ if self.keeps_stored_value() => {
+                if was_seen {
+                    cell
+                } else {
+                    self.seed::<A, ONLY_ADDITIVE>(row_index, worker_context)
                 }
             }
             _ => self.update::<A, ONLY_ADDITIVE>(cell, row_index, worker_context, shared),
@@ -383,6 +472,19 @@ impl<'b> OperationReader<'b> {
                     )
                 }
             }
+            // An untracked run seeds every slot from its group's first row, and
+            // no aggregated column holds NULLs, so the cell is always set here.
+            OperationReader::AnyValueI64(_)
+            | OperationReader::AnyValueF64(_)
+            | OperationReader::AnyValueU128(_)
+            | OperationReader::AnyValueStr(_)
+            | OperationReader::AnyValueBool(_) => {
+                if ONLY_ADDITIVE {
+                    unreachable!()
+                } else {
+                    cell
+                }
+            }
         }
     }
 }
@@ -470,6 +572,9 @@ impl<A: IntCell + StringCell + F64Cell + WideCell> MergeCells for A {
             }
             AggregationKind::Max if ty.is_floating() => F64Max::<A>::merge(*self, source),
             AggregationKind::Max => Max::<A>::merge(*self, source),
+            // Both cells are set when this runs: an untracked run seeds every
+            // cell, and a tracking merge only calls this for two seen cells.
+            AggregationKind::AnyValue => *self,
             AggregationKind::First => unreachable!("the planner rejects FIRST inside a GROUP BY"),
         };
     }

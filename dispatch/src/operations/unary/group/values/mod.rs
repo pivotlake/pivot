@@ -58,6 +58,10 @@ pub enum AggregationKind {
     /// `FIRST(col)` — one of the column's values, whichever a worker sees
     /// first. Global aggregates only; the grouped path rejects it at planning.
     First,
+    /// `ANY_VALUE(col)`: one non-NULL value of the column, NULL only when the
+    /// column has none. A slot keeps the first value stored in it; later rows
+    /// and merged partials leave a set slot alone.
+    AnyValue,
 }
 
 /// One aggregate output slot: which aggregate, over which input column, and the
@@ -87,6 +91,16 @@ impl AggregationSlot {
     pub fn is_string_extreme(&self) -> bool {
         matches!(self.kind, AggregationKind::Min | AggregationKind::Max)
             && self.output_type == DataType::Utf8View
+    }
+
+    /// Returns whether a grouped slot keeps its string in the value arena:
+    /// MIN, MAX, or ANY_VALUE over strings.
+    #[inline(always)]
+    pub fn keeps_string_in_arena(&self) -> bool {
+        matches!(
+            self.kind,
+            AggregationKind::Min | AggregationKind::Max | AggregationKind::AnyValue
+        ) && self.output_type == DataType::Utf8View
     }
 }
 

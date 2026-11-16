@@ -254,9 +254,12 @@ enum Slot<A: IntCell> {
     /// of its column so any value type rides through unchanged (NULL included -
     /// `FIRST` keeps the first *row's* value, unlike the NULL-skipping folds).
     /// The declared output type shapes the NULL emitted over zero rows.
+    /// With `skip_nulls` this is `ANY_VALUE(col)`: the first non-NULL value
+    /// this worker saw, so a NULL is only emitted when the column has none.
     First {
         column: usize,
         output_type: DataType,
+        skip_nulls: bool,
         acc: Option<ArrayRef>,
     },
 }
@@ -284,10 +287,11 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
             AggregationKind::Sum => NumOp::Sum,
             AggregationKind::Min => NumOp::Min,
             AggregationKind::Max => NumOp::Max,
-            AggregationKind::First => {
+            AggregationKind::First | AggregationKind::AnyValue => {
                 return Slot::First {
                     column,
                     output_type: spec.output_type.clone(),
+                    skip_nulls: spec.kind == AggregationKind::AnyValue,
                     acc: None,
                 };
             }
@@ -340,9 +344,19 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
                 let reduced = reduce_str_column(*is_max, batch.column(*column).as_ref());
                 fold_into(acc, reduced, str_extreme_fn(*is_max));
             }
-            Slot::First { column, acc, .. } => {
-                if acc.is_none() && batch.num_rows() > 0 {
-                    *acc = Some(batch.column(*column).slice(0, 1));
+            Slot::First {
+                column,
+                skip_nulls,
+                acc,
+                ..
+            } => {
+                if acc.is_none() {
+                    let values = batch.column(*column);
+                    let kept_row = match values.nulls() {
+                        Some(nulls) if *skip_nulls => nulls.valid_indices().next(),
+                        _ => (batch.num_rows() > 0).then_some(0),
+                    };
+                    *acc = kept_row.map(|row| values.slice(row, 1));
                 }
             }
         }
@@ -891,6 +905,35 @@ mod tests {
         assert_eq!(
             out.items[0].column(0).as_primitive::<Int32Type>().value(0),
             7
+        );
+    }
+
+    #[test]
+    fn any_value_skips_nulls_across_batches() {
+        let nullable_batch = |values: Vec<Option<i32>>| {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap()
+        };
+        let ops = build::<i64>(
+            1,
+            vec![AggregationSlot::new(
+                AggregationKind::AnyValue,
+                0,
+                DataType::Int32,
+            )],
+        );
+
+        let out = run_consumers(
+            ops,
+            vec![vec![
+                nullable_batch(vec![None, None]),
+                nullable_batch(vec![None, Some(9)]),
+            ]],
+        );
+
+        assert_eq!(
+            out.items[0].column(0).as_primitive::<Int32Type>().value(0),
+            9
         );
     }
 

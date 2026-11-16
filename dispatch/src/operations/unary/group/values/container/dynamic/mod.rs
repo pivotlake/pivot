@@ -37,7 +37,7 @@ use super::super::fold::{Count, F64Max, F64Min, F64Sum, Fold, Max, Min, StrMax, 
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use operations::{MergeCells, OperationReader, OperationsReader};
@@ -392,8 +392,9 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
     }
 
     /// Merges a tracking partial: numeric identity cells absorb so their merge
-    /// stays unconditional; only a string extreme, whose unseen cell must
-    /// never resolve through the arena, consults the seen bits. Masks union.
+    /// stays unconditional. A string extreme, whose unseen cell must never
+    /// resolve through the arena, and an `ANY_VALUE`, which keeps whichever
+    /// side is set, consult the seen bits. Masks union.
     fn merge_tracked(
         &mut self,
         source: &Self,
@@ -407,7 +408,9 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
             let source_cell = source.1[slot_index];
             if ONLY_ADDITIVE {
                 self.1[slot_index] = self.1[slot_index] + source_cell;
-            } else if slot.output_type == DataType::Utf8View {
+            } else if slot.output_type == DataType::Utf8View
+                || slot.kind == AggregationKind::AnyValue
+            {
                 let destination_seen = bits & (1 << slot_index) != 0;
                 let source_seen = source_bits & (1 << slot_index) != 0;
                 match (destination_seen, source_seen) {
@@ -613,6 +616,16 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
                     F64Max::<A>::finish(name, builder, nulls)
                 }
                 AggregationKind::Max => Max::<A>::finish(name, builder, nulls),
+                AggregationKind::AnyValue if *ty == DataType::Utf8View => {
+                    <A as StringCell>::finish(name, builder, arena, nulls)
+                }
+                AggregationKind::AnyValue if ty.is_floating() => {
+                    A::finish_float(name, builder, nulls)
+                }
+                AggregationKind::AnyValue if *ty == DataType::Boolean => {
+                    finish_boolean_column(name, builder, nulls)
+                }
+                AggregationKind::AnyValue => <A as IntCell>::finish(name, builder, nulls),
                 AggregationKind::First => {
                     unreachable!("the planner rejects FIRST inside a GROUP BY")
                 }
@@ -622,6 +635,22 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
         }
         (fields, arrays)
     }
+}
+
+/// Renders a finished column of boolean cells (`0` is false, `1` is true) as a
+/// `Boolean` array. `nulls` marks the groups whose slot never saw a non-NULL
+/// value.
+fn finish_boolean_column<A: IntCell>(
+    name: &str,
+    column: SlabColumn<A>,
+    nulls: Option<NullBuffer>,
+) -> (Field, ArrayRef) {
+    let cells = column.as_slice();
+    let values = BooleanBuffer::collect_bool(cells.len(), |row| cells[row] != A::from(0));
+    (
+        Field::new(name, DataType::Boolean, nulls.is_some()),
+        Arc::new(BooleanArray::new(values, nulls)),
+    )
 }
 
 impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S: SeenMask>

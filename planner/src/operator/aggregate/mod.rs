@@ -231,13 +231,19 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
                     a.column().column_idx,
                 ),
                 AggregateFunc::First(a) => (AggregationKind::First, a.column().column_idx),
+                AggregateFunc::AnyValue(a) => (AggregationKind::AnyValue, a.column().column_idx),
                 _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
             };
-            Ok(AggregationSlot::new(
-                kind,
-                column,
-                crate::types::physical_arrow_type(func.return_type()),
-            ))
+            let declared_type = crate::types::physical_arrow_type(func.return_type());
+            // An ANY_VALUE of a date is emitted as the int the date stores, the
+            // form its cell holds at either accumulator width.
+            let output_type = match kind {
+                AggregationKind::AnyValue => {
+                    temporal_to_int(&declared_type).unwrap_or(declared_type)
+                }
+                _ => declared_type,
+            };
+            Ok(AggregationSlot::new(kind, column, output_type))
         })
         .collect()
 }
@@ -298,14 +304,15 @@ pub(super) fn key_output_type(t: &Type) -> Option<DataType> {
     }
 }
 
-/// The temporal arrow type a `MIN`/`MAX` aggregate emits, or `None` for any other
-/// expression (or a `MIN`/`MAX` over a non-temporal column). Used to gate the
-/// int-ify of value columns and to restore the temporal type on the output.
+/// The temporal arrow type a `MIN`/`MAX`/`ANY_VALUE` aggregate emits, or `None`
+/// for any other expression (or one of those over a non-temporal column). Used
+/// to gate the int-ify of value columns and to restore the temporal type on the
+/// output.
 fn aggregate_value_temporal(e: &Expression) -> Option<DataType> {
     match e {
-        Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a)) => {
-            temporal_output_type(&a.column().return_type)
-        }
+        Expression::AggregateFunc(
+            AggregateFunc::Min(a) | AggregateFunc::Max(a) | AggregateFunc::AnyValue(a),
+        ) => temporal_output_type(&a.column().return_type),
         _ => None,
     }
 }
@@ -371,10 +378,10 @@ pub(super) fn is_groupable_key_type(t: &Type) -> bool {
 /// The accumulator-width rule shared by the global and grouped paths: `i128` when
 /// a `SUM` reads a 64-bit or 128-bit column (whose total can overflow `i64`, and
 /// any decimal `SUM` declares a `DECIMAL(38, s)` result), or when a `MIN`/`MAX`
-/// reads a wide (`Decimal128`-carried) decimal column whose raw unscaled `i128`
-/// values must be held losslessly; else `i64`. A `MIN`/`MAX` over a
-/// `Decimal64`-carried column stays narrow: its raw values are `i64` and its
-/// extreme is one of them.
+/// or `ANY_VALUE` reads a wide (`Decimal128`-carried) decimal column whose raw
+/// unscaled `i128` values must be held losslessly; else `i64`. A `MIN`/`MAX`/
+/// `ANY_VALUE` over a `Decimal64`-carried column stays narrow: its raw values
+/// are `i64` and its result is one of them.
 fn needs_wide_accumulator(exprs: &[Expression]) -> bool {
     exprs.iter().any(|e| match e {
         Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
@@ -383,7 +390,9 @@ fn needs_wide_accumulator(exprs: &[Expression]) -> bool {
                 Type::Int64 | Type::Int128 | Type::Decimal { .. }
             )
         }
-        Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a)) => {
+        Expression::AggregateFunc(
+            AggregateFunc::Min(a) | AggregateFunc::Max(a) | AggregateFunc::AnyValue(a),
+        ) => {
             matches!(
                 a.column().return_type,
                 Type::Decimal { precision, .. } if precision > crate::types::MAX_DECIMAL64_PRECISION

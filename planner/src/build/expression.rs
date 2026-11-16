@@ -335,6 +335,11 @@ impl AggregateFunc {
                 return_type,
                 function,
             )?)),
+            "any_value" => Ok(AggregateFunc::AnyValue(numeric_aggregate(
+                params,
+                return_type,
+                function,
+            )?)),
             _ => Err(Error::UnsupportedAggregateFunction(function)),
         }
     }
