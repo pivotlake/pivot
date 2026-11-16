@@ -40,8 +40,8 @@ use crate::operations::unary::{
 };
 use crate::waker::waker_set;
 
-use batch_sort::{batch_arrives_sorted, sorted_row_indices};
-use keys::{KeyOrdering, RunRow, SelectedKeyOrdering, select_key_ordering, with_key_ordering};
+use batch_sort::{batch_arrives_sorted, sort_chunked_row_positions};
+use keys::{KeyOrdering, KeyedRow, Packed, PackedKeyPrefix, RunRow};
 
 /// Returns a valid row order for one batch. The identity order is returned
 /// when the batch already satisfies `order_by`.
@@ -49,15 +49,150 @@ pub fn batch_sort_indices(
     order_by: &[OrderBy],
     batch: &RecordBatch,
 ) -> Result<Vec<u32>, arrow_schema::ArrowError> {
-    let batches = std::slice::from_ref(batch);
-    let selected = select_key_ordering(order_by, batches, batches)?;
-    Ok(with_key_ordering!(selected, |ordering| {
-        if batch_arrives_sorted(&mut ordering, batch.num_rows()) {
-            (0..batch.num_rows() as u32).collect()
-        } else {
-            sorted_row_indices(&mut ordering, batch.num_rows())
+    Ok(find_sorted_row_order(order_by, batch)?
+        .unwrap_or_else(|| (0..batch.num_rows() as u32).collect()))
+}
+
+/// The order the rows of `batch` sort into by `order_by`, as row indices
+/// from lowest key to highest. Equal keys may appear in any order allowed by
+/// SQL.
+///
+/// `None` when the batch already arrives in key order, so that a caller can
+/// pass the batch on without copying it.
+fn find_sorted_row_order(
+    order_by: &[OrderBy],
+    batch: &RecordBatch,
+) -> Result<Option<Vec<u32>>, arrow_schema::ArrowError> {
+    let mut sorter = ChunkedRowSorter::try_new(order_by, std::slice::from_ref(batch))?;
+    if batch_arrives_sorted(&sorter.ordering, batch.num_rows()) {
+        return Ok(None);
+    }
+    let mut positions: Vec<(u32, u32)> = (0..batch.num_rows() as u32).map(|row| (0, row)).collect();
+    sorter.sort(&mut positions);
+    Ok(Some(positions.into_iter().map(|(_, row)| row).collect()))
+}
+
+/// Sorts row positions that are spread over several batches.
+///
+/// The sorter is bound to the batches once and can then sort any number of
+/// position lists over them, so a caller that sorts several subsets of the
+/// same batches reads the key columns' buffers once. No row data moves: a
+/// caller gathers the rows once, in the final order.
+pub struct ChunkedRowSorter<'chunks> {
+    ordering: KeyOrdering<'chunks>,
+    /// Packs the key's leading columns next to each row's position, when
+    /// they can be (see [`PackedKeyPrefix`]). The sort then compares those
+    /// packed keys and reads the key columns once per row.
+    packed_key_prefix: Option<PackedKeyPrefix<'chunks>>,
+    /// Scratch space reused from sort to sort.
+    keyed_rows: KeyedRowsByKeyWidth,
+}
+
+/// The entries a sort moves around, kept from sort to sort so their memory
+/// is reused. There is one list per key width: every sort uses the narrowest
+/// key that holds the columns it packs, and that can differ from one sort to
+/// the next when a string column is packed. A width that no sort used holds
+/// no memory.
+#[derive(Default)]
+struct KeyedRowsByKeyWidth {
+    bits32: Vec<KeyedRow<u32>>,
+    bits64: Vec<KeyedRow<Packed<1>>>,
+    bits128: Vec<KeyedRow<Packed<2>>>,
+    bits192: Vec<KeyedRow<Packed<3>>>,
+    bits256: Vec<KeyedRow<Packed<4>>>,
+}
+
+impl<'chunks> ChunkedRowSorter<'chunks> {
+    pub fn try_new<Batch: std::borrow::Borrow<RecordBatch>>(
+        order_by: &[OrderBy],
+        chunks: &'chunks [Batch],
+    ) -> Result<Self, arrow_schema::ArrowError> {
+        Ok(Self {
+            ordering: KeyOrdering::try_new(order_by, chunks, chunks)?,
+            packed_key_prefix: PackedKeyPrefix::try_new(order_by, chunks),
+            keyed_rows: KeyedRowsByKeyWidth::default(),
+        })
+    }
+
+    /// Reorders `rows`, each a `(chunk, row)` pair naming a row of the
+    /// sorter's batches, from lowest key to highest.
+    pub fn sort(&mut self, rows: &mut [(u32, u32)]) {
+        self.sort_rows(rows, None)
+    }
+
+    /// Reorders `rows` like [`sort`](Self::sort), for rows that are a
+    /// sequence of stretches of `run_lengths` rows, each already in key
+    /// order. Merging the stretches takes fewer comparisons than sorting
+    /// from scratch, and rows with equal keys stay in the order they were
+    /// given.
+    pub fn merge_sorted_runs(&mut self, rows: &mut [(u32, u32)], run_lengths: &[usize]) {
+        self.sort_rows(rows, Some(run_lengths))
+    }
+
+    fn sort_rows(&mut self, rows: &mut [(u32, u32)], sorted_run_lengths: Option<&[usize]>) {
+        let Some(packed_key_prefix) = &self.packed_key_prefix else {
+            sort_chunked_row_positions(&self.ordering, rows, sorted_run_lengths.is_some());
+            return;
+        };
+        let column_bits = packed_key_prefix.plan_column_bits(rows);
+        let ordering = &self.ordering;
+        let keyed_rows = &mut self.keyed_rows;
+        macro_rules! sort_with_keys_in {
+            ($scratch:expr) => {
+                KeyedRow::sort_positions(
+                    $scratch,
+                    packed_key_prefix,
+                    &column_bits,
+                    ordering,
+                    rows,
+                    sorted_run_lengths,
+                )
+            };
         }
-    }))
+        // One arm per key width, so the sort is compiled for each.
+        match column_bits.iter().sum::<u32>() {
+            0..=32 => sort_with_keys_in!(&mut keyed_rows.bits32),
+            33..=64 => sort_with_keys_in!(&mut keyed_rows.bits64),
+            65..=128 => sort_with_keys_in!(&mut keyed_rows.bits128),
+            129..=192 => sort_with_keys_in!(&mut keyed_rows.bits192),
+            _ => sort_with_keys_in!(&mut keyed_rows.bits256),
+        }
+    }
+}
+
+/// Compares rows of one set of batches with rows of another by a sort key.
+///
+/// The comparer is bound to both sets once and can then compare any number
+/// of row pairs, so the key columns' buffers are read once.
+pub struct RowComparer<'chunks> {
+    ordering: KeyOrdering<'chunks>,
+}
+
+impl<'chunks> RowComparer<'chunks> {
+    pub fn try_new(
+        order_by: &[OrderBy],
+        left_chunks: &'chunks [RecordBatch],
+        right_chunks: &'chunks [RecordBatch],
+    ) -> Result<Self, arrow_schema::ArrowError> {
+        Ok(Self {
+            ordering: KeyOrdering::try_new(order_by, left_chunks, right_chunks)?,
+        })
+    }
+
+    /// How row `left`, a `(chunk, row)` position in the left batches, orders
+    /// against row `right` of the right batches.
+    #[inline(always)]
+    pub fn compare(&self, left: (usize, usize), right: (usize, usize)) -> std::cmp::Ordering {
+        let left = RunRow {
+            chunk: left.0,
+            row: left.1,
+        };
+        let right = RunRow {
+            chunk: right.0,
+            row: right.1,
+        };
+        self.ordering.compare(left, right)
+    }
 }
 
 /// A maximal stretch of rows already in key order, held as the batch-sized
@@ -350,14 +485,9 @@ impl<O> OrderBySorter<O> {
     /// Returns the input unchanged when it is already ordered; otherwise
     /// returns a reordered batch backed by ring memory.
     fn sort_batch(&mut self, batch: RecordBatch) -> unary::Result<RecordBatch> {
-        let chunks = std::slice::from_ref(&batch);
-        let selected = select_key_ordering(&self.order_by, chunks, chunks)?;
-        let sorted_indices = with_key_ordering!(selected, |ordering| {
-            if batch_arrives_sorted(&mut ordering, batch.num_rows()) {
-                return Ok(batch);
-            }
-            sorted_row_indices(&mut ordering, batch.num_rows())
-        });
+        let Some(sorted_indices) = find_sorted_row_order(&self.order_by, &batch)? else {
+            return Ok(batch);
+        };
 
         let allocator = self
             .allocator
@@ -376,15 +506,13 @@ impl<O> OrderBySorter<O> {
             return Ok(false);
         };
         let run_tail = std::slice::from_ref(run.last_chunk());
-        let selected = select_key_ordering(&self.order_by, run_tail, std::slice::from_ref(batch))?;
+        let ordering = KeyOrdering::try_new(&self.order_by, run_tail, std::slice::from_ref(batch))?;
         let last_of_run = RunRow {
             chunk: 0,
             row: run.last_chunk().num_rows() - 1,
         };
         let first_of_batch = RunRow { chunk: 0, row: 0 };
-        Ok(with_key_ordering!(selected, |ordering| {
-            ordering.compare(last_of_run, first_of_batch) != std::cmp::Ordering::Greater
-        }))
+        Ok(ordering.compare(last_of_run, first_of_batch) != std::cmp::Ordering::Greater)
     }
 }
 
@@ -673,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn null_keys_take_the_general_path_and_order_first() {
+    fn null_keys_order_first() {
         init_test_free_pool(16);
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
         let with_null = RecordBatch::try_new(
@@ -728,6 +856,142 @@ mod tests {
         assert_eq!(payloads, vec![10, 20, 30, 40]);
     }
 
+    fn nullable_int_pair_batch(rows: &[(Option<i64>, Option<i64>)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("first", DataType::Int64, true),
+            Field::new("second", DataType::Int64, true),
+        ]));
+        let first: Int64Array = rows.iter().map(|&(first, _)| first).collect();
+        let second: Int64Array = rows.iter().map(|&(_, second)| second).collect();
+        RecordBatch::try_new(schema, vec![Arc::new(first), Arc::new(second)]).unwrap()
+    }
+
+    fn nullable_int_pairs(batches: &[RecordBatch]) -> Vec<(Option<i64>, Option<i64>)> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = |index: usize| {
+                    batch
+                        .column(index)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>()
+                };
+                column(0).into_iter().zip(column(1))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_keys_each_follow_their_own_direction_and_null_placement() {
+        init_test_free_pool(16);
+        let worker_batches = vec![
+            vec![nullable_int_pair_batch(&[
+                (Some(1), Some(9)),
+                (None, Some(3)),
+                (Some(1), None),
+            ])],
+            vec![nullable_int_pair_batch(&[
+                (Some(1), Some(2)),
+                (None, Some(5)),
+            ])],
+        ];
+        let first_ascending_nulls_first = OrderBy::new(0, false, true);
+        let second_descending_nulls_last = OrderBy::new(1, true, false);
+
+        let output = run_consumers(
+            consumers(
+                vec![first_ascending_nulls_first, second_descending_nulls_last],
+                2,
+            ),
+            worker_batches,
+        );
+
+        assert_eq!(
+            nullable_int_pairs(&output.items),
+            vec![
+                (None, Some(5)),
+                (None, Some(3)),
+                (Some(1), Some(9)),
+                (Some(1), Some(2)),
+                (Some(1), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn boolean_and_wide_decimal_keys_sort_by_value() {
+        init_test_free_pool(16);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("amount", DataType::Decimal128(38, 0), false),
+        ]));
+        let batch = |flags: Vec<Option<bool>>, amounts: Vec<i128>| {
+            let amounts = arrow_array::Decimal128Array::from(amounts)
+                .with_precision_and_scale(38, 0)
+                .unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow_array::BooleanArray::from(flags)),
+                    Arc::new(amounts),
+                ],
+            )
+            .unwrap()
+        };
+        let beyond_64_bits = 1i128 << 100;
+        let worker_batches = vec![
+            vec![batch(
+                vec![Some(true), Some(false), None],
+                vec![-beyond_64_bits, 7, 1],
+            )],
+            vec![batch(
+                vec![Some(true), Some(false)],
+                vec![beyond_64_bits, -3],
+            )],
+        ];
+        let flag_ascending_nulls_last = OrderBy::new(0, false, false);
+        let amount_descending = OrderBy::new(1, true, false);
+
+        let output = run_consumers(
+            consumers(vec![flag_ascending_nulls_last, amount_descending], 2),
+            worker_batches,
+        );
+
+        let rows: Vec<(Option<bool>, i128)> = output
+            .items
+            .iter()
+            .flat_map(|batch| {
+                let flags = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::BooleanArray>()
+                    .unwrap();
+                let amounts = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Decimal128Array>()
+                    .unwrap();
+                flags
+                    .iter()
+                    .zip(amounts.values().iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some(false), 7),
+                (Some(false), -3),
+                (Some(true), beyond_64_bits),
+                (Some(true), -beyond_64_bits),
+                (None, 1),
+            ]
+        );
+    }
+
     #[test]
     fn empty_input_emits_nothing() {
         init_test_free_pool(16);
@@ -765,5 +1029,322 @@ mod tests {
         let keys = output.i64_column(0);
         assert_eq!(keys.len(), 8 * rows_per_batch);
         assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    /// A batch of `(day, amount, name)` rows.
+    fn day_amount_name_batch(rows: &[(i32, i64, &str)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, false),
+        ]));
+        let days = arrow_array::Date32Array::from_iter_values(rows.iter().map(|row| row.0));
+        let amounts = Int64Array::from_iter_values(rows.iter().map(|row| row.1));
+        let names = StringViewArray::from_iter_values(rows.iter().map(|row| row.2));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(days), Arc::new(amounts), Arc::new(names)],
+        )
+        .unwrap()
+    }
+
+    /// Every `(batch, row)` position of two batches of two rows.
+    fn positions_of_two_batches_of_two_rows() -> Vec<(u32, u32)> {
+        vec![(0, 0), (0, 1), (1, 0), (1, 1)]
+    }
+
+    #[test]
+    fn row_positions_sort_by_keys_of_different_widths_and_directions() {
+        let batches = [
+            day_amount_name_batch(&[(-3, 10, "a"), (7, -5, "b")]),
+            day_amount_name_batch(&[(7, -9, "c"), (-3, 2, "d")]),
+        ];
+        let descending_day_then_amount =
+            [OrderBy::new(0, true, false), OrderBy::new(1, false, false)];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&descending_day_then_amount, &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(1, 0), (0, 1), (1, 1), (0, 0)]);
+    }
+
+    #[test]
+    fn row_positions_that_tie_on_the_fixed_width_keys_sort_by_the_string_key() {
+        let batches = [
+            day_amount_name_batch(&[(1, 5, "pear"), (1, 5, "apple")]),
+            day_amount_name_batch(&[(0, 9, "zebra"), (1, 5, "fig")]),
+        ];
+        let day_then_amount_then_name = [
+            OrderBy::new(0, false, false),
+            OrderBy::new(1, false, false),
+            OrderBy::new(2, false, false),
+        ];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&day_then_amount_then_name, &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(1, 0), (0, 1), (1, 1), (0, 0)]);
+    }
+
+    #[test]
+    fn sorted_stretches_merge_into_key_order_with_equal_rows_in_the_order_given() {
+        let batches = [
+            day_amount_name_batch(&[(1, 5, "apple"), (1, 5, "pear")]),
+            day_amount_name_batch(&[(0, 9, "zebra"), (1, 5, "fig")]),
+            day_amount_name_batch(&[(1, 5, "apple")]),
+        ];
+        let day_then_amount_then_name = [
+            OrderBy::new(0, false, false),
+            OrderBy::new(1, false, false),
+            OrderBy::new(2, false, false),
+        ];
+        let mut positions = vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0)];
+
+        ChunkedRowSorter::try_new(&day_then_amount_then_name, &batches)
+            .unwrap()
+            .merge_sorted_runs(&mut positions, &[2, 2, 1]);
+
+        assert_eq!(positions, vec![(1, 0), (0, 0), (2, 0), (1, 1), (0, 1)]);
+    }
+
+    fn name_then_day() -> [OrderBy; 2] {
+        [OrderBy::new(2, false, false), OrderBy::new(0, false, false)]
+    }
+
+    #[test]
+    fn row_positions_that_tie_on_a_short_string_key_sort_by_the_next_key() {
+        let batches = [
+            day_amount_name_batch(&[(5, 0, "ab"), (3, 0, "b")]),
+            day_amount_name_batch(&[(1, 0, "ab"), (9, 0, "a")]),
+        ];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&name_then_day(), &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(1, 1), (1, 0), (0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn a_string_sorts_before_the_same_string_followed_by_zero_bytes() {
+        let batches = [
+            day_amount_name_batch(&[(0, 0, "a\0"), (0, 0, "a")]),
+            day_amount_name_batch(&[(0, 0, ""), (0, 0, "a\0\0")]),
+        ];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&name_then_day(), &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(1, 0), (0, 1), (0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn long_strings_that_share_their_first_bytes_sort_by_the_rest_of_the_key() {
+        let batches = [
+            day_amount_name_batch(&[
+                (2, 0, "same first bytes, last"),
+                (1, 0, "same first bytes, first"),
+            ]),
+            day_amount_name_batch(&[(0, 0, "same first b"), (7, 0, "same first bytes, first")]),
+        ];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&name_then_day(), &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(1, 0), (0, 1), (1, 1), (0, 0)]);
+    }
+
+    #[test]
+    fn short_strings_next_to_a_long_one_still_tie_break_on_the_next_key() {
+        let batches = [
+            day_amount_name_batch(&[(5, 0, "pear"), (1, 0, "a string of over twelve bytes")]),
+            day_amount_name_batch(&[(2, 0, "pear"), (0, 0, "apple")]),
+        ];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&name_then_day(), &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(0, 1), (1, 1), (1, 0), (0, 0)]);
+    }
+
+    #[test]
+    fn row_positions_sort_by_a_descending_string_key_of_short_and_long_values() {
+        let batches = [
+            day_amount_name_batch(&[(0, 0, "same first bytes, a"), (0, 0, "same first bytes, b")]),
+            day_amount_name_batch(&[(0, 0, "same first b"), (0, 0, "zz")]),
+        ];
+        let descending_name = [OrderBy::new(2, true, false)];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&descending_name, &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(1, 1), (0, 1), (0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn a_key_after_two_strings_of_twelve_bytes_still_breaks_their_ties() {
+        let names_and_amount_batch = |rows: &[(&str, &str, i64)]| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("first_name", DataType::Utf8View, false),
+                Field::new("last_name", DataType::Utf8View, false),
+                Field::new("amount", DataType::Int64, false),
+            ]));
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(StringViewArray::from_iter_values(
+                    rows.iter().map(|row| row.0),
+                )),
+                Arc::new(StringViewArray::from_iter_values(
+                    rows.iter().map(|row| row.1),
+                )),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.2))),
+            ];
+            RecordBatch::try_new(schema, columns).unwrap()
+        };
+        let batches = [
+            names_and_amount_batch(&[
+                ("twelve bytes", "twelve bytes", 30),
+                ("twelve bytes", "twelve bytes", -40),
+            ]),
+            names_and_amount_batch(&[
+                ("twelve bytes", "twelve bytes", 0),
+                ("twelve bytes", "eleven byte", 99),
+            ]),
+        ];
+        let all_three_ascending = [
+            OrderBy::new(0, false, false),
+            OrderBy::new(1, false, false),
+            OrderBy::new(2, false, false),
+        ];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&all_three_ascending, &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(1, 1), (0, 1), (1, 0), (0, 0)]);
+    }
+
+    #[test]
+    fn a_batch_sorts_by_a_string_column_that_holds_offsets() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let names: ArrayRef =
+            Arc::new(arrow_array::StringArray::from(vec!["pear", "apple", "fig"]));
+        let batch = RecordBatch::try_new(schema, vec![names]).unwrap();
+
+        let sorted_rows = batch_sort_indices(&ascending_by_key(), &batch).unwrap();
+
+        assert_eq!(sorted_rows, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn ordering_by_a_struct_column_is_an_error_that_names_the_type() {
+        let numbers: ArrayRef = Arc::new(Int64Array::from(vec![2, 1]));
+        let pair_type = DataType::Struct(vec![Field::new("number", DataType::Int64, false)].into());
+        let pairs: ArrayRef = Arc::new(arrow_array::StructArray::from(vec![(
+            Arc::new(Field::new("number", DataType::Int64, false)),
+            numbers,
+        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("pair", pair_type, false)]));
+        let batch = RecordBatch::try_new(schema, vec![pairs]).unwrap();
+
+        let result = batch_sort_indices(&ascending_by_key(), &batch);
+
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("cannot be ordered by a column of type Struct"));
+    }
+
+    #[test]
+    fn row_positions_sort_by_negative_8_bit_and_16_bit_keys() {
+        let narrow_numbers_batch = |rows: &[(i8, i16)]| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("tiny", DataType::Int8, false),
+                Field::new("small", DataType::Int16, false),
+            ]));
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(arrow_array::Int8Array::from_iter_values(
+                    rows.iter().map(|row| row.0),
+                )),
+                Arc::new(arrow_array::Int16Array::from_iter_values(
+                    rows.iter().map(|row| row.1),
+                )),
+            ];
+            RecordBatch::try_new(schema, columns).unwrap()
+        };
+        let batches = [
+            narrow_numbers_batch(&[(-1, 5), (-128, 0)]),
+            narrow_numbers_batch(&[(127, -3), (-1, -7)]),
+        ];
+        let tiny_then_descending_small =
+            [OrderBy::new(0, false, false), OrderBy::new(1, true, false)];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&tiny_then_descending_small, &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(0, 1), (0, 0), (1, 1), (1, 0)]);
+    }
+
+    #[test]
+    fn row_positions_sort_by_a_single_descending_32_bit_key() {
+        let batches = [
+            day_amount_name_batch(&[(-3, 0, "a"), (7, 0, "b")]),
+            day_amount_name_batch(&[(0, 0, "c"), (-9, 0, "d")]),
+        ];
+        let descending_day = [OrderBy::new(0, true, false)];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&descending_day, &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(0, 1), (1, 0), (0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn row_positions_sort_by_three_64_bit_keys_when_only_the_last_differs() {
+        let numbers_batch = |rows: &[(i64, i64, i64)]| {
+            let column = |values: Vec<i64>| Arc::new(Int64Array::from(values)) as ArrayRef;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("first", DataType::Int64, false),
+                Field::new("second", DataType::Int64, false),
+                Field::new("third", DataType::Int64, false),
+            ]));
+            let columns = vec![
+                column(rows.iter().map(|row| row.0).collect()),
+                column(rows.iter().map(|row| row.1).collect()),
+                column(rows.iter().map(|row| row.2).collect()),
+            ];
+            RecordBatch::try_new(schema, columns).unwrap()
+        };
+        let batches = [
+            numbers_batch(&[(5, -1, 30), (5, -1, -40)]),
+            numbers_batch(&[(5, -1, 0), (4, 9, 99)]),
+        ];
+        let all_three_ascending = [
+            OrderBy::new(0, false, false),
+            OrderBy::new(1, false, false),
+            OrderBy::new(2, false, false),
+        ];
+        let mut positions = positions_of_two_batches_of_two_rows();
+
+        ChunkedRowSorter::try_new(&all_three_ascending, &batches)
+            .unwrap()
+            .sort(&mut positions);
+
+        assert_eq!(positions, vec![(1, 1), (0, 1), (1, 0), (0, 0)]);
     }
 }
