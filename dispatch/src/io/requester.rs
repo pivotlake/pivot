@@ -492,7 +492,11 @@ impl IORequester {
                 let mut request = DataFlowRequest::new(
                     data_flow_id,
                     operator_idx,
-                    HttpRequest::Upload(HttpUploadRequest { remote, data }),
+                    HttpRequest::Upload(HttpUploadRequest {
+                        remote,
+                        data,
+                        etag: None,
+                    }),
                 );
                 stats.stamp_issued(std::slice::from_mut(&mut request));
                 let split = self.submit_http_request_to_backend(request)?;
@@ -2048,6 +2052,7 @@ mod tests {
             HttpRequest::Upload(HttpUploadRequest {
                 remote,
                 data: data.clone(),
+                etag: None,
             }),
         );
         upload.submitted_at = Some(submitted_at);
@@ -2109,6 +2114,7 @@ mod tests {
         let upload = HttpRequest::Upload(HttpUploadRequest {
             remote,
             data: data.clone(),
+            etag: None,
         });
         let mut requester = IORequester::default();
 
@@ -2125,6 +2131,44 @@ mod tests {
         assert!(matches!(completion, Ok(Completion::HttpUpload(_))));
         let sent: Vec<u8> = data.runs().flatten().copied().collect();
         assert_eq!(server.join().unwrap(), sent);
+    }
+
+    #[test]
+    fn upload_completion_carries_the_response_etag() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_upload_body(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nETag: \"part-1\"\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let data = build_upload_payload();
+        let url = Url::parse(&format!("http://{addr}/object.parquet")).unwrap();
+        let remote = Arc::new(RemoteFile::open(url, None, data.len() as u64).unwrap());
+        let upload = HttpRequest::Upload(HttpUploadRequest {
+            remote,
+            data,
+            etag: None,
+        });
+        let mut requester = IORequester::default();
+
+        requester
+            .submit_http_request_to_backend(DataFlowRequest::new(7, 11, upload))
+            .unwrap();
+        let completion = loop {
+            if let Some(completion) = requester.completions().unwrap().into_iter().next() {
+                break completion;
+            }
+            requester.wait().unwrap();
+        };
+
+        let Ok(Completion::HttpUpload(request)) = completion else {
+            panic!("expected an HTTP upload completion");
+        };
+        assert_eq!(request.request.etag.as_deref(), Some("\"part-1\""));
+        server.join().unwrap();
     }
 
     /// Read one range request and write back its `206` response body.

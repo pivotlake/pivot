@@ -71,7 +71,7 @@ pub fn build_range_get(
 }
 
 /// A parsed (and validated `206`) response head.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ResponseHead {
     /// Length of the header section, including the terminating `\r\n\r\n`. The
     /// body begins at this offset in the buffer that was parsed.
@@ -84,6 +84,8 @@ pub struct ResponseHead {
     /// close-delimited): pooling it would leave unread bytes that corrupt the
     /// next response read on that connection.
     pub reuse_connection: bool,
+    /// The response's `ETag` header, if it carries one.
+    pub etag: Option<String>,
 }
 
 /// Outcome of trying to parse a (possibly incomplete) response head.
@@ -129,6 +131,7 @@ pub fn parse_get_response_head(buf: &[u8], expected_len: usize) -> Result<HeadPa
         head_len: head.head_len,
         content_length,
         reuse_connection: true,
+        etag: head.etag,
     }))
 }
 
@@ -150,6 +153,7 @@ pub fn parse_upload_response_head(buf: &[u8]) -> Result<HeadParse, ProtoError> {
         head_len: head.head_len,
         content_length: head.content_length.unwrap_or(0),
         reuse_connection: head.content_length.is_some(),
+        etag: head.etag,
     }))
 }
 

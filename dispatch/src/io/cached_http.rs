@@ -633,8 +633,9 @@ impl CachedHttpEngine {
                 read.time.http_reissues += 1;
             }
         }
-        for id in self.http.take_completed() {
-            if let Some(upload) = self.http_uploads.remove(&id) {
+        for (id, etag) in self.http.take_completed() {
+            if let Some(mut upload) = self.http_uploads.remove(&id) {
+                upload.request.etag = etag;
                 out.push(Ok(Completion::HttpUpload(upload)));
                 continue;
             }

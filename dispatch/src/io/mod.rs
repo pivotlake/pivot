@@ -507,6 +507,9 @@ pub struct HttpGetRequest {
 pub struct HttpUploadRequest {
     pub remote: Arc<RemoteFile>,
     pub data: Arc<FileBytes>,
+    /// The `ETag` header of the store's response, set when the upload
+    /// completes. `None` before that, and when the store sent none.
+    pub etag: Option<String>,
 }
 
 /// An HTTP operation issued by a dataflow operator. GETs pass through the

@@ -36,7 +36,7 @@ pub enum Http1Error {
 }
 
 /// A parsed response head.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ParsedHead {
     /// Byte length of the head including the terminating `\r\n\r\n`; the body
     /// begins at this offset in the parsed buffer.
@@ -45,6 +45,9 @@ pub struct ParsedHead {
     pub status: u16,
     /// `Content-Length`, if the header was present (and a valid integer).
     pub content_length: Option<u64>,
+    /// The `ETag` header as the server sent it, quotes included, if the
+    /// response carries one.
+    pub etag: Option<String>,
 }
 
 /// Outcome of parsing a (possibly incomplete) response head.
@@ -81,10 +84,17 @@ pub fn parse_response_head(buf: &[u8]) -> Result<HeadStatus, Http1Error> {
         None => None,
     };
 
+    let etag = resp
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("etag"))
+        .map(|h| String::from_utf8_lossy(h.value).trim().to_string());
+
     Ok(HeadStatus::Complete(ParsedHead {
         head_len,
         status,
         content_length,
+        etag,
     }))
 }
 
@@ -181,6 +191,15 @@ mod tests {
         let h = parse(b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\n");
         assert_eq!(h.status, 404);
         assert_eq!(h.content_length, Some(3));
+    }
+
+    #[test]
+    fn parses_the_etag_header() {
+        let raw = b"HTTP/1.1 200 OK\r\nETag: \"abc123\"\r\nContent-Length: 0\r\n\r\n";
+
+        let head = parse(raw);
+
+        assert_eq!(head.etag.as_deref(), Some("\"abc123\""));
     }
 
     #[test]
