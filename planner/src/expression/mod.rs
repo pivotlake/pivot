@@ -38,6 +38,7 @@ mod regexp;
 mod regexp_jit;
 mod substring;
 mod suffix;
+mod time_bucket;
 mod variant_get;
 
 pub use aggregate::{AggregateFunc, CountStar, NumericAggregate};
@@ -72,6 +73,7 @@ pub use regexp::{RegexpFullMatch, RegexpReplace};
 pub use regexp_jit::RegexpJitReplace;
 pub use substring::Substring;
 pub use suffix::Suffix;
+pub use time_bucket::{BucketGrid, MICROS_PER_DAY, TimeBucket, count_epoch_months};
 pub use variant_get::{JsonPath, VariantGet};
 
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
