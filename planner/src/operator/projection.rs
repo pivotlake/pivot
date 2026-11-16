@@ -1,7 +1,7 @@
 //! [`Projection`] — computes a list of output expressions from its child.
 
 use crate::compile::{Error, ExprEvalFn, ExprFn};
-use crate::expression::Expression;
+use crate::expression::{Expression, Ref};
 use crate::types::Type;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, Field, Schema};
@@ -29,6 +29,23 @@ impl fmt::Display for Projection {
 }
 
 impl Projection {
+    /// A projection that passes the listed input columns through unchanged,
+    /// in the order given. Each entry is a column's position and type.
+    pub(crate) fn of_columns(columns: impl IntoIterator<Item = (usize, Type)>) -> Self {
+        Self {
+            projections: columns
+                .into_iter()
+                .map(|(column_idx, return_type)| {
+                    Expression::Ref(Ref {
+                        column_idx,
+                        return_type,
+                        name: None,
+                    })
+                })
+                .collect(),
+        }
+    }
+
     pub fn compile(
         &self,
         input: RecordBatchOperatorSpec,

@@ -37,6 +37,7 @@ mod table_function;
 mod top_n;
 mod transaction;
 mod values;
+mod window;
 
 pub use aggregate::Aggregate;
 pub use compact::Compact;
@@ -63,6 +64,7 @@ pub(crate) use table_function::{built_in_table_function, built_in_table_function
 pub use top_n::TopN;
 pub use transaction::TransactionStatement;
 pub use values::Values;
+pub use window::{Window, WindowFunction, WindowRowLimit};
 
 use crate::compile;
 use crate::expression::{self, Expression};
@@ -138,6 +140,8 @@ pub enum Operator {
     CteScan(CteScan),
     /// The distinct values of a tuple of input columns (see [`Distinct`]).
     Distinct(Distinct),
+    /// Window functions sharing one `OVER` clause (see [`Window`]).
+    Window(Window),
 }
 
 impl Operator {
@@ -203,6 +207,12 @@ impl Operator {
             // A distinct emits its key columns, in key order.
             Operator::Distinct(distinct) => {
                 Ok(distinct.keys.iter().map(|(_, ty)| ty.clone()).collect())
+            }
+            // A window appends one column per function to its input.
+            Operator::Window(window) => {
+                let mut types = inputs[0].clone();
+                types.extend(window.function_types(&inputs[0])?);
+                Ok(types)
             }
             // Statements, not queries: no result columns.
             Operator::CreateTable(_)
@@ -301,6 +311,11 @@ impl Operator {
                 .iter()
                 .map(|&(idx, _)| inputs[0][idx])
                 .collect(),
+            Operator::Window(window) => {
+                let mut nullable = inputs[0].clone();
+                nullable.extend(window.function_nullability());
+                nullable
+            }
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)
@@ -348,6 +363,7 @@ impl fmt::Display for Operator {
             Operator::Cte(c) => write!(f, "{c}"),
             Operator::CteScan(c) => write!(f, "{c}"),
             Operator::Distinct(d) => write!(f, "{d}"),
+            Operator::Window(w) => write!(f, "{w}"),
         }
     }
 }

@@ -128,6 +128,23 @@ const Expression &lo_aggregate_group(const LogicalOperator &op, size_t index);
 size_t lo_aggregate_expr_count(const LogicalOperator &op);
 const Expression &lo_aggregate_expr(const LogicalOperator &op, size_t index);
 
+// ---- Window ----
+size_t lo_window_expr_count(const LogicalOperator &op);
+const Expression &lo_window_expr(const LogicalOperator &op, size_t index);
+size_t expr_window_partition_count(const Expression &expr);
+const Expression &expr_window_partition(const Expression &expr, size_t index);
+size_t expr_window_order_count(const Expression &expr);
+uint8_t expr_window_order_direction(const Expression &expr, size_t index);
+uint8_t expr_window_order_null_order(const Expression &expr, size_t index);
+const Expression &expr_window_order_expr(const Expression &expr, size_t index);
+size_t expr_window_argument_order_count(const Expression &expr);
+size_t expr_window_argument_count(const Expression &expr);
+const Expression &expr_window_argument(const Expression &expr, size_t index);
+bool expr_window_ignores_nulls(const Expression &expr);
+rust::String expr_window_aggregate_name(const Expression &expr);
+bool expr_window_is_distinct_or_filtered(const Expression &expr);
+uint8_t expr_window_running_frame(const Expression &expr);
+
 // ---- Distinct ----
 bool lo_distinct_is_distinct_on(const LogicalOperator &op);
 size_t lo_distinct_target_count(const LogicalOperator &op);
@@ -319,6 +336,7 @@ const Expression &expr_between_upper(const Expression &expr);
 bool expr_between_lower_inclusive(const Expression &expr);
 bool expr_between_upper_inclusive(const Expression &expr);
 
+bool expr_equals(const Expression &left, const Expression &right);
 rust::String expr_aggregate_name(const Expression &expr);
 bool expr_aggregate_distinct(const Expression &expr);
 size_t expr_aggregate_child_count(const Expression &expr);
