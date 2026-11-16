@@ -129,6 +129,27 @@ impl Slab {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
     }
 
+    /// Cut the slab in two at `at`: this one keeps its first `at` bytes and
+    /// the rest is returned. Both hold the slot, so whoever wrote only the
+    /// start of a slab can hand that on and keep writing into what is left.
+    pub fn split_off(&mut self, at: usize) -> Slab {
+        assert!(
+            at <= self.size,
+            "cannot cut a {} byte slab at {at}",
+            self.size
+        );
+        // SAFETY: `at` is within the slab, so the rest starts inside the same
+        // slot and ends where this slab ended. Shortening this slab to `at`
+        // keeps the two from overlapping.
+        let rest = Slab::new(
+            unsafe { self.ptr.add(at) },
+            self.size - at,
+            self.backing.clone(),
+        );
+        self.size = at;
+        rest
+    }
+
     /// A read-only handle over the same bytes, sharing the backing, while this
     /// writable one lives on. The reader must not look until the writer is
     /// done; the cache fill hands the writable slab to a builder and reads
@@ -240,5 +261,18 @@ mod tests {
 
         let slice = unsafe { std::slice::from_raw_parts(slab.ptr, 256) };
         assert!(slice.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_slab_cut_in_two_keeps_its_bytes_on_each_side_of_the_cut() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(false);
+        let mut slab = alloc.get_slab_of_size(8, false);
+        slab.as_mut_slice().copy_from_slice(b"headtail");
+
+        let rest = slab.split_off(4);
+
+        assert_eq!(slab.as_slice(), b"head");
+        assert_eq!(rest.as_slice(), b"tail");
     }
 }

@@ -42,6 +42,30 @@ impl<T> SlabBuffer<T> {
         self.slab.size / size_of::<T>() - index
     }
 
+    /// The whole buffer as a slice, for what indexing one element at a time
+    /// does not give: bounds checks, sorting, filling.
+    ///
+    /// Every element must hold a valid `T`: either each was written, or the
+    /// buffer was created zeroed and a zeroed `T` is valid.
+    pub fn as_slice(&self) -> &[T]
+    where
+        T: Copy,
+    {
+        // SAFETY: the slab holds `elements_left(0)` elements' worth of live
+        // bytes, aligned for `T` by whoever carved it, and the caller vouches
+        // for their contents.
+        unsafe { std::slice::from_raw_parts(self.ptr_at_index(0), self.elements_left(0)) }
+    }
+
+    /// [`as_slice`](Self::as_slice), mutably.
+    pub fn as_mut_slice(&mut self) -> &mut [T]
+    where
+        T: Copy,
+    {
+        // SAFETY: as in `as_slice`, with `&mut self` for the exclusivity.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr_at_index(0), self.elements_left(0)) }
+    }
+
     /// Hand the buffer's first `byte_len` bytes to Arrow as a zero-copy
     /// [`Buffer`]. The slab rides in the buffer's allocation `Arc`, so the
     /// memory returns to the pool when the last downstream reference drops.
@@ -96,6 +120,18 @@ mod tests {
         for i in 0..128 {
             assert_eq!(buf[i], 0);
         }
+    }
+
+    #[test]
+    fn the_buffer_as_a_slice_holds_what_was_written_by_index() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut buf: SlabBuffer<u32> = alloc.create_slab_buffer(4, true);
+        buf[1] = 7;
+
+        buf.as_mut_slice()[3] = 9;
+
+        assert_eq!(buf.as_slice(), [0, 7, 0, 9]);
     }
 
     #[test]
