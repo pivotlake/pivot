@@ -2181,3 +2181,52 @@ async fn query_returns_no_rows_for_an_empty_binary_result(#[future] conn: Conn) 
 
     assert!(rows.is_empty());
 }
+
+/// (team BIGINT, score BIGINT) with `row_count` rows spread evenly over
+/// `team_count` teams. Scores are distinct, and within each team they rise
+/// with the row's position, so a team's lowest scores are its first rows.
+fn team_scores_batch(row_count: i64, team_count: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("team", DataType::Int64, false),
+        Field::new("score", DataType::Int64, false),
+    ]));
+    let team: ArrayRef = Arc::new(Int64Array::from_iter_values(
+        (0..row_count).map(|row| row % team_count),
+    ));
+    let score: ArrayRef = Arc::new(Int64Array::from_iter_values(0..row_count));
+    RecordBatch::try_new(schema, vec![team, score]).unwrap()
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn qualify_on_row_number_keeps_the_lowest_scores_of_each_team(#[future] conn: Conn) {
+    let dir = write_parquet(&team_scores_batch(50_000, 100));
+    let path = dir.path().to_str().unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE team_scores (team BIGINT, score BIGINT) \
+         WITH (with_pre_existing_parquets = '{path}')"
+    ))
+    .await
+    .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT count(*), min(score), max(score) FROM ( \
+             SELECT team, score FROM team_scores \
+             QUALIFY row_number() OVER (PARTITION BY team ORDER BY score) <= 3 \
+         ) AS lowest_scores",
+    )
+    .await;
+
+    // Each of the 100 teams keeps its three lowest scores, which are the
+    // table's first 300 scores.
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("300".into()),
+            Some("0".into()),
+            Some("299".into())
+        ]]
+    );
+}

@@ -19,6 +19,7 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
@@ -53,6 +54,7 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -157,8 +159,13 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
                 throw std::runtime_error(timezone_result->GetError());
         }
 
+        // top_n_window_elimination rewrites `row_number() OVER (...) <= N` into
+        // an aggregate that collects each partition's rows into a list and
+        // unnests it. Pivot has neither lists nor unnest; its window operator
+        // applies such a limit itself.
         auto disable_result = con.Query(
-            "SET disabled_optimizers='compressed_materialization,empty_result_pullup,regex_range'");
+            "SET disabled_optimizers='compressed_materialization,empty_result_pullup,regex_range,"
+            "top_n_window_elimination'");
         if (disable_result->HasError()) {
                 throw std::runtime_error(disable_result->GetError());
         }
@@ -511,6 +518,95 @@ size_t lo_aggregate_expr_count(const LogicalOperator &op) {
 
 const Expression &lo_aggregate_expr(const LogicalOperator &op, size_t index) {
 	return *as<duckdb::LogicalAggregate>(op).expressions[index];
+}
+
+// ---- Window ----
+
+size_t lo_window_expr_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalWindow>(op).expressions.size();
+}
+
+const Expression &lo_window_expr(const LogicalOperator &op, size_t index) {
+	return *as<duckdb::LogicalWindow>(op).expressions[index];
+}
+
+size_t expr_window_partition_count(const Expression &expr) {
+	return as_expr<duckdb::BoundWindowExpression>(expr).partitions.size();
+}
+
+const Expression &expr_window_partition(const Expression &expr, size_t index) {
+	return *as_expr<duckdb::BoundWindowExpression>(expr).partitions[index];
+}
+
+size_t expr_window_order_count(const Expression &expr) {
+	return as_expr<duckdb::BoundWindowExpression>(expr).orders.size();
+}
+
+uint8_t expr_window_order_direction(const Expression &expr, size_t index) {
+	return static_cast<uint8_t>(as_expr<duckdb::BoundWindowExpression>(expr).orders[index].type);
+}
+
+uint8_t expr_window_order_null_order(const Expression &expr, size_t index) {
+	return static_cast<uint8_t>(as_expr<duckdb::BoundWindowExpression>(expr).orders[index].null_order);
+}
+
+const Expression &expr_window_order_expr(const Expression &expr, size_t index) {
+	return *as_expr<duckdb::BoundWindowExpression>(expr).orders[index].expression;
+}
+
+// The function's arguments. For LAG and LEAD these are the value, then the
+// offset and the default when they were written.
+size_t expr_window_argument_count(const Expression &expr) {
+	return as_expr<duckdb::BoundWindowExpression>(expr).children.size();
+}
+
+const Expression &expr_window_argument(const Expression &expr, size_t index) {
+	return *as_expr<duckdb::BoundWindowExpression>(expr).children[index];
+}
+
+bool expr_window_ignores_nulls(const Expression &expr) {
+	return as_expr<duckdb::BoundWindowExpression>(expr).ignore_nulls;
+}
+
+// The aggregate's name for an aggregate used as a window function, and an
+// empty string for the dedicated window functions.
+rust::String expr_window_aggregate_name(const Expression &expr) {
+	auto &window = as_expr<duckdb::BoundWindowExpression>(expr);
+	return rust::String::lossy(window.aggregate ? window.aggregate->name : "");
+}
+
+// Whether the window expression has a DISTINCT or a FILTER clause.
+bool expr_window_is_distinct_or_filtered(const Expression &expr) {
+	auto &window = as_expr<duckdb::BoundWindowExpression>(expr);
+	return window.distinct || window.filter_expr != nullptr;
+}
+
+// Classifies the frame of a window expression that starts at the partition's
+// first row and excludes nothing: 1 when it ends at the current row, 2 when
+// it ends at the last row that ties with the current row on the order keys.
+// Any other frame is 0.
+uint8_t expr_window_running_frame(const Expression &expr) {
+	auto &window = as_expr<duckdb::BoundWindowExpression>(expr);
+	if (window.start != duckdb::WindowBoundary::UNBOUNDED_PRECEDING ||
+	    window.exclude_clause != duckdb::WindowExcludeMode::NO_OTHER) {
+		return 0;
+	}
+	switch (window.end) {
+	case duckdb::WindowBoundary::CURRENT_ROW_ROWS:
+		return 1;
+	case duckdb::WindowBoundary::CURRENT_ROW_RANGE:
+	case duckdb::WindowBoundary::CURRENT_ROW_GROUPS:
+		return 2;
+	default:
+		return 0;
+	}
+}
+
+// The ordering written inside the function call itself, as in
+// `rank(ORDER BY x) OVER (...)`, which replaces the OVER clause's ordering for
+// that function.
+size_t expr_window_argument_order_count(const Expression &expr) {
+	return as_expr<duckdb::BoundWindowExpression>(expr).arg_orders.size();
 }
 
 // ---- Distinct ----
@@ -1441,6 +1537,10 @@ bool expr_between_lower_inclusive(const Expression &expr) {
 
 bool expr_between_upper_inclusive(const Expression &expr) {
 	return as_expr<duckdb::BoundBetweenExpression>(expr).upper_inclusive;
+}
+
+bool expr_equals(const Expression &left, const Expression &right) {
+	return left.Equals(right);
 }
 
 rust::String expr_aggregate_name(const Expression &expr) {
