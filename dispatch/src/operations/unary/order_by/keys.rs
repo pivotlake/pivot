@@ -8,7 +8,7 @@
 //! positions the right run's. Comparing rows within a single run passes that
 //! run as both sides.
 //!
-//! Three implementations, picked by [`select_key_ordering`] from what the key
+//! Four implementations, picked by [`select_key_ordering`] from what the key
 //! actually is, fastest first:
 //!
 //! - [`FixedWidthKeyOrdering`]: one null-free fixed-width column (integers,
@@ -18,8 +18,12 @@
 //!   loads and an integer compare.
 //! - [`ViewBytesKeyOrdering`]: one null-free byte-view column (strings,
 //!   binary). A comparison resolves each view to its bytes and memcmps.
-//! - [`ComparatorKeyOrdering`]: everything else, meaning several key columns,
-//!   nulls, or wider types. Arrow comparators are built per pair of chunks
+//! - [`ColumnwiseKeyOrdering`]: any number of columns, with or without
+//!   nulls, each fixed-width, a 128-bit decimal, a boolean or a byte view. A
+//!   comparison walks the key columns until one differs, reading each
+//!   column's values straight from its buffers.
+//! - [`ComparatorKeyOrdering`]: everything else, meaning a key with a column
+//!   of an interval or nested type. Arrow comparators are built per pair of chunks
 //!   and cached by pair, and a comparison walks the key columns until one
 //!   differs. A k-way merge heap interleaves chunk pairs, so the cache keeps
 //!   every pair the walk revisits instead of only the latest one.
@@ -27,9 +31,19 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::{
+    Date32Type, Date64Type, Decimal32Type, Decimal64Type, Decimal128Type, DurationMicrosecondType,
+    DurationMillisecondType, DurationNanosecondType, DurationSecondType, Float32Type, Float64Type,
+    Int8Type, Int16Type, Int32Type, Int64Type, Time32MillisecondType, Time32SecondType,
+    Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
+    UInt32Type, UInt64Type,
+};
 use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_ord::ord::{DynComparator, make_comparator};
-use arrow_schema::{ArrowError, DataType, SortOptions};
+use arrow_schema::{ArrowError, DataType, SortOptions, TimeUnit};
 
 use crate::operations::unary::order_by_limit::OrderBy;
 
@@ -55,6 +69,7 @@ pub(super) trait KeyOrdering {
 pub(super) enum SelectedKeyOrdering<'chunks> {
     FixedWidth(FixedWidthKeyOrdering<'chunks>),
     ViewBytes(ViewBytesKeyOrdering<'chunks>),
+    Columnwise(ColumnwiseKeyOrdering<'chunks>),
     General(ComparatorKeyOrdering<'chunks>),
 }
 
@@ -65,6 +80,7 @@ macro_rules! with_key_ordering {
         match $selected {
             SelectedKeyOrdering::FixedWidth(mut $ordering) => $body,
             SelectedKeyOrdering::ViewBytes(mut $ordering) => $body,
+            SelectedKeyOrdering::Columnwise(mut $ordering) => $body,
             SelectedKeyOrdering::General(mut $ordering) => $body,
         }
     };
@@ -102,6 +118,9 @@ pub(super) fn select_key_ordering<'chunks>(
                 }));
             }
         }
+    }
+    if let Some(columnwise) = ColumnwiseKeyOrdering::try_new(order_by, left_chunks, right_chunks) {
+        return Ok(SelectedKeyOrdering::Columnwise(columnwise));
     }
     Ok(SelectedKeyOrdering::General(ComparatorKeyOrdering {
         order_by: order_by.to_vec(),
@@ -144,21 +163,294 @@ fn fixed_width_chunks<'chunks>(
 ) -> Vec<FixedWidthChunk<'chunks>> {
     chunks
         .iter()
-        .map(|chunk| {
-            let data = chunk.column(key_column).to_data();
-            let width = data
-                .data_type()
-                .primitive_width()
-                .expect("selected for a fixed-width key");
-            // SAFETY (of the `add`): buffer 0 holds `offset + len` values, so
-            // the offset stays within its allocation.
-            let first_value = unsafe { data.buffers()[0].as_ptr().add(data.offset() * width) };
-            FixedWidthChunk {
-                first_value,
-                _keeps_chunk_alive: std::marker::PhantomData,
-            }
+        .map(|chunk| FixedWidthChunk {
+            first_value: FixedWidthChunk::find_first_value(chunk.column(key_column).as_ref()),
+            _keeps_chunk_alive: std::marker::PhantomData,
         })
         .collect()
+}
+
+impl FixedWidthChunk<'_> {
+    const SIGN: u64 = 1 << 63;
+
+    // SAFETY of every reader: the caller hands the chunk's values pointer and
+    // an in-bounds row of a null-free fixed-width column. Unaligned reads
+    // tolerate sliced offsets.
+
+    /// Row `row` of signed integers at `values`, as a `u64` that orders like
+    /// the integers do.
+    #[inline(always)]
+    fn read_signed<T: Copy + Into<i64>>(values: *const u8, row: usize) -> u64 {
+        let value: T = unsafe { (values as *const T).add(row).read_unaligned() };
+        (value.into() as u64) ^ Self::SIGN
+    }
+
+    /// Row `row` of unsigned integers at `values`, widened to a `u64`.
+    #[inline(always)]
+    fn read_unsigned<T: Copy + Into<u64>>(values: *const u8, row: usize) -> u64 {
+        let value: T = unsafe { (values as *const T).add(row).read_unaligned() };
+        value.into()
+    }
+
+    /// Row `row` of 64-bit floats at `values`, as a `u64` in the IEEE total
+    /// order: negatives (sign bit set) invert entirely, so more-negative
+    /// orders lower, and the rest set the sign bit to sit above every
+    /// negative. Matches the total order Arrow's sort applies, NaN at the
+    /// ends included.
+    #[inline(always)]
+    fn read_f64(values: *const u8, row: usize) -> u64 {
+        let bits: u64 = unsafe { (values as *const u64).add(row).read_unaligned() };
+        if bits & Self::SIGN != 0 {
+            !bits
+        } else {
+            bits | Self::SIGN
+        }
+    }
+
+    /// Row `row` of 32-bit floats at `values`, ordered like
+    /// [`read_f64`](Self::read_f64).
+    #[inline(always)]
+    fn read_f32(values: *const u8, row: usize) -> u64 {
+        let bits: u32 = unsafe { (values as *const u32).add(row).read_unaligned() };
+        let flipped = if bits & (1 << 31) != 0 {
+            !bits
+        } else {
+            bits | (1 << 31)
+        };
+        flipped as u64
+    }
+
+    /// The address of the first value of a fixed-width column.
+    fn find_first_value(column: &dyn Array) -> *const u8 {
+        macro_rules! first_value_of {
+            ($($data_type:pat => $primitive:ty,)+) => {
+                match column.data_type() {
+                    $($data_type => column.as_primitive::<$primitive>().values().as_ptr() as *const u8,)+
+                    other => unreachable!("{other} is not a fixed-width key type"),
+                }
+            };
+        }
+        first_value_of! {
+            DataType::Int8 => Int8Type,
+            DataType::Int16 => Int16Type,
+            DataType::Int32 => Int32Type,
+            DataType::Int64 => Int64Type,
+            DataType::UInt8 => UInt8Type,
+            DataType::UInt16 => UInt16Type,
+            DataType::UInt32 => UInt32Type,
+            DataType::UInt64 => UInt64Type,
+            DataType::Float32 => Float32Type,
+            DataType::Float64 => Float64Type,
+            DataType::Date32 => Date32Type,
+            DataType::Date64 => Date64Type,
+            DataType::Timestamp(TimeUnit::Second, _) => TimestampSecondType,
+            DataType::Timestamp(TimeUnit::Millisecond, _) => TimestampMillisecondType,
+            DataType::Timestamp(TimeUnit::Microsecond, _) => TimestampMicrosecondType,
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => TimestampNanosecondType,
+            DataType::Time32(TimeUnit::Second) => Time32SecondType,
+            DataType::Time32(TimeUnit::Millisecond) => Time32MillisecondType,
+            DataType::Time64(TimeUnit::Microsecond) => Time64MicrosecondType,
+            DataType::Time64(TimeUnit::Nanosecond) => Time64NanosecondType,
+            DataType::Duration(TimeUnit::Second) => DurationSecondType,
+            DataType::Duration(TimeUnit::Millisecond) => DurationMillisecondType,
+            DataType::Duration(TimeUnit::Microsecond) => DurationMicrosecondType,
+            DataType::Duration(TimeUnit::Nanosecond) => DurationNanosecondType,
+            DataType::Decimal32(_, _) => Decimal32Type,
+            DataType::Decimal64(_, _) => Decimal64Type,
+            DataType::Decimal128(_, _) => Decimal128Type,
+        }
+    }
+}
+
+/// Evaluates `$with_reader` with `$read_key` bound to the reader that turns
+/// a row of a chunk's values into a `u64` whose unsigned order equals the sort
+/// order of a `$data_type` column, or `$without_reader` for a type with no
+/// such form. Each type gets its own copy of `$with_reader`, so a loop
+/// written there reads its values without a call per row.
+macro_rules! match_normalized_key_reader {
+    ($data_type:expr, |$read_key:ident| $with_reader:expr, $without_reader:expr) => {
+        match $data_type {
+            DataType::Int64
+            | DataType::Date64
+            | DataType::Timestamp(_, _)
+            | DataType::Time64(_)
+            | DataType::Duration(_)
+            | DataType::Decimal64(_, _) => {
+                let $read_key = FixedWidthChunk::read_signed::<i64>;
+                $with_reader
+            }
+            DataType::Int32
+            | DataType::Date32
+            | DataType::Time32(_)
+            | DataType::Decimal32(_, _) => {
+                let $read_key = FixedWidthChunk::read_signed::<i32>;
+                $with_reader
+            }
+            DataType::Int16 => {
+                let $read_key = FixedWidthChunk::read_signed::<i16>;
+                $with_reader
+            }
+            DataType::Int8 => {
+                let $read_key = FixedWidthChunk::read_signed::<i8>;
+                $with_reader
+            }
+            DataType::UInt64 => {
+                let $read_key = FixedWidthChunk::read_unsigned::<u64>;
+                $with_reader
+            }
+            DataType::UInt32 => {
+                let $read_key = FixedWidthChunk::read_unsigned::<u32>;
+                $with_reader
+            }
+            DataType::UInt16 => {
+                let $read_key = FixedWidthChunk::read_unsigned::<u16>;
+                $with_reader
+            }
+            DataType::UInt8 => {
+                let $read_key = FixedWidthChunk::read_unsigned::<u8>;
+                $with_reader
+            }
+            DataType::Float64 => {
+                let $read_key = FixedWidthChunk::read_f64;
+                $with_reader
+            }
+            DataType::Float32 => {
+                let $read_key = FixedWidthChunk::read_f32;
+                $with_reader
+            }
+            _ => $without_reader,
+        }
+    };
+}
+
+/// A row's position with the leading columns of its sort key packed into one
+/// integer, so that sorting compares integers held next to each other
+/// instead of reading the key columns for every comparison.
+#[derive(Clone, Copy)]
+pub(super) struct PackedRow {
+    /// The packed key columns. A lower value sorts first.
+    pub(super) key: (u64, u64),
+    pub(super) chunk: u32,
+    pub(super) row: u32,
+}
+
+/// Packs the leading columns of a sort key into [`PackedRow`]s.
+///
+/// A column can be packed when it is fixed-width, at most 64 bits wide and
+/// has no nulls. Columns are packed in key order for as long as they fit in
+/// 128 bits together, each as an unsigned integer that orders like the
+/// column does (inverted for a descending column), so comparing two packed
+/// keys compares those columns in key order.
+pub(super) struct PackedKeyPrefix<'chunks> {
+    columns: Vec<PackedColumn<'chunks>>,
+    /// Whether every key column is packed. When not, rows with equal packed
+    /// keys still have to be compared on the full key.
+    pub(super) covers_whole_key: bool,
+}
+
+struct PackedColumn<'chunks> {
+    chunks: Vec<FixedWidthChunk<'chunks>>,
+    data_type: DataType,
+    /// How many bits of the packed key the column takes.
+    bits: u32,
+    /// Subtracted from the value the column's reader returns to bring it
+    /// within `bits` bits. A signed column narrower than 64 bits reads as a
+    /// value centred on 2^63, and this moves its lowest value to zero.
+    bias: u64,
+    descending: bool,
+}
+
+impl<'chunks> PackedKeyPrefix<'chunks> {
+    /// `None` when the key's first column cannot be packed.
+    pub(super) fn try_new(order_by: &[OrderBy], chunks: &'chunks [RecordBatch]) -> Option<Self> {
+        let mut columns = Vec::new();
+        let mut used_bits = 0;
+        for key in order_by {
+            let key_column = key.column_idx();
+            let data_type = chunks.first()?.column(key_column).data_type();
+            let (bits, bias) = match data_type {
+                DataType::Int8 => (8, (1 << 63) - (1 << 7)),
+                DataType::Int16 => (16, (1 << 63) - (1 << 15)),
+                DataType::Int32
+                | DataType::Date32
+                | DataType::Time32(_)
+                | DataType::Decimal32(_, _) => (32, (1 << 63) - (1 << 31)),
+                DataType::UInt8 => (8, 0),
+                DataType::UInt16 => (16, 0),
+                DataType::UInt32 | DataType::Float32 => (32, 0),
+                _ => (64, 0),
+            };
+            let has_nulls = chunks
+                .iter()
+                .any(|chunk| chunk.column(key_column).null_count() > 0);
+            if normalized_key_reader(data_type).is_none() || has_nulls || used_bits + bits > 128 {
+                break;
+            }
+            used_bits += bits;
+            columns.push(PackedColumn {
+                chunks: fixed_width_chunks(key_column, chunks),
+                data_type: data_type.clone(),
+                bits,
+                bias,
+                descending: key.descending(),
+            });
+        }
+        if columns.is_empty() {
+            return None;
+        }
+        Some(Self {
+            covers_whole_key: columns.len() == order_by.len(),
+            columns,
+        })
+    }
+
+    /// Replaces `packed_rows` with one entry per position of `rows`, each a
+    /// `(chunk, row)` pair. The keys are filled a column at a time, so each
+    /// column is read by a loop written for its type.
+    pub(super) fn pack_rows(&self, rows: &[(u32, u32)], packed_rows: &mut Vec<PackedRow>) {
+        packed_rows.clear();
+        packed_rows.extend(rows.iter().map(|&(chunk, row)| PackedRow {
+            key: (0, 0),
+            chunk,
+            row,
+        }));
+        for column in &self.columns {
+            column.append_to_keys(packed_rows);
+        }
+    }
+}
+
+impl PackedColumn<'_> {
+    /// Moves the key of every row of `packed_rows` up by this column's bits
+    /// and puts the row's value of this column in the bits that frees.
+    fn append_to_keys(&self, packed_rows: &mut [PackedRow]) {
+        match_normalized_key_reader!(
+            &self.data_type,
+            |read_key| self.append_values_to_keys(packed_rows, read_key),
+            unreachable!("a packed column is of a type with a normalized key reader")
+        )
+    }
+
+    #[inline(always)]
+    fn append_values_to_keys(
+        &self,
+        packed_rows: &mut [PackedRow],
+        read_key: impl Fn(*const u8, usize) -> u64,
+    ) {
+        let highest_value = u64::MAX >> (64 - self.bits);
+        for packed_row in packed_rows {
+            let first_value = self.chunks[packed_row.chunk as usize].first_value;
+            let value = read_key(first_value, packed_row.row as usize) - self.bias;
+            let value = if self.descending {
+                highest_value - value
+            } else {
+                value
+            };
+            let key = (u128::from(packed_row.key.0) << 64) | u128::from(packed_row.key.1);
+            let key = (key << self.bits) | u128::from(value);
+            packed_row.key = ((key >> 64) as u64, key as u64);
+        }
+    }
 }
 
 impl KeyOrdering for FixedWidthKeyOrdering<'_> {
@@ -179,55 +471,11 @@ impl KeyOrdering for FixedWidthKeyOrdering<'_> {
 /// unsigned order equals the column's sort order, or `None` for a type with
 /// no such form.
 fn normalized_key_reader(data_type: &DataType) -> Option<fn(*const u8, usize) -> u64> {
-    const SIGN: u64 = 1 << 63;
-
-    // SAFETY of every reader: the caller hands the chunk's values pointer and
-    // an in-bounds row of a null-free fixed-width column. Unaligned reads
-    // tolerate sliced offsets.
-    fn read_signed<T: Copy + Into<i64>>(values: *const u8, row: usize) -> u64 {
-        let value: T = unsafe { (values as *const T).add(row).read_unaligned() };
-        (value.into() as u64) ^ SIGN
-    }
-    fn read_unsigned<T: Copy + Into<u64>>(values: *const u8, row: usize) -> u64 {
-        let value: T = unsafe { (values as *const T).add(row).read_unaligned() };
-        value.into()
-    }
-    // The IEEE total-order flip: negatives (sign bit set) invert entirely, so
-    // more-negative orders lower; the rest just set the sign bit to sit above
-    // every negative. Matches the total order Arrow's sort applies, NaN at
-    // the ends included.
-    fn read_f64(values: *const u8, row: usize) -> u64 {
-        let bits: u64 = unsafe { (values as *const u64).add(row).read_unaligned() };
-        if bits & SIGN != 0 { !bits } else { bits | SIGN }
-    }
-    fn read_f32(values: *const u8, row: usize) -> u64 {
-        let bits: u32 = unsafe { (values as *const u32).add(row).read_unaligned() };
-        let flipped = if bits & (1 << 31) != 0 {
-            !bits
-        } else {
-            bits | (1 << 31)
-        };
-        flipped as u64
-    }
-
-    match data_type {
-        DataType::Int64
-        | DataType::Date64
-        | DataType::Timestamp(_, _)
-        | DataType::Time64(_)
-        | DataType::Duration(_)
-        | DataType::Decimal64(_, _) => Some(read_signed::<i64>),
-        DataType::Int32 | DataType::Date32 | DataType::Time32(_) => Some(read_signed::<i32>),
-        DataType::Int16 => Some(read_signed::<i16>),
-        DataType::Int8 => Some(read_signed::<i8>),
-        DataType::UInt64 => Some(read_unsigned::<u64>),
-        DataType::UInt32 => Some(read_unsigned::<u32>),
-        DataType::UInt16 => Some(read_unsigned::<u16>),
-        DataType::UInt8 => Some(read_unsigned::<u8>),
-        DataType::Float64 => Some(read_f64),
-        DataType::Float32 => Some(read_f32),
-        _ => None,
-    }
+    match_normalized_key_reader!(
+        data_type,
+        |read_key| Some(read_key as fn(*const u8, usize) -> u64),
+        None
+    )
 }
 
 /// One null-free byte-view key column: rows compare by their value bytes.
@@ -318,6 +566,209 @@ impl KeyOrdering for ViewBytesKeyOrdering<'_> {
         } else {
             ascending
         }
+    }
+}
+
+/// Any number of key columns, each fixed-width or a byte view, with or
+/// without nulls. Rows compare one key column at a time until a column
+/// differs.
+pub(super) struct ColumnwiseKeyOrdering<'chunks> {
+    columns: Vec<KeyColumn<'chunks>>,
+}
+
+/// One key column of a [`ColumnwiseKeyOrdering`], bound to every chunk of
+/// both runs.
+struct KeyColumn<'chunks> {
+    values: KeyColumnValues<'chunks>,
+    /// Each chunk's validity, `None` for a chunk without nulls. Only read
+    /// when `has_nulls` is set.
+    left_validity: Vec<Option<&'chunks NullBuffer>>,
+    right_validity: Vec<Option<&'chunks NullBuffer>>,
+    /// Whether any chunk of either run holds a null in this column. A column
+    /// without nulls skips the validity checks altogether.
+    has_nulls: bool,
+    descending: bool,
+    nulls_first: bool,
+}
+
+/// How one key column's values are read, per chunk of each run.
+enum KeyColumnValues<'chunks> {
+    FixedWidth {
+        left: Vec<FixedWidthChunk<'chunks>>,
+        right: Vec<FixedWidthChunk<'chunks>>,
+        read_key: fn(*const u8, usize) -> u64,
+    },
+    /// A 128-bit decimal, whose values are signed 128-bit integers.
+    Int128 {
+        left: Vec<FixedWidthChunk<'chunks>>,
+        right: Vec<FixedWidthChunk<'chunks>>,
+    },
+    /// A boolean, stored one bit per value. False orders before true.
+    Boolean {
+        left: Vec<&'chunks BooleanBuffer>,
+        right: Vec<&'chunks BooleanBuffer>,
+    },
+    ViewBytes {
+        left: Vec<ViewChunk<'chunks>>,
+        right: Vec<ViewChunk<'chunks>>,
+    },
+}
+
+impl FixedWidthChunk<'_> {
+    /// Reads row `row` of a chunk of 128-bit integers.
+    #[inline(always)]
+    fn read_int128(&self, row: usize) -> i128 {
+        // SAFETY: the chunk's pointer is the first value of a 16-byte-wide
+        // column and the row is in bounds. Unaligned reads tolerate sliced
+        // offsets.
+        unsafe { (self.first_value as *const i128).add(row).read_unaligned() }
+    }
+}
+
+impl<'chunks> KeyColumn<'chunks> {
+    /// The values of a boolean key column, per chunk.
+    fn boolean_chunks(
+        key_column: usize,
+        chunks: &'chunks [RecordBatch],
+    ) -> Vec<&'chunks BooleanBuffer> {
+        chunks
+            .iter()
+            .map(|chunk| chunk.column(key_column).as_boolean().values())
+            .collect()
+    }
+
+    /// The validity of a key column, per chunk. `None` for a chunk without
+    /// nulls.
+    fn chunk_validities(
+        key_column: usize,
+        chunks: &'chunks [RecordBatch],
+    ) -> Vec<Option<&'chunks NullBuffer>> {
+        chunks
+            .iter()
+            .map(|chunk| {
+                let column = chunk.column(key_column);
+                column.nulls().filter(|_| column.null_count() > 0)
+            })
+            .collect()
+    }
+}
+
+impl<'chunks> ColumnwiseKeyOrdering<'chunks> {
+    /// `None` when some key column is of a type this ordering cannot read.
+    fn try_new(
+        order_by: &[OrderBy],
+        left_chunks: &'chunks [RecordBatch],
+        right_chunks: &'chunks [RecordBatch],
+    ) -> Option<Self> {
+        let columns = order_by
+            .iter()
+            .map(|key| {
+                let key_column = key.column_idx();
+                let data_type = data_type_of(key_column, left_chunks, right_chunks);
+                let values = if let Some(read_key) = normalized_key_reader(&data_type) {
+                    KeyColumnValues::FixedWidth {
+                        left: fixed_width_chunks(key_column, left_chunks),
+                        right: fixed_width_chunks(key_column, right_chunks),
+                        read_key,
+                    }
+                } else {
+                    match data_type {
+                        DataType::Utf8View | DataType::BinaryView => KeyColumnValues::ViewBytes {
+                            left: view_chunks(key_column, left_chunks),
+                            right: view_chunks(key_column, right_chunks),
+                        },
+                        DataType::Decimal128(_, _) => KeyColumnValues::Int128 {
+                            left: fixed_width_chunks(key_column, left_chunks),
+                            right: fixed_width_chunks(key_column, right_chunks),
+                        },
+                        DataType::Boolean => KeyColumnValues::Boolean {
+                            left: KeyColumn::boolean_chunks(key_column, left_chunks),
+                            right: KeyColumn::boolean_chunks(key_column, right_chunks),
+                        },
+                        _ => return None,
+                    }
+                };
+                let left_validity = KeyColumn::chunk_validities(key_column, left_chunks);
+                let right_validity = KeyColumn::chunk_validities(key_column, right_chunks);
+                let has_nulls = left_validity
+                    .iter()
+                    .chain(&right_validity)
+                    .any(Option::is_some);
+                Some(KeyColumn {
+                    values,
+                    left_validity,
+                    right_validity,
+                    has_nulls,
+                    descending: key.descending(),
+                    nulls_first: key.nulls_first(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { columns })
+    }
+}
+
+impl KeyOrdering for ColumnwiseKeyOrdering<'_> {
+    fn compare(&mut self, left: RunRow, right: RunRow) -> Ordering {
+        for column in &self.columns {
+            if column.has_nulls {
+                let left_valid = column.left_validity[left.chunk]
+                    .is_none_or(|validity| validity.is_valid(left.row));
+                let right_valid = column.right_validity[right.chunk]
+                    .is_none_or(|validity| validity.is_valid(right.row));
+                match (left_valid, right_valid) {
+                    (true, true) => {}
+                    // Two nulls tie on this column; the next column decides.
+                    (false, false) => continue,
+                    // Where nulls go does not depend on the sort direction.
+                    (false, true) if column.nulls_first => return Ordering::Less,
+                    (false, true) => return Ordering::Greater,
+                    (true, false) if column.nulls_first => return Ordering::Greater,
+                    (true, false) => return Ordering::Less,
+                }
+            }
+            let ascending = match &column.values {
+                KeyColumnValues::FixedWidth {
+                    left: left_chunks,
+                    right: right_chunks,
+                    read_key,
+                } => {
+                    let left_key = read_key(left_chunks[left.chunk].first_value, left.row);
+                    let right_key = read_key(right_chunks[right.chunk].first_value, right.row);
+                    left_key.cmp(&right_key)
+                }
+                KeyColumnValues::Int128 {
+                    left: left_chunks,
+                    right: right_chunks,
+                } => {
+                    let left_key = left_chunks[left.chunk].read_int128(left.row);
+                    let right_key = right_chunks[right.chunk].read_int128(right.row);
+                    left_key.cmp(&right_key)
+                }
+                KeyColumnValues::Boolean {
+                    left: left_chunks,
+                    right: right_chunks,
+                } => {
+                    let left_key = left_chunks[left.chunk].value(left.row);
+                    let right_key = right_chunks[right.chunk].value(right.row);
+                    left_key.cmp(&right_key)
+                }
+                KeyColumnValues::ViewBytes {
+                    left: left_chunks,
+                    right: right_chunks,
+                } => {
+                    let left_bytes = view_value_bytes(&left_chunks[left.chunk], left.row);
+                    let right_bytes = view_value_bytes(&right_chunks[right.chunk], right.row);
+                    left_bytes.cmp(right_bytes)
+                }
+            };
+            match ascending {
+                Ordering::Equal => {}
+                _ if column.descending => return ascending.reverse(),
+                _ => return ascending,
+            }
+        }
+        Ordering::Equal
     }
 }
 
