@@ -109,6 +109,64 @@ pub fn write_via_sink(store: &dyn ObjectStore, key: &ObjectPath, bytes: &[u8]) {
     }
 }
 
+/// How many parts the S3 object at `key` was uploaded in. S3 ends the `ETag`
+/// of an object assembled from parts with `-<part count>`; an object uploaded
+/// in one request has no such suffix.
+pub fn count_s3_upload_parts(store: &dyn ObjectStore, key: &ObjectPath) -> usize {
+    let DataFileLocation::Remote { url, .. } = store.source(key).expect("source") else {
+        panic!("an S3 object is read through a URL");
+    };
+    let response = ureq::get(url.as_str())
+        .set("Range", "bytes=0-0")
+        .call()
+        .expect("GET source url");
+    let etag = response.header("etag").expect("S3 answers with an ETag");
+    match etag.trim_matches('"').rsplit_once('-') {
+        Some((_, part_count)) => part_count.parse().expect("a part count"),
+        None => 1,
+    }
+}
+
+/// The key of every multipart upload of the object `s3://<bucket>/<key>` that
+/// was neither completed nor aborted. MinIO lists the uploads of one object
+/// at a time, so `key` names the whole object.
+pub fn list_s3_pending_uploads(key: &str) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct ListMultipartUploadsResult {
+        #[serde(default, rename = "Upload")]
+        uploads: Vec<Upload>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Upload {
+        key: String,
+    }
+    containers().s3.as_ref().expect("MinIO is running");
+    let endpoint = std::env::var("AWS_ENDPOINT_URL").expect("the harness set the S3 endpoint");
+    let url = format!(
+        "{endpoint}/{BUCKET}?uploads=&prefix={}",
+        crate::percent_encode(key)
+    );
+
+    let mut request = ureq::get(&url);
+    for (name, value) in sign_s3_request("GET", &url, &endpoint).expect("sign") {
+        request = request.set(&name, &value);
+    }
+    let body = request
+        .call()
+        .expect("ListMultipartUploads")
+        .into_string()
+        .expect("ListMultipartUploads body");
+
+    let listed: ListMultipartUploadsResult =
+        quick_xml::de::from_str(&body).expect("ListMultipartUploads parse");
+    listed
+        .uploads
+        .into_iter()
+        .map(|upload| upload.key)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Container lifecycle: one MinIO + one fake-gcs-server per test binary.
 // ---------------------------------------------------------------------------
@@ -236,16 +294,34 @@ fn gcs_create_bucket(endpoint: &str) -> Result<(), String> {
     Err(format!("create bucket: server never became ready ({last})"))
 }
 
-/// `PUT /<bucket>` against MinIO, SigV4-signed (mirrors the datastore's own S3
-/// signing). A 409 means the bucket already exists — fine.
+/// `PUT /<bucket>` against MinIO. A 409 means the bucket already exists — fine.
 fn s3_create_bucket(endpoint: &str) -> Result<(), String> {
+    let url = format!("{endpoint}/{BUCKET}");
+    let mut req = ureq::put(&url);
+    for (name, value) in sign_s3_request("PUT", &url, endpoint)? {
+        req = req.set(&name, &value);
+    }
+    match req.send_bytes(b"") {
+        Ok(_) => Ok(()),
+        // Bucket already exists / already owned by us.
+        Err(ureq::Error::Status(409, _)) => Ok(()),
+        Err(e) => Err(format!("PUT bucket: {e}")),
+    }
+}
+
+/// The SigV4 headers for a bodiless request to MinIO at `endpoint` (mirrors
+/// the datastore's own S3 signing).
+fn sign_s3_request(
+    method: &str,
+    url: &str,
+    endpoint: &str,
+) -> Result<Vec<(String, String)>, String> {
     use aws_credential_types::Credentials;
     use aws_sigv4::http_request::{
         PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
     };
     use aws_sigv4::sign::v4;
 
-    let url = format!("{endpoint}/{BUCKET}");
     let host = endpoint.split("://").nth(1).unwrap_or(endpoint);
 
     let creds = Credentials::new(S3_ACCESS_KEY, S3_SECRET_KEY, None, None, "harness");
@@ -263,8 +339,8 @@ fn s3_create_bucket(endpoint: &str) -> Result<(), String> {
 
     let headers = [("host", host)];
     let signable = SignableRequest::new(
-        "PUT",
-        &url,
+        method,
+        url,
         headers.iter().copied(),
         SignableBody::Bytes(b""),
     )
@@ -273,14 +349,8 @@ fn s3_create_bucket(endpoint: &str) -> Result<(), String> {
         .map_err(|e| format!("sigv4 sign: {e}"))?
         .into_parts();
 
-    let mut req = ureq::put(&url);
-    for (name, value) in instructions.headers() {
-        req = req.set(name, value);
-    }
-    match req.send_bytes(b"") {
-        Ok(_) => Ok(()),
-        // Bucket already exists / already owned by us.
-        Err(ureq::Error::Status(409, _)) => Ok(()),
-        Err(e) => Err(format!("PUT bucket: {e}")),
-    }
+    Ok(instructions
+        .headers()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect())
 }
