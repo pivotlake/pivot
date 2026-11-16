@@ -29,6 +29,7 @@ use crate::numa::dominant_node;
 use crate::operations::channels::NodeIdOutput;
 use crate::operations::unary::order_by_limit::OrderBy;
 
+use super::ChunkedRowSorter;
 use super::batch_sort::MERGE_SLICE_ROWS;
 use super::keys::{
     KeyOrdering, RunRow, SelectedKeyOrdering, select_key_ordering, with_key_ordering,
@@ -143,16 +144,57 @@ impl ParallelKWayMerge {
                 self.slices.len()
             ))
         })?;
-        let mapping = with_key_ordering!(
-            select_key_ordering(&self.order_by, &self.batches, &self.batches)?,
-            |ordering| slice_mapping(&mut ordering, &self.run_indexes, &slice.run_rows)
-        );
+        // A slice reads one stretch of each run. The key readers and the row
+        // copy are bound to the batches those stretches touch, so the cost of
+        // a slice does not grow with the size of the whole merge.
+        let mut slice_runs = Vec::with_capacity(self.run_indexes.len());
+        let mut slice_run_rows = Vec::with_capacity(self.run_indexes.len());
+        for (run, rows) in self.run_indexes.iter().zip(&slice.run_rows) {
+            if rows.is_empty() {
+                slice_runs.push(Vec::new());
+                slice_run_rows.push(0..0);
+                continue;
+            }
+            let first_batch = run
+                .first_row_by_batch
+                .partition_point(|&first_row| first_row <= rows.start)
+                - 1;
+            let end_batch = run
+                .first_row_by_batch
+                .partition_point(|&first_row| first_row < rows.end);
+            let rows_before_first_batch = run.first_row_by_batch[first_batch];
+            slice_runs.push(
+                self.batches[run.first_batch + first_batch..run.first_batch + end_batch].to_vec(),
+            );
+            slice_run_rows
+                .push(rows.start - rows_before_first_batch..rows.end - rows_before_first_batch);
+        }
+        let slice_run_indexes = build_run_indexes(&slice_runs);
+        let slice_batches: Vec<RecordBatch> = slice_runs.into_iter().flatten().collect();
 
-        let schema = self.batches[0].schema();
+        // The slice's rows, one run's stretch after another. Each stretch is
+        // in key order, so ordering the slice is a merge of the stretches.
+        let mut mapping = Vec::with_capacity(slice_run_rows.iter().map(Range::len).sum());
+        for (run, rows) in slice_run_indexes.iter().zip(&slice_run_rows) {
+            if rows.is_empty() {
+                continue;
+            }
+            let mut position = run.locate(rows.start);
+            for _ in 0..rows.len() {
+                mapping.push((position.chunk as u32, position.row as u32));
+                position.row += 1;
+                if position.row == run.rows_by_batch[position.chunk - run.first_batch] {
+                    position.chunk += 1;
+                    position.row = 0;
+                }
+            }
+        }
+        ChunkedRowSorter::try_new(&self.order_by, &slice_batches)?.merge_sorted_runs(&mut mapping);
+
+        let schema = slice_batches[0].schema();
         let mut output_columns = Vec::with_capacity(schema.fields().len());
         for column_index in 0..schema.fields().len() {
-            let input_columns: Vec<ArrayRef> = self
-                .batches
+            let input_columns: Vec<ArrayRef> = slice_batches
                 .iter()
                 .map(|batch| batch.column(column_index).clone())
                 .collect();
@@ -525,99 +567,6 @@ fn search_cut<K: KeyOrdering>(
         }
     }
     low
-}
-
-/// Produces the flattened `(batch, row)` order for one output slice.
-fn slice_mapping<K: KeyOrdering>(
-    ordering: &mut K,
-    run_indexes: &[RunIndex],
-    run_rows: &[Range<usize>],
-) -> Vec<(u32, u32)> {
-    let row_count = run_rows.iter().map(Range::len).sum();
-    let mut heap: Vec<MappingCursor> = run_rows
-        .iter()
-        .enumerate()
-        .filter(|(_, rows)| !rows.is_empty())
-        .map(|(run_index, rows)| MappingCursor::new(run_index, &run_indexes[run_index], rows))
-        .collect();
-    for parent in (0..heap.len() / 2).rev() {
-        sift_down(ordering, &mut heap, parent);
-    }
-
-    let mut mapping = Vec::with_capacity(row_count);
-    while !heap.is_empty() {
-        let position = heap[0].position;
-        mapping.push((position.chunk as u32, position.row as u32));
-        if heap[0].advance(run_indexes) {
-            sift_down(ordering, &mut heap, 0);
-        } else {
-            let last = heap.pop().expect("the heap has a root");
-            if !heap.is_empty() {
-                heap[0] = last;
-                sift_down(ordering, &mut heap, 0);
-            }
-        }
-    }
-    mapping
-}
-
-struct MappingCursor {
-    run_index: usize,
-    position: RunRow,
-    rows_remaining: usize,
-}
-
-impl MappingCursor {
-    fn new(run_index: usize, run: &RunIndex, rows: &Range<usize>) -> Self {
-        Self {
-            run_index,
-            position: run.locate(rows.start),
-            rows_remaining: rows.len(),
-        }
-    }
-
-    /// Advances within the run and returns whether this cursor remains live.
-    fn advance(&mut self, run_indexes: &[RunIndex]) -> bool {
-        self.rows_remaining -= 1;
-        if self.rows_remaining == 0 {
-            return false;
-        }
-        self.position.row += 1;
-        let run = &run_indexes[self.run_index];
-        let local_batch = self.position.chunk - run.first_batch;
-        if self.position.row == run.rows_by_batch[local_batch] {
-            self.position.chunk += 1;
-            self.position.row = 0;
-        }
-        true
-    }
-}
-
-fn sift_down<K: KeyOrdering>(ordering: &mut K, heap: &mut [MappingCursor], mut parent: usize) {
-    loop {
-        let left = parent * 2 + 1;
-        if left >= heap.len() {
-            return;
-        }
-        let right = left + 1;
-        let mut first = left;
-        if right < heap.len() && precedes(ordering, &heap[right], &heap[left]) {
-            first = right;
-        }
-        if !precedes(ordering, &heap[first], &heap[parent]) {
-            return;
-        }
-        heap.swap(parent, first);
-        parent = first;
-    }
-}
-
-fn precedes<K: KeyOrdering>(ordering: &mut K, left: &MappingCursor, right: &MappingCursor) -> bool {
-    match ordering.compare(left.position, right.position) {
-        Ordering::Less => true,
-        Ordering::Equal => left.run_index < right.run_index,
-        Ordering::Greater => false,
-    }
 }
 
 #[cfg(test)]
