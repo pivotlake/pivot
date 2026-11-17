@@ -32,6 +32,8 @@
 //! - [`tokenizer`] defines what a token is.
 //! - [`sparse_index`], [`dict_index`] and [`postings`] are the three pieces.
 //! - [`index_file`] lays the pieces of one index out as a file.
+//! - [`token_run`] is how the text of a data file gets to the index file:
+//!   sorted a row group at a time, then merged.
 //! - [`sorted_tokens`] is the run of tokens the sparse index and a dict
 //!   index are each built around.
 //! - [`carve_order`] tells the chunks of a piece's several vecs apart once
@@ -45,6 +47,7 @@ pub mod index_file;
 pub mod postings;
 mod sorted_tokens;
 pub mod sparse_index;
+pub mod token_run;
 pub mod tokenizer;
 
 pub use dict_index::{
@@ -53,6 +56,7 @@ pub use dict_index::{
 pub use index_file::{IndexFileFooter, IndexFileWriter, TOKENS_PER_DICT_INDEX};
 pub use postings::{Postings, PostingsBuilder, PostingsMeta};
 pub use sparse_index::{SparseIndex, SparseIndexBuilder, SparseIndexMeta};
+pub use token_run::{PlacedTokenRun, TokenRun, TokenRunBuilder};
 pub use tokenizer::{LetterCase, Tokenizer, split_tokens};
 
 /// Why encoded bytes could not be decoded.

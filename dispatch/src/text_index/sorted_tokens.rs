@@ -111,10 +111,8 @@ impl SortedTokens {
         let (mut token_start, mut index) = (0, 0);
         self.token_ends.for_each(|token_end| {
             token.clear();
-            token.extend(
-                (token_start as usize..token_end as usize)
-                    .map(|position| self.token_bytes.get(position)),
-            );
+            self.token_bytes
+                .copy_range_into(token_start as usize..token_end as usize, &mut token);
             let shared_len = token
                 .iter()
                 .zip(&token_before)

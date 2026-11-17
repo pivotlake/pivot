@@ -331,6 +331,20 @@ impl<T: Copy> SlabVec<T> {
         self.chunk_elements(chunk_index)[index_in_chunk]
     }
 
+    /// Append the elements in `range` to `into`, a chunk's part at a time.
+    /// Panics when `range` reaches past the end.
+    pub fn copy_range_into(&self, range: Range<usize>, into: &mut Vec<T>) {
+        let mut position = range.start;
+        while position < range.end {
+            let (chunk_index, index_in_chunk) = Self::locate(position);
+            let chunk_rest = &self.chunk_elements(chunk_index)[index_in_chunk..];
+            assert!(!chunk_rest.is_empty(), "element {position} is past the end");
+            let part = &chunk_rest[..chunk_rest.len().min(range.end - position)];
+            into.extend_from_slice(part);
+            position += part.len();
+        }
+    }
+
     /// How the elements in `range` compare, as a sequence, to `other`. The
     /// range may lie across chunks: it is compared a chunk's part at a time.
     /// Panics when `range` reaches past the end.
@@ -562,6 +576,17 @@ mod tests {
         v.push(&mut alloc, 1u64);
 
         v.push(&mut alloc, 2u64);
+    }
+
+    #[test]
+    fn a_range_lying_across_chunks_is_copied_out_whole() {
+        let (v, _alloc) = push_range(10_000);
+        let mut copied = vec![7];
+
+        v.copy_range_into(1_000..1_100, &mut copied);
+
+        let expected: Vec<u64> = std::iter::once(7).chain(1_000..1_100).collect();
+        assert_eq!(copied, expected);
     }
 
     #[test]
