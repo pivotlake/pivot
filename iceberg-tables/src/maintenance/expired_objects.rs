@@ -69,7 +69,7 @@ use iceberg::spec::{
 use object_storage::ObjectPath;
 
 use crate::files::deletes::is_deletion_vector;
-use crate::maintenance::linear_history::list_linear_history;
+use crate::maintenance::sorted_snapshots::list_sorted_snapshots;
 use crate::table::{MANIFESTS_PER_READ, Table};
 use crate::{Error, Result};
 
@@ -226,7 +226,7 @@ impl Table {
     /// version holds tells with nothing read.
     pub fn collect_expired_objects(&self, expired: &ExpiredSnapshots) -> Result<Vec<ObjectPath>> {
         let table_name = self.name().to_string();
-        let history = list_linear_history(&table_name, self.metadata())?;
+        let retained_snapshots = list_sorted_snapshots(&table_name, self.metadata())?;
         let location = self.location();
         let named_by_metadata =
             list_metadata_object_names(self.metadata_location(), self.metadata());
@@ -235,7 +235,7 @@ impl Table {
         let mut unused_manifests: HashMap<String, ManifestFile> = HashMap::new();
         let mut unused_manifest_lists = Vec::new();
         if !expired.snapshots.is_empty() {
-            let oldest_retained = match history.first() {
+            let oldest_retained = match retained_snapshots.first() {
                 Some(oldest_retained) if expired.are_nearest_ancestors_of(oldest_retained) => {
                     oldest_retained
                 }

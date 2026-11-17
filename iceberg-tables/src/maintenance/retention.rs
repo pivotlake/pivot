@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use iceberg::spec::{TableMetadata, TableProperties};
 
-use crate::maintenance::linear_history::list_linear_history;
+use crate::maintenance::sorted_snapshots::list_sorted_snapshots;
 use crate::table::Table;
 use crate::{Error, Result};
 
@@ -71,11 +71,11 @@ impl Table {
         if !self.is_gc_enabled()? {
             return Ok(Vec::new());
         }
-        let history = list_linear_history(&self.name().to_string(), metadata)?;
+        let snapshots = list_sorted_snapshots(&self.name().to_string(), metadata)?;
         let retention_ms =
             i64::try_from(snapshot_retention(metadata)?.as_millis()).unwrap_or(i64::MAX);
         let mut expired = Vec::new();
-        for (snapshot, successor) in history.iter().zip(history.iter().skip(1)) {
+        for (snapshot, successor) in snapshots.iter().zip(snapshots.iter().skip(1)) {
             let past_window = successor.timestamp_ms().saturating_add(retention_ms) <= now_ms;
             if !past_window {
                 break;
@@ -102,7 +102,7 @@ impl Table {
         if !self.is_gc_enabled()? {
             return Ok(Vec::new());
         }
-        list_linear_history(&self.name().to_string(), metadata)?;
+        list_sorted_snapshots(&self.name().to_string(), metadata)?;
         let retention_ms =
             i64::try_from(snapshot_retention(metadata)?.as_millis()).unwrap_or(i64::MAX);
         let log = metadata.metadata_log();
