@@ -3530,6 +3530,56 @@ fn create_table_registers_a_v3_table_with_pivots_logical_types() {
 }
 
 #[test]
+fn an_insert_records_a_sort_columns_long_string_bounds_whole_and_cuts_another_columns() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("sorted_pages", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE sorted_pages.pages (url VARCHAR, referrer VARCHAR) WITH (sort_by = 'url')",
+        )
+        .unwrap();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO sorted_pages.pages VALUES \
+             ('https://example.com/pages/a', 'https://example.com/pages/a'), \
+             ('https://example.com/pages/z', 'https://example.com/pages/z')",
+        )
+        .unwrap();
+
+    let schema = harness
+        .load(&namespace, "pages")
+        .metadata()
+        .current_schema()
+        .clone();
+    let url = schema.field_id_by_name("url").unwrap();
+    let referrer = schema.field_id_by_name("referrer").unwrap();
+    let files = harness.live_data_files(&namespace, "pages");
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files[0].lower_bounds()[&url],
+        Datum::string("https://example.com/pages/a")
+    );
+    assert_eq!(
+        files[0].upper_bounds()[&url],
+        Datum::string("https://example.com/pages/z")
+    );
+    assert_eq!(
+        files[0].lower_bounds()[&referrer],
+        Datum::string("https://example.")
+    );
+    assert_eq!(
+        files[0].upper_bounds()[&referrer],
+        Datum::string("https://example/")
+    );
+}
+
+#[test]
 fn create_table_refuses_a_duplicate_unless_asked_not_to() {
     let Some(harness) = harness() else { return };
     harness.namespace("twice", "orders", orders_schema());

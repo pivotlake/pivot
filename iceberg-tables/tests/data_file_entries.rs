@@ -597,3 +597,82 @@ fn an_entry_without_stats_cannot_be_recorded() {
 
     assert!(matches!(error, Error::MissingFileStats { .. }), "{error}");
 }
+
+/// Two strings that differ only after their first 26 code points.
+const FIRST_PAGE: &str = "https://example.com/pages/a";
+const LAST_PAGE: &str = "https://example.com/pages/z";
+
+/// An entry for one file whose strings in each of `columns` run from
+/// [`FIRST_PAGE`] to [`LAST_PAGE`].
+fn build_page_entry(columns: &[&str]) -> DataFileEntry {
+    let bound = |page: &str| -> ArrayRef { Arc::new(StringViewArray::from(vec![page])) };
+    let bounds: Vec<(&str, ArrayRef, ArrayRef)> = columns
+        .iter()
+        .map(|column| (*column, bound(FIRST_PAGE), bound(LAST_PAGE)))
+        .collect();
+    DataFileEntry {
+        file: FileRef {
+            path: ObjectPath::new("pivot-1.parquet"),
+            size: 1,
+        },
+        partition: None,
+        partition_spec_id: None,
+        stats: Some(stats(2, &bounds, &[])),
+        sort_order_id: None,
+        first_row_id: None,
+    }
+}
+
+#[test]
+fn a_sort_columns_long_string_bounds_are_recorded_whole() {
+    let columns = [column("url", Type::Utf8)];
+    let (_fixture, table) = create_table_of(&columns, &[], &["url".to_string()]);
+    let entry = build_page_entry(&["url"]);
+
+    let data_file = entry
+        .create_data_file(table.metadata(), table.location())
+        .unwrap();
+
+    assert_eq!(data_file.lower_bounds()[&1], Datum::string(FIRST_PAGE));
+    assert_eq!(data_file.upper_bounds()[&1], Datum::string(LAST_PAGE));
+}
+
+#[test]
+fn a_long_string_bound_of_a_column_outside_the_sort_order_is_cut() {
+    let columns = [column("url", Type::Utf8), column("referrer", Type::Utf8)];
+    let (_fixture, table) = create_table_of(&columns, &[], &["url".to_string()]);
+    let entry = build_page_entry(&["referrer"]);
+
+    let data_file = entry
+        .create_data_file(table.metadata(), table.location())
+        .unwrap();
+
+    // The first 16 code points below, and above them with the last one
+    // incremented.
+    assert_eq!(
+        data_file.lower_bounds()[&2],
+        Datum::string("https://example.")
+    );
+    assert_eq!(
+        data_file.upper_bounds()[&2],
+        Datum::string("https://example/")
+    );
+}
+
+#[test]
+fn every_sort_column_reads_its_long_string_bounds_back_whole_from_a_manifest() {
+    let columns = [column("site", Type::Utf8), column("url", Type::Utf8)];
+    let sort_by = ["site".to_string(), "url".to_string()];
+    let (fixture, created) = create_table_of(&columns, &[], &sort_by);
+
+    append(&created, vec![build_page_entry(&["site", "url"])]);
+    let read = live_entry(&load(&fixture), "pivot-1.parquet")
+        .stats
+        .unwrap();
+
+    for column in ["site", "url"] {
+        let (lowest, highest) = (&read.min_values[column], &read.max_values[column]);
+        assert_eq!(lowest.as_string_view().value(0), FIRST_PAGE);
+        assert_eq!(highest.as_string_view().value(0), LAST_PAGE);
+    }
+}

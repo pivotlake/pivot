@@ -4,7 +4,7 @@
 
 mod iceberg_support;
 
-use arrow_array::{ArrayRef, Int64Array, Scalar};
+use arrow_array::{ArrayRef, Int64Array, Scalar, StringViewArray};
 use datastore_pivotlake::test_support::{
     commit_external_append, hinted_version, live_data_file_names, metadata_versions,
 };
@@ -203,6 +203,64 @@ fn a_filter_on_a_columns_bounds_prunes_the_files_a_scan_reads() {
     assert_eq!(whole.row_groups().len(), 2);
     assert_eq!(filtered.row_groups().len(), 1);
     assert_eq!(filtered.row_groups()[0].num_rows, 3);
+}
+
+#[test]
+fn a_filter_on_a_long_sort_string_prunes_a_file_whose_strings_share_its_prefix() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE pages (url VARCHAR) WITH (sort_by = 'url')");
+    db.execute("INSERT INTO pages VALUES ('https://example.com/pages/a')");
+    db.execute(
+        "INSERT INTO pages VALUES \
+         ('https://example.com/pages/b'), ('https://example.com/pages/c')",
+    );
+    let table = db
+        .datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("pages"))
+        .unwrap();
+    let is_last_page = Expression::Compare(Compare {
+        left: Box::new(Expression::Ref(Ref {
+            column_idx: 0,
+            return_type: Type::Utf8,
+            name: None,
+        })),
+        right: Box::new(Expression::Constant(Scalar::new(
+            Arc::new(StringViewArray::from(vec!["https://example.com/pages/c"])) as ArrayRef,
+        ))),
+        compare_type: CompareType::Equal,
+        return_type: Type::Boolean,
+    });
+
+    let filtered = table.select_scan(&[is_last_page]).unwrap();
+
+    assert_eq!(filtered.row_groups().len(), 1);
+    assert_eq!(filtered.row_groups()[0].num_rows, 2);
+}
+
+#[test]
+fn a_filter_on_a_sort_column_of_long_strings_returns_exactly_the_matching_rows() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE pages (url VARCHAR, visits BIGINT) WITH (sort_by = 'url')");
+    db.execute(
+        "INSERT INTO pages VALUES \
+         ('https://example.com/pages/a', 1), ('https://example.com/pages/b', 2)",
+    );
+    db.execute(
+        "INSERT INTO pages VALUES \
+         ('https://example.com/pages/c', 3), ('https://example.com/pages/d', 4)",
+    );
+    let select_visits =
+        |filter: &str| format!("SELECT visits FROM pages WHERE url {filter} ORDER BY visits");
+
+    let equal = db.execute(&select_visits("= 'https://example.com/pages/c'"));
+    let above = db.execute(&select_visits("> 'https://example.com/pages/b'"));
+    let up_to = db.execute(&select_visits("<= 'https://example.com/pages/b'"));
+    let absent = db.execute(&select_visits("= 'https://example.com/pages/bb'"));
+
+    assert_eq!(collect_i64s(&equal, 0), [3]);
+    assert_eq!(collect_i64s(&above, 0), [3, 4]);
+    assert_eq!(collect_i64s(&up_to, 0), [1, 2]);
+    assert!(collect_i64s(&absent, 0).is_empty());
 }
 
 #[test]

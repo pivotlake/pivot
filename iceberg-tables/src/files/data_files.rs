@@ -33,9 +33,10 @@ use crate::types::columns::to_pivot_type;
 use crate::types::datum::array_to_datum;
 use crate::{Error, Result};
 
-/// String bounds are cut to this many code points: a bound only has to
-/// bracket the file's values, and a long string would otherwise be recorded
-/// in full in every manifest and manifest-list summary.
+/// String bounds of a column outside the table's sort order are cut to this
+/// many code points: such a bound only has to bracket the file's values, and
+/// a long string would otherwise be recorded in full in every manifest entry
+/// of the file.
 const STRING_BOUND_CODE_POINTS: usize = 16;
 
 /// One data file: its store identity, the partition tuple a partitioned
@@ -181,12 +182,26 @@ impl DataFileEntry {
     /// default partition spec, its path as a URI under `location`. Requires
     /// the entry's statistics: a manifest entry carries the file's row
     /// count, and a file without one cannot be committed.
+    ///
+    /// A column of the default sort order is bounded by the minimum and
+    /// maximum the statistics hold, whole, however long: where a file lies
+    /// on the sort key is read from them, and bounds cut to a prefix give
+    /// the files whose values share it one range, so files that lie apart
+    /// read as overlapping, as do the files a rewrite of them writes. A
+    /// string bound of any other column is cut to
+    /// `STRING_BOUND_CODE_POINTS` code points.
     pub fn create_data_file(
         &self,
         metadata: &TableMetadata,
         location: &TableLocation,
     ) -> Result<DataFile> {
         let schema = metadata.current_schema();
+        let sort_column_ids: Vec<i32> = metadata
+            .default_sort_order()
+            .fields
+            .iter()
+            .map(|field| field.source_id)
+            .collect();
         let stats = self.stats.as_ref().ok_or_else(|| Error::MissingFileStats {
             file: self.file.path.to_string(),
         })?;
@@ -209,10 +224,20 @@ impl DataFileEntry {
             // A bound Iceberg cannot hold (a `UInt64` above `i64::MAX`, a NaN)
             // leaves the column unbounded for that file, which prunes nothing.
             let (Some(lower), Some(upper)) = (
-                array_to_datum(min.as_ref(), &primitive).map(truncate_lower),
-                array_to_datum(max.as_ref(), &primitive).and_then(truncate_upper),
+                array_to_datum(min.as_ref(), &primitive),
+                array_to_datum(max.as_ref(), &primitive),
             ) else {
                 continue;
+            };
+            let (lower, upper) = if sort_column_ids.contains(&field_id) {
+                (lower, upper)
+            } else {
+                // A cut maximum without a successor leaves the column
+                // unbounded too.
+                let Some(upper) = truncate_upper(upper) else {
+                    continue;
+                };
+                (truncate_lower(lower), upper)
             };
             lower_bounds.insert(field_id, lower);
             upper_bounds.insert(field_id, upper);

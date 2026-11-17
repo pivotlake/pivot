@@ -48,6 +48,10 @@ impl Metastore for TrustMetastore {
     }
 }
 
+/// How long a test lets one compaction round run: many times what a round
+/// over a test's few files takes.
+const COMPACTION_DEADLINE: Duration = Duration::from_secs(60);
+
 static INIT: Once = Once::new();
 
 fn init_tracing() {
@@ -299,12 +303,17 @@ impl Database {
     /// Compact the table `name` (in the default schema) to completion, the
     /// way the server runs a `COMPACT` statement: through the transaction's
     /// catalog view, `final_sweep` dropping the routine guards. Returns the
-    /// number of passes the round took.
+    /// number of passes the round took. A round still running after
+    /// [`COMPACTION_DEADLINE`] fails the test instead of hanging it.
     pub fn compact(&mut self, name: &str, final_sweep: bool) -> u64 {
         let transaction = self.catalog.begin_transaction();
         let table = SchemaQualifiedTableName::in_default_schema(name);
+        let round = transaction.compact(DEFAULT_DATASTORE_NAME, &table, final_sweep);
         self.runtime
-            .block_on(transaction.compact(DEFAULT_DATASTORE_NAME, &table, final_sweep))
+            .block_on(async { tokio::time::timeout(COMPACTION_DEADLINE, round).await })
+            .unwrap_or_else(|_| {
+                panic!("compacting `{name}` did not settle within {COMPACTION_DEADLINE:?}")
+            })
             .unwrap_or_else(|error| panic!("compacting `{name}` failed: {error}"))
     }
 
