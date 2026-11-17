@@ -37,7 +37,7 @@ use crate::metadata::layout::TableLocation;
 use crate::metadata::metadata_store::{
     CommitCatalog, MetadataFile, MetadataStore, build_table_ident,
 };
-use crate::table::{Lineage, Table};
+use crate::table::Table;
 use crate::types::schema::{
     LOGICAL_TYPES_PROPERTY, NAME_MAPPING_PROPERTY, build_partition_spec, build_schema,
     build_sort_order, logical_types_property, name_mapping_property,
@@ -134,7 +134,6 @@ impl Table {
             }),
             ManifestList::empty(&metadata),
             None,
-            Lineage::begin(),
         )?;
         let created = if creation.adopted.is_empty() {
             unpublished.commit_transaction(Vec::new(), |transaction| {
@@ -409,7 +408,6 @@ impl Table {
                 )
             }
         };
-        let lineage = self.derive_lineage(metadata);
         Table::from_manifest_list(
             self.dispatcher(),
             Arc::clone(self.metadata_store()),
@@ -418,7 +416,6 @@ impl Table {
             Arc::new(metadata_file),
             manifest_list,
             manifest_list_size,
-            lineage,
         )
     }
 }

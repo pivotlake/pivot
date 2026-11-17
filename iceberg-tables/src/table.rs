@@ -54,10 +54,24 @@
 //! with nothing opened: one the cache let go of is read again. Row groups
 //! are shared between the cache and everything that took them, so nothing
 //! changes one: a selection records its version's deleted rows on copies.
+//!
+//! # Which entries a version finds
+//!
+//! A version carries nothing of the versions before it. It finds its
+//! table's entries in the cache under a key computed from itself: where
+//! the table is, which table it is, and what a file of it is read and
+//! indexed under, its schema, the Pivot types its fields are read as, and
+//! its default partition spec and sort order. Every version that computes
+//! an equal key finds the same entries, whether it was derived from another
+//! by a refresh, a commit or a swap, or loaded on its own; a version under
+//! another schema, partition spec or sort order finds none of them.
+//! Nothing leaves the cache because a table object went away: an entry
+//! stays until the budget lets go of it, or until whoever deletes its file
+//! says so ([`Table::forget_footers`], [`forget_cached_table`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use dispatch::DataFlowDispatcher;
@@ -70,7 +84,7 @@ use parquet_engine::{
 use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 use planner::expression::Expression;
 use planner::types::physical_arrow_type;
-use table_file_index::{FileMetadataCache, LookupUse, TableCacheScope, VersionOrder};
+use table_file_index::{FileMetadataCache, LookupUse, TableKey, VersionOrder};
 use uuid::Uuid;
 
 use crate::files::data_files::DataFileEntry;
@@ -181,9 +195,9 @@ pub struct Table {
     /// The length of the current snapshot's manifest list, when the version
     /// was told it or read the list; `None` for a version with no snapshot.
     manifest_list_size: Option<u64>,
-    /// What this version shares with the versions it was derived from and
-    /// those derived from it.
-    lineage: Arc<Lineage>,
+    /// The key this version's partition indexes and the footers of its
+    /// files are cached under ([`build_cache_key`]).
+    cache_key: TableKey,
     /// For a local view of file swaps this process committed through
     /// another copy of the table: per partition, the files swapped out of
     /// the committed ones and those swapped in, which no manifest of this
@@ -192,35 +206,37 @@ pub struct Table {
     swapped: Option<Arc<SwappedFiles>>,
 }
 
-/// What the versions of a table that read a file alike share: of one
-/// schema, one partition spec and one sort order, each derived from
-/// another by a refresh, a commit or a swap, or built in the lineage a
-/// datastore keeps for the table. The partition indexes one version built
-/// and the footers it read, the others find in the cache; nothing else is
-/// kept between them.
-pub struct Lineage {
-    /// Where the versions' partition indexes and the footers of their
-    /// files are cached.
-    scope: TableCacheScope<PartitionIndex>,
-    /// Held while partitions are indexed, so scans that want one partition
-    /// at once wait for one build of its index rather than each decoding
-    /// its manifests.
-    indexing: Mutex<()>,
+/// The key the version `metadata` describes of the table at `location`
+/// finds its cached partition indexes and footers under: equal for exactly
+/// the versions of one table that read a file alike, however each came to
+/// be. The table is named by its URI. The rest tells which table that is,
+/// by its UUID, and what an entry was built under: the ids of the schema,
+/// which a footer is parsed against, and of the default partition spec and
+/// sort order, which a partition's files are indexed and ordered under,
+/// and the [`LOGICAL_TYPES_PROPERTY`], the Pivot types the schema's fields
+/// are read as. Each id is written whole and the property last, quoted, so
+/// two versions that differ in any of them never write the same key.
+fn build_cache_key(location: &TableLocation, metadata: &TableMetadata) -> TableKey {
+    let logical_types = metadata.properties().get(LOGICAL_TYPES_PROPERTY);
+    TableKey {
+        table: Arc::from(location.table_uri()),
+        reading: Arc::from(format!(
+            "{} {} {} {} {logical_types:?}",
+            metadata.uuid(),
+            metadata.current_schema_id(),
+            metadata.default_partition_spec_id(),
+            metadata.default_sort_order_id(),
+        )),
+    }
 }
 
-impl Lineage {
-    /// A lineage no version belongs to yet, its partition indexes and
-    /// footers kept in the process's cache.
-    pub fn begin() -> Arc<Self> {
-        Arc::new(Self::new(FileMetadataCache::process_wide()))
-    }
-
-    fn new(cache: Arc<FileMetadataCache>) -> Self {
-        Self {
-            scope: TableCacheScope::new(cache),
-            indexing: Mutex::new(()),
-        }
-    }
+/// Let go of everything the process's cache holds of the table at
+/// `location`, whichever schema, partition spec and sort order its
+/// versions read it under: what whoever deletes the table's directory
+/// calls first, since a footer held holds its file open, and a deleted
+/// local file keeps its blocks for as long as it is open.
+pub fn forget_cached_table(location: &TableLocation) {
+    FileMetadataCache::process_wide().remove_tables(&location.table_uri());
 }
 
 /// What a scan over some filters selected of a table version.
@@ -358,16 +374,12 @@ impl Table {
             name,
             metadata_file,
             None,
-            Lineage::begin(),
         )
     }
 
-    /// The table at the version `metadata_file` holds, in `lineage`: one
-    /// just begun, or the one the versions it reads files alike with
-    /// belong to. The manifest list is read over the pool when
-    /// `manifest_list_size` is known, else fetched whole. No manifest is
-    /// read.
-    #[allow(clippy::too_many_arguments)] // the pieces of one version
+    /// The table at the version `metadata_file` holds. The manifest list
+    /// is read over the pool when `manifest_list_size` is known, else
+    /// fetched whole. No manifest is read.
     pub fn at(
         dispatcher: &DataFlowDispatcher,
         metadata_store: Arc<dyn MetadataStore>,
@@ -375,7 +387,6 @@ impl Table {
         name: &SchemaQualifiedTableName,
         metadata_file: MetadataFile,
         manifest_list_size: Option<u64>,
-        lineage: Arc<Lineage>,
     ) -> Result<Table> {
         let metadata = &metadata_file.metadata;
         let (manifest_list, manifest_list_size) = match metadata.current_snapshot() {
@@ -405,14 +416,12 @@ impl Table {
             Arc::new(metadata_file),
             manifest_list,
             manifest_list_size,
-            lineage,
         )
     }
 
-    /// The table at `metadata_file` with its manifest list already in hand, in
-    /// `lineage`: it finds the partition indexes the lineage's versions
-    /// built and the footers they parsed.
-    #[allow(clippy::too_many_arguments)] // the pieces of one version, built in two places
+    /// The table at `metadata_file` with its manifest list already in hand:
+    /// it finds the partition indexes built and the footers parsed by the
+    /// versions of the table that read a file as it does.
     pub(crate) fn from_manifest_list(
         dispatcher: &DataFlowDispatcher,
         metadata_store: Arc<dyn MetadataStore>,
@@ -421,7 +430,6 @@ impl Table {
         metadata_file: Arc<MetadataFile>,
         manifest_list: ManifestList,
         manifest_list_size: Option<u64>,
-        lineage: Arc<Lineage>,
     ) -> Result<Table> {
         let metadata = &metadata_file.metadata;
         if metadata.encryption_keys_iter().len() > 0 {
@@ -448,6 +456,7 @@ impl Table {
                 .map(|field| (field.source_id, &field.transform)),
         );
         let writer_sort_order_id = find_writer_sort_order_id(metadata, columns.columns());
+        let cache_key = build_cache_key(&location, metadata);
         Ok(Table {
             name: name.clone(),
             metadata_store,
@@ -460,22 +469,9 @@ impl Table {
             writer_sort_order_id,
             manifest_list,
             manifest_list_size,
-            lineage,
+            cache_key,
             swapped: None,
         })
-    }
-
-    /// The lineage of a version of this table that `metadata` describes:
-    /// this version's when the two read a file alike, of one schema read
-    /// as the same columns, one partition spec and one sort order, else
-    /// one just begun, since nothing carries over between versions that
-    /// do not.
-    pub fn derive_lineage(&self, metadata: &TableMetadata) -> Arc<Lineage> {
-        if reads_files_alike(metadata, self.metadata()) {
-            Arc::clone(&self.lineage)
-        } else {
-            Arc::new(Lineage::new(Arc::clone(self.lineage.scope.cache())))
-        }
     }
 
     /// The latest committed version, derived from this one, or `None` when
@@ -485,7 +481,6 @@ impl Table {
         if latest.location == self.metadata_file.location {
             return Ok(None);
         }
-        let lineage = self.derive_lineage(&latest.metadata);
         Self::at(
             &self.dispatcher,
             Arc::clone(&self.metadata_store),
@@ -493,7 +488,6 @@ impl Table {
             &self.name,
             latest,
             None,
-            lineage,
         )
         .map(Some)
     }
@@ -563,7 +557,7 @@ impl Table {
             writer_sort_order_id: self.writer_sort_order_id,
             manifest_list: self.manifest_list.clone(),
             manifest_list_size: self.manifest_list_size,
-            lineage: Arc::clone(&self.lineage),
+            cache_key: self.cache_key.clone(),
             swapped: Some(Arc::new(swapped)),
         })
     }
@@ -602,7 +596,7 @@ impl Table {
         let deletion_vectors =
             read_deletion_vectors(delete_manifests, &files, &self.location, &self.dispatcher)?;
         let mut footers = self.open_footers(&files, FooterUse::Kept)?;
-        self.lineage.scope.mark_indexes_used(&partitions);
+        FileMetadataCache::process_wide().mark_indexes_used(&self.cache_key, &partitions);
         for (footer, deleted) in footers.iter_mut().zip(deletion_vectors) {
             if let Some(deleted) = deleted {
                 footer.mark_deleted_rows(deleted);
@@ -829,13 +823,13 @@ impl Table {
         files: &[DataFile],
         footer_use: FooterUse,
     ) -> Result<Vec<FileRowGroups>> {
-        let scope = &self.lineage.scope;
+        let cache = FileMetadataCache::process_wide();
         let paths = files.iter().map(|file| file.file.path.as_str());
         let lookup_use = match footer_use {
             FooterUse::Kept => LookupUse::Counted,
             FooterUse::Unrecorded => LookupUse::Uncounted,
         };
-        let held = scope.find_footers(paths, lookup_use);
+        let held = cache.find_footers(&self.cache_key, paths, lookup_use);
         let unheld: Vec<DataFile> = files
             .iter()
             .zip(&held)
@@ -851,7 +845,7 @@ impl Table {
                     (path, footer.row_groups.clone())
                 })
                 .collect();
-            scope.store_footers(kept);
+            cache.store_footers(&self.cache_key, kept);
         }
         let mut read = read.into_iter();
         Ok(files
@@ -878,9 +872,8 @@ impl Table {
             .iter()
             .map(|path| self.location.uri_for(path))
             .collect::<Result<Vec<String>>>()?;
-        self.lineage
-            .scope
-            .remove_footers(uris.iter().map(String::as_str));
+        FileMetadataCache::process_wide()
+            .remove_footers(&self.cache_key, uris.iter().map(String::as_str));
         Ok(())
     }
 
@@ -1065,9 +1058,11 @@ impl Table {
         partitions: &[KeyedPartition],
         ahead: &mut DecodedFiles,
     ) -> Result<Vec<Arc<PartitionIndex>>> {
-        let _indexing = self.lineage.indexing.lock().unwrap();
+        let cache = FileMetadataCache::process_wide();
+        let _indexing = cache.lock_table(&self.cache_key);
         let listed = self.manifest_list.listed_data_manifests();
-        let held = self.lineage.scope.find_indexes(
+        let held = cache.find_indexes::<PartitionIndex>(
+            &self.cache_key,
             partitions.iter().map(|keyed| keyed.key.as_ref()),
             LookupUse::Counted,
         );
@@ -1148,7 +1143,7 @@ impl Table {
                     }
                 },
             ));
-            self.lineage.scope.store_index(key, &index, built_at);
+            cache.store_index(&self.cache_key, key, &index, built_at);
             indexes[partition.position] = Some(index);
         }
         Ok(partitions
@@ -1466,21 +1461,4 @@ impl Table {
     pub fn manifest_list_size(&self) -> Option<u64> {
         self.manifest_list_size
     }
-
-    /// What this version shares with the versions that read a file as it
-    /// does.
-    pub fn lineage(&self) -> &Arc<Lineage> {
-        &self.lineage
-    }
-}
-
-/// Whether a version of a table described by `metadata` reads a file as
-/// one described by `earlier` does: under one schema, whose fields are
-/// read as the same Pivot types, one partition spec and one sort order.
-pub fn reads_files_alike(metadata: &TableMetadata, earlier: &TableMetadata) -> bool {
-    metadata.current_schema_id() == earlier.current_schema_id()
-        && metadata.properties().get(LOGICAL_TYPES_PROPERTY)
-            == earlier.properties().get(LOGICAL_TYPES_PROPERTY)
-        && metadata.default_partition_spec_id() == earlier.default_partition_spec_id()
-        && metadata.default_sort_order_id() == earlier.default_sort_order_id()
 }

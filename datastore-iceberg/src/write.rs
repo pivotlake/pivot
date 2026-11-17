@@ -192,7 +192,6 @@ impl PendingInsert {
                 table: self.table.name().to_string(),
             });
         }
-        let lineage = held.derive_lineage(&current.metadata);
         let table = LoadedTable::at(
             held.dispatcher(),
             Arc::clone(held.metadata_store()),
@@ -200,7 +199,6 @@ impl PendingInsert {
             held.name(),
             current,
             None,
-            lineage,
         )?;
         Ok(Arc::new(table))
     }

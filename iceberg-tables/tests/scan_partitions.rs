@@ -311,6 +311,60 @@ fn the_first_scan_of_a_partition_after_a_commit_reads_the_manifest_the_commit_wr
 }
 
 #[test]
+fn a_table_loaded_on_its_own_scans_a_partition_another_copy_indexed_with_no_manifest_or_footer_read()
+ {
+    let (fixture, created) = create_partitioned_table();
+    append(&created, vec![fixture.write_file("seven", 7)]);
+    load(&fixture).select_scan(&v_equals(7)).unwrap();
+    let loaded_again = load(&fixture);
+    fixture.delete_data_manifests(&loaded_again);
+    fixture.replace_with_garbage("seven");
+
+    let selection = loaded_again.select_scan(&v_equals(7)).unwrap();
+
+    assert_eq!(selection.row_groups.row_groups().len(), 1);
+}
+
+#[test]
+fn an_earlier_version_scans_its_own_files_whatever_a_later_one_indexed() {
+    let (fixture, created) = create_partitioned_table();
+    let earlier = append(&created, vec![fixture.write_file("early", 7)]);
+    append(&earlier, vec![fixture.write_file("late", 7)]);
+    selected(&load(&fixture), &v_equals(7));
+
+    let files = selected(&earlier, &v_equals(7));
+
+    assert_eq!(files, ["early.parquet"]);
+}
+
+#[test]
+fn another_copy_of_a_table_scans_the_committed_files_whatever_a_local_view_swapped_in() {
+    let (fixture, created) = create_partitioned_table();
+    let written = append(&created, vec![fixture.write_file("committed", 7)]);
+    let swapped_in = vec![fixture.write_file("swapped-in", 7)];
+    let view = written.with_files_swapped(&[], &[], swapped_in).unwrap();
+    let files_of_the_view = selected(&view, &v_equals(7));
+
+    let files = selected(&load(&fixture), &v_equals(7));
+
+    assert_eq!(files_of_the_view.len(), 2);
+    assert_eq!(files, ["committed.parquet"]);
+}
+
+#[test]
+fn a_version_under_another_partition_spec_indexes_a_partition_from_its_manifests_again() {
+    let (fixture, created) = create_partitioned_table();
+    let written = append(&created, vec![fixture.write_file("seven", 7)]);
+    written.select_scan(&[]).unwrap();
+    let repartitioned = repartition(&fixture, &[("v", "v_bucket", Transform::Bucket(4))]);
+    fixture.delete_data_manifests(&repartitioned);
+
+    let scan = repartitioned.select_scan(&[]);
+
+    assert!(scan.is_err());
+}
+
+#[test]
 fn a_partitions_key_names_the_partition_and_its_files_again() {
     let (_fixture, created) = create_partitioned_table();
     let written = append(&created, vec![partition_entry("seven", 7, 0)]);

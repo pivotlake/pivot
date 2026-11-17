@@ -796,10 +796,16 @@ impl PivotlakeDatastore {
             }
             return Err(Error::TableNotFound(name.to_string()));
         };
-        let retention = index
+        let dropped = index
             .get_table_by_id(&id)
-            .expect("the name index resolved the id, so the table is held")
-            .deleted_file_retention()?;
+            .expect("the name index resolved the id, so the table is held");
+        let retention = dropped.deleted_file_retention()?;
+        // The table's files are deleted once its tombstone ages out, and a
+        // footer the cache holds keeps its file open. What a query that
+        // bound the table before the drop caches from here on is let go of
+        // when the storage is reclaimed.
+        self.table_factory
+            .forget_cached_table(&ObjectPath::new(dropped.location()))?;
         let dropped_at_ms = crate::vacuum::now_unix_ms();
         CatalogManifest::update(self.store.as_ref(), |manifest| {
             manifest.remove_table(&name, dropped_at_ms, retention.as_millis() as u64)
@@ -827,6 +833,10 @@ impl PivotlakeDatastore {
                 location = %entry.location,
                 "vacuum: deleting dropped table's storage"
             );
+            // A footer the cache holds keeps its file open, and a deleted
+            // file that is open keeps its blocks: a query that bound the
+            // table before its drop may have cached one since.
+            self.table_factory.forget_cached_table(&entry.location)?;
             self.delete_table_storage(&entry.location)?;
             tracing::info!(
                 table_id = %entry.id,

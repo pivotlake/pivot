@@ -72,6 +72,7 @@ mod version_summary;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,7 +85,7 @@ use parquet_engine::{ParquetTable, PushedPredicate, RowGroupMetadata, ScanSelect
 use planner::catalog::{Column, SchemaQualifiedTableName};
 use planner::expression::{CompareType, Expression};
 use table_file_index::{
-    FileMetadataCache, IndexedRecord, LookupUse, PartitionFiles, TableCacheScope, VersionOrder,
+    FileMetadataCache, IndexedRecord, LookupUse, PartitionFiles, TableKey, VersionOrder,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -230,6 +231,12 @@ impl TableFactory for DeltaTableFactory {
             &HashMap::new(),
         )?))
     }
+
+    /// Nothing is let go of here: what the copies of a table cached leaves
+    /// the cache with the last of them.
+    fn forget_cached_table(&self, _directory: &ObjectPath) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// What the versions of a table that read a file alike share: of one schema,
@@ -237,8 +244,9 @@ impl TableFactory for DeltaTableFactory {
 /// a refresh, a commit or a swap.
 struct Lineage {
     /// Where the versions' partition indexes and the footers of their files
-    /// are cached.
-    scope: TableCacheScope<DeltaIndex>,
+    /// are cached, under a key that is this lineage's alone.
+    cache: Arc<FileMetadataCache>,
+    cache_key: TableKey,
     /// Builds the record of a file of the table.
     records: Mutex<RecordBuilder>,
     /// What the commits made here changed.
@@ -256,9 +264,17 @@ impl Lineage {
     /// A lineage no version belongs to yet, of tables of `shape`, its
     /// partition indexes and footers kept in the process's cache.
     fn begin(shape: &TableShape) -> Result<Arc<Self>> {
+        /// Numbers the lineages of the process.
+        static NEXT_LINEAGE: AtomicU64 = AtomicU64::new(0);
+
         let records = RecordBuilder::new(&shape.columns, &shape.partition_by, &shape.sort_by)?;
+        let lineage_number = NEXT_LINEAGE.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(Self {
-            scope: TableCacheScope::new(FileMetadataCache::process_wide()),
+            cache: FileMetadataCache::process_wide(),
+            cache_key: TableKey {
+                table: Arc::from(format!("delta lineage {lineage_number}")),
+                reading: Arc::from(""),
+            },
             records: Mutex::new(records),
             commits: Mutex::default(),
             newest: Mutex::default(),
@@ -309,6 +325,14 @@ impl Lineage {
                 ))
             })
             .collect()
+    }
+}
+
+/// What the lineage's versions cached is no other table's to find, so it
+/// leaves the cache with the lineage.
+impl Drop for Lineage {
+    fn drop(&mut self) {
+        self.cache.remove_tables(&self.cache_key.table);
     }
 }
 
@@ -463,9 +487,12 @@ impl DeltaTable {
     /// Hold `index` in the cache as this version's index of `partition`.
     fn store_index(&self, partition: &Arc<[u8]>, index: DeltaIndex) -> Arc<DeltaIndex> {
         let index = Arc::new(index);
-        self.lineage
-            .scope
-            .store_index(partition, &index, self.version_order());
+        self.lineage.cache.store_index(
+            &self.lineage.cache_key,
+            partition,
+            &index,
+            self.version_order(),
+        );
         index
     }
 
@@ -481,7 +508,9 @@ impl DeltaTable {
                 (path, file.row_groups.clone())
             })
             .collect();
-        self.lineage.scope.store_footers(footers);
+        self.lineage
+            .cache
+            .store_footers(&self.lineage.cache_key, footers);
     }
 
     /// The shared key of `partition`, when this version or a local swap
@@ -667,10 +696,11 @@ impl DeltaTable {
         replayed: &mut FilesByPartition,
     ) -> Result<Vec<Arc<DeltaIndex>>> {
         let _indexing = self.lineage.indexing.lock().unwrap();
-        let scope = &self.lineage.scope;
+        let (cache, table) = (&self.lineage.cache, &self.lineage.cache_key);
         let mut indexes: Vec<Option<Arc<DeltaIndex>>> = Vec::with_capacity(partitions.len());
         let mut stale: HashMap<Arc<[u8]>, Arc<DeltaIndex>> = HashMap::new();
-        let held = scope.find_indexes(
+        let held = cache.find_indexes::<DeltaIndex>(
+            table,
             partitions.iter().map(|partition| &**partition),
             LookupUse::Uncounted,
         );
@@ -708,7 +738,8 @@ impl DeltaTable {
                 .iter()
                 .filter(|partition| self.summary.partitions.contains_key(*partition))
                 .collect();
-            let held_ahead = scope.find_indexes(
+            let held_ahead = cache.find_indexes::<DeltaIndex>(
+                table,
                 ahead.iter().map(|partition| &***partition),
                 LookupUse::Uncounted,
             );
@@ -789,7 +820,9 @@ impl DeltaTable {
             visited += chunk.len();
             let indexes = self.load_indexes(chunk, &partitions[visited..], &mut replayed)?;
             if index_use == IndexUse::Counted {
-                self.lineage.scope.mark_indexes_used(chunk);
+                self.lineage
+                    .cache
+                    .mark_indexes_used(&self.lineage.cache_key, chunk);
             }
             for (partition, index) in chunk.iter().zip(&indexes) {
                 if visit(partition, index)?.is_break() {
@@ -849,7 +882,9 @@ impl DeltaTable {
         };
         let partitions = [key];
         let mut indexes = self.load_indexes(&partitions, &[], &mut FilesByPartition::new())?;
-        self.lineage.scope.mark_indexes_used(&partitions);
+        self.lineage
+            .cache
+            .mark_indexes_used(&self.lineage.cache_key, &partitions);
         Ok(indexes.pop())
     }
 
@@ -862,7 +897,9 @@ impl DeltaTable {
         let partitions = std::slice::from_ref(key);
         let mut indexes =
             self.load_committed_indexes(partitions, &[], &mut FilesByPartition::new())?;
-        self.lineage.scope.mark_indexes_used(partitions);
+        self.lineage
+            .cache
+            .mark_indexes_used(&self.lineage.cache_key, partitions);
         Ok(indexes.pop())
     }
 
@@ -933,13 +970,13 @@ impl DeltaTable {
         files: &[&FileRef],
         footer_use: FooterUse,
     ) -> Result<Vec<Vec<Arc<RowGroupMetadata>>>> {
-        let scope = &self.lineage.scope;
+        let (cache, table) = (&self.lineage.cache, &self.lineage.cache_key);
         let paths = files.iter().map(|file| file.path.as_str());
         let lookup_use = match footer_use {
             FooterUse::Kept => LookupUse::Counted,
             FooterUse::Unrecorded => LookupUse::Uncounted,
         };
-        let held = scope.find_footers(paths, lookup_use);
+        let held = cache.find_footers(table, paths, lookup_use);
         let store = self.factory.store.as_ref();
         let unheld: Vec<DataFile> = files
             .iter()
@@ -962,7 +999,7 @@ impl DeltaTable {
                 .zip(&read)
                 .map(|(path, footer)| (Arc::from(path.as_str()), footer.row_groups.clone()))
                 .collect();
-            scope.store_footers(kept);
+            cache.store_footers(table, kept);
         }
         let mut read = read.into_iter();
         Ok(held
@@ -1143,7 +1180,9 @@ impl DeltaTable {
         let selected = self.select_scan_files(filters)?;
         let files: Vec<&FileRef> = selected.files.iter().map(|file| &file.entry.file).collect();
         let footers = self.open_footers(&files, FooterUse::Kept)?;
-        self.lineage.scope.mark_indexes_used(&selected.partitions);
+        self.lineage
+            .cache
+            .mark_indexes_used(&self.lineage.cache_key, &selected.partitions);
         Ok(footers.into_iter().flatten().collect())
     }
 }
@@ -1368,9 +1407,10 @@ impl Table for DeltaTable {
             swapped: None,
         };
         let indexing = advanced.lineage.indexing.lock().unwrap();
-        let scope = &advanced.lineage.scope;
-        let indexed: Vec<Arc<[u8]>> = scope.list_indexed_partitions();
-        let held = scope.find_indexes(
+        let (cache, table) = (&advanced.lineage.cache, &advanced.lineage.cache_key);
+        let indexed: Vec<Arc<[u8]>> = cache.list_indexed_partitions(table);
+        let held = cache.find_indexes::<DeltaIndex>(
+            table,
             indexed.iter().map(|partition| &**partition),
             LookupUse::Counted,
         );
@@ -1552,8 +1592,8 @@ impl Table for DeltaTable {
                 continue;
             }
             self.lineage
-                .scope
-                .remove_footers(std::iter::once(path.as_str()));
+                .cache
+                .remove_footers(&self.lineage.cache_key, std::iter::once(path.as_str()));
             if let Err(error) = storage.delete_data_file(&path) {
                 warn!(table = %name, file = %path, error = %error, "vacuum: deleting file failed");
                 first_error.get_or_insert(error);
@@ -1604,8 +1644,9 @@ impl DeltaTable {
             .lock()
             .unwrap()
             .record(version, changes.into_values().collect());
-        let scope = &self.lineage.scope;
-        let held = scope.find_indexes(
+        let (cache, table) = (&self.lineage.cache, &self.lineage.cache_key);
+        let held = cache.find_indexes::<DeltaIndex>(
+            table,
             partitions.iter().map(|partition| &**partition),
             LookupUse::Counted,
         );

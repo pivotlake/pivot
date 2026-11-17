@@ -125,6 +125,12 @@ pub(crate) trait TableFactory: Send + Sync {
         directory: &ObjectPath,
         name: &SchemaQualifiedTableName,
     ) -> Result<Arc<dyn Table>>;
+
+    /// Let go of what this process caches of the dropped table at
+    /// `directory`, whose storage is deleted whole once its tombstone ages
+    /// out: a cached footer holds its file open, and a deleted local file
+    /// keeps its blocks for as long as it is open.
+    fn forget_cached_table(&self, directory: &ObjectPath) -> Result<()>;
 }
 
 /// One table at one committed version, as its format holds it. Immutable: a

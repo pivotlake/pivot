@@ -18,7 +18,7 @@ use iceberg_tables::commit::{SnapshotExpiry, TableCreation};
 use iceberg_tables::files::data_files::DataFileEntry;
 use iceberg_tables::maintenance::retention::SNAPSHOT_RETENTION_PROPERTY;
 use iceberg_tables::test_support::{Faults, FaultyStore, MemoryMetadataStore};
-use iceberg_tables::{Error, IndexedFile, Lineage, MetadataFile, Table, TableLocation};
+use iceberg_tables::{Error, IndexedFile, MetadataFile, Table, TableLocation};
 use object_storage::{DataFileLocation, FileRef, LocalStore, ObjectPath, ObjectStore};
 use parquet::arrow::ArrowWriter;
 use parquet_engine::{FileStats, PartitionValues};
@@ -128,8 +128,27 @@ impl Fixture {
                 metadata: Arc::new(metadata),
             },
             None,
-            Lineage::begin(),
         )
+    }
+
+    /// A table partitioned by `v`, created in this directory under a UUID
+    /// and a metadata store of its own: what a table created after a drop
+    /// of the one the directory held is.
+    pub fn create_table_again(&self) -> Table {
+        Table::create(
+            &test_pool(),
+            MemoryMetadataStore::new(self.location.clone()),
+            self.location.clone(),
+            &table_name(),
+            TableCreation {
+                table_uuid: Uuid::new_v4(),
+                columns: &columns(),
+                partition_by: &["v".to_string()],
+                sort_by: &[],
+                adopted: Vec::new(),
+            },
+        )
+        .unwrap()
     }
 
     /// Delete the data manifests of `table` from the store.

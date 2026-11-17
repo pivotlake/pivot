@@ -127,6 +127,20 @@ impl TableFactory for IcebergTableFactory {
         )?;
         Ok(Arc::new(IcebergTable::new(name.clone(), table)))
     }
+
+    /// The partition indexes and the footers the cache of the tables' file
+    /// metadata holds for the table leave it, whichever of the table's
+    /// versions stored them: nothing else lets go of them before the
+    /// cache's budget does.
+    fn forget_cached_table(&self, directory: &ObjectPath) -> crate::Result<()> {
+        let location = TableLocation::in_datastore_store(
+            directory.as_str(),
+            self.store.clone(),
+            directory.clone(),
+        )?;
+        iceberg_tables::forget_cached_table(&location);
+        Ok(())
+    }
 }
 
 /// The entry a new table adopts `file` under: its statistics (from the entry,

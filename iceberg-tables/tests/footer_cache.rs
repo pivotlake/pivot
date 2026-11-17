@@ -6,8 +6,12 @@ mod support;
 
 use std::sync::Arc;
 
+use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadata, Type};
+use iceberg_tables::{Table, forget_cached_table};
 use parquet_engine::ScanSelection;
-use support::{append, create_partitioned_table, describe, load, v_equals};
+use support::{
+    Fixture, append, create_partitioned_table, describe, load, publish_changed, v_equals,
+};
 
 /// The rows of each row group `selection` scans, in scan order.
 fn row_group_rows(selection: &ScanSelection) -> Vec<i64> {
@@ -60,6 +64,70 @@ fn footers_loaded_for_named_files_are_kept_for_the_next_plan() {
     assert_eq!(row_group_rows(&selection), [10]);
 }
 
+/// The table of `fixture` once another tool has added the column `added`
+/// to the schema of `table`, its current version.
+fn add_a_column(fixture: &Fixture, table: &Table) -> Table {
+    let schema = table.metadata().current_schema();
+    let added = NestedField::optional(
+        schema.highest_field_id() + 1,
+        "added",
+        Type::Primitive(PrimitiveType::Long),
+    );
+    let fields = schema.as_struct().fields().iter().cloned();
+    let widened = Schema::builder()
+        .with_fields(fields.chain([Arc::new(added)]))
+        .build()
+        .unwrap();
+    publish_changed(fixture, |builder| {
+        builder.add_current_schema(widened).unwrap()
+    })
+}
+
+#[test]
+fn a_version_under_another_schema_reads_a_files_footer_again() {
+    let (fixture, created) = create_partitioned_table();
+    let written = append(&created, vec![fixture.write_file("seven", 7)]);
+    written.select_scan(&[]).unwrap();
+    let altered = add_a_column(&fixture, &written);
+    fixture.replace_with_garbage("seven");
+
+    let read_without_its_footer = altered.select_scan(&[]);
+
+    assert!(read_without_its_footer.is_err());
+}
+
+#[test]
+fn a_table_created_again_in_the_directory_of_another_shares_nothing_the_other_cached() {
+    let (fixture, created) = create_partitioned_table();
+    let dropped = append(&created, vec![fixture.write_file("seven", 7)]);
+    let cached = dropped.select_scan(&[]).unwrap();
+    let created_again = fixture.create_table_again();
+    let rewritten = append(&created_again, vec![fixture.write_file("seven", 7)]);
+
+    let read_again = rewritten.select_scan(&[]).unwrap();
+
+    assert!(!Arc::ptr_eq(
+        &cached.row_groups.row_groups()[0],
+        &read_again.row_groups.row_groups()[0]
+    ));
+}
+
+#[test]
+fn a_tables_metadata_copied_to_another_directory_shares_nothing_the_table_cached() {
+    let (fixture, created) = create_partitioned_table();
+    let written = append(&created, vec![fixture.write_file("seven", 7)]);
+    let cached = written.select_scan(&[]).unwrap();
+    let elsewhere = Fixture::new();
+    let copied = elsewhere.build_table_at(TableMetadata::clone(written.metadata()));
+
+    let read_by_the_copy = copied.select_scan(&[]).unwrap();
+
+    assert!(!Arc::ptr_eq(
+        &cached.row_groups.row_groups()[0],
+        &read_by_the_copy.row_groups.row_groups()[0]
+    ));
+}
+
 #[test]
 fn a_second_plan_shares_the_row_groups_of_the_first() {
     let (fixture, created) = create_partitioned_table();
@@ -89,6 +157,21 @@ fn a_forgotten_footer_is_read_again_and_its_file_no_longer_held_open() {
 
     assert!(held_open.upgrade().is_none());
     assert!(read_without_its_footer.is_err());
+}
+
+#[test]
+fn a_table_the_cache_forgot_has_no_file_held_open_and_is_indexed_from_its_manifests_again() {
+    let (fixture, created) = create_partitioned_table();
+    append(&created, vec![fixture.write_file("seven", 7)]);
+    let opened = load(&fixture);
+    let held_open = Arc::downgrade(&opened.select_scan(&[]).unwrap().row_groups.row_groups()[0]);
+
+    forget_cached_table(&fixture.location);
+    fixture.delete_data_manifests(&opened);
+    let scan_without_its_manifests = opened.select_scan(&[]);
+
+    assert!(held_open.upgrade().is_none());
+    assert!(scan_without_its_manifests.is_err());
 }
 
 #[test]

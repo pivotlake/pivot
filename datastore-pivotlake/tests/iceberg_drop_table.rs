@@ -1,13 +1,15 @@
 //! `DROP TABLE` on a managed table: the catalog forgets the table at commit,
+//! the cache of the tables' file metadata lets go of what it holds of it,
 //! its storage stays until vacuum reclaims it after the retention window, and
 //! a recreated name is a new table.
 
 mod iceberg_support;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use datastore_pivotlake::{DEFAULT_VACUUM_POLL, Vacuumer};
+use datastore_pivotlake::{CatalogTable, DEFAULT_VACUUM_POLL, Vacuumer};
 use iceberg_support::{Database, FIVE_HOURS_MS, now_ms, write_int_parquet};
+use parquet_engine::RowGroupMetadata;
 use planner::catalog::SchemaQualifiedTableName;
 
 fn vacuum(db: &Database, now_ms: u64) {
@@ -73,6 +75,51 @@ fn vacuum_reclaims_a_dropped_tables_storage_only_after_retention() {
         "past the window the storage is deleted"
     );
     assert!(adopted_dir.join("live.parquet").exists());
+}
+
+/// A database whose table `t` holds one file, and a copy of that table as a
+/// query that bound it holds one.
+fn database_with_a_bound_table() -> (Database, CatalogTable) {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (value BIGINT)");
+    db.execute("INSERT INTO t VALUES (1)");
+    let bound = db
+        .datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    (db, bound)
+}
+
+/// Scan `table`, which holds one file, so the cache of the tables' file
+/// metadata holds the file's footer, and with it the file open; the footer
+/// handed back is gone once the cache has let go of it.
+fn cache_footer(table: &CatalogTable) -> Weak<RowGroupMetadata> {
+    Arc::downgrade(&table.select_scan(&[]).unwrap().row_groups()[0])
+}
+
+#[test]
+fn dropping_a_table_lets_go_of_the_footers_cached_of_its_files() {
+    let (mut db, bound) = database_with_a_bound_table();
+    let cached_footer = cache_footer(&bound);
+    let is_cached_before_the_drop = cached_footer.upgrade().is_some();
+
+    db.execute("DROP TABLE t");
+
+    assert!(is_cached_before_the_drop);
+    assert!(cached_footer.upgrade().is_none());
+}
+
+#[test]
+fn reclaiming_a_dropped_tables_storage_lets_go_of_a_footer_cached_since_the_drop() {
+    let (mut db, bound_before_the_drop) = database_with_a_bound_table();
+    db.execute("DROP TABLE t");
+    let cached_footer = cache_footer(&bound_before_the_drop);
+    let is_cached_before_the_reclaim = cached_footer.upgrade().is_some();
+
+    vacuum(&db, now_ms() + FIVE_HOURS_MS);
+
+    assert!(is_cached_before_the_reclaim);
+    assert!(cached_footer.upgrade().is_none());
 }
 
 #[test]

@@ -2339,6 +2339,37 @@ fn concurrent_clones_share_one_metadata_load() {
 }
 
 #[test]
+fn tables_bound_by_separate_queries_read_a_manifest_once_between_them() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("separate_queries", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2], &["ann", "bob"], &[1.0, 2.0]),
+    );
+    let reads = ReadLog::default();
+    let (catalog, _) = harness.pivot_with(HashMap::new(), Arc::new(reads.clone()));
+    let bindings: Vec<_> = (0..8)
+        .map(|_| bind_orders(&catalog, "separate_queries"))
+        .collect();
+    let barrier = std::sync::Barrier::new(bindings.len());
+    reads.take();
+
+    std::thread::scope(|scope| {
+        for binding in &bindings {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                binding.column_min_max(0).unwrap();
+            });
+        }
+    });
+    let paths = reads.take();
+
+    assert_eq!(list_manifests_among(&paths).len(), 1, "{paths:?}");
+}
+
+#[test]
 fn failed_metadata_loads_can_be_retried() {
     let Some(harness) = harness() else { return };
     let namespace = harness.namespace("retry_metadata", "orders", orders_schema());

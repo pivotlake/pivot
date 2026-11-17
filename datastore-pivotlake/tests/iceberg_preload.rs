@@ -87,16 +87,10 @@ fn the_first_query_on_a_database_of_one_file_more_reads_its_manifests_and_footer
     let mut db = Database::new();
     create_table_of_files(&mut db, "t", MOST_PRELOADED_FILES + 1);
     let mut reopened = Database::reopen(db.close());
-
-    let read_at_the_first_query = query_extremes(&mut reopened, "t");
-    let mut reopened = Database::reopen(reopened.close());
     destroy_manifests_and_footers(&reopened, "t");
+
     let unread_at_open = query_extremes(&mut reopened, "t");
 
-    assert_eq!(
-        read_at_the_first_query,
-        Ok((0, MOST_PRELOADED_FILES as i64))
-    );
     assert!(unread_at_open.is_err());
 }
 

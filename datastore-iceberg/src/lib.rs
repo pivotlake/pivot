@@ -51,25 +51,25 @@
 //! A query that names a table builds it from the table's entry: its
 //! manifest list is read over the ring and parsed, and no manifest. The
 //! table is the query's own and goes with it; what the query learns of the
-//! table stays on the entry, in its lineage, which every query over the
-//! entry builds its table in. A scan indexes the partitions its filters
-//! keep, one record per live file, from the data manifests that hold a
-//! file of them, and selects its files from those; the indexes are held in
-//! the process's file metadata cache, and what decoding a manifest told of
-//! the partitions it holds is kept in the lineage, so a manifest one query
-//! decoded is decoded by none after it. A query's binding takes the row
-//! groups of the files it selects and keeps them for as long as its plan
-//! is kept. A file's footer is read and parsed for the first binding that
-//! selects the file, through the entry's store, and the row groups it
-//! produced are then held, with that open of the file, in the same cache,
-//! where the bindings after it and the table's later versions take them as
-//! they are. A refresh enters the table anew and hands the new entry the
-//! lineage of the previous one, so a partition's index is brought to the
-//! new version by the manifests that joined the manifest list since, and
-//! by none when the snapshot is the same. A table created again under the
-//! name, or one whose schema, partition spec or sort order changed, begins
-//! a lineage of its own. A commit enters the version it produced, in the
-//! lineage of the table it was built on.
+//! table stays in the process's file metadata cache, which a table
+//! addresses under a key computed from itself, so every table built for
+//! the same table, read the same way, finds it, whichever entry it was
+//! built from. A scan indexes the partitions its filters keep, one record
+//! per live file, from the data manifests that hold a file of them, and
+//! selects its files from those; the indexes are held in that cache, so
+//! the manifests one query decoded for a partition are decoded by none
+//! after it. A query's binding takes the row groups of the files it selects
+//! and keeps them for as long as its plan is kept. A file's footer is read
+//! and parsed for the first binding that selects the file, through the
+//! entry's store, and the row groups it produced are then held, with that
+//! open of the file, in the same cache, where the bindings after it and
+//! the table's later versions take them as they are. A refresh enters the
+//! table anew, and a query over the new entry finds what the queries
+//! before it cached, so a partition's index is brought to the new version
+//! by the manifests that joined the manifest list since, and by none when
+//! the snapshot is the same. A table created again under the name, or one
+//! whose schema, partition spec or sort order changed, finds nothing of
+//! what was cached before it. A commit enters the version it produced.
 //!
 //! Every bind of one query resolves against the same index, so a refresh landing
 //! mid-query does not move a table under it.
@@ -145,7 +145,6 @@ use async_trait::async_trait;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use catalog::{CommitAction, CommitQueue, StagedCommit};
 use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
-use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use iceberg::{Catalog, ErrorKind};
 use iceberg_catalog_rest::RestCatalog;
@@ -163,8 +162,7 @@ use crate::storage::PivotStorageFactory;
 
 use iceberg_tables::block_on;
 use iceberg_tables::{
-    IndexedFile, Lineage, MetadataFile, MetadataStore, Table as LoadedTable, TableLocation,
-    reads_files_alike,
+    IndexedFile, MetadataFile, MetadataStore, Table as LoadedTable, TableLocation,
 };
 
 use crate::table_store::{fetch_manifest_list_size, open_table_store};
@@ -309,8 +307,7 @@ struct SchemaEntry {
 /// the catalog last answered or as a commit of this process left it, with
 /// what building the table needs that the answer does not say: the store
 /// its files are read through, opened with the credentials the catalog
-/// vended, the size of the current snapshot's manifest list, and what the
-/// queries over the table learned of it.
+/// vended, and the size of the current snapshot's manifest list.
 #[derive(Clone)]
 struct TableEntry {
     metadata_file: MetadataFile,
@@ -322,11 +319,6 @@ struct TableEntry {
     /// rather than asked again by every query. Ugly, but off the query path.
     /// `None` for a table with no current snapshot.
     manifest_list_size: Option<u64>,
-    /// What every query over this entry builds its table in, so each finds
-    /// the manifests the others decoded and the partitions they indexed.
-    /// The entries of one table share it for as long as they read a file
-    /// alike.
-    lineage: Arc<Lineage>,
 }
 
 /// Two entries hold different tables under the same name, one dropped and
@@ -336,27 +328,13 @@ struct DifferentTable;
 
 impl TableEntry {
     /// The entry of `table`, the version a commit of this process just
-    /// produced: in the table's lineage, read through its store, with the
-    /// size of its manifest list as the load of that version read it.
+    /// produced: read through its store, with the size of its manifest
+    /// list as the load of that version read it.
     fn of_version(table: &LoadedTable) -> Self {
         Self {
             metadata_file: table.metadata_file().as_ref().clone(),
             store: Arc::clone(table.location().store()),
             manifest_list_size: table.manifest_list_size(),
-            lineage: Arc::clone(table.lineage()),
-        }
-    }
-
-    /// The lineage the entry of a version of this entry's name that
-    /// `metadata` describes takes: this entry's when that is the same
-    /// table and reads a file as this version does, else one just begun.
-    fn derive_lineage(&self, metadata: &TableMetadata) -> Arc<Lineage> {
-        let is_shared = metadata.uuid() == self.metadata_file.metadata.uuid()
-            && reads_files_alike(metadata, &self.metadata_file.metadata);
-        if is_shared {
-            Arc::clone(&self.lineage)
-        } else {
-            Lineage::begin()
         }
     }
 
@@ -530,8 +508,7 @@ impl IcebergDatastore {
     /// `table`'s entry: with its store, opened now from the credentials the
     /// catalog just vended, its manifest list's size, the one `previous`
     /// learned when the snapshot is the one it entered, else asked of the
-    /// store now, and the lineage of `previous` when that entered the same
-    /// table reading files alike. Nothing of the table is read.
+    /// store now. Nothing of the table is read.
     fn build_table_entry(
         &self,
         name: &SchemaQualifiedTableName,
@@ -556,15 +533,10 @@ impl IcebergDatastore {
             Some(size) => Some(size),
             None => fetch_manifest_list_size(name, &metadata_file, &*store)?,
         };
-        let lineage = match previous.and_then(|previous| previous.as_ref().ok()) {
-            Some(previous) => previous.derive_lineage(&metadata_file.metadata),
-            None => Lineage::begin(),
-        };
         Ok(TableEntry {
             metadata_file,
             store,
             manifest_list_size,
-            lineage,
         })
     }
 
@@ -575,12 +547,12 @@ impl IcebergDatastore {
     }
 
     /// The table `name` as `index` has it, its schema being the namespace,
-    /// built for the caller in its entry's lineage; or `None` when the
-    /// catalog listed no such table. Every query over the entry, and over
-    /// the entries sharing its lineage, finds the manifests the others
-    /// decoded and the partitions they indexed: an index is brought to this
-    /// version by the manifests that joined and left the manifest list, and
-    /// only those are read.
+    /// built for the caller; or `None` when the catalog listed no such
+    /// table. Every table built for it, from this entry or from another of
+    /// the table read the same way, finds in the process's cache the
+    /// partitions the others indexed: an index is brought to this version
+    /// by the manifests that joined and left the manifest list, and only
+    /// those are read.
     fn load_table(
         &self,
         index: &DatastoreIndex,
@@ -593,18 +565,17 @@ impl IcebergDatastore {
             table: name.to_string(),
             message: message.clone(),
         })?;
-        let table = self.load_entry(name, entry, Arc::clone(&entry.lineage))?;
+        let table = self.load_entry(name, entry)?;
         Ok(Some(Arc::new(table)))
     }
 
-    /// The table `name` at the version `entry` holds, in `lineage`: its
-    /// manifest list is read, over the ring when its size is known, and
-    /// parsed under the entry's metadata.
+    /// The table `name` at the version `entry` holds: its manifest list is
+    /// read, over the ring when its size is known, and parsed under the
+    /// entry's metadata.
     fn load_entry(
         &self,
         name: &SchemaQualifiedTableName,
         entry: &TableEntry,
-        lineage: Arc<Lineage>,
     ) -> Result<LoadedTable> {
         let location = TableLocation::of_catalog_table(
             &name.to_string(),
@@ -618,17 +589,13 @@ impl IcebergDatastore {
             name,
             entry.metadata_file.clone(),
             entry.manifest_list_size,
-            lineage,
         )?;
         Ok(loaded)
     }
 
-    /// Every table `index` has that the catalog handed over, each built in
-    /// a lineage of its own that no entry keeps: a description of every
-    /// table reads every footer and caches none, and the tables let go of
-    /// what they indexed with the query. A
-    /// table the catalog lists but would not hand over (Unity Catalog lists
-    /// its `information_schema` views, which are not Iceberg tables) is not
+    /// Every table `index` has that the catalog handed over. A table the
+    /// catalog lists but would not hand over (Unity Catalog lists its
+    /// `information_schema` views, which are not Iceberg tables) is not
     /// served, so it is not listed; a query naming it reports why.
     fn load_all_tables(&self, index: &DatastoreIndex) -> Result<Vec<LoadedTable>> {
         let mut tables = Vec::new();
@@ -638,7 +605,7 @@ impl IcebergDatastore {
                     continue;
                 };
                 let name = SchemaQualifiedTableName::new(schema.clone(), table.clone());
-                tables.push(self.load_entry(&name, entry, Lineage::begin())?);
+                tables.push(self.load_entry(&name, entry)?);
             }
         }
         Ok(tables)

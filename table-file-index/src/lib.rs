@@ -15,8 +15,8 @@
 //! - [`file_metadata_cache`]: the one cache, within one budget of memory,
 //!   that holds the partition indexes and the footers of every table of the
 //!   process.
-//! - [`weighted_lru`]: the map within a budget of bytes that the cache
-//!   keeps its entries in, whatever they are.
+//! - [`weighted_lru`]: the map of groups within a budget of bytes that the
+//!   cache keeps its tables' entries in, whatever they are.
 
 pub mod file_index;
 pub mod file_metadata_cache;
@@ -25,7 +25,7 @@ pub mod weighted_lru;
 
 pub use file_index::{FileFacts, FileIndex, IndexedRecord, PartitionFiles, VisitFacts};
 pub use file_metadata_cache::{
-    CacheableIndex, FileMetadataCache, LookupUse, TableCacheScope, VersionOrder,
+    CacheableIndex, FileMetadataCache, LookupUse, TableKey, TableLock, VersionOrder,
     measure_footer_entry, measure_index_entry,
 };
 pub use sort_key::{SortKeyEncoder, SortRange};
