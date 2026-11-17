@@ -112,6 +112,8 @@ pub enum Error {
     UnsupportedExpressionForContainsNeedle(Expression),
     #[error("Unsupported haystack expression for contains: {0:?}")]
     UnsupportedExpressionForContainsHaystack(Expression),
+    #[error("has_token searches a text column, not: {0:?}")]
+    UnsupportedExpressionForHasTokenText(Expression),
     #[error("Unsupported pattern expression for prefix: {0:?}")]
     UnsupportedExpressionForPrefixPattern(Expression),
     #[error("Unsupported input expression for LIKE: {0:?}")]

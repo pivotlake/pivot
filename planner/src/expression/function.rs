@@ -2,9 +2,10 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic,
-    Length, Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
-    Round, StructExtract, StructPack, Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
+    Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, HasToken,
+    IntervalArithmetic, Length, Like, NormalizedInterval, Prefix, RegexpFullMatch,
+    RegexpJitReplace, RegexpReplace, Round, StructExtract, StructPack, Substring, Suffix,
+    TemporalConvert, TimeBucket, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -58,6 +59,7 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
 #[derive(Debug, Clone)]
 pub enum Function {
     Contains(Contains),
+    HasToken(HasToken),
     Prefix(Prefix),
     Suffix(Suffix),
     /// `LIKE` / `NOT LIKE` against a constant pattern, for the patterns DuckDB's
@@ -118,6 +120,7 @@ impl Function {
                 visit(&c.needle);
                 visit(&c.haystack);
             }
+            Function::HasToken(h) => visit(&h.text),
             Function::Prefix(p) => {
                 visit(&p.haystack);
                 visit(&p.prefix);
@@ -168,6 +171,7 @@ impl Function {
                 visit(&mut c.needle);
                 visit(&mut c.haystack);
             }
+            Function::HasToken(h) => visit(&mut h.text),
             Function::Prefix(p) => {
                 visit(&mut p.haystack);
                 visit(&mut p.prefix);
@@ -215,6 +219,7 @@ impl Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Function::Contains(c) => write!(f, "{c}"),
+            Function::HasToken(h) => write!(f, "{h}"),
             Function::Prefix(p) => write!(f, "{p}"),
             Function::Suffix(s) => write!(f, "{s}"),
             Function::Like(l) => write!(f, "{l}"),
@@ -274,6 +279,7 @@ impl Function {
         match self {
             // The string matchers yield booleans.
             Function::Contains(_)
+            | Function::HasToken(_)
             | Function::Prefix(_)
             | Function::Suffix(_)
             | Function::Like(_)
@@ -319,6 +325,7 @@ impl Function {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         match self {
             Function::Contains(c) => c.compile(),
+            Function::HasToken(h) => h.compile(),
             Function::Prefix(p) => p.compile(),
             Function::Suffix(s) => s.compile(),
             Function::Like(l) => l.compile(),

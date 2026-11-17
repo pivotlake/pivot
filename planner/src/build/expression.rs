@@ -23,10 +23,10 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, BucketGrid, Case, CaseCheck, Cast, Compare,
     Concat, Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc,
-    Divide, Error, Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length,
-    Like, MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch,
-    RegexpJitReplace, RegexpReplace, Round, Rounding, StructExtract, StructPack, Substring, Suffix,
-    TemporalConvert, TimeBucket, VariantGet, count_epoch_months,
+    Divide, Error, Expression, FormatBytes, Function, HasToken, InList, IntervalArithmetic, IsNull,
+    Length, Like, MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, Round, Rounding, StructExtract, StructPack,
+    Substring, Suffix, TemporalConvert, TimeBucket, VariantGet, count_epoch_months,
 };
 use crate::types::{
     MICROS_PER_DAY, StructField, Type, build_scalar_value, physical_arrow_type, type_from_logical,
@@ -370,6 +370,7 @@ impl Function {
                 input: Box::new(Expression::from_handle(function_args(func, 1)?[0])?),
             })),
             "contains" => Ok(Function::Contains(Contains::from_handle(func)?)),
+            "has_token" => Ok(Function::HasToken(HasToken::from_handle(func)?)),
             // DuckDB's optimizer rewrites `LIKE 'foo%'` into `prefix(col, 'foo')`
             // and `LIKE '%foo'` into `suffix(col, 'foo')`.
             "prefix" => Ok(Function::Prefix(Prefix::from_handle(func)?)),
@@ -472,6 +473,20 @@ impl Contains {
         Ok(Contains {
             needle: Box::new(Expression::from_handle(params[1])?),
             haystack: Box::new(Expression::from_handle(params[0])?),
+        })
+    }
+}
+
+impl HasToken {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<HasToken, Error> {
+        let params = function_args(func, 2)?;
+        let token = constant_string(Expression::from_handle(params[1])?)?;
+        if !dispatch::HasToken::is_one_token(token.as_bytes()) {
+            return Err(Error::HasTokenOfNotOneToken(token));
+        }
+        Ok(HasToken {
+            text: Box::new(Expression::from_handle(params[0])?),
+            token,
         })
     }
 }

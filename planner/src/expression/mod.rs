@@ -24,6 +24,7 @@ mod date_trunc;
 mod divide;
 mod format_bytes;
 mod function;
+mod has_token;
 mod in_list;
 mod interval;
 mod is_null;
@@ -62,6 +63,7 @@ pub use date_trunc::DateTrunc;
 pub use divide::Divide;
 pub use format_bytes::FormatBytes;
 pub use function::{Function, ScalarFunctionSignature, builtin_scalar_function};
+pub use has_token::HasToken;
 pub use in_list::InList;
 pub use interval::IntervalArithmetic;
 pub use is_null::IsNull;
@@ -101,6 +103,8 @@ pub enum Error {
     UnsupportedAggregateFunction(String),
     #[error("Unsupported scalar function: {0}")]
     UnsupportedScalarFunction(String),
+    #[error("has_token looks for one token, and '{0}' is not one")]
+    HasTokenOfNotOneToken(String),
     #[error("TRY_CAST is not supported; use CAST, which fails on unconvertible values")]
     TryCastUnsupported,
     #[error("Invalid parameter count for {function}: expected {expected}, got {actual}")]

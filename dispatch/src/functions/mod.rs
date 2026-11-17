@@ -1,9 +1,11 @@
 mod contains;
+mod has_token;
 mod needle;
 mod prefix;
 mod segments;
 mod suffix;
 pub use contains::Contains;
+pub use has_token::HasToken;
 pub use prefix::Prefix;
 pub use segments::SegmentMatcher;
 pub use suffix::Suffix;
