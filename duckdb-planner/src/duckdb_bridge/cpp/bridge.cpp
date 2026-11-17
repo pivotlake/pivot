@@ -24,6 +24,7 @@
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
+#include "duckdb-planner/src/duckdb_bridge/cpp/catalog/catalog.h"
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
@@ -1107,10 +1108,11 @@ bool lo_compact_final(const LogicalOperator &op) {
 
 // ---- CreateTextIndex ----
 
-// `CREATE TEXT INDEX` arrives as a `LogicalCreate` holding the statement's
-// `CreateIndexInfo`, as `PivotCatalog::BindCreateIndex` hands it on.
+// `CREATE TEXT INDEX` arrives as a `LogicalCreateTextIndex` holding the
+// statement's `CreateIndexInfo`, as `PivotCatalog::BindCreateIndex` hands it
+// on. It is the only extension operator a plan can hold.
 static duckdb::CreateIndexInfo &create_text_index_info(const LogicalOperator &op) {
-	return as<duckdb::LogicalCreate>(op).info->Cast<duckdb::CreateIndexInfo>();
+	return *as<LogicalCreateTextIndex>(op).info;
 }
 
 rust::String lo_create_text_index_name(const LogicalOperator &op) {

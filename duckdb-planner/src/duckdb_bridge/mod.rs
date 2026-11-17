@@ -460,7 +460,6 @@ pub mod ffi {
         ) -> Result<String>;
 
         // ---- CreateTextIndex ----
-        /// The index's name, or empty when the statement gave none.
         fn lo_create_text_index_name(op: &LogicalOperator) -> Result<String>;
         /// The datastore, the schema and the name of the table, as the
         /// binder resolved them.

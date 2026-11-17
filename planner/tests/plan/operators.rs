@@ -472,15 +472,11 @@ fn create_text_index_if_not_exists_is_carried_to_the_request(mut testing_planner
 }
 
 #[rstest]
-fn a_text_index_without_a_name_is_named_after_its_table_and_column(
-    mut testing_planner: TestingPlanner,
-) {
-    let request = plan_create_text_index(
-        &mut testing_planner,
-        "CREATE TEXT INDEX ON example_table (name)",
-    );
+fn a_text_index_without_a_name_is_refused(mut testing_planner: TestingPlanner) {
+    let result = testing_planner.plan("CREATE TEXT INDEX ON example_table (name)");
 
-    assert_eq!(request.index_name, "example_table_name_text_idx");
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("index name"), "{error}");
 }
 
 #[rstest]

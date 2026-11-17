@@ -265,7 +265,10 @@ impl<'plan> LogicalOp<'plan> {
             }
             L::LOGICAL_COPY_FROM_STDIN => Operator::CopyFromStdin(CopyFromStdin { raw: self.raw }),
             L::LOGICAL_CREATE_USER => Operator::CreateUser(CreateUser { raw: self.raw }),
-            L::LOGICAL_CREATE_INDEX => Operator::CreateTextIndex(CreateTextIndex { raw: self.raw }),
+            // The one extension operator the bridge's catalog puts in a plan.
+            L::LOGICAL_EXTENSION_OPERATOR => {
+                Operator::CreateTextIndex(CreateTextIndex { raw: self.raw })
+            }
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
             }
@@ -415,8 +418,8 @@ define_handles! { ffi::LogicalOperator;
     CopyFromStdin,
     /// A `LogicalCreateUser`: `CREATE USER <name> [PASSWORD '<password>']`.
     CreateUser,
-    /// A `LogicalCreate` for `CREATE TEXT INDEX`, carrying DuckDB's
-    /// `CreateIndexInfo` as the statement gave it.
+    /// The bridge's `LogicalCreateTextIndex` for `CREATE TEXT INDEX`, carrying
+    /// DuckDB's `CreateIndexInfo` as the statement gave it.
     CreateTextIndex,
     /// A `LogicalComparisonJoin`.
     ComparisonJoin,
@@ -1079,10 +1082,8 @@ impl<'plan> CopyFromStdin<'plan> {
 }
 
 impl<'plan> CreateTextIndex<'plan> {
-    /// The index's name, or `None` when the statement gave none.
-    pub fn name(self) -> Result<Option<String>> {
-        let name = ffi::lo_create_text_index_name(self.raw)?;
-        Ok((!name.is_empty()).then_some(name))
+    pub fn name(self) -> Result<String> {
+        Ok(ffi::lo_create_text_index_name(self.raw)?)
     }
 
     /// The datastore of the table, as the binder resolved it.

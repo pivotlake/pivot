@@ -407,20 +407,13 @@ impl CreateTextIndex {
     pub(crate) fn from_handle(
         view: CreateTextIndexView<'_>,
     ) -> Result<CreateTextIndex, OperatorError> {
-        let table_name = view.table()?;
-        let column = view.column()?;
-        // An index the statement left unnamed is named after what it indexes.
-        let index_name = match view.name()? {
-            Some(index_name) => index_name,
-            None => format!("{table_name}_{column}_text_idx"),
-        };
         Ok(CreateTextIndex {
             request: CreateTextIndexRequest {
                 datastore_name: view.datastore()?,
                 schema_name: view.schema()?,
-                table_name,
-                index_name,
-                column,
+                table_name: view.table()?,
+                index_name: view.name()?,
+                column: view.column()?,
                 case_sensitive: view.is_case_sensitive()?,
                 if_not_exists: view.if_not_exists()?,
             },

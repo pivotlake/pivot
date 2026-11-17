@@ -3,8 +3,34 @@
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "rust/cxx.h"
 #include "duckdb-planner/src/duckdb_bridge/mod.rs.h"
+
+// A `CREATE TEXT INDEX` statement, carried through DuckDB's planning as it
+// was written, for the planner to resolve. It is an extension operator
+// because DuckDB takes an operator typed CREATE INDEX for its own, with its
+// own fields, wherever it walks a plan.
+struct LogicalCreateTextIndex : public duckdb::LogicalExtensionOperator {
+	explicit LogicalCreateTextIndex(duckdb::unique_ptr<duckdb::CreateIndexInfo> info) : info(std::move(info)) {
+	}
+
+	duckdb::unique_ptr<duckdb::CreateIndexInfo> info;
+
+	duckdb::PhysicalOperator &CreatePlan(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &) override {
+		throw duckdb::NotImplementedException("CREATE TEXT INDEX is run by Pivot, not by DuckDB");
+	}
+
+	std::string GetExtensionName() const override {
+		return "pivot_create_text_index";
+	}
+
+protected:
+	void ResolveTypes() override {
+		types.emplace_back(duckdb::LogicalType::BIGINT);
+	}
+};
 
 class PivotCatalog : public duckdb::Catalog {
 	// The schema entries materialized by lookups so far, keyed by schema name.
@@ -48,7 +74,7 @@ public:
 
 	// `CREATE TEXT INDEX` is the one kind of index there is. DuckDB would bind
 	// the statement into a plan that builds one of its own indexes; this hands
-	// the statement on as it was written, for the planner to resolve.
+	// the statement on as it was written, in a `LogicalCreateTextIndex`.
 	duckdb::unique_ptr<duckdb::LogicalOperator> BindCreateIndex(duckdb::Binder &binder, duckdb::CreateStatement &stmt,
 	                                                           duckdb::TableCatalogEntry &table,
 	                                                           duckdb::unique_ptr<duckdb::LogicalOperator> plan) override;

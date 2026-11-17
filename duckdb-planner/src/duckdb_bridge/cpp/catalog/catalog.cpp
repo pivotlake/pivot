@@ -6,7 +6,6 @@
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
-#include "duckdb/planner/operator/logical_create.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/common/exception.hpp"
 
@@ -35,8 +34,7 @@ unique_ptr<LogicalOperator> PivotCatalog::BindCreateIndex(Binder &, CreateStatem
 	// binder resolved it to `table`, so the plan carries the names that did.
 	info.catalog = table.ParentCatalog().GetName();
 	info.schema = table.ParentSchema().name;
-	return make_uniq<LogicalCreate>(LogicalOperatorType::LOGICAL_CREATE_INDEX, std::move(stmt.info),
-	                                &table.ParentSchema());
+	return make_uniq<LogicalCreateTextIndex>(unique_ptr_cast<CreateInfo, CreateIndexInfo>(std::move(stmt.info)));
 }
 
 PivotSchemaCatalogEntry &PivotCatalog::FindOrCreateSchema(const std::string &name) {
