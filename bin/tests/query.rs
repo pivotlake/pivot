@@ -685,6 +685,151 @@ async fn system_memory_blocks_shows_a_scan_caching_bytes(#[future] conn: Conn) {
     assert!(cached > 0, "reading a table must leave its bytes cached");
 }
 
+/// Connect to the shared server under `application_name`, so a test can pick
+/// its own connections out of `system.connections`.
+async fn connect_named_client(application_name: &str) -> Client {
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(server_port())
+        .user("pivot")
+        .dbname("test")
+        .application_name(application_name)
+        .connect(tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
+/// Run `sql` until its single value is `expected`. The server learns what a
+/// client did when it reads the client's socket, a moment after the client
+/// did it.
+async fn wait_for_single_value(client: &Client, sql: &str, expected: &str) {
+    let poll = async {
+        while single_value(client, sql).await != expected {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+        .await
+        .unwrap_or_else(|_| panic!("`{sql}` never returned {expected}"));
+}
+
+/// A connection reads its own row too, as running the very query that reads
+/// it. The tests run one at a time, so no other connection is mid-query.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_connections_reports_the_connection_running_the_query(#[future] conn: Conn) {
+    let sql = "SELECT user_name, statement, copy_bytes FROM system.connections \
+               WHERE state = 'query'";
+
+    let rows = select_rows(&conn, sql).await;
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("pivot".to_string()),
+            Some(sql.to_string()),
+            Some("0".to_string()),
+        ]],
+    );
+}
+
+/// A connection that has sent nothing is listed as idle, under the name its
+/// client gave when it connected.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_connections_reports_an_idle_connection(#[future] conn: Conn) {
+    let _idle = connect_named_client("connections_idle").await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT user_name, state, statement, connected_at = state_changed_at \
+         FROM system.connections WHERE application_name = 'connections_idle'",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("pivot".to_string()),
+            Some("idle".to_string()),
+            Some(String::new()),
+            Some("t".to_string()),
+        ]],
+    );
+}
+
+/// A connection goes back to idle once its statement has finished.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_connections_reports_idle_after_a_statement_finishes(#[future] conn: Conn) {
+    let worker = connect_named_client("connections_finished").await;
+
+    worker.simple_query("SELECT 1").await.unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT state, statement FROM system.connections \
+         WHERE application_name = 'connections_finished'",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![vec![Some("idle".to_string()), Some(String::new())]],
+    );
+}
+
+/// A connection in the middle of a COPY FROM STDIN is listed as copying, with
+/// the bytes its client has sent so far.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_connections_reports_a_copy_in_progress(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE connections_copying (id BIGINT)")
+        .await
+        .unwrap();
+    let port = server_port();
+
+    let _copier = tokio::task::spawn_blocking(move || {
+        let mut copier = common::RawConn::connect(port);
+        copier.query("COPY connections_copying FROM STDIN");
+        copier.read_message();
+        copier.copy_data(b"1\n2\n");
+        copier
+    })
+    .await
+    .unwrap();
+
+    wait_for_single_value(
+        &conn,
+        "SELECT copy_bytes FROM system.connections \
+         WHERE state = 'copy' AND statement = 'COPY connections_copying FROM STDIN'",
+        "4",
+    )
+    .await;
+}
+
+/// A connection leaves the table when its client disconnects.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_connections_drops_a_closed_connection(#[future] conn: Conn) {
+    let closing = connect_named_client("connections_closed").await;
+    let count_sql = "SELECT count(*) FROM system.connections \
+                     WHERE application_name = 'connections_closed'";
+    assert_eq!(single_value(&conn, count_sql).await, "1");
+
+    drop(closing);
+
+    wait_for_single_value(&conn, count_sql, "0").await;
+}
+
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]

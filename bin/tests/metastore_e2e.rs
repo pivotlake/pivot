@@ -188,6 +188,12 @@ async fn queries_bind_tables_by_datastore_name() {
         vec![
             Some("system".into()),
             Some("main".into()),
+            Some("connections".into()),
+            Some("5e551005-ca11-4e25-acce-55edc11e0750".into()),
+        ],
+        vec![
+            Some("system".into()),
+            Some("main".into()),
             Some("datastores".into()),
             Some("da7aba5e-5e75-4a11-ab1e-5e1ec7edda7a".into()),
         ],

@@ -10,6 +10,7 @@ use crate::server::copy_session;
 use crate::server::peer_hang_up::PeerHangUp;
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
+use catalog::connections::{ConnectionRegistry, RegisteredConnection};
 use catalog::metastore::Metastore;
 use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
@@ -306,6 +307,14 @@ impl PivotQueryHandler {
         #[cfg(not(feature = "perf"))]
         let with_perf = false;
 
+        // Reported as this connection's statement until it drops: when this
+        // function returns, or for a COPY FROM STDIN when the copy ends.
+        let running_statement = client
+            .session_extensions()
+            .get::<RegisteredConnection>()
+            .expect("a connection is registered when its startup completes")
+            .run_statement(query);
+
         info!(sql = %query, "query received");
         // A statement nobody is waiting for is dropped, which cancels it.
         let execution = tokio::select! {
@@ -347,7 +356,7 @@ impl PivotQueryHandler {
                     CopyFormat::Text(_) => 0,
                     CopyFormat::ArrowIpc => 1,
                 };
-                let columns = copy_session::begin_copy(client, *ingest)
+                let columns = copy_session::begin_copy(client, *ingest, running_statement)
                     .await
                     .map_err(|error| {
                         warn!(%error, sql = %query, "copy from stdin failed to start");
@@ -502,15 +511,18 @@ pub struct PivotHandlers {
 }
 
 impl PivotHandlers {
+    /// `connections` is where every connection that logs in is registered,
+    /// for `system.connections` to report.
     pub fn new(
         query_executor: Arc<crate::execution::Executor>,
         metastore: Arc<dyn Metastore>,
+        connections: Arc<ConnectionRegistry>,
     ) -> Self {
         let manager = Arc::new(ConnectionManager::new());
         Self {
             query_executor,
             cancel_handler: Arc::new(DefaultCancelHandler::new(manager.clone())),
-            authenticator: Authenticator::new(metastore, manager),
+            authenticator: Authenticator::new(metastore, manager, connections),
         }
     }
 

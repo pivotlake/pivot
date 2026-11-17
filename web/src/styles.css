@@ -1,0 +1,648 @@
+/*
+ * The documentation's look: monospace-first, a neutral ink palette, one
+ * accent, and hairline borders instead of shadows. Every colour is a
+ * light/dark pair resolved by the reader's colour scheme.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-display: "Space Grotesk", var(--font-mono);
+
+  --canvas: light-dark(#f7f6f4, #0d0d0d);
+  --surface: light-dark(#fdfcfb, #131313);
+  --surface-inset: light-dark(#efeeea, #0d0d0d);
+  --hairline: light-dark(#dcdad4, #282828);
+  --hairline-strong: light-dark(#bfbdb6, #3d3d3d);
+  --text: light-dark(#17181b, #f0f0f0);
+  --text-secondary: light-dark(#4a4b52, #b9b9b9);
+  --text-muted: light-dark(#6b6d75, #8a8a8a);
+  --accent: light-dark(#3049c9, #78d18b);
+  --accent-soft: light-dark(#dfe3f8, #16301d);
+  --connection-dot: light-dark(#a8aab1, #5a5a5a);
+  --failure: light-dark(#b3261e, #f2857c);
+
+  /* The uses of memory: red for memory that is held, two shades of light
+     blue for the two caches, green for what is free. */
+  --memory-pinned: #dc2626;
+  --memory-decompressed-cache: #5aa9ef;
+  --memory-compressed-cache: #a3cff7;
+  --memory-other: #c3ccd6;
+  --memory-free: #58c283;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--canvas);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* React Flow chrome, restyled through the variables it reads. */
+.react-flow {
+  --xy-background-color: var(--canvas);
+  --xy-background-pattern-dots-color: var(--hairline);
+  --xy-controls-button-background-color: var(--surface);
+  --xy-controls-button-background-color-hover: var(--surface-inset);
+  --xy-controls-button-color: var(--text-secondary);
+  --xy-controls-button-color-hover: var(--text);
+  --xy-controls-button-border-color: var(--hairline);
+  --xy-controls-box-shadow: none;
+  --xy-attribution-background-color: transparent;
+}
+
+.react-flow__controls {
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.react-flow__attribution a {
+  color: var(--text-muted);
+}
+
+.react-flow__handle {
+  width: 7px;
+  height: 7px;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--hairline-strong);
+  background: var(--canvas);
+}
+
+/* The server has a handle on every side and uses one or two of them, so its
+   handles stay out of sight; a client's single handle shows as a small port. */
+.react-flow__node-server .react-flow__handle {
+  opacity: 0;
+}
+
+/* A COPY rate sits on its connection, in front of any card it runs close to. */
+.react-flow__edgelabel-renderer {
+  z-index: 5;
+}
+
+.section-label {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Page furniture */
+
+.title-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wordmark {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+}
+
+.wordmark-cursor {
+  width: 13px;
+  height: 4px;
+  background: var(--accent);
+}
+
+.connections-notice {
+  max-width: 46ch;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.connections-notice.is-failed {
+  padding: 6px 10px;
+  border: 1px solid var(--failure);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--failure);
+  overflow-wrap: anywhere;
+}
+
+/* Server */
+
+.server-card {
+  width: 372px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.server-identity {
+  padding: 16px 18px 18px;
+}
+
+.server-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.server-version {
+  margin-left: auto;
+  color: var(--text-muted);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.live-dot {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.live-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse-live-dot 2.4s ease-out infinite;
+}
+
+/* No reading of the server: nothing says it is up. */
+.live-dot.is-unknown,
+.live-dot.is-unknown::after {
+  background: var(--connection-dot);
+  animation: none;
+}
+
+.live-dot.is-unknown::after {
+  opacity: 0;
+}
+
+@keyframes pulse-live-dot {
+  from {
+    opacity: 0.6;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(3.2);
+  }
+}
+
+.server-hostname {
+  margin: 10px 0 12px;
+  overflow: hidden;
+  font-family: var(--font-display);
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.server-facts li {
+  padding: 2px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+.server-counters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-top: 1px solid var(--hairline);
+}
+
+.server-counter {
+  padding: 12px 18px 10px;
+}
+
+.server-counter + .server-counter {
+  border-left: 1px solid var(--hairline);
+}
+
+.counter-value {
+  font-family: var(--font-display);
+  font-size: 32px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.memory {
+  padding: 12px 18px 12px;
+  border-top: 1px solid var(--hairline);
+}
+
+.memory-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.memory-total {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.memory-node {
+  margin-top: 9px;
+}
+
+.memory-node-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.memory-node-pinned {
+  color: var(--text-secondary);
+}
+
+/* Holds the bar and the tooltip raised over it. The bar clips its parts to
+   its rounded ends, so the tooltip has to sit outside it. */
+.memory-bar-frame {
+  position: relative;
+  margin-top: 6px;
+}
+
+/* One seamless bar: its parts touch, and are told apart by colour. The
+   outline keeps the palest parts from fading into a light card. */
+.memory-bar {
+  display: flex;
+  height: 22px;
+  overflow: hidden;
+  border-radius: 5px;
+  outline: 1px solid light-dark(rgb(0 0 0 / 0.14), transparent);
+  outline-offset: -1px;
+}
+
+.memory-segment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-basis: 0;
+  overflow: hidden;
+  color: #f4f2ec;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.memory-segment.is-pinned {
+  background: var(--memory-pinned);
+}
+
+.memory-segment.is-decompressed_cache {
+  background: var(--memory-decompressed-cache);
+}
+
+.memory-segment.is-compressed_cache {
+  background: var(--memory-compressed-cache);
+}
+
+.memory-segment.is-other {
+  background: var(--memory-other);
+}
+
+.memory-segment.is-free {
+  background: var(--memory-free);
+}
+
+.memory-segment:hover {
+  filter: brightness(1.08);
+}
+
+/* Black in both themes, centred over the part it describes. */
+.memory-tooltip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  z-index: 10;
+  padding: 5px 9px;
+  border: 1px solid light-dark(#000000, var(--hairline-strong));
+  border-radius: 5px;
+  background: #000000;
+  color: #f0f0f0;
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: center;
+  white-space: nowrap;
+  pointer-events: none;
+  transform-origin: 50% 100%;
+}
+
+/* The tooltip can reach past the server card, so the card comes in front of
+   the client cards while it is pointed at. */
+.react-flow__node-server:hover {
+  z-index: 1000 !important;
+}
+
+.memory-tooltip strong {
+  display: block;
+  color: #ffffff;
+  font-weight: 700;
+}
+
+.memory-tooltip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  width: 8px;
+  height: 8px;
+  border: 1px solid light-dark(#000000, var(--hairline-strong));
+  border-top: 0;
+  border-left: 0;
+  background: #000000;
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.compaction {
+  padding: 12px 18px 16px;
+  border-top: 1px solid var(--hairline);
+}
+
+.compaction-heading,
+.compaction-figures {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.simulated-tag {
+  margin-left: 4px;
+  padding: 0 5px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.compaction-table {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.compaction.is-running .compaction-table {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.compaction-track {
+  height: 6px;
+  margin: 9px 0;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--surface-inset);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+
+.compaction-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 250ms linear;
+}
+
+.compaction-figures {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.compaction-figures strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+/* Clients */
+
+.client-card {
+  width: 252px;
+  padding: 12px 14px 11px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface);
+  animation: enter-client 320ms ease-out;
+  transition: border-color 200ms;
+}
+
+@keyframes enter-client {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+}
+
+.client-card.is-copy {
+  border-color: var(--accent);
+}
+
+.client-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.client-application {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.client-application.is-unnamed {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.client-id {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.client-origin {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.client-activity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--hairline);
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.is-query .client-activity {
+  color: var(--text);
+}
+
+.is-copy .client-activity {
+  color: var(--accent);
+}
+
+.client-detail {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Three bars: flat while the client is idle, moving while it works. */
+.activity-indicator {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: 12px;
+  height: 12px;
+}
+
+.activity-indicator i {
+  width: 2.5px;
+  height: 2.5px;
+  border-radius: 1px;
+  background: currentColor;
+}
+
+.is-query .activity-indicator i,
+.is-copy .activity-indicator i {
+  height: 100%;
+  transform-origin: center;
+  animation: bounce-activity-bar 900ms ease-in-out infinite;
+}
+
+.activity-indicator i:nth-child(2) {
+  animation-delay: -300ms;
+}
+
+.activity-indicator i:nth-child(3) {
+  animation-delay: -600ms;
+}
+
+@keyframes bounce-activity-bar {
+  0%,
+  100% {
+    transform: scaleY(0.25);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+/* Connections */
+
+.connection-path {
+  fill: none;
+  stroke: var(--connection-dot);
+  stroke-width: 2.25;
+  stroke-linecap: round;
+  stroke-dasharray: 0.01 8;
+}
+
+.connection-path.is-query {
+  stroke: var(--text-muted);
+}
+
+.connection-path.is-copy {
+  stroke: var(--accent);
+  stroke-dasharray: 5 9;
+  animation: stream-to-server 600ms linear infinite;
+}
+
+/* One dash period towards the end of the path, which is the server. */
+@keyframes stream-to-server {
+  to {
+    stroke-dashoffset: -14;
+  }
+}
+
+.connection-glow {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 9;
+  stroke-linecap: round;
+  opacity: 0.12;
+}
+
+.connection-particle {
+  fill: var(--accent);
+  filter: drop-shadow(0 0 4px var(--accent));
+}
+
+.connection-rate {
+  position: absolute;
+  padding: 1px 7px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* A narrow screen is a touch screen: pinch and drag replace the zoom buttons. */
+@media (max-width: 640px) {
+  .react-flow__controls {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

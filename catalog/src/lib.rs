@@ -6,6 +6,8 @@
 //!   datastores it serves and which users may log in.
 //! - [`system`]: the read-only `system` datastore describing the server's own
 //!   catalog.
+//! - [`connections`]: the registry of the connections a server has open, which
+//!   the `system` datastore reports.
 //! - this root, the **cross-datastore catalog**: the layer that presents the set
 //!   of named datastores a server serves to the planner.
 //!
@@ -22,6 +24,7 @@
 //! one's own commit; a datastore decides for itself whether that commit does
 //! blocking store I/O or is an in-memory no-op.
 
+pub mod connections;
 pub mod datastore;
 pub mod metastore;
 pub mod system;
@@ -30,7 +33,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use crossbeam_deque::{Injector, Steal};
+use connections::ConnectionRegistry;
+use crossbeam_deque::Injector;
 use datastore::DatastoreTransaction;
 use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use metastore::Metastore;
@@ -96,6 +100,10 @@ pub struct PivotCatalog {
     /// Process-wide external parquet access. This is global to the composite
     /// catalog rather than associated with one datastore.
     external_parquet_read_context: Option<ExternalParquetContext>,
+    /// The connections open to whatever serves this catalog, which
+    /// `system.connections` reports. A frontend that accepts connections
+    /// registers them here; one that accepts none leaves it empty.
+    connections: Arc<ConnectionRegistry>,
 }
 
 impl PivotCatalog {
@@ -115,6 +123,7 @@ impl PivotCatalog {
             default_name,
             metastore,
             external_parquet_read_context: None,
+            connections: Arc::new(ConnectionRegistry::default()),
         })
     }
 
@@ -145,6 +154,11 @@ impl PivotCatalog {
     /// The name of the default datastore.
     pub fn default_datastore_name(&self) -> &str {
         &self.default_name
+    }
+
+    /// Where a frontend registers the connections it accepts.
+    pub fn connections(&self) -> &Arc<ConnectionRegistry> {
+        &self.connections
     }
 
     pub fn datastore_names(&self) -> Vec<String> {
@@ -179,6 +193,7 @@ impl PivotCatalog {
             sub_transactions: Mutex::new(HashMap::new()),
             metastore: self.metastore.clone(),
             external_parquet_read_context: self.external_parquet_read_context.clone(),
+            connections: self.connections.clone(),
             staged_users: Arc::new(Injector::new()),
         })
     }
@@ -205,6 +220,8 @@ pub struct PivotTransaction {
     /// Where staged users land at commit.
     metastore: Arc<dyn Metastore>,
     external_parquet_read_context: Option<ExternalParquetContext>,
+    /// Handed to the `system` sub-transaction, which reports them.
+    connections: Arc<ConnectionRegistry>,
     /// The users this transaction's dataflows staged (see
     /// [`PivotUserCreation`]), applied to the metastore at commit and dropped
     /// on rollback. Shared (`Arc`) with the staging dataflow's workers.
@@ -264,7 +281,9 @@ impl PivotTransaction {
             .lock()
             .unwrap()
             .entry(system::DATASTORE_NAME.to_string())
-            .or_insert_with(|| Arc::new(SystemTransaction::new(datastores)))
+            .or_insert_with(|| {
+                Arc::new(SystemTransaction::new(datastores, self.connections.clone()))
+            })
             .clone()
     }
 
