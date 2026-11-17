@@ -3,8 +3,10 @@
 //! files and what only those snapshots used, with no listing of the table's
 //! directory: it never touches a live file, a file some retained snapshot
 //! still names, a metadata file replaced inside the window, or a file no
-//! metadata names. Age is judged against a `now_ms` threaded in, so the
-//! window is not waited out on the wall clock.
+//! metadata names. A table whose history is not linear, as one with a tag,
+//! is refused: its round fails, and nothing of it expires or is deleted,
+//! while inserts and compaction go on. Age is judged against a `now_ms`
+//! threaded in, so the window is not waited out on the wall clock.
 
 mod iceberg_support;
 
@@ -20,8 +22,8 @@ use datastore_pivotlake::test_support::{
 };
 use datastore_pivotlake::{DEFAULT_VACUUM_POLL, Vacuumer};
 use iceberg_support::{
-    Database, FIVE_HOURS_MS, append_version, backdate_by, insert_rows, int_batch, names_in, now_ms,
-    single_i64, write_int_parquet,
+    Database, FIVE_HOURS_MS, append_version, backdate_by, collect_i64s, insert_rows, int_batch,
+    names_in, now_ms, parquet_files_in, single_i64, write_int_parquet,
 };
 use iceberg_tables::test_support::{Faults, FaultyStore, HeldRead};
 use object_storage::{LocalStore, ObjectStore};
@@ -41,9 +43,12 @@ fn adopting_database() -> (Database, PathBuf, PathBuf) {
 /// One vacuum round: what the background maintenance timer and the SQL
 /// `VACUUM` command both run.
 fn vacuum(db: &Database, now_ms: u64) {
-    Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, db.datastore.clone()))
-        .vacuum_all(now_ms)
-        .unwrap();
+    try_vacuum(db, now_ms).unwrap();
+}
+
+/// One vacuum round, with the first error a table's cleanup failed with.
+fn try_vacuum(db: &Database, now_ms: u64) -> datastore_pivotlake::Result<()> {
+    Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, db.datastore.clone())).vacuum_all(now_ms)
 }
 
 const THIRTY_DAYS: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -162,7 +167,7 @@ fn routine_cleanup_keeps_a_retired_file_while_its_snapshot_is_inside_the_window(
 }
 
 #[test]
-fn routine_cleanup_keeps_a_file_a_tagged_snapshot_uses_when_the_snapshot_that_retired_it_expires() {
+fn routine_cleanup_refuses_a_table_with_a_tag_and_leaves_its_snapshots_and_files() {
     let mut db = Database::new();
     db.execute("CREATE TABLE t (value BIGINT)");
     db.execute("INSERT INTO t VALUES (1)");
@@ -173,15 +178,175 @@ fn routine_cleanup_keeps_a_file_a_tagged_snapshot_uses_when_the_snapshot_that_re
     let (root, replaced) = (db.root_uri(), [tagged_file.as_str()]);
     commit_external_replace(&root, &directory, &replaced, "b.parquet", &bytes, 1).unwrap();
     commit_external_append(&root, &directory, "c.parquet", &bytes, 1).unwrap();
+    let metadata_dir = db.table_path("t").join("metadata");
+    let objects_before = names_in(&metadata_dir);
+
+    let refusal = try_vacuum(&db, now_ms() + FIVE_HOURS_MS)
+        .unwrap_err()
+        .to_string();
+
+    assert!(refusal.contains("tag `release`"), "{refusal}");
+    assert!(
+        refusal.contains("https://github.com/pivotlake/pivot/issues/101"),
+        "{refusal}"
+    );
+    assert_eq!(retained_snapshots(&root, &directory).unwrap(), 3);
+    assert!(db.table_path("t").join(&tagged_file).exists());
+    assert_eq!(names_in(&metadata_dir), objects_before);
+}
+
+#[test]
+fn a_table_with_a_tag_takes_inserts_and_compaction_while_its_cleanup_is_refused() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (value BIGINT)");
+    db.execute("INSERT INTO t VALUES (1)");
+    let directory = db.table_directory("t");
+    tag_current_snapshot(&db.root_uri(), &directory, "release").unwrap();
+
+    let refused_before = try_vacuum(&db, now_ms() + FIVE_HOURS_MS);
+    db.execute("INSERT INTO t VALUES (2)");
+    db.execute("INSERT INTO t VALUES (3)");
+    let inserted = live_data_file_names(&db.root_uri(), &directory).unwrap();
+    db.compact("t", true);
+    let refused_after = try_vacuum(&db, now_ms() + FIVE_HOURS_MS);
+
+    assert!(refused_before.is_err() && refused_after.is_err());
+    let live = live_data_file_names(&db.root_uri(), &directory).unwrap();
+    assert_eq!(inserted.len(), 3);
+    assert!(
+        inserted.iter().all(|file| !live.contains(file)),
+        "the compaction replaced {inserted:?}, and {live:?} are live"
+    );
+    let files = parquet_files_in(&db.table_path("t"));
+    assert!(
+        inserted.iter().all(|file| files.contains(file)),
+        "a refused round deletes none of the files the compaction replaced: {files:?}"
+    );
+    let rows = db.execute("SELECT CAST(sum(value) AS BIGINT), count(*) FROM t");
+    assert_eq!(collect_i64s(&rows, 0), [6]);
+    assert_eq!(collect_i64s(&rows, 1), [3]);
+}
+
+#[test]
+fn routine_cleanup_deletes_what_a_compaction_replaced_once_the_snapshots_before_it_expire() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (value BIGINT)");
+    for value in 1..=3 {
+        db.execute(&format!("INSERT INTO t VALUES ({value})"));
+    }
+    let directory = db.table_directory("t");
+    let replaced = live_data_file_names(&db.root_uri(), &directory).unwrap();
+    db.compact("t", true);
+    let window_start = pause_between_commits();
+    db.execute("INSERT INTO t VALUES (4)");
+    let live = live_data_file_names(&db.root_uri(), &directory).unwrap();
+
+    vacuum(&db, window_start + WINDOW_MS);
+
+    assert!(
+        replaced.iter().all(|file| !live.contains(file)),
+        "the compaction replaced {replaced:?}, and {live:?} are live"
+    );
+    assert_eq!(parquet_files_in(&db.table_path("t")), live);
+    assert_eq!(
+        retained_snapshots(&db.root_uri(), &directory).unwrap(),
+        2,
+        "the compaction is the oldest snapshot kept"
+    );
+    let rows = db.execute("SELECT CAST(sum(value) AS BIGINT), count(*) FROM t");
+    assert_eq!(collect_i64s(&rows, 0), [10]);
+    assert_eq!(collect_i64s(&rows, 1), [4]);
+}
+
+#[test]
+fn routine_cleanup_keeps_a_live_file_committed_with_one_a_compaction_replaced() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (ts BIGINT, p BIGINT) WITH (partition_by = 'p')");
+    db.execute("INSERT INTO t VALUES (10, 1), (20, 2)");
+    db.execute("INSERT INTO t VALUES (11, 1)");
+    let directory = db.table_directory("t");
+    let inserted = live_data_file_names(&db.root_uri(), &directory).unwrap();
+    db.compact("t", true);
+    let live = live_data_file_names(&db.root_uri(), &directory).unwrap();
+
+    vacuum(&db, now_ms() + FIVE_HOURS_MS);
+
+    // The first insert committed a file to each partition in one manifest,
+    // and the compaction replaced the one of the partition with two files.
+    let is_in_store = |file: &String| db.table_path("t").join(file).exists();
+    let (kept, replaced): (Vec<&String>, Vec<&String>) =
+        inserted.iter().partition(|file| live.contains(file));
+    assert_eq!((kept.len(), replaced.len()), (1, 2));
+    assert!(live.iter().all(is_in_store), "{live:?}");
+    assert!(!replaced.into_iter().any(is_in_store));
+    let rows = db.execute("SELECT p, count(*) FROM t GROUP BY p ORDER BY p");
+    assert_eq!(collect_i64s(&rows, 0), [1, 2]);
+    assert_eq!(collect_i64s(&rows, 1), [2, 1]);
+}
+
+#[test]
+fn routine_cleanup_after_several_compactions_leaves_exactly_the_live_files() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (value BIGINT)");
+    for value in 1..=3 {
+        db.execute(&format!("INSERT INTO t VALUES ({value})"));
+    }
+    db.compact("t", true);
+    for value in 4..=5 {
+        db.execute(&format!("INSERT INTO t VALUES ({value})"));
+    }
+    db.compact("t", true);
+    db.execute("INSERT INTO t VALUES (6)");
+    let directory = db.table_directory("t");
+    let live = live_data_file_names(&db.root_uri(), &directory).unwrap();
+    let files_before = parquet_files_in(&db.table_path("t"));
+
+    vacuum(&db, now_ms() + FIVE_HOURS_MS);
+
+    assert!(
+        files_before.len() > live.len(),
+        "the compactions left the files they replaced: {files_before:?}"
+    );
+    assert_eq!(parquet_files_in(&db.table_path("t")), live);
+    assert_eq!(retained_snapshots(&db.root_uri(), &directory).unwrap(), 1);
+    let rows = db.execute("SELECT CAST(sum(value) AS BIGINT), count(*) FROM t");
+    assert_eq!(collect_i64s(&rows, 0), [21]);
+    assert_eq!(collect_i64s(&rows, 1), [6]);
+}
+
+#[test]
+fn routine_cleanup_deletes_nothing_when_an_expired_manifest_list_cannot_be_read() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (value BIGINT)");
+    db.execute("INSERT INTO t VALUES (1)");
+    let directory = db.table_directory("t");
+    let metadata_dir = db.table_path("t").join("metadata");
+    let first_manifest_list = names_in(&metadata_dir)
+        .into_iter()
+        .find(|name| name.starts_with("snap-"))
+        .unwrap();
+    let retired = live_data_file_names(&db.root_uri(), &directory).unwrap()[0].clone();
+    let bytes = std::fs::read(db.table_path("t").join(&retired)).unwrap();
+    let (root, replaced) = (db.root_uri(), [retired.as_str()]);
+    commit_external_replace(&root, &directory, &replaced, "b.parquet", &bytes, 1).unwrap();
+    std::fs::remove_file(metadata_dir.join(&first_manifest_list)).unwrap();
+    let objects_before = names_in(&metadata_dir);
 
     vacuum(&db, now_ms() + FIVE_HOURS_MS);
 
     assert_eq!(
         retained_snapshots(&root, &directory).unwrap(),
-        2,
-        "the replace expired; the tagged snapshot and the current one stay"
+        1,
+        "the expiry itself was committed"
     );
-    assert!(db.table_path("t").join(&tagged_file).exists());
+    assert!(db.table_path("t").join(&retired).exists());
+    let objects_after = names_in(&metadata_dir);
+    assert!(
+        objects_before
+            .iter()
+            .all(|name| objects_after.contains(name)),
+        "{objects_before:?} {objects_after:?}"
+    );
 }
 
 #[test]

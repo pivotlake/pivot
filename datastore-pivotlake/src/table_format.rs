@@ -260,10 +260,12 @@ pub(crate) trait Table: Send + Sync {
     /// the table's commit lock, and hand back the version that wrote with
     /// what it expired. `None` when there was nothing to expire, which is
     /// learned with nothing read; a race with another writer is retried
-    /// inside. It lists nothing and deletes nothing.
+    /// inside. It lists nothing and deletes nothing. A table the format
+    /// does not expire, as an Iceberg table with a branch or a tag besides
+    /// `main`, is refused with an error before anything is committed.
     fn expire_snapshots(&self, now_ms: u64) -> Result<Option<SnapshotExpiry>>;
-    /// Delete, through `storage`, the objects the snapshots `expired` used
-    /// that this version, the one their expiry committed, does not, logging
+    /// Delete, through `storage`, what the snapshots `expired` left unused
+    /// in this version, the one their expiry committed, logging
     /// what it could not delete: it fails nothing. It reads manifests and
     /// deletes objects, which no writer should wait for, so a caller runs
     /// it once it has released the table's commit lock.

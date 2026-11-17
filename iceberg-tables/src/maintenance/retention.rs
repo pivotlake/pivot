@@ -3,12 +3,26 @@
 //! that.
 //!
 //! A snapshot stays readable while a reader that loaded it may still be
-//! reading: until its successor is older than the table's retention window.
-//! Expiring it deletes the files only it used, so the window is the only
-//! rule: no count of newer snapshots expires one that a reader inside the
-//! window may hold. A snapshot a branch or a tag points at is kept for as
-//! long as the reference is, and a table whose `gc.enabled` property is
-//! `false` expires nothing.
+//! reading: at least until its successor is older than the table's
+//! retention window. Expiring it deletes the files only it used, so the
+//! window is the only rule: no count of newer snapshots expires one that a
+//! reader inside the window may hold. A table whose `gc.enabled` property
+//! is `false` expires nothing.
+//!
+//! A table's history is taken to be linear: its current snapshot and that
+//! snapshot's ancestors, oldest first, each the parent of the next, which
+//! is its successor. A linear history gives up snapshots from its oldest
+//! only: a snapshot expires when its successor is older than the window
+//! and every snapshot before it has expired, so what expires is every
+//! snapshot before the first one still inside the window. In a history
+//! whose snapshots are each dated after their parent, as Pivot dates every
+//! one it commits, the second condition follows from the first: it decides
+//! only where the clocks of a table's writers disagreed. A table whose
+//! history is not linear, because it has a branch or a tag besides `main`
+//! or a snapshot that is not an ancestor of the current one, is refused,
+//! and nothing of it expires, its previous metadata files included: what
+//! its expired snapshots retired could not be told from what the rest of
+//! it still reads.
 //!
 //! A previous metadata file follows the same rule: the metadata log names
 //! it until the file that replaced it is older than the window, and no
@@ -16,11 +30,11 @@
 //! inside the window therefore finds the file after it still in place, which
 //! is how it learns that it lost.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use iceberg::spec::{TableMetadata, TableProperties};
 
+use crate::maintenance::linear_history::list_linear_history;
 use crate::table::Table;
 use crate::{Error, Result};
 
@@ -37,37 +51,36 @@ impl Table {
         snapshot_retention(self.metadata())
     }
 
-    /// The snapshots that have expired as of `now_ms`: every non-current one
-    /// whose successor is older than the retention window. The current
-    /// snapshot never expires, and neither does one a branch or a tag points
-    /// at: the spec crate's expiry refuses to drop the head of a reference
-    /// it keeps. Nothing expires in a table that turned `gc.enabled` off.
+    /// The snapshots that have expired as of `now_ms`, oldest first: the
+    /// oldest snapshots of the table's linear history, each one's successor
+    /// older than the retention window. Successors are taken in the
+    /// history's order, whatever clocks dated them, and the history gives
+    /// up snapshots from its oldest only: the first snapshot still inside
+    /// the window keeps every snapshot after it. What expires is therefore
+    /// the nearest ancestors of the oldest snapshot kept, none of them kept
+    /// itself, which is what
+    /// [`collect_expired_objects`](Self::collect_expired_objects) finds the
+    /// retired files of. The current snapshot never expires, and nothing
+    /// expires in a table that turned `gc.enabled` off.
+    ///
+    /// A table whose history is not linear is refused
+    /// ([`Error::NonLinearHistory`]): it has a branch or a tag besides
+    /// `main`, or a snapshot that is not an ancestor of the current one.
     pub fn expired_snapshot_ids(&self, now_ms: i64) -> Result<Vec<i64>> {
         let metadata = self.metadata();
         if !self.is_gc_enabled()? {
             return Ok(Vec::new());
         }
-        let referenced = referenced_snapshot_ids(metadata);
+        let history = list_linear_history(&self.name().to_string(), metadata)?;
         let retention_ms =
             i64::try_from(snapshot_retention(metadata)?.as_millis()).unwrap_or(i64::MAX);
-        let mut ordered: Vec<_> = metadata.snapshots().collect();
-        ordered.sort_by_key(|snapshot| (snapshot.sequence_number(), snapshot.timestamp_ms()));
-        let current = metadata.current_snapshot_id();
         let mut expired = Vec::new();
-        for (position, snapshot) in ordered.iter().enumerate() {
-            if Some(snapshot.snapshot_id()) == current {
-                continue;
-            }
-            if referenced.contains(&snapshot.snapshot_id()) {
-                continue;
-            }
-            let Some(successor) = ordered.get(position + 1) else {
-                continue;
-            };
+        for (snapshot, successor) in history.iter().zip(history.iter().skip(1)) {
             let past_window = successor.timestamp_ms().saturating_add(retention_ms) <= now_ms;
-            if past_window {
-                expired.push(snapshot.snapshot_id());
+            if !past_window {
+                break;
             }
+            expired.push(snapshot.snapshot_id());
         }
         Ok(expired)
     }
@@ -80,11 +93,16 @@ impl Table {
     /// and the log gives up entries from its oldest only: the first entry
     /// still inside the window keeps every entry after it. Nothing expires
     /// in a table that turned `gc.enabled` off.
+    ///
+    /// A table whose history is not linear is refused as its snapshots
+    /// are ([`expired_snapshot_ids`](Self::expired_snapshot_ids)): nothing
+    /// of such a table is deleted, so its log gives up no file either.
     pub fn expired_metadata_files(&self, now_ms: i64) -> Result<Vec<String>> {
         let metadata = self.metadata();
         if !self.is_gc_enabled()? {
             return Ok(Vec::new());
         }
+        list_linear_history(&self.name().to_string(), metadata)?;
         let retention_ms =
             i64::try_from(snapshot_retention(metadata)?.as_millis()).unwrap_or(i64::MAX);
         let log = metadata.metadata_log();
@@ -136,14 +154,4 @@ pub fn snapshot_retention(metadata: &TableMetadata) -> Result<Duration> {
                 })
         }
     }
-}
-
-/// The snapshots the branches and tags of the table `metadata` describes
-/// point at.
-fn referenced_snapshot_ids(metadata: &TableMetadata) -> HashSet<i64> {
-    metadata
-        .refs()
-        .values()
-        .map(|reference| reference.snapshot_id)
-        .collect()
 }

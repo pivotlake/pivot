@@ -486,7 +486,10 @@ impl Table for IcebergTable {
     /// looks again: whatever the winner expired is the winner's to delete,
     /// and only what this commit itself dropped is handed back. A commit
     /// that fails, or whose outcome is unknown, hands back nothing, so
-    /// nothing is deleted for it.
+    /// nothing is deleted for it. A table whose history is not linear (it
+    /// has a branch or a tag besides `main`, or a snapshot that is not an
+    /// ancestor of the current one) is refused before anything is
+    /// committed.
     fn expire_snapshots(&self, now_ms: u64) -> crate::Result<Option<SnapshotExpiry>> {
         let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
         let mut refreshed: Option<IcebergTable> = None;
@@ -511,9 +514,13 @@ impl Table for IcebergTable {
         Ok(None)
     }
 
-    /// Delete, through `storage`, the objects the snapshots `expired` used
-    /// that this version, the one their expiry committed, does not, and the
-    /// previous metadata files `expired` that it no longer names. An object
+    /// Delete, through `storage`, what `expired`, the expiry that committed
+    /// this version, left to delete: the files its snapshots retired, the
+    /// manifests and manifest lists only they name, and the statistics
+    /// files and previous metadata files it dropped
+    /// ([`collect_expired_objects`](iceberg_tables::Table::collect_expired_objects)).
+    /// They are found from the dropped snapshots and the oldest snapshot
+    /// kept, the table's history being linear. An object
     /// outside the table's own directory (a file the table adopted where it
     /// lay) is not the table's to delete and is left. The version hint may
     /// name a metadata file deleted here: a store lists on from the name
@@ -560,15 +567,16 @@ impl Table for IcebergTable {
             snapshots = expired.snapshot_count(),
             metadata_files = expired.metadata_file_count(),
             objects = deleted,
-            "expired snapshots and previous metadata files and deleted the objects only they used"
+            "expired snapshots and previous metadata files and deleted what they left unused"
         );
     }
 
     /// An Iceberg table retires a file by committing a snapshot without it,
-    /// and what a snapshot retired is deleted when the snapshot expires, as
-    /// a metadata file is when the one that replaced it has aged past the
-    /// window ([`delete_snapshot_objects`](Self::delete_snapshot_objects)):
-    /// nothing else is deleted.
+    /// and what a snapshot retired is deleted once every snapshot before it
+    /// has expired, as a metadata file is when the one that replaced it has
+    /// aged past the window
+    /// ([`delete_snapshot_objects`](Self::delete_snapshot_objects)): nothing
+    /// else is deleted.
     fn delete_expired_objects(
         &self,
         _name: &SchemaQualifiedTableName,

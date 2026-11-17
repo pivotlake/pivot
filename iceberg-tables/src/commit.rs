@@ -12,8 +12,9 @@
 //! A commit of files drops no snapshot and no entry of the metadata log.
 //! Snapshots and previous metadata files are expired by a commit of its own
 //! ([`Table::expire_snapshots`]), which hands back what it dropped so the
-//! objects only those snapshots used, and the metadata files, can be
-//! deleted: finding them reads manifests, which no INSERT should wait for.
+//! files those snapshots retired, the manifests and manifest lists only
+//! they name, and the metadata files can be deleted: finding them reads
+//! manifests, which no INSERT should wait for.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -252,7 +253,9 @@ impl Table {
     /// Whether a snapshot or a previous metadata file of this version has
     /// outlived the table's retention window as of `now_ms`: whether
     /// [`expire_snapshots`](Self::expire_snapshots) has anything to commit.
-    /// Read from the metadata held, with nothing read from the store.
+    /// Read from the metadata held, with nothing read from the store. A
+    /// table whose history is not linear is refused
+    /// ([`Error::NonLinearHistory`]).
     pub fn has_expired_history(&self, now_ms: i64) -> Result<bool> {
         Ok(!self.expired_snapshot_ids(now_ms)?.is_empty()
             || !self.expired_metadata_files(now_ms)?.is_empty())
@@ -266,9 +269,14 @@ impl Table {
     /// writer committed the next version first: the caller refreshes and
     /// looks again.
     ///
-    /// The expiry handed back is of a commit that succeeded. An error leaves
-    /// open whether it did ([`Error::may_have_committed`]) and hands back
-    /// nothing to delete by.
+    /// A table whose history is not linear is refused
+    /// ([`Error::NonLinearHistory`]) before anything is committed, so no
+    /// snapshot is dropped whose retired files could then not be found
+    /// ([`collect_expired_objects`](Self::collect_expired_objects)).
+    ///
+    /// The expiry handed back is of a commit that succeeded. An error of
+    /// the commit leaves open whether it did ([`Error::may_have_committed`])
+    /// and hands back nothing to delete by.
     pub fn expire_snapshots(&self, now_ms: i64) -> Result<Option<SnapshotExpiry>> {
         let expired_snapshot_ids = self.expired_snapshot_ids(now_ms)?;
         let expired_metadata_files = self.expired_metadata_files(now_ms)?;

@@ -156,6 +156,22 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+    /// The table's history is not linear, the current snapshot and its
+    /// ancestors with `main` the only reference, which expiring its
+    /// snapshots and deleting what they retired both take it to be.
+    /// `reason` says what makes it not linear.
+    #[error(
+        "table `{table}` is neither expired nor cleaned: {reason}; expiry takes a table's history to be linear, the current snapshot and its ancestors, and branches and tags are not supported yet (https://github.com/pivotlake/pivot/issues/101)"
+    )]
+    NonLinearHistory { table: String, reason: String },
+    /// A manifest that an expiry was about to delete, one of the snapshots
+    /// it dropped, is still listed by the table's current snapshot: some
+    /// snapshot listed again a manifest that an earlier one had stopped
+    /// listing.
+    #[error(
+        "table `{table}` manifest `{manifest}` is listed by the current snapshot, and not by the oldest snapshot an expiry kept, which would delete it with the snapshots it dropped; nothing of the expiry is deleted"
+    )]
+    ExpiredManifestStillListed { table: String, manifest: String },
     #[error("table `{table}` is encrypted; encrypted tables are not read")]
     EncryptedTable { table: String },
     #[error("table `{table}` partition metadata is invalid: {source}")]

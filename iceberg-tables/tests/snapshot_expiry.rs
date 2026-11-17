@@ -1,7 +1,9 @@
 //! Which snapshots and previous metadata files a table expires, and what an
-//! expiry commits and leaves to delete: only what has outlived the retention
-//! window, never what a tag points at, nothing when garbage collection is off,
-//! and never as a side effect of a commit of files.
+//! expiry commits: only what has outlived the retention window, the oldest
+//! snapshots of the table's linear history, nothing when garbage
+//! collection is off, nothing of a table whose history is not linear (it
+//! has a tag, a second branch or a snapshot that is no ancestor of the
+//! current one), and never as a side effect of a commit of files.
 
 mod support;
 
@@ -19,9 +21,10 @@ use iceberg_tables::maintenance::retention::{
 };
 use iceberg_tables::{Error, Table};
 use support::{
-    Fixture, HOUR_MS, append, create_table, entry, live_entry, load, logged_versions, now_unix_ms,
-    paths, publish_changed, version, with_retention_of_one_millisecond,
-    with_tag_on_current_snapshot,
+    Fixture, HOUR_MS, append, avro_objects, create_table, entry, is_non_linear_history_error,
+    list_expired_objects, load, logged_versions, now_unix_ms, paths, publish_changed, replace,
+    version, with_branch_on_current_snapshot, with_retention_of_one_millisecond,
+    with_staged_snapshot, with_tag_on_current_snapshot,
 };
 
 const WINDOW_MS: i64 = DEFAULT_SNAPSHOT_RETENTION.as_millis() as i64;
@@ -42,31 +45,86 @@ fn a_commit_drops_no_snapshot_however_far_past_the_window() {
     assert_eq!(paths(&table), ["a.parquet", "b.parquet", "c.parquet"]);
 }
 
+/// What a try at expiring a table left of it.
+struct RefusedExpiry {
+    /// The error the try failed with; `None` when it did not fail.
+    error: Option<Error>,
+    /// Whether the table has the versions, the snapshots and the manifests
+    /// and manifest lists it had before the try.
+    is_table_untouched: bool,
+}
+
+/// Try to expire `table`, the fixture's current version, far past its
+/// window.
+fn try_to_expire(fixture: &Fixture, table: &Table) -> RefusedExpiry {
+    let versions_before = fixture.metadata_store.count_versions();
+    let snapshots_before = table.metadata().snapshots().len();
+    let objects_before = avro_objects(&fixture.location);
+    let error = table.expire_snapshots(now_unix_ms() + 100 * HOUR_MS).err();
+    RefusedExpiry {
+        error,
+        is_table_untouched: fixture.metadata_store.count_versions() == versions_before
+            && load(fixture).metadata().snapshots().len() == snapshots_before
+            && avro_objects(&fixture.location) == objects_before,
+    }
+}
+
 #[test]
-fn a_tagged_snapshot_outlives_the_window_and_commits_keep_landing() {
+fn a_table_with_a_tag_is_refused_before_anything_expires_and_commits_keep_landing() {
     let (fixture, created) = create_table(&[]);
     let table = append(&created, vec![entry("a", 1, 1, 1)]);
-    let tagged_snapshot_id = table.metadata().current_snapshot_id().unwrap();
     let table = with_tag_on_current_snapshot(&fixture, &table);
     let table = append(&table, vec![entry("b", 1, 2, 2)]);
-    let untagged_snapshot_id = table.metadata().current_snapshot_id().unwrap();
     let table = append(&table, vec![entry("c", 1, 3, 3)]);
 
-    let much_later = now_unix_ms() + 100 * HOUR_MS;
-    let table = table.expire_snapshots(much_later).unwrap().unwrap().table;
+    let refused = try_to_expire(&fixture, &table);
     let table = append(&table, vec![entry("d", 1, 4, 4)]);
+    let table = replace(&table, &["a.parquet"], "e");
 
-    let snapshot_ids: Vec<i64> = table
-        .metadata()
-        .snapshots()
-        .map(|snapshot| snapshot.snapshot_id())
-        .collect();
-    assert!(snapshot_ids.contains(&tagged_snapshot_id));
-    assert!(!snapshot_ids.contains(&untagged_snapshot_id));
+    assert!(
+        refused
+            .error
+            .as_ref()
+            .is_some_and(is_non_linear_history_error)
+    );
+    assert!(refused.is_table_untouched);
+    assert_eq!(table.metadata().snapshots().len(), 5);
     assert_eq!(
         paths(&table),
-        ["a.parquet", "b.parquet", "c.parquet", "d.parquet"]
+        ["b.parquet", "c.parquet", "d.parquet", "e.parquet"]
     );
+}
+
+#[test]
+fn a_table_with_a_second_branch_is_refused_before_anything_expires() {
+    let (fixture, created) = create_table(&[]);
+    let table = append(&created, vec![entry("a", 1, 1, 1)]);
+    let table = with_branch_on_current_snapshot(&fixture, &table);
+    let table = append(&table, vec![entry("b", 1, 2, 2)]);
+
+    let refused = try_to_expire(&fixture, &table);
+
+    let error = refused.error.expect("the table has a second branch");
+    assert!(is_non_linear_history_error(&error), "{error}");
+    assert!(error.to_string().contains("branch `audit`"), "{error}");
+    assert!(refused.is_table_untouched);
+}
+
+#[test]
+fn a_table_with_a_snapshot_outside_its_linear_history_is_refused_before_anything_expires() {
+    let (fixture, created) = create_table(&[]);
+    let table = append(&created, vec![entry("a", 1, 1, 1)]);
+    let table = append(&table, vec![entry("b", 1, 2, 2)]);
+    let table = with_staged_snapshot(&fixture, &table);
+
+    let refused = try_to_expire(&fixture, &table);
+
+    let error = refused
+        .error
+        .expect("the table has a snapshot outside its linear history");
+    assert!(is_non_linear_history_error(&error), "{error}");
+    assert!(error.to_string().contains("ancestor"), "{error}");
+    assert!(refused.is_table_untouched);
 }
 
 #[test]
@@ -95,114 +153,12 @@ fn expiry_alone_commits_a_metadata_only_version() {
     assert_eq!(paths(&expired), paths(&table));
 }
 
-/// The table's names for the objects `expiry` leaves to delete, sorted.
-fn objects_of(expiry: &SnapshotExpiry) -> Vec<String> {
-    let mut objects: Vec<String> = expiry
-        .table
-        .collect_expired_objects(&expiry.expired)
-        .unwrap()
-        .iter()
-        .map(|path| path.to_string())
-        .collect();
-    objects.sort_unstable();
-    objects
-}
-
-/// The table's names for the objects an expiry `far_later` leaves to
-/// delete for the snapshots it dropped, sorted: the metadata files it
-/// dropped are left out.
-fn expired_snapshot_objects(table: &Table) -> Vec<String> {
-    let far_later = now_unix_ms() + 100 * HOUR_MS;
-    let expiry = table.expire_snapshots(far_later).unwrap().unwrap();
-    let mut objects = objects_of(&expiry);
-    objects.retain(|object| !object.ends_with(".metadata.json"));
-    objects
-}
-
 /// The versions of the metadata files `expiry` leaves to delete.
 fn expired_metadata_versions(fixture: &Fixture, expiry: &SnapshotExpiry) -> Vec<u64> {
-    objects_of(expiry)
+    list_expired_objects(expiry)
         .iter()
         .filter_map(|object| fixture.metadata_store.find_version_number(object))
         .collect()
-}
-
-/// The table's names for the manifest list and the manifests of
-/// `table`'s current snapshot.
-fn current_snapshot_objects(table: &Table) -> Vec<String> {
-    let location = table.location();
-    let list = table.metadata().current_snapshot().unwrap().manifest_list();
-    let manifests = table.manifest_list();
-    std::iter::once(list)
-        .chain(
-            manifests
-                .data_manifests()
-                .chain(manifests.delete_manifests())
-                .map(|manifest| manifest.manifest_path.as_str()),
-        )
-        .map(|uri| location.file_path_for_uri(uri).unwrap().to_string())
-        .collect()
-}
-
-#[test]
-fn an_expiry_leaves_to_delete_what_only_its_snapshots_used() {
-    let (_fixture, created) = create_table(&[]);
-    let appended = append(&created, vec![entry("a", 1, 1, 1), entry("b", 1, 2, 2)]);
-    let removed = live_entry(&appended, "a.parquet");
-    let replaced = appended
-        .commit(&[removed], vec![entry("c", 1, 1, 1)])
-        .unwrap()
-        .unwrap();
-
-    let objects = expired_snapshot_objects(&replaced);
-
-    let mut expected = current_snapshot_objects(&appended);
-    expected.push("a.parquet".to_string());
-    expected.sort_unstable();
-    assert_eq!(objects, expected);
-}
-
-#[test]
-fn an_expiry_leaves_what_a_retained_snapshot_shares_with_an_expired_one() {
-    let (_fixture, created) = create_table(&[]);
-    let first = append(&created, vec![entry("a", 1, 1, 1)]);
-    let second = append(&first, vec![entry("b", 1, 2, 2)]);
-
-    let objects = expired_snapshot_objects(&second);
-
-    let first_list = first.metadata().current_snapshot().unwrap().manifest_list();
-    assert_eq!(
-        objects,
-        [second
-            .location()
-            .file_path_for_uri(first_list)
-            .unwrap()
-            .to_string()],
-        "the first snapshot's manifest, and the file in it, are the second's too"
-    );
-}
-
-#[test]
-fn an_expiry_leaves_what_a_tagged_snapshot_uses() {
-    let (fixture, created) = create_table(&[]);
-    let appended = append(&created, vec![entry("a", 1, 1, 1)]);
-    let tagged = with_tag_on_current_snapshot(&fixture, &appended);
-    let removed = live_entry(&tagged, "a.parquet");
-    let replaced = tagged
-        .commit(&[removed], vec![entry("b", 1, 1, 1)])
-        .unwrap()
-        .unwrap();
-    let replaced = append(&replaced, vec![entry("c", 1, 2, 2)]);
-
-    let objects = expired_snapshot_objects(&replaced);
-
-    let kept = current_snapshot_objects(&appended);
-    assert!(!objects.contains(&"a.parquet".to_string()), "{objects:?}");
-    assert!(
-        kept.iter().all(|object| !objects.contains(object)),
-        "{objects:?}"
-    );
-    assert!(!objects.is_empty(), "the untagged replace expired");
 }
 
 #[test]
@@ -425,10 +381,30 @@ fn a_malformed_window_is_an_error() {
 }
 
 #[test]
-fn a_snapshot_a_tag_points_at_does_not_expire() {
+fn a_snapshot_inside_the_window_keeps_every_snapshot_after_it() {
+    let history = HandMadeHistory::new();
+    // The writer of the third snapshot dated it thirty seconds before the
+    // second.
+    let table = history.build_table_with_snapshots(
+        &[0, HOUR_MS, HOUR_MS - 30 * SECOND_MS, 2 * HOUR_MS],
+        HashMap::new(),
+    );
+
+    let expired = table
+        .expired_snapshot_ids(5 * HOUR_MS - 10 * SECOND_MS)
+        .unwrap();
+
+    // The second snapshot's successor is past the window by its own date,
+    // but the first one's is not, and a history gives up its oldest
+    // snapshot first.
+    assert!(expired.is_empty(), "{expired:?}");
+}
+
+#[test]
+fn a_table_with_a_tag_expires_no_snapshot_and_no_metadata_file() {
     let history = HandMadeHistory::new();
     let metadata = history
-        .build_metadata_with_snapshots(&[0, HOUR_MS, 2 * HOUR_MS], HashMap::new())
+        .build_metadata_with_metadata_files(&[0, HOUR_MS, 2 * HOUR_MS], HashMap::new())
         .into_builder(None)
         .set_ref(
             "release",
@@ -445,9 +421,21 @@ fn a_snapshot_a_tag_points_at_does_not_expire() {
         .metadata;
     let table = history.build_table_at(metadata);
 
-    let expired = table.expired_snapshot_ids(100 * HOUR_MS).unwrap();
+    let snapshots_refusal = table.expired_snapshot_ids(100 * HOUR_MS).unwrap_err();
+    let metadata_files_refusal = table.expired_metadata_files(100 * HOUR_MS).unwrap_err();
 
-    assert_eq!(expired, vec![2]);
+    assert!(
+        is_non_linear_history_error(&snapshots_refusal),
+        "{snapshots_refusal}"
+    );
+    assert!(
+        snapshots_refusal.to_string().contains("tag `release`"),
+        "{snapshots_refusal}"
+    );
+    assert!(
+        is_non_linear_history_error(&metadata_files_refusal),
+        "{metadata_files_refusal}"
+    );
 }
 
 #[test]

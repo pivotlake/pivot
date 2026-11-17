@@ -103,6 +103,14 @@ fn sum_deleted_rows(by_data_file: &HashMap<String, DeletionVectorMetadata>) -> R
         })
 }
 
+/// Whether `file`, which a manifest entry names, is a deletion vector: the
+/// deleted positions of one data file, kept as one blob of a Puffin file
+/// that holds the vectors of every data file its commit touched.
+pub(crate) fn is_deletion_vector(file: &iceberg::spec::DataFile) -> bool {
+    file.content_type() == DataContentType::PositionDeletes
+        && file.file_format() == DataFileFormat::Puffin
+}
+
 /// Where the deletion vector each live entry of `manifests` declares lies,
 /// by the data file it applies to. A snapshot keeps one per data file: a
 /// second one is corrupt, not a second set of deletes.
@@ -113,9 +121,7 @@ fn locate_deletion_vectors(
     for manifest in manifests {
         for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
             let file = entry.data_file();
-            let is_deletion_vector = file.content_type() == DataContentType::PositionDeletes
-                && file.file_format() == DataFileFormat::Puffin;
-            if !is_deletion_vector {
+            if !is_deletion_vector(file) {
                 return Err(Error::DeleteFile {
                     file: file.file_path().to_string(),
                 });

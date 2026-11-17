@@ -14,11 +14,11 @@ use catalog::datastore::DatastoreTableMetadata;
 use dispatch::io::{LocalFile, OpenFile};
 use dispatch::{DataFlowDispatcher, Dispatch};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder, Transform, UnboundPartitionSpec};
-use iceberg_tables::commit::TableCreation;
+use iceberg_tables::commit::{SnapshotExpiry, TableCreation};
 use iceberg_tables::files::data_files::DataFileEntry;
 use iceberg_tables::maintenance::retention::SNAPSHOT_RETENTION_PROPERTY;
-use iceberg_tables::test_support::MemoryMetadataStore;
-use iceberg_tables::{IndexedFile, Lineage, MetadataFile, Table, TableLocation};
+use iceberg_tables::test_support::{Faults, FaultyStore, MemoryMetadataStore};
+use iceberg_tables::{Error, IndexedFile, Lineage, MetadataFile, Table, TableLocation};
 use object_storage::{DataFileLocation, FileRef, LocalStore, ObjectPath, ObjectStore};
 use parquet::arrow::ArrowWriter;
 use parquet_engine::{FileStats, PartitionValues};
@@ -44,6 +44,15 @@ pub fn now_unix_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+/// The wall clock at a moment no commit is dated at: every commit before
+/// the call is dated earlier and every commit after it later.
+pub fn pause_between_commits() -> i64 {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let paused_at = now_unix_ms();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    paused_at
 }
 
 /// The name every fixture's table is known by.
@@ -263,6 +272,29 @@ pub fn load(fixture: &Fixture) -> Table {
     .unwrap()
 }
 
+/// The fixture's table location over a store that fails the way `faults`
+/// says.
+pub fn open_faulty_location(fixture: &Fixture, faults: &Arc<Faults>) -> TableLocation {
+    let store: Arc<dyn ObjectStore> = Arc::new(FaultyStore {
+        inner: Arc::clone(fixture.location.store()),
+        faults: Arc::clone(faults),
+    });
+    TableLocation::in_datastore_store("main.t", store, ObjectPath::new("t1")).unwrap()
+}
+
+/// The fixture's table as a writer loads it whose store fails the way
+/// `faults` says, and counts the whole objects read from it.
+pub fn load_over_faulty_store(fixture: &Fixture, faults: &Arc<Faults>) -> Table {
+    let location = open_faulty_location(fixture, faults);
+    Table::load(
+        &test_pool(),
+        fixture.metadata_store.clone(),
+        location,
+        &table_name(),
+    )
+    .unwrap()
+}
+
 /// The table after `change` to its current metadata is published as
 /// its next version, the way another tool alters a table.
 pub fn publish_changed(
@@ -301,6 +333,72 @@ pub fn with_tag_on_current_snapshot(fixture: &Fixture, table: &Table) -> Table {
             )
             .unwrap()
     })
+}
+
+/// `table` with a second branch, `audit`, on its current snapshot.
+pub fn with_branch_on_current_snapshot(fixture: &Fixture, table: &Table) -> Table {
+    use iceberg::spec::{SnapshotReference, SnapshotRetention};
+    let branched_snapshot_id = table.metadata().current_snapshot_id().unwrap();
+    publish_changed(fixture, |builder| {
+        builder
+            .set_ref(
+                "audit",
+                SnapshotReference::new(
+                    branched_snapshot_id,
+                    SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                ),
+            )
+            .unwrap()
+    })
+}
+
+/// `table` with one more snapshot that no reference points at: a child of
+/// its current snapshot that was written and never made current, naming
+/// the current snapshot's manifest list.
+pub fn with_staged_snapshot(fixture: &Fixture, table: &Table) -> Table {
+    use iceberg::spec::{Operation, Snapshot, Summary};
+    let metadata = table.metadata();
+    let current = metadata.current_snapshot().unwrap();
+    let staged = Snapshot::builder()
+        .with_snapshot_id(current.snapshot_id().wrapping_add(1))
+        .with_parent_snapshot_id(Some(current.snapshot_id()))
+        .with_sequence_number(metadata.last_sequence_number() + 1)
+        .with_timestamp_ms(now_unix_ms())
+        .with_manifest_list(current.manifest_list().to_string())
+        .with_summary(Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::new(),
+        })
+        .with_schema_id(metadata.current_schema_id())
+        .with_row_range(metadata.next_row_id(), 0)
+        .build();
+    publish_changed(fixture, |builder| builder.add_snapshot(staged).unwrap())
+}
+
+/// The fixture's table set to merge its data manifests into one as soon
+/// as a commit lists two of them.
+pub fn lower_manifest_merge_threshold(fixture: &Fixture) -> Table {
+    publish_changed(fixture, |builder| {
+        builder
+            .set_properties(HashMap::from([(
+                "commit.manifest.min-count-to-merge".to_string(),
+                "2".to_string(),
+            )]))
+            .unwrap()
+    })
+}
+
+/// Whether `error` refuses a table because its history is not linear,
+/// naming the issue that tracks branches and tags.
+pub fn is_non_linear_history_error(error: &Error) -> bool {
+    matches!(error, Error::NonLinearHistory { .. })
+        && error
+            .to_string()
+            .contains("https://github.com/pivotlake/pivot/issues/101")
 }
 
 /// An entry for `name` holding `rows` rows of `v` in `low..=high`.
@@ -344,6 +442,29 @@ pub fn append(table: &Table, entries: Vec<DataFileEntry>) -> Table {
         .commit(&[], entries)
         .unwrap()
         .expect("no other writer")
+}
+
+/// `table` after a commit that replaces its live files at `removed` with
+/// one file named `added`, as a compaction does.
+pub fn replace(table: &Table, removed: &[&str], added: &str) -> Table {
+    let removed: Vec<DataFileEntry> = removed.iter().map(|path| live_entry(table, path)).collect();
+    table
+        .commit(&removed, vec![entry(added, 1, 1, 1)])
+        .unwrap()
+        .expect("no other writer")
+}
+
+/// The table's names for the objects `expiry` leaves to delete, sorted.
+pub fn list_expired_objects(expiry: &SnapshotExpiry) -> Vec<String> {
+    let mut objects: Vec<String> = expiry
+        .table
+        .collect_expired_objects(&expiry.expired)
+        .unwrap()
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
+    objects.sort_unstable();
+    objects
 }
 
 /// Which version of the fixture's table, counted from 1, `table` is at.

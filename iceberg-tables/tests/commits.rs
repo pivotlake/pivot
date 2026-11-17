@@ -17,41 +17,17 @@ use iceberg::spec::{
 };
 use iceberg::table::Table as SpecTable;
 use iceberg::{NamespaceIdent, TableIdent};
-use iceberg_tables::test_support::{Faults, FaultyStore};
+use iceberg_tables::test_support::Faults;
 use iceberg_tables::types::schema::build_schema;
-use iceberg_tables::{Error, MetadataFile, Table, TableLocation, block_on};
-use object_storage::{ObjectPath, ObjectStore};
+use iceberg_tables::{Error, MetadataFile, Table, block_on};
 use parquet_engine::{PartitionValues, scalar_equal};
 use planner::catalog::Column;
 use planner::types::Type;
 use support::{
-    Fixture, append, avro_objects, columns, count_manifests, create_table,
-    create_table_laid_out_by, entry, int_scalar, live_entry, load, partition_entry, paths,
-    paths_in_order, repartition, table_name, test_pool, version,
+    append, avro_objects, columns, count_manifests, create_table, create_table_laid_out_by, entry,
+    int_scalar, live_entry, load, load_over_faulty_store, partition_entry, paths, paths_in_order,
+    repartition, version,
 };
-
-/// The fixture's table location over a store that fails the way `faults`
-/// says.
-fn open_faulty_location(fixture: &Fixture, faults: &Arc<Faults>) -> TableLocation {
-    let store: Arc<dyn ObjectStore> = Arc::new(FaultyStore {
-        inner: Arc::clone(fixture.location.store()),
-        faults: Arc::clone(faults),
-    });
-    TableLocation::in_datastore_store("main.t", store, ObjectPath::new("t1")).unwrap()
-}
-
-/// The fixture's table as a writer loads it whose store fails the way
-/// `faults` says.
-fn load_over_faulty_store(fixture: &Fixture, faults: &Arc<Faults>) -> Table {
-    let location = open_faulty_location(fixture, faults);
-    Table::load(
-        &test_pool(),
-        fixture.metadata_store.clone(),
-        location,
-        &table_name(),
-    )
-    .unwrap()
-}
 
 /// What a version's manifests record of one live file, with what a
 /// manifest leaves implicit inherited from its manifest-list entry.

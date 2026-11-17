@@ -10,13 +10,16 @@
 //! One round ([`Vacuumer::vacuum_all`]) is what the datastore's timer runs
 //! and what the SQL `VACUUM` command runs. What it deletes is the format's
 //! to say: an Iceberg table expires the snapshots and the previous metadata
-//! files its retention allows and deletes exactly those files and the
-//! objects only those snapshots used, found from the table's own metadata
+//! files its retention allows and deletes exactly those metadata files and
+//! what the expired snapshots retired, found from the table's own metadata
 //! with no listing of its directory
 //! ([`Table::expire_snapshots`](crate::table_format::Table::expire_snapshots),
 //! then
 //! [`Table::delete_snapshot_objects`](crate::table_format::Table::delete_snapshot_objects)),
-//! so a file no metadata ever named is not reclaimed; a Delta table lists
+//! so a file no metadata ever named is not reclaimed, and an Iceberg table
+//! whose history is not linear (it has a branch or a tag besides `main`)
+//! is refused: its round fails with nothing expired and nothing deleted; a
+//! Delta table lists
 //! its directory, dates a retired file by its `Remove` tombstone and an
 //! orphan by its storage mtime, deletes each past the table's deleted-file
 //! retention and deletes the log files a checkpoint superseded
@@ -144,7 +147,9 @@ impl Vacuumer {
     /// One table's round: reload it to its latest version (so a vacuumer on a
     /// shared remote store sees commits another process wrote), expire its
     /// snapshots and publish the version that wrote, then delete what the
-    /// expired snapshots alone used and whatever else the format retires.
+    /// expired snapshots left unused and whatever else the format retires.
+    /// A table its format refuses to expire fails here before anything is
+    /// committed or deleted.
     fn vacuum_table(
         &self,
         name: &SchemaQualifiedTableName,

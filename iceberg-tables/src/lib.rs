@@ -23,8 +23,9 @@
 //!   ([`table`]);
 //! - building the next version on top of one ([`commit`]);
 //! - which snapshots and previous metadata files have expired
-//!   ([`maintenance::retention`]), and what the retained ones still use and
-//!   an expiry leaves to delete ([`maintenance::expired_objects`]);
+//!   ([`maintenance::retention`]), and what an expiry leaves to delete,
+//!   found from the snapshots it dropped and the oldest one it kept
+//!   ([`maintenance::expired_objects`]);
 //! - the partition keys an INSERT's files are cut by, computed from the
 //!   spec's transforms ([`types::partitioning`]), and the dataflow that
 //!   writes the files ([`io::sink`]).

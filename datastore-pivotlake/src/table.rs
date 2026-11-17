@@ -368,9 +368,9 @@ impl CatalogTable {
         Ok(Some(expiry.expired))
     }
 
-    /// Delete the objects the snapshots `expired` used that this copy's
-    /// version, the one their expiry committed, does not, logging what
-    /// could not be deleted; see `Table::delete_snapshot_objects`.
+    /// Delete what the snapshots `expired` left unused in this copy's
+    /// version, the one their expiry committed, logging what could not be
+    /// deleted; see `Table::delete_snapshot_objects`.
     pub(crate) fn delete_snapshot_objects(&self, expired: &ExpiredSnapshots) {
         self.table.delete_snapshot_objects(&self.storage, expired)
     }
