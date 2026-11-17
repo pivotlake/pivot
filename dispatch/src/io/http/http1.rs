@@ -33,6 +33,10 @@ pub enum Http1Error {
     InvalidContentLength,
     #[error("body longer than declared Content-Length")]
     BodyOverflow,
+    #[error("malformed chunked body")]
+    MalformedChunk,
+    #[error("connection closed before the response body completed")]
+    TruncatedBody,
 }
 
 /// A parsed response head.
@@ -45,6 +49,8 @@ pub struct ParsedHead {
     pub status: u16,
     /// `Content-Length`, if the header was present (and a valid integer).
     pub content_length: Option<u64>,
+    /// Whether `Transfer-Encoding` says the body comes in chunks.
+    pub is_chunked: bool,
     /// The `ETag` header as the server sent it, quotes included, if the
     /// response carries one.
     pub etag: Option<String>,
@@ -84,6 +90,16 @@ pub fn parse_response_head(buf: &[u8]) -> Result<HeadStatus, Http1Error> {
         None => None,
     };
 
+    let is_chunked = resp
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
+        .any(|h| {
+            String::from_utf8_lossy(h.value)
+                .split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+        });
+
     let etag = resp
         .headers
         .iter()
@@ -94,8 +110,133 @@ pub fn parse_response_head(buf: &[u8]) -> Result<HeadStatus, Http1Error> {
         head_len,
         status,
         content_length,
+        is_chunked,
         etag,
     }))
+}
+
+/// How a response says where its body ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyFraming {
+    /// The body is this many bytes.
+    Length(u64),
+    /// The body comes in chunks, each led by its size, and ends with a chunk
+    /// of no bytes.
+    Chunked,
+    /// The body is everything the peer sends before it closes the
+    /// connection.
+    UntilClose,
+}
+
+impl BodyFraming {
+    /// The framing of the body under `head`. A chunked transfer encoding
+    /// takes precedence over a `Content-Length`, as HTTP/1.1 has it.
+    pub fn of(head: &ParsedHead) -> Self {
+        match head.content_length {
+            _ if head.is_chunked => Self::Chunked,
+            Some(length) => Self::Length(length),
+            None => Self::UntilClose,
+        }
+    }
+}
+
+/// A response body that is kept whole, such as the small document an object
+/// store answers a `POST` with. The transport hands it the body bytes as they
+/// arrive and asks whether the body is all there.
+#[derive(Debug)]
+pub struct KeptBody {
+    framing: BodyFraming,
+    /// The bytes received, as they came off the connection.
+    received: Vec<u8>,
+    /// The body, once all of it has arrived.
+    body: Option<Vec<u8>>,
+}
+
+impl KeptBody {
+    pub fn new(framing: BodyFraming) -> Self {
+        let mut kept = Self {
+            framing,
+            received: Vec::new(),
+            body: None,
+        };
+        if framing == BodyFraming::Length(0) {
+            kept.body = Some(Vec::new());
+        }
+        kept
+    }
+
+    /// Take `bytes`, the next of the response after its head.
+    pub fn receive(&mut self, bytes: &[u8]) -> Result<(), Http1Error> {
+        if self.body.is_some() {
+            return Ok(());
+        }
+        self.received.extend_from_slice(bytes);
+        match self.framing {
+            BodyFraming::Length(length) => {
+                if self.received.len() as u64 >= length {
+                    self.received.truncate(length as usize);
+                    self.body = Some(std::mem::take(&mut self.received));
+                }
+            }
+            BodyFraming::Chunked => self.body = Self::decode_chunks(&self.received)?,
+            BodyFraming::UntilClose => {}
+        }
+        Ok(())
+    }
+
+    /// Record that the peer closed the connection. That ends a body framed
+    /// by the close, and cuts any other short.
+    pub fn record_peer_closed(&mut self) -> Result<(), Http1Error> {
+        if self.body.is_some() {
+            return Ok(());
+        }
+        if self.framing != BodyFraming::UntilClose {
+            return Err(Http1Error::TruncatedBody);
+        }
+        self.body = Some(std::mem::take(&mut self.received));
+        Ok(())
+    }
+
+    /// Whether the whole body has arrived.
+    pub fn is_complete(&self) -> bool {
+        self.body.is_some()
+    }
+
+    /// The body. Empty until it [is complete](Self::is_complete).
+    pub fn take_body(&mut self) -> Vec<u8> {
+        self.body.take().unwrap_or_default()
+    }
+
+    /// The body `encoded` holds in chunks, or `None` while its last chunk,
+    /// the one of no bytes, has not arrived.
+    fn decode_chunks(encoded: &[u8]) -> Result<Option<Vec<u8>>, Http1Error> {
+        let mut body = Vec::new();
+        let mut rest = encoded;
+        loop {
+            let Some(line_end) = rest.windows(2).position(|pair| pair == b"\r\n") else {
+                return Ok(None);
+            };
+            // A chunk's size is in hexadecimal, and may be followed by
+            // extensions after a semicolon.
+            let size_text =
+                std::str::from_utf8(&rest[..line_end]).map_err(|_| Http1Error::MalformedChunk)?;
+            let size_digits = size_text.split(';').next().unwrap_or("").trim();
+            let size =
+                usize::from_str_radix(size_digits, 16).map_err(|_| Http1Error::MalformedChunk)?;
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                return Ok(Some(body));
+            }
+            if rest.len() < size + 2 {
+                return Ok(None);
+            }
+            if &rest[size..size + 2] != b"\r\n" {
+                return Err(Http1Error::MalformedChunk);
+            }
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
 }
 
 /// What the transport should do to read more of the (identity) body.
@@ -175,6 +316,49 @@ mod tests {
             HeadStatus::Complete(h) => h,
             HeadStatus::Incomplete => panic!("expected complete head"),
         }
+    }
+
+    #[test]
+    fn a_chunked_body_is_whole_once_its_last_chunk_arrives() {
+        let mut kept = KeptBody::new(BodyFraming::Chunked);
+
+        kept.receive(b"3\r\nabc\r\n2;name=value\r\nde\r\n").unwrap();
+        let was_complete_before_the_last_chunk = kept.is_complete();
+        kept.receive(b"0\r\n\r\n").unwrap();
+
+        assert!(!was_complete_before_the_last_chunk);
+        assert_eq!(kept.take_body(), b"abcde");
+    }
+
+    #[test]
+    fn a_body_framed_by_the_close_ends_when_the_peer_closes() {
+        let mut kept = KeptBody::new(BodyFraming::UntilClose);
+
+        kept.receive(b"<Done/>").unwrap();
+        let was_complete_before_the_close = kept.is_complete();
+        kept.record_peer_closed().unwrap();
+
+        assert!(!was_complete_before_the_close);
+        assert_eq!(kept.take_body(), b"<Done/>");
+    }
+
+    #[test]
+    fn a_close_before_the_declared_length_is_a_truncated_body() {
+        let mut kept = KeptBody::new(BodyFraming::Length(10));
+
+        kept.receive(b"short").unwrap();
+        let outcome = kept.record_peer_closed();
+
+        assert!(matches!(outcome, Err(Http1Error::TruncatedBody)));
+    }
+
+    #[test]
+    fn a_chunked_transfer_encoding_is_read_from_the_head() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+        let head = parse(raw);
+
+        assert_eq!(BodyFraming::of(&head), BodyFraming::Chunked);
     }
 
     #[test]

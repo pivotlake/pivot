@@ -11,12 +11,13 @@
 //! dictionary pages before data pages, and their offsets and statistics are
 //! recorded in the footer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::thrift::footer::{
-    ColumnChunk, ColumnMetaData, ColumnOrder, FileMetaData, LogicalType, RowGroup, SchemaElement,
+    ColumnChunk, ColumnIndex, ColumnMetaData, ColumnOrder, FileMetaData, LogicalType, OffsetIndex,
+    PageLocation, RowGroup, SchemaElement,
 };
 use crate::thrift::general::Encoding;
 use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
@@ -25,9 +26,11 @@ use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 
 use dispatch::memory::{FileBytes, Slab, SlabAllocator};
 
+use super::compaction::MemoryReservation;
 use super::error::{WriteError, WriteResult};
 use super::types::{
     AssembledFile, EncodedLeaf, EncodedLeafChunk, FileId, RowGroupContext, RowGroupId,
+    WrittenFileMetadata,
 };
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -149,12 +152,315 @@ impl Unary<EncodedLeafChunk, AssembledFile> for FileAssembler {
     }
 }
 
-/// Encoded bytes and footer column metadata for one row group. Column offsets
-/// are relative to the row group until `build_file` rebases them.
+/// Assembles each row group of a merge and hands the row groups on one at a
+/// time, in file order, for a writer that appends them to a file as they
+/// come. Parallel encoding may complete row groups out of order, so one that
+/// is ahead of its turn waits here.
+#[derive(Default)]
+pub(super) struct RowGroupAssembler {
+    chunks_by_row_group: HashMap<RowGroupId, Gathering<EncodedLeafChunk>>,
+    assembled: BTreeMap<RowGroupId, EncodedRowGroup>,
+    next_row_group_id: RowGroupId,
+}
+
+pub(super) fn row_group_assembler_factories(
+    worker_count: usize,
+) -> Vec<DefaultUnaryFactory<RowGroupAssembler>> {
+    DefaultUnaryFactory::create_for_workers(worker_count)
+}
+
+impl Unary<EncodedLeafChunk, EncodedRowGroup> for RowGroupAssembler {
+    fn consume(
+        &mut self,
+        chunk: EncodedLeafChunk,
+        sender: &mut dyn Sender<EncodedRowGroup>,
+        _io: &mut dispatch::OperatorIO,
+    ) -> UnaryResult<()> {
+        let row_group_id = chunk.context.row_group_id;
+        let leaf_count = chunk.context.leaf_count;
+        let context = chunk.context.clone();
+        if !self
+            .chunks_by_row_group
+            .entry(row_group_id)
+            .or_insert_with(|| Gathering::new(leaf_count, context))
+            .push(chunk)
+        {
+            return Ok(());
+        }
+        let Gathering {
+            context,
+            items: chunks,
+            ..
+        } = self.chunks_by_row_group.remove(&row_group_id).unwrap();
+        let group = AssembledRowGroup::new(row_group_id, chunks)?;
+        // The row group's rows are encoded and no longer needed decoded, so
+        // the memory reserved for them is given back as `context` goes, and
+        // the row group holds only what its encoded bytes take.
+        let memory_reservations = context
+            .memory_reservations
+            .first()
+            .map(|rows_memory| rows_memory.reserve_encoded_row_group(group.bytes.len()))
+            .into_iter()
+            .collect();
+        self.assembled.insert(
+            row_group_id,
+            EncodedRowGroup {
+                group,
+                memory_reservations,
+            },
+        );
+        while let Some(group) = self.assembled.remove(&self.next_row_group_id) {
+            self.next_row_group_id += 1;
+            sender.send(group)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, _sender: &mut dyn Sender<EncodedRowGroup>) -> UnaryResult<bool> {
+        assert!(
+            self.chunks_by_row_group.is_empty() && self.assembled.is_empty(),
+            "every row group of the merge was assembled and handed on"
+        );
+        Ok(true)
+    }
+}
+
+/// One encoded row group, complete and ready to be appended to a file through
+/// a [`ParquetFileBuilder`].
+pub struct EncodedRowGroup {
+    group: AssembledRowGroup,
+    memory_reservations: Vec<Arc<MemoryReservation>>,
+}
+
+impl EncodedRowGroup {
+    /// How many bytes the row group takes in a file.
+    pub fn byte_len(&self) -> usize {
+        self.group.bytes.len()
+    }
+
+    /// Take the memory reserved for the row group's rows. Its writer drops
+    /// it once the row group is stored.
+    pub fn take_memory_reservations(&mut self) -> Vec<Arc<MemoryReservation>> {
+        std::mem::take(&mut self.memory_reservations)
+    }
+
+    /// How many rows the row group holds.
+    pub fn row_count(&self) -> usize {
+        self.group
+            .columns
+            .first()
+            .and_then(|chunk| chunk.meta_data.as_ref())
+            .map_or(0, |meta| meta.num_values as usize)
+    }
+}
+
+/// Lays a Parquet file out a row group at a time, for a writer that appends
+/// each piece where the last one ended: every appended row group returns the
+/// bytes that come next in the file, and finishing returns the page index and
+/// the footer.
+pub struct ParquetFileBuilder {
+    schema: SchemaRef,
+    row_groups: Vec<RowGroup>,
+    /// The page index of every chunk of `row_groups`, kept until the file
+    /// ends: the index is written after the last row group.
+    page_indexes: Vec<Vec<ChunkPageIndex>>,
+    row_count: i64,
+    /// How many bytes of the file have been handed out.
+    len: usize,
+    row_group_bytes: usize,
+}
+
+impl ParquetFileBuilder {
+    /// A file of `schema` with nothing in it yet.
+    pub fn new(schema: SchemaRef) -> Self {
+        Self {
+            schema,
+            row_groups: Vec::new(),
+            page_indexes: Vec::new(),
+            row_count: 0,
+            len: 0,
+            row_group_bytes: 0,
+        }
+    }
+
+    /// How many bytes the appended row groups take, without the file's
+    /// leading magic or its footer.
+    pub fn row_group_bytes(&self) -> usize {
+        self.row_group_bytes
+    }
+
+    /// The leading magic, when nothing of the file has been handed out.
+    fn start_file(&mut self, allocator: &mut SlabAllocator) -> FileBytes {
+        let mut out = FileBytes::new();
+        if self.len == 0 {
+            out.push_slab(run_of(PARQUET_MAGIC, allocator));
+            self.len = out.len();
+        }
+        out
+    }
+
+    /// Add `group` as the file's next row group and return the bytes that go
+    /// at the file's current end.
+    pub fn append_row_group(
+        &mut self,
+        group: EncodedRowGroup,
+        allocator: &mut SlabAllocator,
+    ) -> FileBytes {
+        let mut out = self.start_file(allocator);
+        let group = group.group;
+        let base = self.len as i64;
+        self.len += group.bytes.len();
+        self.row_group_bytes += group.bytes.len();
+        out.append(group.bytes);
+
+        // Rebase each column's page offsets to the file, and tally the row
+        // group's size and (from any column — all cover the same rows) row count.
+        let mut total_byte_size = 0i64;
+        let mut group_rows = 0i64;
+        let columns: Vec<ColumnChunk> = group
+            .columns
+            .into_iter()
+            .map(|mut chunk| {
+                chunk.file_offset += base;
+                if let Some(meta) = chunk.meta_data.as_mut() {
+                    meta.data_page_offset += base;
+                    if let Some(dict_offset) = meta.dictionary_page_offset.as_mut() {
+                        *dict_offset += base;
+                    }
+                    total_byte_size += meta.total_uncompressed_size;
+                    group_rows = meta.num_values;
+                }
+                chunk
+            })
+            .collect();
+        self.row_count += group_rows;
+        self.page_indexes.push(
+            group
+                .page_indexes
+                .into_iter()
+                .map(|mut index| {
+                    for location in &mut index.offset_index.page_locations {
+                        location.offset += base;
+                    }
+                    index
+                })
+                .collect(),
+        );
+        self.row_groups.push(RowGroup {
+            columns,
+            total_byte_size,
+            num_rows: group_rows,
+        });
+        out
+    }
+
+    /// End the file: returns the bytes that go at its current end, which
+    /// close it with the page index and the footer, and the metadata just
+    /// written into them, so a consumer that needs the file's row-group
+    /// metadata can take it directly instead of reading it back.
+    pub fn finish(
+        self,
+        allocator: &mut SlabAllocator,
+    ) -> UnaryResult<(FileBytes, WrittenFileMetadata)> {
+        Ok(self.finish_file(allocator)?)
+    }
+
+    fn finish_file(
+        mut self,
+        allocator: &mut SlabAllocator,
+    ) -> WriteResult<(FileBytes, WrittenFileMetadata)> {
+        let mut out = self.start_file(allocator);
+        let offset_indexes = self.write_page_index(&mut out, allocator)?;
+        // Readers following the spec only honour a chunk's `min_value`/`max_value`
+        // when the footer names an order for every leaf column.
+        let schema_elements = build_schema_elements(&self.schema)?;
+        let leaf_count = schema_elements
+            .iter()
+            .filter(|element| element.num_children.is_none())
+            .count();
+        let file_meta = FileMetaData {
+            version: PARQUET_VERSION,
+            schema: schema_elements,
+            num_rows: self.row_count,
+            row_groups: self.row_groups,
+            created_by: Some("pivotdb".to_string()),
+            column_orders: Some(vec![ColumnOrder::TYPE_ORDER; leaf_count]),
+        };
+        write_footer(&mut out, &file_meta, allocator)?;
+        Ok((
+            out,
+            WrittenFileMetadata {
+                footer: file_meta,
+                offset_indexes,
+            },
+        ))
+    }
+
+    /// Append the page index of every chunk at the file's current end and
+    /// point each chunk's footer entry at its part of it. The column indexes
+    /// come first and the offset indexes last, so the offset indexes, which
+    /// are what a reader fetching some rows of a row group needs, sit next
+    /// to the footer and are read together with it. Returns the offset
+    /// indexes, per row group and chunk.
+    fn write_page_index(
+        &mut self,
+        out: &mut FileBytes,
+        allocator: &mut SlabAllocator,
+    ) -> WriteResult<Vec<Vec<OffsetIndex>>> {
+        let index_start = self.len;
+        let mut index = Vec::new();
+        let page_indexes = std::mem::take(&mut self.page_indexes);
+        for (row_group, chunk_indexes) in self.row_groups.iter_mut().zip(&page_indexes) {
+            for (chunk, chunk_index) in row_group.columns.iter_mut().zip(chunk_indexes) {
+                let Some(column_index) = &chunk_index.column_index else {
+                    continue;
+                };
+                let start = index.len();
+                column_index.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut index))?;
+                chunk.column_index_offset = Some((index_start + start) as i64);
+                chunk.column_index_length = Some((index.len() - start) as i32);
+            }
+        }
+        for (row_group, chunk_indexes) in self.row_groups.iter_mut().zip(&page_indexes) {
+            for (chunk, chunk_index) in row_group.columns.iter_mut().zip(chunk_indexes) {
+                let start = index.len();
+                chunk_index
+                    .offset_index
+                    .write_thrift(&mut ThriftCompactOutputProtocol::new(&mut index))?;
+                chunk.offset_index_offset = Some((index_start + start) as i64);
+                chunk.offset_index_length = Some((index.len() - start) as i32);
+            }
+        }
+        self.len += index.len();
+        push_runs_of(out, &index, allocator);
+        Ok(page_indexes
+            .into_iter()
+            .map(|chunk_indexes| {
+                chunk_indexes
+                    .into_iter()
+                    .map(|chunk_index| chunk_index.offset_index)
+                    .collect()
+            })
+            .collect())
+    }
+}
+
+/// The page index of one column chunk: where its data pages are, and their
+/// value ranges when the encoder recorded them.
+struct ChunkPageIndex {
+    offset_index: OffsetIndex,
+    column_index: Option<ColumnIndex>,
+}
+
+/// Encoded bytes and footer column metadata for one row group. Column and
+/// page offsets are relative to the row group until a [`ParquetFileBuilder`]
+/// rebases them.
 struct AssembledRowGroup {
     row_group_id: RowGroupId,
     bytes: FileBytes,
     columns: Vec<ColumnChunk>,
+    /// Each chunk's page index, in the order of `columns`.
+    page_indexes: Vec<ChunkPageIndex>,
 }
 
 impl AssembledRowGroup {
@@ -165,13 +471,17 @@ impl AssembledRowGroup {
 
         let mut bytes = FileBytes::new();
         let mut columns = Vec::with_capacity(chunks.len());
+        let mut page_indexes = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            columns.push(write_leaf_chunk(&mut bytes, chunk.leaf)?);
+            let (column, page_index) = write_leaf_chunk(&mut bytes, chunk.leaf)?;
+            columns.push(column);
+            page_indexes.push(page_index);
         }
         Ok(Self {
             row_group_id,
             bytes,
             columns,
+            page_indexes,
         })
     }
 }
@@ -186,7 +496,7 @@ fn build_files(
     groups: Vec<AssembledRowGroup>,
     target_size: Option<usize>,
     allocator: &mut SlabAllocator,
-) -> WriteResult<Vec<(FileBytes, FileMetaData)>> {
+) -> WriteResult<Vec<(FileBytes, WrittenFileMetadata)>> {
     let ranges = match target_size {
         Some(target_size) if !groups.is_empty() => {
             let weights = groups
@@ -289,76 +599,38 @@ fn linear_partitions(weights: &[usize], parts: usize) -> Vec<Range<usize>> {
     reversed
 }
 
-/// Stitch several assembled row groups into one Parquet file, rebasing each row
-/// group's column offsets to its position in the file. Returns the bytes and the
-/// footer metadata just written into them, so a consumer that needs the file's
-/// row-group metadata can take it directly instead of parsing the footer back.
-/// The magic and footer are carved from `allocator`.
+/// Stitch several assembled row groups into one Parquet file. Returns the bytes
+/// and the metadata just written into them. The magic, page index and footer
+/// are carved from `allocator`.
 fn build_file(
     schema: &SchemaRef,
     groups: Vec<AssembledRowGroup>,
     allocator: &mut SlabAllocator,
-) -> WriteResult<(FileBytes, FileMetaData)> {
+) -> WriteResult<(FileBytes, WrittenFileMetadata)> {
+    let mut builder = ParquetFileBuilder::new(schema.clone());
     let mut out = FileBytes::new();
-    out.push_slab(run_of(PARQUET_MAGIC, allocator));
-
-    let mut row_groups = Vec::with_capacity(groups.len());
-    let mut num_rows = 0i64;
     for group in groups {
-        let base = out.len() as i64;
-        out.append(group.bytes);
-
-        // Rebase each column's page offsets to the file, and tally the row
-        // group's size and (from any column — all cover the same rows) row count.
-        let mut total_byte_size = 0i64;
-        let mut group_rows = 0i64;
-        let columns: Vec<ColumnChunk> = group
-            .columns
-            .into_iter()
-            .map(|mut chunk| {
-                chunk.file_offset += base;
-                if let Some(meta) = chunk.meta_data.as_mut() {
-                    meta.data_page_offset += base;
-                    if let Some(dict_offset) = meta.dictionary_page_offset.as_mut() {
-                        *dict_offset += base;
-                    }
-                    total_byte_size += meta.total_uncompressed_size;
-                    group_rows = meta.num_values;
-                }
-                chunk
-            })
-            .collect();
-        num_rows += group_rows;
-        row_groups.push(RowGroup {
-            columns,
-            total_byte_size,
-            num_rows: group_rows,
-        });
+        out.append(builder.append_row_group(
+            EncodedRowGroup {
+                group,
+                memory_reservations: Vec::new(),
+            },
+            allocator,
+        ));
     }
-
-    // Readers following the spec only honour a chunk's `min_value`/`max_value`
-    // when the footer names an order for every leaf column.
-    let schema_elements = build_schema_elements(schema)?;
-    let leaf_count = schema_elements
-        .iter()
-        .filter(|element| element.num_children.is_none())
-        .count();
-    let file_meta = FileMetaData {
-        version: PARQUET_VERSION,
-        schema: schema_elements,
-        num_rows,
-        row_groups,
-        created_by: Some("pivotdb".to_string()),
-        column_orders: Some(vec![ColumnOrder::TYPE_ORDER; leaf_count]),
-    };
-    write_footer(&mut out, &file_meta, allocator)?;
+    let (footer, file_meta) = builder.finish_file(allocator)?;
+    out.append(footer);
     Ok((out, file_meta))
 }
 
 /// Append one leaf's column chunk to `out`: its dictionary page (if any) followed
-/// by its data pages, contiguously. Returns the chunk metadata with offsets
-/// relative to `out` (rebased to the file by [`build_file`]).
-fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<ColumnChunk> {
+/// by its data pages, contiguously. Returns the chunk metadata and its page
+/// index, with offsets relative to `out` (rebased to the file by
+/// [`ParquetFileBuilder::append_row_group`]).
+fn write_leaf_chunk(
+    out: &mut FileBytes,
+    leaf: EncodedLeaf,
+) -> WriteResult<(ColumnChunk, ChunkPageIndex)> {
     if leaf.data_pages.is_empty() {
         return Err(WriteError::MissingPages {
             path: leaf.path.join("."),
@@ -377,7 +649,13 @@ fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<Colum
 
     let data_page_offset = out.len() as i64;
     let mut num_values = 0i64;
+    let mut page_locations = Vec::with_capacity(leaf.data_pages.len());
     for page in leaf.data_pages {
+        page_locations.push(PageLocation {
+            offset: out.len() as i64,
+            compressed_page_size: page.bytes.size() as i32,
+            first_row_index: num_values,
+        });
         num_values += page.num_rows;
         uncompressed += (page.header_len + page.uncompressed_size) as i64;
         out.push_slab(page.bytes);
@@ -392,7 +670,7 @@ fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<Colum
     } else {
         vec![leaf.data_page_encoding as i32]
     };
-    Ok(ColumnChunk {
+    let chunk = ColumnChunk {
         file_offset: chunk_start,
         meta_data: Some(ColumnMetaData {
             physical_type: leaf.physical_type,
@@ -407,7 +685,18 @@ fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<Colum
             statistics: Some(leaf.statistics),
             encoding_stats: None,
         }),
-    })
+        // The index is written when the file ends, which is when its place
+        // in the file is known.
+        offset_index_offset: None,
+        offset_index_length: None,
+        column_index_offset: None,
+        column_index_length: None,
+    };
+    let page_index = ChunkPageIndex {
+        offset_index: OffsetIndex { page_locations },
+        column_index: leaf.column_index,
+    };
+    Ok((chunk, page_index))
 }
 
 /// Build the footer schema: a root group element followed by every field's,
@@ -517,12 +806,20 @@ fn write_footer(
     file_meta.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut footer))?;
     footer.extend_from_slice(&(footer.len() as u32).to_le_bytes());
     footer.extend_from_slice(PARQUET_MAGIC);
-    out.push_slab(run_of(&footer, allocator));
+    push_runs_of(out, &footer, allocator);
     Ok(())
 }
 
+/// Append a copy of `bytes` to `out`, in as many runs as it takes: a run is
+/// at most one ring buffer long.
+fn push_runs_of(out: &mut FileBytes, bytes: &[u8], allocator: &mut SlabAllocator) {
+    for run in bytes.chunks(dispatch::memory::BUFFER_SIZE) {
+        out.push_slab(run_of(run, allocator));
+    }
+}
+
 /// A run holding a copy of `bytes`, for the small pieces of a file that are not
-/// pages: the leading magic, and the footer.
+/// pages: the leading magic, the page index and the footer.
 fn run_of(bytes: &[u8], allocator: &mut SlabAllocator) -> Slab {
     let mut run = allocator.get_slab_of_size(bytes.len(), false);
     run.as_mut_slice().copy_from_slice(bytes);
@@ -569,6 +866,7 @@ mod tests {
                 sorted_by: Arc::default(),
                 max_file_size: None,
             }),
+            memory_reservations: Vec::new(),
         })
     }
 

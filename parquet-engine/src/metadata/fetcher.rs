@@ -3,13 +3,20 @@
 //! The operator submits logical file ranges through `OperatorIO`; dispatch's
 //! requester resolves cache hits, allocates missing compressed-cache extents,
 //! and immediately performs the physical reads. This
-//! module owns only the footer-specific two-step state machine: probe the tail,
-//! then request the exact footer when it is larger than the probe.
+//! module owns only the footer-specific state machine: probe the tail, request
+//! the exact footer when it is larger than the probe, and request the offset
+//! indexes the footer points at when the bytes read so far do not hold them.
+//! A writer puts the offset indexes right before the footer, so the probe
+//! usually holds both and a file takes one read.
 
 use super::FileRowGroups;
+use crate::thrift::footer::FileMetaData;
 use crate::types::columns::TableColumns;
 use crate::types::metadata::RowGroupMetadata;
-use crate::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
+use crate::types::table::{
+    Error, FOOTER_PROBE_BYTES, Result, locate_offset_indexes, parse_footer_thrift,
+    parse_offset_indexes, row_groups_from_metadata,
+};
 use dispatch::io::{FileRange, OpenFile, OperatorIO, ReadRequestId, ReadResponse};
 use dispatch::memory::memory_ctx;
 use dispatch::{Sender, Unary};
@@ -107,7 +114,7 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
             .parse_region(&bytes, &self.table_columns)
             .map_err(crate::op_err)?
         {
-            FooterProgress::ReadExact(range) => self.request_region(request, range, io)?,
+            FooterProgress::Read(range) => self.request_region(request, range, io)?,
             FooterProgress::Done(row_groups) => sender.send(FileRowGroups {
                 file: request.file,
                 row_groups: row_groups.into_iter().map(Arc::new).collect(),
@@ -127,7 +134,20 @@ struct FooterRead {
     file: FileRef,
     open_file: OpenFile,
     size: usize,
-    reading_exact: bool,
+    awaiting: AwaitedRegion,
+}
+
+/// What the read in flight for a file brings.
+enum AwaitedRegion {
+    /// The file's tail, which holds the footer's length and, unless the
+    /// footer is longer than the probe, the footer.
+    Tail,
+    /// The footer, the last `footer_len` bytes of the region, and the
+    /// stretch of the file before it, where its offset indexes are when the
+    /// file has any.
+    Footer { footer_len: usize },
+    /// The offset indexes of the footer already parsed.
+    OffsetIndexes(Box<FileMetaData>),
 }
 
 impl FooterRead {
@@ -136,8 +156,14 @@ impl FooterRead {
             file,
             open_file,
             size,
-            reading_exact: false,
+            awaiting: AwaitedRegion::Tail,
         }
+    }
+
+    /// Where the footer ends: before its length and the closing magic, the
+    /// file's last eight bytes.
+    fn footer_end(&self) -> usize {
+        self.size - 8
     }
 
     fn probe_range(&self) -> FileRange {
@@ -145,38 +171,81 @@ impl FooterRead {
         FileRange::new(self.size - probe, probe)
     }
 
+    /// Take the bytes of the region that was read, which ends where the
+    /// footer ends, or is the offset indexes alone.
     fn parse_region(
         &mut self,
         bytes: &[u8],
         table_columns: &TableColumns,
     ) -> Result<FooterProgress> {
-        let footer = if self.reading_exact {
-            bytes
-        } else {
-            let footer_len = footer_len_from_tail(bytes)?;
-            if footer_len + 8 > self.size {
-                return Err(Error::InvalidFooter(format!(
-                    "footer length {footer_len} exceeds file size {}",
-                    self.size
-                )));
-            }
-            if footer_len + 8 > bytes.len() {
-                self.reading_exact = true;
-                return Ok(FooterProgress::ReadExact(FileRange::new(
-                    self.size - 8 - footer_len,
-                    footer_len,
-                )));
-            }
-            let start = bytes.len() - 8 - footer_len;
-            &bytes[start..bytes.len() - 8]
-        };
+        let (file_meta, held_offset, held) =
+            match std::mem::replace(&mut self.awaiting, AwaitedRegion::Tail) {
+                AwaitedRegion::Tail => {
+                    let footer_len = footer_len_from_tail(bytes)?;
+                    if footer_len + 8 > self.size {
+                        return Err(Error::InvalidFooter(format!(
+                            "footer length {footer_len} exceeds file size {}",
+                            self.size
+                        )));
+                    }
+                    if footer_len + 8 > bytes.len() {
+                        // The offset indexes of a footer end where it
+                        // starts and take a fraction of its bytes, a few per
+                        // page against a chunk's whole description, so
+                        // reading half as many bytes again before the footer
+                        // usually brings them with it.
+                        let footer_start = self.footer_end() - footer_len;
+                        let start = footer_start.saturating_sub(footer_len / 2);
+                        self.awaiting = AwaitedRegion::Footer { footer_len };
+                        return Ok(FooterProgress::Read(FileRange::new(
+                            start,
+                            self.footer_end() - start,
+                        )));
+                    }
+                    let held = &bytes[..bytes.len() - 8];
+                    let footer = &held[held.len() - footer_len..];
+                    (
+                        parse_footer_thrift(footer)?,
+                        self.footer_end() - held.len(),
+                        held,
+                    )
+                }
+                AwaitedRegion::Footer { footer_len } => {
+                    let footer = &bytes[bytes.len() - footer_len..];
+                    (
+                        parse_footer_thrift(footer)?,
+                        self.footer_end() - bytes.len(),
+                        bytes,
+                    )
+                }
+                AwaitedRegion::OffsetIndexes(file_meta) => {
+                    let indexes = locate_offset_indexes(&file_meta, self.size)?
+                        .expect("offset indexes were requested because the footer points at some");
+                    (*file_meta, indexes.start, bytes)
+                }
+            };
 
-        let row_groups = row_groups_from_footer(footer, self.open_file.clone(), table_columns)?;
-        Ok(FooterProgress::Done(row_groups))
+        let offset_indexes = match locate_offset_indexes(&file_meta, self.size)? {
+            Some(indexes)
+                if indexes.start < held_offset || indexes.end > held_offset + held.len() =>
+            {
+                let range = FileRange::new(indexes.start, indexes.len());
+                self.awaiting = AwaitedRegion::OffsetIndexes(Box::new(file_meta));
+                return Ok(FooterProgress::Read(range));
+            }
+            _ => parse_offset_indexes(&file_meta, held_offset, held)?,
+        };
+        Ok(FooterProgress::Done(row_groups_from_metadata(
+            file_meta,
+            offset_indexes,
+            self.open_file.clone(),
+            table_columns,
+        )?))
     }
 }
 
 enum FooterProgress {
-    ReadExact(FileRange),
+    /// The next region of the file to read.
+    Read(FileRange),
     Done(Vec<RowGroupMetadata>),
 }

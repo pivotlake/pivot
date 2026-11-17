@@ -105,24 +105,33 @@ impl UnaryFactory<DataFile, FileRowGroups> for MetadataFetcherFactory {
 }
 
 /// Build the scan metadata for a file a worker has just uploaded, from the footer
-/// metadata the writer already produced. This skips both scheduling a nested
-/// metadata dataflow from a worker and re-parsing a footer we just wrote; only
-/// the open_file has to be bound now, since it names the stored file that future
-/// scans read and exists only once the upload has landed.
+/// and offset indexes the writer already produced. This skips both scheduling a
+/// nested metadata dataflow from a worker and reading back what we just wrote;
+/// only the open_file has to be bound now, since it names the stored file that
+/// future scans read and exists only once the upload has landed.
 pub fn file_row_groups_from_metadata(
     file: FileRef,
     source: DataFileLocation,
-    metadata: crate::thrift::footer::FileMetaData,
+    metadata: crate::writing::WrittenFileMetadata,
     table_columns: &TableColumns,
 ) -> Result<FileRowGroups, crate::ParquetTableError> {
     let open_file = source
         .open_read(file.size)
         .map_err(crate::ParquetTableError::IO)?;
-    let row_groups =
-        crate::types::table::row_groups_from_metadata(metadata, open_file, table_columns)?
-            .into_iter()
-            .map(Arc::new)
-            .collect();
+    let offset_indexes = metadata
+        .offset_indexes
+        .into_iter()
+        .map(|chunks| chunks.into_iter().map(Some).collect())
+        .collect();
+    let row_groups = crate::types::table::row_groups_from_metadata(
+        metadata.footer,
+        offset_indexes,
+        open_file,
+        table_columns,
+    )?
+    .into_iter()
+    .map(Arc::new)
+    .collect();
     Ok(FileRowGroups { file, row_groups })
 }
 

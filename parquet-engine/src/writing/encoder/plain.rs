@@ -23,22 +23,10 @@ use super::super::leaves::Leaf;
 use super::super::types::EncodedPage;
 use super::pages::{self, PageKind, PageRange};
 
-/// PLAIN-encode a leaf: cut it into pages and encode each.
-pub(super) fn encode_chunk(
-    leaf: &Leaf,
-    codec: CompressionCodec,
-    allocator: &mut SlabAllocator,
-) -> WriteResult<Vec<EncodedPage>> {
-    pages::page_ranges(leaf)?
-        .into_iter()
-        .map(|range| encode_data_page(leaf, range, codec, allocator))
-        .collect()
-}
-
 /// Encode one PLAIN data page: the page's rows' definition levels, then its
 /// stored values. A page counts its rows, not its values — the absent rows have
 /// a level but nothing in the value stream.
-fn encode_data_page(
+pub(super) fn encode_data_page(
     leaf: &Leaf,
     range: PageRange,
     codec: CompressionCodec,
@@ -53,6 +41,7 @@ fn encode_data_page(
     let raw = pages::data_page_body(levels, leaf.max_def_level, encoded);
     pages::assemble_page(
         num_rows as i64,
+        values.len(),
         raw,
         PageKind::Data {
             num_values: num_rows,

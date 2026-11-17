@@ -45,27 +45,6 @@ const VALUES_PER_BLOCK: usize = 2048;
 const MINIBLOCKS_PER_BLOCK: usize = 8;
 const VALUES_PER_MINIBLOCK: usize = VALUES_PER_BLOCK / MINIBLOCKS_PER_BLOCK;
 
-/// Delta-encode a leaf, or `None` when its type has no delta form: floats are
-/// not whole numbers, and a decimal wide enough to need fixed-length bytes is
-/// stored as bytes rather than as an integer.
-///
-/// Which of the two encodings a leaf takes follows from its type, so the caller
-/// gets it back rather than having to ask again.
-pub(super) fn try_encode_chunk(
-    leaf: &Leaf,
-    codec: CompressionCodec,
-    allocator: &mut SlabAllocator,
-) -> WriteResult<Option<(Encoding, Vec<EncodedPage>)>> {
-    let Some(encoding) = encoding_for(leaf.values.data_type()) else {
-        return Ok(None);
-    };
-    let pages = pages::page_ranges(leaf)?
-        .into_iter()
-        .map(|range| encode_data_page(leaf, range, encoding, codec, allocator))
-        .collect::<WriteResult<Vec<_>>>()?;
-    Ok(Some((encoding, pages)))
-}
-
 /// The delta encoding a column of this type takes, or `None` for one that has
 /// none.
 ///
@@ -74,7 +53,7 @@ pub(super) fn try_encode_chunk(
 /// `i64`, so an unsigned value past its signed maximum would need more bits than
 /// the physical type it is annotated as declares. Such a column takes a
 /// dictionary or PLAIN instead, which store its bits at their declared width.
-fn encoding_for(data_type: &DataType) -> Option<Encoding> {
+pub(super) fn encoding_for(data_type: &DataType) -> Option<Encoding> {
     match data_type {
         DataType::Int8
         | DataType::Int16
@@ -99,7 +78,7 @@ fn encoding_for(data_type: &DataType) -> Option<Encoding> {
 
 /// Encode one delta data page: the page's rows' definition levels, then its
 /// values in whichever delta form the leaf's type takes.
-fn encode_data_page(
+pub(super) fn encode_data_page(
     leaf: &Leaf,
     range: PageRange,
     encoding: Encoding,
@@ -120,6 +99,7 @@ fn encode_data_page(
     let raw = pages::data_page_body(levels, leaf.max_def_level, encoded);
     pages::assemble_page(
         num_rows as i64,
+        range.values.len(),
         raw,
         PageKind::Data {
             num_values: num_rows,

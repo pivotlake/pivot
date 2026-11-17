@@ -206,7 +206,7 @@ struct PendingUpload {
     sorted_by: Arc<[String]>,
     /// The footer metadata the writer produced for this file, used to record its
     /// row groups once the upload lands (no re-parsing the file we just wrote).
-    metadata: crate::thrift::footer::FileMetaData,
+    metadata: crate::writing::WrittenFileMetadata,
 }
 
 pub(super) struct Upload {
@@ -246,7 +246,7 @@ impl Upload {
             .expect("completion for an upload not in flight");
         let source = self.store.source(&pending.key).map_err(crate::op_err)?;
         // Row count is taken from the metadata before it's consumed below.
-        let num_rows = pending.metadata.num_rows as usize;
+        let num_rows = pending.metadata.row_count();
         // Build the row groups from the footer the writer already produced; only
         // the location is bound now, since it names the stored file (which exists
         // only once the upload has landed) that future scans read.

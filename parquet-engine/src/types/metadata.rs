@@ -9,6 +9,7 @@
 //! decompressor to locate pages on disk.
 
 use crate::thrift::general::CompressionCodec;
+use crate::types::page_index::{DataPageLocation, RowGroupPageIndex};
 use crate::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
@@ -16,7 +17,7 @@ use dispatch::io::OpenFile;
 use roaring::RoaringTreemap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// One entry per leaf in column-chunk order, shared by every row group in the
 /// file. Each leaf holds one bound array indexed by file-local row-group index.
@@ -128,6 +129,13 @@ pub struct ColumnChunkMeta {
 }
 
 impl ColumnChunkMeta {
+    /// The chunk's bytes in the file: its dictionary page, if it has one,
+    /// followed by its data pages.
+    pub fn byte_range(&self) -> Range<usize> {
+        let start = self.dictionary_page_offset.unwrap_or(self.data_page_offset) as usize;
+        start..start + self.total_compressed_size as usize
+    }
+
     /// The chunk of a leaf the file has no chunk for. Its layout fields are
     /// placeholders: no reader dereferences them, because the leaf is never
     /// fetched. `max_def_level` is one, the level of an optional leaf, since an
@@ -165,6 +173,11 @@ pub struct RowGroupMetadata {
     /// The whole file's statistics, shared by every row group in it and read at
     /// this row group's `file_row_group_idx`.
     pub(crate) statistics: Arc<FileStatistics>,
+    /// Where the data pages of the leaves spanning several pages are, when
+    /// the file carries an offset index for them. A read of some of the row
+    /// group's rows fetches only the pages holding them; without it, and for
+    /// a leaf of one data page, the leaf's whole chunk is read.
+    pub page_index: Option<Arc<RowGroupPageIndex>>,
     /// Total number of rows in this row group, deleted ones included.
     pub num_rows: i64,
     /// The position in the file of this row group's first row: how many rows
@@ -244,6 +257,17 @@ impl RowGroupMetadata {
         self.file_row_offset + rows.start as u64..self.file_row_offset + rows.end as u64
     }
 
+    /// The data pages of the chunk at `leaf`, in file order, when the leaf
+    /// spans several pages and the file's offset index lists them.
+    pub fn locate_leaf_pages(
+        &self,
+        leaf: usize,
+    ) -> Option<impl Iterator<Item = DataPageLocation> + '_> {
+        self.page_index
+            .as_ref()?
+            .locate_leaf_pages(leaf, &self.columns[leaf], self.num_rows as u32)
+    }
+
     /// This row group's statistics for the top-level column `column`, if the
     /// file recorded any for it. Chunks are per leaf, so the column is resolved
     /// to its first leaf. Callers that need a nested field's statistics resolve
@@ -306,11 +330,16 @@ pub enum RowSelection {
 /// Row-group metadata augmented with per-query filtering state.
 ///
 /// Wraps a shared [`RowGroupMetadata`] and the [`RowSelection`] describing
-/// which of the row group's rows are read through it.
+/// which of the row group's rows are read through it. Each one made is a
+/// read of its own: a dataflow may read the same row group several times,
+/// for different rows, and the pages of each read stay apart.
 #[derive(Clone)]
 pub struct QueryRowGroupMetadata {
     /// The underlying static row-group metadata.
     pub row_group_metadata: Arc<RowGroupMetadata>,
+    /// Which read of a row group this is, shared by every page and range of
+    /// the read and by no other read.
+    read_id: u64,
     /// The rows read through this metadata.
     selection: RowSelection,
     /// The row group's global index — its position in the table's flat
@@ -321,22 +350,50 @@ pub struct QueryRowGroupMetadata {
     /// the decompressor skips the remaining, not-yet-touched pages instead of
     /// decompressing them only to be discarded.
     pruned: Arc<AtomicBool>,
+    /// Whether the read goes around the compressed cache and the decompressed
+    /// cache (see [`bypassing_caches`](Self::bypassing_caches)).
+    bypasses_caches: bool,
 }
 
 impl QueryRowGroupMetadata {
     /// Metadata for reading the `selection` of row group `index`.
     pub fn new(table: &ParquetTable, index: usize, selection: RowSelection) -> Self {
+        static NEXT_READ_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             row_group_metadata: table.row_groups[index].clone(),
+            read_id: NEXT_READ_ID.fetch_add(1, Ordering::Relaxed),
             selection,
             row_group_index: index,
             pruned: Arc::new(AtomicBool::new(false)),
+            bypasses_caches: false,
         }
+    }
+
+    /// This read, going around the compressed cache and the decompressed
+    /// cache: it takes nothing from them and leaves nothing in them. Its
+    /// bytes are read into memory of its own and its pages are decompressed
+    /// into memory of their own. For a read whose bytes are read once and
+    /// not again, such as a compaction's of its inputs, which would only
+    /// take the caches' room from what queries read.
+    pub fn bypassing_caches(mut self) -> Self {
+        self.bypasses_caches = true;
+        self
+    }
+
+    /// Whether this read goes around the caches.
+    pub fn bypasses_caches(&self) -> bool {
+        self.bypasses_caches
     }
 
     /// The rows read through this metadata.
     pub fn selection(&self) -> &RowSelection {
         &self.selection
+    }
+
+    /// Which read of a row group this is: the stages that collect a read's
+    /// pages and ranges tell reads apart by it.
+    pub fn read_id(&self) -> u64 {
+        self.read_id
     }
 
     /// Whether this row group has been pruned (no row can match a pushed-down

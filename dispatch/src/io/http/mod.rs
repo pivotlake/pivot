@@ -14,7 +14,7 @@
 //! tracks which dataflow each in-flight request belongs to and commits the block
 //! once its body has fully landed.
 
-use crate::io::RemoteFile;
+use crate::io::{RemoteFile, UploadMethod};
 use crate::memory::FileBytes;
 use std::sync::Arc;
 use thiserror::Error;
@@ -182,6 +182,16 @@ impl BodyCursor {
 pub(crate) struct RemoteUpload {
     pub remote: Arc<RemoteFile>,
     pub data: Arc<FileBytes>,
+    pub method: UploadMethod,
+}
+
+/// What a store answered a finished request with, beyond the bytes a read
+/// put in its destination: the `ETag` header of an upload's answer, and the
+/// body of the answer to a `POST`.
+#[derive(Debug, Default)]
+pub(crate) struct ResponseAnswer {
+    pub etag: Option<String>,
+    pub body: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -198,8 +208,14 @@ impl RemoteRequest {
         }
     }
 
+    /// Whether this is a `POST`: a request sent once, on a connection of its
+    /// own, whose answer's body is kept.
+    pub fn is_post(&self) -> bool {
+        matches!(self, Self::Upload(upload) if upload.method == UploadMethod::Post)
+    }
+
     /// The parts a read's body is made of. An upload's response body has none:
-    /// it is drained and dropped.
+    /// it is dropped, or kept whole for a `POST`.
     pub fn body_parts(&self) -> &[BodyPart] {
         match self {
             Self::Read(read) => &read.parts,
@@ -219,6 +235,7 @@ impl RemoteRequest {
                 auth.as_deref(),
             ),
             Self::Upload(upload) => proto::build_upload(
+                upload.method,
                 remote.host_header(),
                 remote.request_target(),
                 upload.data.len(),

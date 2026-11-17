@@ -188,14 +188,22 @@ pub const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// Default compacted-file size target. Files smaller than half this size enter
 /// small-file compaction; files at least half this size are full enough to
 /// enter layout optimization instead.
-pub const DEFAULT_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_COMPACT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Default headroom for compression gains: a group whose input bytes only just
 /// reach the desired output size can encode to another undersized file.
 pub const DEFAULT_MERGE_TARGET_MULTIPLIER: f64 = 1.3;
 
-/// Default count at which a sub-target pile may take the balance-check path.
-pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 100;
+/// Default count at which a sub-target pile may take the balance-check path:
+/// as many files as one merge takes, so a pile is merged as soon as it
+/// fills one.
+pub const DEFAULT_MIN_FILES_TO_MERGE: usize = MAX_SMALL_FILES_PER_MERGE;
+
+/// The most small files one merge takes. A merge holds rows of every input
+/// file in memory at once, so its memory grows with their number. A larger
+/// pile is merged in steps, each taking the next files in the partition's
+/// order.
+pub const MAX_SMALL_FILES_PER_MERGE: usize = 10;
 
 /// Per-file fixed cost in the balance test. This prevents many similarly small
 /// files from being rejected merely because their byte total is low.
@@ -206,14 +214,13 @@ const MIN_BALANCE_RATIO: f64 = 5.0;
 /// change when a commit produces a new version, so seconds-scale is plenty.
 pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(30);
 
-/// Default number of merges a datastore runs at once. A merge holds its whole
-/// input decoded on the memory ring until its output is encoded, and the
-/// decoded form is many times the input (a merge of 300 MB of compressed
-/// OTLP logs with variant columns pinned about 6 GB). Several merges landing
-/// together can take the entire ring, and then every read that needs a
-/// buffer, the merges' own footer loads and the ingest included, fails with
-/// nothing left to evict. One merge at a time keeps that footprint bounded;
-/// a deployment that has the memory to spare raises it in its config.
+/// Default number of merges a datastore runs at once. A merge holds a few
+/// decoded row groups of each of its input files on the memory ring, plus the
+/// output row groups being encoded and written, and decoded rows are many
+/// times their compressed size. Merges of many files landing together can
+/// take a large part of the ring from the reads that need buffers, the
+/// ingest included. One merge at a time keeps that footprint bounded; a
+/// deployment that has the memory to spare raises it in its config.
 pub const DEFAULT_COMPACT_PARALLELISM: usize = 1;
 
 /// Default size of the clique a routine round merges, and the cap on a
@@ -860,7 +867,10 @@ impl MergeSelection {
             CompactionPass::Routine => {
                 small_file_batch(small_files, self.merge_target_bytes, self.min_files)
             }
-            CompactionPass::Final => (small_files.len() >= 2).then_some(small_files),
+            CompactionPass::Final => {
+                small_files.truncate(MAX_SMALL_FILES_PER_MERGE);
+                (small_files.len() >= 2).then_some(small_files)
+            }
         })
     }
 
@@ -1059,8 +1069,8 @@ fn small_file_batch(
     min_files: usize,
 ) -> Option<Vec<FileRef>> {
     let mut total = 0u64;
-    let mut batch = Vec::with_capacity(files.len());
-    for file in files {
+    let mut batch = Vec::with_capacity(MAX_SMALL_FILES_PER_MERGE);
+    for file in files.into_iter().take(MAX_SMALL_FILES_PER_MERGE) {
         total += file.size;
         batch.push(file);
         if batch.len() >= 2 && total >= merge_target_bytes {
@@ -1068,7 +1078,9 @@ fn small_file_batch(
         }
     }
 
-    if batch.len() < min_files.max(2) {
+    // A pile of as many files as a merge takes is merged whatever count was
+    // asked for: it would otherwise never be.
+    if batch.len() < min_files.clamp(2, MAX_SMALL_FILES_PER_MERGE) {
         return None;
     }
 
@@ -1253,6 +1265,32 @@ mod tests {
     /// rows, which models two 80%-full overlapping files without footer bytes
     /// dominating the test.
     fn write_wide_parquet_file(dir: &Path, file_name: &str, rows: usize, seed: u64) {
+        write_wide_parquet_row_groups(dir, file_name, rows, seed, rows);
+    }
+
+    /// [`write_wide_parquet_file`] with the rows cut into row groups of
+    /// `rows_per_group`.
+    fn write_wide_parquet_row_groups(
+        dir: &Path,
+        file_name: &str,
+        rows: usize,
+        seed: u64,
+        rows_per_group: usize,
+    ) {
+        let keys: Vec<i64> = (1..=rows as i64).collect();
+        write_wide_parquet_keys(dir, file_name, keys, seed, rows_per_group);
+    }
+
+    /// [`write_wide_parquet_row_groups`] with the `Timestamp` of every row
+    /// given, in the order the rows are stored.
+    fn write_wide_parquet_keys(
+        dir: &Path,
+        file_name: &str,
+        keys: Vec<i64>,
+        seed: u64,
+        rows_per_group: usize,
+    ) {
+        let rows = keys.len();
         let schema = Arc::new(Schema::new(vec![
             Field::new("Timestamp", DataType::Int64, false),
             Field::new("Payload0", DataType::Int64, false),
@@ -1260,7 +1298,6 @@ mod tests {
             Field::new("Payload2", DataType::Int64, false),
             Field::new("Payload3", DataType::Int64, false),
         ]));
-        let keys: Vec<i64> = (1..=rows as i64).collect();
         let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(keys))];
         for column in 0..4 {
             let payload: Vec<i64> = (0..rows)
@@ -1279,6 +1316,7 @@ mod tests {
         let file = std::fs::File::create(dir.join(file_name)).unwrap();
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(rows_per_group))
             .build();
         let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
         writer.write(&batch).unwrap();
@@ -2485,6 +2523,282 @@ mod tests {
         dispatch.exit();
     }
 
+    /// Two inputs of many row groups each, covering the same keys, merge
+    /// into one file of many row groups that holds every row in key order.
+    #[test]
+    fn a_merge_of_many_row_group_inputs_keeps_every_row_in_order() {
+        const ROWS_PER_INPUT: usize = 40_000;
+        let dispatch = Dispatch::spin_up(2, 8 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_wide_parquet_row_groups(&adopted, "left.parquet", ROWS_PER_INPUT, 11, 3_000);
+        write_wide_parquet_row_groups(&adopted, "right.parquet", ROWS_PER_INPUT, 29, 3_000);
+        let datastore =
+            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
+        let table = datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+            .unwrap();
+
+        let outputs = table
+            .merge_files(
+                &table.list_partitions().unwrap().remove(0),
+                &table.file_refs().unwrap(),
+                5_000,
+                u64::MAX,
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        let output = std::fs::File::open(
+            db.path()
+                .join(table.location())
+                .join(outputs[0].file_ref().path.as_str()),
+        )
+        .unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(output).unwrap();
+        assert_eq!(reader.metadata().num_row_groups(), 16);
+        let keys: Vec<i64> = reader
+            .build()
+            .unwrap()
+            .flat_map(|batch| {
+                batch
+                    .unwrap()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let expected: Vec<i64> = (1..=ROWS_PER_INPUT as i64)
+            .flat_map(|key| [key, key])
+            .collect();
+        assert_eq!(keys, expected);
+        dispatch.exit();
+    }
+
+    /// Write a file of `(Timestamp, Doc)` rows whose `Doc` is the variant
+    /// `{"age": <timestamp>}`.
+    fn write_variant_parquet_file(dir: &Path, file_name: &str, timestamps: Vec<i64>) {
+        use arrow_array::StringArray;
+        let documents: ArrayRef = Arc::new(StringArray::from(
+            timestamps
+                .iter()
+                .map(|timestamp| format!(r#"{{"age":{timestamp}}}"#))
+                .collect::<Vec<_>>(),
+        ));
+        let variant = parquet_variant_compute::json_to_variant(&documents).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("Timestamp", DataType::Int64, false),
+            variant.field("Doc"),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(timestamps)),
+                Arc::new(variant.into_inner()),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.join(file_name)).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// A merge of files with a variant column reads only that column to plan
+    /// the output's layout, shreds it, and keeps every row in key order.
+    #[test]
+    fn a_merge_shreds_a_variant_column_from_a_sample_of_it() {
+        use catalog::datastore::DatastoreTransaction as _;
+        use planner::catalog::{Column, CreateTableRequest};
+        let dispatch = Dispatch::spin_up(2, 8 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_variant_parquet_file(
+            &adopted,
+            "odd.parquet",
+            (0..500).map(|n| 2 * n + 1).collect(),
+        );
+        write_variant_parquet_file(&adopted, "even.parquet", (0..500).map(|n| 2 * n).collect());
+        let datastore =
+            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        let request = CreateTableRequest {
+            datastore_name: None,
+            schema_name: None,
+            name: "events".to_string(),
+            columns: vec![
+                Column {
+                    name: "Timestamp".to_string(),
+                    col_type: planner::types::Type::Int64,
+                },
+                Column {
+                    name: "Doc".to_string(),
+                    col_type: planner::types::Type::Variant,
+                },
+            ],
+            options: std::collections::HashMap::from([
+                (
+                    "with_pre_existing_parquets".to_string(),
+                    adopted.to_str().unwrap().to_string(),
+                ),
+                ("sort_by".to_string(), "Timestamp".to_string()),
+            ]),
+            if_not_exists: false,
+        };
+        let transaction = datastore.clone().begin_transaction();
+        transaction
+            .bind_create_table(request)
+            .unwrap()
+            .compile(dispatch.dispatcher())
+            .unwrap()
+            .collect()
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(transaction.commit())
+            .unwrap();
+        let table = datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+            .unwrap();
+
+        let outputs = table
+            .merge_files(
+                &table.list_partitions().unwrap().remove(0),
+                &table.file_refs().unwrap(),
+                300,
+                u64::MAX,
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        let output = std::fs::File::open(
+            db.path()
+                .join(table.location())
+                .join(outputs[0].file_ref().path.as_str()),
+        )
+        .unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(output).unwrap();
+        let document_fields = match reader.schema().field(1).data_type() {
+            DataType::Struct(fields) => fields.clone(),
+            other => panic!("a variant column is a struct, not {other:?}"),
+        };
+        assert!(document_fields.find("typed_value").is_some());
+        let timestamps: Vec<i64> = reader
+            .build()
+            .unwrap()
+            .flat_map(|batch| {
+                batch
+                    .unwrap()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(timestamps, (0..1_000).collect::<Vec<i64>>());
+        dispatch.exit();
+    }
+
+    /// A file whose rows are not in the table's sort order cannot be merged
+    /// into sorted output, so the merge fails instead of writing a file.
+    #[test]
+    fn a_merge_of_an_input_out_of_sort_order_fails() {
+        let dispatch = Dispatch::spin_up(2, 8 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_wide_parquet_file(&adopted, "sorted.parquet", 1_000, 11);
+        let descending: Vec<i64> = (1..=1_000).rev().collect();
+        write_wide_parquet_keys(&adopted, "unsorted.parquet", descending, 29, 1_000);
+        let datastore =
+            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
+        let table = datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+            .unwrap();
+
+        let outcome = table.merge_files(
+            &table.list_partitions().unwrap().remove(0),
+            &table.file_refs().unwrap(),
+            500,
+            u64::MAX,
+        );
+
+        let error = outcome.err().expect("the merge fails").to_string();
+        assert!(error.contains("not sorted"), "{error}");
+        dispatch.exit();
+    }
+
+    /// A table without sort columns keeps its rows in file order, and an
+    /// input row group can hold rows of two output row groups.
+    #[test]
+    fn a_merge_without_sort_columns_cuts_input_row_groups_across_output_ones() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        let values: Vec<i64> = (0..14).collect();
+        write_parquet_file_with_row_group_size(&adopted, "rows.parquet", values.clone(), 7);
+        let datastore =
+            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(&adopted),
+            false,
+        );
+        let table = datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+            .unwrap();
+
+        let outputs = table
+            .merge_files(
+                &table.list_partitions().unwrap().remove(0),
+                &table.file_refs().unwrap(),
+                5,
+                u64::MAX,
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        let output = std::fs::File::open(
+            db.path()
+                .join(table.location())
+                .join(outputs[0].file_ref().path.as_str()),
+        )
+        .unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(output).unwrap();
+        assert_eq!(reader.metadata().num_row_groups(), 3);
+        let merged: Vec<i64> = reader
+            .build()
+            .unwrap()
+            .flat_map(|batch| {
+                batch
+                    .unwrap()
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(merged, values);
+        dispatch.exit();
+    }
+
     /// The byte target is applied only between independently encoded row
     /// groups. A group that crosses it is emitted alone without changing the
     /// normal compaction row-group size or re-encoding the input.
@@ -2939,12 +3253,25 @@ mod tests {
     fn small_file_fallback_removes_largest_until_balanced() {
         const MIB: u64 = 1024 * 1024;
         let mut files = vec![file_of_size("outlier", 500 * MIB)];
-        files.extend((0..99).map(|index| file_of_size(&format!("small-{index}"), MIB)));
+        files.extend((0..9).map(|index| file_of_size(&format!("small-{index}"), MIB)));
 
-        let batch = small_file_batch(files.to_vec(), 2 * 1024 * MIB, 100).unwrap();
+        let batch = small_file_batch(files.to_vec(), 2 * 1024 * MIB, 10).unwrap();
 
-        assert_eq!(batch.len(), 99, "the check continues below 100 files");
+        assert_eq!(batch.len(), 9, "the check continues below 10 files");
         assert!(batch.iter().all(|file| file.path.as_str() != "outlier"));
+    }
+
+    #[test]
+    fn a_pile_of_more_small_files_than_a_merge_takes_merges_the_first_of_them() {
+        let files: Vec<_> = (0..25)
+            .map(|index| file_of_size(&format!("small-{index:02}"), 1))
+            .collect();
+
+        let batch = small_file_batch(files, 1_000, 10).unwrap();
+
+        let names: Vec<&str> = batch.iter().map(|file| file.path.as_str()).collect();
+        let expected: Vec<String> = (0..10).map(|index| format!("small-{index:02}")).collect();
+        assert_eq!(names, expected);
     }
 
     #[test]

@@ -23,7 +23,7 @@
 //! so a fetch never blocks the dataflow worker and many run concurrently.
 
 use super::proto;
-use super::{BodyCursor, BodyWindow, RemoteRead, RemoteRequest, RemoteUpload};
+use super::{BodyCursor, BodyWindow, RemoteRead, RemoteRequest, RemoteUpload, ResponseAnswer};
 
 const IO_CHUNK_SIZE: usize = 16 * 1024;
 
@@ -71,9 +71,9 @@ mod blocking_engine {
     /// A finished fetch handed back from a pool thread: `Ok` once the body landed
     /// in the slot, `Err` for a terminal transport failure (the engine surfaces it
     /// to the owning dataflow). The id is the read's engine-side request id, and
-    /// the value is the response's `ETag` header when the request was an upload
-    /// whose response carried one.
-    pub(crate) type HttpCompletion = (Identifier, Result<Option<String>>);
+    /// the value is what the store answered beyond a read's bytes: an upload's
+    /// `ETag` header, and the body of the answer to a `POST`.
+    pub(crate) type HttpCompletion = (Identifier, Result<ResponseAnswer>);
 
     /// One range read for a pool thread to perform: fetch `read` into its pinned
     /// slot and report `(id, outcome)` on `sink`. `client_config` builds any fresh
@@ -190,11 +190,17 @@ mod blocking_engine {
 
     /// Fetch `read` into its slot, reusing a pooled keep-alive connection when one
     /// is idle for the host and reconnecting once if it turns out to be stale.
+    /// A `POST` goes out once, on a connection of its own that is closed after
+    /// the answer: sending it again could do twice what it asks for.
     fn run_fetch(
         conns: &ConnPool,
         client_config: &Arc<rustls::ClientConfig>,
         request: &RemoteRequest,
-    ) -> Result<Option<String>> {
+    ) -> Result<ResponseAnswer> {
+        if request.is_post() {
+            let (_, answer) = do_request(connect(client_config, request)?, request)?;
+            return Ok(answer);
+        }
         let key = host_key(request.remote());
         // Recover a poisoned lock rather than propagating the panic: the guarded
         // region is only a pop/push, so a poisoned map is still usable, and the
@@ -205,7 +211,7 @@ mod blocking_engine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_mut(&key)
             .and_then(|v| v.pop());
-        let (conn, etag) = match pooled {
+        let (conn, answer) = match pooled {
             // A pooled connection may have been closed by the server's keep-alive
             // timeout; on any error, reconnect once and retry.
             Some(c) => match do_request(c, request) {
@@ -224,7 +230,7 @@ mod blocking_engine {
                 .or_default()
                 .push(conn);
         }
-        Ok(etag)
+        Ok(answer)
     }
 
     fn connect(client_config: &Arc<rustls::ClientConfig>, request: &RemoteRequest) -> Result<Conn> {
@@ -247,8 +253,8 @@ mod blocking_engine {
 
     /// Run one request on `conn`, returning the connection for re-pooling, or
     /// `None` when the request succeeded but the connection must be closed,
-    /// along with the `ETag` header of an upload's response.
-    fn do_request(conn: Conn, request: &RemoteRequest) -> Result<(Option<Conn>, Option<String>)> {
+    /// along with what the store answered an upload with.
+    fn do_request(conn: Conn, request: &RemoteRequest) -> Result<(Option<Conn>, ResponseAnswer)> {
         match request {
             // A range GET response is always identity-framed with a known
             // Content-Length that is fully drained, so `do_read` can never leave
@@ -256,7 +262,9 @@ mod blocking_engine {
             // the connection back for pooling, hence the unconditional `Some`.
             // Upload responses can have unknown framing, so `do_upload` decides
             // per-response whether the connection may be reused.
-            RemoteRequest::Read(read) => do_read(conn, read).map(|conn| (Some(conn), None)),
+            RemoteRequest::Read(read) => {
+                do_read(conn, read).map(|conn| (Some(conn), ResponseAnswer::default()))
+            }
             RemoteRequest::Upload(upload) => do_upload(conn, upload),
         }
     }
@@ -352,7 +360,7 @@ mod blocking_engine {
         Ok(conn)
     }
 
-    fn do_upload(mut conn: Conn, upload: &RemoteUpload) -> Result<(Option<Conn>, Option<String>)> {
+    fn do_upload(mut conn: Conn, upload: &RemoteUpload) -> Result<(Option<Conn>, ResponseAnswer)> {
         let request = RemoteRequest::Upload(upload.clone()).request_head();
         conn.write_all(&request)?;
         for run in upload.data.runs() {
@@ -376,11 +384,37 @@ mod blocking_engine {
                 proto::HeadParse::Incomplete => continue,
             }
         };
+        // The answer to a `POST` is kept whole. Its connection is not used
+        // again, so the body may also end where the store closes it.
+        if upload.method == crate::io::UploadMethod::Post {
+            let mut kept = http1::KeptBody::new(head.framing);
+            kept.receive(&acc[head.head_len..])
+                .map_err(proto::ProtoError::from)?;
+            while !kept.is_complete() {
+                let n = conn.read(&mut chunk)?;
+                if n == 0 {
+                    kept.record_peer_closed().map_err(proto::ProtoError::from)?;
+                } else {
+                    kept.receive(&chunk[..n]).map_err(proto::ProtoError::from)?;
+                }
+            }
+            return Ok((
+                None,
+                ResponseAnswer {
+                    etag: head.etag,
+                    body: kept.take_body(),
+                },
+            ));
+        }
+        let answer = ResponseAnswer {
+            etag: head.etag,
+            body: Vec::new(),
+        };
         // The upload itself succeeded (2xx), but a body of unknown framing
         // can't be drained; close the connection instead of pooling it with
         // unread bytes.
         if !head.reuse_connection {
-            return Ok((None, head.etag));
+            return Ok((None, answer));
         }
         // Nothing currently consumes the upload response body (an object store
         // may return a small JSON result); the `|_| {}` discards each chunk. We only decode it to drain the body off the socket so the
@@ -397,7 +431,7 @@ mod blocking_engine {
             }
             body.decode(&chunk[..n], |_| {});
         }
-        Ok((Some(conn), head.etag))
+        Ok((Some(conn), answer))
     }
 
     /// A thin per-worker handle onto the shared blocking-HTTP pool. Stages each
@@ -416,10 +450,9 @@ mod blocking_engine {
         rx: Receiver<HttpCompletion>,
         /// Fetches dispatched but not yet drained from `rx`.
         active: usize,
-        /// Drained successes, each with its response's `ETag` header if it was
-        /// an upload answered with one, awaiting
-        /// [`take_completed`](Self::take_completed).
-        completed: Vec<(Identifier, Option<String>)>,
+        /// Drained successes, each with what the store answered beyond a
+        /// read's bytes, awaiting [`take_completed`](Self::take_completed).
+        completed: Vec<(Identifier, ResponseAnswer)>,
         /// Drained failures with their error, awaiting [`take_failed`](Self::take_failed).
         failed: Vec<(Identifier, Error)>,
     }
@@ -467,13 +500,13 @@ mod blocking_engine {
             while let Ok((id, outcome)) = self.rx.try_recv() {
                 self.active -= 1;
                 match outcome {
-                    Ok(etag) => self.completed.push((id, etag)),
+                    Ok(answer) => self.completed.push((id, answer)),
                     Err(error) => self.failed.push((id, error)),
                 }
             }
         }
 
-        pub fn take_completed(&mut self) -> Vec<(Identifier, Option<String>)> {
+        pub fn take_completed(&mut self) -> Vec<(Identifier, ResponseAnswer)> {
             self.drain_rx();
             std::mem::take(&mut self.completed)
         }
@@ -744,6 +777,9 @@ mod uring_engine {
         /// The response's `ETag` header, once the head has arrived, if it
         /// carries one.
         etag: Option<String>,
+        /// The body of the answer to a `POST`, kept whole, once the head has
+        /// arrived. `None` for every other request.
+        kept_body: Option<http1::KeptBody>,
 
         state: State,
     }
@@ -776,16 +812,26 @@ mod uring_engine {
                 recv_in_dest: false,
                 conn_reusable: true,
                 etag: None,
+                kept_body: None,
                 state,
             }
         }
 
         /// Finish this exchange and return only its reusable connection and
-        /// the response's `ETag`. Every other request/response field, including
-        /// an upload's `Arc<[u8]>`, is dropped.
-        fn into_connection(mut self) -> (Identifier, Option<String>, Conn) {
+        /// what the store answered beyond a read's bytes. Every other
+        /// request/response field, including an upload's `Arc<[u8]>`, is
+        /// dropped.
+        fn into_connection(mut self) -> (Identifier, ResponseAnswer, Conn) {
             self.conn.out_buf.clear();
-            (self.id, self.etag, self.conn)
+            let answer = ResponseAnswer {
+                etag: self.etag,
+                body: self
+                    .kept_body
+                    .as_mut()
+                    .map(http1::KeptBody::take_body)
+                    .unwrap_or_default(),
+            };
+            (self.id, answer, self.conn)
         }
 
         /// Ensure `out_buf` holds the next bytes to send: queue the HTTP request
@@ -851,6 +897,7 @@ mod uring_engine {
                 expected_body_len,
                 conn_reusable,
                 etag,
+                kept_body,
                 ..
             } = self;
             let Conn {
@@ -869,7 +916,12 @@ mod uring_engine {
                     // this branch. Nothing currently consumes the upload response
                     // body (e.g. a JSON result); the `|_| {}` discards
                     // it - we only drain it before pooling the connection.
-                    if let Some(decoder) = body.as_mut()
+                    if let Some(kept) = kept_body.as_mut() {
+                        // The answer to a `POST` is kept whole.
+                        kept.receive(&in_buf[..n])
+                            .map_err(proto::ProtoError::from)?;
+                        Ok(())
+                    } else if let Some(decoder) = body.as_mut()
                         && matches!(request, RemoteRequest::Upload(_))
                     {
                         decoder.decode(&in_buf[..n], |_| {});
@@ -883,6 +935,7 @@ mod uring_engine {
                             expected_body_len,
                             conn_reusable,
                             etag,
+                            kept_body,
                             &in_buf[..n],
                         )
                     }
@@ -900,6 +953,22 @@ mod uring_engine {
                         tls.process_new_packets().map_err(Error::Tls)?;
                         let mut drained = 0usize;
                         loop {
+                            if let Some(kept) = kept_body.as_mut() {
+                                // The answer to a `POST` is kept whole.
+                                match tls.reader().read(&mut header_scratch) {
+                                    Ok(0) => break,
+                                    Ok(m) => {
+                                        kept.receive(&header_scratch[..m])
+                                            .map_err(proto::ProtoError::from)?;
+                                        drained += m;
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        break;
+                                    }
+                                    Err(e) => return Err(Error::Io(e)),
+                                }
+                                continue;
+                            }
                             if let Some(decoder) = body.as_mut() {
                                 if matches!(request, RemoteRequest::Upload(_)) {
                                     // An upload endpoint may return a response body (for
@@ -970,6 +1039,7 @@ mod uring_engine {
                                             expected_body_len,
                                             conn_reusable,
                                             etag,
+                                            kept_body,
                                             &header_scratch[..m],
                                         )?;
                                     }
@@ -991,7 +1061,10 @@ mod uring_engine {
         }
 
         fn request_complete(&self) -> bool {
-            self.body.as_ref().is_some_and(|b| b.is_complete())
+            match &self.kept_body {
+                Some(kept) => kept.is_complete(),
+                None => self.body.as_ref().is_some_and(|b| b.is_complete()),
+            }
         }
 
         /// Set the deadline for this exchange's next connect or recv and return
@@ -1045,6 +1118,7 @@ mod uring_engine {
         expected_body_len: usize,
         conn_reusable: &mut bool,
         etag: &mut Option<String>,
+        kept_body: &mut Option<http1::KeptBody>,
         chunk: &[u8],
     ) -> Result<()> {
         head_acc.extend_from_slice(chunk);
@@ -1053,8 +1127,19 @@ mod uring_engine {
             RemoteRequest::Upload(_) => proto::parse_upload_response_head(head_acc)?,
         };
         if let proto::HeadParse::Complete(h) = parsed {
-            *conn_reusable = h.reuse_connection;
             *etag = h.etag;
+            if request.is_post() {
+                // The answer to a `POST` is kept whole, and its connection is
+                // closed after it rather than used again.
+                *conn_reusable = false;
+                let mut kept = http1::KeptBody::new(h.framing);
+                kept.receive(&head_acc[h.head_len..])
+                    .map_err(proto::ProtoError::from)?;
+                *kept_body = Some(kept);
+                *body = Some(http1::BodyDecoder::new(0));
+                return Ok(());
+            }
+            *conn_reusable = h.reuse_connection;
             let mut decoder = http1::BodyDecoder::new(h.content_length);
             // The body bytes that arrived alongside the head — the one copy (out of
             // the shared recv scratch into the slot) the identity path needs; the
@@ -1085,8 +1170,8 @@ mod uring_engine {
         /// Requests in flight (not counting idle pooled connections).
         active: usize,
         /// Ids whose body fully landed during the last completion routing pass,
-        /// each with its response's `ETag` header if it carried one.
-        completed: Vec<(Identifier, Option<String>)>,
+        /// each with what the store answered beyond a read's bytes.
+        completed: Vec<(Identifier, ResponseAnswer)>,
         /// Ids whose transport failed terminally (retries exhausted or a
         /// non-retryable error), paired with the error to report to the dataflow.
         failed: Vec<(Identifier, Error)>,
@@ -1137,7 +1222,7 @@ mod uring_engine {
             self.active > 0
         }
 
-        pub fn take_completed(&mut self) -> Vec<(Identifier, Option<String>)> {
+        pub fn take_completed(&mut self) -> Vec<(Identifier, ResponseAnswer)> {
             std::mem::take(&mut self.completed)
         }
 
@@ -1179,10 +1264,14 @@ mod uring_engine {
         /// A connection for `request` and the state its exchange starts in: an
         /// idle keep-alive connection ready to send on, or a fresh socket still
         /// to connect. The exchange owns it until the response completes or the
-        /// connection fails.
+        /// connection fails. A `POST` always gets a fresh socket: an idle
+        /// connection may have been closed by the store, which a request that
+        /// is sent only once cannot recover from.
         fn take_connection(&mut self, request: &RemoteRequest) -> Result<(Conn, State)> {
             let key = host_key(request.remote());
-            if let Some(conn) = self.pool.get_mut(&key).and_then(Vec::pop) {
+            if !request.is_post()
+                && let Some(conn) = self.pool.get_mut(&key).and_then(Vec::pop)
+            {
                 return Ok((conn, State::Sending));
             }
             Ok((self.new_conn(key, request)?, State::Connecting))
@@ -1254,7 +1343,7 @@ mod uring_engine {
                         (self.typical_read_time * 7 + exchange.started_at.elapsed()) / 8;
                 }
                 let reusable = exchange.conn_reusable;
-                let (id, etag, conn) = exchange.into_connection();
+                let (id, answer, conn) = exchange.into_connection();
                 // A connection whose response body had unknown framing may
                 // still hold unread bytes; dropping it closes the socket
                 // instead of poisoning the pool.
@@ -1263,7 +1352,7 @@ mod uring_engine {
                     self.pool.entry(key).or_default().push(conn);
                 }
                 self.active -= 1;
-                self.completed.push((id, etag));
+                self.completed.push((id, answer));
                 return Ok(());
             }
 
@@ -1287,6 +1376,14 @@ mod uring_engine {
                     false
                 }
                 State::Receiving => {
+                    if size == 0
+                        && let Some(kept) = exchange.kept_body.as_mut()
+                    {
+                        // The store closed the connection, which ends a kept
+                        // body that is framed by the close.
+                        kept.record_peer_closed().map_err(proto::ProtoError::from)?;
+                        return Ok(true);
+                    }
                     if size == 0 {
                         return Err(Error::Io(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -1377,7 +1474,9 @@ mod uring_engine {
             let key = conn.host_key.clone();
             drop(conn); // close the failed socket before reconnecting
 
-            if is_retryable(&err) && retries < MAX_HTTP_RETRIES {
+            // A `POST` is sent once: the store may have acted on it before
+            // the connection failed.
+            if is_retryable(&err) && retries < MAX_HTTP_RETRIES && !request.is_post() {
                 match self.new_conn(key, &request) {
                     Ok(conn) => {
                         let mut fresh = HttpExchange::new(conn, id, request, State::Connecting);

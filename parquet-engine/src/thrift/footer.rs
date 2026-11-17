@@ -1,6 +1,7 @@
 use super::general::{CompressionCodec, Encoding, PageType, TimeUnit};
 use super::parquet_thrift::*;
-use crate::{general_err, thrift_struct, thrift_union_all_empty};
+use crate::{general_err, thrift_enum, thrift_struct, thrift_union_all_empty};
+use std::fmt;
 use std::io::Write;
 
 // LogicalType is a thrift union where most variants are empty structs. We model
@@ -279,8 +280,92 @@ thrift_struct!(
     pub struct ColumnChunk {
         2: required i64 file_offset;
         3: optional ColumnMetaData meta_data;
+        /// Where the chunk's [`OffsetIndex`] is in the file, and how many
+        /// bytes it takes.
+        4: optional i64 offset_index_offset;
+        5: optional i32 offset_index_length;
+        /// Where the chunk's [`ColumnIndex`] is in the file, and how many
+        /// bytes it takes.
+        6: optional i64 column_index_offset;
+        7: optional i32 column_index_length;
     }
 );
+
+thrift_struct!(
+    /// Where one data page of a column chunk is in the file.
+    pub struct PageLocation {
+        /// The file offset of the page's header.
+        1: required i64 offset;
+        /// The page's header and compressed body together, in bytes.
+        2: required i32 compressed_page_size;
+        /// The row group row of the page's first value.
+        3: required i64 first_row_index;
+    }
+);
+
+thrift_struct!(
+    /// The data pages of one column chunk, in file order. A reader that
+    /// wants some rows of the chunk reads only the pages holding them.
+    pub struct OffsetIndex {
+        1: required list<PageLocation> page_locations;
+    }
+);
+
+thrift_enum!(
+/// How the per-page bounds of a [`ColumnIndex`] are ordered across the pages.
+enum BoundaryOrder {
+  UNORDERED = 0;
+  ASCENDING = 1;
+  DESCENDING = 2;
+}
+);
+
+/// The value range of each data page of one column chunk, in page order,
+/// which lets a reader skip pages by a predicate on the column. The engine
+/// writes it for other readers and does not read it back.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnIndex {
+    /// Whether each page holds only nulls, and so has no bounds.
+    pub null_pages: Vec<bool>,
+    /// Each page's lower bound; empty for a page of only nulls.
+    pub min_values: Vec<Vec<u8>>,
+    /// Each page's upper bound, on the same terms.
+    pub max_values: Vec<Vec<u8>>,
+    pub boundary_order: BoundaryOrder,
+    /// How many rows of each page hold no value.
+    pub null_counts: Vec<i64>,
+}
+
+impl WriteThrift for ColumnIndex {
+    const ELEMENT_TYPE: ElementType = ElementType::Struct;
+
+    fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
+        let last_field_id = self.null_pages.write_thrift_field(writer, 1, 0)?;
+        let last_field_id = write_binary_list_field(&self.min_values, writer, 2, last_field_id)?;
+        let last_field_id = write_binary_list_field(&self.max_values, writer, 3, last_field_id)?;
+        let last_field_id = self
+            .boundary_order
+            .write_thrift_field(writer, 4, last_field_id)?;
+        self.null_counts
+            .write_thrift_field(writer, 5, last_field_id)?;
+        writer.write_struct_end()
+    }
+}
+
+/// Write `values` as a `list<binary>` field.
+fn write_binary_list_field<W: Write>(
+    values: &[Vec<u8>],
+    writer: &mut ThriftCompactOutputProtocol<W>,
+    field_id: i16,
+    last_field_id: i16,
+) -> Result<i16> {
+    writer.write_field_begin(FieldType::List, field_id, last_field_id)?;
+    writer.write_list_begin(ElementType::Binary, values.len())?;
+    for value in values {
+        value.as_slice().write_thrift(writer)?;
+    }
+    Ok(field_id)
+}
 
 thrift_struct!(
     pub struct RowGroup {

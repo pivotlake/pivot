@@ -5,7 +5,7 @@
 //! worker's requester performs those physical tasks the moment the operator
 //! asks, through the [`OperatorIO`] handle dispatch wraps around each call.
 
-use super::{LocalFile, OpenFile};
+use super::{LocalFile, OpenFile, RemoteFile, UploadMethod};
 use crate::io::requester::resolve_read_through_cache;
 use crate::memory::cache::{CacheId, CompressedCache, RingCache};
 use crate::memory::{FileBytes, Slab};
@@ -122,18 +122,21 @@ pub struct PendingReadRequest {
     pub cache: CacheId,
 }
 
-/// One range of a direct read: the `slab.size()` bytes at `offset` of the
-/// file, read into `slab`.
+/// One range of a direct read: the `len` bytes at `offset` of the file, read
+/// into the start of `slab`. The slab may be longer than `len`: a local file
+/// opened for direct IO is read in whole blocks, so a range that ends at the
+/// end of such a file is read into a slab that reaches past it.
 pub struct SlabRead {
     pub offset: usize,
     pub slab: Slab,
+    pub len: usize,
 }
 
-/// A logical read of a local file around the compressed cache, into slabs
-/// the reader supplies.
+/// A logical read of a file around the compressed cache, into slabs the
+/// reader supplies.
 pub struct PendingDirectReadRequest {
     pub id: ReadRequestId,
-    pub file: LocalFile,
+    pub file: OpenFile,
     pub reads: Vec<SlabRead>,
 }
 
@@ -145,6 +148,8 @@ pub struct PendingWriteRequest {
     /// whole.
     pub offset: u64,
     pub data: Arc<FileBytes>,
+    /// How `data` is sent to a remote object. A local file has no method.
+    pub method: UploadMethod,
 }
 
 /// The logical I/O handle passed to an operator whenever it runs.
@@ -214,12 +219,15 @@ impl<'a> OperatorIO<'a> {
     /// Read ranges of `file` around the compressed cache, each into the slab
     /// given for it. For bytes only their writer reads back, such as a spill
     /// file's: a cache fill reads whole blocks, and so bytes that writes still
-    /// in flight are changing, and keeps them. The response comes back the
-    /// same way as [`read`](Self::read)'s, one location per range in the
-    /// order given, each a view of its slab.
+    /// in flight are changing, and keeps them. Also for bytes read once and
+    /// not again, such as a compaction's inputs, which would only take a
+    /// cache's room. A remote object's ranges are fetched over the network
+    /// and bypass the disk cache as well. The response comes back the same
+    /// way as [`read`](Self::read)'s, one location per range in the order
+    /// given, each a view of its slab.
     pub fn read_direct(
         &mut self,
-        file: LocalFile,
+        file: OpenFile,
         reads: Vec<SlabRead>,
     ) -> Result<ReadRequestId, crate::io::IORequesterError> {
         let id = ReadRequestId(*self.next_request_id);
@@ -263,6 +271,59 @@ impl<'a> OperatorIO<'a> {
             open_file,
             offset: 0,
             data,
+            method: UploadMethod::Put,
+        };
+        self.requester.borrow_mut().request_write(
+            self.data_flow_id,
+            self.operator_idx,
+            request,
+            self.stats,
+        )?;
+        Ok(id)
+    }
+
+    /// Send `body` to `remote` as a `POST` and keep the body of the store's
+    /// answer, which the completed request carries back to the operator with
+    /// the id returned here. The request goes out once: one that fails on
+    /// its connection fails the dataflow.
+    pub fn post(
+        &mut self,
+        remote: Arc<RemoteFile>,
+        body: Arc<FileBytes>,
+    ) -> Result<WriteRequestId, crate::io::IORequesterError> {
+        let id = WriteRequestId::next(self.next_request_id, false);
+        let request = PendingWriteRequest {
+            id,
+            open_file: OpenFile::Remote(remote),
+            offset: 0,
+            data: body,
+            method: UploadMethod::Post,
+        };
+        self.requester.borrow_mut().request_write(
+            self.data_flow_id,
+            self.operator_idx,
+            request,
+            self.stats,
+        )?;
+        Ok(id)
+    }
+
+    /// Write `data` into the local `file` at `offset`. For a file an operator
+    /// writes a piece at a time: every piece is its own request with its own
+    /// completion, and pieces at different offsets may be in flight together.
+    pub fn write_at(
+        &mut self,
+        file: LocalFile,
+        offset: u64,
+        data: Arc<FileBytes>,
+    ) -> Result<WriteRequestId, crate::io::IORequesterError> {
+        let id = WriteRequestId::next(self.next_request_id, false);
+        let request = PendingWriteRequest {
+            id,
+            open_file: OpenFile::Local(file),
+            offset,
+            data,
+            method: UploadMethod::Put,
         };
         self.requester.borrow_mut().request_write(
             self.data_flow_id,
@@ -288,6 +349,7 @@ impl<'a> OperatorIO<'a> {
             open_file,
             offset,
             data,
+            method: UploadMethod::Put,
         };
         self.requester.borrow_mut().request_write(
             self.data_flow_id,

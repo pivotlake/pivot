@@ -30,7 +30,7 @@ use crate::operations::channels::NodeIdOutput;
 use crate::operations::unary::order_by_limit::OrderBy;
 
 use super::ChunkedRowSorter;
-use super::batch_sort::MERGE_SLICE_ROWS;
+use super::batch_sort::{MERGE_SLICE_ROWS, batch_arrives_sorted};
 use super::keys::{
     KeyOrdering, RunRow, SelectedKeyOrdering, select_key_ordering, with_key_ordering,
 };
@@ -43,7 +43,6 @@ struct KWayMergeSlice {
 }
 
 impl KWayMergeSlice {
-    #[cfg(test)]
     fn row_count(&self) -> usize {
         self.run_rows.iter().map(Range::len).sum()
     }
@@ -426,6 +425,68 @@ impl KWayMergeTask {
     }
 }
 
+impl KWayMergeTask {
+    /// How many rows this task's slice of the output holds.
+    pub fn row_count(&self) -> usize {
+        self.stage.plan.slices[self.slice_index].row_count()
+    }
+
+    /// Merges this task's slice and returns its rows alone. The tasks of a
+    /// level cover its output in the order the plan listed them, so a caller
+    /// that puts the batches back in that order can pass each one on as soon
+    /// as it is merged instead of holding the whole level.
+    pub fn merge_slice(self, allocator: &mut SlabAllocator) -> Result<LocatedBatch, ArrowError> {
+        let batch = self.stage.plan.merge_slice(allocator, self.slice_index)?;
+        Ok(LocatedBatch::new(batch, self.node_id()))
+    }
+}
+
+/// Whether the rows of `batch` are sorted by `order_by`.
+pub fn is_batch_sorted(order_by: &[OrderBy], batch: &RecordBatch) -> Result<bool, ArrowError> {
+    let chunks = std::slice::from_ref(batch);
+    Ok(with_key_ordering!(
+        select_key_ordering(order_by, chunks, chunks)?,
+        |ordering| batch_arrives_sorted(&mut ordering, batch.num_rows())
+    ))
+}
+
+/// How many leading rows of `run`, whose rows are sorted by `order_by`, sort
+/// at or before row `bound_row` of `bound`.
+pub fn count_rows_not_after(
+    order_by: &[OrderBy],
+    run: &[RecordBatch],
+    bound: &RecordBatch,
+    bound_row: usize,
+) -> Result<usize, ArrowError> {
+    let run_index = build_run_indexes(std::slice::from_ref(&run.to_vec()))
+        .pop()
+        .expect("one run was indexed");
+    if run_index.row_count == 0 {
+        return Ok(0);
+    }
+    let bound_position = RunRow {
+        chunk: 0,
+        row: bound_row,
+    };
+    let bound_chunks = std::slice::from_ref(bound);
+    Ok(with_key_ordering!(
+        select_key_ordering(order_by, run, bound_chunks)?,
+        |ordering| {
+            let mut low = 0;
+            let mut high = run_index.row_count;
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if ordering.compare(run_index.locate(middle), bound_position) == Ordering::Greater {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            low
+        }
+    ))
+}
+
 impl NodeIdOutput for KWayMergeTask {
     fn node_id(&self) -> usize {
         self.stage.plan.slices[self.slice_index].target_node
@@ -621,6 +682,59 @@ mod tests {
                     .to_vec()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_batch_is_sorted_only_when_no_row_sorts_before_its_predecessor() {
+        let sorted = is_batch_sorted(&ascending(), &int_batch(&[1, 4, 4, 9])).unwrap();
+        let unsorted = is_batch_sorted(&ascending(), &int_batch(&[1, 4, 3, 9])).unwrap();
+
+        assert!(sorted);
+        assert!(!unsorted);
+    }
+
+    #[test]
+    fn rows_at_or_before_a_bound_are_counted_across_the_run_batches() {
+        let run = [int_batch(&[1, 4, 4]), int_batch(&[4, 9, 12])];
+        let bound = int_batch(&[0, 4, 20]);
+
+        let through_four = count_rows_not_after(&ascending(), &run, &bound, 1).unwrap();
+        let through_zero = count_rows_not_after(&ascending(), &run, &bound, 0).unwrap();
+        let through_twenty = count_rows_not_after(&ascending(), &run, &bound, 2).unwrap();
+
+        assert_eq!(through_four, 4);
+        assert_eq!(through_zero, 0);
+        assert_eq!(through_twenty, 6);
+    }
+
+    #[test]
+    fn each_task_of_a_level_merges_its_own_slice_in_plan_order() {
+        init_test_free_pool(16);
+        let rows_per_run = 2 * MERGE_SLICE_ROWS as i64;
+        let even: Vec<i64> = (0..rows_per_run).map(|row| row * 2).collect();
+        let odd: Vec<i64> = (0..rows_per_run).map(|row| row * 2 + 1).collect();
+        let runs = vec![
+            MergeRun::new(vec![int_batch(&even)], 0),
+            MergeRun::new(vec![int_batch(&odd)], 0),
+        ];
+        let KWayMergePlan::Parallel(tasks) =
+            KWayMergePlan::try_new(ascending().into(), runs, 1).unwrap()
+        else {
+            panic!("interleaved runs need a merge");
+        };
+        let planned_rows: usize = tasks.iter().map(KWayMergeTask::row_count).sum();
+        let mut allocator = SlabAllocator::new(false);
+
+        let slices: Vec<RecordBatch> = tasks
+            .into_iter()
+            .map(|task| task.merge_slice(&mut allocator).unwrap().into_batch())
+            .collect();
+
+        assert_eq!(planned_rows, 2 * rows_per_run as usize);
+        assert_eq!(
+            int_column(&slices, 0),
+            (0..2 * rows_per_run).collect::<Vec<i64>>()
+        );
     }
 
     #[test]

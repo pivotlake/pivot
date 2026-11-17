@@ -10,14 +10,29 @@
 //! still queued stay available for peer workers to steal. Once the cursor
 //! reaches the end, the column's leaves go out as one [`LeafChunkJob`] each.
 //!
-//! A column with nothing to shred (a plain column, or a variant the planner
-//! left unshredded) only has to be split into its leaves, which costs at most
-//! a pass over its null bitmap. That is not worth spreading over turns, so it
+//! A compaction's column arrives as the chunks its rows were read in, with
+//! the order the rows go out in. The cursor then walks the output order, and
+//! each step first copies its rows out of the chunks. A variant column
+//! arrives shredded the way each input file was, which differs from file to
+//! file, so a step folds the rows it takes of each chunk back to plain
+//! variants before it puts them in order. A compaction also cuts a variant
+//! column into slices of rows, one job each, so that several workers shred
+//! one column at a time.
+//!
+//! A column with nothing to shred or fold back only has to be split into its
+//! leaves, which costs at most a pass over its null bitmap. That is a plain
+//! column, and a variant column whose rows all arrived in the layout the
+//! output has: unshredded for an output left unshredded, or shredded the
+//! very way the output is, as the files of one table usually are. That is not worth spreading over turns, so it
 //! is split and sent on within the call that received it.
 
+use std::collections::HashMap;
+
 use arrow_array::{Array, ArrayRef};
+use dispatch::arrays::take_chunked;
 use dispatch::memory::SlabAllocator;
 use dispatch::{DefaultUnaryFactory, RECORD_BATCH_SIZE, Sender, Unary, UnaryResult, WorkStatus};
+use parquet_variant_compute::VariantArray;
 
 use super::error::WriteResult;
 use super::leaves::{self, Leaf};
@@ -50,8 +65,8 @@ impl Unary<ColumnChunkJob, LeafChunkJob> for Shredder {
             self.held.is_none(),
             "a shredder holding a column is not fed another"
         );
-        let mut column = HeldColumn::new(job);
-        if column.job.shredding.is_none() {
+        let mut column = HeldColumn::new(job)?;
+        if column.shredding.is_none() && !column.arrived_shredded {
             while !column.is_exhausted() {
                 column.convert_next_slice(usize::MAX, &mut self.allocator)?;
             }
@@ -112,6 +127,17 @@ struct HeldColumn {
     job: ColumnChunkJob,
     batch_index: usize,
     rows_consumed_from_batch: usize,
+    /// How many rows of a column that is gathered have been copied out of
+    /// its chunks.
+    rows_gathered: usize,
+    /// Whether the column is a variant column that arrived shredded another
+    /// way than the output is, and so is folded back to plain variants
+    /// before it is shredded anew.
+    arrived_shredded: bool,
+    /// How the column's rows are shredded. `None` for a column the output
+    /// leaves unshredded, and for one whose rows all arrived in the output's
+    /// layout already.
+    shredding: Option<std::sync::Arc<arrow_schema::DataType>>,
     /// One per leaf of the column, depth-first, created from the first slice.
     leaves: Vec<LeafAccumulator>,
 }
@@ -125,31 +151,116 @@ struct LeafAccumulator {
 }
 
 impl HeldColumn {
-    fn new(job: ColumnChunkJob) -> Self {
+    fn new(job: ColumnChunkJob) -> WriteResult<Self> {
         debug_assert!(!job.batches.is_empty(), "a row group column has rows");
-        Self {
+        let output_field = job.context.schema.field(job.column_index);
+        // Rows that are already laid out as the output is go out as they
+        // are: folding them back and shredding them again would rebuild the
+        // same values.
+        let is_in_output_layout = job
+            .batches
+            .iter()
+            .all(|chunk| chunk.data_type() == output_field.data_type());
+        let mut arrived_shredded = false;
+        if !is_in_output_layout && crate::is_variant_field(output_field) {
+            for chunk in job.batches.iter() {
+                let variant = VariantArray::try_new(chunk.as_ref())?;
+                arrived_shredded |= variant.typed_value_field().is_some();
+            }
+        }
+        let shredding = if is_in_output_layout {
+            None
+        } else {
+            job.shredding.clone()
+        };
+        Ok(Self {
             job,
             batch_index: 0,
             rows_consumed_from_batch: 0,
+            rows_gathered: 0,
+            arrived_shredded,
+            shredding,
             leaves: Vec::new(),
+        })
+    }
+
+    /// Copy the rows `row_sources` names out of `chunks`, in that order, as
+    /// plain variants. The chunks are shredded, each the way its input file
+    /// was, so rows of different chunks cannot be put side by side as they
+    /// are. The rows taken of each chunk are folded back first, and then put
+    /// in order.
+    fn gather_unshredded(
+        allocator: &mut SlabAllocator,
+        chunks: &[ArrayRef],
+        row_sources: &[(u32, u32)],
+    ) -> WriteResult<ArrayRef> {
+        // The chunks rows are taken of, the rows taken of each, and where
+        // each output row is among the rows taken.
+        let mut taken_chunks: Vec<u32> = Vec::new();
+        let mut rows_of_taken_chunk: Vec<Vec<(u32, u32)>> = Vec::new();
+        let mut place_of_chunk: HashMap<u32, u32> = HashMap::new();
+        let mut order: Vec<(u32, u32)> = Vec::with_capacity(row_sources.len());
+        for &(chunk, row) in row_sources {
+            let place = *place_of_chunk.entry(chunk).or_insert_with(|| {
+                taken_chunks.push(chunk);
+                rows_of_taken_chunk.push(Vec::new());
+                taken_chunks.len() as u32 - 1
+            });
+            let rows = &mut rows_of_taken_chunk[place as usize];
+            order.push((place, rows.len() as u32));
+            rows.push((0, row));
         }
+        let mut unshredded = Vec::with_capacity(taken_chunks.len());
+        for (chunk, rows) in taken_chunks.iter().zip(&rows_of_taken_chunk) {
+            let taken = take_chunked(
+                allocator,
+                std::slice::from_ref(&chunks[*chunk as usize]),
+                rows,
+            )?;
+            unshredded.push(shredding::unshred_column(&taken, allocator)?);
+        }
+        Ok(take_chunked(allocator, &unshredded, &order)?)
     }
 
     fn is_exhausted(&self) -> bool {
-        self.batch_index == self.job.batches.len()
+        match &self.job.gather {
+            Some(gather) => self.rows_gathered == gather.row_count(),
+            None => self.batch_index == self.job.batches.len(),
+        }
     }
 
     /// Shred (if the column is shredded) and convert the next slice of at most
     /// `row_cap` rows to Parquet leaves, appending their values and levels to
-    /// the column's. Shredded values are built on slabs from `allocator`,
-    /// which is created the first time a slice needs it.
+    /// the column's. Gathered rows and shredded values are built on slabs
+    /// from `allocator`, which is created the first time a slice needs it.
     fn convert_next_slice(
         &mut self,
         row_cap: usize,
         allocator: &mut Option<SlabAllocator>,
     ) -> WriteResult<()> {
-        let slice = self.next_slice(row_cap);
-        let values = match &self.job.shredding {
+        let slice = match self.job.gather.clone() {
+            Some(gather) => {
+                let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
+                let row_sources = &gather.row_sources()[self.rows_gathered..];
+                let rows = row_sources.len().min(row_cap).min(RECORD_BATCH_SIZE);
+                self.rows_gathered += rows;
+                if self.arrived_shredded {
+                    Self::gather_unshredded(allocator, &self.job.batches, &row_sources[..rows])?
+                } else {
+                    take_chunked(allocator, &self.job.batches, &row_sources[..rows])?
+                }
+            }
+            None => {
+                let slice = self.next_slice(row_cap);
+                if self.arrived_shredded {
+                    let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
+                    shredding::unshred_column(&slice, allocator)?
+                } else {
+                    slice
+                }
+            }
+        };
+        let values = match &self.shredding {
             Some(shredding) => {
                 let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
                 shredding::shred_column(&slice, shredding, allocator)?
@@ -200,6 +311,7 @@ impl HeldColumn {
                 value_chunks: leaf.value_chunks,
                 def_levels: leaf.def_levels,
                 max_def_level: leaf.max_def_level,
+                slice: job.slice,
                 target_node: job.target_node,
             })
     }
@@ -242,7 +354,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::writing::types::{FileAssemblyInfo, RowGroupContext};
+    use crate::writing::types::{ColumnSlice, FileAssemblyInfo, RowGroupContext};
 
     /// A job over a one-column row group of `field`, whose rows arrive as
     /// `batches`, with the column's leaves numbered from `first_leaf_index`.
@@ -261,10 +373,13 @@ mod tests {
                     sorted_by: Arc::default(),
                     max_file_size: None,
                 }),
+                memory_reservations: Vec::new(),
             }),
             column_index: 0,
             first_leaf_index,
             batches: batches.into(),
+            gather: None,
+            slice: ColumnSlice::WHOLE,
             shredding: None,
             target_node: 0,
         }
@@ -366,6 +481,34 @@ mod tests {
             .find(|leaf| leaf.path == ["attrs", "typed_value", "id", "typed_value"])
             .expect("the id leaf is one of the column's leaves");
         assert_eq!(typed_id.value_chunks.len(), 3);
+        assert_eq!(present_rows(typed_id), 5);
+    }
+
+    /// A column whose batches are already shredded the way the output is has
+    /// nothing to shred, so it is split into its leaves in one turn.
+    #[test]
+    fn a_column_already_in_the_output_layout_is_split_in_one_turn() {
+        let mut shredder = Shredder::default();
+        let mut sender = CollectSender::new();
+        let mut job = shredded_variant_job(vec![documents(0..2), documents(2..5)]);
+        let plan = job.shredding.clone().unwrap();
+        job.batches = job
+            .batches
+            .iter()
+            .map(|batch| {
+                let unshredded = VariantArray::try_new(batch.as_ref()).unwrap();
+                Arc::new(shred_variant(&unshredded, &plan).unwrap().into_inner()) as ArrayRef
+            })
+            .collect();
+
+        let turns = drive(&mut shredder, job, &mut sender);
+
+        assert_eq!(turns, 1);
+        let typed_id = sender
+            .items
+            .iter()
+            .find(|leaf| leaf.path == ["attrs", "typed_value", "id", "typed_value"])
+            .expect("the id leaf is one of the column's leaves");
         assert_eq!(present_rows(typed_id), 5);
     }
 

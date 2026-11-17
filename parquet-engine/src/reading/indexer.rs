@@ -11,6 +11,13 @@
 //! present it attaches a [`FilterMask`] to each data page so the decoder knows which
 //! rows to keep.
 //!
+//! A column read by the file's offset index holds only the pages with selected
+//! rows (see [`ColumnBuffer::SelectedPages`]). Each page read is placed by the
+//! index, and every data page that was not read gets a stand-in without bytes
+//! whose mask keeps no row, so the stages downstream see every page of the
+//! chunk, as they do for a chunk read whole, and skip the stand-ins as they
+//! skip any page without a selected row.
+//!
 //! ## Emission order
 //!
 //! Pages are expected to be emitted onto a **LIFO** channel, so the last page sent is the first one
@@ -23,6 +30,7 @@
 //! 2. **Dictionary pages** — sent last so they arrive first, ensuring the decoder has the
 //!    dictionary before any RLE-dictionary-encoded data page.
 
+use crate::general_err;
 use crate::thrift::general::{CompressionCodec, Encoding, PageType};
 use crate::thrift::headers::{DataPageHeader, PageHeader};
 use crate::thrift::parquet_thrift::{ParquetError, ThriftReadInputProtocol};
@@ -35,6 +43,7 @@ use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
+use std::collections::VecDeque;
 
 pub type IndexerFactory = DefaultUnaryFactory<Indexer>;
 
@@ -85,17 +94,32 @@ struct ColumnPageBuilder {
     cursor: PageCursor,
 }
 
+/// A page of a column as read, before it is placed among the column's pages.
+struct ReadPage {
+    file_offset: usize,
+    span: usize,
+    header: PageHeader,
+    payload: PagePayload,
+}
+
 impl ColumnPageBuilder {
-    /// Build one `CompressedPage`, attaching the current query's filter mask
-    /// and advancing the cursor.
-    fn build_page(
-        &mut self,
-        file_offset: usize,
-        span: usize,
-        header: PageHeader,
-        payload: PagePayload,
-    ) -> CompressedPage {
-        let (page_idx, row_offset) = self.cursor.advance(&header);
+    /// Build the next `CompressedPage` of a column read whole, attaching the
+    /// current query's filter mask and advancing the cursor.
+    fn build_page(&mut self, page: ReadPage) -> CompressedPage {
+        let (page_idx, row_offset) = self.cursor.advance(&page.header);
+        self.build_page_at(page_idx, row_offset, page)
+    }
+
+    /// Build one `CompressedPage`, the column's data page number `page_idx`
+    /// starting at row `row_offset` (both zero for a dictionary page),
+    /// attaching the current query's filter mask.
+    fn build_page_at(&self, page_idx: usize, row_offset: u32, page: ReadPage) -> CompressedPage {
+        let ReadPage {
+            file_offset,
+            span,
+            header,
+            payload,
+        } = page;
         // A whole row group carries no mask; the materializer's row groups
         // mask down to their surviving rows.
         let filter_mask = (header.r#type == PageType::DATA_PAGE)
@@ -133,45 +157,150 @@ impl ColumnPageBuilder {
             header,
         }
     }
+}
 
-    /// Walk a `Compressed` part's raw byte stream and Thrift-parse it into pages,
-    /// appending each to `pages`. Each iteration reads a page header, then slices out
-    /// the compressed payload via [`MultiBufferReader::copy_out_buffers`] (zero-copy).
-    fn parse_compressed_pages(
-        &mut self,
-        part_offset: usize,
-        buffers: &[Bytes],
-        pages: &mut Vec<CompressedPage>,
-    ) -> Result<(), ParquetError> {
-        let mut position = ReaderPosition::default();
-        let buffers_length = buffers.len();
-        let mut reader = MultiBufferReader::new(buffers, &mut position);
-        loop {
-            // Bytes consumed so far = this page's offset within the part, which the
-            // part's own file offset turns into the page's absolute file offset.
-            let page_start = reader.consumed();
-            let header = {
-                let mut prot = ThriftReadInputProtocol::new(&mut reader);
-                PageHeader::read_thrift_without_stats(&mut prot)?
-            };
-            let data = reader.copy_out_buffers(header.compressed_page_size as usize);
-            let span = reader.consumed() - page_start;
+/// Walk a `Compressed` part's raw byte stream and Thrift-parse it into pages,
+/// handing each to `take_page`. Each iteration reads a page header, then slices out
+/// the compressed payload via [`MultiBufferReader::copy_out_buffers`] (zero-copy).
+fn parse_compressed_pages(
+    part_offset: usize,
+    buffers: &[Bytes],
+    mut take_page: impl FnMut(ReadPage),
+) -> Result<(), ParquetError> {
+    let mut position = ReaderPosition::default();
+    let buffers_length = buffers.len();
+    let mut reader = MultiBufferReader::new(buffers, &mut position);
+    loop {
+        // Bytes consumed so far = this page's offset within the part, which the
+        // part's own file offset turns into the page's absolute file offset.
+        let page_start = reader.consumed();
+        let header = {
+            let mut prot = ThriftReadInputProtocol::new(&mut reader);
+            PageHeader::read_thrift_without_stats(&mut prot)?
+        };
+        let data = reader.copy_out_buffers(header.compressed_page_size as usize);
+        let span = reader.consumed() - page_start;
 
-            pages.push(self.build_page(
-                part_offset + page_start,
+        take_page(ReadPage {
+            file_offset: part_offset + page_start,
+            span,
+            header,
+            payload: PagePayload::Compressed(data),
+        });
+
+        if reader.remaining_in_cur() == 0 && reader.position().buffer_index == buffers_length - 1 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Hand each page of a column's resolved `parts` to `take_page`, in file
+/// order.
+fn read_pages(
+    parts: Vec<CachedColumnChunk>,
+    mut take_page: impl FnMut(ReadPage),
+) -> Result<(), ParquetError> {
+    for part in parts {
+        match part {
+            CachedColumnChunk::Compressed { offset, bytes } => {
+                parse_compressed_pages(offset, &bytes, &mut take_page)?
+            }
+            CachedColumnChunk::Decompressed {
+                offset,
                 span,
                 header,
-                PagePayload::Compressed(data),
-            ));
-
-            if reader.remaining_in_cur() == 0
-                && reader.position().buffer_index == buffers_length - 1
-            {
-                break;
-            }
+                data,
+            } => take_page(ReadPage {
+                file_offset: offset,
+                span,
+                header: *header,
+                payload: PagePayload::Decompressed(data),
+            }),
         }
-        Ok(())
     }
+    Ok(())
+}
+
+/// A data page header for a page of `rows` rows that carries no bytes.
+fn header_of_page_without_bytes(rows: i32) -> PageHeader {
+    PageHeader {
+        r#type: PageType::DATA_PAGE,
+        uncompressed_page_size: 0,
+        compressed_page_size: 0,
+        crc: None,
+        data_page_header: Some(DataPageHeader {
+            num_values: rows,
+            encoding: Encoding::PLAIN,
+            definition_level_encoding: Encoding::RLE,
+            repetition_level_encoding: Encoding::RLE,
+            statistics: None,
+        }),
+        index_page_header: None,
+        dictionary_page_header: None,
+        data_page_header_v2: None,
+    }
+}
+
+/// Build the pages of a column read by the offset index of the row group's
+/// leaf `leaf`: the pages in `parts`, placed by the index, and a stand-in
+/// for every data page of the chunk that was not read.
+///
+/// A page read from where the index lists none, or holding another number of
+/// rows than the index gives it, is an error: the index does not describe
+/// the chunk, and rows placed by it would be the wrong rows.
+fn build_selected_column_pages(
+    builder: ColumnPageBuilder,
+    leaf: usize,
+    parts: Vec<CachedColumnChunk>,
+) -> Result<Vec<CompressedPage>, ParquetError> {
+    let mut pages_read = VecDeque::new();
+    read_pages(parts, |page| pages_read.push_back(page))?;
+    let row_group = builder.query_row_group_metadata.row_group_metadata.clone();
+    let locations = row_group
+        .locate_leaf_pages(leaf)
+        .expect("a column is read by the offset index only when the index lists its pages");
+
+    let mut pages = Vec::with_capacity(128);
+    while let Some(page) = pages_read.pop_front_if(|page| page.header.r#type != PageType::DATA_PAGE)
+    {
+        pages.push(builder.build_page_at(0, 0, page));
+    }
+    for location in locations {
+        let rows = location.rows.len() as i32;
+        let page = match pages_read.pop_front_if(|page| page.file_offset == location.file_offset) {
+            Some(page) if page.header.r#type != PageType::DATA_PAGE => {
+                return Err(general_err!(
+                    "the offset index lists a data page at offset {} but the page there is a {}",
+                    location.file_offset,
+                    page.header.r#type
+                ));
+            }
+            Some(page) if page.header.data_page_num_values() != rows => {
+                return Err(general_err!(
+                    "the offset index gives the page at offset {} {} rows but it holds {}",
+                    location.file_offset,
+                    rows,
+                    page.header.data_page_num_values()
+                ));
+            }
+            Some(page) => page,
+            None => ReadPage {
+                file_offset: location.file_offset,
+                span: location.compressed_size,
+                header: header_of_page_without_bytes(rows),
+                payload: PagePayload::Compressed(Vec::new()),
+            },
+        };
+        pages.push(builder.build_page_at(location.page_idx, location.rows.start, page));
+    }
+    if let Some(page) = pages_read.front() {
+        return Err(general_err!(
+            "the offset index lists no page at offset {}, where one was read",
+            page.file_offset
+        ));
+    }
+    Ok(pages)
 }
 
 /// Build one column's pages, in file order, from its resolved parts.
@@ -186,68 +315,34 @@ fn build_column_pages(
     column: ColumnBuffer,
     worker_id: usize,
 ) -> Result<Vec<CompressedPage>, ParquetError> {
-    let (codec, parts) = match column {
-        ColumnBuffer::Resolved { codec, parts } => (codec, parts),
-        ColumnBuffer::Absent => {
-            let mut builder = ColumnPageBuilder {
-                col_idx,
-                codec: CompressionCodec::UNCOMPRESSED,
-                query_row_group_metadata,
-                worker_id,
-                cursor: PageCursor::default(),
-            };
-            let rows = builder.query_row_group_metadata.num_rows().max(0) as i32;
-            let header = PageHeader {
-                r#type: PageType::DATA_PAGE,
-                uncompressed_page_size: 0,
-                compressed_page_size: 0,
-                crc: None,
-                data_page_header: Some(DataPageHeader {
-                    num_values: rows,
-                    encoding: Encoding::PLAIN,
-                    definition_level_encoding: Encoding::RLE,
-                    repetition_level_encoding: Encoding::RLE,
-                    statistics: None,
-                }),
-                index_page_header: None,
-                dictionary_page_header: None,
-                data_page_header_v2: None,
-            };
-            return Ok(vec![builder.build_page(
-                0,
-                0,
-                header,
-                PagePayload::Decompressed(Vec::new()),
-            )]);
-        }
-    };
     let mut builder = ColumnPageBuilder {
         col_idx,
-        codec,
+        codec: CompressionCodec::UNCOMPRESSED,
         query_row_group_metadata,
         worker_id,
         cursor: PageCursor::default(),
     };
-    let mut pages = Vec::with_capacity(128);
-    for part in parts {
-        match part {
-            CachedColumnChunk::Compressed { offset, bytes } => {
-                builder.parse_compressed_pages(offset, &bytes, &mut pages)?
-            }
-            CachedColumnChunk::Decompressed {
-                offset,
-                span,
-                header,
-                data,
-            } => pages.push(builder.build_page(
-                offset,
-                span,
-                *header,
-                PagePayload::Decompressed(data),
-            )),
+    match column {
+        ColumnBuffer::Resolved { codec, parts } => {
+            builder.codec = codec;
+            let mut pages = Vec::with_capacity(128);
+            read_pages(parts, |page| pages.push(builder.build_page(page)))?;
+            Ok(pages)
+        }
+        ColumnBuffer::SelectedPages { codec, leaf, parts } => {
+            builder.codec = codec;
+            build_selected_column_pages(builder, leaf, parts)
+        }
+        ColumnBuffer::Absent => {
+            let rows = builder.query_row_group_metadata.num_rows().max(0) as i32;
+            Ok(vec![builder.build_page(ReadPage {
+                file_offset: 0,
+                span: 0,
+                header: header_of_page_without_bytes(rows),
+                payload: PagePayload::Decompressed(Vec::new()),
+            })])
         }
     }
-    Ok(pages)
 }
 
 impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
@@ -309,14 +404,19 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::dummy_metadata;
+    use crate::test_utils::{dummy_metadata, dummy_row_group};
+    use crate::thrift::footer::{OffsetIndex, PageLocation};
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::{
         DataPageHeader as ThriftDataPageHeader, DictionaryPageHeader as ThriftDictionaryPageHeader,
     };
     use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
+    use crate::types::metadata::{ColumnChunkMeta, RowGroupMetadata};
+    use crate::types::page_index::RowGroupPageIndex;
+    use crate::types::table::ParquetTable;
     use bytes::Bytes;
-    use dispatch::test_utils::run_unary;
+    use dispatch::test_utils::{CollectSender, run_unary};
+    use std::sync::Arc;
 
     /// Serialize a dispatch `PageHeader` to Thrift compact bytes.
     fn serialize_header(header: &PageHeader) -> Vec<u8> {
@@ -607,5 +707,129 @@ mod tests {
         // Row 15 falls in the second page's [10, 20) range, not the first's [0, 10).
         assert!(by_idx[0].filter_mask.as_ref().unwrap().all_false());
         assert_eq!(by_idx[1].filter_mask.as_ref().unwrap().rows(), 1);
+    }
+
+    /// Where the data pages of [`three_indexed_pages`] start in their file.
+    const INDEXED_PAGES_OFFSET: usize = 100;
+
+    /// A row group of thirty rows whose one leaf spans three data pages of
+    /// ten rows that the file's offset index lists, read for `selection`:
+    /// its metadata and the bytes of each page.
+    fn three_indexed_pages(selection: RowSelection) -> (QueryRowGroupMetadata, Vec<Vec<u8>>) {
+        let pages: Vec<Vec<u8>> = (0..3u8)
+            .map(|page| {
+                let mut bytes = serialize_header(&data_page_header(10, 1));
+                bytes.push(page);
+                bytes
+            })
+            .collect();
+        let mut page_locations = Vec::new();
+        let mut offset = INDEXED_PAGES_OFFSET;
+        for (page, bytes) in pages.iter().enumerate() {
+            page_locations.push(PageLocation {
+                offset: offset as i64,
+                compressed_page_size: bytes.len() as i32,
+                first_row_index: page as i64 * 10,
+            });
+            offset += bytes.len();
+        }
+        let chunk = ColumnChunkMeta {
+            data_page_offset: INDEXED_PAGES_OFFSET as i64,
+            total_compressed_size: (offset - INDEXED_PAGES_OFFSET) as i64,
+            absent: false,
+            ..ColumnChunkMeta::absent()
+        };
+        let offset_index = OffsetIndex { page_locations };
+        let page_index =
+            RowGroupPageIndex::from_offset_indexes([Some((&chunk, &offset_index))].into_iter(), 30)
+                .unwrap();
+        let row_group = RowGroupMetadata {
+            columns: vec![chunk],
+            num_rows: 30,
+            page_index: page_index.map(Arc::new),
+            ..(*dummy_row_group()).clone()
+        };
+        let table = ParquetTable::new(vec![Arc::new(row_group)]);
+        (QueryRowGroupMetadata::new(&table, 0, selection), pages)
+    }
+
+    /// The buffer of a read that took `parts` of the leaf of
+    /// [`three_indexed_pages`] from the file.
+    fn buffer_of_selected_pages(
+        metadata: QueryRowGroupMetadata,
+        parts: Vec<CachedColumnChunk>,
+    ) -> RowGroupBuffer {
+        RowGroupBuffer {
+            metadata,
+            columns: vec![ColumnBuffer::SelectedPages {
+                codec: CompressionCodec::SNAPPY,
+                leaf: 0,
+                parts,
+            }],
+            worker_id: 0,
+            read_ahead_charge: None,
+        }
+    }
+
+    #[test]
+    fn a_page_read_by_the_offset_index_is_placed_among_stand_ins_for_the_others() {
+        let (metadata, pages) = three_indexed_pages(RowSelection::Indices(vec![15].into()));
+        let second_page = CachedColumnChunk::Compressed {
+            offset: INDEXED_PAGES_OFFSET + pages[0].len(),
+            bytes: vec![Bytes::from(pages[1].clone())],
+        };
+        let buffer = buffer_of_selected_pages(metadata, vec![second_page]);
+
+        let mut pages = run_unary(Indexer {}, vec![buffer]);
+
+        pages.sort_by_key(|page| page.page_idx);
+        let first_rows: Vec<u32> = pages.iter().map(|page| page.first_row).collect();
+        let kept_rows: Vec<usize> = pages
+            .iter()
+            .map(|page| page.filter_mask.as_ref().unwrap().rows())
+            .collect();
+        let bytes: Vec<usize> = pages
+            .iter()
+            .map(|page| page.data.iter().map(Bytes::len).sum())
+            .collect();
+        assert_eq!(first_rows, vec![0, 10, 20]);
+        assert_eq!(kept_rows, vec![0, 1, 0]);
+        assert_eq!(bytes, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn a_page_holding_other_rows_than_the_offset_index_gives_it_is_an_error() {
+        let (metadata, _) = three_indexed_pages(RowSelection::Indices(vec![5].into()));
+        let mut first_page = serialize_header(&data_page_header(7, 1));
+        first_page.push(0);
+        let buffer = buffer_of_selected_pages(
+            metadata,
+            vec![CachedColumnChunk::Compressed {
+                offset: INDEXED_PAGES_OFFSET,
+                bytes: vec![Bytes::from(first_page)],
+            }],
+        );
+        let mut test_io = dispatch::TestOperatorIO::default();
+
+        let result = Indexer {}.consume(buffer, &mut CollectSender::new(), &mut test_io.io());
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_page_read_from_where_the_offset_index_lists_none_is_an_error() {
+        let (metadata, pages) = three_indexed_pages(RowSelection::Indices(vec![5].into()));
+        let buffer = buffer_of_selected_pages(
+            metadata,
+            vec![CachedColumnChunk::Compressed {
+                offset: INDEXED_PAGES_OFFSET + 1,
+                bytes: vec![Bytes::from(pages[0].clone())],
+            }],
+        );
+        let mut test_io = dispatch::TestOperatorIO::default();
+
+        let result = Indexer {}.consume(buffer, &mut CollectSender::new(), &mut test_io.io());
+
+        assert!(result.is_err());
     }
 }

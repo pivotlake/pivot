@@ -13,7 +13,7 @@ use dispatch::{Sender, Topology, Unary, UnaryFactory, UnaryResult};
 
 use super::leaves;
 use super::shredding;
-use super::types::{ColumnChunkJob, FileAssemblyInfo, ReadyFile, RowGroupContext};
+use super::types::{ColumnChunkJob, ColumnSlice, FileAssemblyInfo, ReadyFile, RowGroupContext};
 
 pub(super) struct RowGroupPlannerFactory {
     node_count: usize,
@@ -127,6 +127,7 @@ fn emit_column_chunk_jobs(
             schema: shredding_plan.schema.clone(),
             leaf_count,
             file_info: file_info.clone(),
+            memory_reservations: Vec::new(),
         });
         let mut first_leaf_index = 0;
         for (column_index, &column_leaf_count) in leaf_counts.iter().enumerate() {
@@ -139,6 +140,8 @@ fn emit_column_chunk_jobs(
                 column_index,
                 first_leaf_index,
                 batches: column_batches,
+                gather: None,
+                slice: ColumnSlice::WHOLE,
                 shredding: shredding_plan.column_shredding[column_index].clone(),
                 target_node,
             })?;

@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::Error;
-use crate::file_entry::{FileEntry, PartitionValues};
+use crate::file_entry::FileEntry;
 use crate::table_format::{RemovedFiles, Table, VisitPartition};
-use arrow_array::RecordBatch;
 use catalog::datastore::DatastoreTableMetadata;
-use dispatch::{DataFlowDispatcher, Projection};
+use crossbeam_deque::{Injector, Steal};
+use dispatch::DataFlowDispatcher;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
 use object_storage::{FileRef, ObjectPath, ObjectStore};
 use parquet_engine::writing::upload::UploadedFiles;
@@ -553,10 +553,11 @@ impl CatalogTable {
     /// Re-encode `inputs`' rows into fresh target-sized files and return them,
     /// uploaded but not yet part of the table: the read half of a compaction,
     /// which [`compact_table_files`](crate::compact_table_files) then swaps in
-    /// for the inputs. The merged files are written over the
-    /// shared io_uring ring by the same upload operators an INSERT uses, and
-    /// their row groups come straight from the writer's own footer metadata, so
-    /// no footer is re-read.
+    /// for the inputs. The inputs are merged a few row groups at a time and
+    /// each output row group is written as soon as it is encoded, so the
+    /// merge's memory does not grow with the size of the inputs. The output
+    /// files' row groups come straight from the writer's own footer metadata,
+    /// so no footer is re-read.
     ///
     /// Nothing here touches the metadata, so it runs off any read copy that
     /// holds the inputs, and a merge of a large batch never stalls another
@@ -591,153 +592,124 @@ impl CatalogTable {
             .flatten()
             .collect();
         let parquet = Arc::new(ParquetTable::new(row_groups));
-        let columns = parquet.schema().fields().len();
-        let scan = parquet_engine::table_input(
-            &self.dispatcher,
-            &parquet,
-            Projection::all(columns),
-            false,
-        );
+        if parquet.total_rows() == 0 {
+            return Ok(Vec::new());
+        }
         // The selector guarantees that all inputs share one partition, whose
-        // tuple the table records for each of them.
-        let input_partition = input_entries
+        // tuple the table records for each of them. The outputs hold the
+        // inputs' rows and no other, so the tuple is theirs too.
+        let output_partition = input_entries
             .first()
             .and_then(|first| first.partition.clone());
-        let partition_keys = self.table.plan_partition_keys()?;
-        // The keys the rows carry as columns are read off each output's
-        // rows; the inputs' tuple keys every decoded batch by them without
-        // repartitioning it.
-        let column_keys: Arc<[String]> = partition_keys.list_column_keys().into();
-        let row_partition = input_partition.clone().filter(|_| !column_keys.is_empty());
-        // A key computed from a row (a transform of a column) is in no row.
-        // The outputs hold the inputs' rows and no other, so they sit in the
-        // inputs' partition: its value of each such key is theirs.
-        let derived_partition_values = partition_keys
-            .list_derived_keys()
-            .into_iter()
-            .map(|key| {
-                let value = input_partition
-                    .as_ref()
-                    .and_then(|tuple| tuple.get(&key))
-                    .cloned()
-                    .ok_or_else(|| Error::PartitionValueMissing {
-                        location: self.storage.location.as_str().to_string(),
-                        field: key.clone(),
-                    })?;
-                Ok::<_, Error>((key, value))
-            })
-            .collect::<crate::Result<PartitionValues>>()?;
-        // The merge keeps each input's rows in the order the input had them,
-        // so its outputs are in the table's sort order only when every input
-        // is recorded as written in it: a file adopted as it lay is not.
-        let sort_by = self.sort_by();
-        let inputs_are_sorted = !sort_by.is_empty()
-            && input_entries
-                .iter()
-                .all(|input| input.sorted_by.as_ref() == sort_by);
-        // A format that resolves columns by field id gets its outputs stamped
-        // with the declared schema: the inputs are reassembled to the declared
-        // shape (an adopted file may carry no field ids, and a variant column
-        // is re-shredded for the file it lands in) and encoded under it.
-        // Otherwise the outputs keep the inputs' own schema.
-        let (scan, output_schema) = match self.table.field_ids() {
-            None => (scan, parquet.schema().clone()),
-            Some(field_ids) => {
-                let schema = iceberg_tables::io::sink::write_schema(
-                    self.table.columns(),
-                    &self.schema_nullability(),
-                    Some(&field_ids),
-                );
-                let projected = parquet_engine::writing::unshred_batches_spec(scan).project({
-                    let schema = schema.clone();
-                    move || {
-                        let schema = schema.clone();
-                        move |batch: RecordBatch| {
-                            Ok(RecordBatch::try_new(
-                                schema.clone(),
-                                batch.columns().to_vec(),
-                            )?)
-                        }
-                    }
-                });
-                (projected, schema)
-            }
+        // The merge checks that each input's rows are in the order of the
+        // table's sort columns and fails otherwise, so its outputs are in
+        // that order whatever the inputs were recorded as: a file adopted as
+        // it lay is recorded as in no order.
+        let merged_by: Arc<[String]> = self.sort_by().into();
+        // A format that resolves columns by field id gets its outputs written
+        // under the declared schema, which carries the ids: an adopted file
+        // may carry none. Otherwise the outputs keep the inputs' own schema.
+        let output_schema = match self.table.field_ids() {
+            None => parquet.schema().clone(),
+            Some(field_ids) => iceberg_tables::io::sink::write_schema(
+                self.table.columns(),
+                &self.schema_nullability(),
+                Some(&field_ids),
+            ),
         };
-        let max_output_file_size = usize::try_from(max_output_file_size).unwrap_or(usize::MAX);
-        // Merged files sit flat in the table's directory.
-        let uploaded_files = UploadedFiles::new();
-        let encoded = parquet_engine::writing::encode_compaction_batches_spec(
-            scan,
+        let max_file_size = usize::try_from(max_output_file_size).unwrap_or(usize::MAX);
+
+        // The first dataflow settles the output's layout from a sample of the
+        // input; the second merges the files and writes the result.
+        let shredding = parquet_engine::writing::plan_compaction_shredding(
+            &self.dispatcher,
+            &parquet,
             output_schema,
-            row_partition,
-            column_keys,
-            Arc::from(sort_by),
-            inputs_are_sorted,
+        )
+        .map_err(crate::Error::Merge)?;
+        let compaction = parquet_engine::writing::compact_files_spec(
+            &self.dispatcher,
+            parquet,
+            shredding.clone(),
+            &merged_by,
             target_rows_per_group,
-            max_output_file_size,
+        )
+        .map_err(crate::Error::Merge)?;
+        let stored_files = Arc::new(Injector::new());
+        let started_uploads = Arc::new(Injector::new());
+        let uploaded_files = Arc::new(Injector::new());
+        let spec = super::compaction_sink::write_row_groups_spec(
+            super::compaction_sink::CompactionOutput {
+                store: self.store(),
+                location: self.storage.location.clone(),
+                declared_columns: self.columns().into(),
+                schema: shredding.schema().clone(),
+                partition: output_partition,
+                max_file_size,
+                stored_files: stored_files.clone(),
+                started_uploads: started_uploads.clone(),
+                uploaded_files: uploaded_files.clone(),
+            },
+            compaction,
         );
-        let spec = parquet_engine::writing::upload::upload_files_spec(
-            uploaded_files.clone(),
-            self.store(),
-            self.storage.location.clone(),
-            self.columns().into(),
-            None,
-            encoded,
-        );
-        // Drive encode → upload to completion; the emitted row-count batch is
-        // ignored, and the uploaded files arrive on `uploaded_files`.
         let outcome = spec.collect().map(|_| ()).map_err(crate::Error::Merge);
 
-        // The files were written into the table's directory, so the path
-        // each is reported by is the one the table names it by.
-        let added: Vec<TableFile> = uploaded_files
-            .take()
-            .into_iter()
-            .map(|uploaded| {
-                let parquet_engine::writing::upload::UploadedFile {
-                    file,
-                    partition,
-                    row_groups,
-                    sorted_by,
-                    ..
-                } = uploaded;
-                let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
-                    &row_groups,
-                )));
-                // What the writer read off the rows, with the keys no row
-                // carries.
-                let partition = if derived_partition_values.is_empty() {
-                    partition
-                } else {
-                    let mut tuple = partition.unwrap_or_default();
-                    tuple.extend(derived_partition_values.clone());
-                    Some(tuple)
-                };
-                let entry = FileEntry {
-                    file,
-                    partition,
-                    stats,
-                    sorted_by,
-                };
-                TableFile::new(entry, row_groups)
-            })
-            .collect();
-
-        // A merge that failed part way has uploaded some of its outputs. They
-        // will never be committed, so delete them rather than leave orphans.
+        // A merge that failed part way has put some of its outputs in
+        // storage. They will never be committed, so delete them rather than
+        // leave orphans.
         if let Err(error) = outcome {
-            for file in &added {
-                if let Err(cleanup_error) = self.delete_data_file(&file.entry.file.path) {
+            // The parts of an upload that was never completed stay stored
+            // until it is aborted. Aborting one that was completed changes
+            // nothing, and its object is deleted below.
+            for upload in drain_injector(&started_uploads) {
+                let aborted = self
+                    .storage
+                    .store
+                    .as_s3()
+                    .expect("a multipart upload is only started in an S3 store")
+                    .abort_multipart_upload(&upload.key, &upload.upload_id);
+                if let Err(cleanup_error) = aborted {
                     tracing::warn!(
                         merge_error = %error,
                         cleanup_error = %cleanup_error,
-                        file = %file.entry.file.path,
+                        file = %upload.key,
+                        "compaction: aborting a multipart upload of a merge that will not commit failed (its parts are left)"
+                    );
+                }
+            }
+            for path in drain_injector(&stored_files) {
+                if let Err(cleanup_error) = self.delete_data_file(&path) {
+                    tracing::warn!(
+                        merge_error = %error,
+                        cleanup_error = %cleanup_error,
+                        file = %path,
                         "compaction: deleting an output of a merge that will not commit failed (orphan left)"
                     );
                 }
             }
             return Err(error);
         }
+
+        let added: Vec<TableFile> = drain_injector(&uploaded_files)
+            .into_iter()
+            .map(|uploaded| {
+                let super::compaction_sink::CompactedFile {
+                    file,
+                    partition,
+                    row_groups,
+                } = uploaded;
+                let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
+                    &row_groups,
+                )));
+                let entry = FileEntry {
+                    file,
+                    partition,
+                    stats,
+                    sorted_by: merged_by.clone(),
+                };
+                TableFile::new(entry, row_groups)
+            })
+            .collect();
         Ok(added)
     }
 
@@ -766,5 +738,17 @@ impl CatalogTable {
             partition_keys: self.table.plan_partition_keys()?,
             sort_by: self.sort_by().to_vec(),
         })
+    }
+}
+
+/// Take everything queued on `injector`.
+fn drain_injector<T>(injector: &Injector<T>) -> Vec<T> {
+    let mut items = Vec::new();
+    loop {
+        match injector.steal() {
+            Steal::Success(item) => items.push(item),
+            Steal::Retry => continue,
+            Steal::Empty => return items,
+        }
     }
 }

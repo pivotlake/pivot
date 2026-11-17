@@ -18,18 +18,19 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+};
 use parquet::basic::ColumnOrder;
+use parquet::file::metadata::PageIndexPolicy;
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet_variant_compute::{
     ShreddedSchemaBuilder, VariantArray, json_to_variant, shred_variant, unshred_variant,
 };
 use parquet_variant_json::VariantToJson;
 
-use super::{
-    AssembledFile, Partitioning, encode_compaction_batches_spec, encode_record_batches_spec,
-    unshred_batches_spec,
-};
+use super::{AssembledFile, Partitioning, encode_record_batches_spec, unshred_batches_spec};
 
 /// A 64 MiB file-cache ring, as the other in-crate write tests use.
 const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
@@ -38,7 +39,7 @@ const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
 const COLUMN: &str = "attrs";
 
 /// A batch of input rows for the pipeline, one per test shape below.
-trait IntoBatch {
+pub(crate) trait IntoBatch {
     fn into_batch(self) -> Result<RecordBatch, ArrowError>;
 }
 
@@ -67,9 +68,9 @@ impl IntoBatch for ShreddedItem {
 
 /// Documents under an integer tag column, so a test can steer rows into
 /// separate partitions — and so separate files.
-struct TaggedJsonItem {
-    file_tag: i64,
-    rows: Vec<String>,
+pub(crate) struct TaggedJsonItem {
+    pub(crate) file_tag: i64,
+    pub(crate) rows: Vec<String>,
 }
 
 impl IntoBatch for TaggedJsonItem {
@@ -107,7 +108,7 @@ fn variant_batch(rows: &[String], paths: Option<&[&str]>) -> Result<RecordBatch,
 /// Run the write pipeline over `items` (one unpartitioned, unsorted stream —
 /// so one output file) and return the finished files' bytes. `rows_per_group`
 /// caps a row group's rows, so a test can force a file of several groups.
-fn write<T: IntoBatch>(items: Vec<T>, rows_per_group: usize) -> Vec<Vec<u8>> {
+pub(crate) fn write<T: IntoBatch>(items: Vec<T>, rows_per_group: usize) -> Vec<Vec<u8>> {
     write_grouped(items, &[], &[], rows_per_group)
 }
 
@@ -197,7 +198,7 @@ fn write_by_derived_key<T: IntoBatch>(
 }
 
 /// Read a file back through arrow-rs's strict reader, as another engine would.
-fn read_back(bytes: &[u8]) -> RecordBatch {
+pub(crate) fn read_back(bytes: &[u8]) -> RecordBatch {
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
         .unwrap()
         .build()
@@ -785,49 +786,6 @@ fn a_sort_key_orders_a_files_rows() {
     }
 }
 
-/// Compaction receives runs that are already sorted within their source files.
-/// It must merge overlapping runs globally, but must not need the INSERT stage
-/// that sorts each incoming batch first.
-#[test]
-fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
-    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
-    let batches = [vec![1, 3, 5, 7], vec![2, 4, 6, 8]]
-        .into_iter()
-        .map(|keys| {
-            ColumnsItem(vec![("key", Arc::new(Int64Array::from(keys)) as ArrayRef)])
-                .into_batch()
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let schema = batches[0].schema();
-    let input = values_input(dispatch.dispatcher(), batches).record_batches();
-
-    let files: Vec<Vec<u8>> = encode_compaction_batches_spec(
-        input,
-        schema,
-        None,
-        Arc::from([]),
-        Arc::from(["key".to_string()]),
-        true,
-        3,
-        usize::MAX,
-    )
-    .map_each(|file: AssembledFile| Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>()))
-    .collect()
-    .unwrap();
-    dispatch.exit();
-
-    assert_eq!(files.len(), 1);
-    let batch = read_back(&files[0]);
-    let keys = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .values();
-    assert_eq!(keys, &[1, 2, 3, 4, 5, 6, 7, 8]);
-}
-
 /// A small in-memory target produces several internally ordered files without
 /// dropping or duplicating rows. Parallel batch arrival makes the exact file
 /// count nondeterministic.
@@ -1212,4 +1170,169 @@ fn a_date_column_writes_whichever_encoding_it_takes() {
         .values()
         .to_vec();
     assert_eq!(read, days);
+}
+
+/// A file's page index as arrow-rs reads it: the builder of a reader that
+/// loaded the index along with the footer.
+fn read_with_page_index(bytes: &[u8]) -> ParquetRecordBatchReaderBuilder<bytes::Bytes> {
+    ParquetRecordBatchReaderBuilder::try_new_with_options(
+        bytes::Bytes::copy_from_slice(bytes),
+        ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+    )
+    .unwrap()
+}
+
+/// The first row of each data page of a column chunk, from the offset index
+/// arrow-rs read.
+fn page_first_rows(
+    reader: &ParquetRecordBatchReaderBuilder<bytes::Bytes>,
+    row_group: usize,
+    column: usize,
+) -> Vec<i64> {
+    reader.metadata().offset_index().unwrap()[row_group][column]
+        .page_locations()
+        .iter()
+        .map(|page| page.first_row_index)
+        .collect()
+}
+
+/// A distinct 24-byte string per row, in row order. A value takes 28 bytes of
+/// a page, its length included, so a page fills up after 37,450 of them.
+fn page_filling_key(row: usize) -> String {
+    format!("key-{row:020}")
+}
+
+const KEYS_PER_PAGE: usize = 37_450;
+
+fn page_filling_keys(rows: std::ops::Range<usize>) -> ArrayRef {
+    Arc::new(StringArray::from_iter_values(rows.map(page_filling_key)))
+}
+
+/// Every chunk gets an offset index, in a file of several row groups too,
+/// where the pages of the later ones sit past the first.
+#[test]
+fn every_chunk_lists_its_pages_in_an_offset_index() {
+    let keys = page_filling_keys(0..150_000);
+
+    let files = write_sorted(vec![ColumnsItem(vec![("key", keys)])], &["key"], 100_000);
+
+    let reader = read_with_page_index(&files[0]);
+    assert_eq!(
+        page_first_rows(&reader, 0, 0),
+        vec![0, KEYS_PER_PAGE as i64, 2 * KEYS_PER_PAGE as i64]
+    );
+    assert_eq!(
+        page_first_rows(&reader, 1, 0),
+        vec![0, KEYS_PER_PAGE as i64]
+    );
+}
+
+/// The offset index is what lets another reader skip pages, so reading a few
+/// rows through it has to land on the pages that hold them, in a later row
+/// group as well as the first.
+#[test]
+fn rows_selected_through_the_offset_index_come_from_the_right_pages() {
+    let keys = page_filling_keys(0..150_000);
+    let files = write_sorted(vec![ColumnsItem(vec![("key", keys)])], &["key"], 100_000);
+    let selection = RowSelection::from(vec![
+        RowSelector::skip(KEYS_PER_PAGE - 2),
+        RowSelector::select(4),
+        RowSelector::skip(149_990 - (KEYS_PER_PAGE + 2)),
+        RowSelector::select(10),
+    ]);
+
+    let batches: Vec<RecordBatch> = read_with_page_index(&files[0])
+        .with_row_selection(selection)
+        .build()
+        .unwrap()
+        .map(|batch| batch.unwrap())
+        .collect();
+
+    let read = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let expected = (KEYS_PER_PAGE - 2..KEYS_PER_PAGE + 2).chain(149_990..150_000);
+    assert_eq!(
+        read.column(0).as_ref(),
+        &StringArray::from_iter_values(expected.map(page_filling_key))
+    );
+}
+
+/// A column index gives each page's value range and null count.
+#[test]
+fn a_column_index_gives_each_page_its_value_range() {
+    let keys = page_filling_keys(0..2 * KEYS_PER_PAGE);
+
+    let files = write_sorted(vec![ColumnsItem(vec![("key", keys)])], &["key"], 100_000);
+
+    let reader = read_with_page_index(&files[0]);
+    let column_index = &reader.metadata().column_index().unwrap()[0][0];
+    let ColumnIndexMetaData::BYTE_ARRAY(pages) = column_index else {
+        panic!("a string column has a byte array column index");
+    };
+    let bounds: Vec<(&[u8], &[u8])> = (0..2)
+        .map(|page| {
+            (
+                pages.min_value(page).unwrap(),
+                pages.max_value(page).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        bounds,
+        vec![
+            (
+                page_filling_key(0).as_bytes(),
+                page_filling_key(KEYS_PER_PAGE - 1).as_bytes()
+            ),
+            (
+                page_filling_key(KEYS_PER_PAGE).as_bytes(),
+                page_filling_key(2 * KEYS_PER_PAGE - 1).as_bytes()
+            ),
+        ]
+    );
+    assert_eq!(column_index.null_counts(), Some(&vec![0, 0]));
+    assert!(column_index.is_sorted());
+}
+
+/// A page of only nulls has no range, and says so. A null spends no value
+/// bytes, so the nulls after the values that fill the first page make up a
+/// page of their own.
+#[test]
+fn a_page_of_only_nulls_is_marked_in_the_column_index() {
+    let values = (0..KEYS_PER_PAGE)
+        .map(|row| Some(page_filling_key(row)))
+        .chain(std::iter::repeat_n(None, 1_000));
+    let column: ArrayRef = Arc::new(StringArray::from_iter(values));
+
+    let files = write(vec![ColumnsItem(vec![("key", column)])], 100_000);
+
+    let reader = read_with_page_index(&files[0]);
+    let column_index = &reader.metadata().column_index().unwrap()[0][0];
+    assert_eq!(
+        page_first_rows(&reader, 0, 0),
+        vec![0, KEYS_PER_PAGE as i64]
+    );
+    assert!(!column_index.is_null_page(0) && column_index.is_null_page(1));
+    assert_eq!(column_index.null_counts(), Some(&vec![0, 1_000]));
+    assert_eq!(read_back(&files[0]).column(0).null_count(), 1_000);
+}
+
+/// A float has no column index, as its NaNs have no place in an order, and a
+/// string longer than a page bound may be has none either. Both still list
+/// their pages in an offset index.
+#[test]
+fn a_column_without_short_ordered_bounds_has_only_an_offset_index() {
+    let floats: ArrayRef = Arc::new(Float64Array::from(vec![1.5, f64::NAN, -2.0]));
+    let long_strings: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(100); 3]));
+
+    let files = write(
+        vec![ColumnsItem(vec![("float", floats), ("text", long_strings)])],
+        100_000,
+    );
+
+    let reader = read_with_page_index(&files[0]);
+    let column_indexes = &reader.metadata().column_index().unwrap()[0];
+    assert!(matches!(column_indexes[0], ColumnIndexMetaData::NONE));
+    assert!(matches!(column_indexes[1], ColumnIndexMetaData::NONE));
+    assert_eq!(page_first_rows(&reader, 0, 0), vec![0]);
+    assert_eq!(page_first_rows(&reader, 0, 1), vec![0]);
 }

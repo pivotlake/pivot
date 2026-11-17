@@ -455,16 +455,23 @@ pub struct FsWriteRequest {
     pub data: Arc<FileBytes>,
 }
 
-/// A filesystem read that goes around the compressed cache: `slab.size()`
-/// bytes at `offset` of `file`, into a slab its issuer supplied. For bytes
-/// only their writer reads back, such as a spill file's: a cache fill would
-/// widen the read to whole blocks and so into bytes that writes still in
-/// flight are changing, and would keep them. The request owns the slab while
-/// the read is in flight, so its memory outlives a cancelled issuer.
+/// A filesystem read that goes around the compressed cache: the bytes at
+/// `offset` of `file`, into a slab its issuer supplied. For bytes only their
+/// writer reads back, such as a spill file's: a cache fill would widen the
+/// read to whole blocks and so into bytes that writes still in flight are
+/// changing, and would keep them. Also for bytes read once and not again,
+/// which would only take a cache's room. The request owns the slab while the
+/// read is in flight, so its memory outlives a cancelled issuer.
+///
+/// The file is asked for the whole slab, and the read is complete once
+/// `len` bytes have arrived. A file opened for direct IO is read in whole
+/// blocks, so the last slab of a read may reach past the end of the file;
+/// `len` is how many of its bytes the file holds.
 pub struct FsDirectReadRequest {
     pub file: LocalFile,
     pub offset: u64,
     pub slab: Slab,
+    pub len: usize,
 }
 
 /// A filesystem operation issued by a dataflow operator. Reads and writes use
@@ -501,22 +508,53 @@ pub struct HttpGetRequest {
     pub block: MissingExtent,
 }
 
-/// An object upload driven by the same per-worker HTTP connection pool and
-/// io_uring as range GETs. Always a `PUT`. The body goes out run by run, like a
-/// filesystem write's.
+/// The method of a request that sends a body to an object store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadMethod {
+    /// Store the body as an object, or as one part of one. The store's
+    /// answer is read for its `ETag` and its body is dropped. Sending the
+    /// same `PUT` twice stores the same bytes, so one that fails on its
+    /// connection is sent again.
+    Put,
+    /// Ask the store to do something the body describes, and keep the body
+    /// of its answer. Sending the same `POST` twice may do the thing twice,
+    /// so it goes out once, on a connection of its own.
+    Post,
+}
+
+/// A request that sends a body to an object store, driven by the same
+/// per-worker HTTP engine and io_uring as range GETs. The body goes out run
+/// by run, like a filesystem write's.
 pub struct HttpUploadRequest {
     pub remote: Arc<RemoteFile>,
     pub data: Arc<FileBytes>,
+    pub method: UploadMethod,
     /// The `ETag` header of the store's response, set when the upload
     /// completes. `None` before that, and when the store sent none.
     pub etag: Option<String>,
+    /// The body of the store's answer to a `POST`, set when the request
+    /// completes. Empty before that, and for a `PUT`.
+    pub response_body: Vec<u8>,
+}
+
+/// An HTTP(S) range GET that goes around the compressed cache and the disk
+/// cache: the `len` bytes at `offset` of `remote`, into the start of a slab
+/// its issuer supplied. For bytes read once and not again, which would only
+/// take a cache's room. The request owns the slab while the read is in
+/// flight, so its memory outlives a cancelled issuer.
+pub struct HttpDirectGetRequest {
+    pub remote: Arc<RemoteFile>,
+    pub offset: u64,
+    pub slab: Slab,
+    pub len: usize,
 }
 
 /// An HTTP operation issued by a dataflow operator. GETs pass through the
-/// compressed/disk cache; uploads bypass it but share the same worker-local
-/// transport and connection pool.
+/// compressed/disk cache unless they are direct; uploads bypass it. All share
+/// the same worker-local transport and connection pool.
 pub enum HttpRequest {
     Get(HttpGetRequest),
+    GetDirect(HttpDirectGetRequest),
     Upload(HttpUploadRequest),
 }
 
@@ -534,7 +572,13 @@ impl ReadyBytesLen for FsReadRequest {
 
 impl ReadyBytesLen for FsDirectReadRequest {
     fn ready_bytes_len(&self) -> u64 {
-        self.slab.size() as u64
+        self.len as u64
+    }
+}
+
+impl ReadyBytesLen for HttpDirectGetRequest {
+    fn ready_bytes_len(&self) -> u64 {
+        self.len as u64
     }
 }
 
@@ -570,6 +614,7 @@ impl ReadyBytesLen for HttpRequest {
     fn ready_bytes_len(&self) -> u64 {
         match self {
             Self::Get(request) => request.ready_bytes_len(),
+            Self::GetDirect(request) => request.ready_bytes_len(),
             Self::Upload(request) => request.ready_bytes_len(),
         }
     }
@@ -652,6 +697,9 @@ pub enum Completion {
     FsReadDirect(DataFlowRequest<FileRange>),
     FsWrite(DataFlowRequest<FsWriteRequest>),
     HttpGet(DataFlowRequest<HttpGetRequest>, RemoteReadTime),
+    /// A direct range GET that landed, with the object range it read; its
+    /// slab has already gone to the read's response.
+    HttpGetDirect(DataFlowRequest<FileRange>),
     HttpUpload(DataFlowRequest<HttpUploadRequest>),
 }
 

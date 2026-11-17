@@ -110,7 +110,7 @@ pub(crate) use normalizer::{
 pub(crate) use order_by::create_normalizing_for_workers as create_normalizing_order_by_factories;
 pub use order_by::{
     KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, OrderByFactory,
-    batch_sort_indices,
+    batch_sort_indices, count_rows_not_after, is_batch_sorted,
 };
 pub use order_by_limit::{OrderBy, OrderByLimitFactory};
 pub use unnest::UnnestFactory;

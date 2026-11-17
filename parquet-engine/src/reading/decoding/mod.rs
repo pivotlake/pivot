@@ -283,12 +283,8 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         assert!(self.active.is_none(), "a decoder takes one range at a time");
-        let row_group_index = range.metadata().row_group_index;
-        let mut decoder = match self
-            .idle
-            .iter()
-            .position(|idle| idle.row_group_index() == row_group_index)
-        {
+        let read_id = range.metadata().read_id();
+        let mut decoder = match self.idle.iter().position(|idle| idle.read_id() == read_id) {
             Some(pos) => self.idle.swap_remove(pos),
             None => RowGroupDecoder::new(&range, self.batch_size, self.add_row_group_metadata)
                 .map_err(crate::op_err)?,
@@ -370,6 +366,7 @@ pub(crate) mod tests {
                 })
                 .collect(),
             statistics: Arc::default(),
+            page_index: None,
             num_rows,
             file_row_offset: 0,
             deleted_rows: None,
@@ -465,6 +462,7 @@ pub(crate) mod tests {
             schema,
             columns: vec![column(true, all_dictionary), column(false, false)],
             statistics: Arc::default(),
+            page_index: None,
             num_rows,
             file_row_offset: 0,
             deleted_rows: None,

@@ -40,6 +40,7 @@
 //! the fetcher, still counted against the budget, and is sent on once no
 //! in-memory row group is left, so what is in memory is worked on first.
 
+use crate::WorkerAllocator;
 use crate::types::metadata::QueryRowGroupMetadata;
 use crate::types::projection::Projection;
 use crate::types::requests::{RowGroupBuffer, RowGroupRequest};
@@ -77,6 +78,8 @@ pub struct RowGroupFetcher<IoRowGroupsReceiver: Receiver<QueryRowGroupMetadata>>
     /// The row groups whose reads are back, oldest first, waiting to be sent
     /// on until no in-memory row group is left.
     fetched_row_groups: VecDeque<RowGroupBuffer>,
+    /// Where the bytes of a read that bypasses the caches are read into.
+    direct_read_allocator: WorkerAllocator,
 }
 
 impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
@@ -97,6 +100,7 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
             uncached_row_groups_receiver,
             in_flight: HashMap::new(),
             fetched_row_groups: VecDeque::new(),
+            direct_read_allocator: WorkerAllocator::new(),
         }
     }
 
@@ -136,6 +140,14 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
             // groups that were expected to be.
             self.fetched_row_groups
                 .push_back(request.into_row_group_buffer(None, Some(read_ahead_charge)));
+        } else if request.bypasses_caches() {
+            // Read into slabs of the fetcher's own, around the compressed
+            // cache: nothing reads these bytes a second time.
+            let reads = self
+                .direct_read_allocator
+                .with(|allocator| request.plan_direct_reads(allocator));
+            let id = io.read_direct(request.open_file().clone(), reads)?;
+            self.in_flight.insert(id, (request, read_ahead_charge));
         } else {
             let id = io.read(
                 &memory_ctx().page_caches().compressed,

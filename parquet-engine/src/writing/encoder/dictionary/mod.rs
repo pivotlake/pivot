@@ -86,6 +86,7 @@ fn dictionary_page(
 ) -> WriteResult<EncodedPage> {
     pages::assemble_page(
         0,
+        num_values,
         raw,
         PageKind::Dictionary { num_values },
         codec,
@@ -112,6 +113,7 @@ fn index_page(
     let raw = pages::data_page_body(leaf.def_levels.as_deref(), leaf.max_def_level, encoded);
     pages::assemble_page(
         num_rows as i64,
+        leaf.values.len(),
         raw,
         PageKind::Data {
             num_values: num_rows,

@@ -5,12 +5,13 @@
 //! Thrift footer, converts the Parquet schema to Arrow, and collects
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
-use crate::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
+use crate::thrift::footer::{FileMetaData, OffsetIndex, PageEncodingStats, Statistics};
 use crate::thrift::general::{Encoding, PageType};
 use crate::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::types::columns::{ColumnResolution, TableColumns};
 use crate::types::leaves::leaf_count;
 use crate::types::metadata::{ColumnChunkMeta, FileLeafStatistics, RowGroupMetadata};
+use crate::types::page_index::RowGroupPageIndex;
 use arrow_array::builder::{BinaryViewBuilder, StringViewBuilder};
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
@@ -241,34 +242,104 @@ pub(crate) fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 /// second read.
 pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 
-/// Parse raw thrift footer bytes into this file's row groups (file-local
-/// indices), tying each to `open_file` for the column-chunk reads that follow.
-/// `table_columns` is the table's declared schema and how the file's columns
-/// match it (see [`resolve_column_layout`]).
-pub(crate) fn row_groups_from_footer(
-    footer: &[u8],
-    open_file: dispatch::io::OpenFile,
-    table_columns: &TableColumns,
-) -> Result<Vec<RowGroupMetadata>> {
-    let file_meta = parse_footer_thrift(footer)?;
-    row_groups_from_metadata(file_meta, open_file, table_columns)
+/// A file's offset indexes: per row group, each chunk's in the footer's
+/// order, `None` for a chunk the file has no offset index for.
+pub(crate) type FileOffsetIndexes = Vec<Vec<Option<OffsetIndex>>>;
+
+/// The stretch of the file holding the offset indexes the footer points at,
+/// from the first one's start to the last one's end; `None` for a file
+/// without any. `file_size` bounds where an index can be.
+pub(crate) fn locate_offset_indexes(
+    file_meta: &FileMetaData,
+    file_size: usize,
+) -> Result<Option<std::ops::Range<usize>>> {
+    let mut span: Option<std::ops::Range<usize>> = None;
+    for chunk in file_meta.row_groups.iter().flat_map(|rg| &rg.columns) {
+        let Some(index) = locate_chunk_offset_index(chunk, file_size)? else {
+            continue;
+        };
+        span = Some(match span {
+            Some(span) => span.start.min(index.start)..span.end.max(index.end),
+            None => index,
+        });
+    }
+    Ok(span)
 }
 
-/// Build the per-row-group metadata from a parsed footer and the (local or
-/// remote) open file. Shared by the local and remote readers and by the writer's
-/// upload path, which already holds the footer metadata it wrote and so skips the
-/// parse. Row groups carry only their *file-local* index; the global index is the
-/// row group's eventual position in the table's flat list.
+/// Where `chunk`'s offset index is in the file, when the file has one for it.
+fn locate_chunk_offset_index(
+    chunk: &crate::thrift::footer::ColumnChunk,
+    file_size: usize,
+) -> Result<Option<std::ops::Range<usize>>> {
+    match (chunk.offset_index_offset, chunk.offset_index_length) {
+        (None, None) => Ok(None),
+        (Some(offset), Some(length))
+            if offset >= 0 && length > 0 && offset as usize + length as usize <= file_size =>
+        {
+            Ok(Some(offset as usize..offset as usize + length as usize))
+        }
+        (offset, length) => Err(Error::InvalidFooter(format!(
+            "offset index at {offset:?} of length {length:?} in a file of {file_size} bytes"
+        ))),
+    }
+}
+
+/// Parse the offset indexes the footer points at out of `region`, the file's
+/// bytes from `region_offset` on, which must hold all of them (see
+/// [`locate_offset_indexes`]).
+pub(crate) fn parse_offset_indexes(
+    file_meta: &FileMetaData,
+    region_offset: usize,
+    region: &[u8],
+) -> Result<FileOffsetIndexes> {
+    file_meta
+        .row_groups
+        .iter()
+        .map(|row_group| {
+            row_group
+                .columns
+                .iter()
+                .map(|chunk| {
+                    let Some(index) =
+                        locate_chunk_offset_index(chunk, region_offset + region.len())?
+                    else {
+                        return Ok(None);
+                    };
+                    let bytes = &region[index.start - region_offset..index.end - region_offset];
+                    let mut prot = ThriftSliceInputProtocol::new(bytes);
+                    OffsetIndex::read_thrift(&mut prot).map(Some).map_err(|e| {
+                        Error::InvalidFooter(format!("offset index does not parse: {e}"))
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Build the per-row-group metadata from a parsed footer, the file's offset
+/// indexes and the (local or remote) open file. Shared by the local and remote
+/// readers and by the writer's upload path, which already holds the metadata it
+/// wrote and so skips the parse. Row groups carry only their *file-local*
+/// index; the global index is the row group's eventual position in the table's
+/// flat list.
 ///
 /// The file's leaves are read in the file's own order, then laid out as
-/// `table_columns` resolves them: a row group's `schema`, `columns` and
-/// statistics all follow that layout, so every reader addresses a column the
-/// same way whatever the file stored.
+/// `table_columns` resolves them: a row group's `schema`, `columns`,
+/// statistics and page index all follow that layout, so every reader addresses
+/// a column the same way whatever the file stored.
 pub(crate) fn row_groups_from_metadata(
     file_meta: FileMetaData,
+    offset_indexes: FileOffsetIndexes,
     open_file: dispatch::io::OpenFile,
     table_columns: &TableColumns,
 ) -> Result<Vec<RowGroupMetadata>> {
+    if offset_indexes.len() != file_meta.row_groups.len() {
+        return Err(Error::InvalidFooter(format!(
+            "offset indexes for {} row groups in a file of {}",
+            offset_indexes.len(),
+            file_meta.row_groups.len()
+        )));
+    }
     let (file_schema, file_field_ids, leaf_infos) = schema_elements_to_arrow(&file_meta.schema)?;
     let file_leaf_count = leaf_infos.len();
     let ColumnLayout {
@@ -298,10 +369,15 @@ pub(crate) fn row_groups_from_metadata(
     let mut leaf_physical_types = vec![0_i32; file_leaf_count];
     let mut row_groups = Vec::with_capacity(row_group_count);
 
-    for (i, rg) in file_meta.row_groups.into_iter().enumerate() {
+    for (i, (rg, chunk_offset_indexes)) in file_meta
+        .row_groups
+        .into_iter()
+        .zip(offset_indexes)
+        .enumerate()
+    {
         // Chunks are per leaf; a row group with a different count is a
         // malformed footer and would index out of bounds below.
-        if rg.columns.len() != file_leaf_count {
+        if rg.columns.len() != file_leaf_count || chunk_offset_indexes.len() != file_leaf_count {
             return Err(Error::InvalidFooter(format!(
                 "row group {i} has {} column chunks but the schema has {} leaves",
                 rg.columns.len(),
@@ -337,6 +413,16 @@ pub(crate) fn row_groups_from_metadata(
         // for the chunks, which is several times wider per element than what is
         // kept. The surplus lives as long as the table does, so release it.
         file_chunks.shrink_to_fit();
+        let page_index = RowGroupPageIndex::from_offset_indexes(
+            leaf_sources.iter().map(|source| match source {
+                LeafSource::File(leaf) => chunk_offset_indexes[*leaf]
+                    .as_ref()
+                    .map(|offset_index| (&file_chunks[*leaf], offset_index)),
+                LeafSource::Absent => None,
+            }),
+            rg.num_rows,
+        )?
+        .map(Arc::new);
         // Lay the chunks out as the resolved schema orders its leaves.
         let columns: Vec<ColumnChunkMeta> = if layout_is_identity {
             file_chunks
@@ -349,10 +435,13 @@ pub(crate) fn row_groups_from_metadata(
                 })
                 .collect()
         };
-        row_groups.push((rg.num_rows, columns));
+        row_groups.push((rg.num_rows, columns, page_index));
     }
 
-    let row_counts: Vec<i64> = row_groups.iter().map(|(num_rows, _)| *num_rows).collect();
+    let row_counts: Vec<i64> = row_groups
+        .iter()
+        .map(|(num_rows, _, _)| *num_rows)
+        .collect();
     let statistics = Arc::new(
         leaf_sources
             .iter()
@@ -372,12 +461,13 @@ pub(crate) fn row_groups_from_metadata(
     Ok(row_groups
         .into_iter()
         .enumerate()
-        .map(|(i, (num_rows, columns))| {
+        .map(|(i, (num_rows, columns, page_index))| {
             let row_group = RowGroupMetadata {
                 open_file: open_file.clone(),
                 schema: schema.clone(),
                 columns,
                 statistics: statistics.clone(),
+                page_index,
                 num_rows,
                 file_row_offset,
                 deleted_rows: None,
@@ -810,7 +900,7 @@ fn i128_from_be_bytes(bytes: &[u8]) -> Option<i128> {
 }
 
 /// Deserialises raw Thrift bytes into a [`FileMetaData`].
-fn parse_footer_thrift(buf: &[u8]) -> Result<FileMetaData> {
+pub(crate) fn parse_footer_thrift(buf: &[u8]) -> Result<FileMetaData> {
     let mut prot = ThriftSliceInputProtocol::new(buf);
     FileMetaData::read_thrift(&mut prot)
         .map_err(|e| Error::IO(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))

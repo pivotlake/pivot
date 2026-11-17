@@ -178,6 +178,7 @@ pub(super) enum PageKind {
 /// the sizes into an [`EncodedPage`].
 pub(super) fn assemble_page(
     num_rows: i64,
+    value_count: usize,
     raw: Vec<u8>,
     kind: PageKind,
     codec: CompressionCodec,
@@ -237,6 +238,7 @@ pub(super) fn assemble_page(
 
     Ok(EncodedPage {
         num_rows,
+        value_count,
         uncompressed_size: raw.len(),
         header_len,
         bytes,

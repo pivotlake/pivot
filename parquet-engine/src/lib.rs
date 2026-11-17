@@ -52,8 +52,8 @@ pub(crate) mod reading;
 pub use reading::{
     ColumnDecoderError, DecodeRange, DecoderFactory, DecompressorError, DecompressorFactory,
     IndexerFactory, MaterializerFactory, RangeCutterFactory, RowGroupFetcherFactory,
-    RowGroupInjectorFactory, ScanEqualityPredicate, WorkerAllocator, materialize, table_input,
-    table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    RowGroupInjectorFactory, ScanEqualityPredicate, WorkerAllocator, fetch_row_groups, materialize,
+    table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
 };
 
 pub mod writing;
@@ -119,6 +119,7 @@ pub(crate) mod test_utils {
             schema: Arc::new(Schema::empty()),
             columns: vec![],
             statistics: Arc::default(),
+            page_index: None,
             num_rows: 0,
             file_row_offset: 0,
             deleted_rows: None,

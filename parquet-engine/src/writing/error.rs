@@ -36,6 +36,17 @@ pub(crate) enum WriteError {
     /// which means the array is nullable where its field is declared required.
     #[error("a required leaf has {nulls} null(s)")]
     NullsInRequiredColumn { nulls: usize },
+    /// Consecutive rows of a merge's input file were not in the table's sort
+    /// order, so merging the files would not produce sorted output.
+    #[error("a compaction input file is not sorted by the table's sort columns")]
+    UnsortedCompactionInput,
+    /// A stage of a merge counted a different number of rows than another,
+    /// or than the input's footers declare.
+    #[error("the stages of a compaction disagree on its row count")]
+    CompactionRowCountMismatch,
+    /// A merge was asked to read a file that has deleted rows.
+    #[error("a compaction input file has deleted rows, which a merge does not read")]
+    CompactionOfDeletedRows,
     /// An array did not have the Arrow type its column's schema declared.
     #[error("array downcast to {expected} failed")]
     Downcast { expected: &'static str },

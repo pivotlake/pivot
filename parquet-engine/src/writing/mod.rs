@@ -10,14 +10,7 @@
 //!    into pending runs all workers share, and the byte target applies to the
 //!    retained Arrow data each partition has pending.
 //!
-//! Compaction replaces those two stages: its selected files already share one
-//! known partition, and every decoded batch retains its source file's row
-//! order. It wraps each batch as a run without partitioning, sorting, or copying,
-//! then collects all selected runs into one file without a memory-size cutoff.
-//! Its outputs are therefore in sort order exactly when every source file
-//! was, which only its caller knows.
-//!
-//! Both paths share the remainder:
+//! The remainder of an INSERT:
 //!
 //! 3. The local planner in [`file_merge`] reads the sort keys of one node's runs
 //!    and divides their k-way merge into independent output slices. It does not
@@ -51,25 +44,34 @@
 //! An unsorted file skips the merge work. Files remain on dispatch workers
 //! through assembly and upload because their bytes occupy worker-owned ring
 //! memory.
+//!
+//! Compaction does not build whole files in memory. Its input files are
+//! already sorted, so [`compaction`] finds the output's row order by merging the
+//! files' sort columns alone, reads the rows as the output reaches them, and
+//! hands encoded row groups on in file order for a writer to append to a
+//! file as they come. It shares the shredder and encoder with INSERT.
 
 mod assembler;
+pub use assembler::{EncodedRowGroup, ParquetFileBuilder};
+mod compaction;
 mod compression;
 pub(crate) mod encoder;
 pub(crate) mod error;
 mod file_collector;
 mod file_merge;
 mod leaves;
+pub use compaction::{FileCompaction, MemoryReservation};
 mod partition_sorter;
-mod presorted_run;
 mod row_group_planner;
 mod shredder;
 mod shredding;
+pub use shredding::FileShredding;
 mod stats;
 pub use stats::aggregate_file_stats;
 mod types;
 pub mod upload;
 
-pub use types::AssembledFile;
+pub use types::{AssembledFile, WrittenFileMetadata};
 
 use std::sync::Arc;
 
@@ -77,12 +79,12 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use dispatch::memory::SlabAllocator;
 use dispatch::{
-    DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy, RecordBatchOperatorSpec,
-    node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, to_single_worker_mpsc,
+    DataFlowDispatcher, DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy,
+    RecordBatchOperatorSpec, node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable,
+    values_input,
 };
 
 use partition_sorter::{PartitionSorterFactory, SortedPartitionRun};
-use presorted_run::PresortedRun;
 use types::{
     ColumnChunkJob, EncodedLeafChunk, FileOrderInput, GlobalMergeJob, LeafChunkJob, LocalMergeJob,
     LocalMergeResult, ReadyFile,
@@ -179,77 +181,97 @@ pub fn encode_record_batches_spec(
     encode_files_spec(files)
 }
 
-/// Appends Parquet construction to a compaction scan. Every input batch already
-/// belongs to the selected partition and is ordered as it was in its source
-/// file, so the INSERT-only partition/sort/copy stage is skipped. All batches
-/// form one ordered output stream, split at target-sized row-group boundaries;
-/// sorted tables still use the downstream k-way merge to combine
-/// overlapping source-file runs.
-///
-/// The merge orders nothing a source file left unordered. `sources_are_sorted`
-/// says whether every source file's rows are in the order of
-/// `sort_column_names`, ascending with NULLs first: the outputs are reported
-/// sorted by those columns only then.
-#[allow(clippy::too_many_arguments)] // one call per compaction merge; each piece is needed
-pub fn encode_compaction_batches_spec(
-    spec: RecordBatchOperatorSpec,
-    schema: SchemaRef,
-    partition: Option<crate::PartitionValues>,
-    partition_column_names: Arc<[String]>,
-    sort_column_names: Arc<[String]>,
-    sources_are_sorted: bool,
+/// How many input row groups a compaction's shredding plan reads.
+const PLAN_SAMPLE_ROW_GROUPS: usize = 8;
+
+/// Plan the shredding of a compaction's output before the merge writes its
+/// first row group. Only variant columns are shredded, so a table without
+/// any reads nothing. Otherwise the plan comes from the variant columns of a
+/// few row groups spread evenly over the input. `output_schema` is the
+/// schema the output is written under, before shredding: the input files'
+/// own, or one that declares the same columns with more on them, such as
+/// field ids.
+pub fn plan_compaction_shredding(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<crate::ParquetTable>,
+    output_schema: SchemaRef,
+) -> Result<Arc<FileShredding>, dispatch::DataFlowError> {
+    use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
+    let schema = &output_schema;
+    let variant_columns: Vec<usize> = (0..schema.fields().len())
+        .filter(|&column| crate::is_variant_field(schema.field(column)))
+        .collect();
+    let row_groups_with_rows: Vec<usize> = table
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter(|(_, metadata)| metadata.num_rows > 0)
+        .map(|(group, _)| group)
+        .collect();
+    if variant_columns.is_empty() || row_groups_with_rows.is_empty() {
+        return Ok(Arc::new(shredding::plan_unshredded(schema.clone())));
+    }
+    let sampled_count = PLAN_SAMPLE_ROW_GROUPS.min(row_groups_with_rows.len());
+    let requests: Vec<QueryRowGroupMetadata> = (0..sampled_count)
+        .map(|sampled| {
+            let group = row_groups_with_rows[sampled * row_groups_with_rows.len() / sampled_count];
+            QueryRowGroupMetadata::new(table, group, RowSelection::All).bypassing_caches()
+        })
+        .collect();
+    let projection = crate::types::projection::Projection::columns(variant_columns.clone());
+    let sample =
+        crate::fetch_row_groups(values_input(dispatcher, requests), table, projection, false);
+    let batches = unshred_batches_spec(sample.record_batches()).collect()?;
+    let shredding = shredding::plan_shredding_from_sample(schema, &variant_columns, &batches)
+        .map_err(|error| {
+            dispatch::DataFlowError::Operation(dispatch::UnaryError::from(error).into())
+        })?;
+    Ok(Arc::new(shredding))
+}
+
+/// Merge the files of `table`, each already sorted by `sort_column_names`,
+/// into one stream of encoded row groups of `target_rows_per_group` rows in
+/// that order. The order is found by merging the files' sort columns alone,
+/// and the rows are then read only as the output reaches them (see
+/// [`compaction`]). `shredding` is the output's plan (see
+/// [`plan_compaction_shredding`]). A table without sort columns has its
+/// files' rows passed through in file order. Fails for a table with deleted
+/// rows.
+pub fn compact_files_spec(
+    dispatcher: &DataFlowDispatcher,
+    table: Arc<crate::ParquetTable>,
+    shredding: Arc<FileShredding>,
+    sort_column_names: &[String],
     target_rows_per_group: usize,
-    max_file_size: usize,
-) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
-    let spec = unshred_batches_spec(spec);
-    let order_by = sort_order(&schema, &sort_column_names);
-    let sorted_by = if sources_are_sorted {
-        sort_column_names
-    } else {
-        Arc::default()
-    };
-    let (dispatcher, heads) = spec.into_parts();
-    let worker_count = heads.len();
-    let file_collector_worker = dispatcher.next_worker();
-    let input_batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
-    let topology = input_batches.dispatcher().topology();
-    let presorted_runs =
-        PresortedRun::create_for_workers(partition.as_ref(), &partition_column_names, topology);
-    let files = input_batches
-        .chain(
-            stealable::<RecordBatch>(topology).into_iter().collect(),
-            presorted_runs,
-        )
-        .chain(
-            to_single_worker_mpsc::<SortedPartitionRun>(worker_count, file_collector_worker)
-                .into_iter()
-                .collect(),
-            file_collector::factories(
-                partition_column_names,
-                0,
-                order_by.into(),
-                sorted_by,
-                target_rows_per_group,
-                usize::MAX,
-                Some(max_file_size),
-                topology,
-            ),
-        );
-    encode_files_spec(files)
+) -> Result<FileCompaction<impl OperatorFactory<EncodedRowGroup> + 'static>, dispatch::DataFlowError>
+{
+    compaction::compact_files_spec(
+        dispatcher,
+        table,
+        shredding,
+        sort_column_names.into(),
+        target_rows_per_group,
+    )
+    .map_err(|error| dispatch::DataFlowError::Operation(dispatch::UnaryError::from(error).into()))
 }
 
 pub fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
-    spec.project(|| {
-        // Built on the first batch rather than here: `SlabAllocator::new` takes
-        // a write buffer from the worker's memory context, which exists only
-        // once the worker is running. One allocator per worker, reused across
-        // batches so its part-filled slab carries over.
-        let mut allocator: Option<SlabAllocator> = None;
-        move |batch| {
-            let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
-            Ok(shredding::unshred_batch(batch, allocator)?)
-        }
-    })
+    spec.project(build_batch_unshredder)
+}
+
+/// One worker's transform of a batch read from a file into the batch with
+/// its variant columns unshredded.
+fn build_batch_unshredder()
+-> impl FnMut(RecordBatch) -> dispatch::UnaryResult<RecordBatch> + Send + 'static {
+    // Built on the first batch rather than here: `SlabAllocator::new` takes
+    // a write buffer from the worker's memory context, which exists only
+    // once the worker is running. One allocator per worker, reused across
+    // batches so its part-filled slab carries over.
+    let mut allocator: Option<SlabAllocator> = None;
+    move |batch| {
+        let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
+        Ok(shredding::unshred_batch(batch, allocator)?)
+    }
 }
 
 fn sort_order(schema: &SchemaRef, sort_column_names: &[String]) -> Vec<OrderBy> {
@@ -327,7 +349,7 @@ where
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod type_tests;

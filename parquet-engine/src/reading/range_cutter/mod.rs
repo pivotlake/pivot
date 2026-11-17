@@ -75,10 +75,12 @@ pub struct RangeCutter {
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
     /// Slab allocator for the dictionaries built here, the worker's own.
     allocator: Arc<WorkerAllocator>,
-    open: HashMap<usize, OpenRowGroup>,
-    /// Row groups whose ranges are all emitted or that were pruned; a page
-    /// arriving late for one is dropped.
-    closed: HashSet<usize>,
+    /// The row group reads whose pages are arriving, by read id (see
+    /// [`QueryRowGroupMetadata::read_id`](crate::types::metadata::QueryRowGroupMetadata::read_id)).
+    open: HashMap<u64, OpenRowGroup>,
+    /// The reads whose ranges are all emitted or whose row group was pruned;
+    /// a page arriving late for one is dropped.
+    closed: HashSet<u64>,
     outstanding_row_groups: Arc<AtomicUsize>,
 }
 
@@ -99,15 +101,15 @@ impl RangeCutter {
         }
     }
 
-    /// Forgets `row_group_index`: its pages from here on are dropped. A row
+    /// Forgets the read `read_id`: its pages from here on are dropped. A row
     /// group closed with no range to decode is released from the scan's
     /// outstanding count here, as no decoder will.
-    fn close(&mut self, row_group_index: usize) {
+    fn close(&mut self, read_id: u64) {
         let open = self
             .open
-            .remove(&row_group_index)
+            .remove(&read_id)
             .expect("a row group is closed once");
-        self.closed.insert(row_group_index);
+        self.closed.insert(read_id);
         if open.pages.range_count() == 0 || open.pages.metadata().is_pruned() {
             self.outstanding_row_groups.fetch_sub(1, Ordering::Relaxed);
         }
@@ -117,12 +119,12 @@ impl RangeCutter {
     /// last one.
     fn emit_ready_ranges(
         &mut self,
-        row_group_index: usize,
+        read_id: u64,
         sender: &mut dyn Sender<DecodeRange>,
     ) -> dispatch::UnaryResult<()> {
         let open = self
             .open
-            .get_mut(&row_group_index)
+            .get_mut(&read_id)
             .expect("ranges are emitted for an open row group");
         let ready = open.pages.ready_ranges();
         for index in open.emitted..ready {
@@ -130,7 +132,7 @@ impl RangeCutter {
         }
         open.emitted = ready;
         if open.emitted == open.pages.range_count() {
-            self.close(row_group_index);
+            self.close(read_id);
         }
         Ok(())
     }
@@ -144,22 +146,26 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         let metadata = page.query_row_group_metadata.clone();
-        let row_group_index = metadata.row_group_index;
-        if self.closed.contains(&row_group_index) {
+        let read_id = metadata.read_id();
+        if self.closed.contains(&read_id) {
             return Ok(());
         }
-        if !self.open.contains_key(&row_group_index) {
+        if !self.open.contains_key(&read_id) {
             let plan = Arc::new(
-                DecodePlan::new(&metadata, &self.projection, &self.eq_predicates)
-                    .map_err(crate::op_err)?,
+                DecodePlan::new(
+                    metadata.get_metadata(),
+                    &self.projection,
+                    &self.eq_predicates,
+                )
+                .map_err(crate::op_err)?,
             );
             let leaf_decoders = plan
-                .create_leaf_decoders(&metadata)
+                .create_leaf_decoders(metadata.get_metadata())
                 .map_err(crate::op_err)?;
             let pages =
                 RowGroupPages::new(metadata.clone(), plan, self.outstanding_row_groups.clone());
             self.open.insert(
-                row_group_index,
+                read_id,
                 OpenRowGroup {
                     pages,
                     emitted: 0,
@@ -167,7 +173,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
                 },
             );
         }
-        let open = self.open.get_mut(&row_group_index).unwrap();
+        let open = self.open.get_mut(&read_id).unwrap();
         let column = page.column_idx;
         match page.data {
             DecompressedPageType::Dict { header, data } => {
@@ -184,7 +190,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
                         // flight: the decompressor drops its remaining data
                         // pages.
                         metadata.mark_pruned();
-                        self.close(row_group_index);
+                        self.close(read_id);
                         return Ok(());
                     }
                     BuiltDictionary::Built(dictionary) => {
@@ -213,7 +219,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
                 );
             }
         }
-        self.emit_ready_ranges(row_group_index, output)
+        self.emit_ready_ranges(read_id, output)
     }
 
     fn finish(&mut self, _output: &mut dyn Sender<DecodeRange>) -> dispatch::UnaryResult<bool> {
@@ -257,6 +263,7 @@ mod tests {
                 absent: false,
             }],
             statistics: Arc::default(),
+            page_index: None,
             num_rows,
             file_row_offset: 0,
             deleted_rows: None,

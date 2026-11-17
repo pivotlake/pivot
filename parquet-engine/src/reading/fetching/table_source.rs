@@ -547,6 +547,7 @@ mod tests {
                 absent: false,
             }],
             statistics: Arc::default(),
+            page_index: None,
             num_rows: 0,
             file_row_offset: 0,
             deleted_rows: None,

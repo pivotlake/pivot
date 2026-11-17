@@ -14,7 +14,10 @@ mod batch_sort;
 mod k_way_merge;
 mod keys;
 
-pub use k_way_merge::{KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput};
+pub use k_way_merge::{
+    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, count_rows_not_after,
+    is_batch_sorted,
+};
 
 use crate::api::BuildContext;
 use crate::operations::{Built, BuiltUnary};

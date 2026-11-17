@@ -9,7 +9,8 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 
-use crate::thrift::footer::Statistics;
+use super::compaction::{GatherRows, MemoryReservation};
+use crate::thrift::footer::{ColumnIndex, FileMetaData, OffsetIndex, Statistics};
 use crate::thrift::general::Encoding;
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
@@ -46,14 +47,31 @@ pub(crate) struct FileAssemblyInfo {
 /// worker that assembled the file.
 pub struct AssembledFile {
     pub bytes: FileBytes,
-    /// Retained to avoid parsing the footer immediately after writing it.
-    pub metadata: crate::thrift::footer::FileMetaData,
+    /// Retained to avoid reading the footer and page index back immediately
+    /// after writing them.
+    pub metadata: WrittenFileMetadata,
     pub partition: Option<crate::PartitionValues>,
     /// The columns the file's rows are in order of, each ascending with NULLs
     /// first, as the stages that ordered them report it: an INSERT's sort
     /// columns, and a compaction's when every row it merged arrived in their
     /// order. Empty for a file whose rows are in no such order.
     pub sorted_by: Arc<[String]>,
+}
+
+/// The metadata of a file as its writer laid it out: the footer, and the
+/// offset index the footer points at.
+pub struct WrittenFileMetadata {
+    pub footer: FileMetaData,
+    /// Every chunk's offset index, per row group and chunk in the footer's
+    /// order.
+    pub offset_indexes: Vec<Vec<OffsetIndex>>,
+}
+
+impl WrittenFileMetadata {
+    /// How many rows the file holds.
+    pub fn row_count(&self) -> usize {
+        self.footer.num_rows as usize
+    }
 }
 
 /// Shared routing and schema information for every column chunk in one row
@@ -66,6 +84,9 @@ pub(crate) struct RowGroupContext {
     /// chunks that complete the row group.
     pub(crate) leaf_count: usize,
     pub(crate) file_info: Arc<FileAssemblyInfo>,
+    /// The memory a compaction reserved for the row group's rows, held until
+    /// the row group is written. Empty for any other write.
+    pub(crate) memory_reservations: Vec<Arc<MemoryReservation>>,
 }
 
 /// Identities, routing, and row-group sizing assigned when a file candidate is
@@ -184,8 +205,22 @@ impl NodeIdOutput for GlobalMergeJob {
     }
 }
 
-/// One top-level column of one row group, ready to be split into its primitive
-/// leaves.
+/// Which part of a row group's column a job is: one of `count` slices of
+/// consecutive rows, numbered in row order. A column that is not cut is its
+/// own one slice.
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnSlice {
+    pub(crate) index: usize,
+    pub(crate) count: usize,
+}
+
+impl ColumnSlice {
+    /// The slice that is the whole column.
+    pub(crate) const WHOLE: Self = Self { index: 0, count: 1 };
+}
+
+/// One top-level column of one row group, or one slice of its rows, ready to
+/// be split into its primitive leaves.
 pub(crate) struct ColumnChunkJob {
     pub(crate) context: Arc<RowGroupContext>,
     pub(crate) column_index: usize,
@@ -195,6 +230,11 @@ pub(crate) struct ColumnChunkJob {
     /// Array slices in row order. The shredder walks them a bounded number of
     /// rows per step.
     pub(crate) batches: Arc<[ArrayRef]>,
+    /// Set when `batches` are not in row order: the job's rows are then
+    /// copied out of them in this order, a bounded number per step.
+    pub(crate) gather: Option<GatherRows>,
+    /// Which slice of the column the job is.
+    pub(crate) slice: ColumnSlice,
     pub(crate) shredding: Option<Arc<arrow_schema::DataType>>,
     pub(crate) target_node: usize,
 }
@@ -217,10 +257,12 @@ pub(crate) struct LeafChunkJob {
     /// The present rows' values in row order, one chunk per shredder step. The
     /// encoder concatenates them before encoding the leaf.
     pub(crate) value_chunks: Vec<ArrayRef>,
-    /// One level per row of the row group; `None` when nothing on the path is
-    /// nullable.
+    /// One level per row of the job's rows; `None` when nothing on the path
+    /// is nullable.
     pub(crate) def_levels: Option<Vec<i16>>,
     pub(crate) max_def_level: i16,
+    /// Which slice of the leaf's column these values are.
+    pub(crate) slice: ColumnSlice,
     pub(crate) target_node: usize,
 }
 
@@ -233,6 +275,9 @@ impl NodeIdOutput for LeafChunkJob {
 /// One encoded Parquet page, including its Thrift header and compressed body.
 pub(crate) struct EncodedPage {
     pub(crate) num_rows: i64,
+    /// How many values the page stores: its rows that are not absent, or a
+    /// dictionary page's entries.
+    pub(crate) value_count: usize,
     pub(crate) uncompressed_size: usize,
     pub(crate) header_len: usize,
     pub(crate) bytes: Slab,
@@ -246,6 +291,9 @@ pub(crate) struct EncodedLeaf {
     pub(crate) dictionary_page: Option<EncodedPage>,
     pub(crate) data_page_encoding: Encoding,
     pub(crate) data_pages: Vec<EncodedPage>,
+    /// The value range of each data page, for a leaf whose type has bounds
+    /// that are short enough to record per page.
+    pub(crate) column_index: Option<ColumnIndex>,
     /// The codec this leaf's pages were compressed with, which the footer
     /// records per column chunk.
     pub(crate) codec: CompressionCodec,

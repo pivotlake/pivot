@@ -91,9 +91,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> RunningPartitionMerge<K, V> 
                             SPILL_BLOCK_SIZE,
                             false,
                         ),
+                        len: stretch.range.len,
                     })
                     .collect();
-                let read = io.read_direct(on_disk.file, reads)?;
+                let read = io.read_direct(crate::io::OpenFile::Local(on_disk.file), reads)?;
                 reads_in_flight.push((read, on_disk.stretches));
             }
         }

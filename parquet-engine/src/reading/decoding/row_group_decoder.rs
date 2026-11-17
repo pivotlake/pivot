@@ -11,13 +11,15 @@ use crate::reading::decoding::ScanEqualityPredicate;
 use crate::reading::decoding::column_decoder::{ColumnDecoder, Error, Result, create_leaf_decoder};
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
-use crate::reading::record_batch_metadata::with_row_index;
+use crate::reading::record_batch_metadata::{with_row_index, with_row_positions};
 use crate::types::filter_mask::FilterMask;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
-use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
+use crate::types::metadata::{
+    ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata, RowSelection,
+};
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
-use arrow_array::{ArrayRef, RecordBatch, Scalar};
+use arrow_array::{ArrayRef, RecordBatch, Scalar, UInt32Array};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{FieldRef, Fields, Schema, SchemaRef};
 use dispatch::memory::SlabAllocator;
@@ -59,14 +61,14 @@ pub(crate) struct DecodePlan {
 
 impl DecodePlan {
     pub fn new(
-        row_group_metadata: &QueryRowGroupMetadata,
+        row_group_metadata: &RowGroupMetadata,
         projection: &Projection,
         eq_predicates: &[ScanEqualityPredicate],
     ) -> Result<Self> {
         // Expand projected columns into this file's leaves. Variant layouts can
         // differ between files, so each row group resolves them independently,
         // and the fetcher resolved them the same way.
-        let fields = row_group_metadata.get_metadata().schema.fields();
+        let fields = row_group_metadata.schema.fields();
         let leaves = leaf_fields(fields);
         let reads = resolve_output_reads(fields, row_group_metadata, projection);
         let plan = plan_leaves(&reads);
@@ -91,7 +93,7 @@ impl DecodePlan {
         let (prunable, eq_constants) = prunable_columns(
             &column_decoders,
             &plan.file_leaves,
-            row_group_metadata.columns(),
+            &row_group_metadata.columns,
             projection,
             eq_predicates,
         );
@@ -123,9 +125,9 @@ impl DecodePlan {
     /// constants installed on the prunable ones.
     pub fn create_leaf_decoders(
         &self,
-        row_group_metadata: &QueryRowGroupMetadata,
+        row_group_metadata: &RowGroupMetadata,
     ) -> Result<Vec<Box<dyn LeafDecoder>>> {
-        let column_chunks = row_group_metadata.columns();
+        let column_chunks = &row_group_metadata.columns;
         let mut leaf_decoders = self
             .leaf_fields
             .iter()
@@ -188,7 +190,7 @@ impl RowGroupDecoder {
         let plan = range.plan().clone();
         let filter_batches =
             !add_row_group_metadata && !matches!(metadata.selection(), RowSelection::Indices(_));
-        let mut leaf_decoders = plan.create_leaf_decoders(&metadata)?;
+        let mut leaf_decoders = plan.create_leaf_decoders(metadata.get_metadata())?;
         for (leaf, decoder) in leaf_decoders.iter_mut().enumerate() {
             if let Some(dictionary) = &range.column(leaf).dictionary {
                 decoder.adopt_dictionary(dictionary.clone());
@@ -212,6 +214,11 @@ impl RowGroupDecoder {
 
     pub fn row_group_index(&self) -> usize {
         self.metadata.row_group_index
+    }
+
+    /// Which read of the row group this decoder decodes the ranges of.
+    pub fn read_id(&self) -> u64 {
+        self.metadata.read_id()
     }
 
     /// Whether every range of the row group is decoded, on any worker, so
@@ -401,7 +408,15 @@ impl RowGroupDecoder {
                 record_batch
             };
             let batch = if self.add_row_group_metadata {
-                with_row_index(record_batch, first_row)
+                match self.metadata.selection() {
+                    RowSelection::All => with_row_index(record_batch, first_row),
+                    // A selection's rows are counted here by their place in
+                    // it, and the metadata names each by its row number.
+                    RowSelection::Indices(rows) => with_row_positions(
+                        record_batch,
+                        UInt32Array::from(rows[first_row..first_row + available].to_vec()),
+                    ),
+                }
             } else {
                 record_batch
             };

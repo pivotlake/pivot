@@ -1974,10 +1974,8 @@ fn scan_two_pushed_extracts_on_one_column_share_the_read() {
 }
 
 // A late-materialized fetch whose one row group's rows arrive split across
-// many metadata batches (spread over the workers) must still issue exactly one
-// request for the group: the decoder tracks row groups by index and drops
-// pages of a group it already finished, so a second request for the same group
-// silently loses its rows.
+// many metadata batches (spread over the workers) returns every one of the
+// group's rows.
 #[test]
 fn materialize_reads_a_row_group_split_across_batches_exactly_once() {
     use arrow_array::Int64Array;

@@ -41,6 +41,7 @@
 
 mod binding;
 mod compact;
+mod compaction_sink;
 mod delta;
 mod iceberg;
 mod insert_sink;

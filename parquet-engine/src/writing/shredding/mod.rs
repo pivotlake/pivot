@@ -64,6 +64,23 @@ pub(crate) fn unshred_batch(
     })
 }
 
+/// Fold one variant column back to the plain `{metadata, value}` pair,
+/// dropping any typed leaves it arrived with. A column that is already
+/// unshredded is returned as it is.
+pub(super) fn unshred_column(
+    values: &ArrayRef,
+    allocator: &mut SlabAllocator,
+) -> WriteResult<ArrayRef> {
+    let variant = VariantArray::try_new(values.as_ref())?;
+    if variant.typed_value_field().is_none() {
+        return Ok(values.clone());
+    }
+    let unshredded = unshred_variant(&variant)?;
+    Ok(Arc::new(
+        copy_value_field_to_slabs(unshredded, allocator)?.into_inner(),
+    ))
+}
+
 /// Rebuilds an unshredded column's `value` field over slab memory.
 ///
 /// [`unshred_variant`] reassembles each row's document with `parquet_variant`'s
@@ -99,9 +116,54 @@ fn copy_value_field_to_slabs(
 /// describe, and each variant column's inferred layout for the encode workers
 /// to apply. Plain columns, and variants with nothing worth shredding, carry
 /// `None`.
-pub(super) struct FileShredding {
+pub struct FileShredding {
     pub(super) schema: arrow_schema::SchemaRef,
     pub(super) column_shredding: Vec<Option<Arc<arrow_schema::DataType>>>,
+}
+
+impl FileShredding {
+    /// The schema the file's footer describes: the columns as they are once
+    /// shredded.
+    pub fn schema(&self) -> &arrow_schema::SchemaRef {
+        &self.schema
+    }
+}
+
+/// A file of `schema` with no column shredded.
+pub(super) fn plan_unshredded(schema: arrow_schema::SchemaRef) -> FileShredding {
+    FileShredding {
+        column_shredding: vec![None; schema.fields().len()],
+        schema,
+    }
+}
+
+/// Decide the shredding of a file of `schema` from `sample`, which holds
+/// rows of the file's variant columns alone: column `position` of a sample
+/// batch is column `variant_columns[position]` of the file.
+pub(super) fn plan_shredding_from_sample(
+    schema: &arrow_schema::SchemaRef,
+    variant_columns: &[usize],
+    sample: &[RecordBatch],
+) -> WriteResult<FileShredding> {
+    let sampled = plan_file_shredding(sample)?;
+    let mut fields: Vec<FieldRef> = schema.fields().to_vec();
+    let mut column_shredding = vec![None; fields.len()];
+    for (position, &column) in variant_columns.iter().enumerate() {
+        // Only the column's type comes from the sample. It stays the field
+        // the output's schema declares, with whatever that carries, such as
+        // the field id a reader resolving columns by id finds it by.
+        fields[column] = Arc::new(
+            fields[column]
+                .as_ref()
+                .clone()
+                .with_data_type(sampled.schema.field(position).data_type().clone()),
+        );
+        column_shredding[column] = sampled.column_shredding[position].clone();
+    }
+    Ok(FileShredding {
+        schema: Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        column_shredding,
+    })
 }
 
 /// Decide one file's shredding from all of its rows without rewriting any of

@@ -31,11 +31,17 @@ pub use range_cutter::{DecodeRange, RangeCutterFactory};
 mod materializer;
 pub use materializer::MaterializerFactory;
 
-mod record_batch_metadata;
+pub(crate) mod record_batch_metadata;
 
 mod empty_projection_scan;
 
+#[cfg(test)]
+mod page_index_tests;
+
 mod scan;
+pub(crate) use range_cutter::row_group_pages::DECODE_RANGE_ROWS;
+pub(crate) use scan::{cut_decode_ranges, decode_ranges, fetch_row_group_buffers};
 pub use scan::{
-    materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    fetch_row_groups, materialize, table_input, table_input_with_filter,
+    table_input_with_filter_and_eq_predicates,
 };

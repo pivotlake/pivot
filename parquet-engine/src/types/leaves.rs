@@ -10,7 +10,6 @@ use arrow_schema::{DataType, Field, FieldRef, Fields};
 use dispatch::{Projection, VariantExtract};
 
 use crate::RowGroupMetadata;
-use crate::types::metadata::QueryRowGroupMetadata;
 
 /// Returns the primitive descendants of `fields` in depth-first order.
 ///
@@ -86,7 +85,7 @@ pub(crate) enum OutputRead {
 impl OutputRead {
     fn create(
         fields: &Fields,
-        metadata: &QueryRowGroupMetadata,
+        metadata: &RowGroupMetadata,
         column: usize,
         extract: Option<&VariantExtract>,
     ) -> Self {
@@ -120,14 +119,14 @@ impl OutputRead {
     /// this cast. Otherwise some values live outside the typed leaf and the
     /// caller has to reconstruct the on-path variant.
     pub(crate) fn try_create_typed_leaf(
-        metadata: &QueryRowGroupMetadata,
+        metadata: &RowGroupMetadata,
         leaves: &ShreddedScalarPath,
         target: &DataType,
     ) -> Option<Self> {
         let terminal = leaves.value_leaves.len().saturating_sub(1);
         for (level, &value_leaf) in leaves.value_leaves.iter().enumerate() {
             if !variant_value_leaf_is_semantically_null(
-                metadata.get_metadata(),
+                metadata,
                 value_leaf,
                 target,
                 level == terminal,
@@ -151,7 +150,7 @@ impl OutputRead {
         fields: &Fields,
         column: usize,
         path: &[String],
-        metadata: &QueryRowGroupMetadata,
+        metadata: &RowGroupMetadata,
         value_leaves: Option<(&ShreddedScalarPath, &DataType)>,
     ) -> Option<Self> {
         let mut leaf_sources = Vec::new();
@@ -192,7 +191,7 @@ impl OutputRead {
 /// Resolves each of `projection`'s output columns against this row group.
 pub(crate) fn resolve_output_reads(
     fields: &Fields,
-    metadata: &QueryRowGroupMetadata,
+    metadata: &RowGroupMetadata,
     projection: &Projection,
 ) -> Vec<OutputRead> {
     projection
@@ -248,7 +247,7 @@ pub(crate) fn plan_leaves(reads: &[OutputRead]) -> LeafPlan {
 /// order.
 pub(crate) fn projected_leaves(
     fields: &Fields,
-    metadata: &QueryRowGroupMetadata,
+    metadata: &RowGroupMetadata,
     projection: &Projection,
 ) -> Vec<usize> {
     plan_leaves(&resolve_output_reads(fields, metadata, projection)).file_leaves
@@ -357,7 +356,7 @@ fn prune_variant_node(
     path: &[String],
     first_leaf: usize,
     leaf_sources: &mut Vec<usize>,
-    metadata: &QueryRowGroupMetadata,
+    metadata: &RowGroupMetadata,
     value_leaves: Option<(&ShreddedScalarPath, &DataType)>,
 ) -> Option<FieldRef> {
     let DataType::Struct(children) = field.data_type() else {
@@ -445,7 +444,7 @@ fn prune_null_leaves(
     field: &FieldRef,
     first_leaf: usize,
     leaf_sources: &mut Vec<usize>,
-    metadata: &QueryRowGroupMetadata,
+    metadata: &RowGroupMetadata,
     value_leaves: Option<(&ShreddedScalarPath, &DataType)>,
 ) -> Option<FieldRef> {
     let DataType::Struct(children) = field.data_type() else {
@@ -482,7 +481,7 @@ fn prune_null_leaves(
 fn leaf_is_semantically_null(
     field: &FieldRef,
     leaf: usize,
-    metadata: &QueryRowGroupMetadata,
+    metadata: &RowGroupMetadata,
     value_leaves: Option<(&ShreddedScalarPath, &DataType)>,
 ) -> bool {
     // Every reconstructed Variant needs its metadata blob.
@@ -490,10 +489,9 @@ fn leaf_is_semantically_null(
         return false;
     }
     if metadata
-        .get_metadata()
         .leaf_statistics(leaf)
         .and_then(|statistics| statistics.null_count)
-        == Some(metadata.num_rows())
+        == Some(metadata.num_rows)
     {
         return true;
     }
@@ -504,7 +502,7 @@ fn leaf_is_semantically_null(
             .position(|&value_leaf| value_leaf == leaf)
             .is_some_and(|level| {
                 variant_value_leaf_is_semantically_null(
-                    metadata.get_metadata(),
+                    metadata,
                     leaf,
                     target,
                     level + 1 == value_leaves.value_leaves.len(),
@@ -867,7 +865,7 @@ mod tests {
             &fields,
             0,
             &build_path(&["age"]),
-            &dummy_metadata(RowSelection::All),
+            dummy_metadata(RowSelection::All).get_metadata(),
             None,
         )
         .unwrap();
@@ -928,7 +926,7 @@ mod tests {
             &fields,
             0,
             &build_path(&["user", "id"]),
-            &dummy_metadata(RowSelection::All),
+            dummy_metadata(RowSelection::All).get_metadata(),
             None,
         )
         .unwrap();
@@ -955,7 +953,7 @@ mod tests {
             &fields,
             0,
             &build_path(&["missing"]),
-            &dummy_metadata(RowSelection::All),
+            dummy_metadata(RowSelection::All).get_metadata(),
             None,
         )
         .unwrap();

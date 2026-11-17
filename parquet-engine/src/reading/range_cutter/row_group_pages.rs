@@ -324,8 +324,12 @@ mod tests {
 
     fn pages_of(table: &Arc<ParquetTable>) -> RowGroupPages {
         let metadata = QueryRowGroupMetadata::new(table, 0, RowSelection::All);
-        let plan =
-            DecodePlan::new(&metadata, &Projection::all_from_schema(table.schema()), &[]).unwrap();
+        let plan = DecodePlan::new(
+            metadata.get_metadata(),
+            &Projection::all_from_schema(table.schema()),
+            &[],
+        )
+        .unwrap();
         RowGroupPages::new(metadata, Arc::new(plan), Arc::new(AtomicUsize::new(1)))
     }
 

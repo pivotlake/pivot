@@ -55,6 +55,10 @@ pub type DecompressorFactory = DefaultUnaryFactory<Decompressor>;
 pub struct Decompressor {
     snappy_decoder: Decoder,
     zstd_decoder: DCtx<'static>,
+    /// Where the pages of a read that bypasses the caches are decompressed
+    /// into. Created with the first such page, so a decompressor that only
+    /// serves cached reads holds no memory for it.
+    uncached_page_allocator: Option<dispatch::memory::SlabAllocator>,
 }
 
 impl Default for Decompressor {
@@ -62,6 +66,7 @@ impl Default for Decompressor {
         Self {
             snappy_decoder: Decoder::new(),
             zstd_decoder: DCtx::create(),
+            uncached_page_allocator: None,
         }
     }
 }
@@ -92,6 +97,55 @@ impl Decompressor {
                 return Err(Error::DecompressedLength { written, expected });
             }
             std::mem::take(&mut page.data)
+        } else if page.header.uncompressed_page_size == 0 {
+            // An empty page decompresses to no bytes, and the decoders reject
+            // zero input/output buffers. This happens for the dictionary page
+            // of an all-null column, e.g. the unused `value` fallback leaf of
+            // a shredded variant path (every value went to its typed leaf).
+            Vec::new()
+        } else if page.row_group.bypasses_caches() {
+            // Decompress into slabs of the decompressor's own, each at most
+            // one buffer, and leave the decompressed cache alone: nothing
+            // reads this page a second time.
+            let uncompressed_size = page.header.uncompressed_page_size as usize;
+            let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
+            let allocator = self
+                .uncached_page_allocator
+                .get_or_insert_with(|| dispatch::memory::SlabAllocator::new(false));
+            let mut slabs: Vec<dispatch::memory::Slab> = (0..uncompressed_size)
+                .step_by(dispatch::BUFFER_SIZE)
+                .map(|slab_start| {
+                    allocator.get_slab_of_size(
+                        (uncompressed_size - slab_start).min(dispatch::BUFFER_SIZE),
+                        false,
+                    )
+                })
+                .collect();
+            let mut outputs: Vec<&mut [u8]> =
+                slabs.iter_mut().map(|slab| slab.as_mut_slice()).collect();
+            let written = match page.codec {
+                CompressionCodec::SNAPPY => {
+                    self.snappy_decoder.decompress_scattered(&input, outputs)?
+                }
+                CompressionCodec::LZ4_RAW => {
+                    lz4_flex::block::decompress_scattered(&input, &mut outputs)?
+                }
+                CompressionCodec::ZSTD => {
+                    decompress_zstd_scattered(&mut self.zstd_decoder, &input, &mut outputs)?
+                }
+                // UNCOMPRESSED took the zero-copy passthrough above.
+                other => return Err(Error::UnsupportedCodec(other)),
+            };
+            if written != uncompressed_size {
+                return Err(Error::DecompressedLength {
+                    written,
+                    expected: uncompressed_size,
+                });
+            }
+            slabs
+                .into_iter()
+                .map(|slab| Bytes::from_owner(slab.freeze()))
+                .collect()
         } else {
             // The decompressed bytes depend only on the compressed input, not on the
             // per-query filter mask, so a cache hit reuses them across queries; the
@@ -104,12 +158,6 @@ impl Decompressor {
             let cache = &memory_ctx().page_caches().decompressed;
             match cache.get(&key) {
                 Some(cached) => cached.data,
-                // An empty page decompresses to no bytes, and the decoders
-                // reject zero input/output buffers. This happens for the
-                // dictionary page of an all-null column, e.g. the unused `value`
-                // fallback leaf of a shredded variant path (every value went to
-                // its typed leaf). Nothing to cache either.
-                None if page.header.uncompressed_page_size == 0 => Vec::new(),
                 None => {
                     // Decompress straight into the cache's fill region and
                     // publish. The header is stored alongside the bytes, opaque

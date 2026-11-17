@@ -26,9 +26,10 @@ use crate::io::backend::IOBackend;
 use crate::io::disk_cache::{DiskCache, Object, Segment};
 use crate::io::http::{BodyPart, HttpEngine, RemoteRead, RemoteUpload, default_client_config};
 use crate::io::{
-    Completion, DataFlowRequest, FailedIO, HttpGetRequest, HttpUploadRequest, OpenFile,
-    RemoteReadTime, RemoteSplit,
+    Completion, DataFlowRequest, FailedIO, FileRange, HttpDirectGetRequest, HttpGetRequest,
+    HttpUploadRequest, OpenFile, RemoteReadTime, RemoteSplit,
 };
+use crate::memory::FrozenSlab;
 use crate::memory::cache::MissingExtent;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -95,6 +96,13 @@ pub(crate) struct CachedHttpEngine {
     /// Whole-object uploads, keyed by the same engine request id space and
     /// driven by the same connection pool as reads.
     http_uploads: HashMap<Identifier, DataFlowRequest<HttpUploadRequest>>,
+    /// Range reads into slabs their issuers supplied, around every cache,
+    /// keyed by the same engine request id space as the cached pieces. Each
+    /// holds its slab until the bytes have landed in it.
+    direct_reads: HashMap<Identifier, DataFlowRequest<HttpDirectGetRequest>>,
+    /// The slabs of the direct reads that landed since they were last taken,
+    /// each with the identity the requester tracks its read by.
+    landed_direct_reads: Vec<(Identifier, FrozenSlab)>,
     next_http_id: Identifier,
     /// Write-backs populating the cache file after an HTTP piece landed (backend
     /// disk-id space). Each holds the slot pin until the write has read it.
@@ -188,6 +196,8 @@ impl CachedHttpEngine {
             cache_reads: HashMap::new(),
             http_reads: HashMap::new(),
             http_uploads: HashMap::new(),
+            direct_reads: HashMap::new(),
+            landed_direct_reads: Vec::new(),
             next_http_id: 0,
             cache_writes: HashMap::new(),
             unissued_fetches: Vec::new(),
@@ -356,6 +366,41 @@ impl CachedHttpEngine {
             },
         );
         Ok(split)
+    }
+
+    /// Register a range read of a remote object into the slab its issuer
+    /// supplied, around the disk cache and the compressed cache. It goes out
+    /// with [`issue_registered_fetches`](Self::issue_registered_fetches) like
+    /// a cached read's pieces, joined with the reads that follow it in the
+    /// object, and takes its bytes from the receive allowance as they do.
+    pub fn get_direct(&mut self, request: DataFlowRequest<HttpDirectGetRequest>) -> RemoteSplit {
+        let id = self.next_http_id;
+        self.next_http_id += 1;
+        let read = &request.request;
+        self.unissued_fetches.push((
+            id,
+            RemoteRead {
+                remote: read.remote.clone(),
+                offset: read.offset,
+                parts: vec![BodyPart::Kept {
+                    dest: read.slab.ptr,
+                    len: read.len,
+                }],
+            },
+        ));
+        let split = RemoteSplit {
+            http_bytes: read.len as u64,
+            ..RemoteSplit::default()
+        };
+        self.direct_reads.insert(id, request);
+        split
+    }
+
+    /// The slabs of the direct reads that landed since the last call, each
+    /// with the identity its read is tracked by. A read with no identity was
+    /// issued by nobody who waits for it, and its slab is dropped.
+    pub fn take_landed_direct_reads(&mut self) -> Vec<(Identifier, FrozenSlab)> {
+        std::mem::take(&mut self.landed_direct_reads)
     }
 
     /// Issue the network pieces registered since the last call, and return how
@@ -538,6 +583,7 @@ impl CachedHttpEngine {
         let upload = RemoteUpload {
             remote: request.request.remote.clone(),
             data: request.request.data.clone(),
+            method: request.request.method,
         };
         self.start_upload(backend, id, upload)?;
         self.http_uploads.insert(id, request);
@@ -633,9 +679,10 @@ impl CachedHttpEngine {
                 read.time.http_reissues += 1;
             }
         }
-        for (id, etag) in self.http.take_completed() {
+        for (id, answer) in self.http.take_completed() {
             if let Some(mut upload) = self.http_uploads.remove(&id) {
-                upload.request.etag = etag;
+                upload.request.etag = answer.etag;
+                upload.request.response_body = answer.body;
                 out.push(Ok(Completion::HttpUpload(upload)));
                 continue;
             }
@@ -644,11 +691,30 @@ impl CachedHttpEngine {
             for piece in joined.as_deref().unwrap_or(std::slice::from_ref(&id)) {
                 if let Some(http_read) = self.http_reads.remove(piece) {
                     self.complete_http_read(backend, disk_id, http_read, out)?;
+                } else if let Some(direct_read) = self.direct_reads.remove(piece) {
+                    let DataFlowRequest {
+                        data_flow_id,
+                        operator_idx,
+                        request,
+                        pending_read_id,
+                        submitted_at,
+                    } = direct_read;
+                    if let Some(pending_read_id) = pending_read_id {
+                        self.landed_direct_reads
+                            .push((pending_read_id, request.slab.freeze()));
+                    }
+                    out.push(Ok(Completion::HttpGetDirect(DataFlowRequest {
+                        data_flow_id,
+                        operator_idx,
+                        request: FileRange::new(request.offset as usize, request.len),
+                        pending_read_id,
+                        submitted_at,
+                    })));
                 }
             }
         }
         for (id, error) in self.http.take_failed() {
-            if self.http_reads.contains_key(&id) {
+            if self.http_reads.contains_key(&id) || self.direct_reads.contains_key(&id) {
                 self.fail_fetch(id, error.into(), out);
             } else if let Some(upload) = self.http_uploads.remove(&id) {
                 out.push(Err(FailedIO {
@@ -682,6 +748,17 @@ impl CachedHttpEngine {
     /// dataflow is told. A read a sibling piece already failed is gone, and
     /// has been reported.
     fn fail_http_read(&mut self, id: Identifier, error: Error, out: &mut Vec<ReadResult>) {
+        if let Some(direct_read) = self.direct_reads.remove(&id) {
+            // The engine has given the request up, so nothing writes into the
+            // slab any more and it is dropped with the read.
+            out.push(Err(FailedIO {
+                data_flow_id: direct_read.data_flow_id,
+                operator_idx: direct_read.operator_idx,
+                pending_read_id: direct_read.pending_read_id,
+                error,
+            }));
+            return;
+        }
         if let Some(http_read) = self.http_reads.remove(&id)
             && let Some(request) = self.fail_read(http_read.read)
         {
@@ -700,7 +777,10 @@ impl CachedHttpEngine {
 
     /// `true` while any HTTP GET or upload is in flight or held back.
     pub fn has_network_pending(&self) -> bool {
-        self.http.has_active() || !self.http_reads.is_empty() || !self.http_uploads.is_empty()
+        self.http.has_active()
+            || !self.http_reads.is_empty()
+            || !self.http_uploads.is_empty()
+            || !self.direct_reads.is_empty()
     }
 
     /// `true` if an HTTP completion is already in hand (non-Linux only, where the
