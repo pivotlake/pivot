@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use crate::execution::CopyIngest;
+use catalog::connections::RunningStatement;
 use pgwire::api::ClientInfo;
 use pgwire::error::{ErrorInfo, PgWireError};
 use thiserror::Error;
@@ -43,6 +44,9 @@ impl Error {
 struct ActiveCopy {
     ingest: CopyIngest,
     error: Option<String>,
+    /// Keeps the connection reported as copying, and counts the bytes it
+    /// receives, until the copy ends however it ends.
+    statement: RunningStatement,
 }
 
 #[derive(Default)]
@@ -59,10 +63,12 @@ fn get_slot<C: ClientInfo>(client: &C) -> Result<Arc<CopySessionSlot>, Error> {
 
 /// Install a running copy on this pgwire session, returning its column count
 /// for the copy-in response. Refusing a second copy drops the new ingest,
-/// which aborts it.
+/// which aborts it. `statement` is the COPY statement the connection is
+/// reported as running.
 pub(crate) async fn begin_copy<C: ClientInfo>(
     client: &C,
     ingest: CopyIngest,
+    statement: RunningStatement,
 ) -> Result<usize, Error> {
     let slot = client
         .session_extensions()
@@ -72,9 +78,11 @@ pub(crate) async fn begin_copy<C: ClientInfo>(
         return Err(Error::AlreadyActive);
     }
     let column_count = ingest.column_count();
+    statement.receive_copy();
     *active = Some(ActiveCopy {
         ingest,
         error: None,
+        statement,
     });
     Ok(column_count)
 }
@@ -85,6 +93,7 @@ pub(crate) async fn push_copy<C: ClientInfo>(client: &C, data: bytes::Bytes) -> 
     let slot = get_slot(client)?;
     let mut guard = slot.active.lock().await;
     let active = guard.as_mut().ok_or(Error::NoActiveCopy)?;
+    active.statement.add_copy_bytes(data.len());
     if active.error.is_some() {
         return Ok(());
     }
