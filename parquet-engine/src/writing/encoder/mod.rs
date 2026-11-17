@@ -29,7 +29,7 @@ use super::error::{WriteError, WriteResult};
 use super::leaves::Leaf;
 use super::stats;
 use super::types::{ColumnTokenRun, EncodedLeaf, EncodedLeafChunk, LeafChunkJob};
-use arrow_array::{ArrayRef, StringViewArray};
+use arrow_array::{Array, ArrayRef, StringViewArray};
 use dispatch::arrays::concat_chunks;
 use dispatch::text_index::{LetterCase, TokenRun, TokenRunBuilder};
 

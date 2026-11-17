@@ -225,6 +225,8 @@ pub(super) struct FileCollector {
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
+    /// See [`FileCollectorFactory`].
+    text_indexes: Arc<[TextIndexedColumn]>,
     topology: Topology,
     shared: Arc<SharedCollector>,
     /// The partitions this worker has already looked up in `shared`.
