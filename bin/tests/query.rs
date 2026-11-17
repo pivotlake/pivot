@@ -2276,3 +2276,110 @@ async fn has_token_counts_a_token_that_many_rows_of_a_file_have(#[future] conn: 
 
     assert_eq!(timeouts, "30");
 }
+
+/// A table of log lines whose every file has an index file of a text index
+/// of `message` that keeps letter case: the index is made before any line is
+/// written.
+async fn create_exactly_indexed_logs(conn: &Client, table: &str) {
+    conn.simple_query(&format!(
+        "CREATE TABLE {table} (id BIGINT, message VARCHAR)"
+    ))
+    .await
+    .unwrap();
+    conn.simple_query(&format!(
+        "CREATE TEXT INDEX idx_message ON {table} (message) WITH (case_sensitive = true)"
+    ))
+    .await
+    .unwrap();
+    conn.simple_query(&format!(
+        "INSERT INTO {table} VALUES (2, 'Disk full'), (3, 'disk full on sda1'), (4, 'network down')"
+    ))
+    .await
+    .unwrap();
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_is_answered_from_the_indexes_when_every_file_has_one(#[future] conn: Conn) {
+    create_exactly_indexed_logs(&conn, "exactly_indexed_logs").await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT id FROM exactly_indexed_logs WHERE has_token(message, 'full') ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![vec![Some("2".to_string())], vec![Some("3".to_string())]]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_answered_from_the_indexes_counts_rows_with_no_column_read(#[future] conn: Conn) {
+    create_exactly_indexed_logs(&conn, "counted_logs").await;
+
+    let rows_with_disk = single_value(
+        &conn,
+        "SELECT count(*) FROM counted_logs WHERE has_token(message, 'disk')",
+    )
+    .await;
+
+    assert_eq!(rows_with_disk, "1");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_under_a_top_n_is_tested_on_the_rows_read(#[future] conn: Conn) {
+    create_exactly_indexed_logs(&conn, "top_n_logs").await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT id FROM top_n_logs WHERE has_token(message, 'full') ORDER BY id DESC LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_answered_from_the_indexes_returns_whole_rows_under_a_limit(
+    #[future] conn: Conn,
+) {
+    create_exactly_indexed_logs(&conn, "exactly_limited_logs").await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT * FROM exactly_limited_logs WHERE has_token(message, 'sda1') LIMIT 5",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("3".to_string()),
+            Some("disk full on sda1".to_string())
+        ]]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_for_two_tokens_returns_the_rows_that_have_both(#[future] conn: Conn) {
+    create_exactly_indexed_logs(&conn, "two_token_logs").await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT id FROM two_token_logs WHERE has_token(message, 'full') AND has_token(message, 'sda1')",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+}

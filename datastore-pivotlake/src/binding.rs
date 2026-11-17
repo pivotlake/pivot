@@ -88,6 +88,11 @@ impl ParquetBackedTable for BoundCatalogTable {
         self.table.total_rows().ok()
     }
 
+    fn has_text_index_keeping_letter_case(&self, column: usize) -> bool {
+        let column_name = &self.table.columns()[column].name;
+        self.table.has_text_index_keeping_letter_case(column_name)
+    }
+
     fn open_text_index_files(
         &self,
         column: usize,

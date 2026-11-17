@@ -6,13 +6,34 @@
 //! A datastore says how its table is scanned, counted and written
 //! ([`ParquetBackedTable`]); the binding ([`ParquetTableBinding`]) is the same
 //! for all of them.
+//!
+//! Every filter pushed into a binding stays above its scan too, but one: a
+//! search for a token (`has_token`) of a column with a text index that keeps
+//! letter case. That one the scan answers itself:
+//!
+//! ```text
+//!   every file of the scan has an index file    the rows found in the indexes
+//!   of such an index, and no Top-N tightens     are the answer: nothing is
+//!   a boundary above the scan                   tested, and the text is not read
+//!                                               unless the query reads it
+//!
+//!   any file has none, or a Top-N does          the scan reads the text of the
+//!                                               rows it decodes and tests every
+//!                                               one of them, whichever file it
+//!                                               is of
+//! ```
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{ArrayRef, Scalar};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, Scalar, StringViewArray};
 use dispatch::io::OpenFile;
-use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use dispatch::memory::SlabAllocator;
+use dispatch::text_index::LetterCase;
+use dispatch::{
+    DataFlowDispatcher, HasToken, Projection, RecordBatchOperatorSpec, RowDelivery,
+    SelectionScratch, collect_selected_indices,
+};
 use object_storage::ObjectPath;
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
@@ -44,6 +65,15 @@ pub struct ScanSelection {
     /// free of them here; any other is reported nullable by a scan that
     /// reads no file.
     pub nullability: Vec<bool>,
+}
+
+/// What a scan asks of its files' text indexes.
+struct TextIndexSearch {
+    files: Vec<FileToSearch>,
+    /// Whether the rows found are exactly the rows that have every token the
+    /// scan answers itself: every file was searched for each of them in an
+    /// index that keeps letter case.
+    answers_exactly: bool,
 }
 
 /// One version of a catalog table as a [`ParquetTableBinding`] reads and
@@ -81,6 +111,14 @@ pub trait ParquetBackedTable: std::fmt::Debug + Send + Sync {
         &self,
         input: RecordBatchOperatorSpec,
     ) -> CatalogResult<RecordBatchOperatorSpec>;
+
+    /// Whether `column` (a position in [`columns`](Self::columns)) has a
+    /// text index that keeps the letter case of its tokens: one whose index
+    /// files say exactly which rows have a token, so that a scan of files
+    /// that all have one need not test the rows it reads.
+    fn has_text_index_keeping_letter_case(&self, _column: usize) -> bool {
+        false
+    }
 
     /// For each of `data_files` (paths as a [`ScanSelection`] gives them),
     /// in their order, the index file that says which of the file's rows
@@ -192,6 +230,26 @@ impl ParquetTableBinding {
         self.filters.is_empty()
     }
 
+    /// `filter` as a search for a token of a column: the column's position
+    /// in the table and the token, when that is what the filter is.
+    fn read_token_search(filter: &Expression) -> Option<(usize, &str)> {
+        let Expression::Function(Function::HasToken(has_token)) = filter else {
+            return None;
+        };
+        let Expression::Ref(column) = has_token.text.as_ref() else {
+            return None;
+        };
+        Some((column.column_idx, has_token.token.as_str()))
+    }
+
+    /// Whether `filter` is the scan's own to answer, with no filter above
+    /// it: a search for a token of a column with a text index that keeps
+    /// letter case.
+    fn is_answered_by_scan(&self, filter: &Expression) -> bool {
+        Self::read_token_search(filter)
+            .is_some_and(|(column, _)| self.table.has_text_index_keeping_letter_case(column))
+    }
+
     /// The files of the scan with what their text indexes are asked: for
     /// every `has_token` of a column among the pushed filters, the token and
     /// the index file of the column in each file that has one. `None` when
@@ -200,19 +258,11 @@ impl ParquetTableBinding {
     fn plan_text_index_search(
         &self,
         selection: &ScanSelection,
-    ) -> CatalogResult<Option<Vec<FileToSearch>>> {
+    ) -> CatalogResult<Option<TextIndexSearch>> {
         let tokens_looked_for: Vec<(usize, &str)> = self
             .filters
             .iter()
-            .filter_map(|filter| {
-                let Expression::Function(Function::HasToken(has_token)) = filter else {
-                    return None;
-                };
-                let Expression::Ref(column) = has_token.text.as_ref() else {
-                    return None;
-                };
-                Some((column.column_idx, has_token.token.as_str()))
-            })
+            .filter_map(Self::read_token_search)
             .collect();
         if tokens_looked_for.is_empty() {
             return Ok(None);
@@ -244,9 +294,17 @@ impl ParquetTableBinding {
                 Some((position, selection.data_file_paths.get(open_file)?.clone()))
             })
             .unzip();
+        let mut answers_exactly = positions_of_named_files.len() == files.len();
         for (column, token) in tokens_looked_for {
+            let is_answered_by_scan = self.table.has_text_index_keeping_letter_case(column);
             let index_files = self.table.open_text_index_files(column, &paths)?;
             for (&position, index_file) in positions_of_named_files.iter().zip(index_files) {
+                let finds_exactly = index_file
+                    .as_ref()
+                    .is_some_and(|index_file| index_file.letter_case == LetterCase::Kept);
+                if is_answered_by_scan && !finds_exactly {
+                    answers_exactly = false;
+                }
                 if let Some(index_file) = index_file {
                     files[position]
                         .1
@@ -259,7 +317,10 @@ impl ParquetTableBinding {
         if files.iter().all(|file| file.tokens.is_empty()) {
             return Ok(None);
         }
-        Ok(Some(files))
+        Ok(Some(TextIndexSearch {
+            files,
+            answers_exactly,
+        }))
     }
 }
 
@@ -305,37 +366,146 @@ impl BoundTable for ParquetTableBinding {
         // tightening a boundary: such a scan reads its row groups in the
         // order of the Top-N's key and stops at the boundary, and a search
         // of every file ahead of that would read indexes of files it never
-        // gets to. The filters stay above the scan either way, so the
-        // search only decides what is read, never what is returned.
-        if dynamic_filters.is_empty()
-            && !projection.indices().is_empty()
-            && let Some(files) = self.plan_text_index_search(&selection)?
+        // gets to.
+        let is_under_top_n = !dynamic_filters.is_empty();
+        let search = if is_under_top_n {
+            None
+        } else {
+            self.plan_text_index_search(&selection)?
+        };
+
+        // The tokens no filter above the scan tests for. The rows the scan
+        // returns have them for sure only when every file was searched in an
+        // index that says exactly which rows do. Otherwise every row decoded
+        // is tested here, whichever file it is of.
+        let tokens_answered_by_scan: Vec<(usize, &str)> = self
+            .filters
+            .iter()
+            .filter(|filter| self.is_answered_by_scan(filter))
+            .filter_map(Self::read_token_search)
+            .collect();
+        let tests_rows = !tokens_answered_by_scan.is_empty()
+            && !search.as_ref().is_some_and(|search| search.answers_exactly);
+
+        // What the scan reads: what was asked for, and the text of each
+        // token it tests rows for, read after the rest where the query does
+        // not read it. A scan asked for no column whose rows come from the
+        // indexes reads one text too: a row group is decoded through its
+        // columns, and this is the column the rows were found by.
+        let mut scan_projection = projection.clone();
+        let add_plain_read = |scan_projection: &mut Projection, column: usize| -> usize {
+            let read_already = (0..scan_projection.indices().len()).find(|&position| {
+                scan_projection.indices()[position] == column
+                    && scan_projection.extract_at(position).is_none()
+            });
+            read_already.unwrap_or_else(|| {
+                scan_projection.column_indices.push(column);
+                if !scan_projection.extracts.is_empty() {
+                    scan_projection.extracts.push(None);
+                }
+                scan_projection.column_indices.len() - 1
+            })
+        };
+        let mut tokens_tested: Vec<(usize, String)> = Vec::new();
+        if tests_rows {
+            for &(column, token) in &tokens_answered_by_scan {
+                let position = add_plain_read(&mut scan_projection, column);
+                tokens_tested.push((position, token.to_string()));
+            }
+        } else if projection.indices().is_empty()
+            && let Some(&(column, _)) = tokens_answered_by_scan.first()
         {
-            return Ok(table_input_searching_text_indexes(
-                dispatcher,
-                &parquet,
-                files,
-                projection,
-                emit_row_group_metadata,
-            ));
+            add_plain_read(&mut scan_projection, column);
         }
+        let columns_added = projection.indices().len()..scan_projection.indices().len();
 
-        // A variant path predicate reaches its shredded typed leaf only in the
-        // files that shred it, so each row group resolves the path itself.
-        let eq_predicates = equality_predicates(&self.list_pushed_predicates());
+        let scan = match search {
+            Some(search) if !scan_projection.indices().is_empty() => {
+                table_input_searching_text_indexes(
+                    dispatcher,
+                    &parquet,
+                    search.files,
+                    scan_projection,
+                    emit_row_group_metadata,
+                )
+            }
+            _ => {
+                // A variant path predicate reaches its shredded typed leaf
+                // only in the files that shred it, so each row group resolves
+                // the path itself.
+                let eq_predicates = equality_predicates(&self.list_pushed_predicates());
 
-        // Order the scan by the Top-N's key so its boundary tightens after the
-        // first row group and the rest get pruned, instead of racing file order.
-        let scan_order = scan_order_from(&dynamic_filters);
-        Ok(table_input_with_filter_and_eq_predicates(
-            dispatcher,
-            &parquet,
-            projection,
-            emit_row_group_metadata,
-            row_group_filter_from(dynamic_filters),
-            scan_order,
-            Arc::new(eq_predicates),
-        ))
+                // Order the scan by the Top-N's key so its boundary tightens
+                // after the first row group and the rest get pruned, instead
+                // of racing file order.
+                let scan_order = scan_order_from(&dynamic_filters);
+                table_input_with_filter_and_eq_predicates(
+                    dispatcher,
+                    &parquet,
+                    scan_projection,
+                    emit_row_group_metadata,
+                    row_group_filter_from(dynamic_filters),
+                    scan_order,
+                    Arc::new(eq_predicates),
+                )
+            }
+        };
+
+        // The rows are handed on as they are found: what is above the scan
+        // may be a LIMIT that stops it, or the Top-N whose boundary prunes
+        // it, and neither can act on rows held back to fill a batch.
+        let scan = if tokens_tested.is_empty() {
+            scan
+        } else {
+            scan.filter_with_delivery(
+                move || {
+                    let tokens: Vec<(usize, HasToken)> = tokens_tested
+                        .iter()
+                        .map(|(position, token)| (*position, HasToken::new(token.as_bytes())))
+                        .collect();
+                    move |batch: &RecordBatch,
+                          _: &mut SlabAllocator,
+                          scratch: &mut SelectionScratch| {
+                        let mut has_every_token: Option<BooleanArray> = None;
+                        for (position, token) in &tokens {
+                            let texts = batch
+                                .column(*position)
+                                .as_any()
+                                .downcast_ref::<StringViewArray>()
+                                .expect("a text column is read as string views");
+                            let has_token = token.run(texts);
+                            has_every_token = Some(match has_every_token {
+                                None => has_token,
+                                Some(has_the_others) => {
+                                    arrow_arith::boolean::and(&has_the_others, &has_token)?
+                                }
+                            });
+                        }
+                        let has_every_token =
+                            has_every_token.expect("a scan that tests rows tests for a token");
+                        collect_selected_indices(&has_every_token, &mut scratch.positions);
+                        Ok(dispatch::RowSelection::Indices)
+                    }
+                },
+                RowDelivery::Immediate,
+            )
+        };
+
+        // The columns the scan read for itself come after those asked for
+        // and before the row group metadata, and go no further.
+        Ok(if columns_added.is_empty() {
+            scan
+        } else {
+            scan.project(move || {
+                let columns_added = columns_added.clone();
+                move |batch: RecordBatch| {
+                    let columns_kept: Vec<usize> = (0..batch.num_columns())
+                        .filter(|position| !columns_added.contains(position))
+                        .collect();
+                    Ok(batch.project(&columns_kept)?)
+                }
+            })
+        })
     }
 
     fn compile_insert(
@@ -384,15 +554,19 @@ impl BoundTable for ParquetTableBinding {
     }
 
     fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
-        // Just record it: pruning happens when the scan is selected. The
-        // upstream `Filter` is kept (`Ok(false)`), so pruning only excludes
-        // work and never decides which rows the query returns.
+        // Record it: pruning happens when the scan is selected. For every
+        // filter but one the upstream `Filter` is kept (`Ok(false)`), so
+        // pruning only excludes work and never decides which rows the query
+        // returns. A search for a token the scan answers itself needs no
+        // filter above: the scan returns the rows that have the token and no
+        // other.
+        let is_answered_by_scan = self.is_answered_by_scan(&filter);
         self.filters.push(filter);
         // What was selected for fewer filters is not this binding's view; it
         // stays the view of the clones made before this filter.
         self.cached_scan_selection = Arc::default();
 
-        Ok(false)
+        Ok(is_answered_by_scan)
     }
 
     fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {

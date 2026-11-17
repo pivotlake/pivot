@@ -337,6 +337,14 @@ impl CatalogTable {
         );
     }
 
+    /// Whether `column` has a text index that keeps the letter case of its
+    /// tokens.
+    pub(crate) fn has_text_index_keeping_letter_case(&self, column: &str) -> bool {
+        self.text_indexes.iter().any(|definition| {
+            definition.column == column && definition.letter_case == LetterCase::Kept
+        })
+    }
+
     /// For each of `data_files` (paths as the table names its files), the
     /// index file to look a token of `column` up in, opened for reading:
     /// `None` for a file none of the column's indexes has an index file of.
