@@ -48,6 +48,7 @@ mod registry;
 mod ring_cache;
 mod setup;
 mod slot_tenants;
+mod text_index;
 
 pub use cached::Cached;
 pub use compressed::{CacheLookup, CompressedCache, MissingExtent};
@@ -60,6 +61,7 @@ pub use id::{CacheId, CachePolicy};
 pub use registry::Caches;
 pub use ring_cache::{Reclaimed, RingCache, SourceRange};
 pub use setup::CacheSetup;
+pub use text_index::TextIndexCaches;
 
 #[cfg(test)]
 mod tests;

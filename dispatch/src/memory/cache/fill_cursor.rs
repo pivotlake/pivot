@@ -81,6 +81,13 @@ impl FillCursor {
         self.pin = Some(Arc::new(ReadBuffer::from(write_buffer))); // used = 1, Release
     }
 
+    /// Skip to the next multiple of `align` in the slot, or to the slot's end
+    /// when there is none before it. A slot starts at a multiple of any
+    /// alignment up to a page, so what is taken next starts aligned in memory.
+    pub(crate) fn align_to(&mut self, align: usize) {
+        self.next_byte = self.next_byte.next_multiple_of(align).min(BUFFER_SIZE);
+    }
+
     /// Take the next `len` bytes, returning their offset in the slot. `len`
     /// must not exceed `remaining`.
     pub(crate) fn take(&mut self, len: usize) -> usize {

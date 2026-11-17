@@ -141,6 +141,9 @@ it.
 | `pinned` | Working memory held by a running query or merge, such as a hash table or a sort run. Released when the work finishes. |
 | `compressed_cache` | Caching file bytes as they were read from storage. |
 | `decompressed_cache` | Caching decoded data pages. |
+| `text_index_sparse_cache` | Caching the sparse indexes of text index files. |
+| `text_index_dict_cache` | Caching dict indexes of text index files. |
+| `text_index_postings_cache` | Caching postings of text index files. |
 
 ```sql
 -- How the buffer pool is used

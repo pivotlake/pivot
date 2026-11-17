@@ -37,6 +37,21 @@ pub use multi_slab_buffer::MultiSlabBuffer;
 mod slab_vec;
 pub use slab_vec::SlabVec;
 
+/// Where the slabs of a structure that grows a slab at a time come from:
+/// working memory ([`SlabAllocator`]), or the slots of a cache while one of
+/// its entries is being built
+/// ([`CacheFill`](crate::memory::cache::CacheFill)).
+pub trait SlabSource {
+    /// `size` bytes in one piece, starting at a multiple of `align`.
+    fn get_contiguous_slab(&mut self, size: usize, align: usize) -> Slab;
+}
+
+impl SlabSource for SlabAllocator {
+    fn get_contiguous_slab(&mut self, size: usize, align: usize) -> Slab {
+        self.get_aligned_slab(size, align, false)
+    }
+}
+
 mod slab_top_k;
 pub(crate) use slab_top_k::{HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabTopK, slots_per_slab};
 

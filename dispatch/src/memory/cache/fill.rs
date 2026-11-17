@@ -16,7 +16,9 @@
 //! ```
 //!
 //! [`get_bytes`](CacheFill::get_bytes) may split across slots, so raw page
-//! bytes pack tightly and a page larger than a slot still fits.
+//! bytes pack tightly and a page larger than a slot still fits. As a
+//! [`SlabSource`] the fill never splits what it hands out, so an entry can be
+//! built as a [`SlabVec`](crate::memory::SlabVec), a chunk at a time.
 //!
 //! Writing into a reader-pinned slot is sound because a carved region is not
 //! yet in any map (no reader can reach it), the bump pointer keeps regions
@@ -32,7 +34,7 @@ use crate::memory::cache::id::CacheId;
 use crate::memory::cache::slot_tenants::SlotTenants;
 use crate::memory::context::memory_ctx;
 use crate::memory::ring::BUFFER_SIZE;
-use crate::memory::slab::{FrozenSlab, Slab, SlabAllocator, SlabBacking};
+use crate::memory::slab::{FrozenSlab, Slab, SlabAllocator, SlabBacking, SlabSource};
 
 /// One contiguous run of an entry's bytes inside a ring slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,7 +108,7 @@ impl<'a> CacheFill<'a> {
                     self.carve(take)
                 }
                 FillRegion::Transient { .. } => {
-                    self.carve_transient_slab(remaining.min(BUFFER_SIZE))
+                    self.carve_transient_slab(remaining.min(BUFFER_SIZE), 1)
                 }
             };
             remaining -= slab.size();
@@ -180,17 +182,41 @@ impl<'a> CacheFill<'a> {
         slab
     }
 
-    /// Carve `size` bytes of working memory and remember the slab.
-    fn carve_transient_slab(&mut self, size: usize) -> Slab {
+    /// Carve `size` bytes of working memory starting at a multiple of `align`
+    /// and remember the slab.
+    fn carve_transient_slab(&mut self, size: usize, align: usize) -> Slab {
         let FillRegion::Transient { allocator } = &mut self.region else {
             unreachable!("only a transient fill allocates working memory")
         };
         let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
-        let slab = allocator.get_slab_of_size(size, false);
+        let slab = allocator.get_aligned_slab(size, align, false);
         self.carved.push(CarvedSlab {
             slab: slab.shared_view(),
             extent: None,
         });
         slab
+    }
+}
+
+/// A fill hands out whole slabs too, for an entry kept in a form that is read
+/// in place and so cannot have one of its pieces lie across a slot boundary.
+/// A piece that does not fit the current slot's tail starts a fresh slot and
+/// leaves that tail unused.
+impl SlabSource for CacheFill<'_> {
+    fn get_contiguous_slab(&mut self, size: usize, align: usize) -> Slab {
+        assert!(
+            size <= BUFFER_SIZE,
+            "{size} contiguous bytes do not fit in one slot"
+        );
+        match &mut self.region {
+            FillRegion::Packed { cursor, .. } => {
+                cursor.align_to(align);
+                if cursor.is_exhausted() || cursor.remaining() < size {
+                    self.rotate();
+                }
+                self.carve(size)
+            }
+            FillRegion::Transient { .. } => self.carve_transient_slab(size, align),
+        }
     }
 }

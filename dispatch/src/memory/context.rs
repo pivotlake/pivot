@@ -1,7 +1,7 @@
 use crate::Identifier;
 use crate::WriteRequestId;
 use crate::io::{Completion, IORequester};
-use crate::memory::cache::{CacheId, CacheSetup, Caches, FillCursor, PageCaches};
+use crate::memory::cache::{CacheId, CacheSetup, Caches, FillCursor, PageCaches, TextIndexCaches};
 use crate::memory::clock::{Clock, Sweep};
 use crate::memory::evict::DataflowEvict;
 use crate::memory::free_pool::{FreePool, PoolFactory};
@@ -175,6 +175,7 @@ impl MemoryContextFactory {
             ring: self.ring,
             caches: self.caches.caches,
             page_caches: self.caches.pages,
+            text_index_caches: self.caches.text_index,
             clock: self.clock,
             dirty_pool: self.dirty_pool_factory.create_pool(),
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
@@ -198,6 +199,7 @@ pub struct MemoryContext {
     caches: Arc<Caches>,
     /// The same caches, typed, for the readers that fill and consult them.
     page_caches: PageCaches,
+    text_index_caches: TextIndexCaches,
     /// The CLOCK eviction policy over all ring slots, shared by every cache.
     clock: Arc<Clock>,
     dirty_pool: FreePool,
@@ -288,6 +290,10 @@ impl MemoryContext {
 
     pub fn page_caches(&self) -> &PageCaches {
         &self.page_caches
+    }
+
+    pub fn text_index_caches(&self) -> &TextIndexCaches {
+        &self.text_index_caches
     }
 
     pub fn clock(&self) -> &Clock {

@@ -38,7 +38,7 @@ pub mod cache;
 pub use cache::{
     Cache, CacheFill, CacheId, CacheKey, CacheLookup, Cached, Caches, CompressedCache,
     DecompressedPage, DecompressedPageMeta, MissingExtent, PageCaches, RingCache, Segment,
-    SourceRange,
+    SourceRange, TextIndexCaches,
 };
 
 pub mod clock;
@@ -56,7 +56,9 @@ mod read_buffer;
 pub use read_buffer::ReadBuffer;
 
 mod slab;
-pub use slab::{FrozenSlab, MultiSlabBuffer, Slab, SlabAllocator, SlabBuffer, SlabVec, WeakSlab};
+pub use slab::{
+    FrozenSlab, MultiSlabBuffer, Slab, SlabAllocator, SlabBuffer, SlabSource, SlabVec, WeakSlab,
+};
 pub(crate) use slab::{HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabTopK, slots_per_slab};
 
 mod reader;

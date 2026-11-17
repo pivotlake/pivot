@@ -3,9 +3,10 @@
 //! installs its own single-worker memory context with the standard setup.
 
 use super::*;
-use crate::io::{LocalFile, OpenFile};
-use crate::memory::BUFFER_SIZE;
+use crate::io::{FileRange, LocalFile, OpenFile};
 use crate::memory::context::{init_test_free_pool, memory_ctx};
+use crate::memory::{BUFFER_SIZE, SlabSource};
+use crate::text_index::{DictIndexBuilder, PostingsBuilder, SparseIndexBuilder};
 use bytes::Bytes;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -654,4 +655,153 @@ fn the_member_to_evict_is_judged_by_the_counts_of_the_region_being_swept() {
 
     assert_eq!(first, Some(compressed().id()));
     assert_eq!(second, Some(decompressed().id()));
+}
+
+// -- a fill as a source of whole slabs --
+
+#[test]
+fn a_slab_from_a_fill_starts_at_the_alignment_asked_for() {
+    init_test_free_pool(4);
+    insert_page(decompressed(), key(0), 3, 0); // leaves the cursor at an odd offset
+
+    let page = decompressed()
+        .insert(key(1), |fill| {
+            fill.get_contiguous_slab(64, 16);
+            Ok::<_, Infallible>(DecompressedPageMeta::new(header(0), counter()))
+        })
+        .unwrap();
+
+    assert_eq!(page.data[0].as_ptr() as usize % 16, 0);
+}
+
+#[test]
+fn a_slab_from_a_fill_larger_than_the_slot_tail_lies_whole_in_the_next_slot() {
+    init_test_free_pool(4);
+    insert_page(decompressed(), key(0), BUFFER_SIZE - 512, 0);
+    let slot_with_short_tail = cursor_slot(decompressed());
+
+    let page = decompressed()
+        .insert(key(1), |fill| {
+            fill.get_contiguous_slab(4096, 1);
+            Ok::<_, Infallible>(DecompressedPageMeta::new(header(0), counter()))
+        })
+        .unwrap();
+
+    assert_eq!(page.data.len(), 1);
+    assert_eq!(page.data[0].len(), 4096);
+    assert_ne!(cursor_slot(decompressed()), slot_with_short_tail);
+}
+
+// -- the text index family --
+
+fn text_index() -> &'static TextIndexCaches {
+    memory_ctx().text_index_caches()
+}
+
+/// Cache a sparse index of one dict index at `offset` of `shared_file()`,
+/// then release the cursor so its slot is evictable. Returns the slot.
+fn insert_sparse_index_slot(offset: usize) -> usize {
+    let sparse_indexes = text_index().sparse_indexes.as_ref();
+    sparse_indexes
+        .insert(key(offset), |fill| {
+            let mut builder = SparseIndexBuilder::new();
+            builder.push(fill, b"apple", FileRange::new(0, 1));
+            Ok::<_, Infallible>(builder.into_meta())
+        })
+        .unwrap();
+    let slot = cursor_slot(sparse_indexes);
+    release_cursor(sparse_indexes);
+    slot
+}
+
+/// Cache a dict index of one token at `offset` of `shared_file()`, then
+/// release the cursor so its slot is evictable. Returns the slot.
+fn insert_dict_index_slot(offset: usize) -> usize {
+    let dict_indexes = text_index().dict_indexes.as_ref();
+    dict_indexes
+        .insert(key(offset), |fill| {
+            let mut builder = DictIndexBuilder::new();
+            builder.push(fill, b"apple", FileRange::new(0, 1));
+            Ok::<_, Infallible>(builder.into_meta())
+        })
+        .unwrap();
+    let slot = cursor_slot(dict_indexes);
+    release_cursor(dict_indexes);
+    slot
+}
+
+/// Cache postings of one row at `offset` of `shared_file()`, then release
+/// the cursor so their slot is evictable. Returns the slot.
+fn insert_postings_slot(offset: usize) -> usize {
+    let postings = text_index().postings.as_ref();
+    postings
+        .insert(key(offset), |fill| {
+            let mut builder = PostingsBuilder::new();
+            builder.push(fill, 0);
+            Ok::<_, Infallible>(builder.into_meta())
+        })
+        .unwrap();
+    let slot = cursor_slot(postings);
+    release_cursor(postings);
+    slot
+}
+
+#[test]
+fn the_text_index_family_gives_postings_then_dict_indexes_then_sparse_indexes() {
+    init_test_free_pool(8);
+    let sparse_index_slot = insert_sparse_index_slot(0);
+    let dict_index_slot = insert_dict_index_slot(1);
+    let postings_slot = insert_postings_slot(2);
+
+    let evicted = [(); 3].map(|_| memory_ctx().evict().slot_idx);
+
+    assert_eq!(evicted, [postings_slot, dict_index_slot, sparse_index_slot]);
+}
+
+#[test]
+fn postings_read_again_and_again_still_go_before_a_dict_index_never_read() {
+    init_test_free_pool(8);
+    let dict_index_slot = insert_dict_index_slot(0);
+    let postings_slot = insert_postings_slot(1);
+    for _ in 0..clock().max_lives() {
+        clock().touch(postings_slot);
+    }
+
+    let evicted = memory_ctx().evict();
+
+    assert_eq!(evicted.slot_idx, postings_slot);
+    assert_eq!(
+        clock().owner(dict_index_slot),
+        Some(text_index().dict_indexes.id())
+    );
+}
+
+#[test]
+fn a_sparse_index_starts_with_more_lives_than_a_dict_index_and_that_with_more_than_postings() {
+    init_test_free_pool(8);
+    let sparse_index_slot = insert_sparse_index_slot(0);
+    let dict_index_slot = insert_dict_index_slot(1);
+    let postings_slot = insert_postings_slot(2);
+
+    let lives = [sparse_index_slot, dict_index_slot, postings_slot].map(|slot| clock().lives(slot));
+
+    assert!(
+        lives[0] > lives[1] && lives[1] > lives[2],
+        "lives: {lives:?}"
+    );
+}
+
+#[test]
+fn a_page_goes_before_a_sparse_index_as_recently_cached() {
+    init_test_free_pool(8);
+    let sparse_index_slot = insert_sparse_index_slot(0);
+    let page_slot = insert_decompressed_slot(4096, 4096);
+
+    let evicted = memory_ctx().evict();
+
+    assert_eq!(evicted.slot_idx, page_slot);
+    assert_eq!(
+        clock().owner(sparse_index_slot),
+        Some(text_index().sparse_indexes.id())
+    );
 }
