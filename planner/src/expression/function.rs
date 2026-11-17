@@ -2,9 +2,10 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic,
-    Length, Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
-    Round, StructExtract, StructPack, Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
+    Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, HasTokens,
+    IntervalArithmetic, Length, Like, NormalizedInterval, Prefix, RegexpFullMatch,
+    RegexpJitReplace, RegexpReplace, Round, StructExtract, StructPack, Substring, Suffix,
+    TemporalConvert, TimeBucket, TokenFunction, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -50,6 +51,12 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Variant,
             volatile: true,
         }),
+        // The token matchers take the text and a constant naming the tokens.
+        name if TokenFunction::from_name(name).is_some() => Some(ScalarFunctionSignature {
+            arguments: vec![Type::Utf8, Type::Utf8],
+            return_type: Type::Boolean,
+            volatile: false,
+        }),
         _ => None,
     }
 }
@@ -60,6 +67,8 @@ pub enum Function {
     Contains(Contains),
     Prefix(Prefix),
     Suffix(Suffix),
+    /// `has_token` / `has_all_tokens` / `has_any_token` against constant tokens.
+    HasTokens(HasTokens),
     /// `LIKE` / `NOT LIKE` against a constant pattern, for the patterns DuckDB's
     /// optimizer leaves alone (several wildcards, or a `_`).
     Like(Like),
@@ -126,6 +135,8 @@ impl Function {
                 visit(&s.haystack);
                 visit(&s.suffix);
             }
+            // The tokens are a plan-time constant, not a child expression.
+            Function::HasTokens(h) => visit(&h.input),
             Function::Like(l) => visit(&l.input),
             Function::Arithmetic(a) => {
                 visit(&a.left);
@@ -176,6 +187,7 @@ impl Function {
                 visit(&mut s.haystack);
                 visit(&mut s.suffix);
             }
+            Function::HasTokens(h) => visit(&mut h.input),
             Function::Like(l) => visit(&mut l.input),
             Function::Arithmetic(a) => {
                 visit(&mut a.left);
@@ -217,6 +229,7 @@ impl Display for Function {
             Function::Contains(c) => write!(f, "{c}"),
             Function::Prefix(p) => write!(f, "{p}"),
             Function::Suffix(s) => write!(f, "{s}"),
+            Function::HasTokens(h) => write!(f, "{h}"),
             Function::Like(l) => write!(f, "{l}"),
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
@@ -276,6 +289,7 @@ impl Function {
             Function::Contains(_)
             | Function::Prefix(_)
             | Function::Suffix(_)
+            | Function::HasTokens(_)
             | Function::Like(_)
             | Function::RegexpFullMatch(_) => Type::Boolean,
             // Arithmetic and the extractors carry DuckDB's bound result type.
@@ -321,6 +335,7 @@ impl Function {
             Function::Contains(c) => c.compile(),
             Function::Prefix(p) => p.compile(),
             Function::Suffix(s) => s.compile(),
+            Function::HasTokens(h) => h.compile(),
             Function::Like(l) => l.compile(),
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),

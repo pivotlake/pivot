@@ -24,6 +24,7 @@ mod date_trunc;
 mod divide;
 mod format_bytes;
 mod function;
+mod has_tokens;
 mod in_list;
 mod interval;
 mod is_null;
@@ -62,6 +63,7 @@ pub use date_trunc::DateTrunc;
 pub use divide::Divide;
 pub use format_bytes::FormatBytes;
 pub use function::{Function, ScalarFunctionSignature, builtin_scalar_function};
+pub use has_tokens::{HasTokens, TokenFunction};
 pub use in_list::InList;
 pub use interval::IntervalArithmetic;
 pub use is_null::IsNull;
@@ -113,6 +115,11 @@ pub enum Error {
     UnsupportedInterval(String),
     #[error("Invalid time_bucket call: {0}")]
     InvalidTimeBucket(String),
+    #[error(
+        "has_token expects exactly one token, got '{0}'; \
+         has_all_tokens and has_any_token take several"
+    )]
+    HasTokenNeedsOneToken(String),
     #[error("Unsupported expression type: {0:?}")]
     UnsupportedExpressionType(ExpressionType),
     /// An operation over a whole struct that only its fields support.

@@ -124,6 +124,8 @@ pub enum Error {
     },
     #[error("Unsupported haystack expression for prefix: {0:?}")]
     UnsupportedExpressionForPrefixHaystack(Expression),
+    #[error("Unsupported input expression for token matching: {0:?}")]
+    UnsupportedExpressionForTokenMatchInput(Expression),
     #[error("Unsupported pattern expression for suffix: {0:?}")]
     UnsupportedExpressionForSuffixPattern(Expression),
     #[error("Unsupported haystack expression for suffix: {0:?}")]
