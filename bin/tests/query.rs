@@ -652,7 +652,17 @@ async fn system_memory_blocks_accounts_for_every_block(#[future] conn: Conn) {
     for row in &by_state {
         let state = row[0].as_ref().unwrap();
         assert!(
-            ["free", "pinned", "compressed_cache", "decompressed_cache"].contains(&state.as_str()),
+            [
+                "free",
+                "pinned",
+                "compressed_cache",
+                "decompressed_cache",
+                "text_index_file_cache",
+                "text_index_sparse_cache",
+                "text_index_dict_cache",
+                "text_index_postings_cache",
+            ]
+            .contains(&state.as_str()),
             "unexpected block state: {state}",
         );
         let blocks: i64 = row[1].as_ref().unwrap().parse().unwrap();

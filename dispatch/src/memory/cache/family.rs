@@ -1,11 +1,13 @@
 //! A family: caches holding the same bytes in different forms.
 //!
 //! ```text
-//!   family "pages"
-//!   ┌──────────────┬─────────┐
-//!   │ compressed   │ 30 %    │
-//!   │ decompressed │ 70 %    │
-//!   └──────────────┴─────────┘
+//!   family "pages"              family "text index"
+//!   ┌──────────────┬─────────┐  ┌──────────────┬─────────┐
+//!   │ compressed   │ 30 %    │  │ sparse index │ 100 %   │
+//!   │ decompressed │ 70 %    │  │ file bytes   │   0 %   │
+//!   └──────────────┴─────────┘  │ postings     │   0 %   │
+//!                               │ dict blocks  │   0 %   │
+//!                               └──────────────┴─────────┘
 //! ```
 //!
 //! Two things follow from being in one family, and nothing else does:
@@ -16,6 +18,13 @@
 //!   to the targets instead of being whatever their lifetimes add up to.
 //!   Shares are judged within the family only; the family's total against the
 //!   rest of the ring is left to recency and weight.
+//!
+//!   Shares can also state an order instead of a balance. A member with the
+//!   whole target is never over it, and a member with none is over as soon as
+//!   it holds a slot. Such a family gives from its zero-share members in the
+//!   order they were added, each only once those before it have nothing to
+//!   give, and from the member with the whole target, added first, only once
+//!   none of the others has.
 //! - **Reinforcement.** When a member drops an entry, every sibling's entry
 //!   over the same file range is reinforced: with one copy gone the others are
 //!   closer to being the last, and losing the last turns the next read into IO.
@@ -222,6 +231,29 @@ mod tests {
         let chosen = family.choose_member_to_evict(slots, everyone_can_give, 0);
 
         assert_eq!(chosen, Some(DECOMPRESSED));
+    }
+
+    #[test]
+    fn a_member_with_the_whole_target_gives_after_every_sibling_holding_a_slot() {
+        let family = FamilySpec::new([(DECODED, 100), (COMPRESSED, 0), (DECOMPRESSED, 0)]);
+
+        let turns: Vec<_> = (0..3)
+            .map(|sweeps_given_up| {
+                family.choose_member_to_evict(|_| 5, everyone_can_give, sweeps_given_up)
+            })
+            .collect();
+
+        assert_eq!(turns, [Some(COMPRESSED), Some(DECOMPRESSED), Some(DECODED)]);
+    }
+
+    #[test]
+    fn a_member_with_the_whole_target_gives_once_it_is_alone() {
+        let family = FamilySpec::new([(DECODED, 100), (COMPRESSED, 0), (DECOMPRESSED, 0)]);
+        let slots = |id: CacheId| if id == DECODED { 50 } else { 0 };
+
+        let chosen = family.choose_member_to_evict(slots, |id| id == DECODED, 0);
+
+        assert_eq!(chosen, Some(DECODED));
     }
 
     #[test]

@@ -38,7 +38,7 @@ pub mod cache;
 pub use cache::{
     Cache, CacheFill, CacheId, CacheKey, CacheLookup, Cached, Caches, CompressedCache,
     DecompressedPage, DecompressedPageMeta, MissingExtent, PageCaches, RingCache, Segment,
-    SourceRange,
+    SourceRange, TextIndexCaches,
 };
 
 pub mod clock;

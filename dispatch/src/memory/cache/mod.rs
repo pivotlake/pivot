@@ -9,13 +9,14 @@
 //!                └─────────────────────┬─────────────────────┘
 //!          reclaim(id, slot) / reinforce siblings / invalidate / clear
 //!                                      │
-//!        ┌─────────────────────────────┤
-//!        ▼                             ▼
-//!   CompressedCache              Cache<DecompressedPage>
-//!   raw file bytes,              bytes decompressed from
-//!   4 KB blocks, async fills     a compressed twin
-//!        │                             │
-//!        └───────── family "pages" ────┘
+//!        ┌─────────────────────────────┼──────────────────────────────┐
+//!        ▼                             ▼                              ▼
+//!   CompressedCache              Cache<DecompressedPage>        Cache<SparseIndex>, …
+//!   raw file bytes,              bytes decompressed from        forms decoded from an
+//!   4 KB blocks, async fills     a compressed twin              index file's raw bytes
+//!        │                             │                              │
+//!        └───────── family "pages" ────┘                    family "text index", with
+//!                                                           a CompressedCache of its own
 //!
 //!   shared underneath:  FileMap (what is cached, per file)
 //!                       SlotTenants (what is in a slot)
@@ -48,6 +49,7 @@ mod registry;
 mod ring_cache;
 mod setup;
 mod slot_tenants;
+mod text_index;
 
 pub use cached::Cached;
 pub use compressed::{CacheLookup, CompressedCache, MissingExtent};
@@ -60,6 +62,7 @@ pub use id::{CacheId, CachePolicy};
 pub use registry::Caches;
 pub use ring_cache::{Reclaimed, RingCache, SourceRange};
 pub use setup::CacheSetup;
+pub use text_index::TextIndexCaches;
 
 #[cfg(test)]
 mod tests;

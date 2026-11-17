@@ -6,6 +6,9 @@ use super::*;
 use crate::io::{LocalFile, OpenFile};
 use crate::memory::BUFFER_SIZE;
 use crate::memory::context::{init_test_free_pool, memory_ctx};
+use crate::text_index::format::Footer;
+use crate::text_index::sparse_index::SparseIndexEncoder;
+use crate::text_index::{DictBlock, DictBlockMeta, SparseIndex};
 use bytes::Bytes;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -152,6 +155,46 @@ fn compressed_has_misses(offset: usize, len: usize) -> bool {
         .get(&shared_file(), offset, len)
         .iter()
         .any(|l| l.missing_extent().is_some())
+}
+
+fn text_index() -> &'static TextIndexCaches {
+    memory_ctx().text_index_caches()
+}
+
+/// Cache a sparse index (of an index with no tokens) for `file` and release
+/// the cursor so its slot is evictable. Returns the slot.
+fn insert_sparse_index_slot(file: &OpenFile) -> usize {
+    let mut encoded = Vec::new();
+    SparseIndexEncoder::new().finish(&mut encoded).unwrap();
+    let footer = Footer {
+        sparse_offset: 0,
+        sparse_len: encoded.len() as u64,
+        row_count: 0,
+        token_count: 0,
+    };
+    let sparse = &text_index().sparse_index;
+    sparse
+        .insert(key_in(file, 0, 1), |fill| {
+            SparseIndex::build(footer, &[Bytes::from(encoded)], fill)
+        })
+        .unwrap();
+    let slot = cursor_slot(sparse.as_ref());
+    release_cursor(sparse.as_ref());
+    slot
+}
+
+/// Cache a few bytes as a dictionary block of `file` at `offset` and release
+/// the cursor so its slot is evictable. Returns the slot.
+fn insert_dict_block_slot(file: &OpenFile, offset: usize) -> usize {
+    let dict: &Cache<DictBlock> = &text_index().dict_blocks;
+    dict.insert(key_in(file, offset, 1), |fill| {
+        fill.get_bytes(8);
+        Ok::<_, Infallible>(DictBlockMeta)
+    })
+    .unwrap();
+    let slot = cursor_slot(dict);
+    release_cursor(dict);
+    slot
 }
 
 /// Take every slot still in the free pool as working memory, so the next
@@ -688,6 +731,83 @@ fn evicting_a_decompressed_page_reinforces_its_compressed_source() {
     assert_eq!(
         clock().lives(source_slot),
         lives_before + lives_at_reinforce(compressed())
+    );
+}
+
+#[test]
+fn a_heavier_cache_outlives_a_lighter_one_at_equal_recency() {
+    init_test_free_pool(8);
+    let dict_slot = insert_dict_block_slot(&shared_file(), 0);
+    let page_slot = insert_decompressed_slot(0, 4096);
+
+    let evicted = memory_ctx().evict();
+
+    assert_eq!(evicted.slot_idx, page_slot);
+    assert_eq!(
+        clock().owner(dict_slot),
+        Some(text_index().dict_blocks.id())
+    );
+}
+
+/// The sparse index is what finds a file's cached dictionary blocks, so it is
+/// held while any of them is: however cold it is next to them.
+#[test]
+fn a_sparse_index_outlives_hotter_dictionary_blocks() {
+    init_test_free_pool(8);
+    let sparse_slot = insert_sparse_index_slot(&shared_file());
+    let dict_slots = [
+        insert_dict_block_slot(&shared_file(), 0),
+        insert_dict_block_slot(&shared_file(), 4096),
+    ];
+    for slot in dict_slots {
+        for _ in 0..clock().max_lives() {
+            clock().touch(slot);
+        }
+    }
+
+    let first = memory_ctx().evict();
+    let second = memory_ctx().evict();
+
+    assert!(dict_slots.contains(&first.slot_idx));
+    assert!(dict_slots.contains(&second.slot_idx));
+    assert_eq!(
+        clock().owner(sparse_slot),
+        Some(text_index().sparse_index.id())
+    );
+}
+
+/// The sparse index is held only while there is something for it to find:
+/// alone in its family it is evictable like any cache.
+#[test]
+fn a_sparse_index_goes_once_nothing_else_of_its_family_is_cached() {
+    init_test_free_pool(8);
+    let sparse_slot = insert_sparse_index_slot(&shared_file());
+
+    let evicted = memory_ctx().evict();
+
+    assert_eq!(evicted.slot_idx, sparse_slot);
+}
+
+/// The index file's raw bytes are family too, and are given up before the
+/// sparse index.
+#[test]
+fn a_sparse_index_outlives_the_index_files_raw_bytes() {
+    init_test_free_pool(8);
+    let sparse_slot = insert_sparse_index_slot(&shared_file());
+    let file_bytes = &text_index().file_bytes;
+    file_bytes.get(&shared_file(), 0, 4096)[0]
+        .missing_extent()
+        .unwrap()
+        .commit();
+    let raw_slot = cursor_slot(file_bytes.as_ref());
+    release_cursor(file_bytes.as_ref());
+
+    let evicted = memory_ctx().evict();
+
+    assert_eq!(evicted.slot_idx, raw_slot);
+    assert_eq!(
+        clock().owner(sparse_slot),
+        Some(text_index().sparse_index.id())
     );
 }
 
