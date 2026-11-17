@@ -15,7 +15,8 @@
 
 use crate::io::FileRange;
 use crate::memory::cache::Cached;
-use crate::memory::{FrozenSlab, SlabSource};
+use crate::memory::{FrozenSlab, Slab, SlabAllocator, SlabSource};
+use crate::text_index::Error;
 use crate::text_index::token_ranges::{TokenRanges, TokenRangesBuilder, TokenRangesMeta};
 
 /// One dict index, all of it in memory for as long as this is held.
@@ -24,6 +25,24 @@ pub struct DictIndex {
 }
 
 impl DictIndex {
+    /// The dict index in its encoded form (that of
+    /// [`token_ranges`](crate::text_index::token_ranges)), in slabs from
+    /// `allocator`.
+    pub fn encode(&self, allocator: &mut SlabAllocator) -> Vec<Slab> {
+        self.tokens.encode(allocator)
+    }
+
+    /// Gather the dict index `encoded` holds, with memory from `source`.
+    /// Fails when `encoded` is not what [`encode`](Self::encode) writes.
+    pub fn decode(
+        encoded: &[Slab],
+        source: &mut impl SlabSource,
+    ) -> Result<DictIndexBuilder, Error> {
+        Ok(DictIndexBuilder {
+            tokens: TokenRanges::decode(encoded, source)?,
+        })
+    }
+
     pub fn count_tokens(&self) -> usize {
         self.tokens.count_tokens()
     }

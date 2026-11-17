@@ -15,9 +15,26 @@
 //! two chunks and is compared in place a chunk's part at a time. Finding a
 //! token is a binary search over the entries, which also lie in as many
 //! chunks as they need.
+//!
+//! Encoded, the tokens are a count and then one record per token, in order:
+//!
+//! ```text
+//!   token count                                              varint
+//!   per token:
+//!     bytes shared with the start of the token before it     varint
+//!     bytes after those                                      varint, then the bytes
+//!     range offset, less where the range before it ended     signed varint
+//!     range length                                           varint
+//! ```
+//!
+//! Neighbouring tokens of a sorted run start alike, and ranges written one
+//! after the other each start where the one before ended, so most records
+//! are a few bytes.
 
 use crate::io::FileRange;
-use crate::memory::{FrozenSlab, SlabSource, SlabVec};
+use crate::memory::{FrozenSlab, Slab, SlabAllocator, SlabSource, SlabVec};
+use crate::text_index::Error;
+use crate::text_index::encoded::{EncodedReader, EncodedWriter};
 use std::cmp::Ordering;
 
 /// What is kept for one token.
@@ -66,6 +83,75 @@ impl TokenRanges {
             entries: SlabVec::from_chunks(entry_chunks, meta.token_count),
             token_bytes: SlabVec::from_chunks(token_byte_chunks, meta.token_bytes_len),
         }
+    }
+
+    /// The tokens in their encoded form, in slabs from `allocator`.
+    pub fn encode(&self, allocator: &mut SlabAllocator) -> Vec<Slab> {
+        let mut writer = EncodedWriter::new(allocator);
+        writer.write_varint(self.entries.len() as u64);
+        let (mut token, mut previous_token) = (Vec::new(), Vec::new());
+        let (mut token_start, mut previous_range_end) = (0, 0);
+        self.entries.for_each(|entry| {
+            token.clear();
+            token.extend(
+                (token_start..entry.token_end).map(|position| self.token_bytes.get(position)),
+            );
+            let shared_len = token
+                .iter()
+                .zip(&previous_token)
+                .take_while(|(byte, previous_byte)| byte == previous_byte)
+                .count();
+            writer.write_varint(shared_len as u64);
+            writer.write_varint((token.len() - shared_len) as u64);
+            writer.write_bytes(&token[shared_len..]);
+            writer.write_signed_varint(entry.range.offset as i64 - previous_range_end as i64);
+            writer.write_varint(entry.range.len as u64);
+
+            token_start = entry.token_end;
+            previous_range_end = entry.range.offset + entry.range.len;
+            std::mem::swap(&mut token, &mut previous_token);
+        });
+        writer.into_slabs()
+    }
+
+    /// Gather the tokens `encoded` holds, with memory from `source`. Fails
+    /// when `encoded` is not what [`encode`](Self::encode) writes.
+    pub fn decode(
+        encoded: &[Slab],
+        source: &mut impl SlabSource,
+    ) -> Result<TokenRangesBuilder, Error> {
+        let mut reader = EncodedReader::new(encoded);
+        let mut builder = TokenRangesBuilder::default();
+        let token_count = reader.read_varint()?;
+        let mut token = Vec::new();
+        let mut previous_range_end = 0i64;
+        for _ in 0..token_count {
+            let shared_len = reader.read_len()?;
+            if shared_len > token.len() {
+                return Err(Error::Corrupt(
+                    "a token shares more bytes than the token before it has",
+                ));
+            }
+            token.truncate(shared_len);
+            let rest_len = reader.read_len()?;
+            reader.read_bytes_into(rest_len, &mut token)?;
+            if builder.token_count > 0 && token <= builder.previous_token {
+                return Err(Error::Corrupt("the tokens are not in ascending order"));
+            }
+
+            let offset = previous_range_end
+                .checked_add(reader.read_signed_varint()?)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or(Error::Corrupt("a range starts outside any file"))?;
+            let len = reader.read_len()?;
+            previous_range_end = offset
+                .checked_add(len)
+                .and_then(|end| i64::try_from(end).ok())
+                .ok_or(Error::Corrupt("a range ends outside any file"))?;
+            builder.push(source, &token, FileRange::new(offset, len));
+        }
+        reader.finish()?;
+        Ok(builder)
     }
 
     pub fn count_tokens(&self) -> usize {

@@ -42,6 +42,11 @@ impl<T> SlabBuffer<T> {
         self.slab.size / size_of::<T>() - index
     }
 
+    /// The slab the buffer is backed by, giving up the typed access.
+    pub(super) fn into_slab(self) -> Slab {
+        self.slab
+    }
+
     /// Hand the buffer's first `byte_len` bytes to Arrow as a zero-copy
     /// [`Buffer`]. The slab rides in the buffer's allocation `Arc`, so the
     /// memory returns to the pool when the last downstream reference drops.

@@ -15,7 +15,8 @@
 
 use crate::io::FileRange;
 use crate::memory::cache::Cached;
-use crate::memory::{FrozenSlab, SlabSource};
+use crate::memory::{FrozenSlab, Slab, SlabAllocator, SlabSource};
+use crate::text_index::Error;
 use crate::text_index::token_ranges::{TokenRanges, TokenRangesBuilder, TokenRangesMeta};
 
 /// An index file's sparse index, all of it in memory for as long as this is
@@ -25,6 +26,24 @@ pub struct SparseIndex {
 }
 
 impl SparseIndex {
+    /// The sparse index in its encoded form (that of
+    /// [`token_ranges`](crate::text_index::token_ranges)), in slabs from
+    /// `allocator`.
+    pub fn encode(&self, allocator: &mut SlabAllocator) -> Vec<Slab> {
+        self.smallest_tokens.encode(allocator)
+    }
+
+    /// Gather the sparse index `encoded` holds, with memory from `source`.
+    /// Fails when `encoded` is not what [`encode`](Self::encode) writes.
+    pub fn decode(
+        encoded: &[Slab],
+        source: &mut impl SlabSource,
+    ) -> Result<SparseIndexBuilder, Error> {
+        Ok(SparseIndexBuilder {
+            smallest_tokens: TokenRanges::decode(encoded, source)?,
+        })
+    }
+
     /// How many dict indexes the file has.
     pub fn count_dict_indexes(&self) -> usize {
         self.smallest_tokens.count_tokens()

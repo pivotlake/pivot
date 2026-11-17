@@ -22,9 +22,13 @@
 //! working memory and a cache entry, and it lies in as many chunks, and as
 //! many ring slots, as it needs: lookups work across them.
 //!
+//! Each piece also has an encoded form, compact bytes in slabs, which
+//! `encode` writes and `decode` gathers a piece back from.
+//!
 //! [`tokenizer`] defines what a token is.
 
 pub mod dict_index;
+mod encoded;
 pub mod postings;
 pub mod sparse_index;
 mod token_ranges;
@@ -35,6 +39,13 @@ pub use postings::{Postings, PostingsBuilder, PostingsMeta};
 pub use sparse_index::{SparseIndex, SparseIndexBuilder};
 pub use token_ranges::TokenRangesMeta;
 pub use tokenizer::split_tokens;
+
+/// Why encoded bytes could not be decoded.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("corrupt text index: {0}")]
+    Corrupt(&'static str),
+}
 
 #[cfg(test)]
 mod tests;

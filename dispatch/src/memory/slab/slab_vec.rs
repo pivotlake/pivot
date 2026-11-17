@@ -148,6 +148,17 @@ impl<T: Copy> SlabVec<T> {
         1 + (len - Self::INITIAL_CAP).div_ceil(Self::CHUNK_CAP)
     }
 
+    /// The vec's chunks as slabs, in order, the last one cut to the elements
+    /// pushed: the elements' bytes and nothing after them.
+    pub fn into_slabs(self) -> Vec<Slab> {
+        let last_size = self.last_len * size_of::<T>();
+        let mut slabs: Vec<Slab> = self.chunks.into_iter().map(SlabBuffer::into_slab).collect();
+        if let Some(last) = slabs.last_mut() {
+            last.size = last_size;
+        }
+        slabs
+    }
+
     /// How many chunks have been carved so far.
     pub fn count_chunks(&self) -> usize {
         self.chunks.len()
