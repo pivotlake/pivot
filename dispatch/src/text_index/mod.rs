@@ -31,6 +31,7 @@
 //!
 //! - [`tokenizer`] defines what a token is.
 //! - [`sparse_index`], [`dict_index`] and [`postings`] are the three pieces.
+//! - [`index_file`] lays the pieces of one index out as a file.
 //! - [`sorted_tokens`] is the run of tokens the sparse index and a dict
 //!   index are each built around.
 //! - [`carve_order`] tells the chunks of a piece's several vecs apart once
@@ -40,6 +41,7 @@
 mod carve_order;
 pub mod dict_index;
 mod encoded;
+pub mod index_file;
 pub mod postings;
 mod sorted_tokens;
 pub mod sparse_index;
@@ -48,6 +50,7 @@ pub mod tokenizer;
 pub use dict_index::{
     DictIndex, DictIndexBuilder, DictIndexMeta, FewRows, MOST_ROWS_KEPT_IN_DICT, TokenRows,
 };
+pub use index_file::{IndexFileFooter, IndexFileWriter, TOKENS_PER_DICT_INDEX};
 pub use postings::{Postings, PostingsBuilder, PostingsMeta};
 pub use sparse_index::{SparseIndex, SparseIndexBuilder, SparseIndexMeta};
 pub use tokenizer::split_tokens;

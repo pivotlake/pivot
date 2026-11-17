@@ -3,6 +3,7 @@
 //! memory context.
 
 mod dict_index;
+mod index_file;
 mod postings;
 mod sparse_index;
 
