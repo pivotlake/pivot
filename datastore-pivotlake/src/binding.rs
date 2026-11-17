@@ -5,18 +5,22 @@
 use std::sync::Arc;
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
-use arrow_array::{ArrayRef, Scalar};
+use crate::text_index::{TextIndexRowSelector, TokenPredicate};
+use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use crossbeam_deque::Injector;
-use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec, RowDelivery};
 use parquet_engine::{
     ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    table_input_with_row_selector,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use planner::expression::{CompareType, Expression};
+use planner::expression::{CompareType, Expression, Function, HasTokens, Ref};
+use planner::operator::Filter;
+use planner::types::Type;
 
 use super::insert_sink::build_insert_spec;
 use super::{CatalogTable, CommitAction};
@@ -47,6 +51,11 @@ pub struct TableBinding {
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
+    /// Token predicates (`has_token` and its siblings) pushed down for this
+    /// binding, each on a plain text column some file has a text index for.
+    /// The scan reads only the rows those indexes say hold the tokens, unless
+    /// it feeds a Top-N, which checks them on the text.
+    token_predicates: Vec<TokenPredicate>,
     /// The transaction's staging queue, shared (`Arc`) with the
     /// [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
     /// binding, so the append an INSERT compiled by this binding stages as it
@@ -80,6 +89,7 @@ impl TableBinding {
             columns,
             nullability,
             predicates: Vec::new(),
+            token_predicates: Vec::new(),
             commit_actions,
         }
     }
@@ -176,15 +186,94 @@ impl BoundTable for TableBinding {
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
-        Ok(table_input_with_filter_and_eq_predicates(
+        // The filter is consulted as a row group is handed out, so it does
+        // not shift the row-group positions a late materialize addresses.
+        let filter = row_group_filter_from(dynamic_filters);
+
+        // A token predicate is answered from the text indexes: a stage ahead
+        // of the scan's reads looks each file up in its index, and only the
+        // rows holding the tokens are read.
+        if !self.token_predicates.is_empty() && scan_order.is_none() {
+            return Ok(table_input_with_row_selector(
+                dispatcher,
+                &parquet,
+                projection,
+                emit_row_group_metadata,
+                filter,
+                Arc::new(eq_predicates),
+                TextIndexRowSelector::new(&self.token_predicates),
+            ));
+        }
+
+        // A scan feeding a Top-N is read in the order of its key and under
+        // its throttle, and uses no index. The token predicates the plan
+        // keeps no filter for are checked here, on the text: the scan reads
+        // their columns too, where the query did not ask for them, and drops
+        // those again once the rows are checked.
+        let requested_columns = projection.column_indices.len();
+        let mut scanned = projection;
+        let mut conditions = Vec::new();
+        for predicate in &self.token_predicates {
+            if !predicate.is_answered_by_the_scan {
+                continue;
+            }
+            let read_whole_at = (0..scanned.column_indices.len()).find(|&output| {
+                scanned.column_indices[output] == predicate.column_idx
+                    && scanned.extract_at(output).is_none()
+            });
+            let position = match read_whole_at {
+                Some(position) => position,
+                None => {
+                    scanned.column_indices.push(predicate.column_idx);
+                    if !scanned.extracts.is_empty() {
+                        scanned.extracts.push(None);
+                    }
+                    scanned.column_indices.len() - 1
+                }
+            };
+            conditions.push(Expression::Function(Function::HasTokens(HasTokens {
+                input: Box::new(Expression::Ref(Ref {
+                    column_idx: position,
+                    return_type: Type::Utf8,
+                    name: Some(self.columns[predicate.column_idx].name.clone()),
+                })),
+                ..predicate.call.clone()
+            })));
+        }
+        let added_columns = requested_columns..scanned.column_indices.len();
+        let scan = table_input_with_filter_and_eq_predicates(
             dispatcher,
             &parquet,
-            projection,
+            scanned,
             emit_row_group_metadata,
-            row_group_filter_from(dynamic_filters),
+            filter,
             scan_order,
             Arc::new(eq_predicates),
-        ))
+        );
+        if conditions.is_empty() {
+            return Ok(scan);
+        }
+        let checked = Filter {
+            conditions,
+            // What a filter below a Top-N delivers.
+            delivery: RowDelivery::Immediate,
+        }
+        .compile(scan)
+        .map_err(|error| CatalogError::Other(Box::new(error)))?;
+        if added_columns.is_empty() {
+            return Ok(checked);
+        }
+        // The added columns follow the requested ones, ahead of any row-group
+        // metadata columns.
+        Ok(RecordBatchOperatorSpec::from_spec(checked.map(move || {
+            let added_columns = added_columns.clone();
+            move |batch: RecordBatch| {
+                let kept: Vec<usize> = (0..batch.num_columns())
+                    .filter(|column| !added_columns.contains(column))
+                    .collect();
+                Ok(batch.project(&kept)?)
+            }
+        })))
     }
 
     fn compile_insert(
@@ -236,20 +325,57 @@ impl BoundTable for TableBinding {
     }
 
     fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
-        // Just record it. The actual pruning (min/max row-group elimination and
-        // equality/dictionary pruning) happens in `compile`, once the row-group
-        // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
-        // so this is purely an optimization and never affects correctness.
+        // A comparison is just recorded. The actual pruning (min/max row-group
+        // elimination and equality/dictionary pruning) happens in `compile`,
+        // once the row-group metadata exists, and the upstream `Filter` is
+        // kept, so it is purely an optimization.
         self.predicates
             .extend(PushedPredicate::from_filter(&filter));
 
-        Ok(false)
+        // A token function over a plain text column is answered from the
+        // column's text indexes, for the tokens an index stores.
+        let Expression::Function(Function::HasTokens(has_tokens)) = &filter else {
+            return Ok(false);
+        };
+        let Expression::Ref(column) = has_tokens.input.as_ref() else {
+            return Ok(false);
+        };
+        let query = has_tokens.query();
+        if !query.is_answerable_from_index() {
+            return Ok(false);
+        }
+        // The same call offered again gets the same answer.
+        let already_pushed = self
+            .token_predicates
+            .iter()
+            .find(|pushed| pushed.column_idx == column.column_idx && *pushed.query == query);
+        if let Some(pushed) = already_pushed {
+            return Ok(pushed.is_answered_by_the_scan);
+        }
+        let indexes = self
+            .table
+            .column_text_indexes(&self.columns[column.column_idx].name)?;
+        if indexes.is_empty() {
+            return Ok(false);
+        }
+        // The scan reads exactly the matching rows of every file that has an
+        // index, and every row of a file that has none. So the filter is
+        // needed above the scan only when some file has none.
+        let is_answered_by_the_scan = indexes.covers_every_file();
+        self.token_predicates.push(TokenPredicate {
+            call: has_tokens.clone(),
+            column_idx: column.column_idx,
+            query: Arc::new(query),
+            indexes,
+            is_answered_by_the_scan,
+        });
+        Ok(is_answered_by_the_scan)
     }
 
     fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         // Only sound for the whole, unfiltered table: a pushed-down predicate
         // means the scan this binding stands for excludes rows.
-        if !self.predicates.is_empty() {
+        if !self.predicates.is_empty() || !self.token_predicates.is_empty() {
             return None;
         }
         // Read the captured snapshot files, the same view a scan would see; an
@@ -260,7 +386,7 @@ impl BoundTable for TableBinding {
     fn row_count(&self) -> Option<i64> {
         // Only sound for the whole, unfiltered table: a pushed-down predicate
         // means the scan this binding stands for excludes rows.
-        if !self.predicates.is_empty() {
+        if !self.predicates.is_empty() || !self.token_predicates.is_empty() {
             return None;
         }
         // The parquet footer carries each row group's exact row count, so the

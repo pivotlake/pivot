@@ -22,11 +22,12 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, BucketGrid, Case, CaseCheck, Cast, Compare,
-    Concat, Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc,
-    Divide, Error, Expression, FormatBytes, Function, HasTokens, InList, IntervalArithmetic,
-    IsNull, Length, Like, MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref,
-    RegexpFullMatch, RegexpJitReplace, RegexpReplace, Round, Rounding, StructExtract, StructPack,
-    Substring, Suffix, TemporalConvert, TimeBucket, TokenFunction, VariantGet, count_epoch_months,
+    Concat, Conjunction, ConjunctionOp, Contains, CountStar, CreateTextIndex, DatePart,
+    DatePartKind, DateTrunc, Divide, Error, Expression, FormatBytes, Function, HasTokens, InList,
+    IntervalArithmetic, IsNull, Length, Like, MaybeError, NormalizedInterval, Not,
+    NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Round,
+    Rounding, StructExtract, StructPack, Substring, Suffix, TemporalConvert, TimeBucket,
+    TokenFunction, VariantGet, count_epoch_months,
 };
 use crate::types::{
     MICROS_PER_DAY, StructField, Type, build_scalar_value, physical_arrow_type, type_from_logical,
@@ -428,6 +429,14 @@ impl Function {
             "drop_cache" => {
                 function_args(func, 0)?;
                 Ok(Function::DropCache)
+            }
+            "create_text_index" => {
+                let params = function_args(func, 2)?;
+                let table = constant_string(Expression::from_handle(params[0])?)?;
+                let column = constant_string(Expression::from_handle(params[1])?)?;
+                Ok(Function::CreateTextIndex(CreateTextIndex::new(
+                    &table, column,
+                )))
             }
             // `extract(<part> FROM ts)` lowers to a function named after the part
             // (`minute`, `year`, `dayofweek`, …).

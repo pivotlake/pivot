@@ -2,8 +2,8 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, HasTokens,
-    IntervalArithmetic, Length, Like, NormalizedInterval, Prefix, RegexpFullMatch,
+    Arithmetic, Concat, Contains, CreateTextIndex, DatePart, DateTrunc, Divide, FormatBytes,
+    HasTokens, IntervalArithmetic, Length, Like, NormalizedInterval, Prefix, RegexpFullMatch,
     RegexpJitReplace, RegexpReplace, Round, StructExtract, StructPack, Substring, Suffix,
     TemporalConvert, TimeBucket, TokenFunction, VariantGet,
 };
@@ -49,6 +49,13 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
         "json_extract" => Some(ScalarFunctionSignature {
             arguments: vec![Type::Variant, Type::Utf8],
             return_type: Type::Variant,
+            volatile: true,
+        }),
+        // Runs as a statement (see `CreateTextIndex`); volatile so DuckDB
+        // leaves the call in the plan for the server to find.
+        "create_text_index" => Some(ScalarFunctionSignature {
+            arguments: vec![Type::Utf8, Type::Utf8],
+            return_type: Type::Int64,
             volatile: true,
         }),
         // The token matchers take the text and a constant naming the tokens.
@@ -104,6 +111,9 @@ pub enum Function {
     ///
     /// [`DummyScan`]: crate::operator::DummyScan
     DropCache,
+    /// `create_text_index(table, column)` — a statement in function clothing;
+    /// the server runs it instead of compiling it.
+    CreateTextIndex(CreateTextIndex),
     /// `normalized_interval(span)` — an interval carried into the canonical
     /// form its fields must take before they compare. DuckDB's binder wraps
     /// every interval it orders, compares or hashes in this.
@@ -164,7 +174,7 @@ impl Function {
             Function::IntervalArithmetic(i) => visit(&i.operand),
             Function::TemporalConvert(t) => visit(&t.source),
             Function::NormalizedInterval(n) => visit(&n.input),
-            Function::DropCache => {}
+            Function::DropCache | Function::CreateTextIndex(_) => {}
             Function::VariantGet(v) => visit(&v.input),
             Function::StructPack(s) => s.fields.iter().for_each(visit),
             Function::StructExtract(s) => visit(&s.input),
@@ -215,7 +225,7 @@ impl Function {
             Function::IntervalArithmetic(i) => visit(&mut i.operand),
             Function::TemporalConvert(t) => visit(&mut t.source),
             Function::NormalizedInterval(n) => visit(&mut n.input),
-            Function::DropCache => {}
+            Function::DropCache | Function::CreateTextIndex(_) => {}
             Function::VariantGet(v) => visit(&mut v.input),
             Function::StructPack(s) => s.fields.iter_mut().for_each(visit),
             Function::StructExtract(s) => visit(&mut s.input),
@@ -248,6 +258,7 @@ impl Display for Function {
             Function::TemporalConvert(c) => write!(f, "{c}"),
             Function::NormalizedInterval(n) => write!(f, "{n}"),
             Function::DropCache => write!(f, "drop_cache()"),
+            Function::CreateTextIndex(c) => write!(f, "{c}"),
             Function::VariantGet(v) => write!(f, "{v}"),
             Function::StructPack(s) => write!(f, "{s}"),
             Function::StructExtract(s) => write!(f, "{s}"),
@@ -327,6 +338,8 @@ impl Function {
             Function::StructExtract(s) => s.return_type.clone(),
             // `drop_cache()` returns the evicted-entry count.
             Function::DropCache => Type::Int64,
+            // Bound as the count of index files built.
+            Function::CreateTextIndex(_) => Type::Int64,
         }
     }
 
@@ -356,6 +369,7 @@ impl Function {
             Function::VariantGet(v) => v.compile(),
             Function::StructPack(s) => s.compile(),
             Function::StructExtract(s) => s.compile(),
+            Function::CreateTextIndex(_) => Err(compile::Error::CreateTextIndexNotCompilable),
             // `drop_cache()` evicts every in-memory cache *and* the on-disk cache
             // (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single

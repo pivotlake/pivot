@@ -36,7 +36,7 @@ impl fmt::Display for Filter {
 }
 
 impl Filter {
-    pub(crate) fn compile(
+    pub fn compile(
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {

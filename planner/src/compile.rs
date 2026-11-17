@@ -179,6 +179,11 @@ pub enum Error {
     #[error("VACUUM runs as its own statement and cannot be part of a query")]
     VacuumNotCompilable,
     #[error(
+        "create_text_index runs as its own statement: \
+         SELECT create_text_index('table', 'column')"
+    )]
+    CreateTextIndexNotCompilable,
+    #[error(
         "COPY FROM STDIN compiles to no dataflow; the server drives the ingest from the protocol"
     )]
     CopyFromStdinNotCompilable,

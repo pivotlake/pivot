@@ -114,6 +114,9 @@ pub struct CatalogTable {
     /// for `V + 1`, forcing every loser to replay the log and fetch the winner's
     /// footers before retrying.
     commit_lock: Arc<std::sync::Mutex<()>>,
+    /// The text index files found for this table's data files, shared by every
+    /// copy since an index belongs to a data file rather than to a version.
+    text_indexes: Arc<crate::text_index::TextIndexRegistry>,
 }
 
 impl CatalogTable {
@@ -147,6 +150,7 @@ impl CatalogTable {
             dispatcher,
             engine,
             commit_lock: Arc::default(),
+            text_indexes: Arc::default(),
         }
     }
 
@@ -211,6 +215,7 @@ impl CatalogTable {
             dispatcher,
             engine,
             commit_lock: Arc::default(),
+            text_indexes: Arc::default(),
         })
     }
 
@@ -806,6 +811,14 @@ impl CatalogTable {
 
     pub(crate) fn store(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
+    }
+
+    pub(crate) fn dispatcher(&self) -> &DataFlowDispatcher {
+        &self.dispatcher
+    }
+
+    pub(crate) fn text_indexes(&self) -> &crate::text_index::TextIndexRegistry {
+        &self.text_indexes
     }
 
     /// Re-encode `inputs`' rows into fresh target-sized files and return them,

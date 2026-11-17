@@ -338,6 +338,20 @@ impl CatalogTransaction for PivotTransaction {
         transaction.compact(table, final_sweep).await
     }
 
+    async fn create_text_index(
+        &self,
+        datastore: &str,
+        table: &planner::catalog::SchemaQualifiedTableName,
+        column: &str,
+    ) -> CatalogResult<u64> {
+        let transaction = self
+            .find_or_create_sub_transaction(datastore)
+            .ok_or_else(|| {
+                CatalogError::Other(Box::new(Error::UnknownDatastore(datastore.into())))
+            })?;
+        transaction.create_text_index(table, column).await
+    }
+
     async fn vacuum(&self, datastore: &str) -> CatalogResult<()> {
         let transaction = self
             .find_or_create_sub_transaction(datastore)

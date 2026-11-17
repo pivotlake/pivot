@@ -2046,3 +2046,67 @@ async fn query_returns_no_rows_for_an_empty_binary_result(#[future] conn: Conn) 
 
     assert!(rows.is_empty());
 }
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn create_text_index_covers_the_rows_a_table_already_has(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_text_index", dir.path()).await;
+    let query = "SELECT id FROM people_text_index WHERE has_token(name, 'bob')";
+    let without_index = select_rows(&conn, query).await;
+
+    let created = conn
+        .simple_query("SELECT create_text_index('people_text_index', 'name')")
+        .await
+        .unwrap();
+    let with_index = select_rows(&conn, query).await;
+
+    assert!(matches!(
+        created.as_slice(),
+        [SimpleQueryMessage::CommandComplete(1)]
+    ));
+    assert_eq!(without_index, vec![vec![Some("2".into())]]);
+    assert_eq!(with_index, without_index);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_query_counts_the_rows_its_text_index_names(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_text_count", dir.path()).await;
+    conn.simple_query("SELECT create_text_index('people_text_count', 'name')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT count(*) FROM people_text_count WHERE has_any_token(name, 'bob carol')",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Some("2".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_query_finds_rows_written_after_the_text_index_was_created(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_text_mixed", dir.path()).await;
+    conn.simple_query("SELECT create_text_index('people_text_mixed', 'name')")
+        .await
+        .unwrap();
+    conn.simple_query("INSERT INTO people_text_mixed VALUES (4, 'bob'), (5, 'dave')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT id FROM people_text_mixed WHERE has_token(name, 'bob') ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("4".into())]]);
+}

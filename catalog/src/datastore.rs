@@ -151,6 +151,19 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Build the text index of `column` for every data file of `table` that
+    /// has none, returning how many index files were built.
+    async fn create_text_index(
+        &self,
+        _table: &SchemaQualifiedTableName,
+        _column: &str,
+    ) -> Result<u64> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this datastore does not support text indexes",
+        )
+        .into())
+    }
+
     /// Run one vacuum sweep against the latest state, even without background
     /// maintenance. Retention still applies to every deletion.
     async fn vacuum(&self) -> Result<()> {

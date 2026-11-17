@@ -122,6 +122,7 @@ impl Executor {
 
         if plan.as_set_variable().is_some()
             || plan.as_compact().is_some()
+            || plan.as_create_text_index().is_some()
             || plan.is_vacuum()
             || plan.as_copy_from_stdin().is_some()
             || plan.as_transaction_stmt().is_some()
@@ -192,6 +193,32 @@ impl Executor {
             execute_compact(&self.catalog, transaction.as_ref(), request).await?;
             return Ok(Execution {
                 output: StatementOutput::Command(Command::Compact),
+                stats: ExecutionStats {
+                    plan: plan_time,
+                    execute: started.elapsed(),
+                    ..ExecutionStats::default()
+                },
+            });
+        }
+
+        if let Some(request) = plan.as_create_text_index() {
+            let started = Instant::now();
+            let table = planner::catalog::SchemaQualifiedTableName::new(
+                request
+                    .schema
+                    .as_deref()
+                    .unwrap_or(planner::DEFAULT_SCHEMA_NAME),
+                request.table.as_str(),
+            );
+            let files = transaction
+                .create_text_index(
+                    self.catalog.default_datastore_name(),
+                    &table,
+                    &request.column,
+                )
+                .await?;
+            return Ok(Execution {
+                output: StatementOutput::Command(Command::CreateTextIndex { files }),
                 stats: ExecutionStats {
                     plan: plan_time,
                     execute: started.elapsed(),
