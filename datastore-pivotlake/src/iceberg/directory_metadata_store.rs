@@ -1,8 +1,18 @@
 //! A table whose current version is kept in its own directory: numbered
 //! metadata files under `<directory>/metadata/`, each version committed with a
 //! conditional write that admits exactly one writer, so writers in several
-//! processes share a table with no catalog service. Readable by any Iceberg
-//! reader from the table's path.
+//! processes share a table with no catalog service. An Iceberg reader reads
+//! a version from the path of its metadata file; the directory holds no
+//! `version-hint.text` to tell a reader that is given only the directory
+//! which version is current.
+//!
+//! The current version is the highest numbered file, found by listing the
+//! directory. A store's first listing of a table starts from the version
+//! the table's hint names ([`VERSION_HINT_FILE`]), one at or below the
+//! current version by up to [`VERSION_HINT_INTERVAL`], the number of
+//! versions between two writes of it, and runs on to the newest file, so
+//! the hint only shortens the listing and is never taken for the current
+//! version.
 //!
 //! The metadata log of a version names every earlier metadata file except
 //! the ones the commit that wrote it was told had expired
@@ -24,11 +34,20 @@ use iceberg_tables::{Error, MetadataFile, MetadataStore, Result, TableLocation};
 use object_storage::StoreError;
 use planner::catalog::SchemaQualifiedTableName;
 
-/// The file under the metadata directory naming the current metadata
-/// version, for readers that open the table by its path. Rewritten after
-/// every commit, best effort; a reader lists from the version it names,
-/// never trusting it.
-pub(crate) const VERSION_HINT_FILE: &str = "version-hint.text";
+/// The file under the metadata directory naming a version at or below the
+/// current one, by up to [`VERSION_HINT_INTERVAL`] versions, for a store's
+/// first listing of the table to start from. Written, best effort, by the
+/// commit of each version that is a multiple of the interval: a write that
+/// failed, or two writers' that landed out of order, leaves it further
+/// behind. A store lists from the version it names to the newest, never
+/// trusting it. The name is Pivot's own, not the `version-hint.text` other
+/// engines open a table's directory by: they read the version that file
+/// names as the current one, which this is not.
+pub(crate) const VERSION_HINT_FILE: &str = "pivot-version-hint.text";
+/// How many versions apart the hint is written, which bounds how many
+/// metadata files a store's first listing of a table reads past the one the
+/// hint names.
+const VERSION_HINT_INTERVAL: u64 = 100;
 /// Metadata versions are zero-padded to this many digits, so that the
 /// store's byte-ordered listing is the version order: a listing started after
 /// one version returns only newer ones, and the last key is the current one.
@@ -56,8 +75,8 @@ pub(crate) fn parse_metadata_file_version(name: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// The hint's content for `version`: the same padded digits as the file name,
-/// which a path reader substitutes straight into `v{hint}.metadata.json`.
+/// The hint's content for `version`: the padded digits the version's
+/// metadata file name carries.
 fn hint_content(version: u64) -> String {
     format!("{version:0VERSION_DIGITS$}")
 }
@@ -108,30 +127,22 @@ impl DirectoryMetadataStore {
         }
     }
 
-    /// The version the table's hint names, or `None` when there is no hint,
-    /// which only costs the reader a longer listing. A hint that does not
-    /// parse is an error.
-    pub(crate) fn read_version_hint(&self) -> Result<Option<u64>> {
+    /// The version the table's hint names, or `None` when the table has no
+    /// hint, as one that has not reached version [`VERSION_HINT_INTERVAL`]
+    /// has none. A hint that does not parse is an error.
+    fn read_version_hint(&self) -> Result<Option<u64>> {
         let location = &self.location;
-        match location
+        location
             .store()
             .get(&location.metadata_key(VERSION_HINT_FILE))?
-        {
-            Some(bytes) => Ok(Some(parse_hint(&bytes)?)),
-            None => {
-                tracing::warn!(
-                    table = %location.table_uri(),
-                    "no version hint; listing the table's metadata from its first version"
-                );
-                Ok(None)
-            }
-        }
+            .map(|bytes| parse_hint(&bytes))
+            .transpose()
     }
 
     /// Write the version hint naming `version`. Best effort by the caller:
-    /// the hint is for readers that open the table by its path and is never
-    /// trusted by this datastore, so a failed write costs nothing but a warning.
-    pub(crate) fn write_version_hint(&self, version: u64) -> Result<()> {
+    /// the hint only shortens a store's first listing of the table, so a
+    /// failed write costs nothing but a warning.
+    fn write_version_hint(&self, version: u64) -> Result<()> {
         let location = &self.location;
         location
             .store()
@@ -145,8 +156,9 @@ impl DirectoryMetadataStore {
     /// The table's current version, its highest metadata file's, or `None`
     /// when it has no metadata file at all. The files are listed from the
     /// latest version this store has seen, or else from the version the
-    /// hint names; when the table has none at or after that one, every
-    /// metadata file is listed.
+    /// hint names, which is at or below the current one; without a hint,
+    /// or when the table has no file at or after the start, every metadata
+    /// file is listed.
     fn find_current_version(&self) -> Result<Option<u64>> {
         // Copied out, so the lock is not held while the store is asked.
         let seen_version = self
@@ -174,7 +186,9 @@ impl DirectoryMetadataStore {
 
     /// The highest metadata version listed from the version `start` up, or
     /// among every metadata file without one; `None` when the listing shows
-    /// none.
+    /// none. The start is a place in the order of the names, not a file
+    /// that has to exist: when its metadata file was deleted, the versions
+    /// after it are listed all the same.
     fn list_highest_version(&self, start: Option<u64>) -> Result<Option<u64>> {
         let location = &self.location;
         // The padded names sort in version order, so the name of the version
@@ -251,8 +265,9 @@ impl DirectoryMetadataStore {
     /// `base` (`None` for a table's first version): create
     /// `v{N+1}.metadata.json` only if nothing has that name yet.
     /// Every writer that loaded N derives the same name, so exactly one
-    /// succeeds, and `None` tells the others they lost. The hint is rewritten
-    /// afterwards, best effort.
+    /// succeeds, and `None` tells the others they lost. A version that is a
+    /// multiple of [`VERSION_HINT_INTERVAL`] is then written to the hint,
+    /// best effort.
     ///
     /// A write that fails without saying whether the store applied it leaves
     /// the outcome open: the object under the name is then read back, and is
@@ -316,9 +331,9 @@ impl DirectoryMetadataStore {
             .map_err(|error| Error::CommitOutcomeUnknown {
                 source: Box::new(error),
             })?;
-            // The version hint's name also starts with `v` and sorts after
-            // every version's, so only a numbered metadata file is a
-            // successor.
+            // A file another tool left here may start with `v` too and
+            // sort after every version's name, a `version-hint.text` for
+            // one, so only a numbered metadata file is a successor.
             let has_successor = listed
                 .objects
                 .iter()
@@ -328,12 +343,14 @@ impl DirectoryMetadataStore {
                 return Ok(None);
             }
         }
-        if let Err(error) = self.write_version_hint(version) {
+        if version.is_multiple_of(VERSION_HINT_INTERVAL)
+            && let Err(error) = self.write_version_hint(version)
+        {
             tracing::warn!(
                 table = %location.table_uri(),
                 version,
                 error = %error,
-                "writing the version hint failed; path readers see the previous hint"
+                "writing the version hint failed; a store's first listing of the table starts further back"
             );
         }
         let committed = MetadataFile {

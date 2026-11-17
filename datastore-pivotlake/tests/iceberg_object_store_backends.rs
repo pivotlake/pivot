@@ -79,9 +79,11 @@ fn a_listing_after_a_cursor_returns_only_the_names_past_it() {
                 )
                 .unwrap();
         }
-        store
-            .put(&ObjectPath::new("t/metadata/version-hint.text"), b"9")
-            .unwrap();
+        for other in ["pivot-version-hint.text", "version-hint.text"] {
+            store
+                .put(&ObjectPath::new(format!("t/metadata/{other}")), b"9")
+                .unwrap();
+        }
 
         let listed = store
             .list_filtered(
@@ -91,9 +93,10 @@ fn a_listing_after_a_cursor_returns_only_the_names_past_it() {
             )
             .unwrap();
 
-        // The hint sorts after every padded version name and shares the
-        // prefix, so it rides along; the reader parses names strictly and
-        // ignores it.
+        // Pivot's hint does not share the prefix and is left out. The hint
+        // another tool writes sorts after every padded version name and
+        // shares the prefix, so it rides along; the reader parses names
+        // strictly and ignores it.
         let mut names: Vec<_> = listed
             .objects
             .iter()

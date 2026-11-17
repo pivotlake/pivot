@@ -46,7 +46,7 @@ fn a_created_and_filled_table_reads_back_and_survives_a_reopen() {
         metadata_versions(&db.root_uri(), &directory).unwrap(),
         [1, 2]
     );
-    assert_eq!(hinted_version(&db.root_uri(), &directory).unwrap(), Some(2));
+    assert_eq!(hinted_version(&db.root_uri(), &directory).unwrap(), None);
     let metadata = metadata_json(&db.table_path("events"), 2);
     assert_eq!(metadata["format-version"], 3);
     assert_eq!(metadata["table-uuid"], directory);

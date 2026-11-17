@@ -1,5 +1,6 @@
 //! The numbered metadata files a managed table keeps its versions in: how a
-//! version and the hint are named, how a commit settles a write the store
+//! version and the hint are named, which commits write the hint and what a
+//! store that starts from it finds, how a commit settles a write the store
 //! did not answer for and a race it lost, what a commit and a refresh read
 //! of the store, and how long the metadata log names a version.
 
@@ -46,6 +47,19 @@ fn hold_table(db: &Database, name: &str) -> CatalogTable {
         .expect("the table exists")
 }
 
+/// Bring the table `name` of `db` to `version` without a commit: its
+/// newest metadata file is copied under the name of every version after it
+/// up to `version`, as commits that change nothing leave the directory.
+fn copy_newest_version_up_to(db: &Database, name: &str, version: u64) {
+    let metadata_dir = db.table_path(name).join("metadata");
+    let versions = metadata_versions(&db.root_uri(), &db.table_directory(name)).unwrap();
+    let newest = *versions.last().expect("the table has a version");
+    let locate = |version: u64| metadata_dir.join(format!("v{version:020}.metadata.json"));
+    for next in newest + 1..=version {
+        std::fs::copy(locate(newest), locate(next)).unwrap();
+    }
+}
+
 /// The metadata directory of the table `name` of `db`, a database rooted
 /// at `root`.
 fn locate_metadata_dir(root: &Path, db: &Database, name: &str) -> PathBuf {
@@ -81,7 +95,7 @@ fn vacuum_from_another_process(db: &Database, now_ms: u64) {
 }
 
 #[test]
-fn a_new_table_is_version_one_with_a_hint() {
+fn a_new_table_is_version_one_with_no_hint() {
     let mut db = Database::new();
 
     db.execute("CREATE TABLE t (value BIGINT)");
@@ -96,7 +110,7 @@ fn a_new_table_is_version_one_with_a_hint() {
     );
     assert_eq!(
         hinted_version(&reopened.root_uri(), &directory).unwrap(),
-        Some(1)
+        None
     );
     assert_eq!(hold_table(&reopened, "t").version(), 1);
 }
@@ -158,19 +172,17 @@ fn padded_names_sort_in_version_order() {
 }
 
 #[test]
-fn a_hint_holds_the_padded_digits_and_rejects_anything_else() {
+fn a_hint_is_read_as_the_padded_digits_and_rejects_anything_else() {
     let mut db = Database::new();
     db.execute("CREATE TABLE t (value BIGINT)");
     let directory = db.table_directory("t");
-    let hint_path = db.table_path("t").join("metadata/version-hint.text");
-    let written = std::fs::read_to_string(&hint_path).unwrap();
+    let hint_path = db.table_path("t").join("metadata/pivot-version-hint.text");
 
     std::fs::write(&hint_path, "00000000000000000001\n").unwrap();
     let with_a_newline = hinted_version(&db.root_uri(), &directory).unwrap();
     std::fs::write(&hint_path, "1").unwrap();
     let unpadded = hinted_version(&db.root_uri(), &directory);
 
-    assert_eq!(written, "00000000000000000001");
     assert_eq!(with_a_newline, Some(1));
     assert!(matches!(
         unpadded,
@@ -462,17 +474,93 @@ fn a_writer_whose_base_outlived_the_window_loses_after_its_successor_is_deleted(
 }
 
 #[test]
-fn the_hint_follows_every_version() {
+fn the_hint_is_written_by_the_commit_of_version_one_hundred_and_by_none_around_it() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (value BIGINT)");
+    let (root, directory) = (db.root_uri(), db.table_directory("t"));
+    let hint_path = db.table_path("t").join("metadata/pivot-version-hint.text");
+    copy_newest_version_up_to(&db, "t", 98);
+
+    append_version(&db, &directory, "a.parquet");
+    let hinted_at_99 = hinted_version(&root, &directory).unwrap();
+    append_version(&db, &directory, "b.parquet");
+    let written_at_100 = std::fs::read_to_string(&hint_path).unwrap();
+    append_version(&db, &directory, "c.parquet");
+    let hinted_at_101 = hinted_version(&root, &directory).unwrap();
+
+    assert_eq!(hinted_at_99, None);
+    assert_eq!(written_at_100, "00000000000000000100");
+    assert_eq!(hinted_at_101, Some(100));
+}
+
+#[test]
+fn a_table_with_no_hint_is_opened_at_its_newest_version() {
     let mut db = Database::new();
     db.execute("CREATE TABLE t (value BIGINT)");
     let directory = db.table_directory("t");
-
-    for version in 2..=11u64 {
-        db.execute(&format!("INSERT INTO t VALUES ({version})"));
-        assert_eq!(
-            hinted_version(&db.root_uri(), &directory).unwrap(),
-            Some(version),
-            "after version {version}"
-        );
+    for file in ["a.parquet", "b.parquet", "c.parquet"] {
+        append_version(&db, &directory, file);
     }
+    let hinted = hinted_version(&db.root_uri(), &directory).unwrap();
+
+    let reopened = Database::reopen(db.close());
+
+    assert_eq!(hinted, None);
+    assert_eq!(hold_table(&reopened, "t").version(), 4);
+}
+
+#[test]
+fn a_table_whose_hint_is_several_versions_behind_is_opened_at_its_newest_version() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (value BIGINT)");
+    let directory = db.table_directory("t");
+    copy_newest_version_up_to(&db, "t", 99);
+    for file in ["a.parquet", "b.parquet", "c.parquet", "d.parquet"] {
+        append_version(&db, &directory, file);
+    }
+    let hinted = hinted_version(&db.root_uri(), &directory).unwrap();
+
+    let reopened = Database::reopen(db.close());
+
+    assert_eq!(hinted, Some(100));
+    assert_eq!(hold_table(&reopened, "t").version(), 103);
+}
+
+/// A store lists from the name the hint holds, not from a file: the hinted
+/// version and the fifty after it are gone, as an expiry leaves them, and
+/// the listing still runs on to the newest.
+#[test]
+fn a_table_whose_hinted_version_was_deleted_is_opened_at_its_newest_version() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (value BIGINT)");
+    let directory = db.table_directory("t");
+    let metadata_dir = db.table_path("t").join("metadata");
+    copy_newest_version_up_to(&db, "t", 99);
+    append_version(&db, &directory, "a.parquet");
+    let hinted = hinted_version(&db.root_uri(), &directory).unwrap();
+    copy_newest_version_up_to(&db, "t", 199);
+    for version in 100..=150 {
+        let deleted = metadata_dir.join(format!("v{version:020}.metadata.json"));
+        std::fs::remove_file(deleted).unwrap();
+    }
+
+    let reopened = Database::reopen(db.close());
+
+    assert_eq!(hinted, Some(100));
+    assert_eq!(hold_table(&reopened, "t").version(), 199);
+}
+
+#[test]
+fn a_table_that_wrote_its_hint_holds_no_file_named_version_hint_text() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (value BIGINT)");
+    let directory = db.table_directory("t");
+    let metadata_dir = db.table_path("t").join("metadata");
+    copy_newest_version_up_to(&db, "t", 99);
+
+    append_version(&db, &directory, "a.parquet");
+
+    let names = names_in(&metadata_dir);
+    assert!(names.contains(&"pivot-version-hint.text".to_string()));
+    assert!(!names.contains(&"version-hint.text".to_string()));
 }

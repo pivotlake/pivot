@@ -1,8 +1,8 @@
 //! The Iceberg format: per table, numbered metadata files under
 //! `<directory>/metadata/`, each version committed with a conditional write
 //! that admits exactly one writer, so writers in several processes share a
-//! table with no catalog service. Readable by any Iceberg reader from the
-//! table's path.
+//! table with no catalog service. An Iceberg reader reads a version from
+//! the path of its metadata file.
 //!
 //! The table itself is the `iceberg-tables` crate's, with its directory as
 //! its metadata store ([`DirectoryMetadataStore`]); this module adapts it to
@@ -163,20 +163,12 @@ struct IcebergTable {
     /// The qualified name the table is indexed under, for messages.
     name: SchemaQualifiedTableName,
     table: iceberg_tables::Table,
-    /// The directory the table's versions are numbered in, for the version
-    /// hint an expiry brings up to date.
-    metadata_store: DirectoryMetadataStore,
 }
 
 impl IcebergTable {
     /// The table at the version `table` is at.
     fn new(name: SchemaQualifiedTableName, table: iceberg_tables::Table) -> Self {
-        let metadata_store = DirectoryMetadataStore::new(table.location().clone());
-        Self {
-            name,
-            table,
-            metadata_store,
-        }
+        Self { name, table }
     }
 
     /// The entry a commit records for `file`, which a writer just uploaded:
@@ -201,20 +193,6 @@ impl IcebergTable {
     /// This table at the version `next`, which was derived from this one.
     fn advanced_to(&self, next: iceberg_tables::Table) -> Self {
         Self::new(self.name.clone(), next)
-    }
-
-    /// Rewrite the version hint to name this version when it names an
-    /// earlier one or is missing. A hint falls behind when its write after
-    /// a commit fails or another tool commits without one.
-    fn advance_lagging_hint(&self) -> crate::Result<()> {
-        if self
-            .metadata_store
-            .read_version_hint()?
-            .is_none_or(|hinted| hinted < self.version())
-        {
-            self.metadata_store.write_version_hint(self.version())?;
-        }
-        Ok(())
     }
 }
 
@@ -537,22 +515,12 @@ impl Table for IcebergTable {
     /// that this version, the one their expiry committed, does not, and the
     /// previous metadata files `expired` that it no longer names. An object
     /// outside the table's own directory (a file the table adopted where it
-    /// lay) is not the table's to delete and is left. The hint is brought up
-    /// to this version before a metadata file is deleted, so a reader never
-    /// follows it to a version deleted here. Nothing here fails the
-    /// maintenance step: what is not deleted stays in the table's
-    /// directory, named by no metadata.
+    /// lay) is not the table's to delete and is left. The version hint may
+    /// name a metadata file deleted here: a store lists on from the name
+    /// to the versions after it. Nothing here fails the maintenance step:
+    /// what is not deleted stays in the table's directory, named by no
+    /// metadata.
     fn delete_snapshot_objects(&self, storage: &TableStorage, expired: &ExpiredSnapshots) {
-        if expired.metadata_file_count() > 0
-            && let Err(error) = self.advance_lagging_hint()
-        {
-            warn!(
-                table = %self.name,
-                error = %error,
-                "bringing the version hint up to date failed; the expiry's objects are left in place"
-            );
-            return;
-        }
         let objects = match self.table.collect_expired_objects(expired) {
             Ok(objects) => objects,
             Err(error) => {

@@ -41,7 +41,8 @@ pub enum TableFormat {
     #[serde(alias = "deltalake")]
     Delta,
     /// Iceberg: numbered metadata files per table, each version committed with a
-    /// conditional write, readable by any Iceberg reader from the table's path.
+    /// conditional write, readable by any Iceberg reader from the path of a
+    /// version's metadata file.
     Iceberg,
 }
 

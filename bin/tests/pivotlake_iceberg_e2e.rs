@@ -134,5 +134,5 @@ datastores:
             .join("v00000000000000000002.metadata.json")
             .is_file()
     );
-    assert!(metadata_dir.join("version-hint.text").is_file());
+    assert!(!metadata_dir.join("version-hint.text").exists());
 }
