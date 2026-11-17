@@ -2094,7 +2094,7 @@ async fn a_text_index_of_a_column_that_is_not_text_is_refused(#[future] conn: Co
         .simple_query("CREATE TEXT INDEX idx_id ON unindexable_logs (id)")
         .await;
 
-    let error = created.unwrap_err().to_string();
+    let error = extract_db_error_message(&created.unwrap_err());
     assert!(error.contains("text column"), "{error}");
 }
 
@@ -2116,7 +2116,7 @@ async fn a_second_text_index_of_the_same_name_is_refused_unless_it_may_exist(#[f
         .simple_query("CREATE TEXT INDEX IF NOT EXISTS idx_message ON twice_indexed_logs (message)")
         .await;
 
-    let error = again.unwrap_err().to_string();
+    let error = extract_db_error_message(&again.unwrap_err());
     assert!(error.contains("already exists"), "{error}");
     assert!(again_if_not_exists.is_ok());
 }
