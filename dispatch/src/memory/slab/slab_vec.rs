@@ -12,6 +12,12 @@ pub struct SlabVec<T: Copy> {
     chunks: Vec<SlabBuffer<T>>,
     cur_base: *mut T,
     last_len: usize,
+    /// Elements the chunk being filled can hold. Zero while there is no chunk.
+    last_cap: usize,
+    /// For a vec created to hold an exact number of elements (see
+    /// [`with_exact_len`](Self::with_exact_len)): how many of them the chunks
+    /// not yet carved will hold.
+    left_to_carve: Option<usize>,
 }
 
 // SAFETY: the cached `cur_base` raw pointer is the only thing blocking the auto
@@ -95,6 +101,19 @@ impl<T: Copy> SlabVec<T> {
             chunks: Vec::new(),
             cur_base: std::ptr::null_mut(),
             last_len: 0,
+            last_cap: 0,
+            left_to_carve: None,
+        }
+    }
+
+    /// A vec that will hold exactly `len` elements. Its last chunk is carved
+    /// only as large as the elements it will hold, so a vec whose length is
+    /// known before it is filled takes no more memory than its elements.
+    /// Pushing more than `len` elements panics.
+    pub fn with_exact_len(len: usize) -> Self {
+        Self {
+            left_to_carve: Some(len),
+            ..Self::new()
         }
     }
 
@@ -104,21 +123,29 @@ impl<T: Copy> SlabVec<T> {
     /// elements has.
     ///
     /// The vec is for reading. The slabs are shared with whoever else holds
-    /// the entry, so nothing may be pushed to it.
+    /// the entry, so pushing to it panics.
     pub(crate) fn from_chunks(chunks: Vec<FrozenSlab>, len: usize) -> Self {
+        let chunk_count = Self::count_chunks_for_len(len);
         assert_eq!(
             chunks.len(),
-            Self::count_chunks_for_len(len),
+            chunk_count,
             "a vec of {len} elements has another number of chunks"
         );
+        let elements_before_last: usize = (0..chunk_count.saturating_sub(1))
+            .map(Self::chunk_cap)
+            .sum();
+        let last_len = len - elements_before_last;
         let chunks: Vec<SlabBuffer<T>> = chunks
             .into_iter()
             .enumerate()
             .map(|(chunk_index, chunk)| {
-                assert_eq!(
-                    chunk.size,
-                    Self::chunk_cap(chunk_index) * size_of::<T>(),
-                    "chunk {chunk_index} has another size"
+                // Every chunk but the last is full. The last one was carved
+                // for at least the elements it holds.
+                let is_last = chunk_index + 1 == chunk_count;
+                let full_size = Self::chunk_cap(chunk_index) * size_of::<T>();
+                assert!(
+                    chunk.size == full_size || (is_last && chunk.size >= last_len * size_of::<T>()),
+                    "chunk {chunk_index} is too small for its elements"
                 );
                 assert!(
                     (chunk.ptr as usize).is_multiple_of(align_of::<T>()),
@@ -127,15 +154,14 @@ impl<T: Copy> SlabVec<T> {
                 SlabBuffer::new(Slab::new(chunk.ptr as *mut u8, chunk.size, chunk.backing))
             })
             .collect();
-        let elements_before_last: usize = match chunks.len() {
-            0 => 0,
-            count => (0..count - 1).map(Self::chunk_cap).sum(),
-        };
         Self {
             cur_base: chunks
                 .last()
                 .map_or(std::ptr::null_mut(), |chunk| chunk.ptr_at_index(0)),
-            last_len: len - elements_before_last,
+            last_len,
+            // Full, with nothing left to carve: a push finds no room.
+            last_cap: last_len,
+            left_to_carve: Some(0),
             chunks,
         }
     }
@@ -166,19 +192,58 @@ impl<T: Copy> SlabVec<T> {
 
     #[inline(always)]
     pub fn push(&mut self, source: &mut impl SlabSource, val: T) {
-        // Full when the chunk being filled (index `chunks.len() - 1`) is at its
-        // capacity; an empty `SlabVec` allocates its first chunk straight away
-        // (the `is_empty` short-circuit also guards the `len() - 1` below).
-        if self.chunks.is_empty() || self.last_len == Self::chunk_cap(self.chunks.len() - 1) {
-            let cap = Self::chunk_cap(self.chunks.len());
-            let chunk =
-                SlabBuffer::new(source.get_contiguous_slab(cap * size_of::<T>(), align_of::<T>()));
-            self.cur_base = chunk.ptr_at_index(0);
-            self.chunks.push(chunk);
-            self.last_len = 0;
+        // Full when the chunk being filled is at its capacity. An empty
+        // `SlabVec` has no chunk and a capacity of zero, so it carves its
+        // first chunk straight away.
+        if self.last_len == self.last_cap {
+            self.start_chunk(source);
         }
         unsafe { *self.cur_base.add(self.last_len) = val };
         self.last_len += 1;
+    }
+
+    /// Append every element of `values`, a chunk's worth at a time.
+    pub fn extend_from_slice(&mut self, source: &mut impl SlabSource, values: &[T]) {
+        let mut rest = values;
+        while !rest.is_empty() {
+            if self.last_len == self.last_cap {
+                self.start_chunk(source);
+            }
+            let (fitting, after) = rest.split_at(rest.len().min(self.last_cap - self.last_len));
+            // SAFETY: the chunk being filled has room for `fitting` past its
+            // `last_len` elements, and `values` cannot overlap a chunk this
+            // vec holds exclusively.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    fitting.as_ptr(),
+                    self.cur_base.add(self.last_len),
+                    fitting.len(),
+                );
+            }
+            self.last_len += fitting.len();
+            rest = after;
+        }
+    }
+
+    /// Carve the next chunk from `source` and make it the one being filled.
+    #[cold]
+    fn start_chunk(&mut self, source: &mut impl SlabSource) {
+        let full_cap = Self::chunk_cap(self.chunks.len());
+        let cap = match &mut self.left_to_carve {
+            None => full_cap,
+            Some(left) => {
+                assert!(*left > 0, "pushed past the length the vec was created for");
+                let cap = full_cap.min(*left);
+                *left -= cap;
+                cap
+            }
+        };
+        let chunk =
+            SlabBuffer::new(source.get_contiguous_slab(cap * size_of::<T>(), align_of::<T>()));
+        self.cur_base = chunk.ptr_at_index(0);
+        self.chunks.push(chunk);
+        self.last_len = 0;
+        self.last_cap = cap;
     }
 
     /// Visit each chunk's elements as one contiguous slice, in insertion order.
@@ -295,12 +360,17 @@ impl<T: Copy> SlabVec<T> {
         }
     }
 
-    /// How many elements come before the first one `is_before` rejects, by
-    /// binary search over every chunk. `is_before` is given each element it is
-    /// asked about together with its index, and must accept every element
-    /// before some point and none from there on.
-    pub fn find_partition_point(&self, mut is_before: impl FnMut(usize, T) -> bool) -> usize {
-        let (mut low, mut high) = (0, self.len());
+    /// The index of the first element in `range` that `is_before` rejects, or
+    /// the range's end when it rejects none, by binary search across the
+    /// chunks. `is_before` is given each element it is asked about together
+    /// with its index, and must accept every element of the range before some
+    /// point and none from there on.
+    pub fn find_partition_point(
+        &self,
+        range: Range<usize>,
+        mut is_before: impl FnMut(usize, T) -> bool,
+    ) -> usize {
+        let (mut low, mut high) = (range.start, range.end);
         while low < high {
             let middle = low + (high - low) / 2;
             if is_before(middle, self.get(middle)) {
@@ -421,10 +491,75 @@ mod tests {
 
         let points: Vec<usize> = [0, 1, 1_024, 5_000, 9_999, 10_000]
             .into_iter()
-            .map(|bound| v.find_partition_point(|_, value| value < bound))
+            .map(|bound| v.find_partition_point(0..10_000, |_, value| value < bound))
             .collect();
 
         assert_eq!(points, [0, 1, 1_024, 5_000, 9_999, 10_000]);
+    }
+
+    #[test]
+    fn a_partition_point_is_looked_for_only_inside_the_range_given() {
+        let (v, _alloc) = push_range(10_000);
+
+        let before_the_range = v.find_partition_point(2_000..3_000, |_, value| value < 5);
+        let inside_the_range = v.find_partition_point(2_000..3_000, |_, value| value < 2_500);
+        let after_the_range = v.find_partition_point(2_000..3_000, |_, value| value < 9_000);
+
+        assert_eq!(
+            [before_the_range, inside_the_range, after_the_range],
+            [2_000, 2_500, 3_000]
+        );
+    }
+
+    #[test]
+    fn a_slice_appended_across_chunks_keeps_every_element() {
+        init_test_free_pool(8);
+        let mut alloc = SlabAllocator::new(false);
+        let values: Vec<u64> = (0..10_000).collect();
+        let mut v = SlabVec::new();
+
+        v.extend_from_slice(&mut alloc, &values);
+
+        let read: Vec<u64> = (0..10_000).map(|index| v.get(index)).collect();
+        assert_eq!(read, values);
+    }
+
+    #[test]
+    fn a_vec_of_exact_length_takes_only_the_bytes_of_its_elements() {
+        init_test_free_pool(8);
+        let mut alloc = SlabAllocator::new(false);
+        let mut v = SlabVec::with_exact_len(3);
+
+        v.extend_from_slice(&mut alloc, &[1u64, 2, 3]);
+
+        let first_element = v.chunks[0].ptr_at_index(0) as usize;
+        let next = alloc.get_slab_of_size(8, false);
+        assert_eq!(next.ptr as usize - first_element, 3 * size_of::<u64>());
+    }
+
+    #[test]
+    fn a_vec_of_exact_length_longer_than_a_chunk_keeps_every_element() {
+        init_test_free_pool(8);
+        let mut alloc = SlabAllocator::new(false);
+        let values: Vec<u64> = (0..10_000).collect();
+        let mut v = SlabVec::with_exact_len(10_000);
+
+        v.extend_from_slice(&mut alloc, &values);
+
+        let read: Vec<u64> = (0..10_000).map(|index| v.get(index)).collect();
+        assert_eq!(read, values);
+        assert_eq!(v.len(), 10_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "pushed past the length")]
+    fn pushing_past_an_exact_length_panics() {
+        init_test_free_pool(8);
+        let mut alloc = SlabAllocator::new(false);
+        let mut v = SlabVec::with_exact_len(1);
+        v.push(&mut alloc, 1u64);
+
+        v.push(&mut alloc, 2u64);
     }
 
     #[test]

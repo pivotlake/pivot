@@ -6,7 +6,9 @@ use super::*;
 use crate::io::{FileRange, LocalFile, OpenFile};
 use crate::memory::context::{init_test_free_pool, memory_ctx};
 use crate::memory::{BUFFER_SIZE, SlabSource};
-use crate::text_index::{DictIndexBuilder, PostingsBuilder, SparseIndexBuilder};
+use crate::text_index::{
+    DictIndexBuilder, FewRows, PostingsBuilder, SparseIndexBuilder, TokenRows,
+};
 use bytes::Bytes;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -721,7 +723,7 @@ fn insert_dict_index_slot(offset: usize) -> usize {
     dict_indexes
         .insert(key(offset), |fill| {
             let mut builder = DictIndexBuilder::new();
-            builder.push(fill, b"apple", FileRange::new(0, 1));
+            builder.push(fill, b"apple", TokenRows::KeptInDict(FewRows::new(&[0])));
             Ok::<_, Infallible>(builder.into_meta())
         })
         .unwrap();
@@ -738,7 +740,7 @@ fn insert_postings_slot(offset: usize) -> usize {
         .insert(key(offset), |fill| {
             let mut builder = PostingsBuilder::new();
             builder.push(fill, 0);
-            Ok::<_, Infallible>(builder.into_meta())
+            Ok::<_, Infallible>(builder.into_meta(fill))
         })
         .unwrap();
     let slot = cursor_slot(postings);

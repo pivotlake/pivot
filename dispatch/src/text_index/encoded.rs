@@ -42,9 +42,12 @@ impl<'a> EncodedWriter<'a> {
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_byte(byte);
-        }
+        self.bytes.extend_from_slice(&mut *self.allocator, bytes);
+    }
+
+    /// Write `value` as two bytes, the low one first.
+    pub fn write_u16(&mut self, value: u16) {
+        self.write_bytes(&value.to_le_bytes());
     }
 
     pub fn write_varint(&mut self, value: u64) {
@@ -114,6 +117,40 @@ impl<'a> EncodedReader<'a> {
             into.extend_from_slice(taken);
             self.current = rest;
             left -= taken.len();
+        }
+        Ok(())
+    }
+
+    /// Read a number written as two bytes, the low one first.
+    pub fn read_u16(&mut self) -> Result<u16, Error> {
+        Ok(u16::from_le_bytes([self.read_byte()?, self.read_byte()?]))
+    }
+
+    /// Read `count` numbers of two bytes each onto the end of `into`.
+    pub fn read_u16s_into(&mut self, count: usize, into: &mut Vec<u16>) -> Result<(), Error> {
+        let mut left = count;
+        while left > 0 {
+            if !self.advance_to_unread_bytes() {
+                return Err(Error::Corrupt("the bytes end too early"));
+            }
+            // Whole numbers lying in the slab being read are taken together.
+            // One cut in two by the end of a slab is read a byte at a time.
+            let whole = left.min(self.current.len() / 2);
+            if whole == 0 {
+                into.push(self.read_u16()?);
+                left -= 1;
+                continue;
+            }
+            let (taken, rest) = self.current.split_at(2 * whole);
+            into.extend(
+                taken
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| u16::from_le_bytes(*bytes)),
+            );
+            self.current = rest;
+            left -= whole;
         }
         Ok(())
     }
