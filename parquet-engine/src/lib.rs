@@ -39,9 +39,10 @@ pub use external::bind_read_parquet;
 pub(crate) mod reading;
 pub use reading::{
     ColumnDecoderError, DecodeRange, DecoderFactory, DecompressorError, DecompressorFactory,
-    IndexerFactory, MaterializerFactory, RangeCutterFactory, RowGroupFetcherFactory,
-    RowGroupInjectorFactory, ScanEqualityPredicate, WorkerAllocator, materialize, table_input,
-    table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    FileLookupProgress, IndexerFactory, MaterializerFactory, RangeCutterFactory,
+    RowGroupFetcherFactory, RowGroupInjectorFactory, RowSelector, ScanEqualityPredicate,
+    WorkerAllocator, materialize, table_input, table_input_with_filter,
+    table_input_with_filter_and_eq_predicates, table_input_with_row_selector,
 };
 
 pub mod writing;
@@ -72,7 +73,7 @@ pub use types::leaves::{
     ShreddedScalarPath, first_leaf, leaf_count, leaf_fields, variant_shredded_leaves,
     variant_value_leaf_is_semantically_null,
 };
-pub use types::metadata::{ColumnStatistics, RowGroupMetadata};
+pub use types::metadata::{ColumnStatistics, RowGroupMetadata, RowSelection};
 pub use types::page::{CompressedPage, DecompressedPage};
 pub use types::requests::RowGroupBuffer;
 pub use types::table::{

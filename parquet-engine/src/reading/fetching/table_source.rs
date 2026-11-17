@@ -42,7 +42,7 @@ use crate::{RowGroupFilter, ScanOrder};
 /// (its file and its index within that file). Deterministic across queries so
 /// assignment is sticky for as long as the file stays open, and uniform enough
 /// to split any table's row groups evenly across nodes.
-fn affinity_node(row_group: &RowGroupMetadata, node_count: usize) -> usize {
+pub(crate) fn affinity_node(row_group: &RowGroupMetadata, node_count: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     row_group.open_file.hash(&mut hasher);
     row_group.file_row_group_idx.hash(&mut hasher);

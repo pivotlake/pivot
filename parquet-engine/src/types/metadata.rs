@@ -339,6 +339,11 @@ impl QueryRowGroupMetadata {
         &self.selection
     }
 
+    /// The same row group, read through `selection` instead.
+    pub fn with_selection(self, selection: RowSelection) -> Self {
+        Self { selection, ..self }
+    }
+
     /// Whether this row group has been pruned (no row can match a pushed-down
     /// predicate), so its remaining pages need not be decompressed or decoded.
     pub fn is_pruned(&self) -> bool {

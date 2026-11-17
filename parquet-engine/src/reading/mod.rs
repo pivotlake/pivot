@@ -35,7 +35,11 @@ mod record_batch_metadata;
 
 mod empty_projection_scan;
 
+mod row_selection;
+pub use row_selection::{FileLookupProgress, RowSelector};
+
 mod scan;
 pub use scan::{
     materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    table_input_with_row_selector,
 };

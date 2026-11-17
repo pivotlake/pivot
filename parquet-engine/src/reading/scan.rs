@@ -4,13 +4,20 @@
 //! before the Parquet pipeline moved into `catalog`; they're now free functions
 //! built on dispatch's public operator toolkit (`OperatorSpec::chain`,
 //! `RootUnaryOperatorFactory`, the channel factories). The stages are: row-group
-//! injection + fetching (source) → index → decompress → decode.
+//! injection + fetching (source) → index → decompress → decode. A scan with a
+//! [`RowSelector`] starts from its files instead: row selection (source) →
+//! fetching → index → decompress → decode.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crate::RowGroupFilter;
-use crate::reading::empty_projection_scan::empty_projection_scan;
+use crate::reading::empty_projection_scan::{
+    empty_projection_scan, empty_projection_scan_of_selected_rows,
+};
+use crate::reading::row_selection::{
+    RowSelectionStageFactory, RowSelector, ScannedFiles, SelectedRowGroupQueues,
+};
 use crate::types::metadata::QueryRowGroupMetadata;
 use arrow_array::RecordBatch;
 use dispatch::{
@@ -196,6 +203,91 @@ pub fn table_input_with_filter_and_eq_predicates(
         add_row_group_metadata,
         eq_predicates,
         outstanding_row_groups,
+    )
+}
+
+/// A scan of `table` that reads, of each of its files, only the rows
+/// `row_selector` names (see [`RowSelector`]), and emits exactly those rows:
+/// nothing above it needs to check them again.
+///
+/// A [selection stage](crate::reading::row_selection) ahead of the fetchers
+/// looks each file up once and hands the fetchers the row groups worth
+/// reading, each with the rows to read of it.
+pub fn table_input_with_row_selector<Selector>(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<ParquetTable>,
+    projection: Projection,
+    add_row_group_metadata: bool,
+    filter: Option<RowGroupFilter>,
+    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    row_selector: Selector,
+) -> RecordBatchOperatorSpec
+where
+    Selector: RowSelector + Clone + Send + 'static,
+{
+    let n = dispatcher.worker_count();
+    // With no data column nothing is fetched, so the row groups the selector
+    // keeps are turned straight into rows.
+    if projection.indices().is_empty() {
+        return empty_projection_scan_of_selected_rows(
+            dispatcher,
+            table,
+            filter,
+            add_row_group_metadata,
+            row_selector,
+        );
+    }
+    let files = ScannedFiles::of_table(table, &projection, &row_selector);
+    let selected_row_groups = SelectedRowGroupQueues::new(dispatcher.topology().node_count);
+    let siblings_selection = Arc::new(AtomicUsize::new(n));
+    let siblings_fetcher = Arc::new(AtomicUsize::new(n));
+    let shared_projection = Arc::new(projection.clone());
+    let read_medium = table.get_read_medium();
+    // Every row group the stage keeps reaches the fetchers through the node
+    // queues, the ones expected to be in memory too, so that each is worked
+    // on by the node it is assigned to. The channel between the two stages
+    // carries nothing.
+    let factories: Vec<_> = stealable::<QueryRowGroupMetadata>(dispatcher.topology())
+        .into_iter()
+        // The row groups a fetcher found to need a read after it had planned
+        // for none go to a queue every worker's fetcher takes from.
+        .zip(shared_work_queue::<QueryRowGroupMetadata>(n))
+        .map(|(unused_channel, uncached_row_groups_channel)| {
+            UnaryOperatorFactory::new(
+                RootUnaryOperatorFactory::new(
+                    RowSelectionStageFactory::new(
+                        row_selector.clone(),
+                        files.clone(),
+                        filter.clone(),
+                        shared_projection.clone(),
+                        read_medium,
+                        Some(selected_row_groups.clone()),
+                    ),
+                    files.clone(),
+                    siblings_selection.clone(),
+                ),
+                RowGroupFetcherFactory::new(
+                    shared_projection.clone(),
+                    read_medium,
+                    true,
+                    selected_row_groups.clone(),
+                    uncached_row_groups_channel,
+                ),
+                unused_channel,
+                siblings_fetcher.clone(),
+            )
+        })
+        .collect();
+    let input = OperatorSpec::new(dispatcher.clone(), factories);
+    read_parquet(
+        input,
+        projection,
+        RECORD_BATCH_SIZE,
+        add_row_group_metadata,
+        eq_predicates,
+        // Only a Top-N scan consults this count, and a scan with a selector
+        // is never one.
+        Arc::new(AtomicUsize::new(0)),
     )
 }
 
