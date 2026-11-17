@@ -423,6 +423,91 @@ fn create_user_with_invalid_utf8_password_fails_loudly(mut testing_planner: Test
     result.expect_err("an unrepresentable password must not be silently altered");
 }
 
+/// The request a `CREATE TEXT INDEX` statement plans to.
+fn plan_create_text_index(
+    testing_planner: &mut TestingPlanner,
+    sql: &str,
+) -> planner::catalog::CreateTextIndexRequest {
+    let plan = testing_planner.plan(sql).unwrap();
+    let planner::Operator::CreateTextIndex(create_text_index) = plan.root.operator else {
+        panic!("planned {}", plan.root.operator);
+    };
+    create_text_index.request
+}
+
+#[rstest]
+fn create_text_index_names_its_table_and_column_and_lowers_tokens(
+    mut testing_planner: TestingPlanner,
+) {
+    let request = plan_create_text_index(
+        &mut testing_planner,
+        "CREATE TEXT INDEX idx_name ON example_table (name)",
+    );
+
+    assert_eq!(request.index_name, "idx_name");
+    assert_eq!(request.table_name, "example_table");
+    assert_eq!(request.column, "name");
+    assert!(!request.case_sensitive);
+    assert!(!request.if_not_exists);
+}
+
+#[rstest]
+fn create_text_index_keeps_letter_case_when_asked_to(mut testing_planner: TestingPlanner) {
+    let request = plan_create_text_index(
+        &mut testing_planner,
+        "CREATE TEXT INDEX idx_name ON example_table (name) WITH (case_sensitive = true)",
+    );
+
+    assert!(request.case_sensitive);
+}
+
+#[rstest]
+fn create_text_index_if_not_exists_is_carried_to_the_request(mut testing_planner: TestingPlanner) {
+    let request = plan_create_text_index(
+        &mut testing_planner,
+        "CREATE TEXT INDEX IF NOT EXISTS idx_name ON example_table (name)",
+    );
+
+    assert!(request.if_not_exists);
+}
+
+#[rstest]
+fn a_text_index_without_a_name_is_named_after_its_table_and_column(
+    mut testing_planner: TestingPlanner,
+) {
+    let request = plan_create_text_index(
+        &mut testing_planner,
+        "CREATE TEXT INDEX ON example_table (name)",
+    );
+
+    assert_eq!(request.index_name, "example_table_name_text_idx");
+}
+
+#[rstest]
+fn a_text_index_of_an_expression_is_refused(mut testing_planner: TestingPlanner) {
+    let result = testing_planner.plan("CREATE TEXT INDEX idx_name ON example_table (lower(name))");
+
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("one column"), "{error}");
+}
+
+#[rstest]
+fn an_unknown_text_index_option_is_refused(mut testing_planner: TestingPlanner) {
+    let result = testing_planner
+        .plan("CREATE TEXT INDEX idx_name ON example_table (name) WITH (stemming = true)");
+
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("case_sensitive"), "{error}");
+}
+
+#[rstest]
+fn an_index_that_is_not_a_text_index_is_refused(mut testing_planner: TestingPlanner) {
+    let result = testing_planner.plan("CREATE INDEX idx_name ON example_table (name)");
+
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("CREATE TEXT INDEX"), "{error}");
+}
+
 #[rstest]
 fn values_produces_values_operator(mut testing_planner: TestingPlanner) {
     let plan = testing_planner

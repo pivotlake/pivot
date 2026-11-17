@@ -47,6 +47,7 @@ pub(super) enum StatementKind {
     CreateTable,
     CreateSchema,
     CreateUser,
+    CreateTextIndex,
     DropTable,
 }
 
@@ -57,6 +58,7 @@ impl StatementKind {
             planner::Operator::CreateTable(_) => Self::CreateTable,
             planner::Operator::CreateSchema(_) => Self::CreateSchema,
             planner::Operator::CreateUser(_) => Self::CreateUser,
+            planner::Operator::CreateTextIndex(_) => Self::CreateTextIndex,
             planner::Operator::DropTable(_) => Self::DropTable,
             _ => Self::Query,
         }

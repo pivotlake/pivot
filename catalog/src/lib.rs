@@ -37,9 +37,10 @@ use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpe
 use metastore::Metastore;
 use object_storage::ExternalStoreFactory;
 use planner::catalog::{
-    BoundTable, CatalogTransaction, CreateSchemaRequest, CreateTableRequest, CreateUserRequest,
-    DropTableRequest, Error as CatalogError, Result as CatalogResult, SchemaCreation,
-    TableCreation, TableDrop, TableReference, TableRevision, UserCreation,
+    BoundTable, CatalogTransaction, CreateSchemaRequest, CreateTableRequest,
+    CreateTextIndexRequest, CreateUserRequest, DropTableRequest, Error as CatalogError,
+    Result as CatalogResult, SchemaCreation, TableCreation, TableDrop, TableReference,
+    TableRevision, TextIndexCreation, UserCreation,
 };
 use system::{DatastoreEntry, SystemTransaction};
 
@@ -381,6 +382,17 @@ impl CatalogTransaction for PivotTransaction {
                 CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
             })?;
         sub_transaction.bind_drop_table(request)
+    }
+
+    fn bind_create_text_index(
+        &self,
+        request: CreateTextIndexRequest,
+    ) -> CatalogResult<Box<dyn TextIndexCreation>> {
+        let target = &request.datastore_name;
+        let sub_transaction = self.find_or_create_sub_transaction(target).ok_or_else(|| {
+            CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
+        })?;
+        sub_transaction.bind_create_text_index(request)
     }
 
     fn bind_create_schema(

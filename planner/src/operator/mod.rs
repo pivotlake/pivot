@@ -20,6 +20,7 @@ mod copy_from_stdin;
 mod copy_text;
 mod create_schema;
 mod create_table;
+mod create_text_index;
 mod create_user;
 mod cte;
 mod distinct;
@@ -47,6 +48,7 @@ pub use copy_from_stdin::{CopyChunk, CopyFormat, CopyFromStdin, FrameDecoder};
 pub use copy_text::TextFormat;
 pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
+pub use create_text_index::CreateTextIndex;
 pub use create_user::CreateUser;
 pub use cte::{Cte, CteScan};
 pub use distinct::Distinct;
@@ -122,6 +124,7 @@ pub enum Operator {
     /// `CREATE USER <name> [PASSWORD '<password>']` — compiles into a dataflow
     /// that stages the user; the transaction's commit creates it.
     CreateUser(CreateUser),
+    CreateTextIndex(CreateTextIndex),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
@@ -225,6 +228,7 @@ impl Operator {
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)
             | Operator::CreateUser(_)
+            | Operator::CreateTextIndex(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
             | Operator::Vacuum
@@ -326,6 +330,7 @@ impl Operator {
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)
             | Operator::CreateUser(_)
+            | Operator::CreateTextIndex(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
             | Operator::Vacuum
@@ -358,6 +363,7 @@ impl fmt::Display for Operator {
             Operator::CreateSchema(c) => write!(f, "{c}"),
             Operator::DropTable(d) => write!(f, "{d}"),
             Operator::CreateUser(c) => write!(f, "{c}"),
+            Operator::CreateTextIndex(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Compact(c) => write!(f, "{c}"),

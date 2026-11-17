@@ -265,6 +265,7 @@ impl<'plan> LogicalOp<'plan> {
             }
             L::LOGICAL_COPY_FROM_STDIN => Operator::CopyFromStdin(CopyFromStdin { raw: self.raw }),
             L::LOGICAL_CREATE_USER => Operator::CreateUser(CreateUser { raw: self.raw }),
+            L::LOGICAL_CREATE_INDEX => Operator::CreateTextIndex(CreateTextIndex { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
             }
@@ -325,6 +326,8 @@ pub enum Operator<'plan> {
     CopyFromStdin(CopyFromStdin<'plan>),
     /// `CREATE USER <name> [PASSWORD '<password>']`.
     CreateUser(CreateUser<'plan>),
+    /// `CREATE TEXT INDEX [IF NOT EXISTS] <name> ON <table> (<column>) [WITH (...)]`.
+    CreateTextIndex(CreateTextIndex<'plan>),
     /// A user IN/EXISTS comparison join.
     ComparisonJoin(ComparisonJoin<'plan>),
     /// The late-materialization rewrite's fetch: child 0 is the wide get
@@ -412,6 +415,9 @@ define_handles! { ffi::LogicalOperator;
     CopyFromStdin,
     /// A `LogicalCreateUser`: `CREATE USER <name> [PASSWORD '<password>']`.
     CreateUser,
+    /// A `LogicalCreate` for `CREATE TEXT INDEX`, carrying DuckDB's
+    /// `CreateIndexInfo` as the statement gave it.
+    CreateTextIndex,
     /// A `LogicalComparisonJoin`.
     ComparisonJoin,
     /// A `LogicalComparisonJoin` whose operator type is `LOGICAL_DELIM_JOIN`.
@@ -1069,6 +1075,42 @@ impl<'plan> CopyFromStdin<'plan> {
                 Ok((name, values))
             })
             .collect()
+    }
+}
+
+impl<'plan> CreateTextIndex<'plan> {
+    /// The index's name, or `None` when the statement gave none.
+    pub fn name(self) -> Result<Option<String>> {
+        let name = ffi::lo_create_text_index_name(self.raw)?;
+        Ok((!name.is_empty()).then_some(name))
+    }
+
+    /// The datastore of the table, as the binder resolved it.
+    pub fn datastore(self) -> Result<String> {
+        Ok(ffi::lo_create_text_index_datastore(self.raw)?)
+    }
+
+    /// The schema of the table, as the binder resolved it.
+    pub fn schema(self) -> Result<String> {
+        Ok(ffi::lo_create_text_index_schema(self.raw)?)
+    }
+
+    pub fn table(self) -> Result<String> {
+        Ok(ffi::lo_create_text_index_table(self.raw)?)
+    }
+
+    /// The one column the index is of.
+    pub fn column(self) -> Result<String> {
+        Ok(ffi::lo_create_text_index_column(self.raw)?)
+    }
+
+    pub fn if_not_exists(self) -> Result<bool> {
+        Ok(ffi::lo_create_text_index_if_not_exists(self.raw)?)
+    }
+
+    /// Whether the statement asked for tokens to keep their letter case.
+    pub fn is_case_sensitive(self) -> Result<bool> {
+        Ok(ffi::lo_create_text_index_case_sensitive(self.raw)?)
     }
 }
 

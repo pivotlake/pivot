@@ -243,6 +243,15 @@ rust::String lo_copy_stdin_option_name(const LogicalOperator &op, size_t index);
 size_t lo_copy_stdin_option_value_count(const LogicalOperator &op, size_t index);
 rust::String lo_copy_stdin_option_value(const LogicalOperator &op, size_t index, size_t value_index);
 
+// ---- CreateTextIndex ----
+rust::String lo_create_text_index_name(const LogicalOperator &op);
+rust::String lo_create_text_index_datastore(const LogicalOperator &op);
+rust::String lo_create_text_index_schema(const LogicalOperator &op);
+rust::String lo_create_text_index_table(const LogicalOperator &op);
+rust::String lo_create_text_index_column(const LogicalOperator &op);
+bool lo_create_text_index_if_not_exists(const LogicalOperator &op);
+bool lo_create_text_index_case_sensitive(const LogicalOperator &op);
+
 // ---- CreateUser ----
 rust::String lo_create_user_name(const LogicalOperator &op);
 bool lo_create_user_has_password(const LogicalOperator &op);

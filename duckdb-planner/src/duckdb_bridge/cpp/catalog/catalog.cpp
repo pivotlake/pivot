@@ -2,7 +2,11 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/common.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/storage_info.h"
 
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/planner/operator/logical_create.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/common/exception.hpp"
 
@@ -19,6 +23,21 @@ string PivotCatalog::GetCatalogType() {
 }
 
 optional_ptr<CatalogEntry> PivotCatalog::CreateSchema(CatalogTransaction, CreateSchemaInfo &) { RUST_NOT_IMPLEMENTED; }
+
+unique_ptr<LogicalOperator> PivotCatalog::BindCreateIndex(Binder &, CreateStatement &stmt, TableCatalogEntry &table,
+                                                          unique_ptr<LogicalOperator>) {
+	auto &info = stmt.info->Cast<CreateIndexInfo>();
+	if (info.index_type != "TEXT") {
+		throw NotImplementedException("Only CREATE TEXT INDEX is supported, not an index of type %s",
+		                              info.index_type);
+	}
+	// The statement may name its table without a schema or a database. The
+	// binder resolved it to `table`, so the plan carries the names that did.
+	info.catalog = table.ParentCatalog().GetName();
+	info.schema = table.ParentSchema().name;
+	return make_uniq<LogicalCreate>(LogicalOperatorType::LOGICAL_CREATE_INDEX, std::move(stmt.info),
+	                                &table.ParentSchema());
+}
 
 PivotSchemaCatalogEntry &PivotCatalog::FindOrCreateSchema(const std::string &name) {
 	auto existing = schemas.find(name);

@@ -186,6 +186,10 @@ pub enum Error {
     UnexpectedCreateUserInputs,
     #[error("create user: {0}")]
     CreateUser(#[source] crate::catalog::Error),
+    #[error("CREATE TEXT INDEX does not take inputs")]
+    UnexpectedCreateTextIndexInputs,
+    #[error("create text index: {0}")]
+    CreateTextIndex(#[source] crate::catalog::Error),
     #[error("Unsupported table function: {0}")]
     UnsupportedTableFunction(String),
     #[error("Invalid argument to table function {function}: {message}")]
@@ -378,6 +382,12 @@ impl PlanNode {
             crate::Operator::CreateUser(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateUserInputs);
+                }
+                o.compile(dispatcher, transaction)
+            }
+            crate::Operator::CreateTextIndex(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedCreateTextIndexInputs);
                 }
                 o.compile(dispatcher, transaction)
             }

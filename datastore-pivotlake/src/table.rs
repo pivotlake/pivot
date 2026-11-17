@@ -11,9 +11,12 @@ use crate::file_entry::{FileEntry, PartitionValues};
 use crate::table_format::{RemovedFiles, Table, VisitPartition};
 use arrow_array::RecordBatch;
 use catalog::datastore::DatastoreTableMetadata;
+use dispatch::text_index::LetterCase;
 use dispatch::{DataFlowDispatcher, Projection};
+use iceberg_tables::io::sink::TextIndexTarget;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
 use object_storage::{FileRef, ObjectPath, ObjectStore};
+use parquet_engine::writing::TextIndexDefinition;
 use parquet_engine::writing::upload::UploadedFiles;
 use parquet_engine::{ParquetTable, RowGroupMetadata, ScanSelection};
 use planner::catalog::{Column, SchemaQualifiedTableName};
@@ -65,9 +68,99 @@ pub(crate) struct TableStorage {
     location: ObjectPath,
 }
 
+/// The file in an index's directory that says what the index is of. The
+/// index files beside it are named after the data files they index.
+const INDEX_DEFINITION_FILE: &str = "definition.json";
+
+/// A text index's definition as its file holds it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredTextIndexDefinition {
+    name: String,
+    column: String,
+    /// Whether the index lowers the letters of its tokens.
+    lowers_letter_case: bool,
+}
+
 impl TableStorage {
     pub(crate) fn new(store: Arc<dyn ObjectStore>, location: ObjectPath) -> Self {
         Self { store, location }
+    }
+
+    /// The directory the table keeps its indexes in, each in a directory of
+    /// its own:
+    ///
+    /// ```text
+    ///   <table>/indexes/
+    ///       idx_message/
+    ///           definition.json                  what the index is of
+    ///           pivot-1a2b.parquet.textindex     its index of one data file
+    /// ```
+    pub(crate) fn indexes_directory(&self) -> ObjectPath {
+        self.location.resolve(&ObjectPath::new("indexes"))
+    }
+
+    /// Scan the table's indexes directory and read the definition of every
+    /// index found there, in the order of their directories' names. A table
+    /// with no indexes directory has no indexes.
+    pub(crate) fn load_text_indexes(&self) -> crate::Result<Vec<TextIndexDefinition>> {
+        let indexes_directory = self.indexes_directory();
+        let mut index_directories = self.store.list(&indexes_directory)?.prefixes;
+        index_directories.sort_by(|directory, other| directory.as_str().cmp(other.as_str()));
+        index_directories
+            .into_iter()
+            .map(|index_directory| {
+                let definition_file = indexes_directory
+                    .resolve(&index_directory)
+                    .resolve(&ObjectPath::new(INDEX_DEFINITION_FILE));
+                let corrupt = |reason: String| Error::CorruptIndexDefinition {
+                    file: definition_file.as_str().to_string(),
+                    reason,
+                };
+                let bytes = self
+                    .store
+                    .get(&definition_file)?
+                    .ok_or_else(|| corrupt("the index's directory has no definition".into()))?;
+                let stored: StoredTextIndexDefinition =
+                    serde_json::from_slice(&bytes).map_err(|error| corrupt(error.to_string()))?;
+                Ok(TextIndexDefinition {
+                    name: stored.name,
+                    column: stored.column,
+                    letter_case: if stored.lowers_letter_case {
+                        LetterCase::Lowered
+                    } else {
+                        LetterCase::Kept
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Record a new index of the table: a directory of its own under the
+    /// indexes directory, holding its definition. Fails with
+    /// [`Error::TextIndexExists`] when an index of that name is there
+    /// already.
+    pub(crate) fn write_text_index_definition(
+        &self,
+        definition: &TextIndexDefinition,
+    ) -> crate::Result<()> {
+        let index_directory = self.indexes_directory().resolve(&ObjectPath::new(
+            TextIndexDefinition::directory_name(&definition.name),
+        ));
+        self.store.create_dir(&index_directory)?;
+        let stored = StoredTextIndexDefinition {
+            name: definition.name.clone(),
+            column: definition.column.clone(),
+            lowers_letter_case: definition.letter_case == LetterCase::Lowered,
+        };
+        let bytes = serde_json::to_vec_pretty(&stored).expect("a definition is plain data");
+        let definition_file = index_directory.resolve(&ObjectPath::new(INDEX_DEFINITION_FILE));
+        match self.store.put_if_absent(&definition_file, &bytes) {
+            Ok(()) => Ok(()),
+            Err(object_storage::StoreError::VersionConflict { .. }) => {
+                Err(Error::TextIndexExists(definition.name.clone()))
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The Parquet data objects physically present under the table location,
@@ -151,22 +244,48 @@ pub struct CatalogTable {
     /// start at `V` and race for `V + 1`, forcing every loser to reload and
     /// retry.
     commit_lock: Arc<std::sync::Mutex<()>>,
+    /// The table's text indexes, as its indexes directory held them when the
+    /// table was loaded, and as this process has added to them since. Every
+    /// file written to the table comes with an index file for each.
+    text_indexes: Arc<[TextIndexDefinition]>,
 }
 
 impl CatalogTable {
+    /// The table at the version `table` is at, with the indexes found in its
+    /// indexes directory, which loading a table scans.
     pub(super) fn new(
         id: Uuid,
         storage: TableStorage,
         table: Arc<dyn Table>,
         dispatcher: DataFlowDispatcher,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        let text_indexes = storage.load_text_indexes()?.into();
+        Ok(Self {
             id,
             storage,
             table,
             dispatcher,
             commit_lock: Arc::default(),
-        }
+            text_indexes,
+        })
+    }
+
+    /// The table's text indexes.
+    pub fn text_indexes(&self) -> &[TextIndexDefinition] {
+        &self.text_indexes
+    }
+
+    /// Add a text index to the table: record its definition in the table's
+    /// indexes directory, and write an index file for it with every file
+    /// written to this copy from now on. Files already in the table get
+    /// none. Fails with [`Error::TextIndexExists`] when the directory holds
+    /// an index of that name already, which this copy then knows of too.
+    pub(crate) fn add_text_index(&mut self, definition: TextIndexDefinition) -> crate::Result<()> {
+        let written = self.storage.write_text_index_definition(&definition);
+        // Whether this definition landed or another one was there first,
+        // the directory is what the table's indexes are.
+        self.text_indexes = self.storage.load_text_indexes()?.into();
+        written
     }
 
     /// An owned handle to this table's
@@ -675,13 +794,16 @@ impl CatalogTable {
             inputs_are_sorted,
             target_rows_per_group,
             max_output_file_size,
-            Arc::default(),
+            // A merged file is a new file of the table, so it comes with an
+            // index file for each of the table's indexes, whether or not the
+            // files it replaces had one.
+            Arc::clone(&self.text_indexes),
         );
         let spec = parquet_engine::writing::upload::upload_files_spec(
             uploaded_files.clone(),
             self.store(),
             self.storage.location.clone(),
-            None,
+            (!self.text_indexes.is_empty()).then(|| self.storage.indexes_directory()),
             self.columns().into(),
             None,
             encoded,
@@ -767,7 +889,10 @@ impl CatalogTable {
             field_ids: self.field_ids(),
             partition_keys: self.table.plan_partition_keys()?,
             sort_by: self.sort_by().to_vec(),
-            text_indexes: None,
+            text_indexes: (!self.text_indexes.is_empty()).then(|| TextIndexTarget {
+                indexes_directory: self.storage.indexes_directory(),
+                definitions: Arc::clone(&self.text_indexes),
+            }),
         })
     }
 }

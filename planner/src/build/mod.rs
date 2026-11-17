@@ -31,10 +31,10 @@ use crate::expression::{
     Cast, Compare, CompareType, Error as ExpressionError, Expression, Function, Ref, VariantGet,
 };
 use crate::operator::{
-    Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
-    Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
-    JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
-    TopN, TransactionStatement, Unnest, Values,
+    Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateTextIndex, CreateUser, Cte,
+    CteScan, Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input,
+    Insert, Join, JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable,
+    TableFunctionScan, TopN, TransactionStatement, Unnest, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -227,6 +227,9 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::Vacuum => Operator::Vacuum,
         DuckOperator::CopyFromStdin(c) => Operator::CopyFromStdin(CopyFromStdin::from_handle(c)?),
         DuckOperator::CreateUser(c) => Operator::CreateUser(CreateUser::from_handle(c)?),
+        DuckOperator::CreateTextIndex(c) => {
+            Operator::CreateTextIndex(CreateTextIndex::from_handle(c)?)
+        }
         // No view to construct from: this carries no kind-specific payload.
         DuckOperator::DummyScan => Operator::DummyScan(DummyScan),
         DuckOperator::Explain(explain) => {

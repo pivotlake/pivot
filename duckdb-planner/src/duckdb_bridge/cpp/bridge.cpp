@@ -24,6 +24,7 @@
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
@@ -1102,6 +1103,56 @@ rust::String lo_compact_table(const LogicalOperator &op) {
 
 bool lo_compact_final(const LogicalOperator &op) {
 	return as<duckdb::LogicalCompact>(op).final_sweep;
+}
+
+// ---- CreateTextIndex ----
+
+// `CREATE TEXT INDEX` arrives as a `LogicalCreate` holding the statement's
+// `CreateIndexInfo`, as `PivotCatalog::BindCreateIndex` hands it on.
+static duckdb::CreateIndexInfo &create_text_index_info(const LogicalOperator &op) {
+	return as<duckdb::LogicalCreate>(op).info->Cast<duckdb::CreateIndexInfo>();
+}
+
+rust::String lo_create_text_index_name(const LogicalOperator &op) {
+	return rust::String::lossy(create_text_index_info(op).index_name);
+}
+
+rust::String lo_create_text_index_datastore(const LogicalOperator &op) {
+	return rust::String::lossy(create_text_index_info(op).catalog);
+}
+
+rust::String lo_create_text_index_schema(const LogicalOperator &op) {
+	return rust::String::lossy(create_text_index_info(op).schema);
+}
+
+rust::String lo_create_text_index_table(const LogicalOperator &op) {
+	return rust::String::lossy(create_text_index_info(op).table);
+}
+
+rust::String lo_create_text_index_column(const LogicalOperator &op) {
+	auto &expressions = create_text_index_info(op).expressions;
+	if (expressions.size() != 1 || expressions[0]->GetExpressionClass() != duckdb::ExpressionClass::COLUMN_REF) {
+		throw duckdb::BinderException("A text index is created on one column of the table");
+	}
+	return rust::String::lossy(expressions[0]->Cast<duckdb::ColumnRefExpression>().GetColumnName());
+}
+
+bool lo_create_text_index_if_not_exists(const LogicalOperator &op) {
+	return create_text_index_info(op).on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
+}
+
+// The one option of a text index: `WITH (case_sensitive = true)`. Without it
+// the index lowers the letters of its tokens.
+bool lo_create_text_index_case_sensitive(const LogicalOperator &op) {
+	bool case_sensitive = false;
+	for (auto &option : create_text_index_info(op).options) {
+		if (duckdb::StringUtil::Lower(option.first) != "case_sensitive") {
+			throw duckdb::BinderException("Unknown text index option \"%s\": the only one is case_sensitive",
+			                              option.first);
+		}
+		case_sensitive = option.second.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>();
+	}
+	return case_sensitive;
 }
 
 // ---- CreateUser ----

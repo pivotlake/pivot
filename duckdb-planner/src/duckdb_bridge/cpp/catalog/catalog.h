@@ -46,6 +46,13 @@ public:
 	duckdb::PhysicalOperator &PlanUpdate(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &,
 	                                     duckdb::LogicalUpdate &, duckdb::PhysicalOperator &) override;
 
+	// `CREATE TEXT INDEX` is the one kind of index there is. DuckDB would bind
+	// the statement into a plan that builds one of its own indexes; this hands
+	// the statement on as it was written, for the planner to resolve.
+	duckdb::unique_ptr<duckdb::LogicalOperator> BindCreateIndex(duckdb::Binder &binder, duckdb::CreateStatement &stmt,
+	                                                           duckdb::TableCatalogEntry &table,
+	                                                           duckdb::unique_ptr<duckdb::LogicalOperator> plan) override;
+
 	duckdb::DatabaseSize GetDatabaseSize(duckdb::ClientContext &context) override;
 	bool InMemory() override;
 	std::string GetDBPath() override;

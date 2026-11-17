@@ -79,16 +79,19 @@ use uuid::Uuid;
 use async_trait::async_trait;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use catalog::{CommitAction, CommitQueue, StagedCommit};
+use dispatch::text_index::LetterCase;
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
 use manifest::CatalogManifest;
 use object_storage::{self, DataFile, ObjectPath, ObjectStore};
+use parquet_engine::writing::TextIndexDefinition;
 use parquet_engine::writing::upload::{UploadedFile, UploadedFiles};
 use parquet_engine::{ParquetTableBinding, ParquetTableError};
 use planner::catalog::{
-    BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Error as CatalogError,
-    PARTITION_BY_OPTION, Result as CatalogResult, SORT_BY_OPTION, SchemaCreation,
-    SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
+    BoundTable, CreateSchemaRequest, CreateTableRequest, CreateTextIndexRequest, DropTableRequest,
+    Error as CatalogError, PARTITION_BY_OPTION, Result as CatalogResult, SORT_BY_OPTION,
+    SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
+    TextIndexCreation,
 };
 use table::TableStorage;
 pub use table::{CatalogTable, TableFile};
@@ -138,6 +141,18 @@ pub enum Error {
     TableExists(String),
     #[error("table `{0}` does not exist")]
     TableNotFound(String),
+    #[error("text index `{0}` already exists")]
+    TextIndexExists(String),
+    #[error("`{column}` is not a column of table `{table}`")]
+    TextIndexOfUnknownColumn { table: String, column: String },
+    #[error("a text index is of a text column, and `{column}` of table `{table}` is {column_type}")]
+    TextIndexOfNonTextColumn {
+        table: String,
+        column: String,
+        column_type: String,
+    },
+    #[error("the index definition at `{file}` cannot be read: {reason}")]
+    CorruptIndexDefinition { file: String, reason: String },
     #[error("schema `{0}` does not exist")]
     SchemaNotFound(String),
     #[error("schema `{0}` already exists")]
@@ -467,7 +482,7 @@ impl PivotlakeDatastore {
                 TableStorage::new(store.clone(), location.clone()),
                 loaded,
                 dispatcher.clone(),
-            );
+            )?;
             index.insert_table(name, table);
         }
         preload_small_database(&loaded_tables);
@@ -651,12 +666,18 @@ impl PivotlakeDatastore {
                     continue;
                 }
             };
-            let table = CatalogTable::new(
+            let table = match CatalogTable::new(
                 id,
                 TableStorage::new(self.store.clone(), location.clone()),
                 loaded,
                 self.dispatcher.clone(),
-            );
+            ) {
+                Ok(table) => table,
+                Err(e) => {
+                    tracing::warn!(table = %name, error = %e, "catalog refresh: loading the table's indexes failed");
+                    continue;
+                }
+            };
             let mut index = self.tables_index.write().unwrap();
             // An in-process CREATE TABLE may have published it since the read.
             if !index.contains_table(&name) {
@@ -793,7 +814,7 @@ impl PivotlakeDatastore {
             TableStorage::new(self.store.clone(), location.clone()),
             created,
             self.dispatcher.clone(),
-        );
+        )?;
         CatalogManifest::update(self.store.as_ref(), |manifest| {
             manifest.upsert_table(&name, id, location.clone())
         })?;
@@ -941,6 +962,36 @@ impl PivotlakeDatastore {
     /// The whole step holds the index write lock, which serializes in-process
     /// creates (schemas and tables alike) and their read-modify-write of the
     /// shared manifest; the name is re-checked under it as a race backstop.
+    /// Add one text index staged by a completed `CREATE TEXT INDEX` to its
+    /// table: write its definition into the table's indexes directory and
+    /// publish the table with it, so the next INSERT writes its index files.
+    /// The table-set write lock is held throughout, so the copy the index is
+    /// added to is the one published until then.
+    fn finalize_text_index_creation(&self, pending: PendingTextIndexCreation) -> Result<()> {
+        let PendingTextIndexCreation {
+            table_id,
+            definition,
+            if_not_exists,
+        } = pending;
+        let mut index = self.tables_index.write().unwrap();
+        let mut table = index
+            .get_table_by_id(&table_id)
+            .cloned()
+            .ok_or_else(|| Error::TableNotFound(table_id.to_string()))?;
+        let name = definition.name.clone();
+        let added = match table.add_text_index(definition) {
+            // An index of that name got there first, in this process or in
+            // another. With `IF NOT EXISTS` that is still a success.
+            Err(Error::TextIndexExists(_)) if if_not_exists => Ok(()),
+            added => added,
+        };
+        // Whatever became of the definition, the copy now knows every index
+        // the directory holds.
+        index.replace_table(table);
+        tracing::debug!(index = %name, "text index creation finalized");
+        added
+    }
+
     fn finalize_schema_creation(&self, pending: PendingSchemaCreation) -> Result<()> {
         let PendingSchemaCreation {
             name,
@@ -1114,6 +1165,65 @@ impl PivotlakeTransaction {
     /// schema a success. This checks the transaction's frozen snapshot; the
     /// datastore re-checks under its write lock at commit as the real race
     /// backstop, honouring `IF NOT EXISTS` there too.
+    /// Resolve a `CREATE TEXT INDEX` against this datastore and stage it on
+    /// the transaction: the table must exist and the column be one of its
+    /// text columns. The transaction's blocking commit writes the index's
+    /// definition and publishes the table with it.
+    ///
+    /// Rejects a name the table already has an index under, unless
+    /// `IF NOT EXISTS` makes that a success. This checks the transaction's
+    /// frozen snapshot; the commit re-checks against the table's indexes
+    /// directory, where a create that raced this one shows.
+    fn bind_text_index_creation(
+        &self,
+        request: CreateTextIndexRequest,
+    ) -> Result<PivotlakeTextIndexCreation> {
+        let table_name =
+            SchemaQualifiedTableName::new(request.schema_name.clone(), request.table_name.clone());
+        let table = self
+            .snapshot
+            .catalog_table_by_name(&table_name)
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        let columns = table.columns();
+        let column = columns
+            .iter()
+            .find(|column| column.name == request.column)
+            .ok_or_else(|| Error::TextIndexOfUnknownColumn {
+                table: table_name.to_string(),
+                column: request.column.clone(),
+            })?;
+        if column.col_type != planner::types::Type::Utf8 {
+            return Err(Error::TextIndexOfNonTextColumn {
+                table: table_name.to_string(),
+                column: request.column.clone(),
+                column_type: format!("{:?}", column.col_type),
+            });
+        }
+        let already_exists = table
+            .text_indexes()
+            .iter()
+            .any(|definition| definition.name == request.index_name);
+        if already_exists && !request.if_not_exists {
+            return Err(Error::TextIndexExists(request.index_name));
+        }
+        Ok(PivotlakeTextIndexCreation {
+            commit_actions: self.staged.queue(),
+            creation: PendingTextIndexCreation {
+                table_id: table.id(),
+                definition: TextIndexDefinition {
+                    name: request.index_name,
+                    column: request.column,
+                    letter_case: if request.case_sensitive {
+                        LetterCase::Kept
+                    } else {
+                        LetterCase::Lowered
+                    },
+                },
+                if_not_exists: request.if_not_exists,
+            },
+        })
+    }
+
     fn bind_schema_creation(
         &self,
         request: CreateSchemaRequest,
@@ -1232,6 +1342,17 @@ impl PivotlakeTransaction {
             .filter(|file| file.path.as_str().ends_with(".parquet"))
             .collect())
     }
+}
+
+impl CommitAction<PivotlakeDatastore> for PendingTextIndexCreation {
+    /// Write the index's definition into its table's indexes directory and
+    /// publish the table with it.
+    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> CatalogResult<()> {
+        Ok(datastore.finalize_text_index_creation(*self)?)
+    }
+
+    /// A text index creation writes nothing before its commit.
+    fn discard(self: Box<Self>) {}
 }
 
 impl CommitAction<PivotlakeDatastore> for PendingSchemaCreation {
@@ -1451,6 +1572,18 @@ impl PivotlakeSnapshot {
     }
 }
 
+/// One text index creation resolved by a transaction and waiting for it to
+/// commit: the table it is added to and what it is.
+#[derive(Clone)]
+struct PendingTextIndexCreation {
+    table_id: Uuid,
+    definition: TextIndexDefinition,
+    /// Whether the statement used `IF NOT EXISTS`, so the commit treats an
+    /// index of that name that appeared since resolution as a success rather
+    /// than an error.
+    if_not_exists: bool,
+}
+
 /// One schema creation resolved by a transaction and waiting for it to commit.
 /// A schema has no content to load, so it is staged as soon as it resolves.
 #[derive(Clone)]
@@ -1583,6 +1716,13 @@ impl DatastoreTransaction for PivotlakeTransaction {
         Ok(Box::new(self.bind_schema_creation(request)?))
     }
 
+    fn bind_create_text_index(
+        &self,
+        request: CreateTextIndexRequest,
+    ) -> CatalogResult<Box<dyn TextIndexCreation>> {
+        Ok(Box::new(self.bind_text_index_creation(request)?))
+    }
+
     fn bind_drop_table(&self, request: DropTableRequest) -> CatalogResult<Box<dyn TableDrop>> {
         Ok(Box::new(self.bind_drop(request)?))
     }
@@ -1636,6 +1776,37 @@ impl SchemaCreation for PivotlakeSchemaCreation {
         // One nullary per worker, but only the first carries the creation; the
         // rest no-op. Handing it out here rather than racing for it at run time
         // is how the table-creation sink picks its staging worker too.
+        let mut creation = Some(self.creation.clone());
+        let factories: Vec<_> = (0..dispatcher.worker_count())
+            .map(|_| {
+                let carried = creation.take();
+                let commit_actions = self.commit_actions.clone();
+                OneShotNullaryFactory::new(move || {
+                    if let Some(creation) = carried {
+                        commit_actions.push(Box::new(creation));
+                    }
+                    None
+                })
+            })
+            .collect();
+        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
+    }
+}
+
+/// A resolved `CREATE TEXT INDEX` for a [`PivotlakeDatastore`]: the validated
+/// creation plus the transaction-owned staging queue it will land in.
+/// Compiling it builds a dataflow that stages the creation and emits no rows,
+/// so the index is added only once that dataflow runs and the transaction
+/// commits.
+struct PivotlakeTextIndexCreation {
+    commit_actions: CommitQueue<PivotlakeDatastore>,
+    creation: PendingTextIndexCreation,
+}
+
+impl TextIndexCreation for PivotlakeTextIndexCreation {
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
+        // One nullary per worker, but only the first carries the creation;
+        // the rest no-op, exactly as the schema-creation sink stages.
         let mut creation = Some(self.creation.clone());
         let factories: Vec<_> = (0..dispatcher.worker_count())
             .map(|_| {

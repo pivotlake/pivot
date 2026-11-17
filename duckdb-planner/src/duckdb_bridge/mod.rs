@@ -459,6 +459,21 @@ pub mod ffi {
             value_index: usize,
         ) -> Result<String>;
 
+        // ---- CreateTextIndex ----
+        /// The index's name, or empty when the statement gave none.
+        fn lo_create_text_index_name(op: &LogicalOperator) -> Result<String>;
+        /// The datastore, the schema and the name of the table, as the
+        /// binder resolved them.
+        fn lo_create_text_index_datastore(op: &LogicalOperator) -> Result<String>;
+        fn lo_create_text_index_schema(op: &LogicalOperator) -> Result<String>;
+        fn lo_create_text_index_table(op: &LogicalOperator) -> Result<String>;
+        /// The one column the index is of. Fails for anything but one column.
+        fn lo_create_text_index_column(op: &LogicalOperator) -> Result<String>;
+        fn lo_create_text_index_if_not_exists(op: &LogicalOperator) -> Result<bool>;
+        /// The `case_sensitive` option, `false` when not given. Fails for any
+        /// other option.
+        fn lo_create_text_index_case_sensitive(op: &LogicalOperator) -> Result<bool>;
+
         // ---- CreateUser ----
         fn lo_create_user_name(op: &LogicalOperator) -> Result<String>;
         /// Whether a PASSWORD clause was given.

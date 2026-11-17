@@ -278,6 +278,9 @@ impl Executor {
             (StatementKind::CreateUser, StatementResults::Batches(_)) => {
                 StatementOutput::Command(Command::CreateUser)
             }
+            (StatementKind::CreateTextIndex, StatementResults::Batches(_)) => {
+                StatementOutput::Command(Command::CreateTextIndex)
+            }
             (StatementKind::DropTable, StatementResults::Batches(_)) => {
                 StatementOutput::Command(Command::DropTable)
             }

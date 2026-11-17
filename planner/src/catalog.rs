@@ -259,6 +259,27 @@ pub struct CreateSchemaRequest {
     pub if_not_exists: bool,
 }
 
+/// Description of a text index to be created, produced by translating a
+/// `CREATE TEXT INDEX` statement and consumed by
+/// [`CatalogTransaction::bind_create_text_index`], which routes to the
+/// datastore of the table.
+///
+/// The table is named in full: DuckDB resolved it while binding the
+/// statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTextIndexRequest {
+    pub datastore_name: String,
+    pub schema_name: String,
+    pub table_name: String,
+    pub index_name: String,
+    /// The column whose text is indexed.
+    pub column: String,
+    /// Whether tokens differing only in letter case stay apart in the index.
+    /// When `false` the index lowers the letters of its tokens.
+    pub case_sensitive: bool,
+    pub if_not_exists: bool,
+}
+
 /// Description of a user to be created, produced by translating a
 /// `CREATE USER` statement and consumed by
 /// [`CatalogTransaction::bind_create_user`]. Users are server-wide (they live
@@ -360,6 +381,19 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Resolve a `CREATE TEXT INDEX` by routing to the datastore
+    /// [`CreateTextIndexRequest::datastore_name`] names and deferring to that
+    /// datastore's own `bind_create_text_index`.
+    fn bind_create_text_index(
+        &self,
+        _request: CreateTextIndexRequest,
+    ) -> Result<Box<dyn TextIndexCreation>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support CREATE TEXT INDEX",
+        )
+        .into())
+    }
+
     /// Resolve a `CREATE SCHEMA` by routing to the datastore
     /// [`CreateSchemaRequest::datastore_name`] names (the default when
     /// unqualified) and deferring to that datastore's own `bind_create_schema`.
@@ -430,6 +464,17 @@ pub trait TableDrop: Send + Sync {
 /// report an error, to render `EXPLAIN`) would create the schema. Durable
 /// creation belongs to [`CatalogTransaction::commit`], as it does for a table.
 pub trait SchemaCreation: Send + Sync {
+    /// Build the dataflow that stages this creation for the transaction's
+    /// commit. It emits no rows.
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
+}
+
+/// A resolved `CREATE TEXT INDEX`, ready to be compiled into the dataflow
+/// that creates it, exactly as [`SchemaCreation`] is for a schema: the
+/// dataflow does nothing but stage the creation, so the index appears when
+/// the statement *runs* rather than when it is planned, and durable creation
+/// belongs to [`CatalogTransaction::commit`].
+pub trait TextIndexCreation: Send + Sync {
     /// Build the dataflow that stages this creation for the transaction's
     /// commit. It emits no rows.
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;

@@ -2039,3 +2039,84 @@ async fn query_returns_no_rows_for_an_empty_binary_result(#[future] conn: Conn) 
 
     assert!(rows.is_empty());
 }
+
+/// The names of the entries of `directory`, in order.
+fn list_entry_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_index_gets_an_index_file_for_each_data_file_written_after_it(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE indexed_logs (id BIGINT, message VARCHAR)")
+        .await
+        .unwrap();
+    conn.simple_query("INSERT INTO indexed_logs VALUES (1, 'written before the index')")
+        .await
+        .unwrap();
+
+    let created = conn
+        .simple_query("CREATE TEXT INDEX idx_message ON indexed_logs (message)")
+        .await
+        .unwrap();
+    conn.simple_query("INSERT INTO indexed_logs VALUES (2, 'Disk full')")
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        created.as_slice(),
+        [SimpleQueryMessage::CommandComplete(_)]
+    ));
+    let index_directory = table_dir("indexed_logs")
+        .join("indexes")
+        .join("idx_message");
+    let entries = list_entry_names(&index_directory);
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(entries[0], "definition.json");
+    assert!(entries[1].ends_with(".parquet.textindex"), "{entries:?}");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_index_of_a_column_that_is_not_text_is_refused(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE unindexable_logs (id BIGINT, message VARCHAR)")
+        .await
+        .unwrap();
+
+    let created = conn
+        .simple_query("CREATE TEXT INDEX idx_id ON unindexable_logs (id)")
+        .await;
+
+    let error = created.unwrap_err().to_string();
+    assert!(error.contains("text column"), "{error}");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_text_index_of_the_same_name_is_refused_unless_it_may_exist(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE twice_indexed_logs (id BIGINT, message VARCHAR)")
+        .await
+        .unwrap();
+    conn.simple_query("CREATE TEXT INDEX idx_message ON twice_indexed_logs (message)")
+        .await
+        .unwrap();
+
+    let again = conn
+        .simple_query("CREATE TEXT INDEX idx_message ON twice_indexed_logs (message)")
+        .await;
+    let again_if_not_exists = conn
+        .simple_query("CREATE TEXT INDEX IF NOT EXISTS idx_message ON twice_indexed_logs (message)")
+        .await;
+
+    let error = again.unwrap_err().to_string();
+    assert!(error.contains("already exists"), "{error}");
+    assert!(again_if_not_exists.is_ok());
+}

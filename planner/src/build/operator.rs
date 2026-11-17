@@ -17,25 +17,27 @@ use duckdb_planner::duckdb_bridge::duckdb_types::{LimitNodeType, OrderByNullType
 use duckdb_planner::handle::{
     Aggregate as AggregateView, BridgeError, ChunkGet as ChunkGetView, Compact as CompactView,
     CopyFromStdin as CopyFromStdinView, CreateSchema as CreateSchemaView,
-    CreateTable as CreateTableView, CreateUser as CreateUserView, Distinct as DistinctView,
-    Drop as DropView, Expression as DuckExpression, Filter as FilterView, Insert as InsertView,
-    Limit as LimitView, OrderBy as OrderByView, OrderKey, Projection as ProjectionView,
-    Reset as ResetView, Set as SetView, SortedByKey, TableFunctionScan as TableFunctionScanView,
+    CreateTable as CreateTableView, CreateTextIndex as CreateTextIndexView,
+    CreateUser as CreateUserView, Distinct as DistinctView, Drop as DropView,
+    Expression as DuckExpression, Filter as FilterView, Insert as InsertView, Limit as LimitView,
+    OrderBy as OrderByView, OrderKey, Projection as ProjectionView, Reset as ResetView,
+    Set as SetView, SortedByKey, TableFunctionScan as TableFunctionScanView,
     TableScan as TableScanView, TopN as TopNView, Unnest as UnnestView,
     UnnestedList as UnnestedListView, Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
 use crate::catalog::{
-    BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DropTableRequest,
-    DuckDBTableAdapter, PARTITION_BY_OPTION, SORT_BY_OPTION, split_partition_terms,
+    BoundTable, Column, CreateSchemaRequest, CreateTableRequest, CreateTextIndexRequest,
+    DropTableRequest, DuckDBTableAdapter, PARTITION_BY_OPTION, SORT_BY_OPTION,
+    split_partition_terms,
 };
 use crate::dynamic_filter::JoinFilterScanInfo;
 use crate::expression::{Error as ExpressionError, Expression, Ref};
 use crate::operator::{
-    Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Distinct,
-    DropTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode,
-    Projection, SetVariable, TableFunctionScan, TopN, Unnest, UnnestedList, Values,
+    Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateTextIndex,
+    CreateUser, Distinct, DropTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
+    OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Unnest, UnnestedList, Values,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -397,6 +399,31 @@ impl CreateSchema {
                 if_not_exists: view.if_not_exists()?,
             },
             or_replace: view.or_replace()?,
+        })
+    }
+}
+
+impl CreateTextIndex {
+    pub(crate) fn from_handle(
+        view: CreateTextIndexView<'_>,
+    ) -> Result<CreateTextIndex, OperatorError> {
+        let table_name = view.table()?;
+        let column = view.column()?;
+        // An index the statement left unnamed is named after what it indexes.
+        let index_name = match view.name()? {
+            Some(index_name) => index_name,
+            None => format!("{table_name}_{column}_text_idx"),
+        };
+        Ok(CreateTextIndex {
+            request: CreateTextIndexRequest {
+                datastore_name: view.datastore()?,
+                schema_name: view.schema()?,
+                table_name,
+                index_name,
+                column,
+                case_sensitive: view.is_case_sensitive()?,
+                if_not_exists: view.if_not_exists()?,
+            },
         })
     }
 }

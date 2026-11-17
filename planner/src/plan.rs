@@ -74,6 +74,7 @@ impl PlanNode {
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)
             | Operator::CreateUser(_)
+            | Operator::CreateTextIndex(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
             | Operator::Vacuum

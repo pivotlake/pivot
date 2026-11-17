@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use planner::catalog::{
-    BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Result, SchemaCreation,
-    SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
+    BoundTable, CreateSchemaRequest, CreateTableRequest, CreateTextIndexRequest, DropTableRequest,
+    Result, SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
+    TextIndexCreation,
 };
 use planner::types::Type;
 
@@ -199,6 +200,22 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     fn bind_create_schema(&self, _request: CreateSchemaRequest) -> Result<Box<dyn SchemaCreation>> {
         Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "this datastore does not support CREATE SCHEMA",
+        )
+        .into())
+    }
+
+    /// Resolve a `CREATE TEXT INDEX` against this datastore into a
+    /// [`TextIndexCreation`] the caller compiles into the dataflow that stages
+    /// it, split the same way [`bind_create_schema`](Self::bind_create_schema)
+    /// is: the index is staged when the compiled dataflow runs, and made
+    /// durable by [`commit`](Self::commit). The default rejects it (a
+    /// datastore whose tables keep no text indexes).
+    fn bind_create_text_index(
+        &self,
+        _request: CreateTextIndexRequest,
+    ) -> Result<Box<dyn TextIndexCreation>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this datastore does not support CREATE TEXT INDEX",
         )
         .into())
     }
