@@ -53,7 +53,7 @@ pub use dict_index::{
 pub use index_file::{IndexFileFooter, IndexFileWriter, TOKENS_PER_DICT_INDEX};
 pub use postings::{Postings, PostingsBuilder, PostingsMeta};
 pub use sparse_index::{SparseIndex, SparseIndexBuilder, SparseIndexMeta};
-pub use tokenizer::split_tokens;
+pub use tokenizer::{LetterCase, Tokenizer, split_tokens};
 
 /// Why encoded bytes could not be decoded.
 #[derive(Debug, thiserror::Error)]
