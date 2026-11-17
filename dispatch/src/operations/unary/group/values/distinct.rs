@@ -6,7 +6,7 @@
 //! Used for the dedup stage of `COUNT(DISTINCT x)` (and, later, `SELECT DISTINCT`):
 //! only the *set* of distinct keys matters, so it emits no value columns.
 
-use super::{AggregationSlot, AggregationValue, ArityBody, ValueColumnBuilder};
+use super::{AggregationSlot, AggregationValue, ArityBody, StoredValue, ValueColumnBuilder};
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
@@ -16,26 +16,8 @@ use arrow_schema::Field;
 #[derive(Clone, Copy, Default)]
 pub struct Distinct;
 
-impl AggregationValue for Distinct {
-    type Owned = Self;
+impl StoredValue for Distinct {
     type StorageMetadata = ();
-    type Reader<'b> = ();
-    type SharedContext = ();
-    type ColumnBuilder = DistinctColumnBuilder;
-    type SortKey = i64;
-    type WorkerContext = ();
-
-    #[inline(always)]
-    fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
-
-    fn storage_metadata(_ctx: &()) {}
-
-    fn metadata_for_arity<const N: usize>() {}
-
-    #[inline(always)]
-    fn dispatch_arity<Ret>(_metadata: (), body: impl ArityBody<Ret>) -> Ret {
-        body.run::<0>()
-    }
 
     fn stored_size(_metadata: ()) -> usize {
         0
@@ -53,6 +35,27 @@ impl AggregationValue for Distinct {
     #[inline(always)]
     unsafe fn from_entry_mut<'a>(ptr: *mut u8, _metadata: ()) -> &'a mut Self {
         unsafe { &mut *(ptr as *mut Self) }
+    }
+}
+
+impl AggregationValue for Distinct {
+    type Owned = Self;
+    type Reader<'b> = ();
+    type SharedContext = ();
+    type ColumnBuilder = DistinctColumnBuilder;
+    type SortKey = i64;
+    type WorkerContext = ();
+
+    #[inline(always)]
+    fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
+
+    fn storage_metadata(_ctx: &()) {}
+
+    fn metadata_for_arity<const N: usize>() {}
+
+    #[inline(always)]
+    fn dispatch_arity<Ret>(_metadata: (), body: impl ArityBody<Ret>) -> Ret {
+        body.run::<0>()
     }
 
     #[inline(always)]
