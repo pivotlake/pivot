@@ -317,12 +317,12 @@ pub struct CompacterActor {
     datastore: Arc<PivotlakeDatastore>,
     commands: mpsc::UnboundedReceiver<CompactionCommand>,
     /// What the rounds remember of each table from one to the next.
-    tables: HashMap<Uuid, TableRounds>,
+    table_states: HashMap<Uuid, TableCompactionState>,
 }
 
 /// What the rounds over one table remember from one to the next.
 #[derive(Default)]
-struct TableRounds {
+struct TableCompactionState {
     /// What the rounds know of the layout of each partition they examined
     /// that holds a file a layout merge may rewrite, so a pass only measures
     /// the files no round measured before (see [`overlap::OverlapCache`]).
@@ -331,7 +331,7 @@ struct TableRounds {
     /// for the last round that ended with nothing left to merge: no file a
     /// commit up to there added has a merge waiting. `None` until a round
     /// has ended so.
-    examined_through: Option<u64>,
+    examined_through_commit: Option<u64>,
 }
 
 /// What a round over one table came to.
@@ -369,7 +369,7 @@ impl CompacterHandle {
                 poll_interval,
                 datastore,
                 commands: receiver,
-                tables: HashMap::new(),
+                table_states: HashMap::new(),
             },
         )
     }
@@ -448,7 +448,7 @@ impl CompacterActor {
     /// longer holds.
     fn forget_dropped_tables(&mut self) {
         let datastore = &self.datastore;
-        self.tables
+        self.table_states
             .retain(|id, _| datastore.table_handle_by_id(id).is_some());
     }
 
@@ -501,11 +501,11 @@ impl CompacterActor {
         let mut reserved = HashSet::new();
         table.refresh()?;
         let id = table.id();
-        let examined_through = self
-            .tables
+        let examined_through_commit = self
+            .table_states
             .get(&id)
-            .and_then(|rounds| rounds.examined_through);
-        let listed = list_round_partitions(&table, pass, examined_through).await?;
+            .and_then(|rounds| rounds.examined_through_commit);
+        let listed = list_round_partitions(&table, pass, examined_through_commit).await?;
         self.forget_partitions_not_among(id, &listed);
         let mut progress = RoundProgress {
             partitions: listed.partitions,
@@ -534,7 +534,10 @@ impl CompacterActor {
             }
 
             if in_flight.is_empty() {
-                self.tables.entry(id).or_default().examined_through = Some(table.commit_position());
+                self.table_states
+                    .entry(id)
+                    .or_default()
+                    .examined_through_commit = Some(table.commit_position());
                 return Ok(RoundOutcome {
                     passes,
                     examined: progress.partitions,
@@ -581,13 +584,14 @@ impl CompacterActor {
                     // The reloaded copy may hold work in a partition the
                     // round was done with, or had no reason to examine.
                     progress.finished.clear();
-                    let listed = match list_round_partitions(&table, pass, examined_through).await {
-                        Ok(listed) => listed,
-                        Err(error) => {
-                            drain_merges(&mut in_flight).await;
-                            return Err(error);
-                        }
-                    };
+                    let listed =
+                        match list_round_partitions(&table, pass, examined_through_commit).await {
+                            Ok(listed) => listed,
+                            Err(error) => {
+                                drain_merges(&mut in_flight).await;
+                                return Err(error);
+                            }
+                        };
                     self.forget_partitions_not_among(id, &listed);
                     progress.partitions = listed.partitions;
                 }
@@ -607,7 +611,7 @@ impl CompacterActor {
         if !listed.lists_every_partition {
             return;
         }
-        let Some(rounds) = self.tables.get_mut(&id) else {
+        let Some(rounds) = self.table_states.get_mut(&id) else {
             return;
         };
         let listed: HashSet<&[u8]> = listed.partitions.iter().map(Vec::as_slice).collect();
@@ -635,7 +639,7 @@ impl CompacterActor {
             layout_clique_size: self.layout_clique_size,
         };
         let id = table.id();
-        let mut overlaps = std::mem::take(&mut self.tables.entry(id).or_default().overlaps);
+        let mut overlaps = std::mem::take(&mut self.table_states.entry(id).or_default().overlaps);
         let (table, reserved) = (table.clone(), reserved.clone());
         let selected = tokio::task::spawn_blocking(move || {
             let batch = selection.next_batch(&mut overlaps, &table, pass, &reserved, &mut progress);
@@ -644,7 +648,7 @@ impl CompacterActor {
         .await;
         match selected {
             Ok((overlaps, progress, batch)) => {
-                self.tables.entry(id).or_default().overlaps = overlaps;
+                self.table_states.entry(id).or_default().overlaps = overlaps;
                 (progress, batch)
             }
             Err(error) => (
@@ -667,18 +671,18 @@ struct RoundPartitions {
 
 /// The partitions a round over `table`, refreshed to the version it works
 /// on, examines, in the order it does: those a commit added a file to
-/// since the one standing at `examined_through`, for a routine round over
-/// a table examined before; else every partition. A partition whose files
+/// since the one standing at `examined_through_commit`, for a routine round
+/// over a table examined before; else every partition. A partition whose files
 /// the table's format does not rewrite is in neither. Listing them may
 /// read the table's metadata, so it runs on the blocking pool.
 async fn list_round_partitions(
     table: &CatalogTable,
     pass: CompactionPass,
-    examined_through: Option<u64>,
+    examined_through_commit: Option<u64>,
 ) -> Result<RoundPartitions> {
     let table = table.clone();
     let listed = tokio::task::spawn_blocking(move || {
-        let added_after = match (pass, examined_through) {
+        let added_after = match (pass, examined_through_commit) {
             (CompactionPass::Routine, Some(commit_position)) => Some(commit_position),
             _ => None,
         };
@@ -2808,7 +2812,7 @@ mod tests {
     /// Whether `actor` remembers anything of the layout of the table `id`.
     fn remembers_a_layout_of(actor: &CompacterActor, id: Uuid) -> bool {
         actor
-            .tables
+            .table_states
             .get(&id)
             .is_some_and(|rounds| !rounds.overlaps.is_empty())
     }
@@ -2847,7 +2851,7 @@ mod tests {
         let id = datastore.table_handle(&name).unwrap().id();
         let mut actor = layout_actor(datastore.clone());
         run_round(&mut actor, &name, CompactionPass::Routine);
-        let remembered_before_the_drop = actor.tables.contains_key(&id);
+        let remembered_before_the_drop = actor.table_states.contains_key(&id);
         let transaction = datastore.clone().begin_transaction();
         transaction
             .bind_drop_table(planner::catalog::DropTableRequest {
@@ -2866,7 +2870,7 @@ mod tests {
         block_on_rounds(actor.compact_all());
 
         assert!(remembered_before_the_drop);
-        assert!(!actor.tables.contains_key(&id));
+        assert!(!actor.table_states.contains_key(&id));
         dispatch.exit();
     }
 
