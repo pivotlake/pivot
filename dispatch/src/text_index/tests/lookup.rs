@@ -92,7 +92,7 @@ fn a_token_the_file_does_not_hold_appears_in_no_row() {
         rows_found(&run_lookup(lookup, &file).0)
     });
 
-    assert_eq!(found, [vec![], vec![], vec![]]);
+    assert!(found.iter().all(Vec::is_empty), "{found:?}");
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn only_the_rows_of_the_range_asked_for_are_visited() {
 #[test]
 fn bytes_that_are_not_the_end_of_an_index_file_fail_the_lookup() {
     init_test_free_pool(4);
-    let not_an_index_file = vec![7u8; 100];
+    let not_an_index_file = [7u8; 100];
     let mut lookup = TokenLookup::new(open_index_file(), not_an_index_file.len(), b"apple");
     let LookupProgress::NeedsRead(range) = lookup.advance() else {
         panic!("nothing is cached, so the lookup reads");
