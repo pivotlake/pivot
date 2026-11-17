@@ -23,8 +23,8 @@ use parquet_engine::FileStats;
 use planner::expression::{Compare, CompareType, Expression, Ref};
 use planner::types::{Type as PivotType, type_from_physical};
 use support::{
-    append, column, create_table, create_table_of, entry, int_scalar, live_entry, publish_changed,
-    selected, v_equals,
+    append, column, create_table, create_table_of, entry, int_scalar, live_entry, paths_in_order,
+    publish_changed, selected, v_equals,
 };
 
 /// Where the manifest list of the hand-made table's one snapshot is.
@@ -396,4 +396,35 @@ fn files_of_several_schemas_are_each_read_as_their_own_schema_recorded_them() {
 
     assert_eq!(above_four, ["narrow-nine.parquet", "wide-nine.parquet"]);
     assert_eq!(below_four, ["narrow-three.parquet", "wide-three.parquet"]);
+}
+
+#[test]
+fn a_file_recorded_before_its_sort_column_was_widened_stands_by_value_among_the_files_since() {
+    let columns = [column("id", PivotType::Int32)];
+    let (fixture, created) = create_table_of(&columns, &[], &["id".to_string()]);
+    let twenty: ArrayRef = Arc::new(Int32Array::from(vec![20]));
+    append(&created, vec![entry_holding("narrow-twenty", "id", twenty)]);
+    let widened = publish_changed(&fixture, |builder| {
+        let wide_id = NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long));
+        let wide = Schema::builder().with_fields(vec![Arc::new(wide_id)]);
+        builder
+            .add_schema(wide.build().unwrap())
+            .unwrap()
+            .set_current_schema(-1)
+            .unwrap()
+    });
+    let wide =
+        |name: &str, id: i64| entry_holding(name, "id", Arc::new(Int64Array::from(vec![id])));
+
+    let table = append(
+        &widened,
+        vec![wide("wide-thirty", 30), wide("wide-ten", 10)],
+    );
+
+    let by_value = [
+        "wide-ten.parquet",
+        "narrow-twenty.parquet",
+        "wide-thirty.parquet",
+    ];
+    assert_eq!(paths_in_order(&table), by_value);
 }

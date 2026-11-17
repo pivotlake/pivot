@@ -6012,10 +6012,6 @@ name = "table-file-index"
 version = "0.1.1"
 dependencies = [
  "ahash 0.8.12",
- "arrow-array",
- "arrow-cast",
- "arrow-row",
- "arrow-schema",
  "hashbrown 0.17.1",
  "imbl",
  "object-storage",

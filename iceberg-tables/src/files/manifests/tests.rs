@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::files::file_index::{
-    DecodeContext, FileSelector, IndexedFile, PartitionIndex, SortKeyEncoder,
+    DecodeContext, FileSelector, IndexedFile, PartitionIndex, SortColumns,
 };
 use crate::metadata::layout::TableLocation;
 use arrow_array::{
@@ -186,7 +186,7 @@ fn select_files(
         object_storage::ObjectPath::new("table"),
     )
     .unwrap();
-    let encoder = SortKeyEncoder::new(&table_metadata, &[], &[]).unwrap();
+    let sort_columns = Arc::new(SortColumns::new(&table_metadata, &[], &[]));
     let listed: Vec<ManifestFile> = manifests
         .iter()
         .enumerate()
@@ -196,7 +196,7 @@ fn select_files(
         .collect();
     let context = DecodeContext {
         table: "table",
-        encoder: &encoder,
+        sort_columns: &sort_columns,
         metadata: &table_metadata,
         location: &location,
     };

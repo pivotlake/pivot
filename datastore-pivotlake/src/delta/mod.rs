@@ -61,7 +61,7 @@ use table_file_index::{IndexedRecord, PartitionFiles};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use self::file_record::{DeltaFile, DeltaIndex, RecordBuilder};
+use self::file_record::{DeltaFile, DeltaFilesByPath, DeltaIndex, RecordBuilder};
 use self::log::TableShape;
 use crate::file_entry::{ColumnStatFilter, FileEntry, PartitionEqFilter, constant_partition};
 use crate::table::{TableFile, TableStorage};
@@ -277,7 +277,7 @@ struct TableFiles {
     /// the partition is named by.
     partitions: OrdMap<Arc<[u8]>, Arc<DeltaIndex>>,
     /// Every file of the table, for whoever names a file by its path alone.
-    by_path: DeltaIndex,
+    by_path: DeltaFilesByPath,
     /// The rows the files' row groups hold.
     row_count: u64,
     /// Where the latest file added stands among the table's commits; 0 for

@@ -1,95 +1,164 @@
-//! A bound of a table's sort key in a file, as bytes that order as the
-//! bounds do, so the stretches of the key two files cover are compared
-//! without a typed value being decoded.
+//! The order a table's sort key puts the bounds of its files in.
+//!
+//! A file's record holds the bounds its table's metadata recorded for the
+//! file's columns, and nothing else for the order: a bound on a sort column
+//! is read where the record holds it
+//! ([`IndexedRecord::read_sort_bound`]), as a [`SortValue`], and the bounds
+//! of two files on the key are compared as those values
+//! ([`compare_sort_bounds`]).
+//!
+//! # How two bounds on the sort key compare
+//!
+//! - The sort columns are compared in the order the table is sorted by
+//!   them, the next only when all before it tie.
+//! - A column the file has no bound on orders before every value
+//!   ([`SortValue::Missing`]): its metadata records none, or a NULL, or
+//!   something that is not a value of the column's type.
+//! - `false` orders before `true`; an integer, a date, a timestamp and a
+//!   decimal by value; a string by its bytes, so a prefix orders before
+//!   what extends it.
+//! - Floats order as IEEE 754's total order has them: negative before
+//!   positive, `-0.0` before `+0.0`, a negative NaN before every number and
+//!   a positive one after.
+//! - A bound recorded in another type than its column has now, that of a
+//!   file written before the column was widened, is read as its value in
+//!   the column's current type, so it orders by value among the others.
+//!
+//! The order is total whatever the records hold: every bound reads as one
+//! [`SortValue`], the same for as long as its record lives, and the order
+//! of those values is total.
 
-use std::sync::Arc;
+use std::cmp::Ordering;
 
-use arrow_array::{Array, ArrayRef, new_null_array};
-use arrow_row::{RowConverter, SortField};
-use arrow_schema::{ArrowError, DataType};
+use crate::file_index::IndexedRecord;
 
-/// The stretch of a table's sort key a file's rows are bounded by, as bytes
-/// that order as the keys do.
-pub struct SortRange {
-    /// The lower bound; a column without one orders first. Empty when the
-    /// key has no ordered byte form.
-    pub minimum: Arc<[u8]>,
-    /// The upper bound; `None` when the key has no ordered byte form, or
-    /// the column it leads with is not bounded by a value on both sides,
-    /// so the stretch the file covers is unknown.
-    pub maximum: Option<Arc<[u8]>>,
+/// The side of a file's rows a bound is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundSide {
+    Lower,
+    Upper,
 }
 
-/// Encodes a bound of a table's sort key in a file as bytes that order as
-/// the bounds do.
-pub struct SortKeyEncoder {
-    /// The Arrow type each sort column's bounds are encoded in, with the
-    /// converter over those types; `None` for a table without a sort key,
-    /// or one sorted by a column whose type has no ordered byte form.
-    converter: Option<(Vec<DataType>, RowConverter)>,
+/// The bound of one file on one sort column, as a value of the column's
+/// current type, borrowed from the file's record.
+#[derive(Clone, Copy, Debug)]
+pub enum SortValue<'f> {
+    /// No bound: the file's metadata records none for the column, or a
+    /// NULL, or something that does not read as a value of the column's
+    /// type. Orders before every value.
+    Missing,
+    Boolean(bool),
+    /// An integer of any width, a date as its days and a timestamp as its
+    /// microseconds since the epoch, or the unscaled value of a decimal at
+    /// its column's scale.
+    Integer(i128),
+    /// A float of either width, ordered as IEEE 754's total order has it.
+    Float(f64),
+    String(&'f str),
 }
 
-impl SortKeyEncoder {
-    /// The encoder for a table whose sort columns' bounds are of `types`,
-    /// in the order the table is sorted by them.
-    pub fn new(types: Vec<DataType>) -> Result<Self, ArrowError> {
-        let fields: Vec<SortField> = types.iter().cloned().map(SortField::new).collect();
-        let converter = if fields.is_empty() || !RowConverter::supports_fields(&fields) {
-            None
+impl SortValue<'_> {
+    /// `value` as a float bound. A NaN keeps its sign and nothing else, so
+    /// a NaN of the narrow width reads as one value wherever it is widened.
+    pub fn from_single_precision(value: f32) -> Self {
+        /// The bits of the positive quiet NaN with no payload.
+        const QUIET_NAN_BITS: u64 = 0x7ff8 << 48;
+        /// The bit a negative float has set.
+        const SIGN_BIT: u64 = 1 << 63;
+
+        if !value.is_nan() {
+            return Self::Float(f64::from(value));
+        }
+        let sign = if value.is_sign_negative() {
+            SIGN_BIT
         } else {
-            Some((types, RowConverter::new(fields)?))
+            0
         };
-        Ok(Self { converter })
+        Self::Float(f64::from_bits(QUIET_NAN_BITS | sign))
     }
 
-    /// Whether the sort key has an ordered byte form: a table without a
-    /// sort key, or sorted by a column whose type has none, does not.
-    pub fn has_ordered_form(&self) -> bool {
-        self.converter.is_some()
+    /// Where the kind of the value stands among the kinds, which is what
+    /// orders two values of different kinds: a missing bound first.
+    fn rank_kind(&self) -> u8 {
+        match self {
+            Self::Missing => 0,
+            Self::Boolean(_) => 1,
+            Self::Integer(_) => 2,
+            Self::Float(_) => 3,
+            Self::String(_) => 4,
+        }
     }
+}
 
-    /// One side of a file's bounds on the sort key as one row whose bytes
-    /// order as the bounds do. `bound` hands out the file's bound on the
-    /// sort column at a position, a single value; a column it has no bound
-    /// for orders first. Empty when the key has no ordered byte form.
-    pub fn encode_bound(
-        &self,
-        mut bound: impl FnMut(usize) -> Option<ArrayRef>,
-    ) -> Result<Arc<[u8]>, ArrowError> {
-        let Some((types, converter)) = &self.converter else {
-            return Ok(Arc::from([]));
-        };
-        let arrays: Vec<ArrayRef> = types
-            .iter()
-            .enumerate()
-            .map(|(position, data_type)| match bound(position) {
-                Some(value) if value.len() == 1 && value.data_type() == data_type => Ok(value),
-                Some(value) if value.len() == 1 => arrow_cast::cast(value.as_ref(), data_type),
-                _ => Ok(new_null_array(data_type, 1)),
-            })
-            .collect::<Result<_, ArrowError>>()?;
-        let rows = converter.convert_columns(&arrays)?;
-        Ok(Arc::from(rows.row(0).as_ref()))
+impl Ord for SortValue<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Boolean(left), Self::Boolean(right)) => left.cmp(right),
+            (Self::Integer(left), Self::Integer(right)) => left.cmp(right),
+            (Self::Float(left), Self::Float(right)) => left.total_cmp(right),
+            (Self::String(left), Self::String(right)) => left.cmp(right),
+            _ => self.rank_kind().cmp(&other.rank_kind()),
+        }
     }
+}
 
-    /// The stretch of the sort key `lower` and `upper` bound a file's rows
-    /// by, each handing out the bound on the sort column at a position.
-    pub fn encode_range(
-        &self,
-        mut lower: impl FnMut(usize) -> Option<ArrayRef>,
-        mut upper: impl FnMut(usize) -> Option<ArrayRef>,
-    ) -> Result<SortRange, ArrowError> {
-        let is_known = |bound: Option<ArrayRef>| {
-            bound.is_some_and(|bound| bound.len() == 1 && !bound.is_null(0))
-        };
-        let is_leading_bounded =
-            self.has_ordered_form() && is_known(lower(0)) && is_known(upper(0));
-        let minimum = self.encode_bound(&mut lower)?;
-        let maximum = if is_leading_bounded {
-            Some(self.encode_bound(&mut upper)?)
-        } else {
-            None
-        };
-        Ok(SortRange { minimum, maximum })
+impl PartialOrd for SortValue<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
+}
+
+impl PartialEq for SortValue<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for SortValue<'_> {}
+
+/// The bound of `record` on `side` of the sort column at `position`;
+/// missing past the last column the record's table is sorted by.
+fn read_bound<Record: IndexedRecord + ?Sized>(
+    record: &Record,
+    position: usize,
+    side: BoundSide,
+) -> SortValue<'_> {
+    if position < record.count_sort_columns() {
+        record.read_sort_bound(position, side)
+    } else {
+        SortValue::Missing
+    }
+}
+
+/// Order the bound of `left` on `left_side` of the sort key against the
+/// bound of `right` on `right_side`: column by column in sort order, the
+/// next only when all before it tie.
+pub fn compare_sort_bounds<Left, Right>(
+    left: &Left,
+    left_side: BoundSide,
+    right: &Right,
+    right_side: BoundSide,
+) -> Ordering
+where
+    Left: IndexedRecord + ?Sized,
+    Right: IndexedRecord + ?Sized,
+{
+    let column_count = left.count_sort_columns().max(right.count_sort_columns());
+    for position in 0..column_count {
+        let left_bound = read_bound(left, position, left_side);
+        let order = left_bound.cmp(&read_bound(right, position, right_side));
+        if order.is_ne() {
+            return order;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Whether the stretch of the sort key the rows of `record`'s file cover
+/// is known: its table has a sort key, and the column the key leads with
+/// is bounded by a value on both sides.
+pub fn has_sort_range<Record: IndexedRecord + ?Sized>(record: &Record) -> bool {
+    [BoundSide::Lower, BoundSide::Upper]
+        .into_iter()
+        .all(|side| read_bound(record, 0, side) != SortValue::Missing)
 }

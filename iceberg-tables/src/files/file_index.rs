@@ -17,10 +17,12 @@
 //! with its partition tuple and the bounds and null counts of every column
 //! the manifest recorded something for, so a record grows with the table's
 //! width. A scan selects its files from the records, and a commit rebuilds
-//! the entry of a file it removes from one. Nothing else of a decoded
-//! manifest is kept: which manifests a partition's files are looked for in
-//! is read off the manifest list every time
-//! (`ListedManifest::may_hold_partition`).
+//! the entry of a file it removes from one. Where a file stands on the
+//! table's sort key is read off the same bounds whenever two files are
+//! compared (`SortColumns`), so a record holds them in no other form.
+//! Nothing else of a decoded manifest is kept: which manifests a
+//! partition's files are looked for in is read off the manifest list every
+//! time (`ListedManifest::may_hold_partition`).
 //!
 //! Maintenance walks the facts every format keeps of a file
 //! ([`FileFacts`]), which each record holds.
@@ -36,7 +38,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow_array::ArrayRef;
 use iceberg::expr::BoundPredicate;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, Datum, Literal, Manifest, ManifestEntry,
@@ -50,8 +51,11 @@ use parquet_engine::file_entry::FileEntry;
 use parquet_engine::{measure_allocation, measure_shared_allocation};
 use planner::catalog::Column;
 use planner::expression::Expression;
-use planner::types::{Type, physical_arrow_type};
-use table_file_index::{CacheableIndex, FileFacts, IndexedRecord, PartitionFiles, VisitFacts};
+use planner::types::{MAX_DECIMAL64_PRECISION, Type};
+use table_file_index::{
+    BoundSide, CacheableIndex, FileFacts, IndexedRecord, PartitionFiles, SortValue, VisitFacts,
+    VisitRecord,
+};
 
 use crate::files::data_files::{DataFileEntry, literal_to_scalar, read_partition_values};
 use crate::files::partitions_from_filter::enumerate_tuples_from_filter;
@@ -158,84 +162,154 @@ pub(crate) type FilesByPartition = HashMap<Arc<[u8]>, Vec<Arc<IndexedFile>>>;
 /// What reading a manifest entry into a record needs of its table.
 pub(crate) struct DecodeContext<'t> {
     pub table: &'t str,
-    pub encoder: &'t SortKeyEncoder,
+    pub sort_columns: &'t Arc<SortColumns>,
     pub metadata: &'t TableMetadata,
     pub location: &'t TableLocation,
 }
 
-/// Encodes a bound of a table's sort key in a file, read from the file's
-/// manifest entry, as bytes that order as the bounds do.
-pub(crate) struct SortKeyEncoder {
-    /// The sort columns, each by field id and Pivot type; none for a table
-    /// without a sort key, or one sorted by a column whose type has no
-    /// ordered byte form, whose files then order by commit alone.
-    columns: Vec<(i32, Type)>,
-    /// Over the Arrow types of `columns`.
-    encoder: table_file_index::SortKeyEncoder,
+/// The columns a table is sorted by, in sort order, with what reading a
+/// file's bound on each takes, resolved once for the records that share
+/// it.
+pub(crate) struct SortColumns {
+    columns: Vec<SortColumn>,
 }
 
-impl SortKeyEncoder {
-    /// The encoder for a table sorted by `sort_by`, columns among `columns`
-    /// whose field ids `metadata`'s current schema gives.
-    pub(crate) fn new(
-        metadata: &TableMetadata,
-        columns: &[Column],
-        sort_by: &[String],
-    ) -> Result<Self> {
+/// One column a table is sorted by.
+struct SortColumn {
+    field_id: i32,
+    /// The Pivot type the column has now, which a bound on it is read as a
+    /// value of.
+    column_type: Type,
+    /// The ids of the schemas the table lists that have the field as a
+    /// primitive, in order: a file whose manifest was written under
+    /// another has no bound on the column that reads.
+    stored_in_schemas: Vec<i32>,
+}
+
+impl SortColumns {
+    /// The sort columns of a table sorted by `sort_by`, columns among
+    /// `columns` whose field ids `metadata`'s current schema gives.
+    pub(crate) fn new(metadata: &TableMetadata, columns: &[Column], sort_by: &[String]) -> Self {
         let schema = metadata.current_schema();
-        let sort_columns: Vec<(i32, Type)> = sort_by
+        let columns = sort_by
             .iter()
             .filter_map(|name| {
                 let field_id = schema.field_id_by_name(name)?;
                 let column = columns.iter().find(|column| &column.name == name)?;
-                Some((field_id, column.col_type.clone()))
+                let mut stored_in_schemas: Vec<i32> = metadata
+                    .schemas_iter()
+                    .filter(|stored| holds_primitive_field(stored, field_id))
+                    .map(|stored| stored.schema_id())
+                    .collect();
+                stored_in_schemas.sort_unstable();
+                Some(SortColumn {
+                    field_id,
+                    column_type: column.col_type.clone(),
+                    stored_in_schemas,
+                })
             })
             .collect();
-        let types = sort_columns
-            .iter()
-            .map(|(_, pivot_type)| physical_arrow_type(pivot_type))
-            .collect();
-        let encoder = table_file_index::SortKeyEncoder::new(types).map_err(Error::arrow)?;
-        let columns = if encoder.has_ordered_form() {
-            sort_columns
-        } else {
-            Vec::new()
+        Self { columns }
+    }
+
+    /// The bound on `side` of the sort column at `position` that `data`
+    /// records, a file whose manifest was written under the schema
+    /// `schema_id`, as a value of the column's current type.
+    fn read_bound<'f>(
+        &self,
+        data: &'f DataFile,
+        schema_id: i32,
+        position: usize,
+        side: BoundSide,
+    ) -> SortValue<'f> {
+        let column = &self.columns[position];
+        if column.stored_in_schemas.binary_search(&schema_id).is_err() {
+            return SortValue::Missing;
+        }
+        let bounds = match side {
+            BoundSide::Lower => data.lower_bounds(),
+            BoundSide::Upper => data.upper_bounds(),
         };
-        Ok(Self { columns, encoder })
+        match bounds.get(&column.field_id) {
+            Some(bound) => read_sort_value(bound.literal(), &column.column_type),
+            None => SortValue::Missing,
+        }
     }
 
-    /// The field the sort key leads with, when the key has an ordered byte
-    /// form.
-    fn find_leading_field(&self) -> Option<i32> {
-        self.columns.first().map(|(field_id, _)| *field_id)
+    /// An estimate of the memory the columns hold, themselves included, as
+    /// one shared allocation.
+    fn estimate_heap_bytes(&self) -> usize {
+        measure_shared_allocation(size_of::<Self>())
+            + measure_allocation(size_of_val(self.columns.as_slice()))
+            + self
+                .columns
+                .iter()
+                .map(|column| measure_allocation(size_of_val(column.stored_in_schemas.as_slice())))
+                .sum::<usize>()
     }
+}
 
-    /// The key bytes of a file whose manifest entry bounds the field
-    /// `field_id`, on one side, by `bound(field_id)`. A bound that does not
-    /// read as its column's type orders as a missing one.
-    fn encode<'a>(&self, bound: impl Fn(i32) -> Option<&'a Datum>) -> Result<Arc<[u8]>> {
-        self.encoder
-            .encode_bound(|position| {
-                let (field_id, pivot_type) = &self.columns[position];
-                let arrow_type = physical_arrow_type(pivot_type);
-                let array: ArrayRef = bound(*field_id)
-                    .and_then(|bound| literal_to_scalar(bound.literal(), pivot_type))?
-                    .into_inner();
-                if array.data_type() == &arrow_type {
-                    Some(array)
-                } else {
-                    arrow_cast::cast(array.as_ref(), &arrow_type).ok()
-                }
-            })
-            .map_err(Error::arrow)
+/// `literal`, a bound a manifest recorded for a column whose type is now
+/// `column_type`, as a value of that type. It reads for the pairings
+/// [`literal_to_scalar`] reads, an integer only when the column's type
+/// holds it, and for a bound recorded in the narrower type its column had
+/// before it was widened, an `int` under a `long` column and a `float`
+/// under a `double` one, which reads as its value. Any other bound is
+/// missing.
+fn read_sort_value<'f>(literal: &'f PrimitiveLiteral, column_type: &Type) -> SortValue<'f> {
+    let read_integer = |value: i64, lowest: i64, highest: i64| {
+        if (lowest..=highest).contains(&value) {
+            SortValue::Integer(i128::from(value))
+        } else {
+            SortValue::Missing
+        }
+    };
+    match (literal, column_type) {
+        (PrimitiveLiteral::Boolean(value), Type::Boolean) => SortValue::Boolean(*value),
+        (PrimitiveLiteral::Int(value), Type::Int8) => {
+            read_integer(i64::from(*value), i64::from(i8::MIN), i64::from(i8::MAX))
+        }
+        (PrimitiveLiteral::Int(value), Type::Int16) => {
+            read_integer(i64::from(*value), i64::from(i16::MIN), i64::from(i16::MAX))
+        }
+        (PrimitiveLiteral::Int(value), Type::UInt8) => {
+            read_integer(i64::from(*value), 0, i64::from(u8::MAX))
+        }
+        (PrimitiveLiteral::Int(value), Type::UInt16) => {
+            read_integer(i64::from(*value), 0, i64::from(u16::MAX))
+        }
+        (PrimitiveLiteral::Int(value), Type::Int32 | Type::Date | Type::Int64) => {
+            SortValue::Integer(i128::from(*value))
+        }
+        (PrimitiveLiteral::Long(value), Type::UInt32) => {
+            read_integer(*value, 0, i64::from(u32::MAX))
+        }
+        (PrimitiveLiteral::Long(value), Type::UInt64) => read_integer(*value, 0, i64::MAX),
+        (PrimitiveLiteral::Long(value), Type::Int64 | Type::Timestamp | Type::TimestampTz) => {
+            SortValue::Integer(i128::from(*value))
+        }
+        (PrimitiveLiteral::Float(value), Type::Float32 | Type::Float64) => {
+            SortValue::from_single_precision(value.0)
+        }
+        (PrimitiveLiteral::Double(value), Type::Float64) => SortValue::Float(value.0),
+        (PrimitiveLiteral::String(value), Type::Utf8) => SortValue::String(value),
+        (PrimitiveLiteral::Int128(unscaled), Type::Decimal { precision, .. }) => {
+            let is_held = *precision > MAX_DECIMAL64_PRECISION || i64::try_from(*unscaled).is_ok();
+            if is_held {
+                SortValue::Integer(*unscaled)
+            } else {
+                SortValue::Missing
+            }
+        }
+        _ => SortValue::Missing,
     }
 }
 
 /// One live data file of a table version.
 pub struct IndexedFile {
     /// What every format knows of the file: its path under the table's data
-    /// root and its size, its row count, the stretch of the sort key it
-    /// covers, and the sequence number of its commit.
+    /// root and its size, its row count, and the sequence number of its
+    /// commit.
     pub facts: FileFacts,
     /// The file as its manifest entry describes it: its row count, its
     /// partition tuple, the bounds and null counts of its columns by field
@@ -251,6 +325,10 @@ pub struct IndexedFile {
     /// where the entry leaves it implicit; `None` in a table whose rows
     /// have no ids.
     pub first_row_id: Option<i64>,
+    /// The columns the file's table is sorted by, which the file's bounds
+    /// on the sort key are read by: shared by the records one decode of a
+    /// manifest made.
+    sort_columns: Arc<SortColumns>,
     /// An estimate of the memory the record holds, itself included.
     heap_bytes: u64,
 }
@@ -258,39 +336,24 @@ pub struct IndexedFile {
 impl IndexedFile {
     /// The file `data` describes, of `partition`, recorded by a manifest
     /// written under the schema `schema_id`, and added by the commit with
-    /// the data sequence number `sequence_number`.
-    #[allow(clippy::too_many_arguments)] // what a manifest entry and its table say of one file
+    /// the data sequence number `sequence_number`, in a table sorted by
+    /// `sort_columns`.
     fn new(
         data: DataFile,
         schema_id: i32,
         partition: Arc<Partition>,
         first_row_id: Option<i64>,
         sequence_number: i64,
-        encoder: &SortKeyEncoder,
-        metadata: &TableMetadata,
+        sort_columns: &Arc<SortColumns>,
         location: &TableLocation,
     ) -> Result<Self> {
         let path = location.file_path_for_uri(data.file_path())?;
-        let stored_schema = metadata.schema_by_id(schema_id);
-        let read_bound =
-            |field_id: i32, lower: bool| find_bound(&data, stored_schema, field_id, lower);
-        let sort_minimum = encoder.encode(|field_id| read_bound(field_id, true))?;
-        let leading_field_is_bounded = encoder.find_leading_field().is_some_and(|field_id| {
-            read_bound(field_id, true).is_some() && read_bound(field_id, false).is_some()
-        });
-        let sort_maximum = if leading_field_is_bounded {
-            Some(encoder.encode(|field_id| read_bound(field_id, false))?)
-        } else {
-            None
-        };
         let facts = FileFacts::new(
             FileRef {
                 path,
                 size: data.file_size_in_bytes(),
             },
             Some(data.record_count()),
-            sort_minimum,
-            sort_maximum,
             // A table that numbers no commit reads every file at 0.
             u64::try_from(sequence_number).unwrap_or(0),
         );
@@ -300,6 +363,7 @@ impl IndexedFile {
             partition,
             schema_id,
             first_row_id,
+            sort_columns: Arc::clone(sort_columns),
             heap_bytes: 0,
         };
         file.heap_bytes = file.compute_heap_bytes();
@@ -396,8 +460,7 @@ impl IndexedFile {
                     Arc::clone(partition),
                     first_row_id,
                     sequence_number,
-                    context.encoder,
-                    context.metadata,
+                    context.sort_columns,
                     context.location,
                 )?));
         }
@@ -662,14 +725,23 @@ fn find_bound<'a>(
     field_id: i32,
     lower: bool,
 ) -> Option<&'a Datum> {
-    let field = stored_schema?.field_by_id(field_id)?;
-    field.field_type.as_primitive_type()?;
+    if !holds_primitive_field(stored_schema?, field_id) {
+        return None;
+    }
     let bounds = if lower {
         data.lower_bounds()
     } else {
         data.upper_bounds()
     };
     bounds.get(&field_id)
+}
+
+/// Whether `schema` has the field `field_id` as a primitive, so a manifest
+/// written under it records bounds for the field.
+fn holds_primitive_field(schema: &Schema, field_id: i32) -> bool {
+    schema
+        .field_by_id(field_id)
+        .is_some_and(|field| field.field_type.as_primitive_type().is_some())
 }
 
 /// A partition tuple under its spec's id, as bytes that are equal exactly for
@@ -820,6 +892,15 @@ impl IndexedRecord for IndexedFile {
         &self.facts
     }
 
+    fn count_sort_columns(&self) -> usize {
+        self.sort_columns.columns.len()
+    }
+
+    fn read_sort_bound(&self, position: usize, side: BoundSide) -> SortValue<'_> {
+        self.sort_columns
+            .read_bound(&self.data, self.schema_id, position, side)
+    }
+
     fn estimate_heap_bytes(&self) -> u64 {
         self.heap_bytes
     }
@@ -841,8 +922,8 @@ pub struct PartitionIndex {
 }
 
 /// What the record of one manifest an index was built from takes besides
-/// the manifest's path and the partition its files share: its place in the
-/// map, and its list of files.
+/// the manifest's path and what its files share: its place in the map, and
+/// its list of files.
 const MANIFEST_RECORD_BYTES: usize = 96;
 
 impl PartitionIndex {
@@ -947,18 +1028,23 @@ impl PartitionIndex {
 }
 
 /// What an index's record of the manifest at `path`, which holds `files`
-/// of the index's partition, counts for: the record, the path, and the
-/// partition as the manifest's decode named it, which its files share.
+/// of the index's partition, counts for: the record, the path, and what
+/// the manifest's decode made once for its files to share, the partition
+/// as it named it and the table's sort columns.
 fn measure_manifest_record(path: &str, files: &[Arc<IndexedFile>]) -> u64 {
-    let partition_bytes = files
-        .first()
-        .map_or(0, |file| file.partition.estimate_heap_bytes());
-    (MANIFEST_RECORD_BYTES + measure_shared_allocation(path.len()) + partition_bytes) as u64
+    let shared_bytes = files.first().map_or(0, |file| {
+        file.partition.estimate_heap_bytes() + file.sort_columns.estimate_heap_bytes()
+    });
+    (MANIFEST_RECORD_BYTES + measure_shared_allocation(path.len()) + shared_bytes) as u64
 }
 
 impl PartitionFiles for PartitionIndex {
     fn visit_files(&self, visit: &mut VisitFacts<'_>) -> std::ops::ControlFlow<()> {
         self.files.visit_files(visit)
+    }
+
+    fn visit_records(&self, visit: &mut VisitRecord<'_>) -> std::ops::ControlFlow<()> {
+        self.files.visit_records(visit)
     }
 
     fn find_file(&self, path: &ObjectPath) -> Option<&FileFacts> {

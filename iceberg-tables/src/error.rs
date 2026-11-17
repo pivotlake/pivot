@@ -7,8 +7,6 @@ pub enum Error {
     /// metadata.
     #[error("Iceberg metadata: {0}")]
     Spec(#[source] Box<iceberg::Error>),
-    #[error("encoding a file's place on the table's sort key failed: {0}")]
-    SortKeyEncoding(#[source] Box<arrow_schema::ArrowError>),
     /// An error from a catalog service while loading a table or publishing
     /// a version of it.
     #[error("Iceberg catalog: {0}")]
@@ -200,10 +198,6 @@ impl Error {
             self,
             Self::CommitOutcomeUnknown { .. } | Self::CommittedTableUnloaded { .. }
         )
-    }
-
-    pub fn arrow(error: arrow_schema::ArrowError) -> Self {
-        Self::SortKeyEncoding(Box::new(error))
     }
 
     pub fn spec(error: iceberg::Error) -> Self {

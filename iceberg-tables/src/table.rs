@@ -91,7 +91,7 @@ use crate::files::data_files::DataFileEntry;
 use crate::files::deletes::{count_deleted_rows, read_deletion_vectors};
 use crate::files::file_index::{
     self, DecodeContext, DecodedManifest, FileSelector, FilesByPartition, IndexedFile, Partition,
-    PartitionIndex, SortKeyEncoder,
+    PartitionIndex, SortColumns,
 };
 use crate::files::manifests::{EntryPartitions, ListedManifest, ManifestList};
 use crate::files::partitions_from_filter::MAX_PARTITIONS_FROM_FILTER;
@@ -923,10 +923,10 @@ impl Table {
         wants: &mut dyn FnMut(&[u8], &Partition) -> Result<bool>,
     ) -> Result<DecodedManifest> {
         let table_name = self.name.to_string();
-        let encoder = self.sort_key_encoder()?;
+        let sort_columns = self.resolve_sort_columns();
         let context = DecodeContext {
             table: &table_name,
-            encoder: &encoder,
+            sort_columns: &sort_columns,
             metadata: self.metadata(),
             location: &self.location,
         };
@@ -1086,8 +1086,14 @@ impl Table {
         Ok(partitions.into_values().collect())
     }
 
-    fn sort_key_encoder(&self) -> Result<SortKeyEncoder> {
-        SortKeyEncoder::new(&self.metadata_file.metadata, self.columns(), &self.sort_by)
+    /// The columns this version is sorted by, as the records of the files
+    /// decoded with them share them.
+    fn resolve_sort_columns(&self) -> Arc<SortColumns> {
+        Arc::new(SortColumns::new(
+            &self.metadata_file.metadata,
+            self.columns(),
+            &self.sort_by,
+        ))
     }
 
     /// The live file at `path` in the partition with the key `partition`,

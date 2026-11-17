@@ -171,7 +171,6 @@ use std::time::Duration;
 use object_storage::{FileRef, ObjectPath};
 use parquet_engine::file_entry::FileEntry;
 use planner::catalog::SchemaQualifiedTableName;
-use table_file_index::FileFacts;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -900,8 +899,7 @@ impl MergeSelection {
 
 /// One partition's files at least half the target size, as a layout
 /// observation reads them: walked from the table's metadata, with a file's
-/// bounds decoded and its footer read only when the observation measures
-/// it.
+/// entry built and its footer read only when the observation measures it.
 struct LayoutCandidates<'a> {
     table: &'a CatalogTable,
     /// The partition, as a walk names it.
@@ -910,13 +908,13 @@ struct LayoutCandidates<'a> {
 }
 
 impl overlap::LayoutSource for LayoutCandidates<'_> {
-    fn walk_candidates(&self, visit: &mut dyn FnMut(&[u8], &FileFacts)) -> Result<()> {
+    fn walk_candidates(&self, visit: &mut overlap::VisitCandidate<'_>) -> Result<()> {
         let Some(files) = self.table.load_partition_files(self.partition)? else {
             return Ok(());
         };
-        let _ = files.visit_files(&mut |file| {
-            if !is_small_file(file.file().size, self.target_bytes) {
-                visit(self.partition, file);
+        let _ = files.visit_records(&mut |record| {
+            if !is_small_file(record.facts().file().size, self.target_bytes) {
+                visit(self.partition, record);
             }
             ControlFlow::Continue(())
         });

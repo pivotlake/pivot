@@ -1,6 +1,5 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef};
@@ -13,7 +12,7 @@ use crate::Result;
 use object_storage::{FileRef, ObjectPath};
 use parquet_engine::RowGroupMetadata;
 use parquet_engine::file_entry::FileEntry;
-use table_file_index::FileFacts;
+use table_file_index::{BoundSide, IndexedRecord, compare_sort_bounds, has_sort_range};
 
 /// A file's row groups' min/max on every sort column, in the table's sort
 /// order, each column's in row-group order. `None` marks a row group whose
@@ -44,13 +43,17 @@ pub(super) fn read_row_group_ranges(
         .collect()
 }
 
+/// What a walk over a table's candidates does with each: handed the key of
+/// the partition the file sits in, and the file's record.
+pub(super) type VisitCandidate<'v> = dyn FnMut(&[u8], &Arc<dyn IndexedRecord>) + 'v;
+
 /// What an observation reads of a table: the files a layout merge may
 /// rewrite, and of the few it has to measure, their bounds and their row
 /// groups' bounds.
 pub(super) trait LayoutSource {
-    /// Visit every file a layout merge may rewrite, partition by partition,
-    /// each with the key of the partition it sits in.
-    fn walk_candidates(&self, visit: &mut dyn FnMut(&[u8], &FileFacts)) -> Result<()>;
+    /// Visit the record of every file a layout merge may rewrite, partition
+    /// by partition, each with the key of the partition it sits in.
+    fn walk_candidates(&self, visit: &mut VisitCandidate<'_>) -> Result<()>;
     /// The entry of each of `paths`, files the walk visited, in the order
     /// given, with its bounds on the sort columns.
     fn find_entries(&self, paths: &[Arc<ObjectPath>]) -> Result<Vec<FileEntry>>;
@@ -232,8 +235,6 @@ impl CompactionPass {
 struct PartitionSweep {
     /// The partition being collected; `None` before the first file.
     partition: Option<Vec<u8>>,
-    /// Every collected file's sort-range bytes, one after another.
-    range_bytes: Vec<u8>,
     files: Vec<SweptFile>,
     has_new_file: bool,
 }
@@ -241,10 +242,9 @@ struct PartitionSweep {
 /// One candidate of the partition being swept.
 struct SweptFile {
     path: Arc<ObjectPath>,
-    /// Where the file's lowest and highest sort keys sit in the sweep's
-    /// bytes.
-    lowest: Range<usize>,
-    highest: Range<usize>,
+    /// The file's record, which its lowest and highest sort keys are read
+    /// off.
+    record: Arc<dyn IndexedRecord>,
     /// Whether no earlier observation measured the file.
     is_new: bool,
 }
@@ -257,20 +257,14 @@ impl PartitionSweep {
     /// Start over on `partition`.
     fn start(&mut self, partition: &[u8]) {
         self.partition = Some(partition.to_vec());
-        self.range_bytes.clear();
         self.files.clear();
         self.has_new_file = false;
     }
 
-    fn push(&mut self, path: Arc<ObjectPath>, lowest: &[u8], highest: &[u8], is_new: bool) {
-        let start = self.range_bytes.len();
-        self.range_bytes.extend_from_slice(lowest);
-        let middle = self.range_bytes.len();
-        self.range_bytes.extend_from_slice(highest);
+    fn push(&mut self, path: Arc<ObjectPath>, record: Arc<dyn IndexedRecord>, is_new: bool) {
         self.files.push(SweptFile {
             path,
-            lowest: start..middle,
-            highest: middle..self.range_bytes.len(),
+            record,
             is_new,
         });
         self.has_new_file |= is_new;
@@ -290,10 +284,11 @@ impl PartitionSweep {
         if !self.has_new_file {
             return;
         }
-        let bytes = &self.range_bytes;
+        let compare_bounds = |left: &SweptFile, left_side, right: &SweptFile, right_side| {
+            compare_sort_bounds(&*left.record, left_side, &*right.record, right_side)
+        };
         self.files.sort_unstable_by(|left, right| {
-            bytes[left.lowest.clone()]
-                .cmp(&bytes[right.lowest.clone()])
+            compare_bounds(left, BoundSide::Lower, right, BoundSide::Lower)
                 .then_with(|| left.path.as_str().cmp(right.path.as_str()))
         });
         // The files whose range the sweep has not passed: every one, and
@@ -302,7 +297,7 @@ impl PartitionSweep {
         let mut new_in_reach: Vec<&SweptFile> = Vec::new();
         for candidate in &self.files {
             let reaches_candidate = |partner: &&SweptFile| {
-                bytes[partner.highest.clone()] >= bytes[candidate.lowest.clone()]
+                compare_bounds(partner, BoundSide::Upper, candidate, BoundSide::Lower).is_ge()
             };
             new_in_reach.retain(reaches_candidate);
             let partners = if candidate.is_new {
@@ -358,12 +353,13 @@ impl OverlapCache {
     /// with, and forget the files that are gone. The first observation of a
     /// final sweep measures every file again.
     ///
-    /// The walk reads no footer and decodes no bound: which pairs may share
-    /// a stretch of the key is decided on the sort ranges it hands out (see
+    /// The walk reads no footer and builds no entry: which pairs may share
+    /// a stretch of the key is decided by comparing the bounds on the sort
+    /// key where the walked records hold them (see
     /// [`PartitionSweep::collect_pairs_into`]). Only the files of those
-    /// pairs have their bounds decoded, and only those of the pairs the
-    /// bounds do not rule out have their footers read. A file counts as
-    /// measured once that has succeeded.
+    /// pairs have their entries built, and only those of the pairs the
+    /// entries' bounds do not rule out have their footers read. A file
+    /// counts as measured once that has succeeded.
     pub(super) fn observe(
         &mut self,
         source: &dyn LayoutSource,
@@ -388,7 +384,8 @@ impl OverlapCache {
         let mut live = HashSet::with_capacity(self.measured.len());
         let mut sweep = PartitionSweep::default();
         let mut pairs = Vec::new();
-        source.walk_candidates(&mut |partition, file| {
+        source.walk_candidates(&mut |partition, record| {
+            let file = record.facts();
             let (path, is_new) = match self.measured.get(&file.file().path) {
                 Some(measured) => (measured.clone(), false),
                 None => (Arc::new(file.file().path.clone()), true),
@@ -398,10 +395,10 @@ impl OverlapCache {
                 sweep.collect_pairs_into(&mut pairs);
                 sweep.start(partition);
             }
-            if let Some((lowest, highest)) = file.sort_range()
-                && file.row_count().is_some_and(|row_count| row_count > 0)
+            if file.row_count().is_some_and(|row_count| row_count > 0)
+                && has_sort_range(record.as_ref())
             {
-                sweep.push(path, lowest, highest, is_new);
+                sweep.push(path, Arc::clone(record), is_new);
             }
         })?;
         sweep.collect_pairs_into(&mut pairs);
@@ -743,13 +740,15 @@ fn count_contested_row_groups(
 mod tests {
     use std::sync::Arc;
 
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
     use arrow_array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 
     use super::*;
     use arrow_schema::DataType;
     use object_storage::{FileRef, ObjectPath};
     use parquet_engine::FileStats;
-    use table_file_index::SortKeyEncoder;
+    use table_file_index::{FileFacts, SortValue};
 
     /// Candidates held in memory, partition by partition, read the way an
     /// observation reads a table's.
@@ -768,54 +767,68 @@ mod tests {
                 .find(|candidate| &candidate.entry.file.path == path)
                 .unwrap()
         }
+    }
 
-        /// The encoder of the candidates' sort ranges, each sort column in
-        /// the type the first candidate bounding it records.
-        fn build_sort_key_encoder(&self) -> SortKeyEncoder {
-            let types = self
-                .sort_by
-                .iter()
-                .map(|column| {
-                    self.partitions
-                        .iter()
-                        .flat_map(|partition| partition.iter())
-                        .find_map(|candidate| {
-                            let stats = candidate.entry.stats.as_ref()?;
-                            Some(stats.min_values.get(column)?.data_type().clone())
-                        })
-                        .unwrap_or(DataType::Int64)
-                })
-                .collect();
-            SortKeyEncoder::new(types).unwrap()
+    /// A candidate as a walk hands it out: its bounds on the sort columns
+    /// are read off its entry's statistics, integers and strings.
+    struct CandidateRecord {
+        facts: FileFacts,
+        entry: FileEntry,
+        sort_by: Vec<String>,
+    }
+
+    impl IndexedRecord for CandidateRecord {
+        fn facts(&self) -> &FileFacts {
+            &self.facts
+        }
+
+        fn count_sort_columns(&self) -> usize {
+            self.sort_by.len()
+        }
+
+        fn read_sort_bound(&self, position: usize, side: BoundSide) -> SortValue<'_> {
+            let Some(stats) = self.entry.stats.as_deref() else {
+                return SortValue::Missing;
+            };
+            let bounds = match side {
+                BoundSide::Lower => &stats.min_values,
+                BoundSide::Upper => &stats.max_values,
+            };
+            let Some(bound) = bounds.get(&self.sort_by[position]) else {
+                return SortValue::Missing;
+            };
+            match bound.data_type() {
+                DataType::Int64 => {
+                    SortValue::Integer(bound.as_primitive::<Int64Type>().value(0).into())
+                }
+                DataType::Utf8 => SortValue::String(bound.as_string::<i32>().value(0)),
+                DataType::Utf8View => SortValue::String(bound.as_string_view().value(0)),
+                other => panic!("no candidate bounds a sort column by a {other}"),
+            }
+        }
+
+        fn estimate_heap_bytes(&self) -> u64 {
+            0
         }
     }
 
     impl LayoutSource for CandidateFiles<'_> {
-        fn walk_candidates(&self, visit: &mut dyn FnMut(&[u8], &FileFacts)) -> Result<()> {
-            let encoder = self.build_sort_key_encoder();
+        fn walk_candidates(&self, visit: &mut VisitCandidate<'_>) -> Result<()> {
             for (position, partition) in self.partitions.iter().enumerate() {
                 let partition_key = position.to_le_bytes();
                 for candidate in partition.iter() {
-                    let stats = candidate.entry.stats.as_ref();
-                    let find_bound = |bounds: &HashMap<String, ArrayRef>, column: usize| {
-                        bounds.get(&self.sort_by[column]).cloned()
-                    };
-                    let sort_range = encoder
-                        .encode_range(
-                            |column| find_bound(&stats?.min_values, column),
-                            |column| find_bound(&stats?.max_values, column),
-                        )
-                        .unwrap();
-                    let facts = FileFacts::new(
-                        candidate.entry.file.clone(),
-                        stats
-                            .and_then(|stats| stats.num_records)
-                            .and_then(|rows| u64::try_from(rows).ok()),
-                        sort_range.minimum,
-                        sort_range.maximum,
-                        0,
-                    );
-                    visit(&partition_key, &facts);
+                    let entry = candidate.entry.clone();
+                    let rows = entry
+                        .stats
+                        .as_ref()
+                        .and_then(|stats| stats.num_records)
+                        .and_then(|rows| u64::try_from(rows).ok());
+                    let record: Arc<dyn IndexedRecord> = Arc::new(CandidateRecord {
+                        facts: FileFacts::new(entry.file.clone(), rows, 0),
+                        entry,
+                        sort_by: self.sort_by.to_vec(),
+                    });
+                    visit(&partition_key, &record);
                 }
             }
             Ok(())
