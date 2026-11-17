@@ -54,6 +54,10 @@ pub struct TextIndexDefinition {
 }
 
 impl TextIndexDefinition {
+    /// What the name of every index file ends with, which tells the index
+    /// files in an index's directory from what else is kept there.
+    pub const INDEX_FILE_SUFFIX: &'static str = ".textindex";
+
     /// The name of the directory of the index named `index_name`, in its
     /// table's indexes directory: the index's name, with every byte that
     /// could mean something in a path written as `%` and two hex digits.
@@ -75,9 +79,10 @@ impl TextIndexDefinition {
     /// after it.
     pub fn path_of_index_file(index_name: &str, data_file: &ObjectPath) -> ObjectPath {
         ObjectPath::new(format!(
-            "{}/{}.textindex",
+            "{}/{}{}",
             Self::directory_name(index_name),
-            data_file.as_str()
+            data_file.as_str(),
+            Self::INDEX_FILE_SUFFIX
         ))
     }
 }

@@ -508,6 +508,14 @@ impl Table {
                 footer.mark_deleted_rows(deleted);
             }
         }
+        let data_file_paths = files
+            .iter()
+            .zip(&footers)
+            .filter_map(|(file, footer)| {
+                let open_file = footer.row_groups.first()?.open_file.clone();
+                Some((open_file, file.file.path.clone()))
+            })
+            .collect();
         let row_groups: Vec<_> = footers
             .into_iter()
             .flat_map(|footer| footer.row_groups)
@@ -519,6 +527,7 @@ impl Table {
         };
         Ok(ScanSelection {
             row_groups: Arc::new(parquet),
+            data_file_paths,
             nullability,
         })
     }

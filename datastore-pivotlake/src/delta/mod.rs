@@ -655,7 +655,7 @@ impl Table for DeltaTable {
         let partition_by = &self.shape.partition_by;
         let partition_filters = self.partition_filter_candidates(&predicates);
         let stat_filters = self.stat_filter_candidates(&predicates);
-        let row_groups: Vec<Arc<RowGroupMetadata>> = self
+        let selected_files: Vec<_> = self
             .files
             .list_files()
             .filter(|file| {
@@ -663,11 +663,22 @@ impl Table for DeltaTable {
                     .maybe_matches_partition(partition_by, &partition_filters)
                     && file.entry.maybe_matches_stats(&stat_filters)
             })
+            .collect();
+        let data_file_paths = selected_files
+            .iter()
+            .filter_map(|file| {
+                let open_file = file.row_groups.first()?.open_file.clone();
+                Some((open_file, file.entry.file.path.clone()))
+            })
+            .collect();
+        let row_groups: Vec<Arc<RowGroupMetadata>> = selected_files
+            .iter()
             .flat_map(|file| file.row_groups.iter().cloned())
             .collect();
         let nullability = self.find_nullable_columns(&row_groups);
         Ok(ScanSelection {
             row_groups: Arc::new(ParquetTable::new(row_groups)),
+            data_file_paths,
             nullability,
         })
     }

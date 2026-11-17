@@ -2,8 +2,9 @@
 //! whichever format keeps it: what every reader, writer and maintenance sweep
 //! holds and evolves, over the format's own [`Table`].
 
+use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::Error;
@@ -11,6 +12,7 @@ use crate::file_entry::{FileEntry, PartitionValues};
 use crate::table_format::{RemovedFiles, Table, VisitPartition};
 use arrow_array::RecordBatch;
 use catalog::datastore::DatastoreTableMetadata;
+use dispatch::io::OpenFile;
 use dispatch::text_index::LetterCase;
 use dispatch::{DataFlowDispatcher, Projection};
 use iceberg_tables::io::sink::TextIndexTarget;
@@ -18,7 +20,7 @@ use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
 use object_storage::{FileRef, ObjectPath, ObjectStore};
 use parquet_engine::writing::TextIndexDefinition;
 use parquet_engine::writing::upload::UploadedFiles;
-use parquet_engine::{ParquetTable, RowGroupMetadata, ScanSelection};
+use parquet_engine::{OpenTextIndexFile, ParquetTable, RowGroupMetadata, ScanSelection};
 use planner::catalog::{Column, SchemaQualifiedTableName};
 use planner::expression::Expression;
 use table_file_index::PartitionFiles;
@@ -97,6 +99,51 @@ impl TableStorage {
     /// ```
     pub(crate) fn indexes_directory(&self) -> ObjectPath {
         self.location.resolve(&ObjectPath::new("indexes"))
+    }
+
+    /// List the directory of each of `definitions` and return every index
+    /// file found there with its size, by its path relative to the indexes
+    /// directory
+    /// ([`TextIndexDefinition::path_of_index_file`]): which data files have
+    /// an index file, of which index.
+    pub(crate) fn list_text_index_files(
+        &self,
+        definitions: &[TextIndexDefinition],
+    ) -> crate::Result<HashMap<ObjectPath, u64>> {
+        let indexes_directory = self.indexes_directory();
+        let mut index_files = HashMap::new();
+        for definition in definitions {
+            let index_directory =
+                ObjectPath::new(TextIndexDefinition::directory_name(&definition.name));
+            let listing = self
+                .store
+                .list(&indexes_directory.resolve(&index_directory))?;
+            for object in listing.objects {
+                if object
+                    .file
+                    .path
+                    .as_str()
+                    .ends_with(TextIndexDefinition::INDEX_FILE_SUFFIX)
+                {
+                    index_files
+                        .insert(index_directory.resolve(&object.file.path), object.file.size);
+                }
+            }
+        }
+        Ok(index_files)
+    }
+
+    /// Open the index file at `index_file` (relative to the indexes
+    /// directory), `size` bytes long, for reading.
+    pub(crate) fn open_text_index_file(
+        &self,
+        index_file: &ObjectPath,
+        size: u64,
+    ) -> crate::Result<OpenFile> {
+        let location = self
+            .store
+            .source(&self.indexes_directory().resolve(index_file))?;
+        Ok(location.open_read(size)?)
     }
 
     /// Scan the table's indexes directory and read the definition of every
@@ -248,18 +295,26 @@ pub struct CatalogTable {
     /// table was loaded, and as this process has added to them since. Every
     /// file written to the table comes with an index file for each.
     text_indexes: Arc<[TextIndexDefinition]>,
+    /// The index files of the table's data files, each with its size, by
+    /// its path relative to the indexes directory: those the index
+    /// directories held when the table was loaded, and those this process
+    /// has written since. Shared by every copy of the table: a copy at an
+    /// older version only ever asks about the files of its own version.
+    text_index_files: Arc<RwLock<HashMap<ObjectPath, u64>>>,
 }
 
 impl CatalogTable {
     /// The table at the version `table` is at, with the indexes found in its
-    /// indexes directory, which loading a table scans.
+    /// indexes directory and the index files found in each index's
+    /// directory, which loading a table lists.
     pub(super) fn new(
         id: Uuid,
         storage: TableStorage,
         table: Arc<dyn Table>,
         dispatcher: DataFlowDispatcher,
     ) -> crate::Result<Self> {
-        let text_indexes = storage.load_text_indexes()?.into();
+        let text_indexes: Arc<[TextIndexDefinition]> = storage.load_text_indexes()?.into();
+        let text_index_files = storage.list_text_index_files(&text_indexes)?;
         Ok(Self {
             id,
             storage,
@@ -267,7 +322,58 @@ impl CatalogTable {
             dispatcher,
             commit_lock: Arc::default(),
             text_indexes,
+            text_index_files: Arc::new(RwLock::new(text_index_files)),
         })
+    }
+
+    /// Take note of index files written for data files of this table, each
+    /// by its path relative to the indexes directory, with its size: a scan
+    /// of those data files finds them from now on.
+    pub(crate) fn record_text_index_files(&self, index_files: impl IntoIterator<Item = FileRef>) {
+        self.text_index_files.write().unwrap().extend(
+            index_files
+                .into_iter()
+                .map(|index_file| (index_file.path, index_file.size)),
+        );
+    }
+
+    /// For each of `data_files` (paths as the table names its files), the
+    /// index file to look a token of `column` up in, opened for reading:
+    /// `None` for a file none of the column's indexes has an index file of.
+    /// A file that several of them have one of is answered from an index
+    /// that keeps letter case, which finds exactly the rows that have a
+    /// token, before one that lowers it.
+    pub(crate) fn open_text_index_files(
+        &self,
+        column: &str,
+        data_files: &[ObjectPath],
+    ) -> crate::Result<Vec<Option<OpenTextIndexFile>>> {
+        let mut indexes_of_column: Vec<&TextIndexDefinition> = self
+            .text_indexes
+            .iter()
+            .filter(|definition| definition.column == column)
+            .collect();
+        indexes_of_column.sort_by_key(|definition| definition.letter_case == LetterCase::Lowered);
+        let index_files = self.text_index_files.read().unwrap();
+        data_files
+            .iter()
+            .map(|data_file| {
+                let found = indexes_of_column.iter().find_map(|definition| {
+                    let index_file =
+                        TextIndexDefinition::path_of_index_file(&definition.name, data_file);
+                    let size = *index_files.get(&index_file)?;
+                    Some((index_file, size, definition.letter_case))
+                });
+                let Some((index_file, size, letter_case)) = found else {
+                    return Ok(None);
+                };
+                Ok(Some(OpenTextIndexFile {
+                    open_file: self.storage.open_text_index_file(&index_file, size)?,
+                    len: size as usize,
+                    letter_case,
+                }))
+            })
+            .collect()
     }
 
     /// The table's text indexes.
@@ -823,8 +929,10 @@ impl CatalogTable {
                     partition,
                     row_groups,
                     sorted_by,
+                    text_indexes,
                     ..
                 } = uploaded;
+                self.record_text_index_files(text_indexes);
                 let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
                     &row_groups,
                 )));

@@ -4,7 +4,9 @@
 //! before the Parquet pipeline moved into `catalog`; they're now free functions
 //! built on dispatch's public operator toolkit (`OperatorSpec::chain`,
 //! `RootUnaryOperatorFactory`, the channel factories). The stages are: row-group
-//! injection + fetching (source) → index → decompress → decode.
+//! injection + fetching (source) → index → decompress → decode. A scan that
+//! looks for tokens starts a stage earlier, at the files: text index search →
+//! fetching → the same stages.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -21,9 +23,9 @@ use dispatch::{
 
 use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
-    IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
-    RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate, ScanOrder,
-    WorkerAllocator,
+    FileToSearch, FilesToSearchFactory, IndexerFactory, MaterializerFactory, ParquetTable,
+    RangeCutterFactory, RowGroupBuffer, RowGroupFetcherFactory, RowGroupInjectorFactory,
+    ScanEqualityPredicate, ScanOrder, TextIndexSearcherFactory, WorkerAllocator,
 };
 
 /// Append the index → decompress → cut → decode stages onto a source of
@@ -196,6 +198,75 @@ pub fn table_input_with_filter_and_eq_predicates(
         add_row_group_metadata,
         eq_predicates,
         outstanding_row_groups,
+    )
+}
+
+/// A [`RecordBatchOperatorSpec`] that scans the `files` of `table` through
+/// their text indexes: each file is searched for its tokens first, and of its
+/// row groups only the rows that have them are fetched and decoded (see
+/// [`TextIndexSearcherFactory`]). `files` are all the files the scan reads,
+/// each row group of `table` in exactly one, and a file without an index
+/// among them is read whole. `projection` reads at least one column.
+///
+/// The scan returns every row that has the tokens, and of a file without an
+/// index every row: the rows are still to be tested above it.
+pub fn table_input_searching_text_indexes(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<ParquetTable>,
+    files: Vec<FileToSearch>,
+    projection: Projection,
+    add_row_group_metadata: bool,
+) -> RecordBatchOperatorSpec {
+    let n = dispatcher.worker_count();
+    let files_to_search = FilesToSearchFactory::new(files);
+    let siblings_searcher = Arc::new(AtomicUsize::new(n));
+    let siblings_fetcher = Arc::new(AtomicUsize::new(n));
+    let read_medium = table.get_read_medium();
+    let shared_projection = Arc::new(projection.clone());
+    let factories: Vec<_> = stealable::<QueryRowGroupMetadata>(dispatcher.topology())
+        .into_iter()
+        // The row groups a searcher expects to need a read go to one queue
+        // every worker's fetcher takes from.
+        .zip(shared_work_queue::<QueryRowGroupMetadata>(n))
+        // The row groups a fetcher expected to be in memory and found to need
+        // a read go to another queue every worker's fetcher takes from.
+        .zip(shared_work_queue::<QueryRowGroupMetadata>(n))
+        .map(
+            |(
+                (searched_row_groups_channel, io_row_groups_channel),
+                uncached_row_groups_channel,
+            )| {
+                UnaryOperatorFactory::new(
+                    RootUnaryOperatorFactory::new(
+                        TextIndexSearcherFactory::new(table.clone(), io_row_groups_channel.clone()),
+                        files_to_search.clone(),
+                        siblings_searcher.clone(),
+                    ),
+                    RowGroupFetcherFactory::new(
+                        shared_projection.clone(),
+                        read_medium,
+                        true,
+                        io_row_groups_channel,
+                        uncached_row_groups_channel,
+                    ),
+                    searched_row_groups_channel,
+                    siblings_fetcher.clone(),
+                )
+            },
+        )
+        .collect();
+    let input = OperatorSpec::new(dispatcher.clone(), factories);
+    read_parquet(
+        input,
+        projection,
+        RECORD_BATCH_SIZE,
+        add_row_group_metadata,
+        // A row group read for a selection of its rows is not pruned by its
+        // dictionaries.
+        Arc::new(Vec::new()),
+        // The searchers hand the row groups out, not the injector, so this
+        // count is never consulted.
+        Arc::new(AtomicUsize::new(0)),
     )
 }
 

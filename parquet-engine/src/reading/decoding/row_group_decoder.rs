@@ -11,13 +11,13 @@ use crate::reading::decoding::ScanEqualityPredicate;
 use crate::reading::decoding::column_decoder::{ColumnDecoder, Error, Result, create_leaf_decoder};
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
-use crate::reading::record_batch_metadata::with_row_index;
+use crate::reading::record_batch_metadata::{with_row_index, with_row_positions};
 use crate::types::filter_mask::FilterMask;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
-use arrow_array::{ArrayRef, RecordBatch, Scalar};
+use arrow_array::{ArrayRef, RecordBatch, Scalar, UInt32Array};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{FieldRef, Fields, Schema, SchemaRef};
 use dispatch::memory::SlabAllocator;
@@ -401,7 +401,17 @@ impl RowGroupDecoder {
                 record_batch
             };
             let batch = if self.add_row_group_metadata {
-                with_row_index(record_batch, first_row)
+                match self.metadata.selection() {
+                    RowSelection::All => with_row_index(record_batch, first_row),
+                    // The rows decoded are the selected ones, in order: each
+                    // is tagged with its own position in the row group.
+                    RowSelection::Indices(rows) => with_row_positions(
+                        record_batch,
+                        UInt32Array::from_iter_values(
+                            rows[first_row..first_row + available].iter().copied(),
+                        ),
+                    ),
+                }
             } else {
                 record_batch
             };

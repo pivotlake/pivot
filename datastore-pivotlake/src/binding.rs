@@ -6,7 +6,8 @@
 
 use catalog::CommitQueue;
 use dispatch::RecordBatchOperatorSpec;
-use parquet_engine::{ParquetBackedTable, ScanSelection};
+use object_storage::ObjectPath;
+use parquet_engine::{OpenTextIndexFile, ParquetBackedTable, ScanSelection};
 use planner::catalog::{Column, Error as CatalogError, Result as CatalogResult, TableRevision};
 use planner::expression::Expression;
 
@@ -85,6 +86,17 @@ impl ParquetBackedTable for BoundCatalogTable {
     /// counts them.
     fn estimate_row_count(&self) -> Option<u64> {
         self.table.total_rows().ok()
+    }
+
+    fn open_text_index_files(
+        &self,
+        column: usize,
+        data_files: &[ObjectPath],
+    ) -> CatalogResult<Vec<Option<OpenTextIndexFile>>> {
+        let column_name = &self.table.columns()[column].name;
+        self.table
+            .open_text_index_files(column_name, data_files)
+            .map_err(|e| CatalogError::Other(Box::new(e)))
     }
 
     /// The captured snapshot copy stamps the durable schema onto every

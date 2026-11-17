@@ -2120,3 +2120,159 @@ async fn a_second_text_index_of_the_same_name_is_refused_unless_it_may_exist(#[f
     assert!(error.contains("already exists"), "{error}");
     assert!(again_if_not_exists.is_ok());
 }
+
+/// A table of log lines with a text index of `message` made by
+/// `create_index`, holding one line written before the index and the rest
+/// after it.
+async fn create_searched_logs(conn: &Client, table: &str, create_index: &str) {
+    conn.simple_query(&format!(
+        "CREATE TABLE {table} (id BIGINT, message VARCHAR)"
+    ))
+    .await
+    .unwrap();
+    conn.simple_query(&format!(
+        "INSERT INTO {table} VALUES (1, 'disk failed before the index')"
+    ))
+    .await
+    .unwrap();
+    conn.simple_query(&create_index.replace("{table}", table))
+        .await
+        .unwrap();
+    conn.simple_query(&format!(
+        "INSERT INTO {table} VALUES (2, 'Disk full'), (3, 'disk full on sda1'), (4, 'network down')"
+    ))
+    .await
+    .unwrap();
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_finds_the_rows_of_files_with_an_index_and_of_files_without(
+    #[future] conn: Conn,
+) {
+    create_searched_logs(
+        &conn,
+        "searched_logs",
+        "CREATE TEXT INDEX idx_message ON {table} (message)",
+    )
+    .await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT id FROM searched_logs WHERE has_token(message, 'disk') ORDER BY id",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("3".to_string())]]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_reads_the_index_of_a_file_into_the_index_caches(#[future] conn: Conn) {
+    create_searched_logs(
+        &conn,
+        "cached_index_logs",
+        "CREATE TEXT INDEX idx_message ON {table} (message)",
+    )
+    .await;
+
+    select_rows(
+        &conn,
+        "SELECT id FROM cached_index_logs WHERE has_token(message, 'sda1')",
+    )
+    .await;
+
+    let blocks_of_sparse_indexes = single_value(
+        &conn,
+        "SELECT count(*) FROM system.memory_blocks WHERE state = 'text_index_sparse_cache'",
+    )
+    .await;
+    assert_ne!(blocks_of_sparse_indexes, "0");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_under_a_limit_returns_the_whole_rows_found(#[future] conn: Conn) {
+    create_searched_logs(
+        &conn,
+        "limited_logs",
+        "CREATE TEXT INDEX idx_message ON {table} (message)",
+    )
+    .await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT * FROM limited_logs WHERE has_token(message, 'sda1') LIMIT 5",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("3".to_string()),
+            Some("disk full on sda1".to_string())
+        ]]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_tells_letter_case_apart_through_an_index_that_keeps_it(#[future] conn: Conn) {
+    create_searched_logs(
+        &conn,
+        "case_sensitive_logs",
+        "CREATE TEXT INDEX idx_message ON {table} (message) WITH (case_sensitive = true)",
+    )
+    .await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT id FROM case_sensitive_logs WHERE has_token(message, 'Disk')",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn has_token_counts_a_token_that_many_rows_of_a_file_have(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE noisy_logs (id BIGINT, message VARCHAR)")
+        .await
+        .unwrap();
+    conn.simple_query("CREATE TEXT INDEX idx_message ON noisy_logs (message)")
+        .await
+        .unwrap();
+    let lines: Vec<String> = (0..40)
+        .map(|id| {
+            let message = if id % 4 == 0 {
+                "request ok"
+            } else {
+                "request timeout"
+            };
+            format!("({id}, '{message}')")
+        })
+        .collect();
+    conn.simple_query(&format!(
+        "INSERT INTO noisy_logs VALUES {}",
+        lines.join(", ")
+    ))
+    .await
+    .unwrap();
+
+    let timeouts = single_value(
+        &conn,
+        "SELECT count(*) FROM noisy_logs WHERE has_token(message, 'timeout') AND has_token(message, 'request')",
+    )
+    .await;
+
+    assert_eq!(timeouts, "30");
+}

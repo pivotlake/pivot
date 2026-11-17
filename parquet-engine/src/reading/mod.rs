@@ -35,7 +35,13 @@ mod record_batch_metadata;
 
 mod empty_projection_scan;
 
+mod text_search;
+pub use text_search::{
+    FileToSearch, FilesToSearchFactory, OpenTextIndexFile, TextIndexSearcherFactory, TokenToFind,
+};
+
 mod scan;
 pub use scan::{
-    materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    materialize, table_input, table_input_searching_text_indexes, table_input_with_filter,
+    table_input_with_filter_and_eq_predicates,
 };

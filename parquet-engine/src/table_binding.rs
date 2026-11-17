@@ -7,19 +7,23 @@
 //! ([`ParquetBackedTable`]); the binding ([`ParquetTableBinding`]) is the same
 //! for all of them.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, Scalar};
+use dispatch::io::OpenFile;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use object_storage::ObjectPath;
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
     TableRevision,
 };
-use planner::expression::Expression;
+use planner::expression::{Expression, Function};
 
 use crate::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    FileToSearch, OpenTextIndexFile, ParquetTable, PushedPredicate, TokenToFind,
+    equality_predicates, materialize, prune_parquet, row_group_filter_from, scan_order_from,
+    table_input_searching_text_indexes, table_input_with_filter_and_eq_predicates,
 };
 
 /// What a scan over some filters reads of a table version.
@@ -27,6 +31,10 @@ pub struct ScanSelection {
     /// The row groups the scan reads, in an order the version and the
     /// filters fix.
     pub row_groups: Arc<ParquetTable>,
+    /// The path of each data file the scan reads, as its table names the
+    /// file, by the file as its row groups hold it open. A table finds a
+    /// file's text indexes by this path.
+    pub data_file_paths: HashMap<OpenFile, ObjectPath>,
     /// Whether each column (in the table's column order) can hold a NULL in
     /// the files the scan reads, as the data shows it, not as the schema
     /// declares it. A column is reported free of NULLs only when that is
@@ -73,6 +81,20 @@ pub trait ParquetBackedTable: std::fmt::Debug + Send + Sync {
         &self,
         input: RecordBatchOperatorSpec,
     ) -> CatalogResult<RecordBatchOperatorSpec>;
+
+    /// For each of `data_files` (paths as a [`ScanSelection`] gives them),
+    /// in their order, the index file that says which of the file's rows
+    /// have a token in `column` (a position in [`columns`](Self::columns)),
+    /// opened for reading: `None` for a file no text index of the column
+    /// has an index file of. A table without text indexes has none for any
+    /// file.
+    fn open_text_index_files(
+        &self,
+        _column: usize,
+        data_files: &[ObjectPath],
+    ) -> CatalogResult<Vec<Option<OpenTextIndexFile>>> {
+        Ok(vec![None; data_files.len()])
+    }
 }
 
 /// One reference to a table in a query: the version of the table the
@@ -144,6 +166,7 @@ impl ParquetTableBinding {
         let selected = self.table.select_scan(&self.filters)?;
         let selection = Arc::new(ScanSelection {
             row_groups: Arc::new(self.pruned_parquet(&selected.row_groups)),
+            data_file_paths: selected.data_file_paths,
             nullability: selected.nullability,
         });
         *cached = Some(Arc::clone(&selection));
@@ -167,6 +190,76 @@ impl ParquetTableBinding {
     /// Whether the scan this binding stands for reads the whole table.
     fn is_unfiltered(&self) -> bool {
         self.filters.is_empty()
+    }
+
+    /// The files of the scan with what their text indexes are asked: for
+    /// every `has_token` of a column among the pushed filters, the token and
+    /// the index file of the column in each file that has one. `None` when
+    /// the filters look for no token, or no file of the scan has an index to
+    /// find one in: the scan then reads its row groups as any other does.
+    fn plan_text_index_search(
+        &self,
+        selection: &ScanSelection,
+    ) -> CatalogResult<Option<Vec<FileToSearch>>> {
+        let tokens_looked_for: Vec<(usize, &str)> = self
+            .filters
+            .iter()
+            .filter_map(|filter| {
+                let Expression::Function(Function::HasToken(has_token)) = filter else {
+                    return None;
+                };
+                let Expression::Ref(column) = has_token.text.as_ref() else {
+                    return None;
+                };
+                Some((column.column_idx, has_token.token.as_str()))
+            })
+            .collect();
+        if tokens_looked_for.is_empty() {
+            return Ok(None);
+        }
+
+        // The scan's files in the order its row groups are in, which holds
+        // a file's row groups one after the other.
+        let mut files: Vec<(&OpenFile, FileToSearch)> = Vec::new();
+        for (row_group_index, row_group) in selection.row_groups.row_groups().iter().enumerate() {
+            match files.last_mut() {
+                Some((open_file, file)) if **open_file == row_group.open_file => {
+                    file.row_groups.push(row_group_index);
+                }
+                _ => files.push((
+                    &row_group.open_file,
+                    FileToSearch {
+                        row_groups: vec![row_group_index],
+                        tokens: Vec::new(),
+                    },
+                )),
+            }
+        }
+        // A file the selection gives no path of is one no index is found
+        // for.
+        let (positions_of_named_files, paths): (Vec<usize>, Vec<ObjectPath>) = files
+            .iter()
+            .enumerate()
+            .filter_map(|(position, (open_file, _))| {
+                Some((position, selection.data_file_paths.get(open_file)?.clone()))
+            })
+            .unzip();
+        for (column, token) in tokens_looked_for {
+            let index_files = self.table.open_text_index_files(column, &paths)?;
+            for (&position, index_file) in positions_of_named_files.iter().zip(index_files) {
+                if let Some(index_file) = index_file {
+                    files[position]
+                        .1
+                        .tokens
+                        .push(TokenToFind::new(token.as_bytes(), index_file));
+                }
+            }
+        }
+        let files: Vec<FileToSearch> = files.into_iter().map(|(_, file)| file).collect();
+        if files.iter().all(|file| file.tokens.is_empty()) {
+            return Ok(None);
+        }
+        Ok(Some(files))
     }
 }
 
@@ -204,7 +297,28 @@ impl BoundTable for ParquetTableBinding {
         // The file set this query was bound against, less what the pushed
         // predicates rule out by partition, by file bounds and by row-group
         // statistics.
-        let parquet = self.load_pruned_parquet()?;
+        let selection = self.load_scan_selection()?;
+        let parquet = Arc::clone(&selection.row_groups);
+
+        // A scan that looks for tokens searches its files' text indexes
+        // first and reads only the rows found, unless a Top-N above it is
+        // tightening a boundary: such a scan reads its row groups in the
+        // order of the Top-N's key and stops at the boundary, and a search
+        // of every file ahead of that would read indexes of files it never
+        // gets to. The filters stay above the scan either way, so the
+        // search only decides what is read, never what is returned.
+        if dynamic_filters.is_empty()
+            && !projection.indices().is_empty()
+            && let Some(files) = self.plan_text_index_search(&selection)?
+        {
+            return Ok(table_input_searching_text_indexes(
+                dispatcher,
+                &parquet,
+                files,
+                projection,
+                emit_row_group_metadata,
+            ));
+        }
 
         // A variant path predicate reaches its shredded typed leaf only in the
         // files that shred it, so each row group resolves the path itself.

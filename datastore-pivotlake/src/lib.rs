@@ -1416,6 +1416,16 @@ impl CommitAction<PivotlakeDatastore> for PendingInsert {
                 TableFile::new(entry, uploaded.row_groups.clone())
             })
             .collect();
+        // Known before the commit, so no scan sees the files without their
+        // index files. Those of a commit that fails name files no scan
+        // reads.
+        if let Some(table) = datastore.table_handle_by_id(&self.table_id) {
+            table.record_text_index_files(
+                uploaded
+                    .iter()
+                    .flat_map(|uploaded| uploaded.text_indexes.iter().cloned()),
+            );
+        }
         let committed = datastore.commit_to_table(self.table_id, RemovedFiles::NONE, files, true);
         if let Err(error) = &committed
             && !error.may_have_committed()

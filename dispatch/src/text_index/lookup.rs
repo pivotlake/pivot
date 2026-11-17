@@ -59,6 +59,15 @@ impl RowsWithToken {
         }
     }
 
+    /// Whether the token appears in `row`.
+    pub fn contains_row(&self, row: u32) -> bool {
+        match self {
+            RowsWithToken::NoRows => false,
+            RowsWithToken::Few(few_rows) => few_rows.as_slice().contains(&row),
+            RowsWithToken::Postings(postings) => postings.contains_row(row),
+        }
+    }
+
     /// Visit every row of `rows` the token appears in, ascending.
     pub fn for_each_row_in(&self, rows: Range<u32>, mut visit: impl FnMut(u32)) {
         match self {
