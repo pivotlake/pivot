@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, Scalar, TimestampMicrosecondArray};
-use iceberg::spec::{Literal, PrimitiveLiteral, Transform};
+use iceberg::spec::{Datum, Literal, PrimitiveLiteral, Transform};
 use iceberg::transform::create_transform_function;
 use iceberg_tables::files::data_files::DataFileEntry;
 use iceberg_tables::{Partition, Table};
@@ -314,8 +314,15 @@ fn create_events_table(fields: &[SpecField]) -> (Fixture, Table) {
 /// `day` after the epoch, in the partition those values have under
 /// `fields`.
 fn event(fields: &[SpecField], name: &str, v: i64, day: i64) -> DataFileEntry {
+    event_at(fields, name, v, day * DAY_MICROS)
+}
+
+/// An entry for `name`, a file of ten rows of `v` at `at_micros`
+/// microseconds after the epoch, in the partition those values have under
+/// `fields`.
+fn event_at(fields: &[SpecField], name: &str, v: i64, at_micros: i64) -> DataFileEntry {
     let v: ArrayRef = Arc::new(Int64Array::from(vec![v]));
-    let at: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![day * DAY_MICROS]));
+    let at: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![at_micros]));
     let partition = fields.iter().map(|(source, name, transform)| {
         let source = if *source == "v" { &v } else { &at };
         let value = create_transform_function(transform)
@@ -387,13 +394,80 @@ fn v_in(values: &[i64]) -> Expression {
 /// The filters that keep `at` from the start of the day `first` to before
 /// the start of the day `end`.
 fn at_within_days(first: i64, end: i64) -> Vec<Expression> {
-    let day_start = |day: i64| -> Scalar<ArrayRef> {
-        Scalar::new(Arc::new(TimestampMicrosecondArray::from(vec![day * DAY_MICROS])) as ArrayRef)
+    at_within(first * DAY_MICROS, end * DAY_MICROS)
+}
+
+/// The filters that keep `at` from `first` to before `end`, each in
+/// microseconds after the epoch.
+fn at_within(first: i64, end: i64) -> Vec<Expression> {
+    let instant = |micros: i64| -> Scalar<ArrayRef> {
+        Scalar::new(Arc::new(TimestampMicrosecondArray::from(vec![micros])) as ArrayRef)
     };
     vec![
-        compare(1, CompareType::GreaterEqual, day_start(first)),
-        compare(1, CompareType::Less, day_start(end)),
+        compare(1, CompareType::GreaterEqual, instant(first)),
+        compare(1, CompareType::Less, instant(end)),
     ]
+}
+
+/// Microseconds from the epoch to `instant`, a timestamp written
+/// `1969-12-31T22:30:00` that may stop after any of its fields: `1969` is
+/// the start of that year and `1969-12-31T22` the start of that hour.
+fn parse_instant(instant: &str) -> i64 {
+    let unwritten_fields = &"0000-01-01T00:00:00"[instant.len()..];
+    let parsed = Datum::timestamp_from_str(format!("{instant}{unwritten_fields}")).unwrap();
+    let PrimitiveLiteral::Long(micros) = parsed.literal() else {
+        panic!("a timestamp is held as a long, not {parsed:?}");
+    };
+    *micros
+}
+
+/// A table partitioned by `transform` of `at`, holding one file for each of
+/// `units`, a year, month, day or hour as [`parse_instant`] reads it, named
+/// by the unit and in the partition the unit's start has. No file records
+/// bounds of `at`, so a scan filtered on `at` selects every file of the
+/// partitions it keeps.
+fn create_table_of_units(transform: Transform, units: &[&str]) -> (Fixture, Table) {
+    let fields = [("at", "at_unit", transform)];
+    let (fixture, created) = create_events_table(&fields);
+    let files = units.iter().map(|unit| {
+        let mut entry = event_at(&fields, unit, 0, parse_instant(unit));
+        let stats = Arc::get_mut(entry.stats.as_mut().unwrap()).unwrap();
+        stats.min_values.remove("at");
+        stats.max_values.remove("at");
+        fixture.write_data_file(entry, 0)
+    });
+    append(&created, files.collect());
+    let written = load(&fixture);
+    (fixture, written)
+}
+
+/// The units whose files a scan of `table`, one [`create_table_of_units`]
+/// made, selects over `filters`, in order of time.
+fn list_selected_units(table: &Table, filters: &[Expression]) -> Vec<String> {
+    let mut units: Vec<String> = selected(table, filters)
+        .iter()
+        .map(|name| name.trim_end_matches(".parquet").to_string())
+        .collect();
+    units.sort();
+    units
+}
+
+/// The units a scan keeping `at` from `first` to before `end`, each as
+/// [`parse_instant`] reads it, selects of a table of `units` partitioned by
+/// `transform` ([`create_table_of_units`]): as planned with the table's data
+/// manifests in place, and as planned again once they are deleted, when
+/// only the filters and the partitions the first plan indexed name a file.
+fn plan_range_twice(
+    transform: Transform,
+    units: &[&str],
+    first: &str,
+    end: &str,
+) -> [Vec<String>; 2] {
+    let (fixture, written) = create_table_of_units(transform, units);
+    let range = at_within(parse_instant(first), parse_instant(end));
+    let with_manifests = list_selected_units(&written, &range);
+    fixture.delete_data_manifests(&written);
+    [with_manifests, list_selected_units(&written, &range)]
 }
 
 #[test]
@@ -448,6 +522,240 @@ fn a_bounded_range_of_days_selects_the_files_of_the_days_it_spans() {
 
     assert_eq!(first, ["day-1.parquet", "day0.parquet"]);
     assert_eq!(second, first);
+}
+
+#[test]
+fn a_range_from_the_start_of_one_unit_to_the_start_of_another_selects_the_first_and_not_the_last() {
+    let cases = [
+        (
+            Transform::Year,
+            ["1999", "2000", "2001", "2002", "2003"],
+            ("2000", "2002"),
+            ["2000", "2001"],
+        ),
+        (
+            Transform::Month,
+            ["1999-11", "1999-12", "2000-01", "2000-02", "2000-03"],
+            ("1999-12", "2000-02"),
+            ["1999-12", "2000-01"],
+        ),
+        (
+            Transform::Hour,
+            [
+                "1999-12-31T22",
+                "1999-12-31T23",
+                "2000-01-01T00",
+                "2000-01-01T01",
+                "2000-01-01T02",
+            ],
+            ("1999-12-31T23", "2000-01-01T01"),
+            ["1999-12-31T23", "2000-01-01T00"],
+        ),
+    ];
+
+    for (transform, units, (first, end), expected) in cases {
+        let [with_manifests, without_manifests] = plan_range_twice(transform, &units, first, end);
+
+        assert_eq!(with_manifests, expected, "{transform:?}");
+        assert_eq!(without_manifests, expected, "{transform:?}");
+    }
+}
+
+#[test]
+fn a_range_that_starts_and_ends_inside_units_selects_both_of_them() {
+    let cases = [
+        (
+            Transform::Year,
+            ["1999", "2000", "2001", "2002", "2003"],
+            ("2000-07-01", "2002-03-01"),
+            ["2000", "2001", "2002"],
+        ),
+        (
+            Transform::Month,
+            ["1999-11", "1999-12", "2000-01", "2000-02", "2000-03"],
+            ("1999-12-15", "2000-02-15"),
+            ["1999-12", "2000-01", "2000-02"],
+        ),
+        (
+            Transform::Hour,
+            [
+                "1999-12-31T22",
+                "1999-12-31T23",
+                "2000-01-01T00",
+                "2000-01-01T01",
+                "2000-01-01T02",
+            ],
+            ("1999-12-31T23:30", "2000-01-01T01:30"),
+            ["1999-12-31T23", "2000-01-01T00", "2000-01-01T01"],
+        ),
+    ];
+
+    for (transform, units, (first, end), expected) in cases {
+        let [with_manifests, without_manifests] = plan_range_twice(transform, &units, first, end);
+
+        assert_eq!(with_manifests, expected, "{transform:?}");
+        assert_eq!(without_manifests, expected, "{transform:?}");
+    }
+}
+
+#[test]
+fn a_range_across_the_epoch_selects_the_units_it_spans_on_both_sides() {
+    let cases = [
+        (
+            Transform::Year,
+            ["1967", "1968", "1969", "1970", "1971", "1972"],
+            ("1968-07-01", "1971-07-01"),
+            ["1968", "1969", "1970", "1971"],
+        ),
+        (
+            Transform::Month,
+            [
+                "1969-10", "1969-11", "1969-12", "1970-01", "1970-02", "1970-03",
+            ],
+            ("1969-11-15", "1970-02-15"),
+            ["1969-11", "1969-12", "1970-01", "1970-02"],
+        ),
+        (
+            Transform::Day,
+            [
+                "1969-12-29",
+                "1969-12-30",
+                "1969-12-31",
+                "1970-01-01",
+                "1970-01-02",
+                "1970-01-03",
+            ],
+            ("1969-12-30T12", "1970-01-02T12"),
+            ["1969-12-30", "1969-12-31", "1970-01-01", "1970-01-02"],
+        ),
+        (
+            Transform::Hour,
+            [
+                "1969-12-31T21",
+                "1969-12-31T22",
+                "1969-12-31T23",
+                "1970-01-01T00",
+                "1970-01-01T01",
+                "1970-01-01T02",
+            ],
+            ("1969-12-31T22:30", "1970-01-01T01:30"),
+            [
+                "1969-12-31T22",
+                "1969-12-31T23",
+                "1970-01-01T00",
+                "1970-01-01T01",
+            ],
+        ),
+    ];
+
+    for (transform, units, (first, end), expected) in cases {
+        let [with_manifests, without_manifests] = plan_range_twice(transform, &units, first, end);
+
+        assert_eq!(with_manifests, expected, "{transform:?}");
+        assert_eq!(without_manifests, expected, "{transform:?}");
+    }
+}
+
+/// The spec crate projects an upper bound before the epoch onto its own
+/// year, month or day and the next, where some writers put such a row, so
+/// one partition past the last that holds a row of the range is selected.
+#[test]
+fn a_range_of_years_months_or_days_before_the_epoch_also_selects_the_unit_after_its_last() {
+    let cases = [
+        (
+            Transform::Year,
+            ["1966", "1967", "1968", "1969", "1970"],
+            ("1967", "1969"),
+            ["1967", "1968", "1969"],
+        ),
+        (
+            Transform::Year,
+            ["1967", "1968", "1969", "1970", "1971"],
+            ("1968", "1970"),
+            ["1968", "1969", "1970"],
+        ),
+        (
+            Transform::Month,
+            ["1969-08", "1969-09", "1969-10", "1969-11", "1969-12"],
+            ("1969-09", "1969-11"),
+            ["1969-09", "1969-10", "1969-11"],
+        ),
+        (
+            Transform::Month,
+            ["1969-10", "1969-11", "1969-12", "1970-01", "1970-02"],
+            ("1969-11", "1970-01"),
+            ["1969-11", "1969-12", "1970-01"],
+        ),
+        (
+            Transform::Day,
+            [
+                "1969-12-27",
+                "1969-12-28",
+                "1969-12-29",
+                "1969-12-30",
+                "1969-12-31",
+            ],
+            ("1969-12-28", "1969-12-30"),
+            ["1969-12-28", "1969-12-29", "1969-12-30"],
+        ),
+        (
+            Transform::Day,
+            [
+                "1969-12-29",
+                "1969-12-30",
+                "1969-12-31",
+                "1970-01-01",
+                "1970-01-02",
+            ],
+            ("1969-12-30", "1970-01-01"),
+            ["1969-12-30", "1969-12-31", "1970-01-01"],
+        ),
+    ];
+
+    for (transform, units, (first, end), expected) in cases {
+        let [with_manifests, without_manifests] = plan_range_twice(transform, &units, first, end);
+
+        assert_eq!(with_manifests, expected, "{transform:?} to {end}");
+        assert_eq!(without_manifests, expected, "{transform:?} to {end}");
+    }
+}
+
+/// The spec crate projects an upper bound before the epoch onto its own
+/// hour alone.
+#[test]
+fn a_range_of_hours_before_the_epoch_selects_only_the_hours_it_spans() {
+    let cases = [
+        (
+            [
+                "1969-12-31T19",
+                "1969-12-31T20",
+                "1969-12-31T21",
+                "1969-12-31T22",
+                "1969-12-31T23",
+            ],
+            ("1969-12-31T20", "1969-12-31T22"),
+            ["1969-12-31T20", "1969-12-31T21"],
+        ),
+        (
+            [
+                "1969-12-31T21",
+                "1969-12-31T22",
+                "1969-12-31T23",
+                "1970-01-01T00",
+                "1970-01-01T01",
+            ],
+            ("1969-12-31T22", "1970-01-01T00"),
+            ["1969-12-31T22", "1969-12-31T23"],
+        ),
+    ];
+
+    for (units, (first, end), expected) in cases {
+        let [with_manifests, without_manifests] =
+            plan_range_twice(Transform::Hour, &units, first, end);
+
+        assert_eq!(with_manifests, expected, "to {end}");
+        assert_eq!(without_manifests, expected, "to {end}");
+    }
 }
 
 #[test]

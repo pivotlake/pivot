@@ -4298,6 +4298,122 @@ fn year_month_and_hour_partitions_record_the_crates_value_of_each_row() {
     }
 }
 
+/// The start of a year, a month, a day and an hour on each side of the
+/// epoch, and the epoch, in microseconds after it and in order.
+fn list_unit_starts() -> Vec<i64> {
+    let unit_starts = [
+        "1969-01-01T00:00:00",
+        "1969-12-01T00:00:00",
+        "1969-12-31T00:00:00",
+        "1969-12-31T23:00:00",
+        "1970-01-01T00:00:00",
+        "2001-01-01T00:00:00",
+        "2001-03-01T00:00:00",
+        "2001-03-15T00:00:00",
+        "2001-03-15T07:00:00",
+    ];
+    unit_starts
+        .iter()
+        .map(|start| {
+            let start = Datum::timestamp_from_str(start).unwrap();
+            let PrimitiveLiteral::Long(micros) = *start.literal() else {
+                panic!("a timestamp is held as a long, not {start:?}");
+            };
+            micros
+        })
+        .collect()
+}
+
+/// The instant `micros` after the epoch, as a SQL constant.
+fn write_timestamp(micros: i64) -> String {
+    format!("TIMESTAMP '{}'", Datum::timestamp_micros(micros))
+}
+
+/// What a query asks of `at`: as SQL, and as the same comparison of a row's
+/// instant.
+type TimeCondition = (String, Box<dyn Fn(i64) -> bool>);
+
+/// What a query asks of `at` against `bounds`, instants in order: an
+/// equality with each and an open range below it, and the three bounded
+/// ranges between each two.
+fn list_time_conditions(bounds: &[i64]) -> Vec<TimeCondition> {
+    let mut conditions: Vec<TimeCondition> = Vec::new();
+    for (position, &low) in bounds.iter().enumerate() {
+        let low_sql = write_timestamp(low);
+        conditions.push((
+            format!(r#""at" = {low_sql}"#),
+            Box::new(move |at| at == low),
+        ));
+        conditions.push((format!(r#""at" < {low_sql}"#), Box::new(move |at| at < low)));
+        for &high in &bounds[position + 1..] {
+            let high_sql = write_timestamp(high);
+            conditions.push((
+                format!(r#""at" >= {low_sql} AND "at" < {high_sql}"#),
+                Box::new(move |at| low <= at && at < high),
+            ));
+            conditions.push((
+                format!(r#""at" > {low_sql} AND "at" <= {high_sql}"#),
+                Box::new(move |at| low < at && at <= high),
+            ));
+            conditions.push((
+                format!(r#""at" BETWEEN {low_sql} AND {high_sql}"#),
+                Box::new(move |at| low <= at && at <= high),
+            ));
+        }
+    }
+    conditions
+}
+
+/// A time filter returns the rows it holds for and no other, whichever time
+/// transform cut the table's files: the rows sit on the starts of years,
+/// months, days and hours and one microsecond to either side, where a
+/// partition value or a bound rounded the wrong way loses or adds a row.
+#[test]
+fn a_time_filter_returns_exactly_the_rows_it_holds_for_under_every_time_transform() {
+    let Some(harness) = harness() else { return };
+    let unit_starts = list_unit_starts();
+    let instants: Vec<i64> = unit_starts
+        .iter()
+        .flat_map(|start| [start - 1, *start, start + 1])
+        .collect();
+    let rows: Vec<String> = (0..)
+        .zip(&instants)
+        .map(|(id, at)| format!("({id}, {})", write_timestamp(*at)))
+        .collect();
+    let conditions = list_time_conditions(&unit_starts);
+    for (transform, name) in [
+        (Transform::Year, "year"),
+        (Transform::Month, "month"),
+        (Transform::Day, "day"),
+        (Transform::Hour, "hour"),
+    ] {
+        let table = format!("edges_by_{name}.events");
+        harness.partitioned_namespace(
+            &format!("edges_by_{name}"),
+            "events",
+            events_schema(),
+            2,
+            &format!("at_{name}"),
+            transform,
+        );
+        let (catalog, mut planner) = harness.pivot();
+        let insert = format!("INSERT INTO {table} VALUES {}", rows.join(", "));
+        harness.execute(&catalog, &mut planner, &insert).unwrap();
+
+        for (condition, holds_for) in &conditions {
+            let select = format!("SELECT id FROM {table} WHERE {condition} ORDER BY id");
+            let returned = harness.query(&catalog, &mut planner, &select);
+
+            let expected: Vec<Option<i64>> = (0..)
+                .zip(&instants)
+                .filter(|(_, at)| holds_for(**at))
+                .map(|(id, _)| Some(id))
+                .collect();
+            assert_eq!(int64_column(&returned, 0), expected, "{name}: {condition}");
+        }
+    }
+}
+
 #[test]
 fn a_truncate_partition_records_each_rows_prefix() {
     let Some(harness) = harness() else { return };
