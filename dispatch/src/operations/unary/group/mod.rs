@@ -105,10 +105,13 @@ pub use output::{GroupOutputter, PartitionJob};
 pub use factory::GroupFactory;
 mod hashtables;
 
+pub(crate) use hashtables::{DEFAULT_CAPACITY, HashTable};
+pub(crate) use keys::RowScratch;
 pub use keys::{
     ArenaKey, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor,
     KeyExtractor, RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
+pub(crate) use values::StoredValue;
 pub(crate) use values::cast_value_column;
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot,

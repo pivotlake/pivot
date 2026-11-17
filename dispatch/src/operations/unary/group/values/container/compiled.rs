@@ -17,7 +17,7 @@
 use super::super::cell::Cell;
 use super::super::fold::{Count, Fold, Max, Min, Sum};
 use super::super::read::{IntRead, NoRead, Read, ValidRead};
-use super::super::{AggregationSlot, AggregationValue, ArityBody, ValueColumnBuilder};
+use super::super::{AggregationSlot, AggregationValue, ArityBody, StoredValue, ValueColumnBuilder};
 use super::{SeenMask, SeenMaskColumn};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
@@ -93,6 +93,33 @@ macro_rules! impl_compiled {
             type ColumnBuilders = ($(SlabColumn<$F::Acc>,)+);
         }
 
+        // The stored form of a compiled value is the accumulator tuple itself.
+        impl<S, $($R, $F),+> StoredValue for Compiled<($(Pair<$R, $F>,)+), S>
+        where
+            S: SeenMask,
+            $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+
+        {
+            type StorageMetadata = ();
+
+            fn stored_size(_metadata: ()) -> usize {
+                size_of::<Self>()
+            }
+
+            fn stored_align() -> usize {
+                align_of::<Self>()
+            }
+
+            #[inline(always)]
+            unsafe fn from_entry<'a>(ptr: *const u8, _metadata: ()) -> &'a Self {
+                unsafe { &*(ptr as *const Self) }
+            }
+
+            #[inline(always)]
+            unsafe fn from_entry_mut<'a>(ptr: *mut u8, _metadata: ()) -> &'a mut Self {
+                unsafe { &mut *(ptr as *mut Self) }
+            }
+        }
+
         // Compiled folds are numeric and need no arena context.
         impl<S, $($R, $F),+> AggregationValue for Compiled<($(Pair<$R, $F>,)+), S>
         where
@@ -100,7 +127,6 @@ macro_rules! impl_compiled {
             $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+
         {
             type Owned = Self;
-            type StorageMetadata = ();
             type Reader<'b> = ($($R::Input<'b>,)+);
             type SharedContext = ();
             type ColumnBuilder = CompiledColumnBuilder<($(Pair<$R, $F>,)+), S>;
@@ -120,24 +146,6 @@ macro_rules! impl_compiled {
             fn dispatch_arity<Ret>(_metadata: (), body: impl ArityBody<Ret>) -> Ret {
                 // The tuple arity is already in the type.
                 body.run::<0>()
-            }
-
-            fn stored_size(_metadata: ()) -> usize {
-                size_of::<Self>()
-            }
-
-            fn stored_align() -> usize {
-                align_of::<Self>()
-            }
-
-            #[inline(always)]
-            unsafe fn from_entry<'a>(ptr: *const u8, _metadata: ()) -> &'a Self {
-                unsafe { &*(ptr as *const Self) }
-            }
-
-            #[inline(always)]
-            unsafe fn from_entry_mut<'a>(ptr: *mut u8, _metadata: ()) -> &'a mut Self {
-                unsafe { &mut *(ptr as *mut Self) }
             }
 
             #[inline(always)]

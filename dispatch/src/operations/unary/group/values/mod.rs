@@ -232,6 +232,39 @@ pub trait ArityBody<R> {
     fn run<const N: usize>(self) -> R;
 }
 
+/// How a value is laid out inside a hash table entry.
+///
+/// This is everything [`HashTable`](super::hashtables::HashTable) needs to
+/// know about the value it stores next to each key: how many bytes it takes,
+/// how it is aligned, and how to view those bytes as the value. A table can
+/// hold any type that implements it. [`AggregationValue`] builds on it with
+/// what grouped aggregation does to the value.
+pub trait StoredValue: Send + Sync + 'static {
+    /// Metadata needed to size and view a stored value.
+    type StorageMetadata: Copy + Send + Sync + 'static;
+
+    /// The byte size of one stored value.
+    fn stored_size(metadata: Self::StorageMetadata) -> usize;
+
+    /// The alignment of one stored value.
+    fn stored_align() -> usize;
+
+    /// Views an entry's value bytes as a value reference.
+    ///
+    /// # Safety
+    /// `ptr` must point at [`stored_size`](Self::stored_size) bytes aligned to
+    /// [`stored_align`](Self::stored_align), valid for the returned lifetime,
+    /// and `metadata` must describe this table's value layout.
+    unsafe fn from_entry<'a>(ptr: *const u8, metadata: Self::StorageMetadata) -> &'a Self;
+
+    /// Mutable counterpart of [`from_entry`](Self::from_entry).
+    ///
+    /// # Safety
+    /// As [`from_entry`](Self::from_entry), plus `ptr` must be exclusive for
+    /// the returned lifetime.
+    unsafe fn from_entry_mut<'a>(ptr: *mut u8, metadata: Self::StorageMetadata) -> &'a mut Self;
+}
+
 /// Aggregation payload stored for one group, implemented by the
 /// entry-resident representation itself:
 ///
@@ -243,13 +276,11 @@ pub trait ArityBody<R> {
 /// The fold methods mutate `self` in place inside a table entry or scatter
 /// row. The one path that needs a sized, copyable value that outlives its
 /// table (a top-k heap row) goes through [`Owned`](Self::Owned).
-pub trait AggregationValue: Send + Sync + 'static {
+pub trait AggregationValue: StoredValue {
     /// Sized handle to a value that outlives its table, used only by top-k
     /// heap rows. `Self` for a fixed-size value; an arena pointer for
     /// [`Dynamic`].
     type Owned: Copy + Default + Send + Sync + 'static;
-    /// Metadata needed to size and view a stored value.
-    type StorageMetadata: Copy + Send + Sync + 'static;
     /// Bound input readers for one record batch.
     type Reader<'b>;
     /// Shared state used during consume, merge, and output.
@@ -272,27 +303,6 @@ pub trait AggregationValue: Send + Sync + 'static {
 
     /// Runs a body specialized for common slot counts.
     fn dispatch_arity<R>(metadata: Self::StorageMetadata, body: impl ArityBody<R>) -> R;
-
-    /// The byte size of one stored value.
-    fn stored_size(metadata: Self::StorageMetadata) -> usize;
-
-    /// The alignment of one stored value.
-    fn stored_align() -> usize;
-
-    /// Views an entry's value bytes as a value reference.
-    ///
-    /// # Safety
-    /// `ptr` must point at [`stored_size`](Self::stored_size) bytes aligned to
-    /// [`stored_align`](Self::stored_align), valid for the returned lifetime,
-    /// and `metadata` must describe this table's value layout.
-    unsafe fn from_entry<'a>(ptr: *const u8, metadata: Self::StorageMetadata) -> &'a Self;
-
-    /// Mutable counterpart of [`from_entry`](Self::from_entry).
-    ///
-    /// # Safety
-    /// As [`from_entry`](Self::from_entry), plus `ptr` must be exclusive for
-    /// the returned lifetime.
-    unsafe fn from_entry_mut<'a>(ptr: *mut u8, metadata: Self::StorageMetadata) -> &'a mut Self;
 
     /// Seeds this newly claimed, zeroed entry from one input row.
     fn seed(
