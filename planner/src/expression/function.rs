@@ -44,6 +44,13 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Utf8,
             volatile: false,
         }),
+        // Evaluated on the text itself or answered from a text index of its
+        // column. DuckDB only binds it.
+        "has_token" => Some(ScalarFunctionSignature {
+            arguments: vec![Type::Utf8, Type::Utf8],
+            return_type: Type::Boolean,
+            volatile: false,
+        }),
         // DuckDB binds `doc->'key'` as `json_extract`. The stub is a no-op, so
         // mark it volatile to prevent DuckDB from evaluating or folding it.
         "json_extract" => Some(ScalarFunctionSignature {
