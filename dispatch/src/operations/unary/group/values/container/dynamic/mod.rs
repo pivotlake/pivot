@@ -25,7 +25,7 @@
 
 use super::super::cell::{F64Cell, IntCell, StringCell, WideCell};
 use super::super::{
-    AggregationSlot, AggregationValue, ArityBody, SharedContext, ValueColumnBuilder,
+    AggregationSlot, AggregationValue, ArityBody, SharedContext, StoredValue, ValueColumnBuilder,
 };
 use super::SeenMask;
 use arrow_buffer::{BooleanBuffer, NullBuffer};
@@ -111,11 +111,40 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
 }
 
 impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S: SeenMask>
+    StoredValue for Dynamic<A, ONLY_ADDITIVE, S>
+{
+    /// Number of aggregation slots (the tracking mask cell is not counted).
+    type StorageMetadata = usize;
+
+    fn stored_size(metadata: usize) -> usize {
+        // A tracking run appends one whole cell holding the seen bits.
+        (metadata + S::TRACKING as usize) * size_of::<A>()
+    }
+
+    fn stored_align() -> usize {
+        align_of::<A>()
+    }
+
+    #[inline(always)]
+    unsafe fn from_entry<'a>(ptr: *const u8, metadata: usize) -> &'a Self {
+        // SAFETY of the cast: `repr(transparent)` over `[A]` gives Self the
+        // same layout and slice metadata as the cell run (which includes the
+        // trailing mask cell when tracking).
+        let len = metadata + S::TRACKING as usize;
+        unsafe { &*(std::ptr::slice_from_raw_parts(ptr as *const A, len) as *const Self) }
+    }
+
+    #[inline(always)]
+    unsafe fn from_entry_mut<'a>(ptr: *mut u8, metadata: usize) -> &'a mut Self {
+        let len = metadata + S::TRACKING as usize;
+        unsafe { &mut *(std::ptr::slice_from_raw_parts_mut(ptr as *mut A, len) as *mut Self) }
+    }
+}
+
+impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S: SeenMask>
     AggregationValue for Dynamic<A, ONLY_ADDITIVE, S>
 {
     type Owned = OwnedDynamic<A, ONLY_ADDITIVE>;
-    /// Number of aggregation slots (the tracking mask cell is not counted).
-    type StorageMetadata = usize;
     type Reader<'b> = DynReader<'b>;
     /// Slot descriptors and the arena used by strings and owned top-k copies.
     type SharedContext = (Arc<[AggregationSlot]>, Arc<SharedArena>);
@@ -147,30 +176,6 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
             4 => body.run::<4>(),
             _ => body.run::<0>(),
         }
-    }
-
-    fn stored_size(metadata: usize) -> usize {
-        // A tracking run appends one whole cell holding the seen bits.
-        (metadata + S::TRACKING as usize) * size_of::<A>()
-    }
-
-    fn stored_align() -> usize {
-        align_of::<A>()
-    }
-
-    #[inline(always)]
-    unsafe fn from_entry<'a>(ptr: *const u8, metadata: usize) -> &'a Self {
-        // SAFETY of the cast: `repr(transparent)` over `[A]` gives Self the
-        // same layout and slice metadata as the cell run (which includes the
-        // trailing mask cell when tracking).
-        let len = metadata + S::TRACKING as usize;
-        unsafe { &*(std::ptr::slice_from_raw_parts(ptr as *const A, len) as *const Self) }
-    }
-
-    #[inline(always)]
-    unsafe fn from_entry_mut<'a>(ptr: *mut u8, metadata: usize) -> &'a mut Self {
-        let len = metadata + S::TRACKING as usize;
-        unsafe { &mut *(std::ptr::slice_from_raw_parts_mut(ptr as *mut A, len) as *mut Self) }
     }
 
     #[inline(always)]

@@ -46,7 +46,7 @@ mod string;
 pub use string::{ArenaKey, StringKeyExtractor};
 
 mod row;
-pub use row::{RowKeyExtractor, RowKeySchema};
+pub use row::{RowKeyExtractor, RowKeySchema, RowScratch};
 
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.

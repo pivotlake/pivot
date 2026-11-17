@@ -1,5 +1,6 @@
+use super::PersistedKey;
 use super::hash_table::{EntryLayout, EntryView, fast_div, reciprocal};
-use super::{AggregationValue, PersistedKey};
+use crate::operations::unary::group::values::StoredValue;
 use std::marker::PhantomData;
 
 /// A copyable reader over a table's slots: how hashes and slot indices map
@@ -64,7 +65,7 @@ use std::marker::PhantomData;
 /// The lifetime records that the raw slab addresses belong to a borrowed
 /// table. A reader must be rebuilt after resizing because resizing replaces
 /// the slab list and changes the slot mask and shift.
-pub(crate) struct TableReader<'table, K, V: AggregationValue + ?Sized> {
+pub(crate) struct TableReader<'table, K, V: StoredValue + ?Sized> {
     /// Reciprocal of the number of whole entries in one slab.
     ///
     /// `fast_div(index, entries_per_slab_reciprocal)` returns the slab that
@@ -129,15 +130,15 @@ pub(crate) struct TableReader<'table, K, V: AggregationValue + ?Sized> {
     table_borrow: PhantomData<&'table K>,
 }
 
-impl<K, V: AggregationValue + ?Sized> Clone for TableReader<'_, K, V> {
+impl<K, V: StoredValue + ?Sized> Clone for TableReader<'_, K, V> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<K, V: AggregationValue + ?Sized> Copy for TableReader<'_, K, V> {}
+impl<K, V: StoredValue + ?Sized> Copy for TableReader<'_, K, V> {}
 
-impl<'table, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'table, K, V> {
+impl<'table, K: PersistedKey, V: StoredValue + ?Sized> TableReader<'table, K, V> {
     /// Creates a layout whose raw addresses are valid for `'table`.
     ///
     /// # Safety
