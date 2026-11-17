@@ -15,7 +15,7 @@ use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use object_storage::ObjectPath;
 
 use super::{
-    AssembledFile, Partitioning, TextIndexFile, TextIndexedColumn, encode_record_batches_spec,
+    AssembledFile, Partitioning, TextIndexDefinition, TextIndexFile, encode_record_batches_spec,
 };
 
 /// A 64 MiB file-cache ring, as the other in-crate write tests use.
@@ -32,8 +32,9 @@ fn rows_of_text(rows: &[(i64, Option<&str>)]) -> RecordBatch {
     RecordBatch::try_new(Arc::new(schema), vec![keys, texts]).unwrap()
 }
 
-fn index_of(column: &str, letter_case: LetterCase) -> Arc<[TextIndexedColumn]> {
-    Arc::from([TextIndexedColumn {
+fn index_of(column: &str, letter_case: LetterCase) -> Arc<[TextIndexDefinition]> {
+    Arc::from([TextIndexDefinition {
+        name: format!("idx_{column}"),
         column: column.to_string(),
         letter_case,
     }])
@@ -41,12 +42,12 @@ fn index_of(column: &str, letter_case: LetterCase) -> Arc<[TextIndexedColumn]> {
 
 /// Write `batch` as one file sorted by `key`, in row groups of
 /// `rows_per_group` rows, with `text_indexes`. Returns the bytes of each
-/// text index the file came with, by its column, or the error the write
-/// failed with.
+/// index file the data file came with, by its index's name, or the error
+/// the write failed with.
 fn write_text_indexes(
     batch: RecordBatch,
     rows_per_group: usize,
-    text_indexes: Arc<[TextIndexedColumn]>,
+    text_indexes: Arc<[TextIndexDefinition]>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
     let schema = batch.schema();
@@ -66,9 +67,9 @@ fn write_text_indexes(
         Ok(file
             .text_indexes
             .iter()
-            .map(|TextIndexFile { column, bytes }| {
+            .map(|TextIndexFile { index_name, bytes }| {
                 (
-                    column.clone(),
+                    index_name.clone(),
                     bytes.runs().flatten().copied().collect::<Vec<u8>>(),
                 )
             })
@@ -149,8 +150,8 @@ fn a_text_indexed_column_comes_with_an_index_of_its_tokens_by_row_of_the_file() 
     let indexes = write_text_indexes(batch, 1_024, index_of("message", LetterCase::Kept)).unwrap();
 
     // The file is sorted by key, so "net down" is its row 0.
-    let (column, index) = &indexes[0];
-    assert_eq!(column, "message");
+    let (index_name, index) = &indexes[0];
+    assert_eq!(index_name, "idx_message");
     assert_eq!(
         find_rows(index, &["disk", "full", "net", "ok", "absent"]),
         [
@@ -236,12 +237,36 @@ fn a_text_index_of_a_column_that_is_not_text_fails_the_write() {
 }
 
 #[test]
-fn an_index_file_is_named_after_its_data_file_and_its_column() {
+fn two_indexes_of_one_column_each_come_with_an_index_file_in_their_own_letter_case() {
+    let batch = rows_of_text(&[(1, Some("Error")), (2, Some("error"))]);
+    let text_indexes: Arc<[TextIndexDefinition]> = Arc::from([
+        TextIndexDefinition {
+            name: "as_written".to_string(),
+            column: "message".to_string(),
+            letter_case: LetterCase::Kept,
+        },
+        TextIndexDefinition {
+            name: "lowered".to_string(),
+            column: "message".to_string(),
+            letter_case: LetterCase::Lowered,
+        },
+    ]);
+
+    let indexes = write_text_indexes(batch, 1_024, text_indexes).unwrap();
+
+    assert_eq!(indexes[0].0, "as_written");
+    assert_eq!(find_rows(&indexes[0].1, &["Error"]), [Some(vec![0])]);
+    assert_eq!(indexes[1].0, "lowered");
+    assert_eq!(find_rows(&indexes[1].1, &["error"]), [Some(vec![0, 1])]);
+}
+
+#[test]
+fn an_index_file_is_in_its_index_directory_under_the_name_of_its_data_file() {
     let data_file = ObjectPath::new("pivot-1234.parquet");
 
-    let plain = TextIndexFile::path_for(&data_file, "message");
-    let with_a_slash = TextIndexFile::path_for(&data_file, "a/b");
+    let plain = TextIndexDefinition::path_of_index_file("idx_message", &data_file);
+    let with_a_slash = TextIndexDefinition::path_of_index_file("a/b", &data_file);
 
-    assert_eq!(plain.as_str(), "pivot-1234.parquet.message.textindex");
-    assert_eq!(with_a_slash.as_str(), "pivot-1234.parquet.a%2fb.textindex");
+    assert_eq!(plain.as_str(), "idx_message/pivot-1234.parquet.textindex");
+    assert_eq!(with_a_slash.as_str(), "a%2fb/pivot-1234.parquet.textindex");
 }

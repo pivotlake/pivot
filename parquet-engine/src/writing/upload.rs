@@ -6,10 +6,10 @@
 //! INSERT's transaction and a compaction both drain what it uploaded and
 //! commit it through their own table format.
 //!
-//! A file that comes with text indexes has each written into the write's
-//! text index directory, named after the data file and the column
-//! ([`TextIndexFile::path_for`]), and is reported once all of them and the
-//! data file have landed.
+//! A file that comes with index files has each written into its index's
+//! directory in the table's indexes directory, named after the data file
+//! ([`TextIndexDefinition::path_of_index_file`]), and is reported once all of
+//! them and the data file have landed.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -29,7 +29,7 @@ use dispatch::{
 use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 use planner::catalog::Column;
 
-use super::{AssembledFile, TextIndexFile};
+use super::{AssembledFile, TextIndexDefinition, TextIndexFile};
 use crate::RowGroupMetadata;
 
 /// Upload assembled Parquet files over the ring and push every completion onto
@@ -41,14 +41,15 @@ use crate::RowGroupMetadata;
 /// land: an INSERT stages the pending insert its transaction commits there;
 /// compaction, which commits its files itself, has nothing to run.
 ///
-/// The text indexes the files come with are written into
-/// `text_index_directory` of `store`, which the caller has made sure exists.
-/// It is `None` for a write whose files come with none.
+/// The index files the data files come with are written into
+/// `indexes_directory` of `store`, each in its index's directory there, which
+/// the caller has made sure exist. It is `None` for a write whose files come
+/// with none.
 pub fn upload_files_spec<OF>(
     uploaded_files: UploadedFiles,
     store: Arc<dyn ObjectStore>,
     directory: ObjectPath,
-    text_index_directory: Option<ObjectPath>,
+    indexes_directory: Option<ObjectPath>,
     declared_columns: Arc<[Column]>,
     on_start: Option<Box<dyn FnOnce() + Send>>,
     encoded: OperatorSpec<AssembledFile, OF>,
@@ -65,7 +66,7 @@ where
     let remaining_workers = Arc::new(AtomicUsize::new(workers));
     // Every file the write uploads names the one directory through this.
     let directory = Arc::new(directory);
-    let text_index_directory = text_index_directory.map(Arc::new);
+    let indexes_directory = indexes_directory.map(Arc::new);
     // One factory per worker, but only the first runs `on_start`.
     let mut on_start = on_start;
     let uploads = encoded.chain(
@@ -76,7 +77,7 @@ where
                 uploaded_files: uploaded_files.clone(),
                 store: Arc::clone(&store),
                 directory: Arc::clone(&directory),
-                text_index_directory: text_index_directory.clone(),
+                indexes_directory: indexes_directory.clone(),
                 on_start: on_start.take(),
                 rows: rows.clone(),
                 remaining_workers: remaining_workers.clone(),
@@ -100,14 +101,15 @@ pub struct UploadedFile {
     pub partition: Option<crate::PartitionValues>,
     pub row_groups: Vec<Arc<RowGroupMetadata>>,
     pub sorted_by: Arc<[String]>,
-    /// The file's text indexes, each by its path relative to the write's
-    /// text index directory, with its size.
+    /// The file's index files, each by its path relative to the write's
+    /// indexes directory, with its size.
     pub text_indexes: Vec<FileRef>,
     store: Arc<dyn ObjectStore>,
     /// Shared by every file of one write.
     directory: Arc<ObjectPath>,
-    /// Where the text indexes of the write's files went, when it has any.
-    text_index_directory: Option<Arc<ObjectPath>>,
+    /// The directory the index files of the write's files went under, when
+    /// it has any.
+    indexes_directory: Option<Arc<ObjectPath>>,
 }
 
 impl UploadedFile {
@@ -122,10 +124,10 @@ impl UploadedFile {
         &self.directory
     }
 
-    /// The directory the file's text indexes were written into, which their
+    /// The directory the file's index files were written under, which their
     /// paths are relative to. `None` for a write without text indexes.
-    pub fn text_index_directory(&self) -> Option<&ObjectPath> {
-        self.text_index_directory.as_deref()
+    pub fn indexes_directory(&self) -> Option<&ObjectPath> {
+        self.indexes_directory.as_deref()
     }
 
     /// Delete the file, never recorded, and its text indexes from where they
@@ -134,7 +136,7 @@ impl UploadedFile {
     pub fn delete(&self) {
         let data_file = self.directory.resolve(&self.file.path);
         let text_indexes = self.text_indexes.iter().map(|text_index| {
-            self.text_index_directory
+            self.indexes_directory
                 .as_ref()
                 .expect("a file with text indexes was written with a directory for them")
                 .resolve(&text_index.path)
@@ -198,7 +200,7 @@ pub(super) struct UploadFactory {
     store: Arc<dyn ObjectStore>,
     directory: Arc<ObjectPath>,
     /// Where the files' text indexes are written, in the same store.
-    text_index_directory: Option<Arc<ObjectPath>>,
+    indexes_directory: Option<Arc<ObjectPath>>,
     /// Run once when this factory builds its operator. Held by one worker's
     /// factory only.
     on_start: Option<Box<dyn FnOnce() + Send>>,
@@ -225,7 +227,7 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
             uploaded_files: self.uploaded_files,
             store: self.store,
             directory: self.directory,
-            text_index_directory: self.text_index_directory,
+            indexes_directory: self.indexes_directory,
             rows: self.rows,
             remaining_workers: self.remaining_workers,
             in_flight: HashMap::new(),
@@ -261,7 +263,7 @@ pub(super) struct Upload {
     store: Arc<dyn ObjectStore>,
     directory: Arc<ObjectPath>,
     /// Where the files' text indexes are written, in the same store.
-    text_index_directory: Option<Arc<ObjectPath>>,
+    indexes_directory: Option<Arc<ObjectPath>>,
     /// Running total of inserted rows, shared by every worker (see
     /// [`UploadFactory`]). Added to as completions land; read once at `finish`.
     rows: Arc<AtomicUsize>,
@@ -350,7 +352,7 @@ impl Upload {
             text_indexes: pending.text_indexes,
             store: Arc::clone(&self.store),
             directory: Arc::clone(&self.directory),
-            text_index_directory: self.text_index_directory.clone(),
+            indexes_directory: self.indexes_directory.clone(),
         });
         // Relaxed: the finish barrier (AcqRel on the sibling counter) publishes
         // this add to whichever worker reads the total.
@@ -380,10 +382,10 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
         io.write(self.open_for_write(&key, data.len())?, data.clone())?;
 
         let mut text_indexes = Vec::with_capacity(encoded.text_indexes.len());
-        for TextIndexFile { column, bytes } in encoded.text_indexes {
-            let index_path = TextIndexFile::path_for(&file.path, &column);
+        for TextIndexFile { index_name, bytes } in encoded.text_indexes {
+            let index_path = TextIndexDefinition::path_of_index_file(&index_name, &file.path);
             let index_key = self
-                .text_index_directory
+                .indexes_directory
                 .as_ref()
                 .expect("a write whose files have text indexes has a directory for them")
                 .resolve(&index_path);

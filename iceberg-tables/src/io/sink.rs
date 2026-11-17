@@ -15,7 +15,7 @@ use dispatch::{RecordBatchOperatorSpec, UnaryError};
 use object_storage::{ObjectPath, ObjectStore};
 use parquet_engine::writing::upload::{UploadedFiles, upload_files_spec};
 use parquet_engine::writing::{
-    TextIndexedColumn, encode_record_batches_spec, unshred_batches_spec,
+    TextIndexDefinition, encode_record_batches_spec, unshred_batches_spec,
 };
 use planner::catalog::Column;
 
@@ -88,14 +88,14 @@ pub struct InsertTarget {
     pub text_indexes: Option<TextIndexTarget>,
 }
 
-/// The text indexes an INSERT writes with its files: of which columns, and
-/// into which directory of the target's store.
+/// The text indexes an INSERT writes index files for, with each of its data
+/// files.
 #[derive(Clone, Debug)]
 pub struct TextIndexTarget {
-    /// The directory the index files are written into, each named after its
-    /// data file and its column.
-    pub directory: ObjectPath,
-    pub columns: Arc<[TextIndexedColumn]>,
+    /// The table's indexes directory, in the target's store. Each index
+    /// keeps its files in a directory of its own there.
+    pub indexes_directory: ObjectPath,
+    pub definitions: Arc<[TextIndexDefinition]>,
 }
 
 impl InsertTarget {
@@ -116,7 +116,14 @@ impl InsertTarget {
     ) -> Result<RecordBatchOperatorSpec> {
         self.store.prepare_write()?;
         if let Some(text_indexes) = &self.text_indexes {
-            self.store.create_dir(&text_indexes.directory)?;
+            for definition in text_indexes.definitions.iter() {
+                let directory_name = TextIndexDefinition::directory_name(&definition.name);
+                self.store.create_dir(
+                    &text_indexes
+                        .indexes_directory
+                        .resolve(&ObjectPath::new(directory_name)),
+                )?;
+            }
         }
         // In `INSERT INTO x VALUES (...)`, VALUES emits batches with unnamed columns
         // because only INSERT knows which table columns receive the rows. The
@@ -172,7 +179,7 @@ impl InsertTarget {
             TARGET_IN_MEMORY_BYTES_PER_FILE,
             self.text_indexes
                 .as_ref()
-                .map(|text_indexes| Arc::clone(&text_indexes.columns))
+                .map(|text_indexes| Arc::clone(&text_indexes.definitions))
                 .unwrap_or_default(),
         );
         Ok(upload_files_spec(
@@ -181,7 +188,7 @@ impl InsertTarget {
             self.directory.clone(),
             self.text_indexes
                 .as_ref()
-                .map(|text_indexes| text_indexes.directory.clone()),
+                .map(|text_indexes| text_indexes.indexes_directory.clone()),
             self.columns.clone().into(),
             Some(on_start),
             encoded,

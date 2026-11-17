@@ -27,8 +27,8 @@ use dispatch::memory::{FileBytes, Slab, SlabAllocator};
 
 use super::error::{WriteError, WriteResult};
 use super::types::{
-    AssembledFile, ColumnTokenRun, EncodedLeaf, EncodedLeafChunk, FileId, RowGroupContext,
-    RowGroupId, TextIndexFile, TextIndexedColumn,
+    AssembledFile, EncodedLeaf, EncodedLeafChunk, FileId, IndexTokenRun, RowGroupContext,
+    RowGroupId, TextIndexDefinition, TextIndexFile,
 };
 use dispatch::text_index::{PlacedTokenRun, TokenRun};
 
@@ -160,9 +160,8 @@ struct AssembledRowGroup {
     row_count: usize,
     bytes: FileBytes,
     columns: Vec<ColumnChunk>,
-    /// The tokens of the row group's text, one run for each text indexed
-    /// column.
-    token_runs: Vec<ColumnTokenRun>,
+    /// The tokens of the row group's text, one run for each text index.
+    token_runs: Vec<IndexTokenRun>,
 }
 
 impl AssembledRowGroup {
@@ -177,7 +176,7 @@ impl AssembledRowGroup {
         let mut token_runs = Vec::new();
         for chunk in chunks {
             columns.push(write_leaf_chunk(&mut bytes, chunk.leaf)?);
-            token_runs.extend(chunk.token_run);
+            token_runs.extend(chunk.token_runs);
         }
         Ok(Self {
             row_group_id,
@@ -203,7 +202,7 @@ fn build_files(
     schema: &SchemaRef,
     groups: Vec<AssembledRowGroup>,
     target_size: Option<usize>,
-    text_indexes: &[TextIndexedColumn],
+    text_indexes: &[TextIndexDefinition],
     allocator: &mut SlabAllocator,
 ) -> WriteResult<Vec<(FileBytes, FileMetaData, Vec<TextIndexFile>)>> {
     let ranges = match target_size {
@@ -222,7 +221,7 @@ fn build_files(
         .map(|range| {
             let mut file_groups: Vec<AssembledRowGroup> =
                 groups.by_ref().take(range.len()).collect();
-            let mut runs_of_columns: Vec<Vec<PlacedTokenRun>> =
+            let mut runs_of_indexes: Vec<Vec<PlacedTokenRun>> =
                 text_indexes.iter().map(|_| Vec::new()).collect();
             let mut rows_before_group = 0usize;
             for group in &mut file_groups {
@@ -231,12 +230,8 @@ fn build_files(
                         rows: rows_before_group,
                     }
                 })?;
-                for ColumnTokenRun {
-                    indexed_column,
-                    run,
-                } in group.token_runs.drain(..)
-                {
-                    runs_of_columns[indexed_column].push(PlacedTokenRun { first_row, run });
+                for IndexTokenRun { index, run } in group.token_runs.drain(..) {
+                    runs_of_indexes[index].push(PlacedTokenRun { first_row, run });
                 }
                 rows_before_group += group.row_count;
             }
@@ -247,17 +242,17 @@ fn build_files(
             }
             let text_index_files = text_indexes
                 .iter()
-                .zip(runs_of_columns)
-                .map(|(indexed, runs)| {
+                .zip(runs_of_indexes)
+                .map(|(definition, runs)| {
                     // A run arrives with the column's leaf of every row
                     // group, so fewer means the column has no such leaf.
                     if runs.len() != file_groups.len() {
                         return Err(WriteError::TextIndexOfNonTextColumn {
-                            column: indexed.column.clone(),
+                            column: definition.column.clone(),
                         });
                     }
                     Ok(TextIndexFile {
-                        column: indexed.column.clone(),
+                        index_name: definition.name.clone(),
                         bytes: TokenRun::write_index_file(&runs, allocator),
                     })
                 })
@@ -692,7 +687,7 @@ mod tests {
                     context: file_context(&schema, file_id),
                     leaf_index: 0,
                     leaf: encode_leaf(leaf, &mut page_allocator).unwrap(),
-                    token_run: None,
+                    token_runs: Vec::new(),
                 }
             })
             .collect();
@@ -727,7 +722,7 @@ mod tests {
                                 context: context.clone(),
                                 leaf_index: chunks.len(),
                                 leaf: encode_leaf(leaf, &mut allocator).unwrap(),
-                                token_run: None,
+                                token_runs: Vec::new(),
                             });
                         }
                     }

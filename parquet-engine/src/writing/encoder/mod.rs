@@ -28,7 +28,7 @@ use super::compression;
 use super::error::{WriteError, WriteResult};
 use super::leaves::Leaf;
 use super::stats;
-use super::types::{ColumnTokenRun, EncodedLeaf, EncodedLeafChunk, LeafChunkJob};
+use super::types::{EncodedLeaf, EncodedLeafChunk, IndexTokenRun, LeafChunkJob};
 use arrow_array::{Array, ArrayRef, StringViewArray};
 use dispatch::arrays::concat_chunks;
 use dispatch::text_index::{LetterCase, TokenRun, TokenRunBuilder};
@@ -100,33 +100,29 @@ impl Unary<LeafChunkJob, EncodedLeafChunk> for LeafEncoder {
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
         let values = concat_chunks(allocator, &job.value_chunks).map_err(WriteError::from)?;
-        // A text indexed column is one leaf, named as the column is.
-        let indexed_column = job
-            .context
-            .file_info
-            .text_indexes
-            .iter()
-            .position(|indexed| job.path.len() == 1 && job.path[0] == indexed.column);
-        let token_run = match indexed_column {
-            None => None,
-            Some(indexed_column) => {
-                let indexed = &job.context.file_info.text_indexes[indexed_column];
-                let token_run_allocator = self
-                    .token_run_allocator
-                    .get_or_insert_with(|| SlabAllocator::new(false));
-                Some(ColumnTokenRun {
-                    indexed_column,
-                    run: Self::build_token_run(
-                        &indexed.column,
-                        &values,
-                        job.def_levels.as_deref(),
-                        job.max_def_level,
-                        indexed.letter_case,
-                        token_run_allocator,
-                    )?,
-                })
+        // The column of a text index is one leaf, named as the column is.
+        // Each index of it gets a run of its own: they may differ in letter
+        // case.
+        let mut token_runs = Vec::new();
+        for (index, definition) in job.context.file_info.text_indexes.iter().enumerate() {
+            if job.path.len() != 1 || job.path[0] != definition.column {
+                continue;
             }
-        };
+            let token_run_allocator = self
+                .token_run_allocator
+                .get_or_insert_with(|| SlabAllocator::new(false));
+            token_runs.push(IndexTokenRun {
+                index,
+                run: Self::build_token_run(
+                    &definition.column,
+                    &values,
+                    job.def_levels.as_deref(),
+                    job.max_def_level,
+                    definition.letter_case,
+                    token_run_allocator,
+                )?,
+            });
+        }
         let leaf = Leaf {
             path: job.path,
             values,
@@ -138,7 +134,7 @@ impl Unary<LeafChunkJob, EncodedLeafChunk> for LeafEncoder {
             context: job.context,
             leaf_index: job.leaf_index,
             leaf: encoded,
-            token_run,
+            token_runs,
         })?;
         Ok(())
     }

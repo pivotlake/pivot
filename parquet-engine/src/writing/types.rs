@@ -29,48 +29,73 @@ pub(crate) type RowGroupId = u64;
 /// Unique identity of an output file within one write pipeline.
 pub(crate) type FileId = u64;
 
-/// A column of the table that a text index is kept of: every file written
-/// comes with an index file of the tokens of this column's text.
+/// A text index of a table: the tokens of one column's text, each with the
+/// rows it appears in. Every data file written to the table comes with an
+/// index file for each of the table's text indexes.
+///
+/// A table keeps its indexes in one directory, each index in a directory of
+/// its own there, named after the index:
+///
+/// ```text
+///   <the table's indexes directory>/
+///       idx_message/
+///           pivot-1a2b.parquet.textindex     the index of data file pivot-1a2b.parquet
+///           pivot-3c4d.parquet.textindex
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TextIndexedColumn {
+pub struct TextIndexDefinition {
+    /// The index's name, which its directory is named after.
+    pub name: String,
+    /// The column whose text is indexed.
     pub column: String,
     /// Whether tokens differing only in letter case are one token of the
     /// index.
     pub letter_case: LetterCase,
 }
 
-/// The text index of one column of one data file, ready to be written beside
-/// it. Like the data file's, its bytes are worker-owned ring slabs.
-pub struct TextIndexFile {
-    pub column: String,
-    pub bytes: FileBytes,
-}
-
-impl TextIndexFile {
-    /// Where the text index of `column` of a data file is, in its table's
-    /// text index directory: the data file's own path there, with the column
-    /// and `.textindex` after it. Bytes of the column's name that could mean
-    /// something in a path are written as `%` and two hex digits.
-    pub fn path_for(data_file: &ObjectPath, column: &str) -> ObjectPath {
-        let mut path = format!("{}.", data_file.as_str());
-        for byte in column.bytes() {
+impl TextIndexDefinition {
+    /// The name of the directory of the index named `index_name`, in its
+    /// table's indexes directory: the index's name, with every byte that
+    /// could mean something in a path written as `%` and two hex digits.
+    pub fn directory_name(index_name: &str) -> String {
+        let mut directory_name = String::with_capacity(index_name.len());
+        for byte in index_name.bytes() {
             if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
-                path.push(byte as char);
+                directory_name.push(byte as char);
             } else {
-                path.push_str(&format!("%{byte:02x}"));
+                directory_name.push_str(&format!("%{byte:02x}"));
             }
         }
-        path.push_str(".textindex");
-        ObjectPath::new(path)
+        directory_name
+    }
+
+    /// Where the index named `index_name` keeps its index file of
+    /// `data_file`, relative to its table's indexes directory: in the
+    /// index's directory, under the data file's path with `.textindex`
+    /// after it.
+    pub fn path_of_index_file(index_name: &str, data_file: &ObjectPath) -> ObjectPath {
+        ObjectPath::new(format!(
+            "{}/{}.textindex",
+            Self::directory_name(index_name),
+            data_file.as_str()
+        ))
     }
 }
 
-/// The token run of one row group's text, on its way to the file's assembly
-/// worker with the encoded leaf it was made from.
-pub(crate) struct ColumnTokenRun {
-    /// Which of the file's text indexed columns the run is of, by position in
+/// The index file one text index has of one data file, ready to be written.
+/// Like the data file's, its bytes are worker-owned ring slabs.
+pub struct TextIndexFile {
+    /// The name of the index the file belongs to.
+    pub index_name: String,
+    pub bytes: FileBytes,
+}
+
+/// The token run of one row group's text for one text index, on its way to
+/// the file's assembly worker with the encoded leaf it was made from.
+pub(crate) struct IndexTokenRun {
+    /// Which of the file's text indexes the run is for, by position in
     /// [`FileAssemblyInfo::text_indexes`].
-    pub(crate) indexed_column: usize,
+    pub(crate) index: usize,
     pub(crate) run: TokenRun,
 }
 
@@ -85,8 +110,8 @@ pub(crate) struct FileAssemblyInfo {
     /// and footers are excluded. `None` for INSERT. An individually oversized
     /// row group remains one file.
     pub(crate) max_file_size: Option<usize>,
-    /// The columns an index file is written of, beside each data file.
-    pub(crate) text_indexes: Arc<[TextIndexedColumn]>,
+    /// The text indexes an index file is written for, with each data file.
+    pub(crate) text_indexes: Arc<[TextIndexDefinition]>,
 }
 
 /// A complete Parquet file and the metadata needed to add it to the table.
@@ -103,8 +128,7 @@ pub struct AssembledFile {
     /// columns, and a compaction's when every row it merged arrived in their
     /// order. Empty for a file whose rows are in no such order.
     pub sorted_by: Arc<[String]>,
-    /// The file's text indexes, one for each text indexed column of the
-    /// write.
+    /// The file's index files, one for each text index of the write.
     pub text_indexes: Vec<TextIndexFile>,
 }
 
@@ -135,7 +159,7 @@ pub(crate) struct FilePlan {
     pub(crate) target_rows_per_group: usize,
     pub(crate) max_file_size: Option<usize>,
     /// See [`FileAssemblyInfo::text_indexes`].
-    pub(crate) text_indexes: Arc<[TextIndexedColumn]>,
+    pub(crate) text_indexes: Arc<[TextIndexDefinition]>,
 }
 
 /// A file whose row order is final and ready for row-group planning.
@@ -314,9 +338,9 @@ pub(crate) struct EncodedLeafChunk {
     /// See [`LeafChunkJob::leaf_index`].
     pub(crate) leaf_index: usize,
     pub(crate) leaf: EncodedLeaf,
-    /// The tokens of the row group's text, when the leaf is a text indexed
-    /// column.
-    pub(crate) token_run: Option<ColumnTokenRun>,
+    /// The tokens of the row group's text, one run for each text index of
+    /// the leaf's column.
+    pub(crate) token_runs: Vec<IndexTokenRun>,
 }
 
 impl WorkerIdOutput for EncodedLeafChunk {

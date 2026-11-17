@@ -69,7 +69,7 @@ pub use stats::aggregate_file_stats;
 mod types;
 pub mod upload;
 
-pub use types::{AssembledFile, TextIndexFile, TextIndexedColumn};
+pub use types::{AssembledFile, TextIndexDefinition, TextIndexFile};
 
 use std::sync::Arc;
 
@@ -127,7 +127,7 @@ pub fn encode_record_batches_spec(
     sort_column_names: Arc<[String]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
-    text_indexes: Arc<[TextIndexedColumn]>,
+    text_indexes: Arc<[TextIndexDefinition]>,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
     let Partitioning {
         key_columns: partition_column_names,
@@ -203,7 +203,7 @@ pub fn encode_compaction_batches_spec(
     sources_are_sorted: bool,
     target_rows_per_group: usize,
     max_file_size: usize,
-    text_indexes: Arc<[TextIndexedColumn]>,
+    text_indexes: Arc<[TextIndexDefinition]>,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
     let spec = unshred_batches_spec(spec);
     let order_by = sort_order(&schema, &sort_column_names);

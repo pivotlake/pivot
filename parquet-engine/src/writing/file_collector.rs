@@ -30,7 +30,7 @@ use dispatch::{
 use super::error::WriteError;
 use super::partition_sorter::SortedPartitionRun;
 use super::types::{
-    FileMergeContext, FileOrderInput, FilePlan, NodeMergeRequest, ReadyFile, TextIndexedColumn,
+    FileMergeContext, FileOrderInput, FilePlan, NodeMergeRequest, ReadyFile, TextIndexDefinition,
 };
 use crate::scalar_values_from_row;
 
@@ -78,8 +78,8 @@ pub(super) struct FileCollectorFactory {
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
-    /// The columns an index file is written of, beside each data file.
-    text_indexes: Arc<[TextIndexedColumn]>,
+    /// The text indexes an index file is written for, with each data file.
+    text_indexes: Arc<[TextIndexDefinition]>,
     topology: Topology,
     shared: Arc<SharedCollector>,
 }
@@ -98,7 +98,7 @@ pub(super) fn factories(
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
-    text_indexes: Arc<[TextIndexedColumn]>,
+    text_indexes: Arc<[TextIndexDefinition]>,
     topology: Topology,
 ) -> Vec<FileCollectorFactory> {
     let shared = Arc::new(SharedCollector {
@@ -226,7 +226,7 @@ pub(super) struct FileCollector {
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
     /// See [`FileCollectorFactory`].
-    text_indexes: Arc<[TextIndexedColumn]>,
+    text_indexes: Arc<[TextIndexDefinition]>,
     topology: Topology,
     shared: Arc<SharedCollector>,
     /// The partitions this worker has already looked up in `shared`.
