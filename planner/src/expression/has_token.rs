@@ -3,7 +3,7 @@
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::Type;
-use arrow_array::{ArrayRef, Datum, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch};
 use dispatch::HasToken as DispatchHasToken;
 use std::fmt::{self, Display};
 use std::sync::Arc;
