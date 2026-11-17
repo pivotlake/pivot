@@ -6,7 +6,7 @@ use crate::memory::{BUFFER_SIZE, Slab, SlabAllocator};
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::TableReader;
 use crate::operations::unary::group::keys::StoredKey;
-use crate::operations::unary::group::values::AggregationValue;
+use crate::operations::unary::group::values::{AggregationValue, StoredValue};
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
@@ -131,7 +131,7 @@ pub fn entry_stride<K, V: AggregationValue + ?Sized>(ctx: &V::SharedContext) -> 
     entry_layout::<K, V>(V::storage_metadata(ctx)).stride
 }
 
-pub(super) fn entry_layout<K, V: AggregationValue + ?Sized>(
+pub(super) fn entry_layout<K, V: StoredValue + ?Sized>(
     metadata: V::StorageMetadata,
 ) -> EntryLayout {
     // Alignment and size for hash, key, and value.
@@ -245,7 +245,7 @@ fn prefetch_l2_line(ptr: *const u8) {
 ///
 /// This lets one merge job scan only its ranges. Storing the full hash also
 /// avoids hashing large keys again during resize and merge.
-pub struct HashTable<K: PersistedKey, V: AggregationValue + ?Sized> {
+pub struct HashTable<K: PersistedKey, V: StoredValue + ?Sized> {
     slot_mask: usize,
     slot_shift: u32,
     collisions: usize,
@@ -274,17 +274,53 @@ pub struct HashTable<K: PersistedKey, V: AggregationValue + ?Sized> {
     _phantom: PhantomData<(K, *const V)>,
 }
 
-unsafe impl<K: PersistedKey, V: AggregationValue + ?Sized> Send for HashTable<K, V> {}
+unsafe impl<K: PersistedKey, V: StoredValue + ?Sized> Send for HashTable<K, V> {}
 
-impl<K: PersistedKey, V: AggregationValue + ?Sized> HashTable<K, V> {
+impl<K: PersistedKey, V: StoredValue + ?Sized> HashTable<K, V> {
     /// Creates a zeroed table with power-of-two capacity.
     pub fn new(
         allocator: &mut SlabAllocator,
         expected_capacity: usize,
         hash_left_shift: u32,
         ctx: &V::SharedContext,
-    ) -> Self {
+    ) -> Self
+    where
+        V: AggregationValue,
+    {
         let storage_metadata = V::storage_metadata(ctx);
+        let layout = entry_layout::<K, V>(storage_metadata);
+        let entries_per_slab = BUFFER_SIZE / layout.stride;
+        let slabs = allocator.create_strided_slabs(expected_capacity, layout.stride, layout.align);
+        HashTable {
+            slot_mask: expected_capacity - 1,
+            length: 0,
+            max_load: max_load_for_len(expected_capacity),
+            hash_left_shift,
+            slot_shift: u64::BITS - expected_capacity.trailing_zeros(),
+            entries_per_slab,
+            entries_per_slab_reciprocal: reciprocal(entries_per_slab as u64),
+            entry_stride: layout.stride,
+            hash_offset: layout.hash_offset,
+            entry_alignment: layout.align,
+            storage_metadata,
+            adjusted_slab_bases: adjusted_bases(&slabs, entries_per_slab, layout.stride),
+            slabs,
+            _phantom: PhantomData,
+            collisions: 0,
+        }
+    }
+
+    /// Creates a zeroed table with power-of-two capacity for a value that is
+    /// not an aggregation, laid out as `storage_metadata` describes.
+    ///
+    /// This repeats the body of [`new`](Self::new) instead of sharing it, so
+    /// that the constructor grouped aggregation uses stays exactly as it is.
+    pub fn with_storage_metadata(
+        allocator: &mut SlabAllocator,
+        expected_capacity: usize,
+        hash_left_shift: u32,
+        storage_metadata: V::StorageMetadata,
+    ) -> Self {
         let layout = entry_layout::<K, V>(storage_metadata);
         let entries_per_slab = BUFFER_SIZE / layout.stride;
         let slabs = allocator.create_strided_slabs(expected_capacity, layout.stride, layout.align);
@@ -358,7 +394,10 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> HashTable<K, V> {
     ///
     /// Iteration order is arbitrary (based on slot positions, not insertion order).
     /// Empty slots (hash == 0) are skipped automatically.
-    pub fn iter(&self, start_offset: usize) -> HashTableIterator<'_, K, V> {
+    pub fn iter(&self, start_offset: usize) -> HashTableIterator<'_, K, V>
+    where
+        V: AggregationValue,
+    {
         HashTableIterator {
             reader: self.reader::<0>(),
             idx: start_offset,
@@ -379,7 +418,10 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> HashTable<K, V> {
     /// runtime-arity fallback, and every fixed-size value) reads the table's
     /// stored metadata.
     #[inline(always)]
-    pub(crate) fn reader<const N: usize>(&self) -> TableReader<'_, K, V> {
+    pub(crate) fn reader<const N: usize>(&self) -> TableReader<'_, K, V>
+    where
+        V: AggregationValue,
+    {
         let metadata = if N == 0 {
             self.storage_metadata
         } else {
@@ -488,16 +530,19 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> HashTable<K, V> {
 }
 
 /// Mutable table handle that keeps the probe reader local across many probes.
-pub struct Prober<'t, K: PersistedKey, V: AggregationValue + ?Sized> {
+pub struct Prober<'t, K: PersistedKey, V: StoredValue + ?Sized> {
     table: &'t mut HashTable<K, V>,
     reader: TableReader<'t, K, V>,
 }
 
-impl<'t, K: PersistedKey, V: AggregationValue + ?Sized> Prober<'t, K, V> {
+impl<'t, K: PersistedKey, V: StoredValue + ?Sized> Prober<'t, K, V> {
     /// A probing handle over `table` for a loop specialized to `N` value
     /// slots, or to the table's own runtime metadata when `N` is zero.
     #[inline(always)]
-    pub fn new<const N: usize>(table: &'t mut HashTable<K, V>) -> Self {
+    pub fn new<const N: usize>(table: &'t mut HashTable<K, V>) -> Self
+    where
+        V: AggregationValue,
+    {
         if N == 0 {
             table.prober()
         } else {
@@ -519,7 +564,9 @@ impl<'t, K: PersistedKey, V: AggregationValue + ?Sized> Prober<'t, K, V> {
         hash: u64,
         key: &K,
         stored: &V,
-    ) {
+    ) where
+        V: AggregationValue,
+    {
         self.grow_if_full(allocator, capacity);
         let live_key = S::resolve_persisted(arena, *key);
         self.merge_from::<false, _>(hash, live_key, stored, ctx);
@@ -555,6 +602,7 @@ impl<'t, K: PersistedKey, V: AggregationValue + ?Sized> Prober<'t, K, V> {
         source: &V,
         ctx: &V::SharedContext,
     ) where
+        V: AggregationValue,
         L: LiveKey<Persisted = K>,
     {
         self.probe_fold::<COUNT_COLLISIONS, L, &V, _, _>(
@@ -591,6 +639,42 @@ impl<'t, K: PersistedKey, V: AggregationValue + ?Sized> Prober<'t, K, V> {
                 self.table
                     .reader_with_unchecked_lifetime(self.reader.storage_metadata)
             };
+        }
+    }
+
+    /// Looks a key up without inserting it, and returns the value stored
+    /// with it. Hash zero is remapped to one, as in
+    /// [`probe_fold`](Self::probe_fold).
+    #[inline(always)]
+    pub fn find<L>(&self, mut hash: u64, key: &L) -> Option<&V>
+    where
+        L: LiveKey<Persisted = K>,
+    {
+        let reader = self.reader;
+        if hash == 0 {
+            hash = 1;
+        }
+        let mut idx = reader.slot_for(hash);
+        loop {
+            let entry = reader.entry_ptr(idx);
+            // SAFETY: `idx` is masked to the table's slots, so `entry` points
+            // at an entry of this table, whose key and value are initialized
+            // whenever its hash is nonzero.
+            unsafe {
+                let stored_hash = *(entry.add(reader.hash_offset) as *const u64);
+                if stored_hash == 0 {
+                    return None;
+                }
+                if stored_hash == hash
+                    && key.eq_persisted(&*(entry.add(reader.key_offset) as *const K))
+                {
+                    return Some(V::from_entry(
+                        entry.add(reader.value_offset),
+                        reader.storage_metadata,
+                    ));
+                }
+            }
+            idx = (idx + 1) & reader.slot_mask;
         }
     }
 
@@ -658,12 +742,12 @@ impl<'t, K: PersistedKey, V: AggregationValue + ?Sized> Prober<'t, K, V> {
 ///
 /// Created by [`HashTable::iter`]. Yields [`EntryView`]s of entries where
 /// `hash != 0` in arbitrary order (based on slot positions, not insertion order).
-pub struct HashTableIterator<'a, K: PersistedKey, V: AggregationValue + ?Sized> {
+pub struct HashTableIterator<'a, K: PersistedKey, V: StoredValue + ?Sized> {
     reader: TableReader<'a, K, V>,
     idx: usize,
 }
 
-impl<'a, K: PersistedKey, V: AggregationValue + ?Sized> Iterator for HashTableIterator<'a, K, V> {
+impl<'a, K: PersistedKey, V: StoredValue + ?Sized> Iterator for HashTableIterator<'a, K, V> {
     type Item = EntryView<'a, K, V>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -699,20 +783,8 @@ mod tests {
     #[derive(Copy, Clone, Default, Debug, PartialEq)]
     struct Count(usize);
 
-    impl AggregationValue for Count {
-        type Owned = Self;
+    impl StoredValue for Count {
         type StorageMetadata = ();
-        type Reader<'b> = ();
-        type SharedContext = ();
-        type ColumnBuilder = CountColumnBuilder;
-        type SortKey = i64;
-        type WorkerContext = ();
-        fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
-        fn storage_metadata(_ctx: &()) {}
-        fn metadata_for_arity<const N: usize>() {}
-        fn dispatch_arity<Ret>(_metadata: (), body: impl ArityBody<Ret>) -> Ret {
-            body.run::<0>()
-        }
         fn stored_size(_metadata: ()) -> usize {
             size_of::<Self>()
         }
@@ -724,6 +796,21 @@ mod tests {
         }
         unsafe fn from_entry_mut<'a>(ptr: *mut u8, _metadata: ()) -> &'a mut Self {
             unsafe { &mut *(ptr as *mut Self) }
+        }
+    }
+
+    impl AggregationValue for Count {
+        type Owned = Self;
+        type Reader<'b> = ();
+        type SharedContext = ();
+        type ColumnBuilder = CountColumnBuilder;
+        type SortKey = i64;
+        type WorkerContext = ();
+        fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
+        fn storage_metadata(_ctx: &()) {}
+        fn metadata_for_arity<const N: usize>() {}
+        fn dispatch_arity<Ret>(_metadata: (), body: impl ArityBody<Ret>) -> Ret {
+            body.run::<0>()
         }
         fn seed(&mut self, _reader: &(), _idx: usize, _wc: &mut ()) {
             *self = Count(1);
