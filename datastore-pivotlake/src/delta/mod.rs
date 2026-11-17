@@ -364,10 +364,7 @@ struct DeltaTable {
     /// The columns the version declares, and those its files are
     /// partitioned and sorted by.
     shape: Arc<TableShape>,
-    /// The version's files. A local view of file swaps this process
-    /// committed through another copy of the table holds the files swapped
-    /// in and not those swapped out, which the log at its snapshot does not
-    /// record; the next refresh reconciles the copy to the committed log.
+    /// The version's files.
     files: TableFiles,
     /// The files the log retired but still remembers, each by the Unix ms its
     /// commit retired it: what vacuum ages a retired file by, so the retention
@@ -743,27 +740,6 @@ impl Table for DeltaTable {
             tombstones: self.tombstones_after(removed.paths, now_ms),
             ..self.clone()
         })))
-    }
-
-    /// The files swapped in stand after every file of the version, in the
-    /// order given, with the footers their writer produced.
-    fn with_files_swapped(
-        &self,
-        removed: RemovedFiles<'_>,
-        added: Vec<TableFile>,
-    ) -> Result<Arc<dyn Table>> {
-        let first_commit_sequence = self.files.latest_commit_sequence + 1;
-        let mut files = self.files.clone();
-        for path in removed.paths {
-            files.remove(removed.partition, path);
-        }
-        for (partition, record) in build_records(&self.shape, added, first_commit_sequence)? {
-            files.insert(&partition, record);
-        }
-        Ok(Arc::new(Self {
-            files,
-            ..self.clone()
-        }))
     }
 
     /// The table's `delta.deletedFileRetentionDuration`, or the datastore's

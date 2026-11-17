@@ -63,7 +63,7 @@
 //! indexed under, its schema, the Pivot types its fields are read as, and
 //! its default partition spec and sort order. Every version that computes
 //! an equal key finds the same entries, whether it was derived from another
-//! by a refresh, a commit or a swap, or loaded on its own; a version under
+//! by a refresh or a commit, or loaded on its own; a version under
 //! another schema, partition spec or sort order finds none of them.
 //! Nothing leaves the cache because a table object went away: an entry
 //! stays until the budget lets go of it, or until whoever deletes its file
@@ -175,8 +175,8 @@ impl SelectedNulls {
 /// An Iceberg table at one committed version, with what reading and writing
 /// it needs: its metadata store, where its files live and the
 /// store they are read through, and the pool its reads run on. Immutable as
-/// a version: a refresh, a commit or a local file swap hands back the next
-/// version as a new value.
+/// a version: a refresh or a commit hands back the next version as a new
+/// value.
 pub struct Table {
     /// The name the table is known by in its datastore.
     name: SchemaQualifiedTableName,
@@ -201,12 +201,6 @@ pub struct Table {
     /// The key this version's partition indexes and the footers of its
     /// files are cached under ([`build_cache_key`]).
     cache_key: TableKey,
-    /// For a local view of file swaps this process committed through
-    /// another copy of the table: per partition, the files swapped out of
-    /// the committed ones and those swapped in, which no manifest of this
-    /// version records. The next refresh reconciles the copy to the
-    /// committed metadata.
-    swapped: Option<Arc<SwappedFiles>>,
 }
 
 /// The key the version `metadata` describes of the table at `location`
@@ -297,19 +291,6 @@ struct UnbuiltIndex {
     position: usize,
     candidates: Vec<Arc<str>>,
     held: Option<Arc<PartitionIndex>>,
-}
-
-/// The files a local view swapped, by the key of their partition.
-type SwappedFiles = HashMap<Arc<[u8]>, PartitionSwap>;
-
-/// What a local view swapped in one partition.
-#[derive(Clone)]
-struct PartitionSwap {
-    partition: Arc<Partition>,
-    /// The committed files swapped out.
-    removed: Vec<ObjectPath>,
-    /// The files swapped in.
-    added: Vec<Arc<IndexedFile>>,
 }
 
 /// The files manifests were decoded for, ahead of the partition indexes
@@ -466,7 +447,6 @@ impl Table {
             manifest_list,
             manifest_list_size,
             cache_key,
-            swapped: None,
         })
     }
 
@@ -486,76 +466,6 @@ impl Table {
             None,
         )
         .map(Some)
-    }
-
-    /// This version with `removed`, files of the partition with the key
-    /// `removed_partition`, dropped and `added` swapped in, as a local view
-    /// of a swap this process already committed through another copy. A
-    /// swap rearranges the table's rows, so what the version counts
-    /// stands.
-    pub fn with_files_swapped(
-        &self,
-        removed_partition: &[u8],
-        removed: &[ObjectPath],
-        added: Vec<DataFileEntry>,
-    ) -> Result<Table> {
-        let mut swapped = self.swapped.as_deref().cloned().unwrap_or_default();
-        if !removed.is_empty() {
-            let partition = self.find_partition(removed_partition)?;
-            let swap = swapped
-                .entry(Arc::from(removed_partition))
-                .or_insert_with(|| PartitionSwap {
-                    partition,
-                    removed: Vec::new(),
-                    added: Vec::new(),
-                });
-            for path in removed {
-                let swapped_in = swap
-                    .added
-                    .iter()
-                    .position(|file| &file.facts.file().path == path);
-                match swapped_in {
-                    Some(position) => {
-                        swap.added.remove(position);
-                    }
-                    None => swap.removed.push(path.clone()),
-                }
-            }
-        }
-        let encoder = self.sort_key_encoder()?;
-        for entry in &added {
-            let file = Arc::new(IndexedFile::uncommitted(
-                entry,
-                &encoder,
-                self.metadata(),
-                &self.location,
-            )?);
-            let swap = swapped
-                .entry(file.partition.encode_key())
-                .or_insert_with(|| PartitionSwap {
-                    partition: Arc::clone(&file.partition),
-                    removed: Vec::new(),
-                    added: Vec::new(),
-                });
-            swap.added
-                .retain(|earlier| earlier.facts.file().path != file.facts.file().path);
-            swap.added.push(file);
-        }
-        Ok(Table {
-            name: self.name.clone(),
-            metadata_store: Arc::clone(&self.metadata_store),
-            location: self.location.clone(),
-            dispatcher: self.dispatcher.clone(),
-            metadata_file: Arc::clone(&self.metadata_file),
-            columns: self.columns.clone(),
-            partition_by: self.partition_by.clone(),
-            sort_by: self.sort_by.clone(),
-            writer_sort_order_id: self.writer_sort_order_id,
-            manifest_list: self.manifest_list.clone(),
-            manifest_list_size: self.manifest_list_size,
-            cache_key: self.cache_key.clone(),
-            swapped: Some(Arc::new(swapped)),
-        })
     }
 
     /// What a scan over `filters` reads: the row groups of the files
@@ -696,9 +606,8 @@ impl Table {
     /// or else those listed from the data manifests whose manifest-list
     /// entries the filters cannot rule out
     /// ([`list_partitions_from_manifests`](Self::list_partitions_from_manifests)),
-    /// and those a local swap put a file in, each with its key. A manifest
-    /// decoded to learn its partitions leaves the files of the kept ones in
-    /// `ahead`.
+    /// each with its key. A manifest decoded to learn its partitions leaves
+    /// the files of the kept ones in `ahead`.
     fn select_partitions(
         &self,
         selector: &FileSelector,
@@ -739,8 +648,7 @@ impl Table {
     /// leave the partition fields, under each spec `manifests` were written
     /// under, those whose tuple `keeps` accepts and that the manifest-list
     /// entry of one of `manifests`, the data manifests the filters cannot
-    /// rule out, admits; and those a local swap put a file in that `keeps`
-    /// accepts.
+    /// rule out, admits.
     /// One of them may hold no file. `None` when the filters leave a field
     /// of one of the specs unrestricted, or leave more than
     /// [`MAX_PARTITIONS_FROM_FILTER`] combinations: the partitions are then
@@ -771,11 +679,6 @@ impl Table {
                 .any(|manifest| manifest.may_hold_partition(&partition));
             if is_admitted && keeps(&partition)? {
                 partitions.insert(partition.encode_key(), Arc::new(partition));
-            }
-        }
-        for (key, swap) in self.swapped.iter().flat_map(|swapped| swapped.iter()) {
-            if !partitions.contains_key(key) && keeps(&swap.partition)? {
-                partitions.insert(Arc::clone(key), Arc::clone(&swap.partition));
             }
         }
         let keyed = partitions
@@ -889,9 +792,8 @@ impl Table {
     }
 
     /// The partitions `manifests`, data manifests of this version, hold a
-    /// live file of, and those a local swap put a file in, by key. A
-    /// manifest whose manifest-list entry names its one partition is not
-    /// read. The others are read over the pool, a few at a time, and
+    /// live file of, by key. A manifest whose manifest-list entry names its
+    /// one partition is not read. The others are read over the pool, a few at a time, and
     /// decoded: of each, the files of the partitions `wants_files` accepts
     /// are left in `ahead`, as far as its bound allows, and nothing else
     /// is kept.
@@ -938,11 +840,6 @@ impl Table {
                 ahead.keep(listed.path(), decoded.files, true);
             }
         }
-        for (key, swap) in self.swapped.iter().flat_map(|swapped| swapped.iter()) {
-            partitions
-                .entry(Arc::clone(key))
-                .or_insert_with(|| Arc::clone(&swap.partition));
-        }
         Ok(partitions)
     }
 
@@ -954,8 +851,8 @@ impl Table {
     }
 
     /// The files this version reads in `partition`: those the current
-    /// snapshot's data manifests list, or a local swap's view of them, none
-    /// for a partition the version has no file in. Built from the manifests
+    /// snapshot's data manifests list, none for a partition the version has
+    /// no file in. Built from the manifests
     /// whose manifest-list entries do not rule the partition out, on the
     /// index the cache holds for it when there is one.
     pub fn partition_files(&self, partition: &Arc<Partition>) -> Result<Arc<PartitionIndex>> {
@@ -1037,7 +934,7 @@ impl Table {
     }
 
     /// The index of each of `partitions` at this version, in the order
-    /// given, with a local swap's files swapped.
+    /// given.
     ///
     /// A partition's index is built from the data manifests whose
     /// manifest-list entries do not rule the partition out. The index the
@@ -1142,13 +1039,9 @@ impl Table {
             cache.store_index(&self.cache_key, key, &index, built_at);
             indexes[partition.position] = Some(index);
         }
-        Ok(partitions
-            .iter()
-            .zip(indexes)
-            .map(|(keyed, index)| {
-                let index = index.expect("every partition asked for is indexed");
-                self.swap_files(&keyed.key, index)
-            })
+        Ok(indexes
+            .into_iter()
+            .map(|index| index.expect("every partition asked for is indexed"))
             .collect())
     }
 
@@ -1158,26 +1051,6 @@ impl Table {
             sequence: self.metadata().last_sequence_number(),
             updated_ms: self.metadata().last_updated_ms(),
         }
-    }
-
-    /// `index`, the committed files of the partition with the key
-    /// `partition_key`, with what a local swap swapped in the partition.
-    fn swap_files(&self, partition_key: &[u8], index: Arc<PartitionIndex>) -> Arc<PartitionIndex> {
-        let swap = self
-            .swapped
-            .as_ref()
-            .and_then(|swapped| swapped.get(partition_key));
-        let Some(swap) = swap else {
-            return index;
-        };
-        let mut view = PartitionIndex::clone(&index);
-        for path in &swap.removed {
-            view.remove(path);
-        }
-        for file in &swap.added {
-            view.insert(Arc::clone(file));
-        }
-        Arc::new(view)
     }
 
     /// The partitions holding a file that a commit after the one numbered
@@ -1275,12 +1148,8 @@ impl Table {
     }
 
     /// The live data files, as the manifest list counts them: no manifest
-    /// is read. `None` when the manifest list does not count them, or when
-    /// a local swap changed the files without a manifest list of its own.
+    /// is read. `None` when the manifest list does not count them.
     pub fn count_data_files(&self) -> Option<u64> {
-        if self.swapped.is_some() {
-            return None;
-        }
         self.manifest_list.count_data_files()
     }
 
@@ -1320,9 +1189,6 @@ impl Table {
     /// not applied; planning then has no statistic and COUNT uses the
     /// ordinary scan, which reports what is wrong.
     pub fn row_count(&self) -> Option<i64> {
-        if self.swapped.is_some() {
-            return None;
-        }
         let rows = self.manifest_list.row_count()?;
         let delete_manifests = self
             .read_manifests(self.manifest_list.delete_manifests())

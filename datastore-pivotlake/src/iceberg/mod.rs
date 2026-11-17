@@ -499,22 +499,6 @@ impl Table for IcebergTable {
         Ok(Some(Arc::new(self.advanced_to(next))))
     }
 
-    fn with_files_swapped(
-        &self,
-        removed: RemovedFiles<'_>,
-        added: Vec<TableFile>,
-    ) -> crate::Result<Arc<dyn Table>> {
-        let swapped = self.table.with_files_swapped(
-            removed.partition,
-            removed.paths,
-            added
-                .iter()
-                .map(|file| self.build_uncommitted_entry(file))
-                .collect(),
-        )?;
-        Ok(Arc::new(Self::new(self.name.clone(), swapped)))
-    }
-
     /// The table's own retention property, or the default.
     fn deleted_file_retention(&self) -> crate::Result<Duration> {
         Ok(self.table.snapshot_retention()?)

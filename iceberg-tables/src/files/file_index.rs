@@ -249,8 +249,7 @@ pub struct IndexedFile {
     pub schema_id: i32,
     /// The id of the file's first row, its manifest's running assignment
     /// where the entry leaves it implicit; `None` in a table whose rows
-    /// have no ids, and for a file this process swapped in that no manifest
-    /// of the version records yet.
+    /// have no ids.
     pub first_row_id: Option<i64>,
     /// An estimate of the memory the record holds, itself included.
     heap_bytes: u64,
@@ -409,33 +408,6 @@ impl IndexedFile {
                 .collect(),
             files,
         })
-    }
-
-    /// `entry`, a file this process committed that no manifest of the version
-    /// records yet: it orders among the committed files of its partition as
-    /// a file of the commit after the version's, by where it starts on the
-    /// sort key, after the version's files that start there, by its path.
-    pub(crate) fn uncommitted(
-        entry: &DataFileEntry,
-        encoder: &SortKeyEncoder,
-        metadata: &TableMetadata,
-        location: &TableLocation,
-    ) -> Result<Self> {
-        let data = entry.create_data_file(metadata, location)?;
-        let partition = Arc::new(Partition::new(
-            metadata.default_partition_spec().spec_id(),
-            data.partition().clone(),
-        ));
-        Self::new(
-            data,
-            metadata.current_schema().schema_id(),
-            partition,
-            None,
-            metadata.last_sequence_number() + 1,
-            encoder,
-            metadata,
-            location,
-        )
     }
 
     /// An estimate of the memory the record holds, itself included: its

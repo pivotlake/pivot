@@ -28,7 +28,8 @@
 //! **push, not pull**: a periodic [`refresh_from_store`](PivotlakeDatastore::refresh_from_store)
 //! sweep (the server and the shell each run one on an interval) reloads every
 //! table to its latest committed version and fetches any new files' footers,
-//! and an in-process writer (INSERT, compaction)
+//! a compaction or vacuum round reloads the table it is about to work on the
+//! same way, and an in-process writer (INSERT, compaction)
 //! [`publish_table`](PivotlakeDatastore::publish_table)s its committed copy
 //! immediately. Queries never touch the store: a query opens
 //! a transaction ([`Datastore::begin_transaction`]) whose [`PivotlakeSnapshot`]
@@ -177,6 +178,14 @@ pub enum Error {
     Merge(#[source] DataFlowError),
     #[error("table at `{location}` commit conflict: input file `{file}` is no longer active")]
     CommitConflict { location: String, file: String },
+    #[error(
+        "compaction of table `{table}` stopped: a merge selected from version {version} found its input file `{file}` no longer active, and a refresh from storage left the table at that version"
+    )]
+    CompactionConflictWithoutProgress {
+        table: String,
+        version: u64,
+        file: String,
+    },
     #[error(
         "table at `{location}` cannot merge the files of a partition whose files its format does not rewrite"
     )]
@@ -656,12 +665,9 @@ impl PivotlakeDatastore {
             }
         }
 
-        // Refresh each table on a clone outside the lock (reading a table's
-        // metadata is I/O), then publish the advanced copy back.
-        for (name, mut table) in self.tables() {
-            match table.refresh() {
-                Ok(true) => changed |= self.publish_table(table),
-                Ok(false) => {}
+        for (name, table) in self.tables() {
+            match self.refresh_table_from_store(&table.id()) {
+                Ok(advanced) => changed |= advanced,
                 Err(e) => {
                     tracing::warn!(table = %name, error = %e, "catalog refresh: refreshing table failed");
                 }
@@ -669,6 +675,19 @@ impl PivotlakeDatastore {
         }
 
         Ok(changed)
+    }
+
+    /// Advance the datastore's copy of the table `id` to the latest version
+    /// its storage holds and publish it, so what another process committed
+    /// is in the copy every query, commit and maintenance round takes from
+    /// then on. Returns whether the published copy advanced. The copy is
+    /// refreshed on a clone outside the index lock (reading a table's
+    /// metadata is I/O), then published back.
+    pub(crate) fn refresh_table_from_store(&self, id: &Uuid) -> Result<bool> {
+        let mut table = self
+            .table_handle_by_id(id)
+            .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
+        Ok(table.refresh()? && self.publish_table(table))
     }
 
     /// Publish a committed [`CatalogTable`] copy into the shared map, so its
@@ -971,8 +990,9 @@ impl PivotlakeDatastore {
         self.tables_index.read().unwrap().contains_table(name)
     }
 
-    /// A snapshot clone of every table the catalog currently holds — for a sweep
-    /// (e.g. the compacter) that refreshes and evolves each one independently.
+    /// A snapshot clone of every table the catalog currently holds, each
+    /// under its name: what a sweep over the tables (the refresh, the
+    /// compacter, the vacuumer) goes through.
     pub fn tables(&self) -> Vec<(SchemaQualifiedTableName, CatalogTable)> {
         self.tables_index
             .read()
@@ -1578,7 +1598,7 @@ impl DatastoreTransaction for PivotlakeTransaction {
         Ok(self
             .datastore
             .compacter()
-            .compact(name.clone(), table, final_sweep)
+            .compact(name.clone(), table.id(), final_sweep)
             .await?)
     }
 

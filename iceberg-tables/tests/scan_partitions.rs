@@ -338,20 +338,6 @@ fn an_earlier_version_scans_its_own_files_whatever_a_later_one_indexed() {
 }
 
 #[test]
-fn another_copy_of_a_table_scans_the_committed_files_whatever_a_local_view_swapped_in() {
-    let (fixture, created) = create_partitioned_table();
-    let written = append(&created, vec![fixture.write_file("committed", 7)]);
-    let swapped_in = vec![fixture.write_file("swapped-in", 7)];
-    let view = written.with_files_swapped(&[], &[], swapped_in).unwrap();
-    let files_of_the_view = selected(&view, &v_equals(7));
-
-    let files = selected(&load(&fixture), &v_equals(7));
-
-    assert_eq!(files_of_the_view.len(), 2);
-    assert_eq!(files, ["committed.parquet"]);
-}
-
-#[test]
 fn a_version_under_another_partition_spec_indexes_a_partition_from_its_manifests_again() {
     let (fixture, created) = create_partitioned_table();
     let written = append(&created, vec![fixture.write_file("seven", 7)]);

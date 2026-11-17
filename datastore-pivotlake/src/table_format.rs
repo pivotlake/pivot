@@ -149,8 +149,8 @@ pub(crate) trait TableFactory: Send + Sync {
 }
 
 /// One table at one committed version, as its format holds it. Immutable: a
-/// refresh, a commit or a local file swap hands back the next version as a
-/// new value, so a copy handed to a query never changes under it.
+/// refresh or a commit hands back the next version as a new value, so a
+/// copy handed to a query never changes under it.
 pub(crate) trait Table: Send + Sync {
     /// The committed version this value is at: monotonic per table, so a
     /// published copy is newer than the catalog's exactly when its version is
@@ -267,14 +267,6 @@ pub(crate) trait Table: Send + Sync {
         added: &[TableFile],
         data_change: bool,
     ) -> Result<Option<Arc<dyn Table>>>;
-    /// This version with `removed` dropped and `added` adopted, as a local view
-    /// of a swap this process already committed through another copy; the
-    /// next refresh reconciles it to the committed metadata.
-    fn with_files_swapped(
-        &self,
-        removed: RemovedFiles<'_>,
-        added: Vec<TableFile>,
-    ) -> Result<Arc<dyn Table>>;
     /// How long a file this table no longer references is kept before it may
     /// be deleted.
     fn deleted_file_retention(&self) -> Result<Duration>;
@@ -309,8 +301,8 @@ pub(crate) trait Table: Send + Sync {
     ) -> Result<()>;
 }
 
-/// The live files a commit removes or a swap drops, all of one partition:
-/// a rewrite's inputs share one. The partition is named by the bytes a walk
+/// The live files a commit removes, all of one partition: a rewrite's
+/// inputs share one. The partition is named by the bytes a walk
 /// names it by, so a format that holds its files a partition at a time
 /// finds them without looking through the others.
 #[derive(Clone, Copy)]

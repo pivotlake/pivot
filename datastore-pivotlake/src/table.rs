@@ -141,7 +141,7 @@ pub struct CatalogTable {
     id: Uuid,
     storage: TableStorage,
     /// The version this copy is at, as its format holds it. Replaced whole by
-    /// a refresh, a commit or a local swap.
+    /// a refresh or a commit.
     table: Arc<dyn Table>,
     /// The pool a merge decodes on, so the mutators need no dispatcher passed
     /// in.
@@ -183,20 +183,6 @@ impl CatalogTable {
         };
         self.table = table;
         Ok(true)
-    }
-
-    /// Fold a file swap this process already committed through the datastore
-    /// into this read copy without a metadata read: drop `removed` and adopt
-    /// `added`, whose footers the writer holds. The copy stays at its version;
-    /// a later [`refresh`](Self::refresh) reconciles it to the committed
-    /// metadata.
-    pub(crate) fn apply_file_swap(
-        &mut self,
-        removed: RemovedFiles<'_>,
-        added: Vec<TableFile>,
-    ) -> crate::Result<()> {
-        self.table = self.table.with_files_swapped(removed, added)?;
-        Ok(())
     }
 
     /// Commit file changes against this copy's version. Each attempt first
@@ -272,13 +258,14 @@ impl CatalogTable {
         }
     }
 
-    /// Commit bare `entries` whose footers are not yet in hand: like
-    /// [`commit_files`](Self::commit_files), but the added files' footers are
-    /// read only if the commit wins (a losing swap errors before touching its
-    /// output). Used by test/seed paths; production writers (INSERT,
-    /// compaction) already hold the footers and use `commit_files`. Only its
-    /// `test-support` caller ([`test_support`](crate::test_support)) needs it,
-    /// so it is gated with that feature to stay out of a plain library build.
+    /// Commit bare `entries` whose footers are not yet in hand: read the
+    /// added files' footers, then commit the files with them as
+    /// [`commit_files`](Self::commit_files) does, an entry that carries no
+    /// stats recording those its footer holds. Used by test/seed paths;
+    /// production writers (INSERT, compaction) already hold the footers and
+    /// use `commit_files`. Only its `test-support` caller
+    /// ([`test_support`](crate::test_support)) needs it, so it is gated with
+    /// that feature to stay out of a plain library build.
     #[cfg(feature = "test-support")]
     pub(crate) fn commit_entries(
         &mut self,
@@ -286,12 +273,11 @@ impl CatalogTable {
         added: &[FileEntry],
         data_change: bool,
     ) -> crate::Result<()> {
-        let bare: Vec<TableFile> = added
+        let footers = self.fetch_footers(added)?;
+        let added: Vec<TableFile> = added
             .iter()
-            .map(|entry| TableFile {
-                entry: entry.clone(),
-                row_groups: Vec::new(),
-            })
+            .zip(footers)
+            .map(|(entry, footer)| TableFile::new(entry.clone(), footer.row_groups))
             .collect();
         let removed_partition = match removed.first() {
             Some(path) => self
@@ -303,23 +289,7 @@ impl CatalogTable {
             partition: &removed_partition,
             paths: removed,
         };
-        self.commit_files(removed, bare, data_change)?;
-        // We won; only now read the added files' footers and fold them in
-        // under the same version, each in the partition it was committed to.
-        let footers = self.fetch_footers(added)?;
-        for (entry, footer) in added.iter().zip(footers) {
-            let path = &entry.file.path;
-            let partition = self
-                .find_partition_of(path)?
-                .expect("a file just committed is live");
-            let committed = RemovedFiles {
-                partition: &partition,
-                paths: std::slice::from_ref(path),
-            };
-            let file = TableFile::new(entry.clone(), footer.row_groups);
-            self.apply_file_swap(committed, vec![file])?;
-        }
-        Ok(())
+        self.commit_files(removed, added, data_change)
     }
 
     /// Read the footers of `entries`, files under this table's location that

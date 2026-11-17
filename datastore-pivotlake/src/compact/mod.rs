@@ -152,14 +152,16 @@
 //! # Hosting
 //!
 //! The datastore runs one [`CompacterHandle`] actor over itself: what names
-//! its tables, finds one by identity and commits a swap. Each table reaches
-//! the compacter as a [`CatalogTable`]: a copy at one committed version the
-//! round refreshes, selects from, merges through and folds its own swaps
-//! into. Configured timer ticks and explicit `COMPACT` commands share the
-//! actor's queue, so their rewrites never race in one process. A timed
-//! round reloads each table to its latest version; commands carry the table
-//! copy captured by their query transaction. The actor stops before the
-//! datastore's dispatch pool shuts down.
+//! its tables, holds the published copy of each, refreshes one from storage
+//! and commits a swap. A round names its table by identity and keeps no
+//! copy of it: it has the datastore refresh the table from storage and
+//! publish it as it begins, and reads the published copy whenever it lists
+//! partitions or selects a merge. A merge looks its inputs up in that same
+//! copy and its commit publishes the next version, so a round never selects
+//! a file its merge cannot find. Configured timer ticks and explicit
+//! `COMPACT` commands share the actor's queue, so their rewrites never race
+//! in one process. The actor stops before the datastore's dispatch pool
+//! shuts down.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -296,7 +298,8 @@ pub(crate) enum CompactionPass {
 
 struct CompactionCommand {
     name: SchemaQualifiedTableName,
-    table: CatalogTable,
+    /// The identity of the table to compact.
+    id: Uuid,
     pass: CompactionPass,
     result: oneshot::Sender<Result<u64>>,
 }
@@ -374,15 +377,15 @@ impl CompacterHandle {
         )
     }
 
-    /// Enqueue one table from the caller's transaction snapshot; the round
-    /// refreshes it to the latest version as it begins and keeps merging until
-    /// nothing qualifies. `FINAL` drops the small-file guards and the
-    /// contested bar and compacts each partition to one contiguous flow, see
-    /// the crate docs.
+    /// Enqueue a round over the table with the identity `id`, known as
+    /// `name`; the round has the datastore refresh the table to its latest
+    /// version as it begins and keeps merging until nothing qualifies.
+    /// `FINAL` drops the small-file guards and the contested bar and
+    /// compacts each partition to one contiguous flow, see the crate docs.
     pub async fn compact(
         &self,
         name: SchemaQualifiedTableName,
-        table: CatalogTable,
+        id: Uuid,
         final_sweep: bool,
     ) -> Result<u64> {
         let (result, answer) = oneshot::channel();
@@ -394,7 +397,7 @@ impl CompacterHandle {
         self.commands
             .send(CompactionCommand {
                 name,
-                table,
+                id,
                 pass,
                 result,
             })
@@ -423,7 +426,7 @@ impl CompacterActor {
                     Some(command) => {
                         self.forget_dropped_tables();
                         let res = self
-                            .compact_table(&command.name, command.table, command.pass)
+                            .compact_table(&command.name, command.id, command.pass)
                             .await;
                         let _ = command.result.send(res.map(|round| round.passes));
                     },
@@ -456,7 +459,7 @@ impl CompacterActor {
         self.forget_dropped_tables();
         for (name, table) in self.datastore.tables() {
             match self
-                .compact_table(&name, table, CompactionPass::Routine)
+                .compact_table(&name, table.id(), CompactionPass::Routine)
                 .await
             {
                 Ok(round) => debug!(
@@ -470,43 +473,50 @@ impl CompacterActor {
         }
     }
 
-    /// Compact `table` until it has no candidate left: the round refreshes the
-    /// table to the latest committed version once as it begins, then each pass
-    /// starts a small-file group if one qualifies, else the best overlapping
-    /// large-file group. Up to `max_concurrent_merges` of those rewrites run at
-    /// once, each holding its inputs reserved until it commits, so selection
-    /// works around the merges already in flight. A pass with nothing to start
-    /// and nothing in flight ends the round, and the table is then
-    /// remembered as examined up to the version the round's copy stands on.
+    /// Compact the table `id` until it has no candidate left: the round has
+    /// the datastore refresh the table from storage and publish it once as
+    /// it begins, then each pass starts a small-file group if one qualifies,
+    /// else the best overlapping large-file group. Up to
+    /// `max_concurrent_merges` of those rewrites run at once, each holding
+    /// its inputs reserved until it commits, so selection works around the
+    /// merges already in flight. A pass with nothing to start and nothing in
+    /// flight ends the round, and the table is then remembered as examined
+    /// up to the version the round listed its partitions from.
     ///
     /// A routine round examines the partitions a commit added a file to
     /// since the table was last examined, every partition when it never
     /// was; a final one examines them all. A round that lists every
     /// partition of the table forgets what is remembered of any other.
     ///
-    /// The round works off its one refreshed copy rather than reloading the
-    /// metadata per pass: each of its own merges is folded in as it commits,
-    /// so files landing meanwhile (an INSERT in this process, or another
-    /// writer) wait for the next round. Only a commit conflict, another writer
-    /// having swapped a selected file out first, reloads the copy, and the
-    /// round carries on from what it finds.
+    /// The round keeps no copy of the table. Each pass selects from the copy
+    /// the datastore has published by then, which holds every merge the
+    /// round committed, and every file an INSERT of this process committed
+    /// meanwhile: one landing in a partition the round has not finished
+    /// joins it, any other waits for the next round. What another process
+    /// commits meanwhile waits too: the table is read from storage again
+    /// only after a commit conflict, another writer having swapped a
+    /// selected file out first, and the round carries on from what that
+    /// refresh publishes. A refresh that leaves the table at the version
+    /// the conflicting merge was selected from would have the round select
+    /// that merge again, so the round ends there
+    /// ([`Error::CompactionConflictWithoutProgress`]).
     async fn compact_table(
         &mut self,
         name: &SchemaQualifiedTableName,
-        mut table: CatalogTable,
+        id: Uuid,
         pass: CompactionPass,
     ) -> Result<RoundOutcome> {
         let mut passes = 0;
         let mut in_flight = JoinSet::new();
         let mut reserved = HashSet::new();
-        table.refresh()?;
-        let id = table.id();
         let examined_through_commit = self
             .table_states
             .get(&id)
-            .and_then(|rounds| rounds.examined_through_commit);
+            .and_then(|state| state.examined_through_commit);
+        let table = self.refresh_published_table(id)?;
         let listed = list_round_partitions(&table, pass, examined_through_commit).await?;
         self.forget_partitions_not_among(id, &listed);
+        let mut listed_at = listed.commit_position;
         let mut progress = RoundProgress {
             partitions: listed.partitions,
             ..RoundProgress::default()
@@ -515,9 +525,7 @@ impl CompacterActor {
             passes += 1;
 
             while in_flight.len() < self.max_concurrent_merges {
-                let (selected, batch) = self
-                    .select_next_batch(&table, pass, &reserved, progress)
-                    .await;
+                let (selected, batch) = self.select_next_batch(id, pass, &reserved, progress).await;
                 progress = selected;
                 let Some(batch) = batch? else {
                     break;
@@ -537,7 +545,7 @@ impl CompacterActor {
                 self.table_states
                     .entry(id)
                     .or_default()
-                    .examined_through_commit = Some(table.commit_position());
+                    .examined_through_commit = Some(listed_at);
                 return Ok(RoundOutcome {
                     passes,
                     examined: progress.partitions,
@@ -546,7 +554,7 @@ impl CompacterActor {
 
             // Every exit from here on drains first: a merge body runs on the
             // blocking pool, which a dropped handle does not stop.
-            let (partition, reserved_paths, outcome) = match in_flight.join_next().await {
+            let merge = match in_flight.join_next().await {
                 Some(Ok(merge)) => merge,
                 Some(Err(error)) => {
                     drain_merges(&mut in_flight).await;
@@ -554,34 +562,37 @@ impl CompacterActor {
                 }
                 None => unreachable!("the set is not empty"),
             };
-            for path in &reserved_paths {
+            for path in &merge.reserved_paths {
                 reserved.remove(path);
             }
             let finished_merge = progress
                 .merging
                 .iter()
-                .position(|merging| merging == &partition)
+                .position(|merging| merging == &merge.partition)
                 .expect("a merge in flight is counted in its partition");
             progress.merging.swap_remove(finished_merge);
-            match outcome {
-                Ok(outputs) => {
-                    let merged = RemovedFiles {
-                        partition: &partition,
-                        paths: &reserved_paths,
+            match merge.committed {
+                // The commit published the version the next pass selects from.
+                Ok(()) => {}
+                Err(Error::CommitConflict { file, .. }) => {
+                    // The merge's outputs are already deleted; have the table
+                    // refreshed to see what the conflicting writer left.
+                    let table = match self.refresh_published_table(id) {
+                        Ok(table) => table,
+                        Err(error) => {
+                            drain_merges(&mut in_flight).await;
+                            return Err(error);
+                        }
                     };
-                    if let Err(error) = table.apply_file_swap(merged, outputs) {
+                    if table.version() == merge.selected_at_version {
                         drain_merges(&mut in_flight).await;
-                        return Err(error);
+                        return Err(Error::CompactionConflictWithoutProgress {
+                            table: name.to_string(),
+                            version: merge.selected_at_version,
+                            file,
+                        });
                     }
-                }
-                Err(Error::CommitConflict { .. }) => {
-                    // The merge's outputs are already deleted; reload the copy
-                    // to see what the conflicting writer left and keep going.
-                    if let Err(error) = table.refresh() {
-                        drain_merges(&mut in_flight).await;
-                        return Err(error);
-                    }
-                    // The reloaded copy may hold work in a partition the
+                    // The refreshed table may hold work in a partition the
                     // round was done with, or had no reason to examine.
                     progress.finished.clear();
                     let listed =
@@ -593,6 +604,7 @@ impl CompacterActor {
                             }
                         };
                     self.forget_partitions_not_among(id, &listed);
+                    listed_at = listed.commit_position;
                     progress.partitions = listed.partitions;
                 }
                 Err(error) => {
@@ -603,6 +615,20 @@ impl CompacterActor {
         }
     }
 
+    /// The copy of the table `id` the datastore has published.
+    fn find_published_table(&self, id: Uuid) -> Result<CatalogTable> {
+        self.datastore
+            .table_handle_by_id(&id)
+            .ok_or_else(|| Error::TableNotFound(id.to_string()))
+    }
+
+    /// Have the datastore refresh the table `id` from storage and publish
+    /// it, and hand back the published copy.
+    fn refresh_published_table(&self, id: Uuid) -> Result<CatalogTable> {
+        self.datastore.refresh_table_from_store(&id)?;
+        self.find_published_table(id)
+    }
+
     /// Forget what is remembered of the partitions of the table `id` that
     /// are not among `listed`, when the round listed every partition of the
     /// table: the table no longer has a file a rewrite may replace in any
@@ -611,36 +637,40 @@ impl CompacterActor {
         if !listed.lists_every_partition {
             return;
         }
-        let Some(rounds) = self.table_states.get_mut(&id) else {
+        let Some(state) = self.table_states.get_mut(&id) else {
             return;
         };
         let listed: HashSet<&[u8]> = listed.partitions.iter().map(Vec::as_slice).collect();
-        rounds
+        state
             .overlaps
             .retain(|partition, _| listed.contains(partition.as_slice()));
     }
 
-    /// The next merge a pass can start (see [`MergeSelection::next_batch`]),
-    /// selected on the blocking pool: selection walks the files of the
-    /// partitions it looks at and, for a layout pair it has to measure,
-    /// reads footers over the worker pool, neither of which belongs on an
-    /// async task. Hands `progress` back as the selection left it.
+    /// The next merge a pass can start in the table `id` as the datastore
+    /// has it published (see [`MergeSelection::next_batch`]), selected on
+    /// the blocking pool: selection walks the files of the partitions it
+    /// looks at and, for a layout pair it has to measure, reads footers over
+    /// the worker pool, neither of which belongs on an async task. Hands
+    /// `progress` back as the selection left it.
     async fn select_next_batch(
         &mut self,
-        table: &CatalogTable,
+        id: Uuid,
         pass: CompactionPass,
         reserved: &HashSet<ObjectPath>,
         mut progress: RoundProgress,
     ) -> (RoundProgress, Result<Option<MergeBatch>>) {
+        let table = match self.find_published_table(id) {
+            Ok(table) => table,
+            Err(error) => return (progress, Err(error)),
+        };
         let selection = MergeSelection {
             target_bytes: self.target_bytes,
             merge_target_bytes: self.merge_target_bytes,
             min_files: self.min_files,
             layout_clique_size: self.layout_clique_size,
         };
-        let id = table.id();
         let mut overlaps = std::mem::take(&mut self.table_states.entry(id).or_default().overlaps);
-        let (table, reserved) = (table.clone(), reserved.clone());
+        let reserved = reserved.clone();
         let selected = tokio::task::spawn_blocking(move || {
             let batch = selection.next_batch(&mut overlaps, &table, pass, &reserved, &mut progress);
             (overlaps, progress, batch)
@@ -667,14 +697,19 @@ struct RoundPartitions {
     /// Whether the round listed every partition of the table whose files a
     /// rewrite may replace, and not only those a commit added a file to.
     lists_every_partition: bool,
+    /// Where the version the partitions were listed from stands among the
+    /// table's commits: a file a later commit adds may sit in a partition
+    /// that is not listed.
+    commit_position: u64,
 }
 
-/// The partitions a round over `table`, refreshed to the version it works
-/// on, examines, in the order it does: those a commit added a file to
-/// since the one standing at `examined_through_commit`, for a routine round
-/// over a table examined before; else every partition. A partition whose files
-/// the table's format does not rewrite is in neither. Listing them may
-/// read the table's metadata, so it runs on the blocking pool.
+/// The partitions a round examines of `table`, the copy the datastore
+/// published of the version just refreshed from storage, in the order the
+/// round examines them: those a commit added a file to since the one
+/// standing at `examined_through_commit`, for a routine round over a table
+/// examined before; else every partition. A partition whose files the
+/// table's format does not rewrite is in neither. Listing them may read
+/// the table's metadata, so it runs on the blocking pool.
 async fn list_round_partitions(
     table: &CatalogTable,
     pass: CompactionPass,
@@ -693,6 +728,7 @@ async fn list_round_partitions(
         Ok::<_, Error>(RoundPartitions {
             partitions: table.select_rewritable_partitions(partitions)?,
             lists_every_partition: added_after.is_none(),
+            commit_position: table.commit_position(),
         })
     })
     .await;
@@ -720,6 +756,8 @@ struct MergeBatch {
     partition: Vec<u8>,
     inputs: Vec<FileRef>,
     kind: MergeKind,
+    /// The version of the table the inputs were selected from.
+    selected_at_version: u64,
 }
 
 /// The sizes a round selects its merges by.
@@ -767,6 +805,7 @@ impl MergeSelection {
                         partition,
                         inputs,
                         kind: MergeKind::SmallFiles,
+                        selected_at_version: table.version(),
                     }));
                 }
                 let group =
@@ -776,6 +815,7 @@ impl MergeSelection {
                         partition,
                         inputs,
                         kind: MergeKind::LayoutOptimization,
+                        selected_at_version: table.version(),
                     }));
                 }
                 if progress.merging.contains(&partition) {
@@ -905,16 +945,23 @@ impl overlap::LayoutSource for LayoutCandidates<'_> {
     }
 }
 
-/// What one merge hands back: the partition its inputs sit in and the
-/// input paths it held reserved, beside the output files it committed or
-/// why it did not.
-type MergeOutcome = (Vec<u8>, Vec<ObjectPath>, Result<Vec<TableFile>>);
+/// What one merge hands back.
+struct MergeOutcome {
+    /// The partition the inputs sit in, as a walk names it.
+    partition: Vec<u8>,
+    /// The input paths the merge held reserved.
+    reserved_paths: Vec<ObjectPath>,
+    /// The version of the table the inputs were selected from.
+    selected_at_version: u64,
+    /// Whether the merge committed its swap, or why it did not.
+    committed: Result<()>,
+}
 
 /// Rewrite the inputs of `batch` into target-sized outputs and swap them
 /// into the table in one commit. Returns the inputs' partition and paths
 /// beside the outcome so the round can release their reservations however
-/// the merge went; a committed merge's outcome carries the output files for
-/// the round to fold into its table copy.
+/// the merge went, and the version they were selected from so the round
+/// can tell a conflict it cannot get past.
 async fn compact_batch(
     datastore: Arc<PivotlakeDatastore>,
     name: SchemaQualifiedTableName,
@@ -926,10 +973,17 @@ async fn compact_batch(
         partition,
         inputs,
         kind,
+        selected_at_version,
     } = batch;
     let reserved_paths: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
     let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
     let merged_partition = partition.clone();
+    let build_outcome = |committed| MergeOutcome {
+        partition,
+        reserved_paths,
+        selected_at_version,
+        committed,
+    };
     // `spawn_blocking` needs a `'static` closure, so the merge takes the
     // datastore handle rather than a borrow of it.
     let merged = match tokio::task::spawn_blocking(move || {
@@ -945,13 +999,9 @@ async fn compact_batch(
     .await
     {
         Ok(Ok(merged)) => merged,
-        Ok(Err(error)) => return (partition, reserved_paths, Err(error)),
+        Ok(Err(error)) => return build_outcome(Err(error)),
         Err(error) => {
-            return (
-                partition,
-                reserved_paths,
-                Err(Error::CompactionJobPanicked(error.to_string())),
-            );
+            return build_outcome(Err(Error::CompactionJobPanicked(error.to_string())));
         }
     };
     let output_sizes: Vec<u64> = merged.iter().map(|file| file.file_ref().size).collect();
@@ -966,7 +1016,7 @@ async fn compact_batch(
         output_bytes = output_sizes.iter().sum::<u64>(),
         "compacted batch"
     );
-    (partition, reserved_paths, Ok(merged))
+    build_outcome(Ok(()))
 }
 
 /// Await the merges still in flight, reporting rather than propagating what
@@ -975,10 +1025,10 @@ async fn compact_batch(
 /// own rewrites to finish before the next one selects.
 async fn drain_merges(in_flight: &mut JoinSet<MergeOutcome>) {
     while let Some(joined) = in_flight.join_next().await {
-        match joined {
-            Ok((_, _, Err(error))) => warn!(error = %error, "compaction merge failed"),
+        match joined.map(|merge| merge.committed) {
+            Ok(Err(error)) => warn!(error = %error, "compaction merge failed"),
             Err(error) => warn!(error = %error, "compaction merge panicked"),
-            Ok((_, _, Ok(_))) => {}
+            Ok(Ok(())) => {}
         }
     }
 }
@@ -1084,9 +1134,8 @@ pub fn compact_table_files(
 
 /// Merge `inputs`, files of `partition` (as a walk names it) of the table
 /// with identity `id`, into fresh target-sized files and swap them in for
-/// the inputs, in one commit labelled a rearrangement. Returns the merged
-/// files with their footers in hand, so a caller holding its own table copy
-/// can fold the swap in without reloading the metadata.
+/// the inputs, in one commit labelled a rearrangement, which publishes the
+/// version it wrote. Returns the merged files.
 ///
 /// The merge itself (decode, re-encode, upload) runs off a plain read copy of
 /// the table with no commit lock held, so it never blocks a concurrent INSERT's
@@ -1150,8 +1199,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::PivotlakeDatastore;
     use crate::file_entry::scalar_values_equal;
-    use crate::{CatalogTable, PivotlakeDatastore};
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, Scalar};
     use arrow_schema::{DataType, Field, Schema};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
@@ -1474,7 +1523,7 @@ mod tests {
                 );
                 let actor = tokio::spawn(actor.run());
                 for (name, table) in tables {
-                    compacter.compact(name, table, false).await.unwrap();
+                    compacter.compact(name, table.id(), false).await.unwrap();
                 }
                 actor.abort();
             });
@@ -1514,9 +1563,9 @@ mod tests {
         sizes: CompacterSizes,
         datastore: Arc<PivotlakeDatastore>,
         name: SchemaQualifiedTableName,
-        table: CatalogTable,
         final_sweep: bool,
     ) -> u64 {
+        let id = datastore.table_handle(&name).unwrap().id();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1532,16 +1581,17 @@ mod tests {
                     datastore,
                 );
                 let actor = tokio::spawn(actor.run());
-                let sweeps = compacter.compact(name, table, final_sweep).await.unwrap();
+                let sweeps = compacter.compact(name, id, final_sweep).await.unwrap();
                 actor.abort();
                 sweeps
             })
     }
 
-    /// The command's snapshot is refreshed before selecting, so a file
-    /// committed after it was captured still joins the merge.
+    /// A round has the datastore refresh the table before it selects, so a
+    /// file committed through another copy of the table, which the
+    /// datastore's own does not list, still joins the merge.
     #[test]
-    fn command_refreshes_the_supplied_table_snapshot() {
+    fn a_round_refreshes_the_table_from_storage_before_selecting() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let adopted = db.path().join("events");
@@ -1562,27 +1612,24 @@ mod tests {
             false,
         );
         let name = SchemaQualifiedTableName::in_default_schema("events");
-        let captured = datastore.table_handle(&name).unwrap();
+        let mut writer = datastore.table_handle(&name).unwrap();
         // Each file is small (under half the target), two of them stay under
         // the merge target (1.3 times it), three of them reach it: the merge
         // only happens once the refresh brings `c.parquet` in.
-        let target = captured.file_refs().unwrap()[0].size * 22 / 10;
+        let target = writer.file_refs().unwrap()[0].size * 22 / 10;
         write_parquet_file(&adopted, "c.parquet", vec![3]);
-        let mut latest = captured.clone();
-        latest
+        writer
             .append_data_file(
                 ObjectPath::new("c.parquet"),
                 &std::fs::read(adopted.join("c.parquet")).unwrap(),
                 None,
             )
             .unwrap();
-        datastore.refresh_from_store().unwrap();
 
         let sweeps = run_command(
             CompacterSizes::defaults(target),
             datastore.clone(),
             name.clone(),
-            captured,
             false,
         );
 
@@ -1599,8 +1646,8 @@ mod tests {
         dispatch.exit();
     }
 
-    /// A round does not stop at one pair: it keeps merging, folding each
-    /// committed merge into its view, until no large pair overlaps any more.
+    /// A round does not stop at one pair: it keeps merging, selecting from
+    /// the version each merge commits, until no large pair overlaps any more.
     #[test]
     fn a_round_keeps_merging_until_no_pair_overlaps() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
@@ -1736,7 +1783,6 @@ mod tests {
             CompacterSizes::without_small_files(target),
             datastore.clone(),
             name.clone(),
-            table.clone(),
             false,
         );
         let routine_files = datastore
@@ -1749,7 +1795,6 @@ mod tests {
             CompacterSizes::without_small_files(target),
             datastore.clone(),
             name.clone(),
-            table,
             true,
         );
 
@@ -1816,7 +1861,6 @@ mod tests {
             },
             datastore.clone(),
             name.clone(),
-            table,
             false,
         );
         let after_routine = datastore.table_handle(&name).unwrap();
@@ -1833,7 +1877,6 @@ mod tests {
             },
             datastore.clone(),
             name.clone(),
-            after_routine,
             true,
         );
 
@@ -2171,7 +2214,6 @@ mod tests {
             },
             datastore.clone(),
             name,
-            after_normal,
             true,
         );
         assert_eq!(final_sweeps, 1);
@@ -2329,7 +2371,6 @@ mod tests {
             },
             datastore.clone(),
             name.clone(),
-            after_routine.clone(),
             true,
         );
 
@@ -2400,7 +2441,6 @@ mod tests {
             CompacterSizes::without_small_files(target),
             datastore.clone(),
             name.clone(),
-            after_routine.clone(),
             true,
         );
 
@@ -2554,7 +2594,6 @@ mod tests {
             },
             datastore.clone(),
             name.clone(),
-            table,
             false,
         );
 
@@ -2576,7 +2615,6 @@ mod tests {
             },
             datastore.clone(),
             name.clone(),
-            datastore.table_handle(&name).unwrap(),
             false,
         );
 
@@ -2707,7 +2745,6 @@ mod tests {
             CompacterSizes::defaults(target),
             datastore.clone(),
             name.clone(),
-            datastore.table_handle(&name).unwrap(),
             true,
         );
 
@@ -2805,8 +2842,8 @@ mod tests {
         name: &SchemaQualifiedTableName,
         pass: CompactionPass,
     ) {
-        let table = actor.datastore.table_handle(name).unwrap();
-        block_on_rounds(actor.compact_table(name, table, pass)).unwrap();
+        let id = actor.datastore.table_handle(name).unwrap().id();
+        block_on_rounds(actor.compact_table(name, id, pass)).unwrap();
     }
 
     /// Whether `actor` remembers anything of the layout of the table `id`.
@@ -2814,7 +2851,7 @@ mod tests {
         actor
             .table_states
             .get(&id)
-            .is_some_and(|rounds| !rounds.overlaps.is_empty())
+            .is_some_and(|state| !state.overlaps.is_empty())
     }
 
     #[test]

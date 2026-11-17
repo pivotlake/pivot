@@ -43,6 +43,7 @@ use tracing::{info, warn};
 
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
 use planner::catalog::SchemaQualifiedTableName;
+use uuid::Uuid;
 
 use crate::{CatalogTable, Error, PivotlakeDatastore, Result};
 
@@ -123,7 +124,7 @@ impl Vacuumer {
     pub fn vacuum_all(&self, now_ms: u64) -> Result<()> {
         let mut first_error = None;
         for (name, table) in self.datastore.tables() {
-            if let Err(error) = self.vacuum_table(&name, table, now_ms) {
+            if let Err(error) = self.vacuum_table(&name, table.id(), now_ms) {
                 warn!(table = %name, error = %error, "vacuum: table cleanup failed");
                 first_error.get_or_insert(error);
             }
@@ -144,19 +145,18 @@ impl Vacuumer {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// One table's round: reload it to its latest version (so a vacuumer on a
-    /// shared remote store sees commits another process wrote), expire its
-    /// snapshots and publish the version that wrote, then delete what the
-    /// expired snapshots left unused and whatever else the format retires.
-    /// A table its format refuses to expire fails here before anything is
-    /// committed or deleted.
-    fn vacuum_table(
-        &self,
-        name: &SchemaQualifiedTableName,
-        mut table: CatalogTable,
-        now_ms: u64,
-    ) -> Result<()> {
-        table.refresh()?;
+    /// One round over the table `id`: have the datastore refresh it to its
+    /// latest version and publish it (so a vacuumer on a shared remote store
+    /// sees commits another process wrote), expire its snapshots and publish
+    /// the version that wrote, then delete what the expired snapshots left
+    /// unused and whatever else the format retires. A table its format
+    /// refuses to expire fails here before anything is committed or deleted.
+    fn vacuum_table(&self, name: &SchemaQualifiedTableName, id: Uuid, now_ms: u64) -> Result<()> {
+        self.datastore.refresh_table_from_store(&id)?;
+        let mut table = self
+            .datastore
+            .table_handle_by_id(&id)
+            .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
         if let Some(expired) = self.expire_table_snapshots(&mut table, now_ms)? {
             // The deletions read manifests and delete objects, which no
             // writer should wait for: the lock is released by now, and
@@ -176,10 +176,9 @@ impl Vacuumer {
     /// that has an expiry to commit.
     ///
     /// An expiry is a commit like any other in-process write. Under the
-    /// lock it works from the later of the caller's copy and the version
-    /// the datastore holds then, which an INSERT may have advanced since
-    /// the caller's copy was reloaded; the format retries a race lost to
-    /// another process inside.
+    /// lock it works from the version the datastore holds then, which an
+    /// INSERT may have advanced since `table` was read; the format retries
+    /// a race lost to another process inside.
     fn expire_table_snapshots(
         &self,
         table: &mut CatalogTable,
@@ -190,18 +189,10 @@ impl Vacuumer {
         }
         let commit_lock = table.commit_lock();
         let _committing = commit_lock.lock().unwrap();
-        let held = self
+        let mut latest = self
             .datastore
             .table_handle_by_id(&table.id())
             .ok_or_else(|| Error::TableNotFound(table.id().to_string()))?;
-        // The caller's copy was just reloaded from the store, so it is the
-        // later one when another process committed what the datastore has
-        // not reloaded yet.
-        let mut latest = if held.version() > table.version() {
-            held
-        } else {
-            table.clone()
-        };
         let expired = latest.expire_snapshots(now_ms)?;
         if expired.is_some() {
             self.datastore.publish_table(latest.clone());

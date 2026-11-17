@@ -1513,10 +1513,11 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     winner.replace_data_files(&removed, &added).unwrap();
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh and returns a typed commit-conflict error.
+    let loser_merged = write_ids(dir.path(), "merged-loser.parquet", &[10, 20, 30, 40]);
     let loser_added = vec![datastore_pivotlake::FileEntry::new(
         datastore_pivotlake::FileRef {
-            path: ObjectPath::new("merged-loser.parquet"),
-            size: merged_size,
+            path: ObjectPath::new(loser_merged.to_str().unwrap()),
+            size: std::fs::metadata(&loser_merged).unwrap().len(),
         },
     )];
     let loser_result = loser.replace_data_files(&removed, &loser_added);
@@ -1611,18 +1612,20 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
         .unwrap();
     let version = reader.version();
 
-    // Another writer commits an `Add` for a file that is not in the store, so
-    // any copy reloading onto that version fails to read its footer.
+    // Another writer commits an `Add` for a file that then leaves the store,
+    // so any copy reloading onto that version fails to read its footer.
     let mut writer = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
-    let absent = vec![datastore_pivotlake::FileEntry::new(
+    let removed_after_commit = write_ids(dir.path(), "removed-after-commit.parquet", &[40]);
+    let added = vec![datastore_pivotlake::FileEntry::new(
         datastore_pivotlake::FileRef {
-            path: ObjectPath::new("absent.parquet"),
-            size: 1,
+            path: ObjectPath::new(removed_after_commit.to_str().unwrap()),
+            size: std::fs::metadata(&removed_after_commit).unwrap().len(),
         },
     )];
-    assert!(writer.replace_data_files(&[], &absent).is_err());
+    writer.replace_data_files(&[], &added).unwrap();
+    std::fs::remove_file(&removed_after_commit).unwrap();
 
     assert!(reader.refresh().is_err());
     assert_eq!(reader.version(), version, "the copy stays at its version");
