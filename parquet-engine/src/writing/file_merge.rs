@@ -248,6 +248,7 @@ mod tests {
                 sorted_by: Arc::from(["key".to_string()]),
                 target_rows_per_group: 1_000,
                 max_file_size: None,
+                text_indexes: Arc::default(),
             },
             order_by: Arc::from([OrderBy::new(0, false, true)]),
             row_count: 8,

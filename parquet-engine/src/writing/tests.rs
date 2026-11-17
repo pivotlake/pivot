@@ -151,6 +151,7 @@ fn write_grouped<T: IntoBatch>(
         sort_column_names,
         rows_per_group,
         usize::MAX,
+        Arc::default(),
     )
     .map_each(|file: AssembledFile| Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>()))
     .collect()
@@ -183,6 +184,7 @@ fn write_by_derived_key<T: IntoBatch>(
         Arc::from([]),
         1_024,
         usize::MAX,
+        Arc::default(),
     )
     .map_each(|file: AssembledFile| {
         Ok((
@@ -811,6 +813,7 @@ fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
         true,
         3,
         usize::MAX,
+        Arc::default(),
     )
     .map_each(|file: AssembledFile| Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>()))
     .collect()
@@ -858,6 +861,7 @@ fn a_stream_past_the_file_target_cuts_several_sorted_files() {
         Arc::from(["key".to_string()]),
         500,
         8 * 1024,
+        Arc::default(),
     )
     .map_each(|file: AssembledFile| Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>()))
     .collect()

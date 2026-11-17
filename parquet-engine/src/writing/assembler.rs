@@ -27,8 +27,10 @@ use dispatch::memory::{FileBytes, Slab, SlabAllocator};
 
 use super::error::{WriteError, WriteResult};
 use super::types::{
-    AssembledFile, EncodedLeaf, EncodedLeafChunk, FileId, RowGroupContext, RowGroupId,
+    AssembledFile, ColumnTokenRun, EncodedLeaf, EncodedLeafChunk, FileId, RowGroupContext,
+    RowGroupId, TextIndexFile, TextIndexedColumn,
 };
+use dispatch::text_index::{PlacedTokenRun, TokenRun};
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// Parquet repetition type for a required (non-null) field.
@@ -135,14 +137,16 @@ impl Unary<EncodedLeafChunk, AssembledFile> for FileAssembler {
             &context.schema,
             groups,
             context.file_info.max_file_size,
+            &context.file_info.text_indexes,
             allocator,
         )?;
-        for (bytes, metadata) in files {
+        for (bytes, metadata, text_indexes) in files {
             sender.send(AssembledFile {
                 bytes,
                 metadata,
                 partition: context.file_info.partition.clone(),
                 sorted_by: context.file_info.sorted_by.clone(),
+                text_indexes,
             })?;
         }
         Ok(())
@@ -153,8 +157,12 @@ impl Unary<EncodedLeafChunk, AssembledFile> for FileAssembler {
 /// are relative to the row group until `build_file` rebases them.
 struct AssembledRowGroup {
     row_group_id: RowGroupId,
+    row_count: usize,
     bytes: FileBytes,
     columns: Vec<ColumnChunk>,
+    /// The tokens of the row group's text, one run for each text indexed
+    /// column.
+    token_runs: Vec<ColumnTokenRun>,
 }
 
 impl AssembledRowGroup {
@@ -163,15 +171,20 @@ impl AssembledRowGroup {
         // Workers may return leaves in any order.
         chunks.sort_by_key(|chunk| chunk.leaf_index);
 
+        let row_count = chunks.first().map_or(0, |chunk| chunk.context.row_count);
         let mut bytes = FileBytes::new();
         let mut columns = Vec::with_capacity(chunks.len());
+        let mut token_runs = Vec::new();
         for chunk in chunks {
             columns.push(write_leaf_chunk(&mut bytes, chunk.leaf)?);
+            token_runs.extend(chunk.token_run);
         }
         Ok(Self {
             row_group_id,
+            row_count,
             bytes,
             columns,
+            token_runs,
         })
     }
 }
@@ -181,12 +194,18 @@ impl AssembledRowGroup {
 /// compressed row-group bodies, not Parquet headers and footers. Row groups are
 /// already in global sort order, so consecutive ranges also give consecutive
 /// file key ranges. An individually oversized group stays alone.
+///
+/// Each file comes with an index file of every one of `text_indexes`, merged
+/// from the token runs of its row groups: a run numbers its rows from its row
+/// group's first, so each is placed where its row group starts in the file
+/// it ended up in.
 fn build_files(
     schema: &SchemaRef,
     groups: Vec<AssembledRowGroup>,
     target_size: Option<usize>,
+    text_indexes: &[TextIndexedColumn],
     allocator: &mut SlabAllocator,
-) -> WriteResult<Vec<(FileBytes, FileMetaData)>> {
+) -> WriteResult<Vec<(FileBytes, FileMetaData, Vec<TextIndexFile>)>> {
     let ranges = match target_size {
         Some(target_size) if !groups.is_empty() => {
             let weights = groups
@@ -201,8 +220,50 @@ fn build_files(
     ranges
         .into_iter()
         .map(|range| {
-            let file_groups = groups.by_ref().take(range.len()).collect();
-            build_file(schema, file_groups, allocator)
+            let mut file_groups: Vec<AssembledRowGroup> =
+                groups.by_ref().take(range.len()).collect();
+            let mut runs_of_columns: Vec<Vec<PlacedTokenRun>> =
+                text_indexes.iter().map(|_| Vec::new()).collect();
+            let mut rows_before_group = 0usize;
+            for group in &mut file_groups {
+                let first_row = u32::try_from(rows_before_group).map_err(|_| {
+                    WriteError::TooManyRowsForTextIndex {
+                        rows: rows_before_group,
+                    }
+                })?;
+                for ColumnTokenRun {
+                    indexed_column,
+                    run,
+                } in group.token_runs.drain(..)
+                {
+                    runs_of_columns[indexed_column].push(PlacedTokenRun { first_row, run });
+                }
+                rows_before_group += group.row_count;
+            }
+            if !text_indexes.is_empty() && rows_before_group > u32::MAX as usize + 1 {
+                return Err(WriteError::TooManyRowsForTextIndex {
+                    rows: rows_before_group,
+                });
+            }
+            let text_index_files = text_indexes
+                .iter()
+                .zip(runs_of_columns)
+                .map(|(indexed, runs)| {
+                    // A run arrives with the column's leaf of every row
+                    // group, so fewer means the column has no such leaf.
+                    if runs.len() != file_groups.len() {
+                        return Err(WriteError::TextIndexOfNonTextColumn {
+                            column: indexed.column.clone(),
+                        });
+                    }
+                    Ok(TextIndexFile {
+                        column: indexed.column.clone(),
+                        bytes: TokenRun::write_index_file(&runs, allocator),
+                    })
+                })
+                .collect::<WriteResult<Vec<_>>>()?;
+            let (bytes, metadata) = build_file(schema, file_groups, allocator)?;
+            Ok((bytes, metadata, text_index_files))
         })
         .collect()
 }
@@ -562,12 +623,14 @@ mod tests {
                 .iter()
                 .map(|field| leaves::count_leaves(field))
                 .sum(),
+            row_count: 1,
             file_info: Arc::new(FileAssemblyInfo {
                 file_id,
                 row_group_count: 1,
                 partition: None,
                 sorted_by: Arc::default(),
                 max_file_size: None,
+                text_indexes: Arc::default(),
             }),
         })
     }
@@ -629,6 +692,7 @@ mod tests {
                     context: file_context(&schema, file_id),
                     leaf_index: 0,
                     leaf: encode_leaf(leaf, &mut page_allocator).unwrap(),
+                    token_run: None,
                 }
             })
             .collect();
@@ -663,6 +727,7 @@ mod tests {
                                 context: context.clone(),
                                 leaf_index: chunks.len(),
                                 leaf: encode_leaf(leaf, &mut allocator).unwrap(),
+                                token_run: None,
                             });
                         }
                     }

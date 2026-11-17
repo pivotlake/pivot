@@ -14,7 +14,9 @@ use arrow_schema::{Field, Schema};
 use dispatch::{RecordBatchOperatorSpec, UnaryError};
 use object_storage::{ObjectPath, ObjectStore};
 use parquet_engine::writing::upload::{UploadedFiles, upload_files_spec};
-use parquet_engine::writing::{encode_record_batches_spec, unshred_batches_spec};
+use parquet_engine::writing::{
+    TextIndexedColumn, encode_record_batches_spec, unshred_batches_spec,
+};
 use planner::catalog::Column;
 
 use crate::Result;
@@ -82,6 +84,18 @@ pub struct InsertTarget {
     /// file's partition values are.
     pub partition_keys: PartitionKeys,
     pub sort_by: Vec<String>,
+    /// The text indexes written with every file, when the table has any.
+    pub text_indexes: Option<TextIndexTarget>,
+}
+
+/// The text indexes an INSERT writes with its files: of which columns, and
+/// into which directory of the target's store.
+#[derive(Clone, Debug)]
+pub struct TextIndexTarget {
+    /// The directory the index files are written into, each named after its
+    /// data file and its column.
+    pub directory: ObjectPath,
+    pub columns: Arc<[TextIndexedColumn]>,
 }
 
 impl InsertTarget {
@@ -101,6 +115,9 @@ impl InsertTarget {
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec> {
         self.store.prepare_write()?;
+        if let Some(text_indexes) = &self.text_indexes {
+            self.store.create_dir(&text_indexes.directory)?;
+        }
         // In `INSERT INTO x VALUES (...)`, VALUES emits batches with unnamed columns
         // because only INSERT knows which table columns receive the rows. The
         // planner has already bound and cast each expression to its target column
@@ -153,11 +170,18 @@ impl InsertTarget {
             self.sort_by.clone().into(),
             TARGET_ROWS_PER_GROUP,
             TARGET_IN_MEMORY_BYTES_PER_FILE,
+            self.text_indexes
+                .as_ref()
+                .map(|text_indexes| Arc::clone(&text_indexes.columns))
+                .unwrap_or_default(),
         );
         Ok(upload_files_spec(
             self.uploaded_files.clone(),
             Arc::clone(&self.store),
             self.directory.clone(),
+            self.text_indexes
+                .as_ref()
+                .map(|text_indexes| text_indexes.directory.clone()),
             self.columns.clone().into(),
             Some(on_start),
             encoded,

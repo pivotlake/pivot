@@ -28,8 +28,10 @@ use super::compression;
 use super::error::{WriteError, WriteResult};
 use super::leaves::Leaf;
 use super::stats;
-use super::types::{EncodedLeaf, EncodedLeafChunk, LeafChunkJob};
+use super::types::{ColumnTokenRun, EncodedLeaf, EncodedLeafChunk, LeafChunkJob};
+use arrow_array::{ArrayRef, StringViewArray};
 use dispatch::arrays::concat_chunks;
+use dispatch::text_index::{LetterCase, TokenRun, TokenRunBuilder};
 
 pub(super) type LeafEncoderFactory = DefaultUnaryFactory<LeafEncoder>;
 
@@ -41,6 +43,50 @@ pub(super) fn factories(worker_count: usize) -> Vec<LeafEncoderFactory> {
 pub(super) struct LeafEncoder {
     /// Initialized on first use so an inactive encoder holds no ring buffer.
     allocator: Option<SlabAllocator>,
+    /// Holds the token runs of text indexed leaves, apart from the pages: a
+    /// run is dropped as soon as its file's index is written, and would keep
+    /// the space it took beside the pages out of use until they are uploaded.
+    token_run_allocator: Option<SlabAllocator>,
+}
+
+impl LeafEncoder {
+    /// The tokens of a row group's text. `values` are the texts of the rows
+    /// that have one, in row order, and `def_levels` says which rows those
+    /// are: the rows at `max_def_level`, or every row when there are no
+    /// levels.
+    fn build_token_run(
+        column: &str,
+        values: &ArrayRef,
+        def_levels: Option<&[i16]>,
+        max_def_level: i16,
+        letter_case: LetterCase,
+        allocator: &mut SlabAllocator,
+    ) -> WriteResult<TokenRun> {
+        let texts = values
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .ok_or_else(|| WriteError::TextIndexOfNonTextColumn {
+                column: column.to_string(),
+            })?;
+        let mut builder = TokenRunBuilder::new(letter_case);
+        match def_levels {
+            None => {
+                for row in 0..texts.len() {
+                    builder.push_text(row as u32, texts.value(row).as_bytes());
+                }
+            }
+            Some(def_levels) => {
+                let rows_with_text = def_levels
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, level)| **level == max_def_level);
+                for (value_index, (row, _)) in rows_with_text.enumerate() {
+                    builder.push_text(row as u32, texts.value(value_index).as_bytes());
+                }
+            }
+        }
+        Ok(builder.finish(allocator))
+    }
 }
 
 impl Unary<LeafChunkJob, EncodedLeafChunk> for LeafEncoder {
@@ -54,6 +100,33 @@ impl Unary<LeafChunkJob, EncodedLeafChunk> for LeafEncoder {
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
         let values = concat_chunks(allocator, &job.value_chunks).map_err(WriteError::from)?;
+        // A text indexed column is one leaf, named as the column is.
+        let indexed_column = job
+            .context
+            .file_info
+            .text_indexes
+            .iter()
+            .position(|indexed| job.path.len() == 1 && job.path[0] == indexed.column);
+        let token_run = match indexed_column {
+            None => None,
+            Some(indexed_column) => {
+                let indexed = &job.context.file_info.text_indexes[indexed_column];
+                let token_run_allocator = self
+                    .token_run_allocator
+                    .get_or_insert_with(|| SlabAllocator::new(false));
+                Some(ColumnTokenRun {
+                    indexed_column,
+                    run: Self::build_token_run(
+                        &indexed.column,
+                        &values,
+                        job.def_levels.as_deref(),
+                        job.max_def_level,
+                        indexed.letter_case,
+                        token_run_allocator,
+                    )?,
+                })
+            }
+        };
         let leaf = Leaf {
             path: job.path,
             values,
@@ -65,6 +138,7 @@ impl Unary<LeafChunkJob, EncodedLeafChunk> for LeafEncoder {
             context: job.context,
             leaf_index: job.leaf_index,
             leaf: encoded,
+            token_run,
         })?;
         Ok(())
     }

@@ -66,6 +66,7 @@ fn plan_insert_target(table: &LoadedTable) -> Result<InsertTarget> {
         field_ids: Some(field_ids.collect()),
         partition_keys,
         sort_by: table.sort_by().to_vec(),
+        text_indexes: None,
     })
 }
 

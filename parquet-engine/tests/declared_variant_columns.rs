@@ -65,6 +65,7 @@ fn write(items: Vec<DeclaredJsonItem>, rows_per_group: usize) -> Vec<Vec<u8>> {
         Arc::from([]),
         rows_per_group,
         usize::MAX,
+        Arc::default(),
     )
     .map_each(|file: AssembledFile| Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>()))
     .collect()

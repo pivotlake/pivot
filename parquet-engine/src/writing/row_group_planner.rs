@@ -89,14 +89,16 @@ fn emit_column_chunk_jobs(
         partition: plan.partition.clone(),
         sorted_by: plan.sorted_by.clone(),
         max_file_size: plan.max_file_size,
+        text_indexes: plan.text_indexes.clone(),
     });
 
     let mut rows_remaining = row_count;
     let mut batch_index = 0;
     let mut rows_consumed_from_batch = 0;
     for row_group_index in 0..row_group_count {
-        let mut rows_remaining_in_group = plan.target_rows_per_group.min(rows_remaining);
-        rows_remaining -= rows_remaining_in_group;
+        let rows_in_group = plan.target_rows_per_group.min(rows_remaining);
+        let mut rows_remaining_in_group = rows_in_group;
+        rows_remaining -= rows_in_group;
         let mut row_group_batches = Vec::new();
         let mut rows_by_node = vec![0usize; node_count];
         while rows_remaining_in_group > 0 {
@@ -126,6 +128,7 @@ fn emit_column_chunk_jobs(
             assembly_worker: plan.assembly_worker,
             schema: shredding_plan.schema.clone(),
             leaf_count,
+            row_count: rows_in_group,
             file_info: file_info.clone(),
         });
         let mut first_leaf_index = 0;

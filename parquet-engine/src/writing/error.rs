@@ -42,6 +42,13 @@ pub(crate) enum WriteError {
     /// The arrow schema declares something the footer cannot carry as written.
     #[error("schema: {0}")]
     Schema(String),
+    /// A text index was asked of a column that is not written as one leaf of
+    /// text.
+    #[error("a text index is kept of a text column, which `{column}` is not")]
+    TextIndexOfNonTextColumn { column: String },
+    /// A text index numbers the rows of its data file in 32 bits.
+    #[error("a file of {rows} rows has too many for a text index")]
+    TooManyRowsForTextIndex { rows: usize },
 }
 
 pub(crate) type WriteResult<T> = Result<T, WriteError>;

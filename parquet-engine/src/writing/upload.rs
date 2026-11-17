@@ -5,6 +5,11 @@
 //! The sink knows nothing about what records the files afterwards: an
 //! INSERT's transaction and a compaction both drain what it uploaded and
 //! commit it through their own table format.
+//!
+//! A file that comes with text indexes has each written into the write's
+//! text index directory, named after the data file and the column
+//! ([`TextIndexFile::path_for`]), and is reported once all of them and the
+//! data file have landed.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -24,7 +29,7 @@ use dispatch::{
 use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 use planner::catalog::Column;
 
-use super::AssembledFile;
+use super::{AssembledFile, TextIndexFile};
 use crate::RowGroupMetadata;
 
 /// Upload assembled Parquet files over the ring and push every completion onto
@@ -35,10 +40,15 @@ use crate::RowGroupMetadata;
 /// `on_start` runs once, when the dataflow is built and before any file can
 /// land: an INSERT stages the pending insert its transaction commits there;
 /// compaction, which commits its files itself, has nothing to run.
+///
+/// The text indexes the files come with are written into
+/// `text_index_directory` of `store`, which the caller has made sure exists.
+/// It is `None` for a write whose files come with none.
 pub fn upload_files_spec<OF>(
     uploaded_files: UploadedFiles,
     store: Arc<dyn ObjectStore>,
     directory: ObjectPath,
+    text_index_directory: Option<ObjectPath>,
     declared_columns: Arc<[Column]>,
     on_start: Option<Box<dyn FnOnce() + Send>>,
     encoded: OperatorSpec<AssembledFile, OF>,
@@ -55,6 +65,7 @@ where
     let remaining_workers = Arc::new(AtomicUsize::new(workers));
     // Every file the write uploads names the one directory through this.
     let directory = Arc::new(directory);
+    let text_index_directory = text_index_directory.map(Arc::new);
     // One factory per worker, but only the first runs `on_start`.
     let mut on_start = on_start;
     let uploads = encoded.chain(
@@ -65,6 +76,7 @@ where
                 uploaded_files: uploaded_files.clone(),
                 store: Arc::clone(&store),
                 directory: Arc::clone(&directory),
+                text_index_directory: text_index_directory.clone(),
                 on_start: on_start.take(),
                 rows: rows.clone(),
                 remaining_workers: remaining_workers.clone(),
@@ -88,9 +100,14 @@ pub struct UploadedFile {
     pub partition: Option<crate::PartitionValues>,
     pub row_groups: Vec<Arc<RowGroupMetadata>>,
     pub sorted_by: Arc<[String]>,
+    /// The file's text indexes, each by its path relative to the write's
+    /// text index directory, with its size.
+    pub text_indexes: Vec<FileRef>,
     store: Arc<dyn ObjectStore>,
     /// Shared by every file of one write.
     directory: Arc<ObjectPath>,
+    /// Where the text indexes of the write's files went, when it has any.
+    text_index_directory: Option<Arc<ObjectPath>>,
 }
 
 impl UploadedFile {
@@ -105,17 +122,31 @@ impl UploadedFile {
         &self.directory
     }
 
-    /// Delete the file, never recorded, from where it was written. Best
-    /// effort: a file that cannot be removed is logged and left behind,
-    /// unreferenced.
+    /// The directory the file's text indexes were written into, which their
+    /// paths are relative to. `None` for a write without text indexes.
+    pub fn text_index_directory(&self) -> Option<&ObjectPath> {
+        self.text_index_directory.as_deref()
+    }
+
+    /// Delete the file, never recorded, and its text indexes from where they
+    /// were written. Best effort: a file that cannot be removed is logged
+    /// and left behind, unreferenced.
     pub fn delete(&self) {
-        let key = self.directory.resolve(&self.file.path);
-        if let Err(error) = self.store.delete(&key) {
-            tracing::warn!(
-                file = %key.as_str(),
-                %error,
-                "could not remove the uploaded file of a write that did not land"
-            );
+        let data_file = self.directory.resolve(&self.file.path);
+        let text_indexes = self.text_indexes.iter().map(|text_index| {
+            self.text_index_directory
+                .as_ref()
+                .expect("a file with text indexes was written with a directory for them")
+                .resolve(&text_index.path)
+        });
+        for key in std::iter::once(data_file).chain(text_indexes) {
+            if let Err(error) = self.store.delete(&key) {
+                tracing::warn!(
+                    file = %key.as_str(),
+                    %error,
+                    "could not remove the uploaded file of a write that did not land"
+                );
+            }
         }
     }
 }
@@ -166,6 +197,8 @@ pub(super) struct UploadFactory {
     /// Where the files are written: the store, and the directory in it.
     store: Arc<dyn ObjectStore>,
     directory: Arc<ObjectPath>,
+    /// Where the files' text indexes are written, in the same store.
+    text_index_directory: Option<Arc<ObjectPath>>,
     /// Run once when this factory builds its operator. Held by one worker's
     /// factory only.
     on_start: Option<Box<dyn FnOnce() + Send>>,
@@ -192,9 +225,11 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
             uploaded_files: self.uploaded_files,
             store: self.store,
             directory: self.directory,
+            text_index_directory: self.text_index_directory,
             rows: self.rows,
             remaining_workers: self.remaining_workers,
             in_flight: HashMap::new(),
+            text_index_writes: HashMap::new(),
         })
     }
 }
@@ -207,6 +242,11 @@ struct PendingUpload {
     /// The footer metadata the writer produced for this file, used to record its
     /// row groups once the upload lands (no re-parsing the file we just wrote).
     metadata: crate::thrift::footer::FileMetaData,
+    /// The file's text indexes, by their paths in the text index directory.
+    text_indexes: Vec<FileRef>,
+    /// How many of the writes of the data file and its text indexes have not
+    /// landed yet. The upload is reported when none is left.
+    writes_in_flight: usize,
 }
 
 pub(super) struct Upload {
@@ -220,6 +260,8 @@ pub(super) struct Upload {
     /// which each finished upload is stamped with.
     store: Arc<dyn ObjectStore>,
     directory: Arc<ObjectPath>,
+    /// Where the files' text indexes are written, in the same store.
+    text_index_directory: Option<Arc<ObjectPath>>,
     /// Running total of inserted rows, shared by every worker (see
     /// [`UploadFactory`]). Added to as completions land; read once at `finish`.
     rows: Arc<AtomicUsize>,
@@ -233,12 +275,52 @@ pub(super) struct Upload {
     /// right away and they all run concurrently (some disks and object stores
     /// have enough latency that serializing would leave throughput on the table).
     in_flight: HashMap<usize, PendingUpload>,
+    /// The writes of text indexes that have not landed yet: each one's
+    /// bytes pointer, and the `in_flight` key of the upload it belongs to.
+    text_index_writes: HashMap<usize, usize>,
 }
 
 impl Upload {
-    /// Finish the in-flight upload whose encoded bytes are at `id`: its data-file
-    /// IO has landed, so build the table file and hand it to the statement's
-    /// transaction.
+    /// Open `key` of the store for a write of `len` bytes: a new local file,
+    /// or an upload to a remote object.
+    fn open_for_write(&self, key: &ObjectPath, len: usize) -> dispatch::UnaryResult<OpenFile> {
+        Ok(match self.store.sink(key).map_err(crate::op_err)? {
+            DataFileLocation::Local(path) => {
+                let file_handle = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path)
+                    .map_err(crate::op_err)?;
+                OpenFile::Local(LocalFile::new(file_handle).map_err(crate::op_err)?)
+            }
+            DataFileLocation::Remote { url, auth } => {
+                let remote = RemoteFile::open(url, auth, len as u64)
+                    .map(Arc::new)
+                    .map_err(crate::op_err)?;
+                OpenFile::Remote(remote)
+            }
+        })
+    }
+
+    /// The write whose bytes are at `written` has landed: it is the data
+    /// file of an upload or one of its text indexes. Once every write of the
+    /// upload has landed, finish it.
+    fn complete_write(&mut self, written: usize) -> dispatch::UnaryResult<()> {
+        let id = self.text_index_writes.remove(&written).unwrap_or(written);
+        let pending = self
+            .in_flight
+            .get_mut(&id)
+            .expect("completion for an upload not in flight");
+        pending.writes_in_flight -= 1;
+        if pending.writes_in_flight > 0 {
+            return Ok(());
+        }
+        self.complete(id)
+    }
+
+    /// Finish the in-flight upload whose encoded bytes are at `id`: its data
+    /// file and its text indexes have landed, so build the table file and hand
+    /// it to the statement's transaction.
     fn complete(&mut self, id: usize) -> dispatch::UnaryResult<()> {
         let pending = self
             .in_flight
@@ -265,8 +347,10 @@ impl Upload {
             partition: pending.partition,
             row_groups: loaded.row_groups,
             sorted_by: pending.sorted_by,
+            text_indexes: pending.text_indexes,
             store: Arc::clone(&self.store),
             directory: Arc::clone(&self.directory),
+            text_index_directory: self.text_index_directory.clone(),
         });
         // Relaxed: the finish barrier (AcqRel on the sibling counter) publishes
         // this add to whichever worker reads the total.
@@ -293,23 +377,28 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
             size: data.len() as u64,
         };
 
-        let open_file = match self.store.sink(&key).map_err(crate::op_err)? {
-            DataFileLocation::Local(path) => {
-                let file_handle = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(path)
-                    .map_err(crate::op_err)?;
-                OpenFile::Local(LocalFile::new(file_handle).map_err(crate::op_err)?)
-            }
-            DataFileLocation::Remote { url, auth } => {
-                let remote = RemoteFile::open(url, auth, data.len() as u64)
-                    .map(Arc::new)
-                    .map_err(crate::op_err)?;
-                OpenFile::Remote(remote)
-            }
-        };
-        io.write(open_file, data.clone())?;
+        io.write(self.open_for_write(&key, data.len())?, data.clone())?;
+
+        let mut text_indexes = Vec::with_capacity(encoded.text_indexes.len());
+        for TextIndexFile { column, bytes } in encoded.text_indexes {
+            let index_path = TextIndexFile::path_for(&file.path, &column);
+            let index_key = self
+                .text_index_directory
+                .as_ref()
+                .expect("a write whose files have text indexes has a directory for them")
+                .resolve(&index_path);
+            let index_data = Arc::new(bytes);
+            self.text_index_writes
+                .insert(Arc::as_ptr(&index_data) as usize, id);
+            io.write(
+                self.open_for_write(&index_key, index_data.len())?,
+                index_data.clone(),
+            )?;
+            text_indexes.push(FileRef {
+                path: index_path,
+                size: index_data.len() as u64,
+            });
+        }
         self.in_flight.insert(
             id,
             PendingUpload {
@@ -318,6 +407,8 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
                 partition: encoded.partition,
                 sorted_by: encoded.sorted_by,
                 metadata: encoded.metadata,
+                writes_in_flight: 1 + text_indexes.len(),
+                text_indexes,
             },
         );
         Ok(())
@@ -328,7 +419,7 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
         _sender: &mut dyn Sender<RecordBatch>,
         request: FsWriteRequest,
     ) -> dispatch::UnaryResult<()> {
-        self.complete(Arc::as_ptr(&request.data) as usize)
+        self.complete_write(Arc::as_ptr(&request.data) as usize)
     }
 
     fn process_http_upload_response(
@@ -336,7 +427,7 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
         _sender: &mut dyn Sender<RecordBatch>,
         request: HttpUploadRequest,
     ) -> dispatch::UnaryResult<()> {
-        self.complete(Arc::as_ptr(&request.data) as usize)
+        self.complete_write(Arc::as_ptr(&request.data) as usize)
     }
 
     /// The uploads are async: their writes/uploads land later on the ring, so the

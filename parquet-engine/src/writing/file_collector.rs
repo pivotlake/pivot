@@ -29,7 +29,9 @@ use dispatch::{
 
 use super::error::WriteError;
 use super::partition_sorter::SortedPartitionRun;
-use super::types::{FileMergeContext, FileOrderInput, FilePlan, NodeMergeRequest, ReadyFile};
+use super::types::{
+    FileMergeContext, FileOrderInput, FilePlan, NodeMergeRequest, ReadyFile, TextIndexedColumn,
+};
 use crate::scalar_values_from_row;
 
 /// One partition's sorted runs waiting to be cut into files.
@@ -76,6 +78,8 @@ pub(super) struct FileCollectorFactory {
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
+    /// The columns an index file is written of, beside each data file.
+    text_indexes: Arc<[TextIndexedColumn]>,
     topology: Topology,
     shared: Arc<SharedCollector>,
 }
@@ -94,6 +98,7 @@ pub(super) fn factories(
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
     max_file_size: Option<usize>,
+    text_indexes: Arc<[TextIndexedColumn]>,
     topology: Topology,
 ) -> Vec<FileCollectorFactory> {
     let shared = Arc::new(SharedCollector {
@@ -120,6 +125,7 @@ pub(super) fn factories(
             target_rows_per_group,
             target_in_memory_bytes_per_file,
             max_file_size,
+            text_indexes: text_indexes.clone(),
             topology,
             shared: shared.clone(),
         })
@@ -138,6 +144,7 @@ impl UnaryFactory<SortedPartitionRun, FileOrderInput> for FileCollectorFactory {
             target_rows_per_group: self.target_rows_per_group,
             target_in_memory_bytes_per_file: self.target_in_memory_bytes_per_file,
             max_file_size: self.max_file_size,
+            text_indexes: self.text_indexes,
             topology: self.topology,
             shared: self.shared,
             known_partitions: HashMap::new(),
@@ -336,6 +343,7 @@ impl FileCollector {
             sorted_by: self.sorted_by.clone(),
             target_rows_per_group: self.target_rows_per_group,
             max_file_size: self.max_file_size,
+            text_indexes: self.text_indexes.clone(),
         };
 
         if self.order_by.is_empty() {

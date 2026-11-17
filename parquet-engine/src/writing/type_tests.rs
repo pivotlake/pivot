@@ -196,6 +196,7 @@ fn write_cases(dispatch: &Dispatch, cases: &[Case]) -> Vec<u8> {
         Arc::from([]),
         ROWS,
         usize::MAX,
+        Arc::default(),
     )
     .map_each(|file: AssembledFile| Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>()))
     .collect()

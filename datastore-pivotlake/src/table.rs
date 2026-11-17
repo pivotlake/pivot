@@ -675,11 +675,13 @@ impl CatalogTable {
             inputs_are_sorted,
             target_rows_per_group,
             max_output_file_size,
+            Arc::default(),
         );
         let spec = parquet_engine::writing::upload::upload_files_spec(
             uploaded_files.clone(),
             self.store(),
             self.storage.location.clone(),
+            None,
             self.columns().into(),
             None,
             encoded,
@@ -765,6 +767,7 @@ impl CatalogTable {
             field_ids: self.field_ids(),
             partition_keys: self.table.plan_partition_keys()?,
             sort_by: self.sort_by().to_vec(),
+            text_indexes: None,
         })
     }
 }

@@ -14,10 +14,12 @@ use crate::thrift::general::Encoding;
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use dispatch::memory::{FileBytes, Slab};
+use dispatch::text_index::{LetterCase, TokenRun};
 use dispatch::{
     Identifier, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, NodeIdOutput, OrderBy,
     WorkerIdOutput,
 };
+use object_storage::ObjectPath;
 
 use crate::thrift::general::CompressionCodec;
 
@@ -26,6 +28,51 @@ pub(crate) type RowGroupId = u64;
 
 /// Unique identity of an output file within one write pipeline.
 pub(crate) type FileId = u64;
+
+/// A column of the table that a text index is kept of: every file written
+/// comes with an index file of the tokens of this column's text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextIndexedColumn {
+    pub column: String,
+    /// Whether tokens differing only in letter case are one token of the
+    /// index.
+    pub letter_case: LetterCase,
+}
+
+/// The text index of one column of one data file, ready to be written beside
+/// it. Like the data file's, its bytes are worker-owned ring slabs.
+pub struct TextIndexFile {
+    pub column: String,
+    pub bytes: FileBytes,
+}
+
+impl TextIndexFile {
+    /// Where the text index of `column` of a data file is, in its table's
+    /// text index directory: the data file's own path there, with the column
+    /// and `.textindex` after it. Bytes of the column's name that could mean
+    /// something in a path are written as `%` and two hex digits.
+    pub fn path_for(data_file: &ObjectPath, column: &str) -> ObjectPath {
+        let mut path = format!("{}.", data_file.as_str());
+        for byte in column.bytes() {
+            if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
+                path.push(byte as char);
+            } else {
+                path.push_str(&format!("%{byte:02x}"));
+            }
+        }
+        path.push_str(".textindex");
+        ObjectPath::new(path)
+    }
+}
+
+/// The token run of one row group's text, on its way to the file's assembly
+/// worker with the encoded leaf it was made from.
+pub(crate) struct ColumnTokenRun {
+    /// Which of the file's text indexed columns the run is of, by position in
+    /// [`FileAssemblyInfo::text_indexes`].
+    pub(crate) indexed_column: usize,
+    pub(crate) run: TokenRun,
+}
 
 /// File-level information shared by all row groups during assembly.
 pub(crate) struct FileAssemblyInfo {
@@ -38,6 +85,8 @@ pub(crate) struct FileAssemblyInfo {
     /// and footers are excluded. `None` for INSERT. An individually oversized
     /// row group remains one file.
     pub(crate) max_file_size: Option<usize>,
+    /// The columns an index file is written of, beside each data file.
+    pub(crate) text_indexes: Arc<[TextIndexedColumn]>,
 }
 
 /// A complete Parquet file and the metadata needed to add it to the table.
@@ -54,6 +103,9 @@ pub struct AssembledFile {
     /// columns, and a compaction's when every row it merged arrived in their
     /// order. Empty for a file whose rows are in no such order.
     pub sorted_by: Arc<[String]>,
+    /// The file's text indexes, one for each text indexed column of the
+    /// write.
+    pub text_indexes: Vec<TextIndexFile>,
 }
 
 /// Shared routing and schema information for every column chunk in one row
@@ -65,6 +117,8 @@ pub(crate) struct RowGroupContext {
     /// Primitive leaves across every column of `schema`: the number of encoded
     /// chunks that complete the row group.
     pub(crate) leaf_count: usize,
+    /// How many rows the row group holds.
+    pub(crate) row_count: usize,
     pub(crate) file_info: Arc<FileAssemblyInfo>,
 }
 
@@ -80,6 +134,8 @@ pub(crate) struct FilePlan {
     pub(crate) sorted_by: Arc<[String]>,
     pub(crate) target_rows_per_group: usize,
     pub(crate) max_file_size: Option<usize>,
+    /// See [`FileAssemblyInfo::text_indexes`].
+    pub(crate) text_indexes: Arc<[TextIndexedColumn]>,
 }
 
 /// A file whose row order is final and ready for row-group planning.
@@ -258,6 +314,9 @@ pub(crate) struct EncodedLeafChunk {
     /// See [`LeafChunkJob::leaf_index`].
     pub(crate) leaf_index: usize,
     pub(crate) leaf: EncodedLeaf,
+    /// The tokens of the row group's text, when the leaf is a text indexed
+    /// column.
+    pub(crate) token_run: Option<ColumnTokenRun>,
 }
 
 impl WorkerIdOutput for EncodedLeafChunk {
