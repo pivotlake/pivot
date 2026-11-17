@@ -1,8 +1,9 @@
 //! A managed table another tool repartitioned: the files written before
 //! keep the partition spec they were written under, so each file's
 //! partition values are read by its own spec's fields, compaction leaves
-//! the files of an earlier spec as they are, and a merge of them is
-//! refused.
+//! the files of an earlier spec as they are, a merge of them is refused,
+//! and a DELETE checks each file's partition against the spec it was
+//! written under.
 
 mod iceberg_support;
 
@@ -128,4 +129,34 @@ fn a_merge_of_the_files_of_an_earlier_partition_spec_is_refused() {
 
     assert!(matches!(refused, Err(Error::PartitionNotRewritable { .. })));
     assert_eq!(hold_table(&db, "t").file_refs().unwrap(), written_by_p);
+}
+
+#[test]
+fn a_delete_by_the_column_of_an_earlier_spec_is_refused_over_the_files_of_the_later_one() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (ts BIGINT, p BIGINT) WITH (partition_by = 'p')");
+    db.execute("INSERT INTO t VALUES (10, 1)");
+    repartition_by(&db, "t", "ts");
+    db.execute("INSERT INTO t VALUES (20, 1)");
+
+    let refusal = db.try_execute("DELETE FROM t WHERE p = 1").unwrap_err();
+
+    assert!(refusal.contains("cut partition `ts=20`"), "{refusal}");
+    let rows = db.execute("SELECT ts FROM t ORDER BY ts");
+    assert_eq!(collect_i64s(&rows, 0), [10, 20]);
+}
+
+#[test]
+fn a_delete_without_conditions_drops_the_files_of_every_spec() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (ts BIGINT, p BIGINT) WITH (partition_by = 'p')");
+    db.execute("INSERT INTO t VALUES (10, 1), (11, 2)");
+    repartition_by(&db, "t", "ts");
+    db.execute("INSERT INTO t VALUES (20, 1)");
+
+    let deleted = db.execute("DELETE FROM t");
+
+    assert_eq!(collect_i64s(&deleted, 0), [3]);
+    let rows = db.execute("SELECT ts FROM t ORDER BY ts");
+    assert_eq!(collect_i64s(&rows, 0), Vec::<i64>::new());
 }

@@ -2,7 +2,7 @@
 title: "CREATE SCHEMA"
 description: Create a namespace for tables in a datastore.
 sidebar:
-  order: 5
+  order: 6
 ---
 
 `CREATE SCHEMA` adds a namespace for tables to a datastore.

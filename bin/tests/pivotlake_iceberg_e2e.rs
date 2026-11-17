@@ -212,3 +212,66 @@ fn a_copy_into_a_table_partitioned_by_day_lands_a_file_per_day() {
         vec![vec![Some("2".to_string())], vec![Some("3".to_string())]]
     );
 }
+
+/// A DELETE whose condition ends on a partition bound answers with the
+/// rows it removed, and one that cuts a partition with an error naming it,
+/// leaving the table as it was.
+#[test]
+fn a_delete_answers_the_rows_it_removed_and_refuses_to_cut_a_partition() {
+    let location = TempDir::new().unwrap();
+    let config = format!(
+        "datastores:
+  events:
+    kind: pivotlake
+    table_format: iceberg
+    location: {}
+    default: true
+    vacuum: false
+",
+        location.path().display()
+    );
+    let port = start_server_from_config(&config);
+
+    let (deleted, refusal, left) = block_on(async {
+        let client = connect_client(port).await;
+        client
+            .simple_query("CREATE TABLE events (id BIGINT, ts TIMESTAMP) PARTITIONED BY (day(ts))")
+            .await
+            .unwrap();
+        client
+            .simple_query(
+                "INSERT INTO events VALUES \
+                 (1, TIMESTAMP '2024-02-29 08:00:00'), (2, TIMESTAMP '2024-02-29 23:59:59'), \
+                 (3, TIMESTAMP '2024-03-01 08:00:00'), (4, TIMESTAMP '2024-03-01 20:00:00')",
+            )
+            .await
+            .unwrap();
+        let deleted = tokio::task::spawn_blocking(move || {
+            let mut raw = RawConn::connect(port);
+            raw.query("DELETE FROM events WHERE ts < TIMESTAMP '2024-03-01 00:00:00'");
+            command_tag(&raw.read_until_ready())
+        })
+        .await
+        .unwrap();
+        let refusal = client
+            .simple_query("DELETE FROM events WHERE ts < TIMESTAMP '2024-03-01 12:00:00'")
+            .await
+            .unwrap_err()
+            .as_db_error()
+            .expect("the server answers a refused statement with an error")
+            .message()
+            .to_string();
+        let left = select_rows(&client, "SELECT id FROM events ORDER BY id").await;
+        (deleted, refusal, left)
+    });
+
+    assert_eq!(deleted.as_deref(), Some("DELETE 2"));
+    assert!(
+        refusal.contains("cut partition `ts_day=2024-03-01`"),
+        "{refusal}"
+    );
+    assert_eq!(
+        left,
+        vec![vec![Some("3".to_string())], vec![Some("4".to_string())]]
+    );
+}

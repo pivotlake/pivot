@@ -250,6 +250,12 @@ pub mod ffi {
         fn lo_insert_column_map_source(op: &LogicalOperator, index: usize) -> Result<usize>;
         fn lo_insert_returns_rows(op: &LogicalOperator) -> Result<bool>;
 
+        // ---- Delete ----
+        fn lo_delete_take_table(op: &LogicalOperator) -> Result<Box<OptionalTableWrapper>>;
+        /// Whether the `LogicalDelete` hands its deleted rows back
+        /// (`DELETE ... RETURNING`).
+        fn lo_delete_returns_rows(op: &LogicalOperator) -> Result<bool>;
+
         // ---- Filter ----
         fn lo_filter_expr_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_filter_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;

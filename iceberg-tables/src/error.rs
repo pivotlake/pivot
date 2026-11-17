@@ -188,6 +188,22 @@ pub enum Error {
     DeleteFile { file: String },
     #[error("the deletion vector for `{file}` is invalid: {message}")]
     DeletionVector { file: String, message: String },
+    #[error(
+        "DELETE on `{table}` takes whole partitions out of the table, and `{condition}` cannot be checked against a partition: a DELETE takes comparisons of a column with a constant (=, <>, <, <=, >, >=, BETWEEN, IN) and IS NULL, joined by AND or OR"
+    )]
+    UnsupportedDeleteCondition { table: String, condition: String },
+    #[error(
+        "DELETE on `{table}` takes whole partitions out of the table, and its conditions cut partition `{partition}`, which they are not true of every row of: end them on the bounds of the table's partitions ({partition_by})"
+    )]
+    DeleteCutsPartition {
+        table: String,
+        partition: String,
+        partition_by: String,
+    },
+    #[error(
+        "DELETE on `{table}` takes whole partitions out of the table, and the table holds files that are in no partition, which its conditions are not true of every row of: only a DELETE without conditions takes those out"
+    )]
+    DeleteCutsUnpartitionedFiles { table: String },
 }
 
 impl Error {

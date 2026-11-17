@@ -1,8 +1,8 @@
 //! A [`catalog::datastore::Datastore`] over the tables of an Iceberg REST
 //! catalog: every table the catalog lists is read, and written to by INSERT,
-//! COPY, CREATE TABLE and DROP TABLE. The Iceberg tables Pivot keeps in its
-//! own directories live in the `pivotlake` datastore; both are built on the
-//! `iceberg-tables` crate.
+//! COPY, DELETE, CREATE TABLE and DROP TABLE. The Iceberg tables Pivot keeps
+//! in its own directories live in the `pivotlake` datastore; both are built
+//! on the `iceberg-tables` crate.
 //!
 //! The catalog is the only source of table identity: namespaces are the
 //! datastore's schemas (single-level namespaces only, as a Pivot schema is one
@@ -23,6 +23,11 @@
 //! the snapshot and moves `main` onto it, provided `main` still names that
 //! version's snapshot; a commit that loses that race is built again on the
 //! winner.
+//! A DELETE writes no file: it takes the partitions its conditions cover
+//! whole out of the table, as one delete snapshot built and committed the
+//! same way, and is refused when the conditions cut a partition that holds a
+//! row. What they cover is selected from the version each commit attempt is
+//! built on.
 //! The table's entry in the index is replaced with the table as committed,
 //! so the session reads its own writes before the next refresh. CREATE TABLE
 //! registers a format version 3 table through the catalog, which assigns its

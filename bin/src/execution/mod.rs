@@ -243,13 +243,13 @@ impl Executor {
         let handle = tokio::task::spawn_blocking(move || -> Result<StatementHandle<T>> {
             let spec = plan.compile(&dispatcher, compile_transaction.as_ref())?;
             Ok(match (statement_kind, options.collect_stats) {
-                (StatementKind::Insert, true) => {
+                (StatementKind::Insert | StatementKind::Delete, true) => {
                     let output = spec.map(|| affected_rows_from_record_batch);
-                    StatementHandle::Insert(output.execute_with_stats())
+                    StatementHandle::AffectedRows(output.execute_with_stats())
                 }
-                (StatementKind::Insert, false) => {
+                (StatementKind::Insert | StatementKind::Delete, false) => {
                     let output = spec.map(|| affected_rows_from_record_batch);
-                    StatementHandle::Insert(output.execute())
+                    StatementHandle::AffectedRows(output.execute())
                 }
                 (_, true) => StatementHandle::Batches(spec.execute_with_stats(convert)),
                 (_, false) => StatementHandle::Batches(spec.execute(convert)),
@@ -264,8 +264,13 @@ impl Executor {
             (StatementKind::Query, StatementResults::Batches(batches)) => {
                 StatementOutput::Rows { columns, batches }
             }
-            (StatementKind::Insert, StatementResults::Insert(outputs)) => {
+            (StatementKind::Insert, StatementResults::AffectedRows(outputs)) => {
                 StatementOutput::Command(Command::Insert {
+                    rows: affected_rows(outputs)?,
+                })
+            }
+            (StatementKind::Delete, StatementResults::AffectedRows(outputs)) => {
+                StatementOutput::Command(Command::Delete {
                     rows: affected_rows(outputs)?,
                 })
             }

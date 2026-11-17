@@ -29,7 +29,7 @@
 //! sweep (the server and the shell each run one on an interval) reloads every
 //! table to its latest committed version and fetches any new files' footers,
 //! a compaction or vacuum round reloads the table it is about to work on the
-//! same way, and an in-process writer (INSERT, compaction)
+//! same way, and an in-process writer (INSERT, DELETE, compaction)
 //! [`publish_table`](PivotlakeDatastore::publish_table)s its committed copy
 //! immediately. Queries never touch the store: a query opens
 //! a transaction ([`Datastore::begin_transaction`]) whose [`PivotlakeSnapshot`]
@@ -41,6 +41,7 @@
 
 mod binding;
 mod compact;
+mod delete;
 mod delta;
 mod iceberg;
 mod insert_sink;
@@ -80,6 +81,7 @@ use async_trait::async_trait;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use catalog::{CommitAction, CommitQueue, StagedCommit};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
+use iceberg_tables::DeleteFilter;
 use local_lock::LocalDatastoreLock;
 use manifest::CatalogManifest;
 use object_storage::{self, DataFile, ObjectPath, ObjectStore};
@@ -124,6 +126,10 @@ pub enum Error {
         "`partition_by` term `{term}` is a transform of a column, which Delta Lake has none of: a database in the `delta` table format partitions its tables by columns"
     )]
     PartitionTransformInDelta { term: String },
+    #[error(
+        "DELETE runs on Iceberg tables, whose partitions it takes out whole, and this database keeps its tables in the `delta` table format"
+    )]
+    DeleteFromDeltaTable,
     #[error(
         "`partition_by` term `{term}` is a transform of a column, and a table that adopts files with `with_pre_existing_parquets` is partitioned by columns alone: no transform cut the files it adopts"
     )]
@@ -744,6 +750,32 @@ impl PivotlakeDatastore {
         Ok(())
     }
 
+    /// Remove from table `id` the rows `filter` removes, as one commit that
+    /// takes whole partitions out: what it removes is selected from the live
+    /// table's version, under the table's
+    /// [commit lock](field@CatalogTable::commit_lock), and the committed
+    /// version is published. A table without a row to remove is left as it
+    /// is.
+    pub(crate) fn delete_from_table(&self, id: Uuid, filter: &DeleteFilter) -> Result<()> {
+        // The table is looked up for its lock alone first, and again under
+        // the lock, as `commit_to_table` does.
+        let commit_lock = self
+            .tables_index
+            .read()
+            .unwrap()
+            .get_table_by_id(&id)
+            .ok_or_else(|| Error::TableNotFound(id.to_string()))?
+            .commit_lock();
+        let _committing = commit_lock.lock().unwrap();
+
+        let mut table = self
+            .table_handle_by_id(&id)
+            .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
+        table.delete_rows(filter)?;
+        self.publish_table(table);
+        Ok(())
+    }
+
     /// Persist one table creation staged by a completed footer-fetch dataflow:
     /// commit Delta version 0, record the table in the database index, and
     /// publish it into the live set so the next transaction binds it. Called
@@ -1311,6 +1343,18 @@ impl CommitAction<PivotlakeDatastore> for PendingInsert {
     }
 }
 
+impl CommitAction<PivotlakeDatastore> for PendingDelete {
+    /// Take the DELETE's rows out of the live table, through
+    /// [`PivotlakeDatastore::delete_from_table`]: the transaction's frozen
+    /// snapshot is a read view, as it is for an INSERT.
+    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> CatalogResult<()> {
+        Ok(datastore.delete_from_table(self.table_id, &self.filter)?)
+    }
+
+    /// A DELETE writes nothing before its commit.
+    fn discard(self: Box<Self>) {}
+}
+
 #[async_trait]
 impl Datastore for PivotlakeDatastore {
     /// Open a transaction: freeze the table set as it stands right now. Every
@@ -1496,6 +1540,17 @@ pub(crate) struct PendingTableCreation {
 pub(crate) struct PendingInsert {
     pub(crate) table_id: Uuid,
     pub(crate) uploaded_files: UploadedFiles,
+}
+
+/// The rows one DELETE removes, waiting for its transaction to take them
+/// out of the table in one version. Staged as the statement's dataflow
+/// starts. Carries the table's durable id, not its name, so the commit
+/// resolves the live table regardless of a rename, and the conditions bound
+/// to the version the statement read, so they mean the same columns
+/// whichever version the commit lands on.
+pub(crate) struct PendingDelete {
+    pub(crate) table_id: Uuid,
+    pub(crate) filter: DeleteFilter,
 }
 
 /// The [`DatastoreTransaction`] a [`PivotlakeDatastore`] opens: one query's frozen

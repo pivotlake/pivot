@@ -90,6 +90,35 @@ pub(crate) fn count_deleted_rows(manifests: Vec<Manifest>) -> Result<u64> {
     sum_deleted_rows(&locate_deletion_vectors(manifests)?)
 }
 
+/// How many rows a scan reads of `data_files`, each the path the table's
+/// manifests record a data file by and the rows the file holds: those rows
+/// less the ones the deletion vectors the delete manifests `manifests`
+/// declare delete in the file, each vector's count as its entry records it,
+/// with no bitmap read. A vector that deletes more rows than its file holds
+/// is refused.
+pub(crate) fn count_live_rows(
+    manifests: Vec<Manifest>,
+    data_files: &[(String, u64)],
+) -> Result<u64> {
+    let by_data_file = locate_deletion_vectors(manifests)?;
+    let mut live_rows = 0u64;
+    for (path, row_count) in data_files {
+        let deleted_row_count = by_data_file
+            .get(path)
+            .map_or(0, |vector| vector.deleted_row_count);
+        live_rows +=
+            row_count
+                .checked_sub(deleted_row_count)
+                .ok_or_else(|| Error::DeletionVector {
+                    file: path.clone(),
+                    message: format!(
+                        "it deletes {deleted_row_count} rows of a file that holds {row_count}"
+                    ),
+                })?;
+    }
+    Ok(live_rows)
+}
+
 fn sum_deleted_rows(by_data_file: &HashMap<String, DeletionVectorMetadata>) -> Result<u64> {
     by_data_file
         .iter()

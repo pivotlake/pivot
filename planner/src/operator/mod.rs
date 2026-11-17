@@ -22,6 +22,7 @@ mod create_schema;
 mod create_table;
 mod create_user;
 mod cte;
+mod delete;
 mod distinct;
 mod drop_table;
 mod dummy_scan;
@@ -49,6 +50,7 @@ pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
 pub use create_user::CreateUser;
 pub use cte::{Cte, CteScan};
+pub use delete::Delete;
 pub use distinct::Distinct;
 pub use drop_table::DropTable;
 pub use dummy_scan::DummyScan;
@@ -104,6 +106,10 @@ pub enum Operator {
     Input(Input),
     Values(Values),
     Insert(Insert),
+    /// `DELETE FROM <table> [WHERE ...]`: compiles into a dataflow that
+    /// stages the removal and emits the deleted-row count; the transaction's
+    /// commit removes the rows.
+    Delete(Delete),
     /// A scan over a table-valued function (e.g. `generate_series`).
     TableFunctionScan(TableFunctionScan),
     Projection(Projection),
@@ -184,6 +190,8 @@ impl Operator {
             }
             // An INSERT emits one row: the inserted-row count.
             Operator::Insert(_) => Ok(vec![Type::Int64]),
+            // A DELETE emits one row: the deleted-row count.
+            Operator::Delete(_) => Ok(vec![Type::Int64]),
             // A join emits its listed probe columns followed by its listed
             // build columns; a mark join appends its boolean marker column.
             Operator::Join(join) => {
@@ -284,6 +292,8 @@ impl Operator {
             }
             // An INSERT emits one row: the inserted-row count, never NULL.
             Operator::Insert(_) => vec![false],
+            // A DELETE emits one row: the deleted-row count, never NULL.
+            Operator::Delete(_) => vec![false],
             // An inner join only emits rows built from both inputs, so each
             // output column keeps its own side's nullability; so does a semi
             // join, whose output is probe columns the build side matched. An
@@ -346,6 +356,7 @@ impl fmt::Display for Operator {
             Operator::Input(i) => write!(f, "{i}"),
             Operator::Values(v) => write!(f, "{v}"),
             Operator::Insert(i) => write!(f, "{i}"),
+            Operator::Delete(d) => write!(f, "{d}"),
             Operator::TableFunctionScan(t) => write!(f, "{t}"),
             Operator::Projection(p) => write!(f, "{p}"),
             Operator::OrderBy(o) => write!(f, "{o}"),

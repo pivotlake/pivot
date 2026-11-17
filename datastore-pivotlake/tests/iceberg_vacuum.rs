@@ -92,6 +92,22 @@ fn table_with_a_retired_file(db: &mut Database) -> (String, String, String) {
 }
 
 #[test]
+fn routine_cleanup_deletes_the_files_of_a_dropped_partition_once_the_delete_snapshot_expires() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (p BIGINT, value BIGINT) PARTITIONED BY (p)");
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)");
+    db.execute("DELETE FROM t WHERE p = 1");
+    let live = live_data_file_names(&db.root_uri(), &db.table_directory("t")).unwrap();
+    let files_after_the_delete = parquet_files_in(&db.table_path("t"));
+
+    vacuum(&db, now_ms() + FIVE_HOURS_MS);
+
+    assert_eq!(files_after_the_delete.len(), 2);
+    assert_eq!(parquet_files_in(&db.table_path("t")), live);
+    assert_eq!(single_i64(&db.execute("SELECT value FROM t")), 20);
+}
+
+#[test]
 fn a_file_in_the_adopted_directory_is_never_deleted() {
     let (db, adopted_dir, _table_dir) = adopting_database();
     write_int_parquet(&adopted_dir.join("theirs.parquet"), &[9]);

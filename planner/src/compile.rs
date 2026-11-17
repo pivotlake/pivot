@@ -170,6 +170,8 @@ pub enum Error {
     CreateSchema(#[source] crate::catalog::Error),
     #[error("inserting rows: {0}")]
     Insert(#[source] crate::catalog::Error),
+    #[error("deleting rows: {0}")]
+    Delete(#[source] crate::catalog::Error),
     #[error("SET/RESET is a session command, not a compilable query")]
     SetVariableNotCompilable,
     #[error("COMPACT runs as its own statement and cannot be part of a query")]
@@ -361,6 +363,7 @@ impl PlanNode {
                 o.compile(dispatcher, transaction)
             }
             crate::Operator::Insert(o) => o.compile(inputs.remove(0), dispatcher),
+            crate::Operator::Delete(o) => o.compile(dispatcher),
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.
             crate::Operator::Explain(_) => unreachable!("Explain is compiled before its inputs"),

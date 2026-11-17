@@ -1,19 +1,19 @@
 //! The per-query binding of one loaded table: the snapshot the query bound
 //! plus the filters pushed into it, compiled into the Parquet scan; or, for
-//! an INSERT, the write into that table, committed on whatever the catalog
-//! holds when the transaction commits.
+//! an INSERT or a DELETE, the change to that table, committed on whatever
+//! the catalog holds when the transaction commits.
 
 use std::sync::Arc;
 
 use catalog::CommitQueue;
-use dispatch::RecordBatchOperatorSpec;
+use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use iceberg_tables::Table as LoadedTable;
 use parquet_engine::{ParquetBackedTable, ScanSelection};
 use planner::catalog::{Column, Result as CatalogResult, TableRevision};
 use planner::expression::Expression;
 
 use crate::IcebergDatastore;
-use crate::write::build_insert_spec;
+use crate::write::{build_delete_spec, build_insert_spec};
 
 /// What a [`ParquetTableBinding`](parquet_engine::ParquetTableBinding) of
 /// this datastore is bound to: the table as the query's snapshot of the
@@ -88,5 +88,22 @@ impl ParquetBackedTable for BoundIcebergTable {
             self.commit_actions.clone(),
             input,
         )?)
+    }
+
+    /// What the conditions remove is counted on the snapshot this query
+    /// bound, which also refuses a DELETE that does not take whole
+    /// partitions out. The removal staged here is committed on whatever the
+    /// catalog holds when the transaction commits.
+    fn compile_delete(
+        &self,
+        conditions: &[Expression],
+        dispatcher: &DataFlowDispatcher,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        build_delete_spec(
+            &self.table,
+            self.commit_actions.clone(),
+            conditions,
+            dispatcher,
+        )
     }
 }

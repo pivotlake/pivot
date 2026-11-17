@@ -2,7 +2,7 @@
 title: "EXPLAIN"
 description: Inspect a query physical plan without executing it.
 sidebar:
-  order: 9
+  order: 10
 ---
 
 `EXPLAIN` shows the physical plan for a query without running the query.

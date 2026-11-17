@@ -2,7 +2,7 @@
 title: "DROP TABLE"
 description: Remove a table from the catalog.
 sidebar:
-  order: 7
+  order: 8
 ---
 
 `DROP TABLE` removes a table from the catalog immediately. With `vacuum: true`,

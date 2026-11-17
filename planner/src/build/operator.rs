@@ -568,7 +568,7 @@ fn build_orders(keys: Vec<OrderKey<'_>>) -> Result<Vec<OrderByNode>, ExpressionE
 }
 
 /// Resolve a bound catalog entry into the Pivot [`BoundTable`] it wraps.
-fn bind_table(wrapper: OptionalTableWrapper) -> Box<dyn BoundTable> {
+pub(super) fn bind_table(wrapper: OptionalTableWrapper) -> Box<dyn BoundTable> {
     let duck: Box<dyn DuckDBTable> = wrapper.table.expect("planner returned an unbound table");
     let any: Box<dyn Any> = duck;
     let adapter: Box<DuckDBTableAdapter> = any

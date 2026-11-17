@@ -2,7 +2,7 @@
 title: "SET / RESET"
 description: Enable or disable execution statistics for a connection.
 sidebar:
-  order: 10
+  order: 11
 ---
 
 `SET` and `RESET` change a setting for the current connection.

@@ -81,6 +81,7 @@ fn build_command_response(command: Command) -> Response {
         Command::Insert { rows } => {
             Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(rows))
         }
+        Command::Delete { rows } => Response::Execution(Tag::new("DELETE").with_rows(rows)),
         Command::CreateTable => Response::Execution(Tag::new("CREATE TABLE")),
         Command::CreateSchema => Response::Execution(Tag::new("CREATE SCHEMA")),
         Command::CreateUser => Response::Execution(Tag::new("CREATE USER")),

@@ -5511,3 +5511,165 @@ fn a_table_whose_property_names_a_variant_is_refused() {
         "{error}"
     );
 }
+
+/// A DELETE whose conditions end on a day bound takes the days before it
+/// out of the table in one delete snapshot: the reference reader every
+/// other engine trusts no longer reads their rows.
+#[test]
+fn a_delete_ending_on_a_day_bound_drops_the_days_before_it_for_every_reader() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "deleted_days",
+        "events",
+        events_schema(),
+        2,
+        "at_day",
+        Transform::Day,
+    );
+    let (catalog, mut planner) = harness.pivot();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO deleted_days.events VALUES \
+             (1, TIMESTAMP '2024-01-01 10:00:00'), \
+             (2, TIMESTAMP '2024-01-02 01:00:00'), \
+             (3, TIMESTAMP '2024-01-01 23:59:59')",
+        )
+        .unwrap();
+
+    let deleted = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "DELETE FROM deleted_days.events WHERE \"at\" < TIMESTAMP '2024-01-02 00:00:00'",
+        )
+        .unwrap();
+
+    assert_eq!(int64_column(&deleted, 0), [Some(2)]);
+    let left = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM deleted_days.events ORDER BY id",
+    );
+    assert_eq!(int64_column(&left, 0), [Some(2)]);
+    assert_eq!(
+        harness.scan_ids(&namespace, "events", Predicate::AlwaysTrue),
+        [2]
+    );
+    let table = harness.load(&namespace, "events");
+    let summary = table.metadata().current_snapshot().unwrap().summary();
+    assert_eq!(summary.operation, Operation::Delete);
+    assert_eq!(summary.additional_properties["deleted-data-files"], "1");
+}
+
+/// A DELETE whose conditions cut a day is refused before anything is
+/// committed: the table keeps its snapshot and every row.
+#[test]
+fn a_delete_inside_a_day_is_refused_with_no_snapshot_committed() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "cut_day",
+        "events",
+        events_schema(),
+        2,
+        "at_day",
+        Transform::Day,
+    );
+    let (catalog, mut planner) = harness.pivot();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO cut_day.events VALUES \
+             (1, TIMESTAMP '2024-01-01 10:00:00'), (2, TIMESTAMP '2024-01-01 23:00:00')",
+        )
+        .unwrap();
+    let snapshot_before = harness
+        .load(&namespace, "events")
+        .metadata()
+        .current_snapshot_id();
+
+    let refusal = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "DELETE FROM cut_day.events WHERE \"at\" < TIMESTAMP '2024-01-01 12:00:00'",
+        )
+        .unwrap_err();
+
+    assert!(
+        refusal.contains("cut partition `at_day=2024-01-01`"),
+        "{refusal}"
+    );
+    let table = harness.load(&namespace, "events");
+    assert_eq!(table.metadata().current_snapshot_id(), snapshot_before);
+    assert_eq!(
+        harness.scan_ids(&namespace, "events", Predicate::AlwaysTrue),
+        [1, 2]
+    );
+}
+
+/// A partition a DELETE drops goes with the deletion vector Spark had
+/// deleted one of its rows by: the DELETE counts the rows that were still
+/// there, and the count the table then answers from its manifests is of the
+/// rows left, which a vector kept for a file that is gone would lower.
+#[test]
+fn a_delete_of_a_partition_takes_the_deletion_vector_of_its_file_with_it() {
+    let Some(harness) = harness() else { return };
+    let by_customer = UnboundPartitionSpec::builder()
+        .with_spec_id(0)
+        .add_partition_field(2, "customer", Transform::Identity)
+        .unwrap()
+        .build();
+    let creation = TableCreation::builder()
+        .name("orders".to_string())
+        .schema(orders_schema())
+        .partition_spec(by_customer)
+        .properties(HashMap::from([(
+            "format-version".to_string(),
+            "3".to_string(),
+        )]))
+        .build();
+    let namespace = harness.namespace_for("dv_dropped", creation);
+    for (ids, customer) in [([1, 2], "ann"), ([3, 4], "bob")] {
+        harness.append_to_partition(
+            &namespace,
+            "orders",
+            orders(&ids, &[customer, customer], &[1.0, 2.0]),
+            Some(vec![Some(Literal::string(customer))]),
+            WriterProperties::default(),
+        );
+    }
+    harness.spark_sql(
+        "ALTER TABLE dv_dropped.orders SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
+         DELETE FROM dv_dropped.orders WHERE id IN (1, 3);",
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let deleted = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "DELETE FROM dv_dropped.orders WHERE customer = 'ann'",
+        )
+        .unwrap();
+
+    assert_eq!(int64_column(&deleted, 0), [Some(1)]);
+    let counted = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT COUNT(*) FROM dv_dropped.orders",
+    );
+    assert_eq!(int64_column(&counted, 0), [Some(1)]);
+    let left = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM dv_dropped.orders ORDER BY id",
+    );
+    assert_eq!(int64_column(&left, 0), [Some(4)]);
+    let table = harness.load(&namespace, "orders");
+    let summary = table.metadata().current_snapshot().unwrap().summary();
+    assert_eq!(summary.additional_properties["removed-delete-files"], "1");
+    assert_eq!(summary.additional_properties["total-delete-files"], "1");
+}

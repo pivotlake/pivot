@@ -241,6 +241,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_PROJECTION => Operator::Projection(Projection { raw: self.raw }),
             L::LOGICAL_EXPRESSION_GET => Operator::Values(Values { raw: self.raw }),
             L::LOGICAL_INSERT => Operator::Insert(Insert { raw: self.raw }),
+            L::LOGICAL_DELETE => Operator::Delete(Delete { raw: self.raw }),
             L::LOGICAL_FILTER => Operator::Filter(Filter { raw: self.raw }),
             L::LOGICAL_AGGREGATE_AND_GROUP_BY => Operator::Aggregate(Aggregate { raw: self.raw }),
             L::LOGICAL_DISTINCT => Operator::Distinct(Distinct { raw: self.raw }),
@@ -277,6 +278,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_CTE_REF => Operator::CteRef(CteRef { raw: self.raw }),
             L::LOGICAL_CHUNK_GET => Operator::ChunkGet(ChunkGet { raw: self.raw }),
             L::LOGICAL_DUMMY_SCAN => Operator::DummyScan,
+            L::LOGICAL_EMPTY_RESULT => Operator::EmptyResult,
             L::LOGICAL_EXPLAIN => Operator::Explain(Explain { raw: self.raw }),
             _ => Operator::Unsupported,
         })
@@ -292,6 +294,9 @@ pub enum Operator<'plan> {
     Projection(Projection<'plan>),
     Values(Values<'plan>),
     Insert(Insert<'plan>),
+    /// `DELETE FROM <table> [WHERE ...]`: its child is the scan of the table
+    /// the rows to delete are read from, under the statement's conditions.
+    Delete(Delete<'plan>),
     Filter(Filter<'plan>),
     Aggregate(Aggregate<'plan>),
     /// A `DISTINCT` over the child's rows.
@@ -345,6 +350,9 @@ pub enum Operator<'plan> {
     ChunkGet(ChunkGet<'plan>),
     /// The single-row source under a `FROM`-less `SELECT`.
     DummyScan,
+    /// What the optimizer leaves of a subtree whose conditions no row can
+    /// meet: a source of no rows.
+    EmptyResult,
     /// `EXPLAIN [ANALYZE] <query>`; the consumer checks
     /// [`Explain::is_analyze`] and supports only plain `EXPLAIN`.
     Explain(Explain<'plan>),
@@ -374,6 +382,9 @@ define_handles! { ffi::LogicalOperator;
     Values,
     /// A `LogicalInsert`: the target table above its value-producing child.
     Insert,
+    /// A `LogicalDelete`: the target table above the scan of the rows to
+    /// delete.
+    Delete,
     /// A `LogicalFilter`: boolean conditions plus an optional projection map.
     Filter,
     /// A `LogicalAggregate`: GROUP BY keys plus aggregate expressions.
@@ -512,6 +523,17 @@ impl<'plan> Insert<'plan> {
 
     pub fn returns_rows(self) -> Result<bool> {
         Ok(ffi::lo_insert_returns_rows(self.raw)?)
+    }
+}
+
+impl<'plan> Delete<'plan> {
+    /// Take the table binding DuckDB resolved for this DELETE's target.
+    pub fn take_table(self) -> Result<Box<OptionalTableWrapper>> {
+        Ok(ffi::lo_delete_take_table(self.raw)?)
+    }
+
+    pub fn returns_rows(self) -> Result<bool> {
+        Ok(ffi::lo_delete_returns_rows(self.raw)?)
     }
 }
 

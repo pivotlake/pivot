@@ -1,5 +1,6 @@
 //! Writing to a catalog table: the catalog as the keeper of the table's
-//! current version, an INSERT's target, and the commit that adds its files.
+//! current version, an INSERT's target and the commit that adds its files,
+//! and a DELETE's commit, which takes whole partitions out.
 //!
 //! The data files are written by the shared table crate's sink, through
 //! Pivot's own store with the credentials the catalog vended. The commit is
@@ -14,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use catalog::{CommitAction, CommitQueue};
-use dispatch::RecordBatchOperatorSpec;
+use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use iceberg::spec::{FormatVersion, Schema};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, ErrorKind, NamespaceIdent, TableCreation};
@@ -26,11 +27,14 @@ use iceberg_tables::metadata::layout::DATA_PATH_PROPERTY;
 use iceberg_tables::types::schema::{
     build_partition_spec, build_schema, build_sort_order, logical_types_property,
 };
-use iceberg_tables::{LOGICAL_TYPES_PROPERTY, Table as LoadedTable, block_on, build_table_ident};
+use iceberg_tables::{
+    DeleteFilter, LOGICAL_TYPES_PROPERTY, Table as LoadedTable, block_on, build_table_ident,
+};
 use object_storage::FileRef;
-use parquet_engine::FileStats;
 use parquet_engine::writing::upload::{UploadedFile, UploadedFiles};
+use parquet_engine::{FileStats, build_affected_rows_spec};
 use planner::catalog::{Column, Result as CatalogResult, SchemaQualifiedTableName};
+use planner::expression::Expression;
 
 use crate::{Error, IcebergDatastore, Result, TableEntry};
 
@@ -156,7 +160,7 @@ impl PendingInsert {
     fn commit_append(&self, files: &[UploadedFile]) -> Result<LoadedTable> {
         let mut held = Arc::clone(&self.table);
         for _ in 0..COMMIT_RETRIES {
-            let current = self.load_current_version(&held)?;
+            let current = load_current_version(&self.table, &held)?;
             let entries = self.build_entries(&current, files)?;
             if let Some(committed) = current.commit(&[], entries)? {
                 return Ok(committed);
@@ -167,33 +171,6 @@ impl PendingInsert {
             attempts: COMMIT_RETRIES,
         }
         .into())
-    }
-
-    /// The table at the version the catalog has current, derived from
-    /// `held`, an earlier version of it; `held` itself when that is still
-    /// current. A table created again under the name is refused before
-    /// anything of it is read: its files are elsewhere, and the INSERT's
-    /// are not its own. A current schema Pivot cannot read refuses the
-    /// load.
-    fn load_current_version(&self, held: &Arc<LoadedTable>) -> Result<Arc<LoadedTable>> {
-        let current = held.metadata_store().load_latest(held.name())?;
-        if current.location == held.metadata_location() {
-            return Ok(Arc::clone(held));
-        }
-        if current.metadata.uuid() != self.table.uuid() {
-            return Err(Error::TableRecreated {
-                table: self.table.name().to_string(),
-            });
-        }
-        let table = LoadedTable::at(
-            held.dispatcher(),
-            Arc::clone(held.metadata_store()),
-            held.location().clone(),
-            held.name(),
-            current,
-            None,
-        )?;
-        Ok(Arc::new(table))
     }
 
     /// `files`, written by the bound table into the directory they were
@@ -250,6 +227,127 @@ impl PendingInsert {
                 })
             })
             .collect()
+    }
+}
+
+/// The table `bound`, which a statement bound, at the version the catalog
+/// has current, derived from `held`, an earlier version of it; `held`
+/// itself when that is still current. A table created again under the name
+/// is refused before anything of it is read: its files are elsewhere, and
+/// what the statement writes or removes is not its own. A current schema
+/// Pivot cannot read refuses the load.
+fn load_current_version(bound: &LoadedTable, held: &Arc<LoadedTable>) -> Result<Arc<LoadedTable>> {
+    let current = held.metadata_store().load_latest(held.name())?;
+    if current.location == held.metadata_location() {
+        return Ok(Arc::clone(held));
+    }
+    if current.metadata.uuid() != bound.uuid() {
+        return Err(Error::TableRecreated {
+            table: bound.name().to_string(),
+        });
+    }
+    let table = LoadedTable::at(
+        held.dispatcher(),
+        Arc::clone(held.metadata_store()),
+        held.location().clone(),
+        held.name(),
+        current,
+        None,
+    )?;
+    Ok(Arc::new(table))
+}
+
+/// Build the dataflow that stages the removal of the rows of `table` every
+/// one of `conditions` is true of and emits their count, or refuse the
+/// DELETE: it takes whole partitions out of the table, so its conditions
+/// have to be ones a partition's values can be checked against, and must
+/// cut no partition that holds a row. The count is of the version the
+/// statement bound; the transaction's commit selects what the conditions
+/// remove from the version the catalog has current then.
+pub(crate) fn build_delete_spec(
+    table: &Arc<LoadedTable>,
+    commit_actions: CommitQueue<IcebergDatastore>,
+    conditions: &[Expression],
+    dispatcher: &DataFlowDispatcher,
+) -> CatalogResult<RecordBatchOperatorSpec> {
+    let filter = table.bind_delete_filter(conditions).map_err(Error::from)?;
+    let deleted_rows = table
+        .select_deleted_files(&filter)
+        .map_err(Error::from)?
+        .row_count();
+    let pending_delete: Box<dyn CommitAction<IcebergDatastore>> = Box::new(PendingDelete {
+        table: Arc::clone(table),
+        filter,
+    });
+    let stage_pending_delete = Box::new(move || commit_actions.push(pending_delete));
+    build_affected_rows_spec(dispatcher, deleted_rows, stage_pending_delete)
+}
+
+/// The rows one DELETE removes, waiting for its transaction to take them
+/// out of the table in one snapshot. Staged as the statement's dataflow
+/// starts.
+pub(crate) struct PendingDelete {
+    /// The table as the query's index had it when the DELETE was bound: its
+    /// name in the catalog, which the commit is addressed to.
+    pub table: Arc<LoadedTable>,
+    /// The DELETE's conditions, bound to the fields of the bound table, so
+    /// they mean the same columns whichever version the commit is built on.
+    pub filter: DeleteFilter,
+}
+
+impl CommitAction<IcebergDatastore> for PendingDelete {
+    /// Commit the removal as one delete snapshot and publish the table at
+    /// the committed version into the datastore's index, so the next query
+    /// sees the rows gone before the background refresh does. Once the
+    /// commit has succeeded so has the statement: a version that cannot be
+    /// entered now is seen at the next refresh.
+    fn apply(self: Box<Self>, datastore: &IcebergDatastore) -> CatalogResult<()> {
+        match self.commit_delete() {
+            Ok(Some(committed)) => {
+                datastore.publish_entry(self.table.name(), TableEntry::of_version(&committed))
+            }
+            Ok(None) => {}
+            Err(Error::Tables(error @ iceberg_tables::Error::CommittedTableUnloaded { .. })) => {
+                tracing::warn!(
+                    table = %self.table.name(),
+                    error = %error,
+                    "the delete was committed, but its version could not be entered; the next refresh enters it"
+                )
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    /// A DELETE writes nothing before its commit.
+    fn discard(self: Box<Self>) {}
+}
+
+impl PendingDelete {
+    /// Commit the removal of the rows the filter removes from the version
+    /// the catalog has current, as one delete snapshot on top of it, and
+    /// hand back the table at the committed version; `None` when that
+    /// version holds no row to remove, and nothing was committed. A commit
+    /// that lost to another writer's is built again on the winner, what the
+    /// filter removes selected anew from it, up to [`COMMIT_RETRIES`]
+    /// times.
+    fn commit_delete(&self) -> Result<Option<LoadedTable>> {
+        let mut held = Arc::clone(&self.table);
+        for _ in 0..COMMIT_RETRIES {
+            let current = load_current_version(&self.table, &held)?;
+            let deleted = current.select_deleted_files(&self.filter)?;
+            if deleted.is_empty() {
+                return Ok(None);
+            }
+            if let Some(committed) = current.commit_delete(&deleted)? {
+                return Ok(Some(committed));
+            }
+            held = current;
+        }
+        Err(iceberg_tables::Error::CommitRacesExhausted {
+            attempts: COMMIT_RETRIES,
+        }
+        .into())
     }
 }
 

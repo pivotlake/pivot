@@ -5,11 +5,12 @@
 //! [`BoundCatalogTable`].
 
 use catalog::CommitQueue;
-use dispatch::RecordBatchOperatorSpec;
+use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use parquet_engine::{ParquetBackedTable, ScanSelection};
 use planner::catalog::{Column, Error as CatalogError, Result as CatalogResult, TableRevision};
 use planner::expression::Expression;
 
+use super::delete::build_delete_spec;
 use super::insert_sink::build_insert_spec;
 use super::{CatalogTable, PivotlakeDatastore};
 
@@ -100,5 +101,23 @@ impl ParquetBackedTable for BoundCatalogTable {
             self.commit_actions.clone(),
             input,
         )?)
+    }
+
+    /// What the conditions remove is counted on the captured snapshot copy,
+    /// which also refuses a DELETE that does not take whole partitions out.
+    /// Compiling stages nothing: the dataflow stages the removal on the
+    /// transaction's queue as it starts, and the transaction's commit
+    /// resolves the live table by its durable id.
+    fn compile_delete(
+        &self,
+        conditions: &[Expression],
+        dispatcher: &DataFlowDispatcher,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        build_delete_spec(
+            &self.table,
+            self.commit_actions.clone(),
+            conditions,
+            dispatcher,
+        )
     }
 }

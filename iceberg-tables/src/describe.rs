@@ -155,7 +155,7 @@ fn add_file_bytes(
 /// pairs in the spec's order, comma-separated, each value in the plain
 /// text its transform reads as (a day as its date, a bucket as its number)
 /// and a NULL as nothing. Empty for a partition of an unpartitioned spec.
-fn format_partition(
+pub(crate) fn format_partition(
     metadata: &TableMetadata,
     partition: &Partition,
     schema_id: i32,

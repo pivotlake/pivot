@@ -527,6 +527,25 @@ pub trait BoundTable: Debug + Send + Sync {
         )
     }
 
+    /// Build a dispatch spec that deletes the rows of this table every one
+    /// of `conditions` is true of, every row when there are none, and emits
+    /// one `BIGINT` row with their count. Each condition is over the table's
+    /// columns: a reference's index is a position in
+    /// [`columns`](Self::columns). A table that can delete only some sets
+    /// of rows refuses the others here. Durable removal belongs to the query
+    /// transaction's [`commit`](CatalogTransaction::commit). The default
+    /// rejects DELETE (a read-only or virtual table).
+    fn compile_delete(
+        &self,
+        _conditions: &[Expression],
+        _dispatcher: &DataFlowDispatcher,
+    ) -> Result<RecordBatchOperatorSpec> {
+        Err(
+            Box::<dyn std::error::Error + Send + Sync>::from("this table does not support DELETE")
+                .into(),
+        )
+    }
+
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;
 

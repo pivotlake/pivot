@@ -2,7 +2,7 @@
 title: "COMPACT"
 description: Merge small Parquet files and re-sort overlapping files.
 sidebar:
-  order: 8
+  order: 9
 ---
 
 `COMPACT` improves a table's physical file layout by merging small Parquet

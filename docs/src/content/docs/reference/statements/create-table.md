@@ -2,7 +2,7 @@
 title: "CREATE TABLE"
 description: Create a table, configure its layout, or adopt existing Parquet files.
 sidebar:
-  order: 4
+  order: 5
 ---
 
 `CREATE TABLE` creates an empty table or registers existing Parquet files as a

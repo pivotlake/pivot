@@ -14,6 +14,9 @@
 //! pushed-down `table_filters` back into a [`Filter`], and replaying a
 //! filter's `projection_map`.
 
+use std::sync::Arc;
+
+use arrow_array::{BooleanArray, Scalar};
 use dispatch::RangeCompare;
 use dispatch::RowDelivery;
 use duckdb_planner::BoundLogicalType;
@@ -21,8 +24,9 @@ use duckdb_planner::Expr;
 use duckdb_planner::LogicalOp;
 use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType, TransactionType};
 use duckdb_planner::handle::{
-    ComparisonJoin as ComparisonJoinView, DelimGet as DelimGetView, DelimJoin as DelimJoinView,
-    JoinCondition, JoinConditionEntry, Operator as DuckOperator, PushedConditions,
+    ComparisonJoin as ComparisonJoinView, Delete as DeleteView, DelimGet as DelimGetView,
+    DelimJoin as DelimJoinView, JoinCondition, JoinConditionEntry, Operator as DuckOperator,
+    PushedConditions,
 };
 
 use crate::catalog::BoundTable;
@@ -31,7 +35,7 @@ use crate::expression::{
     Cast, Compare, CompareType, Error as ExpressionError, Expression, Function, Ref, VariantGet,
 };
 use crate::operator::{
-    Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
+    Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan, Delete,
     Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
     JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
     TopN, TransactionStatement, Unnest, Values,
@@ -138,6 +142,12 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     // have been walked first.
     if let DuckOperator::DelimJoin(delim) = kind {
         return build_delim_join(op, delim, ctx);
+    }
+
+    // A DELETE's child is not a plan to run: it says which rows go, as a scan
+    // of the table under the statement's conditions.
+    if let DuckOperator::Delete(delete) = kind {
+        return build_delete(op, delete);
     }
 
     let mut inputs = op
@@ -250,6 +260,10 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::DelimJoin(_) => {
             unreachable!("a delim join walks its own children")
         }
+        // A DELETE is walked above, in place of its child.
+        DuckOperator::Delete(_) => {
+            unreachable!("a DELETE reads its child's conditions itself")
+        }
         // A CTE is walked above, before its children.
         DuckOperator::MaterializedCte(_) => {
             unreachable!("a CTE walks its own children")
@@ -257,7 +271,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::PivotMaterialize => {
             unreachable!("a materialize walks its own children")
         }
-        DuckOperator::Unsupported => {
+        DuckOperator::EmptyResult | DuckOperator::Unsupported => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported operator type: {}",
                 op.name()?
@@ -1015,6 +1029,96 @@ fn build_scan_columns(
             })))
         })
         .collect()
+}
+
+/// Build a DELETE from DuckDB's `LogicalDelete`, whose child selects the rows
+/// to delete: a scan of the table, under filters holding the statement's
+/// `WHERE` clause. The filters and the conditions DuckDB pushed into the scan
+/// become the DELETE's conditions, each over the table's own columns, and the
+/// scan is not run. Any other child, such as the join a `USING` clause or a
+/// subquery leaves, is refused: the rows it selects are not the rows of the
+/// table some conditions are true of.
+fn build_delete(op: LogicalOp<'_>, delete: DeleteView<'_>) -> Result<PlanNode, OperatorError> {
+    if delete.returns_rows()? {
+        return Err(OperatorError::Unsupported(
+            "DELETE ... RETURNING is not supported".to_string(),
+        ));
+    }
+    let unsupported_source = || {
+        OperatorError::Unsupported(
+            "DELETE takes a WHERE clause over the columns of the table it deletes from: USING and subqueries are not supported"
+                .to_string(),
+        )
+    };
+    let mut filter_conditions: Vec<Expression> = Vec::new();
+    let mut source = op.child(0)?;
+    let scan = loop {
+        match source.operator()? {
+            // A filter that passes only some of its child's columns on would
+            // move the columns the conditions above it are over.
+            DuckOperator::Filter(filter) if filter.projection_map()?.is_empty() => {
+                filter_conditions.extend(Filter::from_handle(filter)?.conditions);
+                source = source.child(0)?;
+            }
+            DuckOperator::TableScan(scan) => break scan,
+            // The optimizer found that the conditions are true of no row.
+            DuckOperator::EmptyResult => {
+                return Ok(PlanNode {
+                    name: op.name()?,
+                    inputs: Vec::new(),
+                    operator: Operator::Delete(Delete {
+                        table: operator::bind_table(*delete.take_table()?),
+                        conditions: vec![build_boolean_constant(false)],
+                    }),
+                });
+            }
+            _ => return Err(unsupported_source()),
+        }
+    };
+    // A filter's conditions are over the columns the scan outputs; the ones
+    // pushed into the scan are over the columns it reads.
+    let output_columns: Vec<Option<usize>> = scan
+        .output_columns()?
+        .into_iter()
+        .map(|(table_column, _, extract_path)| extract_path.is_empty().then_some(table_column))
+        .collect();
+    let read_columns: Vec<Option<usize>> = scan.storage_columns()?.into_iter().map(Some).collect();
+    let mut pushed_conditions = build_pushed_conditions(scan.pushed_conditions()?)?;
+    let table = operator::bind_table(*delete.take_table()?);
+    let table_column_count = table.columns().len();
+    let rebase = |conditions: &mut [Expression], scan_columns: &[Option<usize>]| {
+        let mut is_over_table_columns = true;
+        for condition in conditions {
+            condition.visit_column_refs_mut(&mut |reference| match scan_columns
+                .get(reference.column_idx)
+                .copied()
+                .flatten()
+            {
+                Some(table_column) if table_column < table_column_count => {
+                    reference.column_idx = table_column;
+                }
+                _ => is_over_table_columns = false,
+            });
+        }
+        is_over_table_columns
+    };
+    if !rebase(&mut filter_conditions, &output_columns)
+        || !rebase(&mut pushed_conditions, &read_columns)
+    {
+        return Err(unsupported_source());
+    }
+    let mut conditions = filter_conditions;
+    conditions.append(&mut pushed_conditions);
+    Ok(PlanNode {
+        name: op.name()?,
+        inputs: Vec::new(),
+        operator: Operator::Delete(Delete { table, conditions }),
+    })
+}
+
+/// The constant `value` as a condition.
+fn build_boolean_constant(value: bool) -> Expression {
+    Expression::Constant(Scalar::new(Arc::new(BooleanArray::from(vec![value]))))
 }
 
 fn build_pushed_conditions(list: PushedConditions) -> Result<Vec<Expression>, OperatorError> {

@@ -2,7 +2,7 @@
 title: "Transaction behavior"
 description: How Pivot handles BEGIN, COMMIT, and ROLLBACK.
 sidebar:
-  order: 12
+  order: 13
 ---
 
 Pivot commits each statement individually. `BEGIN`, `COMMIT`, and `ROLLBACK`

@@ -9,6 +9,9 @@
 //! succeeds; the rest learn they lost, the transaction deleting the objects
 //! each of them wrote, reload, and try again on top of the winner.
 //!
+//! A commit either adds files, replaces files by others that hold the same
+//! rows, or takes files out with their rows ([`Table::commit_delete`]).
+//!
 //! A commit of files drops no snapshot and no entry of the metadata log.
 //! Snapshots and previous metadata files are expired by a commit of its own
 //! ([`Table::expire_snapshots`]), which hands back what it dropped so the
@@ -28,6 +31,7 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use planner::catalog::{Column, SchemaQualifiedTableName};
 use uuid::Uuid;
 
+use crate::delete::DeletedFiles;
 use crate::files::data_files::DataFileEntry;
 use crate::files::manifests::ManifestList;
 use crate::io::runtime::block_on;
@@ -248,6 +252,26 @@ impl Table {
                 rewrite = rewrite.add_file(file);
             }
             rewrite.apply(transaction)
+        })
+    }
+
+    /// Commit, on top of this version, the removal of `deleted`, files this
+    /// version holds, and of the deletion vectors that apply to them, as
+    /// one new version: a delete, which takes the files' rows out of the
+    /// table. `None` means another writer committed a version first: the
+    /// caller refreshes, selects what the DELETE takes out of that version,
+    /// and retries.
+    pub fn commit_delete(&self, deleted: &DeletedFiles) -> Result<Option<Table>> {
+        let paths = deleted.paths().to_vec();
+        self.commit_transaction(Vec::new(), move |transaction| {
+            // Manifests left with nothing but removed files pile up as
+            // partitions are dropped, so the small ones are merged as an
+            // append merges them.
+            transaction
+                .delete_files()
+                .with_manifest_merge(true)
+                .delete_file_paths(paths)
+                .apply(transaction)
         })
     }
 

@@ -10,9 +10,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::Datum as _;
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, Datum as _};
+use arrow_schema::DataType;
 use iceberg::expr::{
     BinaryExpression, Bind, BoundPredicate, Predicate, PredicateOperator, Reference,
+    UnaryExpression,
 };
 use iceberg::spec::{
     DataFile, Datum, Literal, NestedField, PartitionField, PartitionSpec, PartitionSpecRef,
@@ -33,18 +36,40 @@ const MAX_IN_LIST_VALUES: usize = 200;
 pub(crate) fn bind_filters(schema: &SchemaRef, filters: &[Expression]) -> Vec<BoundPredicate> {
     filters
         .iter()
-        .filter_map(|filter| to_predicate(schema, filter).bind(schema.clone(), true).ok())
+        .filter_map(|filter| {
+            to_predicate(schema, filter, &mut true)
+                .bind(schema.clone(), true)
+                .ok()
+        })
         .collect()
 }
 
+/// `condition`, over the columns of `schema`, as a predicate true of exactly
+/// the rows the condition is true of, or `None` when it has no such Iceberg
+/// form the schema accepts.
+pub(crate) fn bind_exact_condition(
+    schema: &SchemaRef,
+    condition: &Expression,
+) -> Option<BoundPredicate> {
+    let mut is_exact = true;
+    let predicate = to_predicate(schema, condition, &mut is_exact);
+    if !is_exact {
+        return None;
+    }
+    predicate.bind(schema.clone(), true).ok()
+}
+
 /// `expression` as an Iceberg predicate: true wherever the expression may be.
-fn to_predicate(schema: &Schema, expression: &Expression) -> Predicate {
+/// `is_exact` is cleared when the predicate is true of more rows than the
+/// expression is, some part of the expression having no Iceberg form.
+fn to_predicate(schema: &Schema, expression: &Expression, is_exact: &mut bool) -> Predicate {
     match expression {
         Expression::Compare(compare) => compare_with_constant(
             schema,
             &compare.left,
             to_operator(compare.compare_type),
             &compare.right,
+            is_exact,
         ),
         Expression::Between(between) => {
             let (lower, upper) = match (between.lower_inclusive, between.upper_inclusive) {
@@ -54,19 +79,65 @@ fn to_predicate(schema: &Schema, expression: &Expression) -> Predicate {
                 (false, false) => (CompareType::Greater, CompareType::Less),
             };
             let input = &between.input;
-            compare_with_constant(schema, input, to_operator(lower), &between.lower).and(
-                compare_with_constant(schema, input, to_operator(upper), &between.upper),
+            compare_with_constant(schema, input, to_operator(lower), &between.lower, is_exact).and(
+                compare_with_constant(schema, input, to_operator(upper), &between.upper, is_exact),
             )
         }
         Expression::Conjunction(conjunction) => {
             let children = conjunction
                 .children
                 .iter()
-                .map(|child| to_predicate(schema, child))
+                .map(|child| to_predicate(schema, child, is_exact))
                 .collect();
             match conjunction.op {
                 ConjunctionOp::And => combine(children, Predicate::AlwaysTrue, Predicate::and),
                 ConjunctionOp::Or => combine(children, Predicate::AlwaysFalse, Predicate::or),
+            }
+        }
+        // A row is outside the list when it differs from every one of its
+        // values, which it does from none of them when one is NULL.
+        Expression::Not(not) if is_short_in_list(not.input.as_ref()) => {
+            let Expression::InList(list) = not.input.as_ref() else {
+                unreachable!("the negated expression is an IN list");
+            };
+            let inequalities = list
+                .values
+                .iter()
+                .map(|value| {
+                    compare_with_constant(
+                        schema,
+                        &list.input,
+                        PredicateOperator::NotEq,
+                        value,
+                        is_exact,
+                    )
+                })
+                .collect();
+            combine(inequalities, Predicate::AlwaysTrue, Predicate::and)
+        }
+        // Whether a column is NULL takes no constant to tell.
+        Expression::IsNull(is_null) => match is_null.input.as_ref() {
+            Expression::Ref(reference) => {
+                let name = &schema.as_struct().fields()[reference.column_idx].name;
+                let operator = if is_null.negated {
+                    PredicateOperator::NotNull
+                } else {
+                    PredicateOperator::IsNull
+                };
+                Predicate::Unary(UnaryExpression::new(operator, Reference::new(name)))
+            }
+            _ => {
+                *is_exact = false;
+                Predicate::AlwaysTrue
+            }
+        },
+        // A condition that is the same for every row: only TRUE keeps one.
+        Expression::Constant(constant) if constant.get().0.data_type() == &DataType::Boolean => {
+            let value = constant.get().0.as_boolean();
+            if !value.is_null(0) && value.value(0) {
+                Predicate::AlwaysTrue
+            } else {
+                Predicate::AlwaysFalse
             }
         }
         // A row is in the list when it equals one of its values.
@@ -75,13 +146,28 @@ fn to_predicate(schema: &Schema, expression: &Expression) -> Predicate {
                 .values
                 .iter()
                 .map(|value| {
-                    compare_with_constant(schema, &list.input, PredicateOperator::Eq, value)
+                    compare_with_constant(
+                        schema,
+                        &list.input,
+                        PredicateOperator::Eq,
+                        value,
+                        is_exact,
+                    )
                 })
                 .collect();
             combine(equalities, Predicate::AlwaysFalse, Predicate::or)
         }
-        _ => Predicate::AlwaysTrue,
+        _ => {
+            *is_exact = false;
+            Predicate::AlwaysTrue
+        }
     }
+}
+
+/// Whether `expression` is an `IN` list short enough to compare each of its
+/// values with every object's bounds.
+fn is_short_in_list(expression: &Expression) -> bool {
+    matches!(expression, Expression::InList(list) if list.values.len() <= MAX_IN_LIST_VALUES)
 }
 
 /// `predicates` joined pairwise by `join` into one tree, `of_none` when there
@@ -108,12 +194,14 @@ fn combine(
 
 /// `column <operator> constant`, when `column` reads a column of the table and
 /// `constant` is one. DuckDB normally puts the column on the left; a constant
-/// on the left is not one.
+/// on the left is not one. Anything else is taken to be true of every row,
+/// and clears `is_exact`.
 fn compare_with_constant(
     schema: &Schema,
     column: &Expression,
     operator: PredicateOperator,
     constant: &Expression,
+    is_exact: &mut bool,
 ) -> Predicate {
     // DuckDB casts a TIMESTAMP column to TIMESTAMPTZ to compare it with one.
     // In UTC the cast keeps the microsecond value, so the comparison is the
@@ -131,6 +219,7 @@ fn compare_with_constant(
         column => column,
     };
     let (Expression::Ref(reference), Expression::Constant(constant)) = (column, constant) else {
+        *is_exact = false;
         return Predicate::AlwaysTrue;
     };
     // A comparison with NULL is never true.
@@ -141,6 +230,7 @@ fn compare_with_constant(
     // widens a constant beyond the column's range rather than refuse it, and
     // the evaluator compares the bounds across that widening.
     let Some(constant) = constant_to_datum(constant.get().0) else {
+        *is_exact = false;
         return Predicate::AlwaysTrue;
     };
     let name = &schema.as_struct().fields()[reference.column_idx].name;
@@ -221,16 +311,13 @@ pub(crate) fn project_filters_per_spec(
     Ok(partition_filters)
 }
 
-/// What `row_filters`, over the columns of `schema`, require of a partition
-/// tuple written under `partition_spec`: a row that passes them has a tuple
-/// that passes this. It is over the fields of the spec whose values can prune.
-fn project_filters(
+/// The fields of `partition_spec` whose values can prune, as a schema a
+/// requirement of the spec's tuples binds to: each with the type its values
+/// have for the columns of `schema`.
+pub(crate) fn build_partition_schema(
     schema: &Schema,
     partition_spec: &PartitionSpec,
-    row_filters: &[BoundPredicate],
-) -> Result<BoundPredicate> {
-    // Binding needs the partition fields as a schema, each with the type of
-    // its values.
+) -> Result<SchemaRef> {
     let partition_fields = partition_spec.fields().iter().filter_map(|field| {
         let value_type = find_partition_value_type(schema, field)?;
         Some(Arc::new(NestedField::optional(
@@ -239,7 +326,20 @@ fn project_filters(
             IcebergType::Primitive(value_type),
         )))
     });
-    let partition_schema = Arc::new(Schema::builder().with_fields(partition_fields).build()?);
+    Ok(Arc::new(
+        Schema::builder().with_fields(partition_fields).build()?,
+    ))
+}
+
+/// What `row_filters`, over the columns of `schema`, require of a partition
+/// tuple written under `partition_spec`: a row that passes them has a tuple
+/// that passes this. It is over the fields of the spec whose values can prune.
+fn project_filters(
+    schema: &Schema,
+    partition_spec: &PartitionSpec,
+    row_filters: &[BoundPredicate],
+) -> Result<BoundPredicate> {
+    let partition_schema = build_partition_schema(schema, partition_spec)?;
     let mut projected = Predicate::AlwaysTrue;
     for row_filter in row_filters {
         projected = projected.and(project(partition_spec, &partition_schema, row_filter));
@@ -527,11 +627,30 @@ pub(crate) fn may_match<Range: ValueRange>(predicate: &BoundPredicate, ranges: &
 }
 
 /// A field of a partition spec whose values can prune.
-struct PartitionValueField {
+pub(crate) struct PartitionValueField {
     /// Where a tuple of the spec holds the field's value.
-    position: usize,
-    field_id: i32,
-    value_type: PrimitiveType,
+    pub position: usize,
+    pub field_id: i32,
+    pub value_type: PrimitiveType,
+}
+
+/// The fields of `partition_spec` whose values can prune, in spec order.
+pub(crate) fn list_partition_value_fields(
+    schema: &Schema,
+    partition_spec: &PartitionSpec,
+) -> Vec<PartitionValueField> {
+    partition_spec
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(position, field)| {
+            Some(PartitionValueField {
+                position,
+                field_id: field.field_id,
+                value_type: find_partition_value_type(schema, field)?,
+            })
+        })
+        .collect()
 }
 
 /// What a scan's filters require of the files written under one partition
@@ -555,16 +674,7 @@ impl PartitionPruner {
         row_filters: &[BoundPredicate],
     ) -> Result<Self> {
         let filter = project_filters(schema, partition_spec, row_filters)?;
-        let mut prunable_fields = Vec::new();
-        for (position, field) in partition_spec.fields().iter().enumerate() {
-            if let Some(value_type) = find_partition_value_type(schema, field) {
-                prunable_fields.push(PartitionValueField {
-                    position,
-                    field_id: field.field_id,
-                    value_type,
-                });
-            }
-        }
+        let mut prunable_fields = list_partition_value_fields(schema, partition_spec);
         let tuple_length = prunable_fields.last().map_or(0, |field| field.position + 1);
         let compared = list_compared_fields(std::slice::from_ref(&filter));
         prunable_fields.retain(|field| {

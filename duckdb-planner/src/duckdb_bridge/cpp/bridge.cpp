@@ -20,6 +20,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -215,6 +216,39 @@ PlanHandle::~PlanHandle() {
 	}
 }
 
+// Whether `plan` holds a DELETE: at its root, or under an EXPLAIN.
+static bool plans_delete(const duckdb::LogicalOperator &plan) {
+	if (plan.type == duckdb::LogicalOperatorType::LOGICAL_DELETE) {
+		return true;
+	}
+	for (auto &child : plan.children) {
+		if (plans_delete(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Keeps one optimizer pass off for as long as it lives, unless the pass was
+// off already. Planning is single-threaded per context, so nothing else reads
+// the set meanwhile.
+struct DisabledOptimizerScope {
+	duckdb::set<duckdb::OptimizerType> &disabled_optimizers;
+	duckdb::OptimizerType optimizer;
+	bool disabled_here;
+
+	DisabledOptimizerScope(duckdb::ClientContext &context, duckdb::OptimizerType optimizer)
+	    : disabled_optimizers(duckdb::DBConfig::GetConfig(context).options.disabled_optimizers),
+	      optimizer(optimizer), disabled_here(disabled_optimizers.insert(optimizer).second) {
+	}
+
+	~DisabledOptimizerScope() {
+		if (disabled_here) {
+			disabled_optimizers.erase(optimizer);
+		}
+	}
+};
+
 // Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
 // binder-resolved result column names (in select order) via `result_names`.
 // The stock `ExtractPlan` computes those names on its local `Planner` and then
@@ -239,6 +273,15 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 		requires_rebind = planner.properties.always_require_rebind;
 		plan = std::move(planner.plan);
 		if (context.config.enable_optimizer) {
+			// A DELETE's child is never run: it only says which rows go. A long
+			// IN list is rewritten into a join against its values to run fast,
+			// which would leave the join in place of a condition on the table's
+			// columns, so under a DELETE the list stays as written.
+			duckdb::unique_ptr<DisabledOptimizerScope> written_in_lists;
+			if (plans_delete(*plan)) {
+				written_in_lists =
+				    duckdb::make_uniq<DisabledOptimizerScope>(context, duckdb::OptimizerType::IN_CLAUSE);
+			}
 			duckdb::Optimizer optimizer(*planner.binder, context);
 			plan = optimizer.Optimize(std::move(plan));
 		}
@@ -415,6 +458,18 @@ size_t lo_insert_column_map_source(const LogicalOperator &op, size_t index) {
 
 bool lo_insert_returns_rows(const LogicalOperator &op) {
 	return as<duckdb::LogicalInsert>(op).return_chunk;
+}
+
+// ---- Delete ----
+
+rust::Box<OptionalTableWrapper> lo_delete_take_table(const LogicalOperator &op) {
+	auto &del = as<duckdb::LogicalDelete>(op);
+	auto &pivot_entry = del.table.Cast<PivotTableCatalogEntry>();
+	return std::move(pivot_entry.table);
+}
+
+bool lo_delete_returns_rows(const LogicalOperator &op) {
+	return as<duckdb::LogicalDelete>(op).return_chunk;
 }
 
 // ---- Filter ----

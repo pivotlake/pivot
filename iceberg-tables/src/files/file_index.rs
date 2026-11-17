@@ -995,8 +995,18 @@ impl FileSelector {
     /// What `filters` require of the files of the table `metadata`
     /// describes.
     pub(crate) fn new(metadata: &TableMetadata, filters: &[Expression]) -> iceberg::Result<Self> {
+        let row_filters = pruning::bind_filters(metadata.current_schema(), filters);
+        Self::from_row_filters(metadata, row_filters)
+    }
+
+    /// What `row_filters`, each over the table's columns, require of the
+    /// files of the table `metadata` describes: a row passes when all are
+    /// true.
+    pub(crate) fn from_row_filters(
+        metadata: &TableMetadata,
+        row_filters: Vec<BoundPredicate>,
+    ) -> iceberg::Result<Self> {
         let schema = metadata.current_schema();
-        let row_filters = pruning::bind_filters(schema, filters);
         let mut partition_pruners = Vec::new();
         for partition_spec in metadata.partition_specs_iter() {
             let pruner = PartitionPruner::new(schema, partition_spec, &row_filters)?;

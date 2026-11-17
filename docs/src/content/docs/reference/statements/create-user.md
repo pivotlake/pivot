@@ -2,7 +2,7 @@
 title: "CREATE USER"
 description: Add a login user with password or trust authentication.
 sidebar:
-  order: 6
+  order: 7
 ---
 
 `CREATE USER` adds a login user to the server. The user is written to the

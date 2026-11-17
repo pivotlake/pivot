@@ -48,6 +48,9 @@ pub enum Command {
     Insert {
         rows: usize,
     },
+    Delete {
+        rows: usize,
+    },
     CreateTable,
     CreateSchema,
     CreateUser,
@@ -68,6 +71,7 @@ impl Command {
     pub fn tag(&self) -> String {
         match self {
             Self::Insert { rows } => format!("INSERT 0 {rows}"),
+            Self::Delete { rows } => format!("DELETE {rows}"),
             Self::CreateTable => "CREATE TABLE".to_string(),
             Self::CreateSchema => "CREATE SCHEMA".to_string(),
             Self::CreateUser => "CREATE USER".to_string(),
@@ -169,8 +173,8 @@ pub enum Error {
     WorkerPanic(JoinError),
     #[error("planner thread panicked: {0}")]
     PlannerPanic(JoinError),
-    #[error("invalid INSERT row-count result: {0}")]
-    InvalidInsertResult(String),
+    #[error("invalid affected-row count result: {0}")]
+    InvalidAffectedRows(String),
     #[error("{0}")]
     Copy(String),
 }

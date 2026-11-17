@@ -70,6 +70,7 @@ impl PlanNode {
         let operator_is_cacheable = match &self.operator {
             Operator::Input(input) => input.table.is_plan_cacheable(),
             Operator::Insert(_)
+            | Operator::Delete(_)
             | Operator::CreateTable(_)
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)

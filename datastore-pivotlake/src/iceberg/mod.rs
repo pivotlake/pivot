@@ -35,7 +35,9 @@ use dispatch::DataFlowDispatcher;
 use iceberg_tables::commit::{COMMIT_RETRIES, TableCreation};
 use iceberg_tables::files::data_files::DataFileEntry;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
-use iceberg_tables::{IndexedFile, PartitionKeys, TableLocation, check_partition_terms};
+use iceberg_tables::{
+    DeleteFilter, IndexedFile, PartitionKeys, TableLocation, check_partition_terms,
+};
 use object_storage::{FileRef, ObjectPath, ObjectStore};
 use parquet_engine::{RowGroupMetadata, ScanSelection};
 use planner::catalog::{Column, SchemaQualifiedTableName};
@@ -47,7 +49,9 @@ use uuid::Uuid;
 use crate::file_entry::{FileEntry, constant_partition};
 use crate::iceberg::directory_metadata_store::{DirectoryMetadataStore, metadata_location_version};
 use crate::table::{TableFile, TableStorage};
-use crate::table_format::{RemovedFiles, SnapshotExpiry, Table, TableFactory, VisitPartition};
+use crate::table_format::{
+    RemovedFiles, RowDeletion, SnapshotExpiry, Table, TableFactory, VisitPartition,
+};
 
 pub(crate) use iceberg_tables::{Error, Result};
 
@@ -497,6 +501,29 @@ impl Table for IcebergTable {
             return Ok(None);
         };
         Ok(Some(Arc::new(self.advanced_to(next))))
+    }
+
+    fn bind_delete_filter(&self, conditions: &[Expression]) -> crate::Result<DeleteFilter> {
+        Ok(self.table.bind_delete_filter(conditions)?)
+    }
+
+    /// Counted from the manifest entries of the files the filter takes
+    /// out, less the rows their deletion vectors had deleted.
+    fn count_deleted_rows(&self, filter: &DeleteFilter) -> crate::Result<u64> {
+        Ok(self.table.select_deleted_files(filter)?.row_count())
+    }
+
+    /// One delete snapshot without the files of the partitions the filter
+    /// covers whole, nor the deletion vectors of those files.
+    fn delete_rows(&self, filter: &DeleteFilter) -> crate::Result<RowDeletion> {
+        let deleted = self.table.select_deleted_files(filter)?;
+        if deleted.is_empty() {
+            return Ok(RowDeletion::NothingToDelete);
+        }
+        Ok(match self.table.commit_delete(&deleted)? {
+            Some(next) => RowDeletion::Committed(Arc::new(self.advanced_to(next))),
+            None => RowDeletion::LostRace,
+        })
     }
 
     /// The table's own retention property, or the default.

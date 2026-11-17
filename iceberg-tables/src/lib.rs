@@ -22,6 +22,9 @@
 //!   reads, and their footers, parsed once and held in that same cache
 //!   ([`table`]);
 //! - building the next version on top of one ([`commit`]);
+//! - deleting rows by taking whole partitions out of a version: which
+//!   partitions a DELETE's conditions cover whole, read off their tuples,
+//!   and the files that go with them ([`delete`]);
 //! - which snapshots and previous metadata files have expired
 //!   ([`maintenance::retention`]), and what an expiry leaves to delete,
 //!   found from the snapshots it dropped and the oldest one it kept
@@ -40,6 +43,7 @@
 //! lives with the datastore that has it.
 
 pub mod commit;
+pub mod delete;
 mod describe;
 mod error;
 pub mod files;
@@ -53,6 +57,7 @@ pub mod table;
 pub mod test_support;
 pub mod types;
 
+pub use delete::{DeleteFilter, DeletedFiles};
 pub use error::{Error, Result};
 pub use files::file_index::{IndexedFile, Partition, PartitionIndex};
 pub use files::manifests::ManifestList;

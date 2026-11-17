@@ -140,6 +140,9 @@ snapshot expiry and vacuum are the catalog's, not Pivot's. An `INSERT` into a
 format version 1 table is refused; a `NULL` in a column the table declares
 `required` fails the statement.
 
+A [`DELETE`](/docs/reference/statements/delete/) drops the partitions its
+conditions cover, committed as one delete snapshot.
+
 Format version 3 deletion vectors are supported. A table carrying any other
 kind of delete file is refused rather than read with the deleted rows present.
 

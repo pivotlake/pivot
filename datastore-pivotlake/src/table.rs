@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use crate::Error;
 use crate::file_entry::{FileEntry, PartitionValues};
-use crate::table_format::{RemovedFiles, Table, VisitPartition};
+use crate::table_format::{RemovedFiles, RowDeletion, Table, VisitPartition};
 use arrow_array::RecordBatch;
 use catalog::datastore::DatastoreTableMetadata;
 use dispatch::{DataFlowDispatcher, Projection};
+use iceberg_tables::DeleteFilter;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
 use object_storage::{FileRef, ObjectPath, ObjectStore};
 use parquet_engine::writing::upload::UploadedFiles;
@@ -223,6 +224,56 @@ impl CatalogTable {
                     error @ iceberg_tables::Error::CommittedTableUnloaded { .. },
                 )) => {
                     tracing::warn!(error = %error, "a commit succeeded without its version loading; refreshing onto it");
+                    if let Err(refresh_error) = self.refresh() {
+                        tracing::warn!(
+                            error = %refresh_error,
+                            "refreshing onto a committed version failed; the next refresh loads it"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// The rows a DELETE with `conditions` removes from the table, bound to
+    /// this copy's columns.
+    pub(crate) fn bind_delete_filter(
+        &self,
+        conditions: &[Expression],
+    ) -> crate::Result<DeleteFilter> {
+        self.table.bind_delete_filter(conditions)
+    }
+
+    /// How many rows `filter` removes from this copy's version.
+    pub(crate) fn count_deleted_rows(&self, filter: &DeleteFilter) -> crate::Result<u64> {
+        self.table.count_deleted_rows(filter)
+    }
+
+    /// Remove the rows `filter` removes from this copy's version, which the
+    /// copy then advances past. What the filter removes is selected anew
+    /// from the version each attempt commits on: a version conflict
+    /// refreshes the copy and retries, so a file another writer added to a
+    /// partition the filter covers goes with it. A commit whose version is
+    /// current but could not be loaded has succeeded, as
+    /// [`commit_files`](Self::commit_files) has it. Runs off the dispatch
+    /// workers, as every commit does.
+    pub(crate) fn delete_rows(&mut self, filter: &DeleteFilter) -> crate::Result<()> {
+        loop {
+            match self.table.delete_rows(filter) {
+                Ok(RowDeletion::Committed(table)) => {
+                    self.table = table;
+                    return Ok(());
+                }
+                Ok(RowDeletion::NothingToDelete) => return Ok(()),
+                Ok(RowDeletion::LostRace) => {
+                    self.refresh()?;
+                }
+                Err(Error::Iceberg(
+                    error @ iceberg_tables::Error::CommittedTableUnloaded { .. },
+                )) => {
+                    tracing::warn!(error = %error, "a delete succeeded without its version loading; refreshing onto it");
                     if let Err(refresh_error) = self.refresh() {
                         tracing::warn!(
                             error = %refresh_error,

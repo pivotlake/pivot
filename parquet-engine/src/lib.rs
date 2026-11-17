@@ -70,7 +70,9 @@ pub use metadata::{
 mod pushdown;
 mod table_binding;
 pub use pushdown::{PushedPredicate, equality_predicates, prune_parquet};
-pub use table_binding::{ParquetBackedTable, ParquetTableBinding, ScanSelection};
+pub use table_binding::{
+    ParquetBackedTable, ParquetTableBinding, ScanSelection, build_affected_rows_spec,
+};
 
 mod row_group_stats;
 pub use row_group_stats::{

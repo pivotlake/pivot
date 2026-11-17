@@ -110,6 +110,10 @@ bool lo_insert_column_map_has_source(const LogicalOperator &op, size_t index);
 size_t lo_insert_column_map_source(const LogicalOperator &op, size_t index);
 bool lo_insert_returns_rows(const LogicalOperator &op);
 
+// ---- Delete ----
+rust::Box<OptionalTableWrapper> lo_delete_take_table(const LogicalOperator &op);
+bool lo_delete_returns_rows(const LogicalOperator &op);
+
 // ---- Filter ----
 size_t lo_filter_expr_count(const LogicalOperator &op);
 const Expression &lo_filter_expr(const LogicalOperator &op, size_t index);

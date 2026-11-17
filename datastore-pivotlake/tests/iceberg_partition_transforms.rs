@@ -1,7 +1,8 @@
 //! A managed Iceberg table partitioned by a transform of a column, through
 //! SQL: `CREATE TABLE` records the terms as a partition spec, an INSERT cuts
 //! its files by the transformed values and records each file's partition
-//! tuple, a filter on the source column reads the partitions it keeps,
+//! tuple, a filter on the source column reads the partitions it keeps, a
+//! DELETE takes out the partitions its conditions cover and no other row,
 //! compaction leaves every row in the partition its file records, and a term
 //! the table cannot be partitioned by is refused by name.
 
@@ -131,6 +132,158 @@ fn list_time_conditions(bounds: &[i64]) -> Vec<TimeCondition> {
         ));
     }
     conditions
+}
+
+/// Which of a year, a month, a day and an hour begin at each instant of
+/// [`UNIT_STARTS`], in order.
+const UNITS_BEGUN: [&[&str]; 9] = [
+    &["year", "month", "day", "hour"],
+    &["month", "day", "hour"],
+    &["day", "hour"],
+    &["hour"],
+    &["year", "month", "day", "hour"],
+    &["year", "month", "day", "hour"],
+    &["month", "day", "hour"],
+    &["day", "hour"],
+    &["hour"],
+];
+
+/// What a DELETE asks of `ts`: as SQL, as the same comparison of a row's
+/// instant, and whether a table partitioned by a unit of time has to take
+/// it (`Some(true)`), has to refuse it (`Some(false)`), or may do either.
+struct DeleteCondition {
+    sql: String,
+    holds_for: Box<dyn Fn(i64) -> bool>,
+    is_taken: Option<bool>,
+}
+
+/// What a DELETE asks of `ts` against each instant of [`UNIT_STARTS`]: an
+/// equality with it, an open range to either side of it, and the two
+/// bounded ranges between it and the next. A table partitioned by `unit`
+/// has a row on both sides of each of those instants, so it takes exactly
+/// the ranges that end where a unit begins and include that instant on the
+/// upper side. A bound at or before 1970 may be refused as well: a
+/// partition there counts as covered only as far as a writer that filed
+/// such a time one partition late allows.
+fn list_delete_conditions(unit: &str) -> Vec<DeleteCondition> {
+    let bounds: Vec<(i64, bool)> = UNIT_STARTS
+        .iter()
+        .zip(UNITS_BEGUN)
+        .map(|((start, _, _), units_begun)| {
+            let start = Datum::timestamp_from_str(start).unwrap();
+            let PrimitiveLiteral::Long(micros) = *start.literal() else {
+                panic!("a timestamp is held as a long, not {start:?}");
+            };
+            (micros, units_begun.contains(&unit))
+        })
+        .collect();
+    let judge =
+        |micros: i64, ends_on_unit_starts: bool| (micros > 0).then_some(ends_on_unit_starts);
+    let mut conditions = Vec::new();
+    for (position, &(low, low_begins_unit)) in bounds.iter().enumerate() {
+        let low_sql = write_timestamp(low);
+        conditions.push(DeleteCondition {
+            sql: format!("ts = {low_sql}"),
+            holds_for: Box::new(move |ts| ts == low),
+            is_taken: Some(false),
+        });
+        conditions.push(DeleteCondition {
+            sql: format!("ts < {low_sql}"),
+            holds_for: Box::new(move |ts| ts < low),
+            is_taken: judge(low, low_begins_unit),
+        });
+        conditions.push(DeleteCondition {
+            sql: format!("ts >= {low_sql}"),
+            holds_for: Box::new(move |ts| ts >= low),
+            is_taken: judge(low, low_begins_unit),
+        });
+        let Some(&(high, high_begins_unit)) = bounds.get(position + 1) else {
+            continue;
+        };
+        let high_sql = write_timestamp(high);
+        conditions.push(DeleteCondition {
+            sql: format!("ts >= {low_sql} AND ts < {high_sql}"),
+            holds_for: Box::new(move |ts| low <= ts && ts < high),
+            is_taken: judge(low, low_begins_unit && high_begins_unit),
+        });
+        conditions.push(DeleteCondition {
+            sql: format!("ts > {low_sql} AND ts <= {high_sql}"),
+            holds_for: Box::new(move |ts| low < ts && ts <= high),
+            is_taken: Some(false),
+        });
+    }
+    conditions
+}
+
+/// The conditions a table partitioned by a unit of time answered a DELETE
+/// by wrongly.
+struct MisdeletedConditions {
+    /// Those whose DELETE left other rows than it should have: the rows the
+    /// condition is not true of when it was taken, every row when it was
+    /// refused.
+    left_wrong_rows: Vec<String>,
+    /// Those whose DELETE counted other rows than the condition is true of.
+    miscounted: Vec<String>,
+    /// Those taken that had to be refused, or refused that had to be taken.
+    misjudged: Vec<String>,
+}
+
+/// Create a table partitioned by `unit(ts)` holding a row per instant of
+/// [`list_instants`], its id the instant's position, and delete from it by
+/// every condition of [`list_delete_conditions`], each from the full table.
+fn delete_by_every_time_condition(unit: &str) -> MisdeletedConditions {
+    let instants = list_instants();
+    let mut db = Database::new();
+    db.execute(&format!(
+        "CREATE TABLE events (id BIGINT, ts TIMESTAMP) PARTITIONED BY ({unit}(ts))"
+    ));
+    let rows: Vec<String> = (0..)
+        .zip(&instants)
+        .map(|(id, instant): (i64, _)| format!("({id}, {})", write_timestamp(instant.micros)))
+        .collect();
+    let insert_every_row = format!("INSERT INTO events VALUES {}", rows.join(", "));
+    db.execute(&insert_every_row);
+    let every_id: Vec<i64> = (0..instants.len() as i64).collect();
+    let mut misdeleted = MisdeletedConditions {
+        left_wrong_rows: Vec::new(),
+        miscounted: Vec::new(),
+        misjudged: Vec::new(),
+    };
+    for condition in list_delete_conditions(unit) {
+        let kept_ids: Vec<i64> = (0..)
+            .zip(&instants)
+            .filter(|(_, instant)| !(condition.holds_for)(instant.micros))
+            .map(|(id, _)| id)
+            .collect();
+
+        let deleted = db.try_execute(&format!("DELETE FROM events WHERE {}", condition.sql));
+
+        let left_ids = collect_i64s(&db.execute("SELECT id FROM events ORDER BY id"), 0);
+        let expected_ids = if deleted.is_ok() {
+            &kept_ids
+        } else {
+            &every_id
+        };
+        if &left_ids != expected_ids {
+            misdeleted.left_wrong_rows.push(condition.sql.clone());
+        }
+        if let Ok(deleted) = &deleted
+            && single_i64(deleted) != (every_id.len() - kept_ids.len()) as i64
+        {
+            misdeleted.miscounted.push(condition.sql.clone());
+        }
+        if condition
+            .is_taken
+            .is_some_and(|is_taken| is_taken != deleted.is_ok())
+        {
+            misdeleted.misjudged.push(condition.sql.clone());
+        }
+        if deleted.is_ok() {
+            db.execute("DELETE FROM events");
+            db.execute(&insert_every_row);
+        }
+    }
+    misdeleted
 }
 
 /// The copy of the table `name` the datastore of `db` holds now.
@@ -384,6 +537,42 @@ fn a_table_partitioned_by_hour_holds_a_file_per_hour_and_reads_its_rows_by_their
         count_rows_per_unit(&instants, Instant::count_hours)
     );
     assert_eq!(table.misread_conditions, Vec::<String>::new());
+}
+
+#[test]
+fn a_delete_from_a_table_partitioned_by_year_takes_out_the_rows_of_its_condition_or_none() {
+    let misdeleted = delete_by_every_time_condition("year");
+
+    assert_eq!(misdeleted.left_wrong_rows, Vec::<String>::new());
+    assert_eq!(misdeleted.miscounted, Vec::<String>::new());
+    assert_eq!(misdeleted.misjudged, Vec::<String>::new());
+}
+
+#[test]
+fn a_delete_from_a_table_partitioned_by_month_takes_out_the_rows_of_its_condition_or_none() {
+    let misdeleted = delete_by_every_time_condition("month");
+
+    assert_eq!(misdeleted.left_wrong_rows, Vec::<String>::new());
+    assert_eq!(misdeleted.miscounted, Vec::<String>::new());
+    assert_eq!(misdeleted.misjudged, Vec::<String>::new());
+}
+
+#[test]
+fn a_delete_from_a_table_partitioned_by_day_takes_out_the_rows_of_its_condition_or_none() {
+    let misdeleted = delete_by_every_time_condition("day");
+
+    assert_eq!(misdeleted.left_wrong_rows, Vec::<String>::new());
+    assert_eq!(misdeleted.miscounted, Vec::<String>::new());
+    assert_eq!(misdeleted.misjudged, Vec::<String>::new());
+}
+
+#[test]
+fn a_delete_from_a_table_partitioned_by_hour_takes_out_the_rows_of_its_condition_or_none() {
+    let misdeleted = delete_by_every_time_condition("hour");
+
+    assert_eq!(misdeleted.left_wrong_rows, Vec::<String>::new());
+    assert_eq!(misdeleted.miscounted, Vec::<String>::new());
+    assert_eq!(misdeleted.misjudged, Vec::<String>::new());
 }
 
 #[test]

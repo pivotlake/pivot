@@ -9,8 +9,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{ArrayRef, Scalar};
-use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, Scalar};
+use arrow_schema::{DataType, Field, Schema};
+use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
     TableRevision,
@@ -73,6 +74,50 @@ pub trait ParquetBackedTable: std::fmt::Debug + Send + Sync {
         &self,
         input: RecordBatchOperatorSpec,
     ) -> CatalogResult<RecordBatchOperatorSpec>;
+
+    /// The dataflow deleting the rows of the table every one of
+    /// `conditions` is true of (see [`BoundTable::compile_delete`]).
+    fn compile_delete(
+        &self,
+        conditions: &[Expression],
+        dispatcher: &DataFlowDispatcher,
+    ) -> CatalogResult<RecordBatchOperatorSpec>;
+}
+
+/// The dataflow of a statement that changes a table with no row read or
+/// written: it runs `stage`, which stages the change for the transaction's
+/// commit, once as it starts, and emits one `BIGINT` row holding
+/// `affected_rows`, the rows the change removes.
+pub fn build_affected_rows_spec(
+    dispatcher: &DataFlowDispatcher,
+    affected_rows: u64,
+    stage: Box<dyn FnOnce() + Send>,
+) -> CatalogResult<RecordBatchOperatorSpec> {
+    let affected_rows = i64::try_from(affected_rows)
+        .map_err(|error| planner::catalog::Error::Other(Box::new(error)))?;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "Count",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![affected_rows]))],
+    )
+    .map_err(|error| planner::catalog::Error::Other(Box::new(error)))?;
+    // One nullary per worker, of which only the first stages the change and
+    // emits the row.
+    let mut statement = Some((batch, stage));
+    let factories: Vec<_> = (0..dispatcher.worker_count())
+        .map(|_| {
+            let carried = statement.take();
+            OneShotNullaryFactory::new(move || {
+                let (batch, stage) = carried?;
+                stage();
+                Some(batch)
+            })
+        })
+        .collect();
+    Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
 }
 
 /// One reference to a table in a query: the version of the table the
@@ -230,6 +275,17 @@ impl BoundTable for ParquetTableBinding {
         _dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         self.table.compile_insert(input)
+    }
+
+    /// The table is handed the statement's own conditions: the filters
+    /// pushed into this binding only narrow a scan, and need not be all of
+    /// them.
+    fn compile_delete(
+        &self,
+        conditions: &[Expression],
+        dispatcher: &DataFlowDispatcher,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        self.table.compile_delete(conditions, dispatcher)
     }
 
     fn columns(&self) -> Vec<Column> {

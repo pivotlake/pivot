@@ -109,7 +109,7 @@ pub(crate) const MANIFESTS_PER_READ: usize = 16;
 /// How many partitions the walk over every partition of a table
 /// ([`Table::visit_partitions`]) has indexed at a time: it goes over a
 /// whole table and may end before it reaches the rest.
-const WALKED_PARTITIONS_PER_LOAD: usize = 16;
+pub(crate) const WALKED_PARTITIONS_PER_LOAD: usize = 16;
 
 /// How much of the files a pass decoded ahead of the partitions it will
 /// index it keeps, by [`IndexedFile::estimate_heap_bytes`]; a manifest past
@@ -269,9 +269,9 @@ type VisitSelectedFile<'v> = dyn FnMut(&Arc<[u8]>, &IndexedFile) -> Result<()> +
 /// A partition beside its key, encoded once for everything a pass does
 /// with the partition: finding its index in the cache, taking its decoded
 /// files, storing its index, and counting the index as used.
-struct KeyedPartition {
-    key: Arc<[u8]>,
-    partition: Arc<Partition>,
+pub(crate) struct KeyedPartition {
+    pub(crate) key: Arc<[u8]>,
+    pub(crate) partition: Arc<Partition>,
 }
 
 impl KeyedPartition {
@@ -298,7 +298,7 @@ struct UnbuiltIndex {
 /// was decoded for the same partitions, so a partition among them that a
 /// held manifest has no files of has none in it.
 #[derive(Default)]
-struct DecodedFiles {
+pub(crate) struct DecodedFiles {
     files: HashMap<Arc<str>, FilesByPartition>,
     heap_bytes: u64,
 }
@@ -608,7 +608,7 @@ impl Table {
     /// ([`list_partitions_from_manifests`](Self::list_partitions_from_manifests)),
     /// each with its key. A manifest decoded to learn its partitions leaves
     /// the files of the kept ones in `ahead`.
-    fn select_partitions(
+    pub(crate) fn select_partitions(
         &self,
         selector: &FileSelector,
         ahead: &mut DecodedFiles,
@@ -946,7 +946,7 @@ impl Table {
     /// are among; the other manifests are decoded now, each once for all
     /// the partitions asked for. What is decoded now is held until every
     /// index is built, and only the partitions asked for bound it.
-    fn load_partitions(
+    pub(crate) fn load_partitions(
         &self,
         partitions: &[KeyedPartition],
         ahead: &mut DecodedFiles,

@@ -14,7 +14,7 @@ If you are using Pivot, considering using it, or simply have thoughts about wher
 
 ## Planned enhancements:
 ### Format support
-- **Deletion support** - Pivot currently focuses on append-only workloads. Adding support for deletes will allow Pivot to work with datasets that are updated or modified over time.
+- **Row-level deletes** - `DELETE` currently drops whole partitions. Deleting individual rows will allow Pivot to work with datasets that are updated or modified over time.
 - **Unity catalog support** - Integrate with Unity Catalog as a new datastore.
 
 ### Execution enhancements

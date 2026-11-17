@@ -544,6 +544,101 @@ fn insert_naming_an_unknown_column_is_rejected(mut testing_planner: TestingPlann
 }
 
 #[rstest]
+fn delete_takes_its_where_clause_and_no_input(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("DELETE FROM example_table WHERE c < 300 AND name = 'eve'")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"Delete(c:Int32 < 300:Int32 -> Boolean AND name:Utf8 = eve:Utf8View -> Boolean)");
+}
+
+#[rstest]
+fn delete_conditions_read_the_tables_columns_by_their_place_in_the_table(
+    mut testing_planner: TestingPlanner,
+) {
+    let plan = testing_planner
+        .plan("DELETE FROM example_table WHERE name = 'eve' AND c < 300")
+        .unwrap();
+
+    let planner::Operator::Delete(delete) = &plan.root.operator else {
+        panic!("a DELETE plans as a delete, not {}", plan.root.operator);
+    };
+    let mut condition_columns = Vec::new();
+    for condition in &delete.conditions {
+        condition.collect_column_refs(&mut condition_columns);
+    }
+    condition_columns.sort_unstable();
+    assert_eq!(condition_columns, [2, 3]);
+}
+
+#[rstest]
+fn delete_without_a_where_clause_has_no_condition(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner.plan("DELETE FROM example_table").unwrap();
+
+    assert_snapshot!(plan.to_string(), @"Delete()");
+}
+
+#[rstest]
+fn delete_keeps_a_long_in_list_as_one_condition(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("DELETE FROM example_table WHERE a IN (1, 2, 3, 4, 5, 60)")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"Delete(a:Int32 IN (1:Int32, 2:Int32, 3:Int32, 4:Int32, 5:Int32, 60:Int32))");
+}
+
+#[rstest]
+fn delete_whose_where_clause_no_row_meets_has_a_false_condition(
+    mut testing_planner: TestingPlanner,
+) {
+    let plan = testing_planner
+        .plan("DELETE FROM example_table WHERE 1 = 0")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"Delete(false:Boolean)");
+}
+
+#[rstest]
+fn delete_plan_is_not_cacheable(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("DELETE FROM example_table WHERE a = 1")
+        .unwrap();
+
+    assert!(!plan.is_cacheable());
+}
+
+#[rstest]
+#[case::using(
+    "DELETE FROM example_table USING example_table AS other WHERE example_table.a = other.b"
+)]
+#[case::subquery("DELETE FROM example_table WHERE a IN (SELECT b FROM example_table)")]
+fn delete_by_the_rows_of_another_relation_is_rejected(
+    mut testing_planner: TestingPlanner,
+    #[case] sql: &str,
+) {
+    let error = testing_planner.plan(sql).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("USING and subqueries are not supported"),
+        "{error}"
+    );
+}
+
+#[rstest]
+fn delete_returning_is_rejected(mut testing_planner: TestingPlanner) {
+    let error = testing_planner
+        .plan("DELETE FROM example_table WHERE a = 1 RETURNING a")
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("RETURNING is not supported"),
+        "{error}"
+    );
+}
+
+#[rstest]
 fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")

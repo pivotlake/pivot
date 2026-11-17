@@ -300,6 +300,29 @@ impl Database {
         Ok(batches)
     }
 
+    /// Run one SQL statement as [`execute`](Self::execute) does, with
+    /// `before_commit` run once the statement's dataflow has finished and
+    /// before its transaction commits: where another client's statement
+    /// lands in between.
+    pub fn execute_before_commit(
+        &mut self,
+        sql: &str,
+        before_commit: impl FnOnce(&Arc<PivotlakeDatastore>),
+    ) -> Vec<RecordBatch> {
+        let transaction = self.catalog.begin_transaction();
+        let batches = self
+            .planner
+            .plan(sql, transaction.clone())
+            .unwrap()
+            .compile(&shared_dispatcher(), transaction.as_ref())
+            .unwrap()
+            .collect()
+            .unwrap();
+        before_commit(&self.datastore);
+        self.runtime.block_on(transaction.commit()).unwrap();
+        batches
+    }
+
     /// Compact the table `name` (in the default schema) to completion, the
     /// way the server runs a `COMPACT` statement: through the transaction's
     /// catalog view, `final_sweep` dropping the routine guards. Returns the

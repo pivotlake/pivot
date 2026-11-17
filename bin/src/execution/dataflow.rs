@@ -10,14 +10,16 @@ use super::{Error, Result, ResultColumn};
 
 pub(super) enum StatementHandle<T> {
     Batches(DataFlowHandle<T>),
-    Insert(DataFlowHandle<usize>),
+    /// An INSERT's or a DELETE's dataflow, whose one output is the count of
+    /// the rows it added or removed.
+    AffectedRows(DataFlowHandle<usize>),
 }
 
 impl<T> StatementHandle<T> {
     fn cancel_token(&self) -> CancelToken {
         match self {
             Self::Batches(handle) => handle.cancel_token(),
-            Self::Insert(handle) => handle.cancel_token(),
+            Self::AffectedRows(handle) => handle.cancel_token(),
         }
     }
 
@@ -28,22 +30,23 @@ impl<T> StatementHandle<T> {
             Self::Batches(handle) => handle
                 .collect_with_stats()
                 .map(|(batches, stats)| (StatementResults::Batches(batches), stats)),
-            Self::Insert(handle) => handle
+            Self::AffectedRows(handle) => handle
                 .collect_with_stats()
-                .map(|(outputs, stats)| (StatementResults::Insert(outputs), stats)),
+                .map(|(outputs, stats)| (StatementResults::AffectedRows(outputs), stats)),
         }
     }
 }
 
 pub(super) enum StatementResults<T> {
     Batches(Vec<T>),
-    Insert(Vec<usize>),
+    AffectedRows(Vec<usize>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StatementKind {
     Query,
     Insert,
+    Delete,
     CreateTable,
     CreateSchema,
     CreateUser,
@@ -54,6 +57,7 @@ impl StatementKind {
     pub(super) fn from_plan(plan: &planner::Plan) -> Self {
         match &plan.root.operator {
             planner::Operator::Insert(_) => Self::Insert,
+            planner::Operator::Delete(_) => Self::Delete,
             planner::Operator::CreateTable(_) => Self::CreateTable,
             planner::Operator::CreateSchema(_) => Self::CreateSchema,
             planner::Operator::CreateUser(_) => Self::CreateUser,
@@ -81,7 +85,7 @@ pub(super) fn result_columns(plan: &planner::Plan) -> Result<Vec<ResultColumn>> 
 
 pub(super) fn affected_rows(outputs: Vec<usize>) -> Result<usize> {
     if outputs.len() != 1 {
-        return Err(Error::InvalidInsertResult(format!(
+        return Err(Error::InvalidAffectedRows(format!(
             "expected one affected-row output, got {}",
             outputs.len()
         )));
@@ -92,8 +96,8 @@ pub(super) fn affected_rows(outputs: Vec<usize>) -> Result<usize> {
         .expect("output length checked above"))
 }
 
-/// The affected-row count an INSERT's sink emits as its one-row, one-column
-/// output batch. A batch of another shape fails the dataflow.
+/// The affected-row count an INSERT's sink or a DELETE emits as its one-row,
+/// one-column output batch. A batch of another shape fails the dataflow.
 pub(super) fn affected_rows_from_record_batch(batch: RecordBatch) -> dispatch::UnaryResult<usize> {
     if batch.num_rows() != 1 || batch.num_columns() != 1 {
         return Err(dispatch::UnaryError::Operator(

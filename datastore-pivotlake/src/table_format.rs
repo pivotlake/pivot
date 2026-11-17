@@ -5,7 +5,8 @@
 //! table's current version is read and advanced, how a partition's files
 //! are read out of its metadata into the index both formats keep them in,
 //! how a set of file additions and removals becomes one committed version,
-//! and what its metadata lets maintenance delete. Everything else, the
+//! which partitions a DELETE takes out, and what its metadata lets
+//! maintenance delete. Everything else, the
 //! database index, the transaction and DDL, the insert sink, the compaction
 //! planner and actor, the vacuum driver and the query binding, lives above
 //! this seam and never asks which format it is working on.
@@ -17,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use catalog::datastore::DatastoreTableMetadata;
-use iceberg_tables::PartitionKeys;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
+use iceberg_tables::{DeleteFilter, PartitionKeys};
 use object_storage::{FileRef, ObjectPath};
 use parquet_engine::{RowGroupMetadata, ScanSelection};
 use planner::catalog::{Column, SchemaQualifiedTableName};
@@ -267,6 +268,23 @@ pub(crate) trait Table: Send + Sync {
         added: &[TableFile],
         data_change: bool,
     ) -> Result<Option<Arc<dyn Table>>>;
+    /// The rows a DELETE with `conditions` removes, bound to this version's
+    /// columns, which each condition is over: those all of them are true
+    /// of, every row when there are none. Refused when a condition cannot
+    /// be checked against a partition's values, or by a format whose
+    /// tables no DELETE runs on.
+    fn bind_delete_filter(&self, conditions: &[Expression]) -> Result<DeleteFilter>;
+    /// How many rows `filter` removes from this version, whose partitions
+    /// it takes out whole. Refused when the filter cuts a partition that
+    /// holds a row: it is true of some of the rows the partition may hold
+    /// and not known to be true of them all.
+    fn count_deleted_rows(&self, filter: &DeleteFilter) -> Result<u64>;
+    /// Commit, on top of this version, the removal of the rows `filter`
+    /// removes from it, as one new version: every file of the partitions
+    /// the filter covers whole, with nothing written but metadata. Refused,
+    /// with nothing committed, when the filter cuts a partition that holds
+    /// a row.
+    fn delete_rows(&self, filter: &DeleteFilter) -> Result<RowDeletion>;
     /// How long a file this table no longer references is kept before it may
     /// be deleted.
     fn deleted_file_retention(&self) -> Result<Duration>;
@@ -317,6 +335,17 @@ impl RemovedFiles<'static> {
         partition: &[],
         paths: &[],
     };
+}
+
+/// What became of a DELETE's rows on one version of a table.
+pub(crate) enum RowDeletion {
+    /// The version holds no row to remove, and nothing was committed.
+    NothingToDelete,
+    /// The rows are gone in this version, which the removal committed.
+    Committed(Arc<dyn Table>),
+    /// Another writer committed a version first: the caller refreshes and
+    /// deletes from that one.
+    LostRace,
 }
 
 /// A snapshot expiry a table committed.

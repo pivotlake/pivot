@@ -50,8 +50,8 @@ use std::time::Duration;
 
 use catalog::datastore::DatastoreTableMetadata;
 use dispatch::DataFlowDispatcher;
-use iceberg_tables::PartitionKeys;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
+use iceberg_tables::{DeleteFilter, PartitionKeys};
 use imbl::OrdMap;
 use object_storage::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use parquet_engine::{ParquetTable, PushedPredicate, RowGroupMetadata, ScanSelection};
@@ -65,7 +65,9 @@ use self::file_record::{DeltaFile, DeltaIndex, RecordBuilder};
 use self::log::TableShape;
 use crate::file_entry::{ColumnStatFilter, FileEntry, PartitionEqFilter, constant_partition};
 use crate::table::{TableFile, TableStorage};
-use crate::table_format::{RemovedFiles, SnapshotExpiry, Table, TableFactory, VisitPartition};
+use crate::table_format::{
+    RemovedFiles, RowDeletion, SnapshotExpiry, Table, TableFactory, VisitPartition,
+};
 use crate::{Error, Result};
 
 /// What creates and loads the Delta tables of one database, which every
@@ -744,6 +746,21 @@ impl Table for DeltaTable {
 
     /// The table's `delta.deletedFileRetentionDuration`, or the datastore's
     /// 4-hour default when unset.
+    /// No DELETE runs on a Delta table.
+    fn bind_delete_filter(&self, _conditions: &[Expression]) -> Result<DeleteFilter> {
+        Err(Error::DeleteFromDeltaTable)
+    }
+
+    /// No DELETE is bound to a Delta table, so none is counted on one.
+    fn count_deleted_rows(&self, _filter: &DeleteFilter) -> Result<u64> {
+        Err(Error::DeleteFromDeltaTable)
+    }
+
+    /// No DELETE is bound to a Delta table, so none is committed to one.
+    fn delete_rows(&self, _filter: &DeleteFilter) -> Result<RowDeletion> {
+        Err(Error::DeleteFromDeltaTable)
+    }
+
     fn deleted_file_retention(&self) -> Result<Duration> {
         Ok(log::deleted_file_retention(&self.snapshot))
     }

@@ -2,7 +2,7 @@
 title: "VALUES"
 description: Construct rows from SQL expressions.
 sidebar:
-  order: 11
+  order: 12
 ---
 
 `VALUES` constructs rows directly from expressions. It can be a standalone

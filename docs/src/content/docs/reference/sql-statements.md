@@ -15,6 +15,7 @@ Each command page includes examples, supported syntax, and usage notes.
 
 - [INSERT](/docs/reference/statements/insert/) - append values or query results.
 - [COPY](/docs/reference/statements/copy/) - stream text or Arrow IPC rows from a client.
+- [DELETE](/docs/reference/statements/delete/) - remove rows by dropping whole partitions.
 
 ## Schemas and tables
 
@@ -37,5 +38,6 @@ Each command page includes examples, supported syntax, and usage notes.
 PostgreSQL wire compatibility lets PostgreSQL clients connect. It does not
 imply support for every PostgreSQL statement or statement variant.
 
-`DELETE` is not supported yet. Planned additions are tracked in the
+`DELETE` drops whole partitions; deleting individual rows and `UPDATE` are
+not supported yet. Planned additions are tracked in the
 [roadmap](/docs/database/roadmap/).
