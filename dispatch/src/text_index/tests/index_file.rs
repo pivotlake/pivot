@@ -1,6 +1,6 @@
 use super::{encoded_from, token};
 use crate::io::FileRange;
-use crate::memory::{FileBytes, Slab, SlabAllocator, init_test_free_pool};
+use crate::memory::{BUFFER_SIZE, FileBytes, Slab, SlabAllocator, init_test_free_pool};
 use crate::text_index::{
     DictIndex, IndexFileFooter, IndexFileWriter, Postings, SparseIndex, TOKENS_PER_DICT_INDEX,
     TokenRows,
@@ -23,7 +23,7 @@ fn write_index_file(token_count: usize) -> FileBytes {
     for index in 0..token_count {
         writer.start_token(&mut allocator, &token(index));
         for row in rows_of_token(index) {
-            writer.push_row(&mut allocator, row);
+            writer.push_row(row);
         }
     }
     writer.finish(&mut allocator)
@@ -135,6 +135,24 @@ fn the_postings_of_a_dict_index_are_written_before_it() {
 
     assert_eq!(postings.offset, 0);
     assert!(postings.offset + postings.len <= dict_index_range.offset);
+}
+
+#[test]
+fn writing_a_file_of_many_small_postings_takes_ring_memory_for_little_more_than_the_file() {
+    init_test_free_pool(16);
+    let mut allocator = SlabAllocator::new(false);
+    let mut writer = IndexFileWriter::new();
+    for index in 0..20_000 {
+        writer.start_token(&mut allocator, &token(index));
+        for row in rows_of_token(index) {
+            writer.push_row(row);
+        }
+    }
+
+    let file = writer.finish(&mut allocator);
+
+    assert!(file.len() < BUFFER_SIZE);
+    assert!(allocator.bytes_held() <= 2 * BUFFER_SIZE);
 }
 
 #[test]

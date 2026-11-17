@@ -1,6 +1,6 @@
 //! [`SlabVec`] — a growable, slab-backed, append-only buffer.
 
-use super::{FrozenSlab, Slab, SlabBuffer, SlabSource};
+use super::{FrozenSlab, Slab, SlabAllocator, SlabBuffer, SlabSource};
 use std::cmp::Ordering;
 use std::ops::Range;
 
@@ -175,12 +175,14 @@ impl<T: Copy> SlabVec<T> {
     }
 
     /// The vec's chunks as slabs, in order, the last one cut to the elements
-    /// pushed: the elements' bytes and nothing after them.
-    pub fn into_slabs(self) -> Vec<Slab> {
+    /// pushed: the elements' bytes and nothing after them. `allocator` is
+    /// the one the chunks were carved from, and takes back what is cut off
+    /// when nothing else was carved from it since the last chunk.
+    pub fn into_slabs(self, allocator: &mut SlabAllocator) -> Vec<Slab> {
         let last_size = self.last_len * size_of::<T>();
         let mut slabs: Vec<Slab> = self.chunks.into_iter().map(SlabBuffer::into_slab).collect();
         if let Some(last) = slabs.last_mut() {
-            last.size = last_size;
+            allocator.cut_slab(last, last_size);
         }
         slabs
     }

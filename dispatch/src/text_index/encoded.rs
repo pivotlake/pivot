@@ -59,7 +59,7 @@ impl<'a> EncodedWriter<'a> {
 
     /// The slabs holding everything written, in order.
     pub fn into_slabs(self) -> Vec<Slab> {
-        self.bytes.into_slabs()
+        self.bytes.into_slabs(self.allocator)
     }
 }
 

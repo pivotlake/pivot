@@ -178,6 +178,29 @@ impl SlabAllocator {
         self.get_slab_from_current_buffer(size, zeroed)
     }
 
+    /// Cuts `slab` down to its first `len` bytes. When it is the slab carved
+    /// last, the bytes cut off are handed out again by the next allocation, so
+    /// a slab carved before its contents' size was known ends up taking only
+    /// what was written to it. A slab that others were carved after is cut
+    /// all the same, and its cut-off bytes stay unused.
+    pub fn cut_slab(&mut self, slab: &mut Slab, len: usize) {
+        assert!(
+            len <= slab.size,
+            "cannot cut a {} byte slab to {len}",
+            slab.size
+        );
+        let slab_start = slab.ptr as usize;
+        let buffer_start = self.working_buffer.ptr as usize;
+        let is_carved_last =
+            slab_start >= buffer_start && slab_start + slab.size == buffer_start + self.offset;
+        if is_carved_last {
+            self.offset -= slab.size - len;
+            // The bytes handed back may have been written.
+            self.working_buffer_zeroed = false;
+        }
+        slab.size = len;
+    }
+
     /// Allocates a [`MultiSlabBuffer<T>`] that can hold `size` elements of type `T`.
     ///
     /// Always starts from a fresh buffer boundary so that `MultiSlabBuffer`'s bit-shift
@@ -278,6 +301,33 @@ mod tests {
         assert!(slabs.len() >= 2);
         let total: usize = slabs.iter().map(|s| s.size).sum();
         assert_eq!(total, BUFFER_SIZE + 1024);
+    }
+
+    #[test]
+    fn the_end_cut_off_the_slab_carved_last_is_handed_out_next() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(false);
+        let mut first = alloc.get_slab_of_size(1024, false);
+
+        alloc.cut_slab(&mut first, 100);
+        let second = alloc.get_slab_of_size(64, false);
+
+        assert_eq!(first.size(), 100);
+        assert_eq!(unsafe { second.ptr.offset_from(first.ptr) }, 100);
+    }
+
+    #[test]
+    fn the_end_cut_off_an_earlier_slab_stays_unused() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(false);
+        let mut first = alloc.get_slab_of_size(1024, false);
+        let second = alloc.get_slab_of_size(64, false);
+
+        alloc.cut_slab(&mut first, 100);
+        let third = alloc.get_slab_of_size(64, false);
+
+        assert_eq!(first.size(), 100);
+        assert_eq!(unsafe { third.ptr.offset_from(second.ptr) }, 64);
     }
 
     #[test]

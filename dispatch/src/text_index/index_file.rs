@@ -97,6 +97,13 @@ impl IndexFileFooter {
 ///
 /// What it holds at any moment is the file written so far, the dict index
 /// being gathered, and the rows of the token being gathered.
+///
+/// The file's bytes are long-lived and come from the caller's allocator. The
+/// rows of a token and the tokens of a dict index are only held until they
+/// are written, and sharing a ring buffer with the file's bytes would keep
+/// the space they took out of use for as long as the file lives. So each is
+/// gathered in memory of the writer's own, which starts over once what was
+/// gathered in it is written.
 #[derive(Default)]
 pub struct IndexFileWriter {
     /// The file so far: postings and closed dict indexes.
@@ -117,6 +124,12 @@ pub struct IndexFileWriter {
     row_count: usize,
     first_rows: [u32; MOST_ROWS_KEPT_IN_DICT],
     postings: PostingsBuilder,
+
+    /// Where the postings of the token being gathered are held until they
+    /// are written, and where the dict index being gathered is. Each is taken
+    /// from the ring when first needed.
+    memory_of_token: Option<SlabAllocator>,
+    memory_of_dict_index: Option<SlabAllocator>,
 }
 
 impl IndexFileWriter {
@@ -125,8 +138,8 @@ impl IndexFileWriter {
     }
 
     /// Start the next token, which must sort after every token so far. Its
-    /// rows follow through [`push_row`](Self::push_row). The memory of what
-    /// gets written comes from `allocator`.
+    /// rows follow through [`push_row`](Self::push_row). The bytes this adds
+    /// to the file come from `allocator`.
     pub fn start_token(&mut self, allocator: &mut SlabAllocator, token: &[u8]) {
         self.write_gathered_token(allocator);
         self.token.clear();
@@ -136,19 +149,22 @@ impl IndexFileWriter {
 
     /// Add a row the token being gathered appears in, which must be above
     /// its rows so far.
-    pub fn push_row(&mut self, allocator: &mut SlabAllocator, row: u32) {
+    pub fn push_row(&mut self, row: u32) {
         assert!(self.has_token, "a row belongs to a token started before it");
         if self.row_count < MOST_ROWS_KEPT_IN_DICT {
             self.first_rows[self.row_count] = row;
         } else {
+            let memory_of_token = self
+                .memory_of_token
+                .get_or_insert_with(|| SlabAllocator::new(false));
             // One row too many to keep in the dict index: from here on the
             // token's rows are postings, starting with the ones held back.
             if self.row_count == MOST_ROWS_KEPT_IN_DICT {
                 for first_row in self.first_rows {
-                    self.postings.push(allocator, first_row);
+                    self.postings.push(memory_of_token, first_row);
                 }
             }
-            self.postings.push(allocator, row);
+            self.postings.push(memory_of_token, row);
         }
         self.row_count += 1;
     }
@@ -166,7 +182,11 @@ impl IndexFileWriter {
         let rows = if self.row_count <= MOST_ROWS_KEPT_IN_DICT {
             TokenRows::KeptInDict(FewRows::new(&self.first_rows[..self.row_count]))
         } else {
-            let postings = std::mem::take(&mut self.postings).finish(allocator);
+            let memory_of_token = self
+                .memory_of_token
+                .as_mut()
+                .expect("the token's postings were gathered in it");
+            let postings = std::mem::take(&mut self.postings).finish(memory_of_token);
             let offset = self.file.len();
             for slab in postings.encode(allocator) {
                 self.file.push_slab(slab);
@@ -181,7 +201,11 @@ impl IndexFileWriter {
             self.smallest_token_of_dict_index
                 .extend_from_slice(&self.token);
         }
-        self.dict_index.push(allocator, &self.token, rows);
+        let memory_of_dict_index = self
+            .memory_of_dict_index
+            .get_or_insert_with(|| SlabAllocator::new(false));
+        self.dict_index
+            .push(memory_of_dict_index, &self.token, rows);
         self.tokens_in_dict_index += 1;
         self.row_count = 0;
         if self.tokens_in_dict_index == TOKENS_PER_DICT_INDEX {
