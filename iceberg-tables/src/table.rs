@@ -1460,30 +1460,6 @@ impl Table {
         &self.manifest_list
     }
 
-    /// The length of each metadata object of this version it is known for,
-    /// by the object's location: the manifests, as the manifest list
-    /// records them, and the manifest list itself.
-    pub(crate) fn list_metadata_object_sizes(&self) -> HashMap<String, u64> {
-        let manifests = self
-            .manifest_list
-            .data_manifests()
-            .chain(self.manifest_list.delete_manifests());
-        let mut sizes: HashMap<String, u64> = manifests
-            .map(|manifest| {
-                (
-                    manifest.manifest_path.clone(),
-                    manifest.manifest_length.max(0) as u64,
-                )
-            })
-            .collect();
-        if let (Some(snapshot), Some(size)) =
-            (self.metadata().current_snapshot(), self.manifest_list_size)
-        {
-            sizes.insert(snapshot.manifest_list().to_string(), size);
-        }
-        sizes
-    }
-
     /// The length of the current snapshot's manifest list, when this
     /// version knows it.
     pub fn manifest_list_size(&self) -> Option<u64> {

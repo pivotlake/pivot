@@ -9,21 +9,18 @@
 //! serves no ranged reads, which only a Parquet or Puffin reader would ask
 //! for, and Pivot reads those files with its own engine.
 //!
-//! The crate names an object by its location alone, and a read over the
-//! ring needs the object's length. A commit's file IO is therefore told the
-//! lengths the version it is built on knows, of its manifest list and of
-//! the manifests that lists ([`RingReads`]): those are read over the ring,
-//! through the caches the queries' reads of the same objects fill, and an
-//! object of unknown length, a manifest the commit itself wrote among them,
-//! straight from the store. Writes and deletes go straight to the store.
+//! Every read, write and delete goes straight to the store, on one of the
+//! runtime's blocking threads. Nothing read here passes through the ring or
+//! the caches the queries' reads of the same objects fill, so a commit asks
+//! the store for an object every time its transaction reads it. No call
+//! drives a dataflow, so the file IO asks nothing of the worker pool: it is
+//! driven on a runtime from whatever thread may wait on the store.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use dispatch::DataFlowDispatcher;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use iceberg::io::{
@@ -31,7 +28,7 @@ use iceberg::io::{
     StorageConfig, StorageFactory,
 };
 use iceberg::{Error as IcebergError, ErrorKind};
-use object_storage::{DataFile, FileRef, ObjectPath, ObjectStore, load_objects};
+use object_storage::{ObjectPath, ObjectStore};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -55,33 +52,10 @@ impl ObjectLocator for TableLocation {
 
 impl TableLocation {
     /// The file IO of the table, its files read and written through its
-    /// store. The objects `ring_reads` knows the length of are read over
-    /// the ring.
-    pub fn build_file_io(&self, ring_reads: RingReads) -> FileIO {
-        let storage = PivotStorage {
-            locator: Arc::new(self.clone()),
-            ring_reads: Some(ring_reads),
-        };
+    /// store.
+    pub fn build_file_io(&self) -> FileIO {
+        let storage = PivotStorage::new(Arc::new(self.clone()));
         FileIOBuilder::new(Arc::new(OneStorageFactory { storage })).build()
-    }
-}
-
-/// The objects a file IO reads over the ring: those whose length is known,
-/// by location, and the pool whose ring reads them. A read over the ring
-/// drives a dataflow, so the file IO must be used off the pool's workers,
-/// as a commit is.
-#[derive(Clone)]
-pub struct RingReads {
-    dispatcher: DataFlowDispatcher,
-    sizes: Arc<HashMap<String, u64>>,
-}
-
-impl RingReads {
-    pub fn new(dispatcher: &DataFlowDispatcher, sizes: HashMap<String, u64>) -> Self {
-        Self {
-            dispatcher: dispatcher.clone(),
-            sizes: Arc::new(sizes),
-        }
     }
 }
 
@@ -90,53 +64,11 @@ impl RingReads {
 #[derive(Clone)]
 pub struct PivotStorage {
     locator: Arc<dyn ObjectLocator>,
-    /// The objects read over the ring, when the file IO was told any.
-    ring_reads: Option<RingReads>,
 }
 
 impl PivotStorage {
     pub fn new(locator: Arc<dyn ObjectLocator>) -> Self {
-        Self {
-            locator,
-            ring_reads: None,
-        }
-    }
-
-    /// The bytes of the object at `location`, of `size` bytes, read over
-    /// the ring of `dispatcher` from a blocking thread, which is not one of
-    /// the pool's workers: the read drives a dataflow and waits for it. The
-    /// object is read under its location, as a table's own reads name it,
-    /// so both share what the ring caches.
-    async fn read_over_ring(
-        &self,
-        location: &str,
-        size: u64,
-        dispatcher: DataFlowDispatcher,
-    ) -> iceberg::Result<Bytes> {
-        let file = FileRef {
-            path: ObjectPath::new(location),
-            size,
-        };
-        self.blocking(location, move |store, key| {
-            let file = DataFile {
-                file,
-                source: store.source(key)?,
-            };
-            Ok(load_objects(&dispatcher, &[file]))
-        })
-        .await?
-        .map(|mut loaded| {
-            let object = loaded
-                .pop()
-                .expect("load_objects returns one object per file");
-            Bytes::from(object.bytes)
-        })
-        .map_err(|error| {
-            IcebergError::new(
-                ErrorKind::Unexpected,
-                format!("reading `{location}` over the ring: {error}"),
-            )
-        })
+        Self { locator }
     }
 
     /// Run `call` against the store of `location` on a blocking thread: the
@@ -182,13 +114,6 @@ impl Storage for PivotStorage {
     }
 
     async fn read(&self, path: &str) -> iceberg::Result<Bytes> {
-        if let Some(ring_reads) = &self.ring_reads
-            && let Some(size) = ring_reads.sizes.get(path)
-        {
-            return self
-                .read_over_ring(path, *size, ring_reads.dispatcher.clone())
-                .await;
-        }
         let bytes = self
             .blocking(path, |store, key| store.get(key))
             .await?

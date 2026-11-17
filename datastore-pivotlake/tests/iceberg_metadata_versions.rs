@@ -218,16 +218,17 @@ fn a_commit_whose_write_never_answers_keeps_its_objects_and_says_so() {
 }
 
 #[test]
-fn an_insert_reads_of_the_store_only_the_manifest_list_it_wrote() {
+fn an_insert_reads_of_the_store_the_manifest_list_it_is_built_on_and_the_one_it_wrote() {
     let (_directory, faults, mut db) = open_faulty_database();
     db.execute("CREATE TABLE t (value BIGINT)");
+    db.execute("INSERT INTO t VALUES (1)");
     faults.take_requests();
 
-    db.execute("INSERT INTO t VALUES (1)");
+    db.execute("INSERT INTO t VALUES (2)");
 
     let requests = faults.take_requests();
-    assert_eq!(hold_table(&db, "t").version(), 2);
-    assert_eq!(requests.object_reads, 1);
+    assert_eq!(hold_table(&db, "t").version(), 3);
+    assert_eq!(requests.object_reads, 2);
     assert_eq!(requests.listings, 0);
 }
 

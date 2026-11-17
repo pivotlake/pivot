@@ -1,7 +1,8 @@
 //! Committing to a table: an append or a replace lands as the next version,
 //! of several writers from one version exactly one wins, what was committed
 //! is read back whole, in order, and a commit reads of the store the
-//! manifest list it wrote and nothing of the version it was built on.
+//! manifest list it wrote and, of the version it was built on, the manifest
+//! list and the manifests it merges or looks for a replaced file in.
 
 mod support;
 
@@ -357,7 +358,7 @@ fn a_scan_reports_a_column_nullable_only_while_a_live_file_records_a_null_in_it(
 }
 
 #[test]
-fn commits_merging_manifests_read_the_carried_ones_over_the_pool() {
+fn commits_merging_manifests_read_the_carried_ones_from_the_store() {
     let (fixture, _created) = create_table(&[]);
     let faults = Arc::new(Faults::default());
     let mut table = load_over_faulty_store(&fixture, &faults);
@@ -375,10 +376,39 @@ fn commits_merging_manifests_read_the_carried_ones_over_the_pool() {
 
     assert_eq!(count_manifests(&table), 1);
     assert_eq!(paths(&table).len(), appends as usize);
-    // Each commit reads the manifest list it wrote, and the one that merged
-    // every manifest into one reads the manifest it wrote for its own file:
-    // the 99 manifests it carried are not read from the store.
-    assert_eq!(requests.object_reads, appends as usize + 1);
+    // Each commit reads the manifest list it wrote and, but for the first,
+    // the one it is built on; the one that merged every manifest into one
+    // reads them all, the 99 it carried and the one it wrote for its own
+    // file.
+    assert_eq!(requests.object_reads, 3 * appends as usize - 1);
+    assert_eq!(requests.listings, 0);
+}
+
+#[test]
+fn a_rewrite_reads_every_data_manifest_of_the_table_from_the_store() {
+    let (fixture, _created) = create_table(&[]);
+    let faults = Arc::new(Faults::default());
+    let mut table = load_over_faulty_store(&fixture, &faults);
+    let manifests = 20;
+    for number in 0..manifests {
+        table = append(
+            &table,
+            vec![entry(&format!("f{number:02}"), 10, number, number)],
+        );
+    }
+    let replaced = live_entry(&table, "f00.parquet");
+    faults.take_requests();
+
+    let rewritten = table.commit(&[replaced], vec![entry("merged", 10, 0, 0)]);
+    let requests = faults.take_requests();
+
+    assert_eq!(count_manifests(&table), manifests as usize);
+    assert!(rewritten.unwrap().is_some());
+    // The manifest list the rewrite is built on, once to look for deletes
+    // committed since and once for the manifests it lists; each of those
+    // manifests, for the entry of the file replaced; and the manifest list
+    // it wrote.
+    assert_eq!(requests.object_reads, manifests as usize + 3);
     assert_eq!(requests.listings, 0);
 }
 

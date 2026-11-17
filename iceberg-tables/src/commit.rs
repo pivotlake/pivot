@@ -30,7 +30,6 @@ use uuid::Uuid;
 use crate::files::data_files::DataFileEntry;
 use crate::files::manifests::ManifestList;
 use crate::io::runtime::block_on;
-use crate::io::storage::RingReads;
 use crate::maintenance::expired_objects::ExpiredSnapshots;
 use crate::maintenance::retention::{DEFAULT_SNAPSHOT_RETENTION, SNAPSHOT_RETENTION_PROPERTY};
 use crate::metadata::layout::TableLocation;
@@ -298,12 +297,13 @@ impl Table {
     /// Commit the transaction `build_transaction` builds on this version
     /// through the table's metadata store, the new version's metadata log
     /// dropping `expired_metadata_files`. `Ok(None)` when another writer
-    /// committed first. What the transaction reads of this version, its
-    /// manifest list and the manifests it merges or rewrites, is read over
-    /// the ring. A commit that succeeded is loaded at its version, its
-    /// manifest list read from the table's store
-    /// ([`load_committed`](Self::load_committed)). When that load fails the
-    /// commit stands all the same: the error says so
+    /// committed first. What the transaction reads of this version is read
+    /// whole from the table's store, as often as it asks: the manifest
+    /// list, twice by a commit that removes files, every data manifest by
+    /// such a commit, and the manifests a merge joins. A commit that
+    /// succeeded is loaded at its version, its manifest list read from the
+    /// table's store ([`load_committed`](Self::load_committed)). When that
+    /// load fails the commit stands all the same: the error says so
     /// ([`Error::CommittedTableUnloaded`]), and nothing the commit wrote or
     /// added is deleted for it.
     ///
@@ -324,8 +324,7 @@ impl Table {
         expired_metadata_files: Vec<String>,
         build_transaction: impl FnOnce(Transaction) -> iceberg::Result<Transaction>,
     ) -> Result<Option<Table>> {
-        let ring_reads = RingReads::new(self.dispatcher(), self.list_metadata_object_sizes());
-        let file_io = self.location().build_file_io(ring_reads);
+        let file_io = self.location().build_file_io();
         let base = SpecTable::builder()
             .metadata(Arc::clone(self.metadata()))
             .identifier(build_table_ident(self.name()))
