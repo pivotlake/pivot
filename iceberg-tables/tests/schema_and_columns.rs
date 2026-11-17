@@ -11,7 +11,7 @@ use std::sync::Arc;
 use iceberg::spec::{
     FormatVersion, NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortField,
     SortOrder, TableMetadata, TableMetadataBuilder, Transform, Type as IcebergType,
-    UnboundPartitionSpec,
+    UnboundPartitionSpec, VariantType,
 };
 use iceberg_tables::types::schema::{
     LOGICAL_TYPES_PROPERTY, build_partition_spec, build_schema, build_sort_order,
@@ -23,7 +23,7 @@ use planner::types::Type;
 use support::{Fixture, column, create_table_of, load};
 
 #[test]
-fn columns_become_optional_fields_numbered_in_order_with_variant_leaves_after() {
+fn columns_become_optional_fields_numbered_in_order() {
     let columns = [
         column("id", Type::UInt64),
         column("doc", Type::Variant),
@@ -44,16 +44,32 @@ fn columns_become_optional_fields_numbered_in_order_with_variant_leaves_after() 
         fields[0].field_type.as_ref(),
         &IcebergType::Primitive(PrimitiveType::Long)
     );
-    let IcebergType::Struct(variant) = fields[1].field_type.as_ref() else {
-        panic!("a variant column is declared as a struct");
-    };
     assert_eq!(
-        variant
-            .fields()
-            .iter()
-            .map(|leaf| (leaf.id, leaf.name.as_str()))
-            .collect::<Vec<_>>(),
-        [(4, "metadata"), (5, "value")]
+        fields[1].field_type.as_ref(),
+        &IcebergType::Variant(VariantType)
+    );
+    assert_eq!(schema.highest_field_id(), 3);
+}
+
+#[test]
+fn a_created_table_declares_a_variant_column_as_one_variant_field() {
+    let columns = [
+        column("tiny", Type::Int8),
+        column("doc", Type::Variant),
+        column("day", Type::Date),
+    ];
+
+    let (_fixture, created) = create_table_of(&columns, &[], &[]);
+
+    let metadata = serde_json::to_value(created.metadata()).unwrap();
+    assert_eq!(
+        metadata["schemas"][0]["fields"][1],
+        serde_json::json!({"id": 2, "name": "doc", "required": false, "type": "variant"})
+    );
+    assert_eq!(metadata["last-column-id"], 3);
+    assert_eq!(
+        metadata["properties"][LOGICAL_TYPES_PROPERTY],
+        r#"{"1":"Int8"}"#
     );
 }
 
@@ -80,7 +96,7 @@ fn logical_types_round_trip_through_the_property() {
     let (fixture, created) = create_table_of(&columns, &[], &[]);
     let loaded = load(&fixture);
 
-    assert_eq!(property, r#"{"1":"Int8","3":"Variant"}"#);
+    assert_eq!(property, r#"{"1":"Int8"}"#);
     assert_eq!(
         created.metadata().properties()[LOGICAL_TYPES_PROPERTY],
         property
@@ -216,6 +232,43 @@ fn a_recorded_logical_type_overrides_the_fields_iceberg_type() {
 
     assert_eq!(table.columns()[0].col_type, Type::Int8);
     assert_eq!(table.columns()[1].col_type, Type::Int64);
+}
+
+#[test]
+fn a_variant_field_reads_as_a_variant_column_with_no_property() {
+    let fields = vec![
+        NestedField::required(1, "id", IcebergType::Primitive(PrimitiveType::Long)),
+        NestedField::optional(2, "doc", IcebergType::Variant(VariantType)),
+    ];
+    let fixture = Fixture::new();
+
+    let table = fixture.build_table_at(build_metadata(fields, HashMap::new()));
+
+    assert_eq!(
+        table.columns(),
+        [column("id", Type::Int64), column("doc", Type::Variant)]
+    );
+}
+
+#[test]
+fn a_property_naming_a_variant_is_an_error() {
+    let fields = vec![NestedField::optional(
+        1,
+        "doc",
+        IcebergType::Variant(VariantType),
+    )];
+    let recorded_variant = HashMap::from([(
+        LOGICAL_TYPES_PROPERTY.to_string(),
+        r#"{"1":"Variant"}"#.to_string(),
+    )]);
+    let fixture = Fixture::new();
+
+    let error = fixture
+        .try_build_table_at(build_metadata(fields, recorded_variant))
+        .err()
+        .expect("a table recording a type Pivot never records is refused");
+
+    assert!(matches!(error, Error::MalformedProperty { .. }), "{error}");
 }
 
 #[test]

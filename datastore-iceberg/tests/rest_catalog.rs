@@ -31,8 +31,8 @@ use iceberg::spec::{
     DataFile, DataFileFormat, Datum, FormatVersion, Literal, Manifest, ManifestContentType,
     ManifestList, ManifestListWriter, ManifestWriterBuilder, NestedField, NestedFieldRef,
     NullOrder, Operation, PartitionKey, PrimitiveLiteral, PrimitiveType, Schema, Snapshot,
-    SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Struct, StructType,
-    Summary, Transform, Type, UnboundPartitionSpec,
+    SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Struct, Summary,
+    Transform, Type, UnboundPartitionSpec, VariantType,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -5057,21 +5057,15 @@ fn a_filter_on_a_variant_field_keeps_the_rows_that_hold_the_value() {
 #[test]
 fn a_variant_extract_is_null_for_a_file_that_predates_the_column() {
     let Some(harness) = harness() else { return };
-    let namespace = harness.namespace("late_docs", "orders", orders_schema());
+    let namespace = harness.v3_namespace("late_docs", "orders", orders_schema());
     harness.append(&namespace, "orders", orders(&[1], &["ann"], &[1.0]));
-    let variant = Type::Struct(StructType::new(vec![
-        field(5, "metadata", PrimitiveType::Binary),
-        field(6, "value", PrimitiveType::Binary),
-    ]));
     let mut fields = orders_schema().as_struct().fields().to_vec();
-    fields.push(Arc::new(NestedField::optional(4, "doc", variant)));
+    fields.push(Arc::new(NestedField::optional(
+        4,
+        "doc",
+        Type::Variant(VariantType),
+    )));
     harness.set_schema(&namespace, "orders", &schema(1, fields));
-    harness.set_property(
-        &namespace,
-        "orders",
-        "pivot.logical-types",
-        r#"{"4":"Variant"}"#,
-    );
     let (catalog, mut planner) = harness.pivot();
     harness
         .execute(
@@ -5084,8 +5078,49 @@ fn a_variant_extract_is_null_for_a_file_that_predates_the_column() {
     let rows = harness.query(
         &catalog,
         &mut planner,
-        "SELECT CAST(doc.a AS BIGINT) FROM late_docs.orders ORDER BY id",
+        "SELECT CAST(doc.a AS BIGINT), CAST(doc AS VARCHAR) FROM late_docs.orders ORDER BY id",
     );
 
     assert_eq!(int64_column(&rows, 0), [None, Some(5)]);
+    assert_eq!(
+        string_column(&rows, 1),
+        [None, Some(r#"{"a":5}"#.to_string())]
+    );
+}
+
+#[test]
+fn create_table_registers_a_variant_column_as_one_variant_field() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("declared", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    create_events(&harness, &catalog, &mut planner, "declared", "", &[]);
+
+    let table = harness.load(&namespace, "events");
+    let metadata = table.metadata();
+    let doc = metadata.current_schema().field_by_name("doc").unwrap();
+    assert_eq!(*doc.field_type, Type::Variant(VariantType));
+    assert_eq!(metadata.last_column_id(), 3);
+    assert!(!metadata.properties().contains_key("pivot.logical-types"));
+}
+
+#[test]
+fn a_table_whose_property_names_a_variant_is_refused() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("recorded", "orders", orders_schema());
+    harness.set_property(
+        &namespace,
+        "orders",
+        "pivot.logical-types",
+        r#"{"2":"Variant"}"#,
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness.plan_error(&catalog, &mut planner, "SELECT id FROM recorded.orders");
+    harness.drop_table(&namespace, "orders");
+
+    assert!(
+        error.contains("pivot.logical-types") && error.contains("Variant"),
+        "{error}"
+    );
 }

@@ -11,7 +11,8 @@ use std::time::Duration;
 use datastore_pivotlake::CompactionConfig;
 use datastore_pivotlake::test_support::{live_data_file_names, retained_snapshots};
 use iceberg_support::{
-    Database, collect_i64s, names_in, parquet_files_in, single_i64, write_int_parquet,
+    Database, collect_i64s, collect_strings, names_in, parquet_files_in, single_i64,
+    write_int_parquet,
 };
 use iceberg_tables::iceberg::spec::{
     FormatVersion, Manifest, ManifestList, ManifestStatus, Operation, TableMetadata,
@@ -224,4 +225,27 @@ fn compaction_outputs_carry_the_tables_field_ids() {
         .get_fields()
         .to_vec();
     assert_eq!(fields[0].get_basic_info().id(), 1);
+}
+
+#[test]
+fn a_final_compaction_rewrites_the_documents_of_a_variant_column_into_one_file() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE events (id BIGINT, doc VARIANT)");
+    db.execute(r#"INSERT INTO events VALUES (1, '{"a": 1}'), (2, NULL)"#);
+    db.execute(r#"INSERT INTO events VALUES (3, '{"b": "x"}'), (4, '{"a": "y"}')"#);
+    let directory = db.table_directory("events");
+
+    db.compact("events", true);
+
+    let live = live_data_file_names(&db.root_uri(), &directory).unwrap();
+    assert_eq!(live.len(), 1, "{live:?}");
+    let documents =
+        db.execute("SELECT id, CAST(doc AS VARCHAR) FROM events WHERE doc IS NOT NULL ORDER BY id");
+    assert_eq!(collect_i64s(&documents, 0), [1, 3, 4]);
+    assert_eq!(
+        collect_strings(&documents, 1),
+        [r#"{"a":1}"#, r#"{"b":"x"}"#, r#"{"a":"y"}"#]
+    );
+    let without_a_document = db.execute("SELECT id FROM events WHERE doc IS NULL");
+    assert_eq!(collect_i64s(&without_a_document, 0), [2]);
 }

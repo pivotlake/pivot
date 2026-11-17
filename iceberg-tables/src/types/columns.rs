@@ -13,9 +13,8 @@ use crate::{Error, Result};
 
 /// The table property naming, by field id, the Pivot type of every column
 /// whose Iceberg type is wider than or different from it: the narrow and
-/// unsigned integers, which Iceberg stores as `int`/`long`, and `Variant`,
-/// which is declared as its physical struct. A reader without the property
-/// sees the Iceberg types; Pivot restores its own.
+/// unsigned integers, which Iceberg stores as `int`/`long`. A reader without
+/// the property sees the Iceberg types; Pivot restores its own.
 pub const LOGICAL_TYPES_PROPERTY: &str = "pivot.logical-types";
 
 /// The declared columns of the table `metadata` describes: the top-level
@@ -69,7 +68,6 @@ fn parse_recorded_type(name: &str) -> Option<Type> {
         Type::UInt16,
         Type::UInt32,
         Type::UInt64,
-        Type::Variant,
     ]
     .into_iter()
     .find(|candidate| candidate.to_string() == name)
@@ -118,10 +116,12 @@ fn read_schema_columns(
 
 /// The Pivot type an Iceberg type reads as, or `None` for one Pivot has no
 /// column type for (nested types, time, nanosecond timestamps, uuid, fixed,
-/// binary).
+/// binary). Iceberg's `variant` reads as a `Variant` whoever declared it.
 pub fn to_pivot_type(iceberg_type: &IcebergType) -> Option<Type> {
-    let IcebergType::Primitive(primitive) = iceberg_type else {
-        return None;
+    let primitive = match iceberg_type {
+        IcebergType::Primitive(primitive) => primitive,
+        IcebergType::Variant(_) => return Some(Type::Variant),
+        IcebergType::Struct(_) | IcebergType::List(_) | IcebergType::Map(_) => return None,
     };
     Some(match primitive {
         PrimitiveType::Boolean => Type::Boolean,

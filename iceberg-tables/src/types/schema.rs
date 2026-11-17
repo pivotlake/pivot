@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use iceberg::spec::{
-    NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortField, SortOrder, StructType,
-    TableMetadata, Transform, Type as IcebergType, UnboundPartitionSpec,
+    NestedField, NullOrder, PrimitiveType, Schema, SortDirection, SortField, SortOrder,
+    TableMetadata, Transform, Type as IcebergType, UnboundPartitionSpec, VariantType,
 };
 use planner::catalog::Column;
 use planner::types::Type;
@@ -21,29 +21,16 @@ pub use crate::types::columns::LOGICAL_TYPES_PROPERTY;
 pub const NAME_MAPPING_PROPERTY: &str = "schema.name-mapping.default";
 
 /// `columns` as an Iceberg schema: every field optional (the catalog carries
-/// no NOT NULL), field ids 1.. in column order, a variant column's two leaves
-/// numbered after every top-level column.
+/// no NOT NULL), field ids 1.. in column order.
 pub fn build_schema(columns: &[Column]) -> Result<Schema> {
-    let mut next_nested_id = i32::try_from(columns.len()).expect("a table has few columns") + 1;
     let mut fields = Vec::with_capacity(columns.len());
     for (position, column) in columns.iter().enumerate() {
         let id = i32::try_from(position + 1).expect("a table has few columns");
-        let field_type = match &column.col_type {
-            Type::Variant => {
-                let metadata_id = next_nested_id;
-                let value_id = next_nested_id + 1;
-                next_nested_id += 2;
-                variant_struct(metadata_id, value_id)
-            }
-            pivot_type => {
-                IcebergType::Primitive(to_iceberg_primitive(pivot_type).ok_or_else(|| {
-                    Error::UnsupportedPivotType {
-                        column: column.name.clone(),
-                        pivot_type: pivot_type.to_string(),
-                    }
-                })?)
-            }
-        };
+        let field_type =
+            to_iceberg_type(&column.col_type).ok_or_else(|| Error::UnsupportedPivotType {
+                column: column.name.clone(),
+                pivot_type: column.col_type.to_string(),
+            })?;
         fields.push(Arc::new(NestedField::optional(
             id,
             &column.name,
@@ -57,12 +44,13 @@ pub fn build_schema(columns: &[Column]) -> Result<Schema> {
         .map_err(Error::spec)
 }
 
-/// The Iceberg primitive a Pivot column type is stored as, or `None` for a
-/// type with no Iceberg form (`Int128`, `Interval`; `Variant` is a struct)
-/// and for a `Struct`, which exists only inside a query, so no table
-/// declares one.
-pub fn to_iceberg_primitive(pivot_type: &Type) -> Option<PrimitiveType> {
-    Some(match pivot_type {
+/// The Iceberg type a Pivot column type is declared as, or `None` for a type
+/// with no Iceberg form (`Int128`, `Interval`) and for a `Struct`, which
+/// exists only inside a query, so no table declares one. A `Variant` is
+/// Iceberg's own `variant`: one field with one id, whose Parquet group of
+/// `metadata`, `value` and shredded `typed_value` the format defines.
+pub fn to_iceberg_type(pivot_type: &Type) -> Option<IcebergType> {
+    let primitive = match pivot_type {
         Type::Boolean => PrimitiveType::Boolean,
         Type::Int8 | Type::Int16 | Type::Int32 | Type::UInt8 | Type::UInt16 => PrimitiveType::Int,
         Type::Int64 | Type::UInt32 | Type::UInt64 => PrimitiveType::Long,
@@ -76,25 +64,10 @@ pub fn to_iceberg_primitive(pivot_type: &Type) -> Option<PrimitiveType> {
         Type::Date => PrimitiveType::Date,
         Type::Timestamp => PrimitiveType::Timestamp,
         Type::TimestampTz => PrimitiveType::Timestamptz,
-        Type::Int128 | Type::Interval | Type::Variant | Type::Struct(_) => return None,
-    })
-}
-
-/// The physical shape a variant column is declared as: the binary pair the
-/// Parquet VARIANT group is made of.
-fn variant_struct(metadata_id: i32, value_id: i32) -> IcebergType {
-    IcebergType::Struct(StructType::new(vec![
-        Arc::new(NestedField::optional(
-            metadata_id,
-            "metadata",
-            IcebergType::Primitive(PrimitiveType::Binary),
-        )),
-        Arc::new(NestedField::optional(
-            value_id,
-            "value",
-            IcebergType::Primitive(PrimitiveType::Binary),
-        )),
-    ]))
+        Type::Variant => return Some(IcebergType::Variant(VariantType)),
+        Type::Int128 | Type::Interval | Type::Struct(_) => return None,
+    };
+    Some(IcebergType::Primitive(primitive))
 }
 
 /// Whether `pivot_type` is stored under a different Iceberg type and so must
@@ -102,13 +75,7 @@ fn variant_struct(metadata_id: i32, value_id: i32) -> IcebergType {
 fn needs_logical_type_record(pivot_type: &Type) -> bool {
     matches!(
         pivot_type,
-        Type::Int8
-            | Type::Int16
-            | Type::UInt8
-            | Type::UInt16
-            | Type::UInt32
-            | Type::UInt64
-            | Type::Variant
+        Type::Int8 | Type::Int16 | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64
     )
 }
 

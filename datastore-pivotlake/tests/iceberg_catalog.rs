@@ -387,3 +387,56 @@ fn a_reopen_restores_partitioning_sorting_and_logical_types() {
     assert_eq!(metadata["partition-specs"][0]["fields"][0]["name"], "day");
     assert_eq!(metadata["sort-orders"][0]["fields"][0]["source-id"], 4);
 }
+
+/// The leaves the fields of a variant column were shredded into, by their
+/// path in the schema of the one data file under `table_path`.
+fn list_shredded_leaves(table_path: &std::path::Path) -> Vec<String> {
+    let file = parquet_files_in(table_path).remove(0);
+    let reader =
+        SerializedFileReader::new(std::fs::File::open(table_path.join(file)).unwrap()).unwrap();
+    let schema = reader.metadata().file_metadata().schema_descr();
+    schema
+        .columns()
+        .iter()
+        .map(|leaf| leaf.path().string())
+        .filter(|path| path.ends_with("typed_value"))
+        .collect()
+}
+
+#[test]
+fn a_variant_column_is_declared_as_a_variant_field_and_reads_back_after_a_reopen() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE events (id BIGINT, doc VARIANT)");
+    db.execute(
+        r#"INSERT INTO events VALUES (1, '{"a": 1, "b": "x"}'), (2, '{"a": 2, "b": "y"}'), (3, NULL)"#,
+    );
+
+    let mut reopened = Database::reopen(db.close());
+    let documents = reopened.execute(
+        "SELECT CAST(doc AS VARCHAR), CAST(doc.a AS BIGINT) FROM events \
+         WHERE doc IS NOT NULL ORDER BY id",
+    );
+    let without_a_document = reopened.execute("SELECT id FROM events WHERE doc IS NULL");
+
+    assert_eq!(
+        collect_strings(&documents, 0),
+        [r#"{"a":1,"b":"x"}"#, r#"{"a":2,"b":"y"}"#]
+    );
+    assert_eq!(collect_i64s(&documents, 1), [1, 2]);
+    assert_eq!(collect_i64s(&without_a_document, 0), [3]);
+    let table_path = reopened.table_path("events");
+    assert_eq!(
+        list_shredded_leaves(&table_path),
+        [
+            "doc.typed_value.a.typed_value",
+            "doc.typed_value.b.typed_value"
+        ]
+    );
+    let metadata = metadata_json(&table_path, 2);
+    assert_eq!(
+        metadata["schemas"][0]["fields"][1],
+        serde_json::json!({"id": 2, "name": "doc", "required": false, "type": "variant"})
+    );
+    assert_eq!(metadata["last-column-id"], 2);
+    assert!(metadata["properties"].get("pivot.logical-types").is_none());
+}
