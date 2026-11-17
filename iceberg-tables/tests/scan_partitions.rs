@@ -160,6 +160,30 @@ fn the_partitions_of_manifests_holding_one_each_are_listed_with_no_manifest_read
 }
 
 #[test]
+fn manifests_of_two_specs_holding_the_same_value_list_a_partition_of_each() {
+    let (fixture, created) = create_partitioned_table();
+    append(&created, vec![partition_entry("seven", 7, 0)]);
+    let renamed = repartition(&fixture, &[("v", "v_renamed", Transform::Identity)]);
+    let mut under_renamed = partition_entry("seven-again", 7, 0);
+    under_renamed.partition = Some(PartitionValues::from([(
+        "v_renamed".to_string(),
+        int_scalar(7),
+    )]));
+    append(&renamed, vec![under_renamed]);
+    let opened = load(&fixture);
+    fixture.delete_data_manifests(&opened);
+
+    let partitions = opened.partitions().unwrap();
+
+    let spec_ids: Vec<i32> = partitions
+        .iter()
+        .map(|partition| partition.spec_id())
+        .collect();
+    assert_eq!(list_values(&partitions), [7, 7]);
+    assert_eq!(spec_ids, [0, 1]);
+}
+
+#[test]
 fn nothing_is_kept_of_a_manifest_read_for_the_partitions_it_holds() {
     let (fixture, created) = create_partitioned_table();
     append(

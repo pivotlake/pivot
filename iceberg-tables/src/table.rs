@@ -79,7 +79,7 @@ use crate::files::file_index::{
     self, DecodeContext, DecodedManifest, FileSelector, FilesByPartition, IndexedFile, Partition,
     PartitionIndex, SortKeyEncoder,
 };
-use crate::files::manifests::{EntryPartitions, ListedManifest, ManifestList};
+use crate::files::manifests::{EntryPartitions, ListedManifest, ManifestList, OnlyPartition};
 use crate::files::partitions_from_filter::MAX_PARTITIONS_FROM_FILTER;
 use crate::metadata::layout::TableLocation;
 use crate::metadata::metadata_store::MetadataFile;
@@ -915,22 +915,20 @@ impl Table {
         let mut partitions = BTreeMap::new();
         let mut unnamed: Vec<&ListedManifest> = Vec::new();
         // The partition the manifest before named: manifests that name
-        // their one partition mostly come in runs of one partition, whose
-        // key is encoded once for the run.
-        let mut latest: Option<&Arc<Partition>> = None;
+        // their one partition mostly come in runs of one partition, which
+        // is built, and its key encoded, once for the run.
+        let mut latest: Option<OnlyPartition<'_>> = None;
         for manifest in manifests {
-            match manifest.read_partitions() {
+            match manifest.read_partitions(self.metadata()) {
                 EntryPartitions::None => {}
-                EntryPartitions::One(partition) => {
-                    let is_of_latest = latest.is_some_and(|latest| {
-                        latest.spec_id() == partition.spec_id()
-                            && latest.tuple() == partition.tuple()
-                    });
+                EntryPartitions::One(named) => {
+                    let is_of_latest = latest.is_some_and(|latest| latest.is_same_as(&named));
                     if !is_of_latest {
+                        let partition = named.build_partition();
                         partitions
                             .entry(partition.encode_key())
-                            .or_insert_with(|| Arc::clone(partition));
-                        latest = Some(partition);
+                            .or_insert_with(|| Arc::new(partition));
+                        latest = Some(named);
                     }
                 }
                 EntryPartitions::Unknown => unnamed.push(manifest),

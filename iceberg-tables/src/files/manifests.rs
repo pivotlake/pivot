@@ -49,11 +49,6 @@ pub(crate) struct ListedManifest {
     /// values cannot prune is left out, which is why each summary carries
     /// its field's position in the tuple.
     field_summaries: Vec<PartitionFieldSummary>,
-    /// The one partition the entry leaves the manifest's files, derived
-    /// from `field_summaries`: of a spec without fields, or with every
-    /// field bounded to a single value. `None` for an entry that leaves
-    /// several, or bounds a field it cannot name the value of.
-    only_partition: Option<Arc<Partition>>,
 }
 
 /// What a manifest-list entry alone says of the partitions its manifest
@@ -62,9 +57,46 @@ pub(crate) enum EntryPartitions<'m> {
     /// The manifest holds no live file.
     None,
     /// Every live file of the manifest sits in this partition.
-    One(&'m Arc<Partition>),
+    One(OnlyPartition<'m>),
     /// The entry does not tell: the manifest's own entries do.
     Unknown,
+}
+
+/// The one partition a manifest-list entry leaves its manifest's files, as
+/// the entry's summaries tell it: of a spec without fields, or with every
+/// field bounded to a single value. It is read off the summaries each time
+/// it is asked for, and nothing is built until the partition itself is.
+#[derive(Clone, Copy)]
+pub(crate) struct OnlyPartition<'m> {
+    spec_id: i32,
+    /// A summary for every field of the spec, each leaving its field one
+    /// value.
+    field_summaries: &'m [PartitionFieldSummary],
+}
+
+impl OnlyPartition<'_> {
+    /// Whether `other` is this partition: of the same spec, with the same
+    /// value in every field.
+    pub(crate) fn is_same_as(&self, other: &OnlyPartition<'_>) -> bool {
+        self.spec_id == other.spec_id
+            && self
+                .field_summaries
+                .iter()
+                .zip(other.field_summaries)
+                .all(|(summary, other)| summary.find_only_value() == other.find_only_value())
+    }
+
+    /// The partition itself: its spec, and the tuple of the one value each
+    /// field is bounded to.
+    pub(crate) fn build_partition(&self) -> Partition {
+        let tuple = self.field_summaries.iter().map(|summary| {
+            summary
+                .find_only_value()
+                .expect("every summary of an only partition leaves its field one value")
+                .map(|value| Literal::Primitive(value.clone()))
+        });
+        Partition::new(self.spec_id, Struct::from_iter(tuple))
+    }
 }
 
 /// What a manifest-list entry says of one partition field of its
@@ -127,10 +159,10 @@ impl PartitionFieldSummary {
 
     /// The one value the summary leaves the field, NULL as `None`; `None`
     /// when it leaves several, or does not say.
-    fn find_only_value(&self) -> Option<Option<Literal>> {
+    fn find_only_value(&self) -> Option<Option<&PrimitiveLiteral>> {
         match self.read_comparable_bounds() {
             Some((lowest, highest)) if lowest == highest && !self.contains_null => {
-                Some(Some(Literal::Primitive(lowest.clone())))
+                Some(Some(lowest))
             }
             None if self.range.all_null => Some(None),
             _ => None,
@@ -149,19 +181,40 @@ impl ListedManifest {
     }
 
     /// What the entry alone says of the partitions the manifest holds a
-    /// live file of. An entry that does not count its manifest's files does
-    /// not tell whether it holds one.
-    pub(crate) fn read_partitions(&self) -> EntryPartitions<'_> {
+    /// live file of, in the table `metadata` describes. An entry that does
+    /// not count its manifest's files does not tell whether it holds one.
+    pub(crate) fn read_partitions(&self, metadata: &TableMetadata) -> EntryPartitions<'_> {
         let live_files = self
             .file
             .added_files_count
             .zip(self.file.existing_files_count)
             .map(|(added, existing)| u64::from(added) + u64::from(existing));
-        match (live_files, &self.only_partition) {
-            (Some(0), _) => EntryPartitions::None,
-            (Some(_), Some(partition)) => EntryPartitions::One(partition),
-            _ => EntryPartitions::Unknown,
+        match live_files {
+            Some(0) => EntryPartitions::None,
+            Some(_) => match self.find_only_partition(metadata) {
+                Some(partition) => EntryPartitions::One(partition),
+                None => EntryPartitions::Unknown,
+            },
+            None => EntryPartitions::Unknown,
         }
+    }
+
+    /// The one partition the entry leaves the manifest's files: that of
+    /// the empty tuple for a spec without fields, or of the one value each
+    /// field is bounded to. `None` when a field is left more than one value
+    /// or none is recorded for it, and for a spec `metadata` does not list.
+    fn find_only_partition(&self, metadata: &TableMetadata) -> Option<OnlyPartition<'_>> {
+        let partition_spec = metadata.partition_spec_by_id(self.file.partition_spec_id)?;
+        if self.field_summaries.len() != partition_spec.fields().len() {
+            return None;
+        }
+        self.field_summaries
+            .iter()
+            .all(|summary| summary.find_only_value().is_some())
+            .then_some(OnlyPartition {
+                spec_id: self.file.partition_spec_id,
+                field_summaries: &self.field_summaries,
+            })
     }
 
     /// Whether the manifest may hold a file of `partition`, by its entry's
@@ -237,12 +290,10 @@ impl ManifestList {
         let mut listed_deletes = Vec::new();
         for file in manifests {
             let field_summaries = read_partition_summaries(metadata, &file)?;
-            let only_partition = find_only_partition(metadata, &file, &field_summaries);
             let manifest = ListedManifest {
                 path: Arc::from(file.manifest_path.as_str()),
                 file,
                 field_summaries,
-                only_partition,
             };
             match manifest.file.content {
                 ManifestContentType::Data => listed.push(manifest),
@@ -409,32 +460,6 @@ fn read_partition_summaries(
         });
     }
     Ok(field_summaries)
-}
-
-/// The one partition the manifest-list entry `manifest` leaves its
-/// manifest's files, `field_summaries` being what the entry says of each
-/// field of their tuples: that of the empty tuple for a spec without
-/// fields, or of the one value each field is bounded to. `None` when a
-/// field is left more than one value or none is recorded for it, and for a
-/// spec the table does not list.
-fn find_only_partition(
-    metadata: &TableMetadata,
-    manifest: &ManifestFile,
-    field_summaries: &[PartitionFieldSummary],
-) -> Option<Arc<Partition>> {
-    let partition_spec = metadata.partition_spec_by_id(manifest.partition_spec_id)?;
-    let field_count = partition_spec.fields().len();
-    if field_summaries.len() != field_count {
-        return None;
-    }
-    let tuple = field_summaries
-        .iter()
-        .map(PartitionFieldSummary::find_only_value)
-        .collect::<Option<Vec<_>>>()?;
-    Some(Arc::new(Partition::new(
-        manifest.partition_spec_id,
-        Struct::from_iter(tuple),
-    )))
 }
 
 #[cfg(test)]
