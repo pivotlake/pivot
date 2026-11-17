@@ -31,12 +31,6 @@ impl<'a> EncodedWriter<'a> {
         }
     }
 
-    /// How many bytes [`write_varint`](Self::write_varint) takes for `value`.
-    pub fn count_varint_bytes(value: u64) -> usize {
-        let significant_bits = (u64::BITS - value.leading_zeros()).max(1);
-        significant_bits.div_ceil(7) as usize
-    }
-
     pub fn write_byte(&mut self, byte: u8) {
         self.bytes.push(&mut *self.allocator, byte);
     }
@@ -221,18 +215,17 @@ mod tests {
     }
 
     #[test]
-    fn a_number_takes_the_bytes_counted_for_it() {
+    fn a_small_number_takes_one_byte_and_the_largest_ten() {
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(false);
 
         let lens = [0, 127, 128, 16_383, 16_384, u64::MAX].map(|value| {
             let mut writer = EncodedWriter::new(&mut allocator);
             writer.write_varint(value);
-            let written: usize = writer.into_slabs().iter().map(Slab::size).sum();
-            (written, EncodedWriter::count_varint_bytes(value))
+            writer.into_slabs().iter().map(Slab::size).sum::<usize>()
         });
 
-        assert_eq!(lens, [(1, 1), (1, 1), (2, 2), (2, 2), (3, 3), (10, 10)]);
+        assert_eq!(lens, [1, 1, 2, 2, 3, 10]);
     }
 
     #[test]
