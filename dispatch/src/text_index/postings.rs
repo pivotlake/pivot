@@ -247,6 +247,23 @@ impl Postings {
         });
     }
 
+    /// Visit every row of `rows` the token appears in, ascending.
+    pub fn for_each_row_in(&self, rows: Range<u32>, mut visit: impl FnMut(u32)) {
+        self.for_each_run_in(rows, |run| {
+            if let RowRun::Mixed {
+                first_row,
+                mut rows_with_token,
+                ..
+            } = run
+            {
+                while rows_with_token != 0 {
+                    visit(first_row + rows_with_token.trailing_zeros());
+                    rows_with_token &= rows_with_token - 1;
+                }
+            }
+        });
+    }
+
     /// Select, in `selected`, every row of `rows` the token appears in. Rows
     /// already selected stay selected, so calling this for several tokens
     /// selects the rows any of them appears in.
@@ -419,10 +436,12 @@ impl Postings {
         writer.into_slabs()
     }
 
-    /// Gather the postings `encoded` holds, with memory from `source`. Fails
-    /// when `encoded` is not what [`encode`](Self::encode) writes.
+    /// Gather the postings `encoded` holds, with memory from `source`.
+    /// `encoded` is the bytes [`encode`](Self::encode) writes, in whatever
+    /// pieces they come: the slabs it wrote, or the buffers of a read. Fails
+    /// when they are anything else.
     pub fn decode(
-        encoded: &[Slab],
+        encoded: &[impl AsRef<[u8]>],
         source: &mut impl SlabSource,
     ) -> Result<PostingsBuilder, Error> {
         let mut reader = EncodedReader::new(encoded);

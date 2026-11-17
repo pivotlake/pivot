@@ -4,6 +4,7 @@
 
 mod dict_index;
 mod index_file;
+mod lookup;
 mod postings;
 mod sparse_index;
 mod token_run;

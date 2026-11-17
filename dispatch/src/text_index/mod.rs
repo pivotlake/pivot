@@ -32,6 +32,8 @@
 //! - [`tokenizer`] defines what a token is.
 //! - [`sparse_index`], [`dict_index`] and [`postings`] are the three pieces.
 //! - [`index_file`] lays the pieces of one index out as a file.
+//! - [`lookup`] finds a token's rows in an index file, reading a piece at a
+//!   time and keeping each in its cache.
 //! - [`token_run`] is how the text of a data file gets to the index file:
 //!   sorted a row group at a time, then merged.
 //! - [`sorted_tokens`] is the run of tokens the sparse index and a dict
@@ -44,6 +46,7 @@ mod carve_order;
 pub mod dict_index;
 mod encoded;
 pub mod index_file;
+pub mod lookup;
 pub mod postings;
 mod sorted_tokens;
 pub mod sparse_index;
@@ -54,6 +57,7 @@ pub use dict_index::{
     DictIndex, DictIndexBuilder, DictIndexMeta, FewRows, MOST_ROWS_KEPT_IN_DICT, TokenRows,
 };
 pub use index_file::{IndexFileFooter, IndexFileWriter, TOKENS_PER_DICT_INDEX};
+pub use lookup::{LookupProgress, RowsWithToken, TokenLookup};
 pub use postings::{Postings, PostingsBuilder, PostingsMeta};
 pub use sparse_index::{SparseIndex, SparseIndexBuilder, SparseIndexMeta};
 pub use token_run::{PlacedTokenRun, TokenRun, TokenRunBuilder};

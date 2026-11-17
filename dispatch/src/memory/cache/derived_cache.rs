@@ -225,6 +225,24 @@ impl<V: Cached> Cache<V> {
         self.entries.load(Ordering::Relaxed) == 0
     }
 
+    /// How many bytes of slots the entries derived from `file` take. Nothing
+    /// is pinned or touched to answer, so an entry counted may be evicted the
+    /// next moment: this is how much of the file was here just now.
+    pub fn count_cached_bytes(&self, file: &OpenFile) -> usize {
+        if !self.enabled || self.is_empty() {
+            return 0;
+        }
+        self.files
+            .with_table(file, |table| {
+                table
+                    .values()
+                    .flat_map(|entry| &entry.extents)
+                    .map(|extent| extent.len as usize)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0)
+    }
+
     /// Drop every entry of `slot` still placed there, returning their source
     /// ranges. Stale tenants (dropped another way, lost races, failed builds,
     /// re-inserted elsewhere) are filtered by the placement check. Sound only

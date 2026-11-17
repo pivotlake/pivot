@@ -225,7 +225,7 @@ impl SortedTokensBuilder {
     /// ones added so far.
     pub fn decode_token(
         &mut self,
-        reader: &mut EncodedReader<'_>,
+        reader: &mut EncodedReader<'_, impl AsRef<[u8]>>,
         source: &mut impl SlabSource,
         carve_order: &mut CarveOrder,
     ) -> Result<(), Error> {

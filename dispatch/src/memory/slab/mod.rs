@@ -163,6 +163,12 @@ impl Slab {
     }
 }
 
+impl AsRef<[u8]> for Slab {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 /// A slab that can no longer be written, so any number of handles to it may
 /// exist at once: cloning one is cheap and shares the same bytes. Every handle
 /// keeps the parent slot alive, and the last one dropped releases it.

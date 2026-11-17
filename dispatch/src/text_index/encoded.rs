@@ -6,6 +6,10 @@
 //!                     as many as the bytes need
 //! ```
 //!
+//! What is read need not be the slabs that were written: a piece read back
+//! from its file arrives as the buffers of that read, cut wherever the read
+//! cut them. The reader takes any pieces of bytes, in order.
+//!
 //! Numbers are written as varints: seven bits to a byte, lowest bits first,
 //! with the top bit of a byte saying another byte follows. A small number
 //! takes one byte. A signed number is folded first so that a small negative
@@ -63,30 +67,30 @@ impl<'a> EncodedWriter<'a> {
     }
 }
 
-/// Reads the bytes of encoded slabs front to back.
-pub(super) struct EncodedReader<'a> {
-    /// The slabs not yet started.
-    slabs: &'a [Slab],
-    /// The unread bytes of the slab being read.
+/// Reads encoded bytes front to back, across the pieces they come in.
+pub(super) struct EncodedReader<'a, Piece: AsRef<[u8]>> {
+    /// The pieces not yet started.
+    pieces: &'a [Piece],
+    /// The unread bytes of the piece being read.
     current: &'a [u8],
 }
 
-impl<'a> EncodedReader<'a> {
-    pub fn new(slabs: &'a [Slab]) -> Self {
+impl<'a, Piece: AsRef<[u8]>> EncodedReader<'a, Piece> {
+    pub fn new(pieces: &'a [Piece]) -> Self {
         Self {
-            slabs,
+            pieces,
             current: &[],
         }
     }
 
-    /// Move on to the next slab that holds a byte. `false` when none does.
+    /// Move on to the next piece that holds a byte. `false` when none does.
     fn advance_to_unread_bytes(&mut self) -> bool {
         while self.current.is_empty() {
-            let Some((next, later)) = self.slabs.split_first() else {
+            let Some((next, later)) = self.pieces.split_first() else {
                 return false;
             };
-            self.current = next.as_slice();
-            self.slabs = later;
+            self.current = next.as_ref();
+            self.pieces = later;
         }
         true
     }

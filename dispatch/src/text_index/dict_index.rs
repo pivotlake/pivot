@@ -201,9 +201,11 @@ impl DictIndex {
     }
 
     /// Gather the dict index `encoded` holds, with memory from `source`.
-    /// Fails when `encoded` is not what [`encode`](Self::encode) writes.
+    /// `encoded` is the bytes [`encode`](Self::encode) writes, in whatever
+    /// pieces they come: the slabs it wrote, or the buffers of a read. Fails
+    /// when they are anything else.
     pub fn decode(
-        encoded: &[Slab],
+        encoded: &[impl AsRef<[u8]>],
         source: &mut impl SlabSource,
     ) -> Result<DictIndexBuilder, Error> {
         let mut reader = EncodedReader::new(encoded);
