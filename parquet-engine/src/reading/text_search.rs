@@ -256,6 +256,11 @@ impl UnaryFactory<FileToSearch, QueryRowGroupMetadata> for TextIndexSearcherFact
 struct TokenBeingFound {
     index_file: OpenFile,
     lookup: TokenLookup,
+    /// Whether the lookup asked for a read that has not come back. It goes
+    /// no further until it has been handed that read: a piece another
+    /// token's lookup cached meanwhile would take it on to its next read,
+    /// and the one on its way would come back as the wrong piece.
+    awaits_read: bool,
     /// The token's rows, once the lookup reached them.
     rows: Option<RowsWithToken>,
 }
@@ -293,9 +298,10 @@ pub struct TextIndexSearcher {
 }
 
 impl TextIndexSearcher {
-    /// Take every lookup of file `file_number` as far as what is in memory
-    /// allows, asking for the read each one stops at. A file all of whose
-    /// lookups reached their rows has its row groups sent on.
+    /// Take every lookup of file `file_number` that is not waiting for a
+    /// read as far as what is in memory allows, asking for the read each one
+    /// stops at. A file all of whose lookups reached their rows has its row
+    /// groups sent on.
     fn advance_file(
         &mut self,
         file_number: usize,
@@ -307,7 +313,7 @@ impl TextIndexSearcher {
             .get_mut(&file_number)
             .expect("a file advanced is a file in hand");
         for (token_position, token) in file.tokens.iter_mut().enumerate() {
-            if token.rows.is_some() {
+            if token.rows.is_some() || token.awaits_read {
                 continue;
             }
             match token.lookup.advance() {
@@ -318,6 +324,7 @@ impl TextIndexSearcher {
                         token.index_file.clone(),
                         [range],
                     )?;
+                    token.awaits_read = true;
                     self.awaited_reads.insert(
                         read,
                         AwaitedRead {
@@ -415,6 +422,7 @@ impl Unary<FileToSearch, QueryRowGroupMetadata> for TextIndexSearcher {
                     &token.token,
                 ),
                 index_file: token.index_file.open_file,
+                awaits_read: false,
                 rows: None,
             })
             .collect();
@@ -454,13 +462,16 @@ impl Unary<FileToSearch, QueryRowGroupMetadata> for TextIndexSearcher {
             .into_iter()
             .next()
             .expect("a lookup asks for one range");
-        self.files_being_searched
+        let token = &mut self
+            .files_being_searched
             .get_mut(&file_number)
             .expect("a file waiting on a read is a file in hand")
-            .tokens[token_position]
+            .tokens[token_position];
+        token
             .lookup
             .supply(piece.bytes.as_slice())
             .map_err(crate::op_err)?;
+        token.awaits_read = false;
         self.advance_file(file_number, sender, io)
     }
 
