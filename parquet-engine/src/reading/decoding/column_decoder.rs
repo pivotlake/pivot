@@ -14,7 +14,7 @@ use crate::reading::decoding::leaf_decoders::{
     AbsentLeafDecoder, BooleanLeafDecoder, BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder,
     TimestampMicrosecondLeafDecoder, decimal_decoder,
 };
-use crate::types::leaves::{OutputRead, reconstruct_column_from_leaves};
+use crate::types::leaves::{OutputRead, reconstruct_column_from_leaves, variant_shredded_leaves};
 use crate::types::metadata::ColumnChunkMeta;
 use arrow_array::types::{
     BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
@@ -133,6 +133,8 @@ pub struct ColumnDecoder {
     pre_transform_field: FieldRef,
     /// Finishes the folded array. `None` for a plain column.
     transform: Option<OutputTransform>,
+    /// Whether the transform extracts a path with no typed leaf in this file.
+    parses_binary_variant_rows: bool,
     /// The field this column contributes to the batch schema.
     output_field: FieldRef,
 }
@@ -217,10 +219,15 @@ impl ColumnDecoder {
                 )
             }
         };
+        let parses_binary_variant_rows = matches!(transform, Some(OutputTransform::Extract { .. }))
+            && extract.is_some_and(|extract| {
+                variant_shredded_leaves(fields, column, &extract.path).is_none()
+            });
         Ok(Self {
             leaf_positions,
             pre_transform_field,
             transform,
+            parses_binary_variant_rows,
             output_field,
         })
     }
@@ -243,6 +250,19 @@ impl ColumnDecoder {
             (false, [position]) => Some(*position),
             _ => None,
         }
+    }
+
+    /// Whether this column extracts a path its file keeps no typed leaf for.
+    /// Every value then comes out of a row's binary variant, parsed row by
+    /// row, which costs far more than any other read.
+    pub fn parses_binary_variant_rows(&self) -> bool {
+        self.parses_binary_variant_rows
+    }
+
+    /// The positions within the row group's decoded leaves that this column
+    /// folds.
+    pub fn leaf_positions(&self) -> &[usize] {
+        &self.leaf_positions
     }
 
     /// Folds this column's share of the row group's `decoded` leaves into its

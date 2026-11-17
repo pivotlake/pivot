@@ -40,8 +40,8 @@ pub(crate) mod reading;
 pub use reading::{
     ColumnDecoderError, DecodeRange, DecoderFactory, DecompressorError, DecompressorFactory,
     IndexerFactory, MaterializerFactory, RangeCutterFactory, RowGroupFetcherFactory,
-    RowGroupInjectorFactory, ScanEqualityPredicate, WorkerAllocator, materialize, table_input,
-    table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    RowGroupInjectorFactory, ScanCondition, ScanEqualityPredicate, ScanPushdown, WorkerAllocator,
+    materialize, table_input, table_input_with_filter, table_input_with_filter_and_pushdown,
 };
 
 pub mod writing;
@@ -52,7 +52,7 @@ pub use metadata::{FileRowGroups, create_load_and_stage_spec};
 pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
 
 mod pushdown;
-pub use pushdown::{PushedPredicate, equality_predicates, prune_parquet};
+pub use pushdown::{PushedPredicate, prune_parquet};
 
 mod row_group_stats;
 pub use row_group_stats::{

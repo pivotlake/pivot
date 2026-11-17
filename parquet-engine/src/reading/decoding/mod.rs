@@ -27,6 +27,9 @@ pub(crate) mod leaf_decoders;
 mod column_decoder;
 pub use column_decoder::Error as ColumnDecoderError;
 
+mod early_filter;
+pub use early_filter::ScanCondition;
+
 mod row_group_decoder;
 pub(crate) use row_group_decoder::DecodePlan;
 pub use row_group_decoder::RowGroupDecoder;
@@ -46,6 +49,19 @@ pub struct ScanEqualityPredicate {
     /// path resolves to in each file.
     pub path: Vec<String>,
     pub value: Scalar<ArrayRef>,
+}
+
+/// The filters pushed down into a table, in the forms a scan of it applies
+/// while decoding. Either can be empty, and neither replaces the query's
+/// `Filter`: both only spare work on rows it would drop.
+#[derive(Clone, Default)]
+pub struct ScanPushdown {
+    /// Equality constants, each pruning the row groups whose dictionary
+    /// excludes it.
+    pub eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    /// Conditions over the scan's output columns, each dropping a batch's
+    /// failing rows before the variant paths of the rest are extracted.
+    pub conditions: Arc<Vec<ScanCondition>>,
 }
 
 /// One worker's slab allocator for one scan stage: its range cutter's
@@ -84,6 +100,9 @@ pub struct DecoderFactory {
     pub add_row_group_metadata: bool,
     /// The worker's allocator for decoded batches.
     pub allocator: Arc<WorkerAllocator>,
+    /// Pushed-down conditions each batch's rows are dropped by before their
+    /// variant paths are extracted (may be empty).
+    pub conditions: Arc<Vec<ScanCondition>>,
 }
 
 impl UnaryFactory<DecodeRange, RecordBatch> for DecoderFactory {
@@ -94,6 +113,7 @@ impl UnaryFactory<DecodeRange, RecordBatch> for DecoderFactory {
             self.batch_size,
             self.add_row_group_metadata,
             self.allocator,
+            self.conditions,
         ))
     }
 }
@@ -123,6 +143,9 @@ pub struct Decoder {
     /// Decoders that finished a range, kept for the row group's next range.
     idle: Vec<RowGroupDecoder>,
     add_row_group_metadata: bool,
+    /// The scan's pushed-down conditions, for each row group's decoder to
+    /// filter its batches by.
+    conditions: Arc<Vec<ScanCondition>>,
     /// Accumulates the live rows of partially deleted batches until a full
     /// batch of them is ready, all of one row group: a batch carries one.
     live_row_accumulator: Option<LiveRowAccumulator>,
@@ -139,6 +162,7 @@ impl Decoder {
         batch_size: usize,
         add_row_group_metadata: bool,
         allocator: Arc<WorkerAllocator>,
+        conditions: Arc<Vec<ScanCondition>>,
     ) -> Self {
         Self {
             batch_size,
@@ -146,6 +170,7 @@ impl Decoder {
             active: None,
             idle: Vec::new(),
             add_row_group_metadata,
+            conditions,
             live_row_accumulator: None,
         }
     }
@@ -290,8 +315,13 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
             .position(|idle| idle.row_group_index() == row_group_index)
         {
             Some(pos) => self.idle.swap_remove(pos),
-            None => RowGroupDecoder::new(&range, self.batch_size, self.add_row_group_metadata)
-                .map_err(crate::op_err)?,
+            None => RowGroupDecoder::new(
+                &range,
+                self.batch_size,
+                self.add_row_group_metadata,
+                &self.conditions,
+            )
+            .map_err(crate::op_err)?,
         };
         decoder.attach(range).map_err(crate::op_err)?;
         self.active = Some(decoder);
@@ -559,7 +589,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn new_decoder(batch_size: usize) -> Decoder {
-        Decoder::new(batch_size, false, Arc::new(WorkerAllocator::new()))
+        Decoder::new(
+            batch_size,
+            false,
+            Arc::new(WorkerAllocator::new()),
+            Arc::default(),
+        )
     }
 
     /// Cuts `pages` into ranges.
@@ -790,7 +825,7 @@ pub(crate) mod tests {
 
         let ranges = run_unary_to_completion(new_cutter(&table, Vec::new()), vec![page]);
         let out = run_unary_to_completion(
-            Decoder::new(2, true, Arc::new(WorkerAllocator::new())),
+            Decoder::new(2, true, Arc::new(WorkerAllocator::new()), Arc::default()),
             ranges,
         );
 
@@ -812,7 +847,7 @@ pub(crate) mod tests {
 
         let ranges = run_unary_to_completion(new_cutter(&table, Vec::new()), vec![page]);
         let out = run_unary_to_completion(
-            Decoder::new(2, true, Arc::new(WorkerAllocator::new())),
+            Decoder::new(2, true, Arc::new(WorkerAllocator::new()), Arc::default()),
             ranges,
         );
 

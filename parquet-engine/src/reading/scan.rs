@@ -22,8 +22,7 @@ use dispatch::{
 use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
     IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
-    RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate, ScanOrder,
-    WorkerAllocator,
+    RowGroupFetcherFactory, RowGroupInjectorFactory, ScanOrder, ScanPushdown, WorkerAllocator,
 };
 
 /// Append the index → decompress → cut → decode stages onto a source of
@@ -33,7 +32,7 @@ pub(crate) fn read_parquet<OF>(
     projection: Projection,
     batch_size: usize,
     add_row_group_metadata: bool,
-    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    pushdown: ScanPushdown,
     outstanding_row_groups: Arc<AtomicUsize>,
 ) -> RecordBatchOperatorSpec
 where
@@ -67,7 +66,7 @@ where
                 .into_iter()
                 .map(|allocator| RangeCutterFactory {
                     projection: projection.clone(),
-                    eq_predicates: eq_predicates.clone(),
+                    eq_predicates: pushdown.eq_predicates.clone(),
                     outstanding_row_groups: outstanding_row_groups.clone(),
                     allocator,
                 })
@@ -86,6 +85,7 @@ where
                     batch_size,
                     add_row_group_metadata,
                     allocator,
+                    conditions: pushdown.conditions.clone(),
                 })
                 .collect(),
         );
@@ -99,14 +99,14 @@ pub fn table_input(
     projection: Projection,
     add_row_group_metadata: bool,
 ) -> RecordBatchOperatorSpec {
-    table_input_with_filter_and_eq_predicates(
+    table_input_with_filter_and_pushdown(
         dispatcher,
         table,
         projection,
         add_row_group_metadata,
         None,
         None,
-        Arc::new(Vec::new()),
+        ScanPushdown::default(),
     )
 }
 
@@ -119,28 +119,29 @@ pub fn table_input_with_filter(
     add_row_group_metadata: bool,
     filter: Option<RowGroupFilter>,
 ) -> RecordBatchOperatorSpec {
-    table_input_with_filter_and_eq_predicates(
+    table_input_with_filter_and_pushdown(
         dispatcher,
         table,
         projection,
         add_row_group_metadata,
         filter,
         None,
-        Arc::new(Vec::new()),
+        ScanPushdown::default(),
     )
 }
 
-/// Like [`table_input`] but with both a dynamic [`RowGroupFilter`] and
-/// pushed-down equality predicates (the decoder pruning row groups by
-/// dictionary contents). Either can be inert (`None` / empty `Vec`).
-pub fn table_input_with_filter_and_eq_predicates(
+/// Like [`table_input`] but with both a dynamic [`RowGroupFilter`] and the
+/// statically pushed-down filters the decode stages apply: row groups pruned
+/// by dictionary contents, and rows dropped before their variant paths are
+/// extracted. Either can be inert (`None` / the default [`ScanPushdown`]).
+pub fn table_input_with_filter_and_pushdown(
     dispatcher: &DataFlowDispatcher,
     table: &Arc<ParquetTable>,
     projection: Projection,
     add_row_group_metadata: bool,
     filter: Option<RowGroupFilter>,
     scan_order: Option<ScanOrder>,
-    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    pushdown: ScanPushdown,
 ) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
     // A projection with no data columns can't go through the column-driven page
@@ -194,7 +195,7 @@ pub fn table_input_with_filter_and_eq_predicates(
         projection,
         RECORD_BATCH_SIZE,
         add_row_group_metadata,
-        eq_predicates,
+        pushdown,
         outstanding_row_groups,
     )
 }
@@ -262,7 +263,7 @@ pub fn materialize(
         projection,
         RECORD_BATCH_SIZE,
         false,
-        Arc::new(Vec::new()),
+        ScanPushdown::default(),
         // The materializer path claims by explicit row-group requests, not the
         // injector, so this count is never consulted.
         Arc::new(AtomicUsize::new(0)),

@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, ScanPushdown, materialize, prune_parquet, row_group_filter_from,
+    scan_order_from, table_input_with_filter_and_pushdown,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
@@ -96,21 +96,16 @@ impl BoundTable for IcebergTableBinding {
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        let predicates: Vec<PushedPredicate> = self
-            .filters
-            .iter()
-            .flat_map(PushedPredicate::from_filter)
-            .collect();
-        let eq_predicates = equality_predicates(&predicates);
+        let pushdown = ScanPushdown::new(&self.filters, &projection);
         let scan_order = scan_order_from(&dynamic_filters);
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_filter_and_pushdown(
             dispatcher,
             &self.load_pruned_parquet()?,
             projection,
             emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
             scan_order,
-            Arc::new(eq_predicates),
+            pushdown,
         ))
     }
 

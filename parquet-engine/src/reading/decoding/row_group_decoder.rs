@@ -7,9 +7,10 @@
 //! repositions it, which costs a skip into the range's first page of every
 //! column.
 
-use crate::reading::decoding::ScanEqualityPredicate;
 use crate::reading::decoding::column_decoder::{ColumnDecoder, Error, Result, create_leaf_decoder};
+use crate::reading::decoding::early_filter::EarlyFilter;
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
+use crate::reading::decoding::{ScanCondition, ScanEqualityPredicate};
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
 use crate::reading::record_batch_metadata::with_row_index;
 use crate::types::filter_mask::FilterMask;
@@ -173,6 +174,10 @@ pub struct RowGroupDecoder {
     /// by their position inside the row group, so every row has to stay in
     /// place.
     filter_batches: bool,
+    /// Drops the rows failing the scan's `conditions` before their variant
+    /// paths are extracted, when the row group extracts any and its batches
+    /// may drop rows.
+    early_filter: Option<EarlyFilter>,
 }
 
 impl RowGroupDecoder {
@@ -183,11 +188,15 @@ impl RowGroupDecoder {
         range: &DecodeRange,
         batch_size: usize,
         add_row_group_metadata: bool,
+        conditions: &[ScanCondition],
     ) -> Result<Self> {
         let metadata = range.metadata().clone();
         let plan = range.plan().clone();
         let filter_batches =
             !add_row_group_metadata && !matches!(metadata.selection(), RowSelection::Indices(_));
+        let early_filter = filter_batches
+            .then(|| EarlyFilter::new(&plan.column_decoders, &plan.schema, conditions))
+            .flatten();
         let mut leaf_decoders = plan.create_leaf_decoders(&metadata)?;
         for (leaf, decoder) in leaf_decoders.iter_mut().enumerate() {
             if let Some(dictionary) = &range.column(leaf).dictionary {
@@ -206,6 +215,7 @@ impl RowGroupDecoder {
             ranges_left: range.ranges_left().clone(),
             add_row_group_metadata,
             filter_batches,
+            early_filter,
             metadata,
         })
     }
@@ -371,13 +381,6 @@ impl RowGroupDecoder {
                 .iter_mut()
                 .map(|leaf| leaf.read(allocator, available).map_err(Into::into))
                 .collect::<Result<Vec<_>>>()?;
-            let columns = self
-                .plan
-                .column_decoders
-                .iter()
-                .map(|decoder| decoder.read(&decoded))
-                .collect::<Result<Vec<_>>>()?;
-            let record_batch = RecordBatch::try_new(self.plan.schema.clone(), columns)?;
             let first_row = self.next_row;
             self.next_row += available;
             // The rows the table format deleted are named by the batch's
@@ -387,13 +390,27 @@ impl RowGroupDecoder {
                 let live = live.slice(live.len() - (self.end_row - first_row), available);
                 (live.count_set_bits() < available).then_some(live)
             });
+            // Rows are never dropped on the materializer path, which needs
+            // every row to stay in place, nor from a batch whose live rows
+            // are named by its bits.
+            let may_drop_rows = self.filter_batches && live_rows.is_none();
+            let columns = match &mut self.early_filter {
+                Some(early_filter) if may_drop_rows => {
+                    early_filter.read_columns(&self.plan.column_decoders, &decoded, available)?
+                }
+                _ => self
+                    .plan
+                    .column_decoders
+                    .iter()
+                    .map(|decoder| decoder.read(&decoded))
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            let record_batch = RecordBatch::try_new(self.plan.schema.clone(), columns)?;
             // Give each column carrying a pushed-down equality constant a
             // chance to drop rows that provably fail it, before the batch
             // travels any further. Dictionary encoded string columns filter it
-            // with a cheap view comparison; the rest leave it untouched. Never
-            // done on the materializer path, which needs every row to stay in
-            // place, nor to a batch whose live rows are named by its bits.
-            let record_batch = if self.filter_batches && live_rows.is_none() {
+            // with a cheap view comparison; the rest leave it untouched.
+            let record_batch = if may_drop_rows {
                 self.plan.prunable.iter().fold(record_batch, |batch, p| {
                     self.leaf_decoders[p.leaf].fast_filter_record_batch(batch, p.output_idx)
                 })
