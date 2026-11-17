@@ -1,28 +1,37 @@
-//! One live data file of a Delta table as its partition's index holds it:
-//! the facts every format knows of a file, beside the partition it sits in
-//! and the entry the log recorded for it.
+//! One live data file of a Delta table as its table holds it: the facts
+//! every format knows of a file, beside the entry the log recorded for it
+//! and the row groups of its footer.
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef};
-use parquet_engine::{measure_allocation, measure_shared_allocation};
+use arrow_array::ArrayRef;
+use parquet_engine::RowGroupMetadata;
 use planner::catalog::Column;
 use table_file_index::{FileFacts, FileIndex, IndexedRecord, SortKeyEncoder};
 
 use super::partition_key::PartitionKeyEncoder;
 use crate::Result;
 use crate::file_entry::{FileEntry, FileStats};
+use crate::table::TableFile;
 
 /// One live data file of a Delta table version.
 pub(crate) struct DeltaFile {
     facts: FileFacts,
-    /// The partition the file sits in, as its index names it.
-    partition: Arc<[u8]>,
     /// The file as the log recorded it: its partition tuple and its
     /// statistics.
     pub entry: FileEntry,
-    /// An estimate of the memory the record holds, itself included.
-    heap_bytes: u64,
+    /// The file's row groups, in the file's own order.
+    pub row_groups: Vec<Arc<RowGroupMetadata>>,
+}
+
+impl DeltaFile {
+    /// The rows the file's row groups hold.
+    pub(crate) fn count_rows(&self) -> u64 {
+        self.row_groups
+            .iter()
+            .map(|row_group| row_group.num_rows.max(0) as u64)
+            .sum()
+    }
 }
 
 impl IndexedRecord for DeltaFile {
@@ -30,20 +39,14 @@ impl IndexedRecord for DeltaFile {
         &self.facts
     }
 
+    /// Zero: nothing budgets a Delta record, so none is measured.
     fn estimate_heap_bytes(&self) -> u64 {
-        self.heap_bytes
+        0
     }
 }
 
-impl DeltaFile {
-    /// The partition the file sits in, as its index names it. A file is
-    /// grouped by it before any index of its partition exists.
-    pub(crate) fn partition(&self) -> &Arc<[u8]> {
-        &self.partition
-    }
-}
-
-/// The live data files of one partition of a Delta table version.
+/// Files of a Delta table version, in the order a partition's files stand
+/// in.
 pub(crate) type DeltaIndex = FileIndex<DeltaFile>;
 
 /// Builds the records of one table's files: names each file's partition and
@@ -78,16 +81,15 @@ impl RecordBuilder {
         })
     }
 
-    /// The bytes the index names the partition of a file recorded with the
-    /// tuple of `entry` by.
-    pub(crate) fn encode_partition(&mut self, entry: &FileEntry) -> Result<Arc<[u8]>> {
-        self.partition_keys.encode(entry.partition.as_ref())
-    }
-
-    /// The record of `entry`, a file the commit standing at
-    /// `commit_sequence` among the table's added.
-    pub(crate) fn build(&mut self, entry: FileEntry, commit_sequence: u64) -> Result<DeltaFile> {
-        let partition = self.encode_partition(&entry)?;
+    /// The record of `file`, which the commit standing at `commit_sequence`
+    /// among the table's added, beside the bytes its partition is named by.
+    pub(crate) fn build(
+        &self,
+        file: TableFile,
+        commit_sequence: u64,
+    ) -> Result<(Vec<u8>, DeltaFile)> {
+        let TableFile { entry, row_groups } = file;
+        let partition = self.partition_keys.encode(entry.partition.as_ref())?;
         let stats = entry.stats.as_deref();
         let find_bound =
             |bounds: fn(&FileStats) -> &std::collections::HashMap<String, ArrayRef>,
@@ -108,49 +110,11 @@ impl RecordBuilder {
             sort_range.maximum,
             commit_sequence,
         );
-        let heap_bytes = estimate_record_heap_bytes(&facts, &entry);
-        Ok(DeltaFile {
+        let record = DeltaFile {
             facts,
-            partition,
             entry,
-            heap_bytes,
-        })
-    }
-}
-
-/// An estimate of the memory the record of `entry` holds, itself included:
-/// its facts, its path, its partition tuple and its statistics, each at the
-/// size an allocation of it takes, with what the index's own maps spend on
-/// one file.
-fn estimate_record_heap_bytes(facts: &FileFacts, entry: &FileEntry) -> u64 {
-    /// What a hash map spends on one entry beside its key and value.
-    const MAP_ENTRY_BYTES: usize = 48;
-
-    let measure_name = |name: &String| measure_allocation(name.len()) + MAP_ENTRY_BYTES;
-    let partition_bytes: usize = entry.partition.as_ref().map_or(0, |partition| {
-        partition
-            .iter()
-            .map(|(name, value)| {
-                let (array, _) = arrow_array::Datum::get(value);
-                measure_name(name) + array.get_array_memory_size()
-            })
-            .sum()
-    });
-    let stats_bytes: usize = entry.stats.as_ref().map_or(0, |stats| {
-        let measure_bounds = |bounds: &std::collections::HashMap<String, ArrayRef>| -> usize {
-            bounds
-                .iter()
-                .map(|(name, bound)| measure_name(name) + bound.get_array_memory_size())
-                .sum()
+            row_groups,
         };
-        measure_shared_allocation(size_of::<FileStats>())
-            + measure_bounds(&stats.min_values)
-            + measure_bounds(&stats.max_values)
-            + stats.null_counts.keys().map(measure_name).sum::<usize>()
-    });
-    let total = measure_shared_allocation(size_of::<DeltaFile>())
-        + measure_allocation(entry.file.path.as_str().len())
-        + partition_bytes
-        + stats_bytes;
-    total as u64 + facts.estimate_heap_bytes()
+        Ok((partition, record))
+    }
 }

@@ -1,39 +1,29 @@
 //! A Delta table as the cross-datastore catalog describes it: the columns
 //! it declares with what they cost, and the files it holds, read from the
-//! files' records a few partitions at a time and from their footers a few
-//! files at a time, so the whole table is never in hand: only its
-//! description is.
+//! entries and the row groups the version holds of them.
 
 use std::collections::HashMap;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Datum};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::DataType;
 use catalog::datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, DatastoreTableMetadata};
-use object_storage::FileRef;
 use parquet_engine::{FileStats, RowGroupMetadata};
 use planner::catalog::SchemaQualifiedTableName;
 
-use super::file_record::DeltaFile;
-use super::{DeltaTable, FooterUse, IndexUse};
-use crate::Result;
+use super::DeltaTable;
 use crate::file_entry::PartitionValues;
 
 impl DeltaTable {
     /// This version as the catalog describes it under `name` and `id`, its
-    /// files in the order a walk visits them. The footers are read for the
-    /// description alone: those the cache holds are taken from it, and it
-    /// is left as it was.
+    /// files partition by partition in the order a partition's files stand
+    /// in.
     pub(super) fn describe_as(
         &self,
         name: SchemaQualifiedTableName,
         id: String,
-    ) -> Result<DatastoreTableMetadata> {
-        /// How many files' footers are held at a time.
-        const FILES_PER_READ: usize = 256;
-
+    ) -> DatastoreTableMetadata {
         let declared = &self.shape.columns;
         let column_positions: HashMap<&str, usize> = declared
             .iter()
@@ -41,36 +31,21 @@ impl DeltaTable {
             .map(|(position, column)| (column.name.as_str(), position))
             .collect();
         let mut column_bytes = vec![(0, 0); declared.len()];
-        let mut files = Vec::new();
-        let mut total_rows = 0;
-        let partitions = self.list_partition_keys();
-        self.visit_indexes(&partitions, IndexUse::Counted, &mut |_, index| {
-            let records: Vec<&Arc<DeltaFile>> = index.files().collect();
-            for batch in records.chunks(FILES_PER_READ) {
-                let batch_files: Vec<&FileRef> =
-                    batch.iter().map(|record| &record.entry.file).collect();
-                let footers = self.open_footers(&batch_files, FooterUse::Unrecorded)?;
-                for (record, row_groups) in batch.iter().zip(&footers) {
-                    let entry = &record.entry;
-                    total_rows += row_groups
-                        .iter()
-                        .map(|row_group| row_group.num_rows.max(0) as u64)
-                        .sum::<u64>();
-                    files.push(DatastoreFileMetadata {
-                        path: entry.file.path.as_str().to_string(),
-                        bytes: entry.file.size,
-                        bytes_uncompressed: add_file_bytes(
-                            &mut column_bytes,
-                            &column_positions,
-                            row_groups,
-                        ),
-                        partition: self.format_partition(&entry.partition),
-                        min_max_stats: format_min_max_stats(entry.stats.as_deref()),
-                    });
-                }
-            }
-            Ok(ControlFlow::Continue(()))
-        })?;
+        let files: Vec<DatastoreFileMetadata> = self
+            .files
+            .list_files()
+            .map(|file| DatastoreFileMetadata {
+                path: file.entry.file.path.as_str().to_string(),
+                bytes: file.entry.file.size,
+                bytes_uncompressed: add_file_bytes(
+                    &mut column_bytes,
+                    &column_positions,
+                    &file.row_groups,
+                ),
+                partition: self.format_partition(&file.entry.partition),
+                min_max_stats: format_min_max_stats(file.entry.stats.as_deref()),
+            })
+            .collect();
 
         let partition_by = &self.shape.partition_by;
         let sort_by = &self.shape.sort_by;
@@ -90,17 +65,17 @@ impl DeltaTable {
                 },
             )
             .collect();
-        Ok(DatastoreTableMetadata {
+        DatastoreTableMetadata {
             name,
             id,
             columns,
             sort_by: sort_by.clone(),
             partition_by: partition_by.clone(),
-            total_rows,
+            total_rows: self.files.count_rows(),
             bytes: files.iter().map(|file| file.bytes).sum(),
             bytes_uncompressed: files.iter().map(|file| file.bytes_uncompressed).sum(),
             files,
-        })
+        }
     }
 
     /// A file's partition as the catalog reports it: `column=value` pairs in

@@ -4,53 +4,29 @@
 //! # What a version holds
 //!
 //! A version holds the snapshot it was read at, which is the log's position,
-//! and what its files amount to as a whole ([`VersionSummary`]): how many
-//! there are, their rows and bytes, and the partitions they sit in. It holds
-//! no file and no footer.
-//!
-//! The log, its checkpoint and the commits after it, lists every file of
-//! every partition, like one manifest for the whole table. A partition's
-//! files are indexed when a scan, a commit or a maintenance pass first asks
-//! for the partition, by replaying the log and keeping the files of the
-//! partitions asked for: a replay keeps the files of several partitions at
-//! once, so a pass over many partitions replays the log once, or a few
-//! times for a table whose files do not fit in what a replay may keep. The
-//! indexes of every table, of whichever format, live in one cache
-//! ([`table_file_index::FileMetadataCache`]), which keeps them within a
-//! budget of memory: an index the cache let go of is built again by another
-//! replay. The same cache, within the same budget, keeps the footers the
-//! table's files were found to have.
-//!
-//! The open of a table replays its log once, for the summary, and a table
-//! whose files' records are few is indexed by that same replay. The open of
-//! a database of few files also selects a scan of each table, so the cache
-//! holds every index and every footer before the first query.
+//! and every live file of the table at that version ([`TableFiles`]): each
+//! with the entry the log records for it, its partition tuple and its
+//! statistics, and the row groups of its footer. The log, its checkpoint and
+//! the commits after it, lists every file of every partition, like one
+//! manifest for the whole table, so one read of it builds the whole list,
+//! and the version holds the list for as long as it lives. A scan, a merge,
+//! a layout measurement and a vacuum sweep are answered from it, with
+//! nothing read.
 //!
 //! # From one version to the next
 //!
-//! A commit made here derives the next version from the one it was made on:
-//! the summary by the files it removed and added, and the cached index of
-//! each partition it touched likewise, with no replay. What each such
-//! commit changed is remembered ([`CommitHistory`]), so a copy of the table
-//! standing at another version than the one the cache holds an index for,
-//! a compaction round's or a running query's, has the index brought to its
-//! own version rather than reading the log.
-//!
-//! A refresh that finds a version committed elsewhere replays the log at
-//! that version, once: for the summary, and for the files of the partitions
-//! the cache holds an index for, each built on the index held, so a file
-//! both versions list keeps its record.
+//! A commit made here derives the next version from the one it was made on,
+//! by the files it removed and added, with no log read. A refresh that finds
+//! a version committed elsewhere reads the log at that version, once, and
+//! keeps the row groups of the files the version it started from holds, so
+//! only the footers of the files new to it are read.
 //!
 //! # Compaction rounds
 //!
-//! A version stands among its table's commits at its log version, which
-//! every writer numbers alike. The partitions a file was added to since a
-//! version are read from what the commits made here changed
-//! ([`CommitHistory`]), which is what a routine compaction round examines.
-//! A version committed elsewhere in between, or one the history no longer
-//! holds, leaves them unknown: every partition then counts. A file's
-//! `modificationTime` does not serve for this: another writer records its
-//! file's own time there, which may lie before a commit made earlier.
+//! A version stands among its table's commits at its log version. Which
+//! partitions a commit since an earlier version added a file to is not
+//! kept: a round is told every partition, and examines each off the files
+//! held here.
 //!
 //! # A file's place among its partition's files
 //!
@@ -59,59 +35,37 @@
 //! from the `modificationTime` its `Add` action carries: a commit made here
 //! numbers its files from the clock's reading, or from just past the latest
 //! file when the clock has not moved past it, one millisecond apart in the
-//! order it adds them. A replay therefore reads back the order the files
-//! were committed in, checkpoint or not, which the log's versions do not
-//! give: a checkpoint keeps no trace of the version that added a file.
+//! order it adds them. A read of the log therefore gives back the order the
+//! files were committed in, checkpoint or not, which the log's versions do
+//! not give: a checkpoint keeps no trace of the version that added a file.
 
-mod commit_history;
 mod describe;
 mod file_record;
 pub(crate) mod log;
 mod partition_key;
-mod version_summary;
 
-use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use catalog::datastore::DatastoreTableMetadata;
 use dispatch::DataFlowDispatcher;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
+use imbl::OrdMap;
 use object_storage::{self, DataFile, FileRef, ObjectPath, ObjectStore};
-use parquet_engine::file_entry::partition_maybe_matches;
 use parquet_engine::{ParquetTable, PushedPredicate, RowGroupMetadata, ScanSelection};
 use planner::catalog::{Column, SchemaQualifiedTableName};
 use planner::expression::{CompareType, Expression};
-use table_file_index::{
-    FileMetadataCache, IndexedRecord, LookupUse, PartitionFiles, TableKey, VersionOrder,
-};
+use table_file_index::{IndexedRecord, PartitionFiles};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use self::commit_history::{CommitHistory, PartitionChange};
 use self::file_record::{DeltaFile, DeltaIndex, RecordBuilder};
 use self::log::TableShape;
-use self::version_summary::{CountedFile, VersionSummary};
-use crate::Result;
 use crate::file_entry::{ColumnStatFilter, FileEntry, PartitionEqFilter, constant_partition};
 use crate::table::{TableFile, TableStorage};
 use crate::table_format::{RemovedFiles, SnapshotExpiry, Table, TableFactory, VisitPartition};
-
-/// How many partitions a walk or a scan of many has indexed at a time.
-const PARTITIONS_PER_LOAD: usize = 16;
-
-/// How much of the files a replay met ahead of the partitions a pass will
-/// index it keeps, by [`IndexedRecord::estimate_heap_bytes`]; past it the
-/// files kept ahead are let go of, and the log is replayed again when
-/// their partitions' turn comes.
-const REPLAYED_AHEAD_HELD_BYTES: u64 = 256 * 1024 * 1024;
-
-/// How much the records of a table's files may take, by
-/// [`IndexedRecord::estimate_heap_bytes`], for the replay that opens the
-/// table to index every partition as it goes.
-const INDEXED_AT_OPEN_HELD_BYTES: u64 = 8 * 1024 * 1024;
+use crate::{Error, Result};
 
 /// What creates and loads the Delta tables of one database, which every
 /// table holds a copy of: the Kernel engine its logs are read and written
@@ -134,6 +88,65 @@ impl DeltaTableFactory {
             dispatcher,
         })
     }
+
+    /// The table at `location` as the log at `snapshot`, which declares
+    /// `shape`, has it: every live file with its row groups, and the retired
+    /// files the log remembers. A file `held` has keeps the row groups held
+    /// for it; the footers of the others are read in one pass over the pool,
+    /// each reconciled by name against the columns `shape` declares. Nothing
+    /// is handed back unless every footer was read.
+    fn read_version(
+        &self,
+        location: &ObjectPath,
+        snapshot: Arc<delta_kernel::Snapshot>,
+        shape: Arc<TableShape>,
+        held: &TableFiles,
+    ) -> Result<DeltaTable> {
+        let logged = log::read_files(&snapshot, &self.engine, &shape)?;
+        let unheld: Vec<DataFile> = logged
+            .iter()
+            .filter(|file| held.find(&file.entry.file.path).is_none())
+            .map(|file| {
+                let file = file.entry.file.clone();
+                file.into_data_file(self.store.as_ref(), location)
+            })
+            .collect::<object_storage::Result<_>>()?;
+        // One footer per file not held, in the order the log lists them.
+        let mut read = parquet_engine::load_file_row_groups(
+            &self.dispatcher,
+            &unheld,
+            parquet_engine::TableColumns::by_name(shape.columns.clone()),
+        )?
+        .into_iter();
+
+        let records = RecordBuilder::new(&shape.columns, &shape.partition_by, &shape.sort_by)?;
+        let mut files = TableFiles::default();
+        for file in logged {
+            let row_groups = match held.find(&file.entry.file.path) {
+                Some(held_file) => held_file.row_groups.clone(),
+                None => {
+                    read.next()
+                        .expect("a footer is read for every file not held")
+                        .row_groups
+                }
+            };
+            let (partition, record) =
+                records.build(TableFile::new(file.entry, row_groups), file.commit_sequence)?;
+            files.insert(&partition, record);
+        }
+        // The files this version no longer references but the log still
+        // dates, off the same segment the files were read from, so the two
+        // always agree.
+        let tombstones = log::read_remove_tombstones(&snapshot, &self.engine)?;
+        Ok(DeltaTable {
+            factory: self.clone(),
+            location: location.clone(),
+            snapshot,
+            shape,
+            files,
+            tombstones: Arc::new(tombstones),
+        })
+    }
 }
 
 impl TableFactory for DeltaTableFactory {
@@ -141,8 +154,8 @@ impl TableFactory for DeltaTableFactory {
     /// actions. An adopted file whose partition columns are constant is
     /// stamped with that partition from its stats, so it is recorded in the log
     /// and prunes like a written file; one whose values vary is adopted
-    /// without a tuple. The adopted files are indexed and their footers kept
-    /// as the caller read them, so the log just written is not read back.
+    /// without a tuple. The adopted files are held with the footers the
+    /// caller read, so the log just written is not read back.
     fn create_table(
         &self,
         directory: &ObjectPath,
@@ -174,39 +187,24 @@ impl TableFactory for DeltaTableFactory {
             &entries,
         )?;
         let shape = Arc::new(log::read_table_shape(&snapshot)?);
-        let lineage = Lineage::begin(&shape)?;
-        // The adopted files are recorded in the order given, numbered from
-        // the first.
-        let records = lineage.build_records(&adopted, 0)?;
-        let mut summary = VersionSummary::default();
-        let mut files_by_partition: HashMap<Arc<[u8]>, Vec<Arc<DeltaFile>>> = HashMap::new();
-        for record in records {
-            summary.add(CountedFile::of(&record));
-            files_by_partition
-                .entry(Arc::clone(record.partition()))
-                .or_default()
-                .push(record);
+        // The adopted files stand in the order given, numbered from the
+        // first, as the log numbers them.
+        let mut files = TableFiles::default();
+        for (partition, record) in build_records(&shape, adopted, 0)? {
+            files.insert(&partition, record);
         }
-        let table = DeltaTable {
+        Ok(Arc::new(DeltaTable {
             factory: self.clone(),
             location: directory.clone(),
             snapshot,
             shape,
-            summary: Arc::new(summary),
+            files,
             tombstones: Arc::default(),
-            lineage,
-            swapped: None,
-        };
-        for (partition, files) in files_by_partition {
-            table.store_index(&partition, build_index(files));
-        }
-        table.keep_footers(&adopted);
-        table.lineage.remember_version(&table);
-        Ok(Arc::new(table))
+        }))
     }
 
-    /// Read the table's log at its latest version: its files are counted,
-    /// and indexed when their records are few. No footer is read.
+    /// Read the table's log at its latest version and the footer of every
+    /// file it lists.
     fn load_table(
         &self,
         directory: &ObjectPath,
@@ -215,209 +213,123 @@ impl TableFactory for DeltaTableFactory {
         let delta_uri = log::table_uri(&self.store.location_uri(), directory)?;
         let snapshot = log::open_snapshot(&delta_uri, &self.engine)?;
         let shape = Arc::new(log::read_table_shape(&snapshot)?);
-        let lineage = Lineage::begin(&shape)?;
-        let opened = DeltaTable {
-            factory: self.clone(),
-            location: directory.clone(),
-            snapshot,
-            shape,
-            summary: Arc::default(),
-            tombstones: Arc::default(),
-            lineage,
-            swapped: None,
-        };
-        Ok(Arc::new(opened.read_from_log(
-            Kept::WholeTableWithin(INDEXED_AT_OPEN_HELD_BYTES),
-            &HashMap::new(),
-        )?))
+        let loaded = self.read_version(directory, snapshot, shape, &TableFiles::default())?;
+        Ok(Arc::new(loaded))
     }
 
-    /// Nothing is let go of here: what the copies of a table cached leaves
-    /// the cache with the last of them.
+    /// Nothing: a Delta table's files and footers are held by its versions,
+    /// which go with the table, and by no cache.
     fn forget_cached_table(&self, _directory: &ObjectPath) -> Result<()> {
         Ok(())
     }
 }
 
-/// What the versions of a table that read a file alike share: of one schema,
-/// partitioned and sorted by the same columns, each derived from another by
-/// a refresh, a commit or a swap.
-struct Lineage {
-    /// Where the versions' partition indexes and the footers of their files
-    /// are cached, under a key that is this lineage's alone.
-    cache: Arc<FileMetadataCache>,
-    cache_key: TableKey,
-    /// Builds the record of a file of the table.
-    records: Mutex<RecordBuilder>,
-    /// What the commits made here changed.
-    commits: Mutex<CommitHistory>,
-    /// The newest version a copy of the table in this process read from
-    /// the log or committed, for another copy's refresh to take as it is.
-    newest: Mutex<Option<ReadVersion>>,
-    /// Held while partitions are indexed, so scans that want one partition
-    /// at once wait for one replay of the log rather than each replaying
-    /// it.
-    indexing: Mutex<()>,
+/// The record of each of `files`, files of a table of `shape`, in the order
+/// given, beside the bytes its partition is named by. The first stands at
+/// `first_commit_sequence` among the table's commits and each of the others
+/// one past the file before it.
+fn build_records(
+    shape: &TableShape,
+    files: Vec<TableFile>,
+    first_commit_sequence: u64,
+) -> Result<Vec<(Vec<u8>, DeltaFile)>> {
+    let records = RecordBuilder::new(&shape.columns, &shape.partition_by, &shape.sort_by)?;
+    files
+        .into_iter()
+        .zip(first_commit_sequence..)
+        .map(|(file, commit_sequence)| records.build(file, commit_sequence))
+        .collect()
 }
 
-impl Lineage {
-    /// A lineage no version belongs to yet, of tables of `shape`, its
-    /// partition indexes and footers kept in the process's cache.
-    fn begin(shape: &TableShape) -> Result<Arc<Self>> {
-        /// Numbers the lineages of the process.
-        static NEXT_LINEAGE: AtomicU64 = AtomicU64::new(0);
-
-        let records = RecordBuilder::new(&shape.columns, &shape.partition_by, &shape.sort_by)?;
-        let lineage_number = NEXT_LINEAGE.fetch_add(1, Ordering::Relaxed);
-        Ok(Arc::new(Self {
-            cache: FileMetadataCache::process_wide(),
-            cache_key: TableKey {
-                table: Arc::from(format!("delta lineage {lineage_number}")),
-                reading: Arc::from(""),
-            },
-            records: Mutex::new(records),
-            commits: Mutex::default(),
-            newest: Mutex::default(),
-            indexing: Mutex::new(()),
-        }))
-    }
-
-    /// Remember `version` when no newer one is remembered.
-    fn remember_version(&self, version: &DeltaTable) {
-        let mut newest = self.newest.lock().unwrap();
-        let is_newer = newest
-            .as_ref()
-            .is_none_or(|held| held.snapshot.version() < version.snapshot.version());
-        if is_newer {
-            *newest = Some(ReadVersion {
-                snapshot: Arc::clone(&version.snapshot),
-                summary: Arc::clone(&version.summary),
-                tombstones: Arc::clone(&version.tombstones),
-            });
-        }
-    }
-
-    /// What is remembered of the version numbered `version`, when it is the
-    /// newest one remembered.
-    fn find_version(&self, version: u64) -> Option<ReadVersion> {
-        let newest = self.newest.lock().unwrap();
-        newest
-            .as_ref()
-            .filter(|held| held.snapshot.version() == version)
-            .cloned()
-    }
-
-    /// The record of each of `files`, in the order given, the first
-    /// standing at `first_commit_sequence` among the table's commits and
-    /// each of the others one past the file before it.
-    fn build_records(
-        &self,
-        files: &[TableFile],
-        first_commit_sequence: u64,
-    ) -> Result<Vec<Arc<DeltaFile>>> {
-        let mut records = self.records.lock().unwrap();
-        files
-            .iter()
-            .zip(first_commit_sequence..)
-            .map(|(file, commit_sequence)| {
-                Ok(Arc::new(
-                    records.build(file.entry.clone(), commit_sequence)?,
-                ))
-            })
-            .collect()
-    }
-}
-
-/// What the lineage's versions cached is no other table's to find, so it
-/// leaves the cache with the lineage.
-impl Drop for Lineage {
-    fn drop(&mut self) {
-        self.cache.remove_tables(&self.cache_key.table);
-    }
-}
-
-/// What a committed version holds, as it was read from the log or derived
-/// by the commit that wrote it.
-#[derive(Clone)]
-struct ReadVersion {
-    snapshot: Arc<delta_kernel::Snapshot>,
-    summary: Arc<VersionSummary>,
-    tombstones: Arc<HashMap<ObjectPath, u64>>,
-}
-
-/// The files a local view swapped, by the key of their partition.
-type SwappedFiles = HashMap<Arc<[u8]>, PartitionSwap>;
-
-/// What a local view swapped in one partition.
+/// Every live file of one table version. Persistent: a clone shares every
+/// file and every partition, and an edit copies only what it touches, so
+/// the version a commit derives costs what the commit changed.
 #[derive(Clone, Default)]
-struct PartitionSwap {
-    /// The committed files swapped out.
-    removed: Vec<ObjectPath>,
-    /// The files swapped in.
-    added: Vec<Arc<DeltaFile>>,
+struct TableFiles {
+    /// The files of each partition the version has a file in, by the bytes
+    /// the partition is named by.
+    partitions: OrdMap<Arc<[u8]>, Arc<DeltaIndex>>,
+    /// Every file of the table, for whoever names a file by its path alone.
+    by_path: DeltaIndex,
+    /// The rows the files' row groups hold.
+    row_count: u64,
+    /// Where the latest file added stands among the table's commits; 0 for
+    /// a table no file was added to.
+    latest_commit_sequence: u64,
 }
 
-/// Which of the files a replay meets it keeps.
-#[derive(Clone, Copy)]
-enum Kept<'k> {
-    /// Those of the partitions `now`, and those of the partitions `ahead`
-    /// while what is kept of them stays within
-    /// [`REPLAYED_AHEAD_HELD_BYTES`].
-    Partitions {
-        now: &'k HashSet<Arc<[u8]>>,
-        ahead: &'k HashSet<Arc<[u8]>>,
-    },
-    /// Every file, as long as they all fit within the bytes given; none
-    /// when they do not.
-    WholeTableWithin(u64),
-}
+impl TableFiles {
+    /// The file at `path`, whichever partition it sits in.
+    fn find(&self, path: &ObjectPath) -> Option<&Arc<DeltaFile>> {
+        self.by_path.find(path)
+    }
 
-/// What one replay of the log read.
-struct Replayed {
-    /// What the version's files amount to.
-    summary: VersionSummary,
-    /// Every file of each partition the replay kept the files of.
-    files: FilesByPartition,
-}
+    /// The files of `partition`; `None` when the version has no file in it.
+    fn find_partition(&self, partition: &[u8]) -> Option<&Arc<DeltaIndex>> {
+        self.partitions.get(partition)
+    }
 
-/// Files by the key of the partition they sit in.
-type FilesByPartition = HashMap<Arc<[u8]>, Vec<Arc<DeltaFile>>>;
+    /// Every partition the version has a file in with its files, in the
+    /// order of the bytes the partitions are named by.
+    fn list_partitions(&self) -> impl Iterator<Item = (&Arc<[u8]>, &Arc<DeltaIndex>)> {
+        self.partitions.iter()
+    }
 
-/// What a walk over a table's partitions does with each partition, by its
-/// key, and its files: `Break` ends the walk.
-type VisitIndex<'v> = dyn FnMut(&Arc<[u8]>, &Arc<DeltaIndex>) -> Result<ControlFlow<()>> + 'v;
+    /// Every file, partition by partition, each partition's in the order
+    /// its files stand in.
+    fn list_files(&self) -> impl Iterator<Item = &Arc<DeltaFile>> {
+        self.partitions.values().flat_map(|index| index.files())
+    }
 
-/// What a scan over some filters selected of a table version.
-struct SelectedFiles {
-    /// The keys of the partitions whose tuple the filters keep, which the
-    /// files were selected from.
-    partitions: Vec<Arc<[u8]>>,
-    /// The files, in the order they are scanned.
-    files: Vec<Arc<DeltaFile>>,
-}
+    fn count_files(&self) -> u64 {
+        self.by_path.len() as u64
+    }
 
-/// Who counts the indexes a walk loads as used.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IndexUse {
-    /// The walk, as it loads them.
-    Counted,
-    /// The caller, once it has taken what it reads through them.
-    LeftToCaller,
-}
+    fn count_rows(&self) -> u64 {
+        self.row_count
+    }
 
-/// What a taker of footers leaves of itself in the cache.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FooterUse {
-    /// The footers found count as used, and those read are kept.
-    Kept,
-    /// The cache is left as it was: nothing counts as used and nothing
-    /// read is kept.
-    Unrecorded,
+    /// Add `file` to `partition`, in place of a file of the partition
+    /// already at its path.
+    fn insert(&mut self, partition: &[u8], file: DeltaFile) {
+        let file = Arc::new(file);
+        let facts = file.facts();
+        self.remove(partition, &facts.file().path);
+        self.row_count += file.count_rows();
+        self.latest_commit_sequence = self.latest_commit_sequence.max(facts.commit_sequence());
+        let (key, mut index) = match self.partitions.get_key_value(partition) {
+            Some((key, index)) => (Arc::clone(key), DeltaIndex::clone(index)),
+            None => (Arc::from(partition), DeltaIndex::default()),
+        };
+        index.insert(Arc::clone(&file));
+        self.partitions.insert(key, Arc::new(index));
+        self.by_path.insert(file);
+    }
+
+    /// Drop the file of `partition` at `path`, if the version has one. A
+    /// partition left without a file is no longer one of the version's.
+    fn remove(&mut self, partition: &[u8], path: &ObjectPath) {
+        let Some((key, index)) = self.partitions.get_key_value(partition) else {
+            return;
+        };
+        let (key, mut index) = (Arc::clone(key), DeltaIndex::clone(index));
+        let Some(file) = index.remove(path) else {
+            return;
+        };
+        if index.is_empty() {
+            self.partitions.remove(&key);
+        } else {
+            self.partitions.insert(key, Arc::new(index));
+        }
+        self.by_path.remove(path);
+        self.row_count -= file.count_rows();
+    }
 }
 
 /// One Delta table at one log version: the snapshot it was read at and that
-/// every commit from it is written on top of, what its files amount to, and
-/// the retired files the log still remembers.
+/// every commit from it is written on top of, every live file of the version
+/// with its row groups, and the retired files the log still remembers.
+#[derive(Clone)]
 struct DeltaTable {
     factory: DeltaTableFactory,
     location: ObjectPath,
@@ -425,25 +337,19 @@ struct DeltaTable {
     /// The columns the version declares, and those its files are
     /// partitioned and sorted by.
     shape: Arc<TableShape>,
-    /// What the committed version's files amount to.
-    summary: Arc<VersionSummary>,
+    /// The version's files. A local view of file swaps this process
+    /// committed through another copy of the table holds the files swapped
+    /// in and not those swapped out, which the log at its snapshot does not
+    /// record; the next refresh reconciles the copy to the committed log.
+    files: TableFiles,
     /// The files the log retired but still remembers, each by the Unix ms its
     /// commit retired it: what vacuum ages a retired file by, so the retention
     /// window runs from the moment the file stopped being referenced rather
-    /// than from its storage mtime. Rebuilt from the log on a reload, which
-    /// bounds it to what the log still carries, and extended by every commit
-    /// made from this value's lineage, which drops the entries a window older
+    /// than from its storage mtime. Read from the log alongside the files,
+    /// which bounds it to what the log still carries, and extended by every
+    /// commit made on this version, which drops the entries a window older
     /// than itself.
     tombstones: Arc<HashMap<ObjectPath, u64>>,
-    /// What this version shares with the versions it was derived from and
-    /// those derived from it.
-    lineage: Arc<Lineage>,
-    /// For a local view of file swaps this process committed through
-    /// another copy of the table: per partition, the files swapped out of
-    /// the committed ones and those swapped in, which the log at this
-    /// version does not record. The next refresh reconciles the copy to the
-    /// committed log.
-    swapped: Option<Arc<SwappedFiles>>,
 }
 
 /// Whether `schema` holds each of `columns` at the place `positions` gives
@@ -465,562 +371,14 @@ fn holds_columns_at(
     })
 }
 
-/// The index of one partition whose files are `files`.
-fn build_index(files: Vec<Arc<DeltaFile>>) -> DeltaIndex {
-    let mut index = DeltaIndex::default();
-    for file in files {
-        index.insert(file);
-    }
-    index
-}
-
 impl DeltaTable {
-    /// Where this version stands among the versions of its table, for the
-    /// cache.
-    fn version_order(&self) -> VersionOrder {
-        VersionOrder {
-            sequence: self.snapshot.version() as i64,
-            updated_ms: 0,
-        }
-    }
-
-    /// Hold `index` in the cache as this version's index of `partition`.
-    fn store_index(&self, partition: &Arc<[u8]>, index: DeltaIndex) -> Arc<DeltaIndex> {
-        let index = Arc::new(index);
-        self.lineage.cache.store_index(
-            &self.lineage.cache_key,
-            partition,
-            &index,
-            self.version_order(),
-        );
-        index
-    }
-
-    /// Hold the footers of `files` in the cache, as their writer or reader
-    /// produced them. A file handed over without its row groups is left to
-    /// be read when something first needs them.
-    fn keep_footers(&self, files: &[TableFile]) {
-        let footers = files
-            .iter()
-            .filter(|file| !file.row_groups.is_empty())
-            .map(|file| {
-                let path = Arc::from(file.entry.file.path.as_str());
-                (path, file.row_groups.clone())
-            })
-            .collect();
-        self.lineage
-            .cache
-            .store_footers(&self.lineage.cache_key, footers);
-    }
-
-    /// The shared key of `partition`, when this version or a local swap
-    /// has a file in it.
-    fn find_partition_key(&self, partition: &[u8]) -> Option<Arc<[u8]>> {
-        if let Some((key, _)) = self.summary.partitions.get_key_value(partition) {
-            return Some(Arc::clone(key));
-        }
-        let swapped = self.swapped.as_ref()?;
-        swapped
-            .get_key_value(partition)
-            .map(|(key, _)| Arc::clone(key))
-    }
-
-    /// Every partition this version, or a local swap, has a file in, in
-    /// the order of the bytes they are named by.
-    fn list_partition_keys(&self) -> Vec<Arc<[u8]>> {
-        let committed = self.summary.partitions.keys();
-        let Some(swapped) = &self.swapped else {
-            return committed.cloned().collect();
-        };
-        let mut keys: Vec<Arc<[u8]>> = committed.chain(swapped.keys()).cloned().collect();
-        keys.sort_unstable();
-        keys.dedup();
-        keys
-    }
-
-    /// Replay the log at this version, keeping the files `kept` names, each
-    /// as the record `held` has for it when it has one: `held` is the index
-    /// the cache holds for a partition at another version.
-    fn replay_log(
-        &self,
-        kept: Kept<'_>,
-        held: &HashMap<Arc<[u8]>, Arc<DeltaIndex>>,
-    ) -> Result<Replayed> {
-        let mut records = self.lineage.records.lock().unwrap();
-        let mut summary = VersionSummary::default();
-        let mut files = FilesByPartition::new();
-        // The files kept that the replay may yet let go of: how much they
-        // may take, how much they do, and whether any more is kept.
-        let droppable_bytes_bound = match kept {
-            Kept::Partitions { .. } => REPLAYED_AHEAD_HELD_BYTES,
-            Kept::WholeTableWithin(bound) => bound,
-        };
-        let mut droppable_bytes = 0_u64;
-        let mut keeps_droppable = true;
-        log::replay_files(
-            &self.snapshot,
-            &self.factory.engine,
-            &self.shape,
-            &mut |file: log::ReplayedFile<'_>| -> Result<()> {
-                let partition = records.encode_partition(&file.entry)?;
-                summary.add(CountedFile {
-                    partition: &partition,
-                    values: file.entry.partition.as_ref(),
-                    size: file.entry.file.size,
-                    rows: file.rows,
-                    commit_sequence: file.commit_sequence,
-                });
-                let is_droppable = match kept {
-                    Kept::Partitions { now, .. } if now.contains(&partition) => false,
-                    Kept::Partitions { ahead, .. } if ahead.contains(&partition) => true,
-                    Kept::Partitions { .. } => return Ok(()),
-                    Kept::WholeTableWithin(_) => true,
-                };
-                if is_droppable && !keeps_droppable {
-                    return Ok(());
-                }
-                let record = match held
-                    .get(&partition)
-                    .and_then(|index| index.find(&file.entry.file.path))
-                {
-                    Some(record) => Arc::clone(record),
-                    None => {
-                        let stats = file.read_stats().map(Arc::new);
-                        let entry = FileEntry {
-                            stats,
-                            ..file.entry
-                        };
-                        Arc::new(records.build(entry, file.commit_sequence)?)
-                    }
-                };
-                if is_droppable {
-                    droppable_bytes += record.estimate_heap_bytes();
-                    if droppable_bytes > droppable_bytes_bound {
-                        keeps_droppable = false;
-                        match kept {
-                            Kept::Partitions { ahead, .. } => {
-                                files.retain(|partition, _| !ahead.contains(partition));
-                            }
-                            Kept::WholeTableWithin(_) => files.clear(),
-                        }
-                        return Ok(());
-                    }
-                }
-                files.entry(partition).or_default().push(record);
-                Ok(())
-            },
-        )?;
-        Ok(Replayed { summary, files })
-    }
-
-    /// This table as the log at its snapshot has it: its files counted, the
-    /// files `kept` names indexed and their indexes held in the cache, and
-    /// the retired files the log remembers read. `held` is as
-    /// [`replay_log`](Self::replay_log) takes it. A partition `kept` named
-    /// that the version has no file in is indexed as empty, so the cache
-    /// does not go on holding another version's files for it.
-    fn read_from_log(
-        &self,
-        kept: Kept<'_>,
-        held: &HashMap<Arc<[u8]>, Arc<DeltaIndex>>,
-    ) -> Result<Self> {
-        let named: Vec<Arc<[u8]>> = match &kept {
-            Kept::Partitions { now, .. } => now.iter().cloned().collect(),
-            Kept::WholeTableWithin(_) => Vec::new(),
-        };
-        let Replayed { summary, mut files } = self.replay_log(kept, held)?;
-        // The files this version no longer references but the log still dates, off
-        // the same segment the replay read, so the two always agree.
-        let tombstones = log::read_remove_tombstones(&self.snapshot, &self.factory.engine)?;
-        let read = Self {
-            factory: self.factory.clone(),
-            location: self.location.clone(),
-            snapshot: Arc::clone(&self.snapshot),
-            shape: Arc::clone(&self.shape),
-            summary: Arc::new(summary),
-            tombstones: Arc::new(tombstones),
-            lineage: Arc::clone(&self.lineage),
-            swapped: None,
-        };
-        for partition in named {
-            let partition_files = files.remove(&partition).unwrap_or_default();
-            read.store_index(&partition, build_index(partition_files));
-        }
-        for (partition, partition_files) in files {
-            read.store_index(&partition, build_index(partition_files));
-        }
-        read.lineage.remember_version(&read);
-        Ok(read)
-    }
-
-    /// The index the cache holds for `partition`, built at `built_at`, as
-    /// this version's: itself when it was built at this version, or brought
-    /// across the commits made here between the two. `None` when a commit
-    /// between them was made elsewhere. An index brought forward is this
-    /// version's from now on, and is held as such.
-    fn bring_index(
-        &self,
-        partition: &Arc<[u8]>,
-        index: Arc<DeltaIndex>,
-        built_at: VersionOrder,
-    ) -> Option<Arc<DeltaIndex>> {
-        let version = self.snapshot.version();
-        let built_at = built_at.sequence as u64;
-        if built_at == version {
-            return Some(index);
-        }
-        let commits = self.lineage.commits.lock().unwrap();
-        let brought = commits.bring_index(&index, partition, built_at, version)?;
-        drop(commits);
-        if built_at < version {
-            return Some(self.store_index(partition, brought));
-        }
-        Some(Arc::new(brought))
-    }
-
-    /// The committed files of each of `partitions` at this version, in the
-    /// order given, each partition one this version has a file in.
-    ///
-    /// The index the cache holds for a partition is taken when it is this
-    /// version's, or can be brought to it. The others are built from the
-    /// files `replayed` holds for them, and when it holds none for some,
-    /// the log is replayed for those, keeping as well, as far as the bound
-    /// allows, the files of the partitions `ahead` whose indexes the cache
-    /// does not hold: the partitions the caller will ask for next, which
-    /// are looked at only when the log is replayed. An index taken from the
-    /// cache is not counted as used here.
-    fn load_committed_indexes(
-        &self,
-        partitions: &[Arc<[u8]>],
-        ahead: &[Arc<[u8]>],
-        replayed: &mut FilesByPartition,
-    ) -> Result<Vec<Arc<DeltaIndex>>> {
-        let _indexing = self.lineage.indexing.lock().unwrap();
-        let (cache, table) = (&self.lineage.cache, &self.lineage.cache_key);
-        let mut indexes: Vec<Option<Arc<DeltaIndex>>> = Vec::with_capacity(partitions.len());
-        let mut stale: HashMap<Arc<[u8]>, Arc<DeltaIndex>> = HashMap::new();
-        let held = cache.find_indexes::<DeltaIndex>(
-            table,
-            partitions.iter().map(|partition| &**partition),
-            LookupUse::Uncounted,
-        );
-        let version = self.version_order();
-        for (partition, held) in partitions.iter().zip(held) {
-            let current = match held {
-                // The common case: the index held is this version's.
-                Some((index, built_at)) if built_at == version => Some(index),
-                Some((index, built_at)) => {
-                    let brought = self.bring_index(partition, Arc::clone(&index), built_at);
-                    if brought.is_none() {
-                        stale.insert(Arc::clone(partition), index);
-                    }
-                    brought
-                }
-                None => None,
-            };
-            indexes.push(current);
-        }
-        let unbuilt: Vec<&Arc<[u8]>> = partitions
-            .iter()
-            .zip(&indexes)
-            .filter(|(_, index)| index.is_none())
-            .map(|(partition, _)| partition)
-            .collect();
-        let unread: HashSet<Arc<[u8]>> = unbuilt
-            .into_iter()
-            .filter(|partition| !replayed.contains_key(*partition))
-            .cloned()
-            .collect();
-        if !unread.is_empty() {
-            // A partition only a local swap has a file in has no committed
-            // file to replay.
-            let ahead: Vec<&Arc<[u8]>> = ahead
-                .iter()
-                .filter(|partition| self.summary.partitions.contains_key(*partition))
-                .collect();
-            let held_ahead = cache.find_indexes::<DeltaIndex>(
-                table,
-                ahead.iter().map(|partition| &***partition),
-                LookupUse::Uncounted,
-            );
-            let mut unread_ahead: HashSet<Arc<[u8]>> = HashSet::new();
-            for (partition, held) in ahead.into_iter().zip(held_ahead) {
-                if replayed.contains_key(partition) {
-                    continue;
-                }
-                match held {
-                    Some((index, built_at)) => {
-                        if self
-                            .bring_index(partition, Arc::clone(&index), built_at)
-                            .is_none()
-                        {
-                            stale.insert(Arc::clone(partition), index);
-                            unread_ahead.insert(Arc::clone(partition));
-                        }
-                    }
-                    None => {
-                        unread_ahead.insert(Arc::clone(partition));
-                    }
-                }
-            }
-            let kept = Kept::Partitions {
-                now: &unread,
-                ahead: &unread_ahead,
-            };
-            replayed.extend(self.replay_log(kept, &stale)?.files);
-        }
-        partitions
-            .iter()
-            .zip(indexes)
-            .map(|(partition, index)| match index {
-                Some(index) => Ok(index),
-                None => {
-                    let files = replayed.remove(partition).unwrap_or_default();
-                    self.check_replayed_file_count(partition, files.len() as u64)?;
-                    Ok(self.store_index(partition, build_index(files)))
-                }
-            })
-            .collect()
-    }
-
-    /// An error unless `replayed`, how many files a replay of the log met in
-    /// `partition`, is how many this version counts in it: a partition's
-    /// index is its files exactly, or it is not built.
-    fn check_replayed_file_count(&self, partition: &[u8], replayed: u64) -> Result<()> {
-        let counted = self
-            .summary
-            .partitions
-            .get(partition)
-            .map_or(0, |partition| partition.file_count);
-        if replayed == counted {
-            return Ok(());
-        }
-        Err(log::Error::ReplayedFileCount {
+    /// The error of a caller that names `path`, a file this version does
+    /// not hold.
+    fn conflict_at(&self, path: &ObjectPath) -> Error {
+        Error::CommitConflict {
             location: self.location.as_str().to_string(),
-            replayed,
-            counted,
+            file: path.to_string(),
         }
-        .into())
-    }
-
-    /// Visit each of `partitions`, partitions this version or a local swap
-    /// has a file in, with its files at this version, a local swap's
-    /// swapped, a few partitions indexed at a time; `Break` ends the walk.
-    /// With [`IndexUse::Counted`] the indexes count as used as they are
-    /// loaded.
-    fn visit_indexes(
-        &self,
-        partitions: &[Arc<[u8]>],
-        index_use: IndexUse,
-        visit: &mut VisitIndex<'_>,
-    ) -> Result<()> {
-        let mut replayed = FilesByPartition::new();
-        let mut visited = 0;
-        for chunk in partitions.chunks(PARTITIONS_PER_LOAD) {
-            visited += chunk.len();
-            let indexes = self.load_indexes(chunk, &partitions[visited..], &mut replayed)?;
-            if index_use == IndexUse::Counted {
-                self.lineage
-                    .cache
-                    .mark_indexes_used(&self.lineage.cache_key, chunk);
-            }
-            for (partition, index) in chunk.iter().zip(&indexes) {
-                if visit(partition, index)?.is_break() {
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The files of each of `partitions` at this version, in the order
-    /// given, with a local swap's files swapped; see
-    /// [`load_committed_indexes`](Self::load_committed_indexes). A
-    /// partition only a local swap has a file in has no committed file. An
-    /// index taken from the cache is not counted as used here.
-    fn load_indexes(
-        &self,
-        partitions: &[Arc<[u8]>],
-        ahead: &[Arc<[u8]>],
-        replayed: &mut FilesByPartition,
-    ) -> Result<Vec<Arc<DeltaIndex>>> {
-        // Without a local swap every partition asked for is a committed one,
-        // and its files are the committed ones.
-        if self.swapped.is_none() {
-            return self.load_committed_indexes(partitions, ahead, replayed);
-        }
-        let is_committed = |partition: &Arc<[u8]>| self.summary.partitions.contains_key(partition);
-        let committed: Vec<Arc<[u8]>> = partitions
-            .iter()
-            .filter(|partition| is_committed(partition))
-            .cloned()
-            .collect();
-        let mut committed_indexes = self
-            .load_committed_indexes(&committed, ahead, replayed)?
-            .into_iter();
-        Ok(partitions
-            .iter()
-            .map(|partition| {
-                let index = if is_committed(partition) {
-                    committed_indexes
-                        .next()
-                        .expect("an index is loaded for every committed partition")
-                } else {
-                    Arc::default()
-                };
-                self.swap_files(partition, index)
-            })
-            .collect())
-    }
-
-    /// The files of `partition` at this version, with a local swap's files
-    /// swapped; `None` when neither the version nor a swap has a file in
-    /// it.
-    fn load_index(&self, partition: &[u8]) -> Result<Option<Arc<DeltaIndex>>> {
-        let Some(key) = self.find_partition_key(partition) else {
-            return Ok(None);
-        };
-        let partitions = [key];
-        let mut indexes = self.load_indexes(&partitions, &[], &mut FilesByPartition::new())?;
-        self.lineage
-            .cache
-            .mark_indexes_used(&self.lineage.cache_key, &partitions);
-        Ok(indexes.pop())
-    }
-
-    /// The committed files of `partition` at this version, a local swap
-    /// left out; `None` when the version has no file in the partition.
-    fn load_committed_index(&self, partition: &[u8]) -> Result<Option<Arc<DeltaIndex>>> {
-        let Some((key, _)) = self.summary.partitions.get_key_value(partition) else {
-            return Ok(None);
-        };
-        let partitions = std::slice::from_ref(key);
-        let mut indexes =
-            self.load_committed_indexes(partitions, &[], &mut FilesByPartition::new())?;
-        self.lineage
-            .cache
-            .mark_indexes_used(&self.lineage.cache_key, partitions);
-        Ok(indexes.pop())
-    }
-
-    /// `index`, the committed files of `partition`, with what a local swap
-    /// swapped in the partition.
-    fn swap_files(&self, partition: &[u8], index: Arc<DeltaIndex>) -> Arc<DeltaIndex> {
-        let swap = self
-            .swapped
-            .as_ref()
-            .and_then(|swapped| swapped.get(partition));
-        let Some(swap) = swap else {
-            return index;
-        };
-        let mut view = DeltaIndex::clone(&index);
-        for path in &swap.removed {
-            view.remove(path);
-        }
-        for file in &swap.added {
-            view.insert(Arc::clone(file));
-        }
-        Arc::new(view)
-    }
-
-    /// The local swaps of this view with `removed`, files of the partition
-    /// `removed_partition`, dropped and `added` swapped in.
-    fn swap_more_files(
-        &self,
-        removed_partition: &[u8],
-        removed: &[ObjectPath],
-        added: Vec<Arc<DeltaFile>>,
-    ) -> Arc<SwappedFiles> {
-        let mut swapped = self.swapped.as_deref().cloned().unwrap_or_default();
-        if !removed.is_empty() {
-            let key = self
-                .find_partition_key(removed_partition)
-                .unwrap_or_else(|| Arc::from(removed_partition));
-            let swap = swapped.entry(key).or_default();
-            for path in removed {
-                let swapped_in = swap
-                    .added
-                    .iter()
-                    .position(|file| &file.facts().file().path == path);
-                match swapped_in {
-                    Some(position) => {
-                        swap.added.remove(position);
-                    }
-                    None => swap.removed.push(path.clone()),
-                }
-            }
-        }
-        for file in added {
-            let swap = swapped.entry(Arc::clone(file.partition())).or_default();
-            swap.added
-                .retain(|earlier| earlier.facts().file().path != file.facts().file().path);
-            swap.added.push(file);
-        }
-        Arc::new(swapped)
-    }
-
-    /// The row groups of each of `files`, distinct files of the table, in
-    /// the order given, shared with the cache and with whatever else took
-    /// them. A file whose footer the cache holds is neither opened nor
-    /// read; the others' footers are read and parsed in one pass over the
-    /// pool, which is not run when the cache holds them all, and, with
-    /// [`FooterUse::Kept`], cached.
-    fn open_footers(
-        &self,
-        files: &[&FileRef],
-        footer_use: FooterUse,
-    ) -> Result<Vec<Vec<Arc<RowGroupMetadata>>>> {
-        let (cache, table) = (&self.lineage.cache, &self.lineage.cache_key);
-        let paths = files.iter().map(|file| file.path.as_str());
-        let lookup_use = match footer_use {
-            FooterUse::Kept => LookupUse::Counted,
-            FooterUse::Unrecorded => LookupUse::Uncounted,
-        };
-        let held = cache.find_footers(table, paths, lookup_use);
-        let store = self.factory.store.as_ref();
-        let unheld: Vec<DataFile> = files
-            .iter()
-            .zip(&held)
-            .filter(|(_, held)| held.is_none())
-            .map(|(file, _)| FileRef::clone(file).into_data_file(store, &self.location))
-            .collect::<object_storage::Result<_>>()?;
-        let read = parquet_engine::load_file_row_groups(
-            &self.factory.dispatcher,
-            &unheld,
-            parquet_engine::TableColumns::by_name(self.shape.columns.clone()),
-        )?;
-        let unheld_paths = files
-            .iter()
-            .zip(&held)
-            .filter(|(_, held)| held.is_none())
-            .map(|(file, _)| &file.path);
-        if footer_use == FooterUse::Kept {
-            let kept = unheld_paths
-                .zip(&read)
-                .map(|(path, footer)| (Arc::from(path.as_str()), footer.row_groups.clone()))
-                .collect();
-            cache.store_footers(table, kept);
-        }
-        let mut read = read.into_iter();
-        Ok(held
-            .into_iter()
-            .map(|held| match held {
-                Some(row_groups) => row_groups,
-                None => {
-                    read.next()
-                        .expect("every file whose footer is not held was read")
-                        .row_groups
-                }
-            })
-            .collect())
-    }
-
-    /// Where the first file of the next commit stands among the table's
-    /// commits when the commit is made at `now_ms`: at that reading, or
-    /// just after the latest file when the clock has not moved past it,
-    /// so the files of a later commit always stand after an earlier one's.
-    fn next_commit_sequence(&self, now_ms: u64) -> u64 {
-        now_ms.max(self.summary.latest_commit_sequence + 1)
     }
 
     /// The tombstones after a commit at `retired_at_ms` retired `removed`: a
@@ -1126,65 +484,6 @@ impl DeltaTable {
         }
         may_hold_nulls
     }
-
-    /// What a scan over `filters` reads of the table's files: the
-    /// partitions whose tuple the filters keep, and of their files those
-    /// whose recorded partition tuple and column bounds admit a row the
-    /// filters keep, partition by partition in the order a partition's
-    /// files stand in. Only the kept partitions are indexed, and their
-    /// indexes are left for the caller to count as used.
-    fn select_scan_files(&self, filters: &[Expression]) -> Result<SelectedFiles> {
-        let predicates: Vec<PushedPredicate> = filters
-            .iter()
-            .flat_map(PushedPredicate::from_filter)
-            .collect();
-        let partition_by = &self.shape.partition_by;
-        let partition_filters = self.partition_filter_candidates(&predicates);
-        let stat_filters = self.stat_filter_candidates(&predicates);
-        let committed = &self.summary.partitions;
-        let kept = committed.iter().filter(|(_, partition)| {
-            partition_maybe_matches(
-                partition.values.as_deref(),
-                partition_by,
-                &partition_filters,
-            )
-        });
-        let mut partitions: Vec<Arc<[u8]>> = kept.map(|(key, _)| Arc::clone(key)).collect();
-        // A partition only a local swap has a file in is kept: its tuple is
-        // read from its files.
-        if let Some(swapped) = &self.swapped {
-            let swapped_only = swapped.keys().filter(|key| !committed.contains_key(*key));
-            partitions.extend(swapped_only.cloned());
-            partitions.sort_unstable();
-        }
-        let mut files: Vec<Arc<DeltaFile>> = Vec::new();
-        self.visit_indexes(&partitions, IndexUse::LeftToCaller, &mut |_, index| {
-            let admitted = index.files().filter(|file| {
-                file.entry
-                    .maybe_matches_partition(partition_by, &partition_filters)
-                    && file.entry.maybe_matches_stats(&stat_filters)
-            });
-            files.extend(admitted.cloned());
-            Ok(ControlFlow::Continue(()))
-        })?;
-        Ok(SelectedFiles { partitions, files })
-    }
-
-    /// The row groups of the files a scan over `filters` reads, in the
-    /// order [`select_scan_files`](Self::select_scan_files) selects them.
-    /// The footers are taken from the cache, where those read are kept;
-    /// once they are taken, the indexes the files were selected from count
-    /// as used again, so the cache lets go of a partition's footers before
-    /// its index.
-    fn load_scan_row_groups(&self, filters: &[Expression]) -> Result<Vec<Arc<RowGroupMetadata>>> {
-        let selected = self.select_scan_files(filters)?;
-        let files: Vec<&FileRef> = selected.files.iter().map(|file| &file.entry.file).collect();
-        let footers = self.open_footers(&files, FooterUse::Kept)?;
-        self.lineage
-            .cache
-            .mark_indexes_used(&self.lineage.cache_key, &selected.partitions);
-        Ok(footers.into_iter().flatten().collect())
-    }
 }
 
 impl Table for DeltaTable {
@@ -1204,21 +503,21 @@ impl Table for DeltaTable {
         &self.shape.sort_by
     }
 
-    /// The partitions in the order of the bytes they are named by, a few
-    /// indexed at a time.
+    /// The partitions in the order of the bytes they are named by.
     fn visit_partitions(&self, visit: &mut VisitPartition<'_>) -> Result<()> {
-        let partitions = self.list_partition_keys();
-        self.visit_indexes(&partitions, IndexUse::Counted, &mut |partition, index| {
-            Ok(visit(partition, &**index))
-        })
+        for (partition, index) in self.files.list_partitions() {
+            if visit(partition, &**index).is_break() {
+                break;
+            }
+        }
+        Ok(())
     }
 
-    /// Read from what the version counted of its files: no log is read.
     fn list_partitions(&self) -> Result<Vec<Vec<u8>>> {
         Ok(self
-            .list_partition_keys()
-            .iter()
-            .map(|key| key.to_vec())
+            .files
+            .list_partitions()
+            .map(|(partition, _)| partition.to_vec())
             .collect())
     }
 
@@ -1227,21 +526,9 @@ impl Table for DeltaTable {
         self.version()
     }
 
-    /// Read from what the commits made here since that version changed,
-    /// with no log read. A version committed elsewhere since, or one the
-    /// history let go of, leaves what was added unknown: every partition is
-    /// then listed.
-    fn list_partitions_added_after(&self, commit_position: u64) -> Result<Vec<Vec<u8>>> {
-        let added = self
-            .lineage
-            .commits
-            .lock()
-            .unwrap()
-            .list_partitions_added_between(commit_position, self.version());
-        match added {
-            Some(partitions) => Ok(partitions.iter().map(|key| key.to_vec()).collect()),
-            None => self.list_partitions(),
-        }
+    /// Every partition: what a commit added is not kept.
+    fn list_partitions_added_after(&self, _commit_position: u64) -> Result<Vec<Vec<u8>>> {
+        self.list_partitions()
     }
 
     /// Every one: a rewrite's output sits in the partition of its inputs.
@@ -1249,87 +536,57 @@ impl Table for DeltaTable {
         Ok(partitions)
     }
 
-    /// The partitions are indexed together: the log is replayed once for
-    /// those the cache holds no index of, as far as their files fit in
-    /// what a replay keeps.
-    fn index_partitions(&self, partitions: &[Vec<u8>]) -> Result<()> {
-        let keys: Vec<Arc<[u8]>> = partitions
-            .iter()
-            .filter_map(|partition| self.find_partition_key(partition))
-            .collect();
-        self.visit_indexes(&keys, IndexUse::Counted, &mut |_, _| {
-            Ok(ControlFlow::Continue(()))
-        })
+    /// Nothing: the version holds every partition's files.
+    fn index_partitions(&self, _partitions: &[Vec<u8>]) -> Result<()> {
+        Ok(())
     }
 
-    /// The partition's index; the log is replayed when the cache does not
-    /// hold it.
     fn load_partition_files(&self, partition: &[u8]) -> Result<Option<Arc<dyn PartitionFiles>>> {
         Ok(self
-            .load_index(partition)?
-            .map(|index| index as Arc<dyn PartitionFiles>))
+            .files
+            .find_partition(partition)
+            .map(|index| Arc::clone(index) as Arc<dyn PartitionFiles>))
     }
 
-    /// A record holds everything the log recorded for its file.
+    /// A file's record holds everything the log recorded for it.
     fn find_file_entries(
         &self,
         partition: &[u8],
         paths: &[ObjectPath],
     ) -> Result<Vec<Option<FileEntry>>> {
-        let Some(index) = self.load_index(partition)? else {
-            return Ok(vec![None; paths.len()]);
-        };
+        let index = self.files.find_partition(partition);
         Ok(paths
             .iter()
-            .map(|path| index.find(path).map(|file| file.entry.clone()))
+            .map(|path| Some(index?.find(path)?.entry.clone()))
             .collect())
     }
 
-    /// Read from the files' records a few partitions at a time, with their
-    /// footers.
     fn describe(
         &self,
         name: SchemaQualifiedTableName,
         id: String,
     ) -> Result<DatastoreTableMetadata> {
-        self.describe_as(name, id)
+        Ok(self.describe_as(name, id))
     }
 
-    /// Counted from the log's entries.
+    /// The rows the footers of the version's files count.
     fn total_rows(&self) -> Result<u64> {
-        self.summary.count_rows().ok_or_else(|| {
-            log::Error::UncountedRows {
-                location: self.location.as_str().to_string(),
-            }
-            .into()
-        })
+        Ok(self.files.count_rows())
     }
 
-    /// Counted from the log's entries when every file's records its rows:
-    /// a Delta file here has no deleted row. A local swap changed the files
-    /// without the log, so only a scan counts its rows.
+    /// The rows the footers of the version's files count: a scan reads
+    /// exactly those row groups, and a Delta file here has no deleted row.
     fn count_rows(&self) -> Result<Option<u64>> {
-        if self.swapped.is_some() {
-            return Ok(None);
-        }
-        Ok(self.summary.count_rows())
+        Ok(Some(self.files.count_rows()))
     }
 
-    /// Counted while the log was replayed; `None` for a local swap, which
-    /// changed the files without the log.
     fn count_files(&self) -> Option<u64> {
-        if self.swapped.is_some() {
-            return None;
-        }
-        Some(self.summary.file_count)
+        Some(self.files.count_files())
     }
 
-    /// Selects the files of an unfiltered scan and takes their footers:
-    /// the partition indexes built for it and the row groups of the footers
-    /// read stay in the cache of the tables' file metadata, where the next
-    /// scan takes them from.
+    /// Nothing: the version holds what a scan reads of its metadata and of
+    /// its files' footers.
     fn preload_scan_metadata(&self) -> Result<()> {
-        self.load_scan_row_groups(&[])?;
         Ok(())
     }
 
@@ -1338,12 +595,17 @@ impl Table for DeltaTable {
         None
     }
 
-    /// The row groups the cache of the tables' file metadata holds for each
-    /// file, shared with it; a footer is read only when the cache does not
-    /// hold it, and is then kept there.
+    /// The row groups the version holds for each file, shared with it. A
+    /// file the version does not hold is a commit conflict: another writer
+    /// swapped it out.
     fn row_groups(&self, files: &[FileRef]) -> Result<Vec<Vec<Arc<RowGroupMetadata>>>> {
-        let files: Vec<&FileRef> = files.iter().collect();
-        self.open_footers(&files, FooterUse::Kept)
+        files
+            .iter()
+            .map(|file| match self.files.find(&file.path) {
+                Some(held) => Ok(held.row_groups.clone()),
+                None => Err(self.conflict_at(&file.path)),
+            })
+            .collect()
     }
 
     /// Every column is declared nullable: the footers tell which columns
@@ -1353,12 +615,27 @@ impl Table for DeltaTable {
     }
 
     /// The row groups of the files whose recorded partition tuple and
-    /// column bounds admit a row the filters keep, with the footers the
-    /// cache holds; see
-    /// [`load_scan_row_groups`](Self::load_scan_row_groups). Nullability
-    /// is answered for the files the scan reads.
+    /// column bounds admit a row the filters keep, partition by partition
+    /// in the order a partition's files stand in. Nullability is answered
+    /// for the files the scan reads.
     fn select_scan(&self, filters: &[Expression]) -> Result<ScanSelection> {
-        let row_groups = self.load_scan_row_groups(filters)?;
+        let predicates: Vec<PushedPredicate> = filters
+            .iter()
+            .flat_map(PushedPredicate::from_filter)
+            .collect();
+        let partition_by = &self.shape.partition_by;
+        let partition_filters = self.partition_filter_candidates(&predicates);
+        let stat_filters = self.stat_filter_candidates(&predicates);
+        let row_groups: Vec<Arc<RowGroupMetadata>> = self
+            .files
+            .list_files()
+            .filter(|file| {
+                file.entry
+                    .maybe_matches_partition(partition_by, &partition_filters)
+                    && file.entry.maybe_matches_stats(&stat_filters)
+            })
+            .flat_map(|file| file.row_groups.iter().cloned())
+            .collect();
         let nullability = self.find_nullable_columns(&row_groups);
         Ok(ScanSelection {
             row_groups: Arc::new(ParquetTable::new(row_groups)),
@@ -1367,73 +644,23 @@ impl Table for DeltaTable {
     }
 
     /// One log listing when nothing changed (Kernel updates the snapshot in
-    /// hand rather than rebuilding it). A version another copy of the table
-    /// in this process read or committed is taken as that copy left it.
-    /// Otherwise the log is replayed at the new version, once: its files
-    /// are counted, and those of the partitions the cache holds an index
-    /// for are indexed again, each on the index held. No footer is read.
+    /// hand rather than rebuilding it). Otherwise the log is read at the
+    /// new version, and the footers of the files this version does not hold.
+    /// A footer that cannot be read fails the refresh, so no copy is handed
+    /// back at a version whose files it does not hold.
     fn refresh(&self) -> Result<Option<Arc<dyn Table>>> {
-        let engine = &self.factory.engine;
-        let Some(snapshot) = log::advance_snapshot(&self.snapshot, engine)? else {
+        let factory = &self.factory;
+        let Some(snapshot) = log::advance_snapshot(&self.snapshot, &factory.engine)? else {
             return Ok(None);
         };
-        if let Some(known) = self.lineage.find_version(snapshot.version()) {
-            return Ok(Some(Arc::new(Self {
-                factory: self.factory.clone(),
-                location: self.location.clone(),
-                snapshot: known.snapshot,
-                shape: Arc::clone(&self.shape),
-                summary: known.summary,
-                tombstones: known.tombstones,
-                lineage: Arc::clone(&self.lineage),
-                swapped: None,
-            })));
-        }
-        let shape = log::read_table_shape(&snapshot)?;
-        let (shape, lineage) = if shape == *self.shape {
-            (Arc::clone(&self.shape), Arc::clone(&self.lineage))
-        } else {
-            let lineage = Lineage::begin(&shape)?;
-            (Arc::new(shape), lineage)
-        };
-        let advanced = Self {
-            factory: self.factory.clone(),
-            location: self.location.clone(),
-            snapshot,
-            shape,
-            summary: Arc::default(),
-            tombstones: Arc::default(),
-            lineage,
-            swapped: None,
-        };
-        let indexing = advanced.lineage.indexing.lock().unwrap();
-        let (cache, table) = (&advanced.lineage.cache, &advanced.lineage.cache_key);
-        let indexed: Vec<Arc<[u8]>> = cache.list_indexed_partitions(table);
-        let held = cache.find_indexes::<DeltaIndex>(
-            table,
-            indexed.iter().map(|partition| &**partition),
-            LookupUse::Counted,
-        );
-        let held: HashMap<Arc<[u8]>, Arc<DeltaIndex>> = indexed
-            .iter()
-            .cloned()
-            .zip(held)
-            .filter_map(|(partition, held)| Some((partition, held?.0)))
-            .collect();
-        let indexed: HashSet<Arc<[u8]>> = held.keys().cloned().collect();
-        let kept = Kept::Partitions {
-            now: &indexed,
-            ahead: &HashSet::new(),
-        };
-        let refreshed = advanced.read_from_log(kept, &held)?;
-        drop(indexing);
+        let shape = Arc::new(log::read_table_shape(&snapshot)?);
+        let refreshed = factory.read_version(&self.location, snapshot, shape, &self.files)?;
         Ok(Some(Arc::new(refreshed)))
     }
 
-    /// The next version is derived from this one: its counts by the files
-    /// removed and added, and the index the cache holds for each partition
-    /// they sit in likewise. The log is not read, unless the partition of
-    /// the removed files is not indexed.
+    /// The next version is this one's files less those removed, with those
+    /// added standing after every file of this version, in the order given:
+    /// the log is written and not read.
     fn commit(
         &self,
         removed: RemovedFiles<'_>,
@@ -1441,27 +668,25 @@ impl Table for DeltaTable {
         data_change: bool,
     ) -> Result<Option<Arc<dyn Table>>> {
         let now_ms = crate::vacuum::now_unix_ms();
-        let removed_index = match removed.paths {
-            [] => None,
-            _ => self.load_committed_index(removed.partition)?,
-        };
-        let removed_records: Option<Vec<Arc<DeltaFile>>> = removed
+        let removed_index = self.files.find_partition(removed.partition);
+        let removed_entries: Vec<FileEntry> = removed
             .paths
             .iter()
-            .map(|path| removed_index.as_ref()?.find(path).cloned())
-            .collect();
-        // A file this view holds that the log at its version does not was
-        // swapped in by a commit made through another copy: the log has
-        // moved, and the caller refreshes onto it.
-        let Some(removed_records) = removed_records else {
-            return Ok(None);
-        };
-        let removed_entries: Vec<FileEntry> = removed_records
-            .iter()
-            .map(|file| file.entry.clone())
+            .map(|path| {
+                removed_index
+                    .and_then(|index| index.find(path))
+                    .expect("a file to remove is live in the version it is removed from")
+                    .entry
+                    .clone()
+            })
             .collect();
         let added_entries: Vec<FileEntry> = added.iter().map(|file| file.entry.clone()).collect();
-        let first_commit_sequence = self.next_commit_sequence(now_ms);
+        // Where the first file added stands among the table's commits: at
+        // the clock's reading, or just after the latest file when the clock
+        // has not moved past it, so the files of a later commit always stand
+        // after an earlier one's.
+        let first_commit_sequence = now_ms.max(self.files.latest_commit_sequence + 1);
+        let added_records = build_records(&self.shape, added.to_vec(), first_commit_sequence)?;
         let Some(committed) = log::commit_file_changes(
             &self.factory.engine,
             &self.snapshot,
@@ -1473,57 +698,39 @@ impl Table for DeltaTable {
         else {
             return Ok(None);
         };
-        let added_records = self.lineage.build_records(added, first_commit_sequence)?;
-        let mut summary = VersionSummary::clone(&self.summary);
-        for file in &removed_records {
-            summary.remove(CountedFile::of(file));
+        let mut files = self.files.clone();
+        for path in removed.paths {
+            files.remove(removed.partition, path);
         }
-        for file in &added_records {
-            summary.add(CountedFile::of(file));
+        for (partition, record) in added_records {
+            files.insert(&partition, record);
         }
-        let swapped = match &self.swapped {
-            Some(_) if !removed.paths.is_empty() => {
-                Some(self.swap_more_files(removed.partition, removed.paths, Vec::new()))
-            }
-            swapped => swapped.clone(),
-        };
-        let next = Self {
-            factory: self.factory.clone(),
-            location: self.location.clone(),
+        Ok(Some(Arc::new(Self {
             snapshot: committed,
-            shape: Arc::clone(&self.shape),
-            summary: Arc::new(summary),
+            files,
             tombstones: self.tombstones_after(removed.paths, now_ms),
-            lineage: Arc::clone(&self.lineage),
-            swapped,
-        };
-        next.record_commit(removed_records, added_records);
-        next.keep_footers(added);
-        next.lineage.remember_version(&next);
-        Ok(Some(Arc::new(next)))
+            ..self.clone()
+        })))
     }
 
     /// The files swapped in stand after every file of the version, in the
-    /// order given, and their footers are kept as their writer produced
-    /// them.
+    /// order given, with the footers their writer produced.
     fn with_files_swapped(
         &self,
         removed: RemovedFiles<'_>,
         added: Vec<TableFile>,
     ) -> Result<Arc<dyn Table>> {
-        let first_commit_sequence = self.summary.latest_commit_sequence + 1;
-        let added_records = self.lineage.build_records(&added, first_commit_sequence)?;
-        let swapped = self.swap_more_files(removed.partition, removed.paths, added_records);
-        self.keep_footers(&added);
+        let first_commit_sequence = self.files.latest_commit_sequence + 1;
+        let mut files = self.files.clone();
+        for path in removed.paths {
+            files.remove(removed.partition, path);
+        }
+        for (partition, record) in build_records(&self.shape, added, first_commit_sequence)? {
+            files.insert(&partition, record);
+        }
         Ok(Arc::new(Self {
-            factory: self.factory.clone(),
-            location: self.location.clone(),
-            snapshot: Arc::clone(&self.snapshot),
-            shape: Arc::clone(&self.shape),
-            summary: Arc::clone(&self.summary),
-            tombstones: Arc::clone(&self.tombstones),
-            lineage: Arc::clone(&self.lineage),
-            swapped: Some(swapped),
+            files,
+            ..self.clone()
         }))
     }
 
@@ -1555,11 +762,6 @@ impl Table for DeltaTable {
     /// its storage mtime. Then delete the commits, checkpoints and checksums a
     /// later checkpoint has made redundant, once past the log-retention window.
     /// Failed deletions are retried by the next sweep.
-    ///
-    /// The paths of the version's files are gathered a few partitions at a
-    /// time and held for the sweep, as the listing of the table's directory
-    /// is. A footer the cache holds keeps its file open, so the cache lets
-    /// go of a file's before the file is deleted.
     fn delete_expired_objects(
         &self,
         name: &SchemaQualifiedTableName,
@@ -1568,17 +770,10 @@ impl Table for DeltaTable {
     ) -> Result<()> {
         let cutoff =
             now_ms.saturating_sub(log::deleted_file_retention(&self.snapshot).as_millis() as u64);
-        let mut live: HashSet<ObjectPath> = HashSet::new();
-        let partitions = self.list_partition_keys();
-        self.visit_indexes(&partitions, IndexUse::Counted, &mut |_, index| {
-            live.extend(index.files().map(|file| file.entry.file.path.clone()));
-            Ok(ControlFlow::Continue(()))
-        })?;
-
         let mut deleted = 0u64;
         let mut first_error = None;
         for (path, modified_ms) in storage.list_data_files()? {
-            if live.contains(&path) {
+            if self.files.find(&path).is_some() {
                 continue;
             }
             // A retired file is dated by the commit that retired it, which keeps
@@ -1591,9 +786,6 @@ impl Table for DeltaTable {
             if unreferenced_since_ms > cutoff {
                 continue;
             }
-            self.lineage
-                .cache
-                .remove_footers(&self.lineage.cache_key, std::iter::once(path.as_str()));
             if let Err(error) = storage.delete_data_file(&path) {
                 warn!(table = %name, file = %path, error = %error, "vacuum: deleting file failed");
                 first_error.get_or_insert(error);
@@ -1622,53 +814,4 @@ impl Table for DeltaTable {
         }
         first_error.map_or(Ok(()), Err)
     }
-}
-
-impl DeltaTable {
-    /// Remember what the commit that wrote this version changed, the files
-    /// `removed` from the version it was made on and those `added`, and
-    /// bring the index the cache holds for each partition they sit in to
-    /// this version by them.
-    fn record_commit(&self, removed: Vec<Arc<DeltaFile>>, added: Vec<Arc<DeltaFile>>) {
-        let mut changes: HashMap<Arc<[u8]>, PartitionChange> = HashMap::new();
-        for file in removed {
-            find_change(&mut changes, &file).removed.push(file);
-        }
-        for file in added {
-            find_change(&mut changes, &file).added.push(file);
-        }
-        let partitions: Vec<Arc<[u8]>> = changes.keys().cloned().collect();
-        let version = self.snapshot.version();
-        self.lineage
-            .commits
-            .lock()
-            .unwrap()
-            .record(version, changes.into_values().collect());
-        let (cache, table) = (&self.lineage.cache, &self.lineage.cache_key);
-        let held = cache.find_indexes::<DeltaIndex>(
-            table,
-            partitions.iter().map(|partition| &**partition),
-            LookupUse::Counted,
-        );
-        for (partition, held) in partitions.iter().zip(held) {
-            if let Some((index, built_at)) = held {
-                self.bring_index(partition, index, built_at);
-            }
-        }
-    }
-}
-
-/// What a commit changed in the partition of `file`, among `changes`.
-fn find_change<'c>(
-    changes: &'c mut HashMap<Arc<[u8]>, PartitionChange>,
-    file: &DeltaFile,
-) -> &'c mut PartitionChange {
-    let partition = file.partition();
-    changes
-        .entry(Arc::clone(partition))
-        .or_insert_with(|| PartitionChange {
-            partition: Arc::clone(partition),
-            removed: Vec::new(),
-            added: Vec::new(),
-        })
 }

@@ -1,10 +1,9 @@
 //! Delta Lake metadata loading for the catalog refresh path.
 //!
 //! Delta Kernel is the source of truth for a table's version, schema, and
-//! active `Add` files. A version's files are not held as a list: the log,
-//! its checkpoint and the commits after it, is replayed whenever a
-//! partition's files are wanted ([`replay_files`]), and each replay hands
-//! out every live file once for the caller to keep or pass over.
+//! active `Add` files. One read of the log, its checkpoint and the commits
+//! after it, lists every live file of a version ([`read_files`]); Pivot
+//! then fetches the Parquet footers of the files it does not hold yet.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -54,18 +53,6 @@ use object_storage::{FileRef, ObjectPath, ObjectStore, StoreConnection};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error(
-        "the Delta log of the table at `{location}` does not record the row count of every data file"
-    )]
-    UncountedRows { location: String },
-    #[error(
-        "replaying the Delta log of the table at `{location}` met {replayed} files in a partition its version counts {counted} files in"
-    )]
-    ReplayedFileCount {
-        location: String,
-        replayed: u64,
-        counted: u64,
-    },
     #[error("invalid Delta table URI `{uri}`: {source}")]
     InvalidUri {
         uri: String,
@@ -140,7 +127,6 @@ const DEFAULT_DELETED_FILE_RETENTION: Duration = Duration::from_secs(4 * 60 * 60
 /// the columns its files are partitioned and sorted by. The table's durable
 /// identity is not sourced here: the catalog owns its own id in its manifest,
 /// independent of the id Kernel mints into the `metaData` action.
-#[derive(PartialEq)]
 pub(crate) struct TableShape {
     pub columns: Vec<Column>,
     pub partition_by: Vec<String>,
@@ -150,27 +136,15 @@ pub(crate) struct TableShape {
     delta_types: HashMap<String, DeltaDataType>,
 }
 
-/// One live file as a replay of the log meets it.
-pub(crate) struct ReplayedFile<'batch> {
-    /// The file with its partition tuple. Its statistics are left out:
-    /// [`read_stats`](Self::read_stats) decodes them for a file the caller
-    /// keeps.
+/// One live file as the log records it.
+pub(crate) struct LoggedFile {
+    /// The file with its partition tuple and the statistics the log
+    /// persisted for it; no statistics for a file the log recorded none for.
     pub entry: FileEntry,
     /// Where the commit that added the file stands among the table's
     /// commits: the `modificationTime` its `Add` action carries, which a
     /// commit made here numbers its files by ([`commit_file_changes`]).
     pub commit_sequence: u64,
-    /// The rows the file holds, when the log records them.
-    pub rows: Option<u64>,
-    batch: &'batch ScanBatch<'batch>,
-}
-
-impl ReplayedFile<'_> {
-    /// The file's statistics as the log persisted them; `None` for a file
-    /// the log recorded none for.
-    pub(crate) fn read_stats(&self) -> Option<parquet_engine::FileStats> {
-        self.batch.read_file_stats(self.entry.file.path.as_str())
-    }
 }
 
 /// Initialize version 0 for `CREATE TABLE`. Data files already exist; this
@@ -208,7 +182,8 @@ pub(crate) fn initialize_table(
     }
     if !sort_by.is_empty() {
         // Delta has no native sort spec; it rides as a free-form table property
-        // (custom app keys are preserved) and is read back in `load_table`.
+        // (custom app keys are preserved) and is read back in
+        // `read_table_shape`.
         builder = builder.with_table_properties([(SORT_BY_CONFIGURATION_KEY, sort_by.join(","))]);
     }
     let mut txn = builder.build(engine.kernel(), Box::new(FileSystemCommitter::new()))?;
@@ -928,38 +903,33 @@ pub(crate) fn read_table_shape(snapshot: &Snapshot) -> Result<TableShape, Error>
     })
 }
 
-/// Replay the log `snapshot` was built from, its checkpoint and the commits
-/// after it, and hand every live file of the version to `visit`, once each,
-/// in the order the replay meets them. Nothing is kept here: a file's
-/// statistics are decoded only when the visit asks for them, so a replay
-/// that keeps the files of a few partitions pays for those files alone.
+/// Every live file of the version `snapshot` is at, read from the log the
+/// snapshot was built from, its checkpoint and the commits after it, in the
+/// order the read meets them.
 ///
 /// Kernel is asked for the typed `stats_parsed` struct
 /// (min/max/nullCount/numRecords) alongside the scan files, so a file carries
 /// its Parquet statistics straight from the log and is pruned by range with no
 /// footer in hand.
-pub(crate) fn replay_files<Failure: From<Error>>(
+pub(crate) fn read_files(
     snapshot: &Arc<Snapshot>,
     engine: &DeltaEngine,
     shape: &TableShape,
-    visit: &mut dyn FnMut(ReplayedFile<'_>) -> Result<(), Failure>,
-) -> Result<(), Failure> {
+) -> Result<Vec<LoggedFile>, Error> {
     let scan = snapshot
         .clone()
         .scan_builder()
         .with_stats(StatsOptions::all_struct())
-        .build()
-        .map_err(Error::from)?;
+        .build()?;
     let by_name: HashMap<&str, &Type> = shape
         .columns
         .iter()
         .map(|column| (column.name.as_str(), &column.col_type))
         .collect();
-    for metadata in scan.scan_metadata(engine.kernel()).map_err(Error::from)? {
-        let scan_metadata = metadata.map_err(Error::from)?;
-        let scan_files = scan_metadata
-            .visit_scan_files(Vec::new(), collect_scan_file)
-            .map_err(Error::from)?;
+    let mut files = Vec::new();
+    for metadata in scan.scan_metadata(engine.kernel())? {
+        let scan_metadata = metadata?;
+        let scan_files = scan_metadata.visit_scan_files(Vec::new(), collect_scan_file)?;
         let (data, live) = scan_metadata.scan_files.into_parts();
         let data: Arc<dyn EngineData> = Arc::from(data);
         let arrow = data.as_any().downcast::<ArrowEngineData>().map_err(|_| {
@@ -971,7 +941,7 @@ pub(crate) fn replay_files<Failure: From<Error>>(
         for file in scan_files {
             // A file recorded before any time reads as committed first.
             let commit_sequence = u64::try_from(file.modification_time).unwrap_or(0);
-            let rows = batch.read_row_count(&file.path);
+            let stats = batch.read_file_stats(&file.path).map(Arc::new);
             let null_columns = batch.list_null_partition_columns(&file.path);
             let mut entry =
                 scan_file_entry(file, &by_name, &shape.delta_types, &shape.partition_by)?;
@@ -986,15 +956,14 @@ pub(crate) fn replay_files<Failure: From<Error>>(
                     }
                 }
             }
-            visit(ReplayedFile {
+            entry.stats = stats;
+            files.push(LoggedFile {
                 entry,
                 commit_sequence,
-                rows,
-                batch: &batch,
-            })?;
+            });
         }
     }
-    Ok(())
+    Ok(files)
 }
 
 /// The Delta Kernel engine a datastore reads and writes its tables' logs
@@ -1230,13 +1199,6 @@ impl<'batch> ScanBatch<'batch> {
     fn find_stats_row(&self, path: &str) -> Option<usize> {
         let row = *self.rows_by_path.get(path)?;
         (!self.stats?.is_null(row)).then_some(row)
-    }
-
-    /// The rows the file at `path` holds, when the log recorded them.
-    fn read_row_count(&self, path: &str) -> Option<u64> {
-        let row = self.find_stats_row(path)?;
-        let num_records = self.num_records.filter(|column| !column.is_null(row))?;
-        u64::try_from(num_records.value(row)).ok()
     }
 
     /// The statistics the log recorded for the file at `path`.
@@ -1638,25 +1600,19 @@ mod tests {
     use arrow_array::Datum;
 
     /// Every live file of `snapshot` with its statistics, in the order a
-    /// replay of its log meets them.
-    fn replay_entries(snapshot: &Arc<Snapshot>, engine: &DeltaEngine) -> Vec<FileEntry> {
+    /// read of its log meets them.
+    fn read_entries(snapshot: &Arc<Snapshot>, engine: &DeltaEngine) -> Vec<FileEntry> {
         let shape = read_table_shape(snapshot).unwrap();
-        let mut entries = Vec::new();
-        let mut keep_entry = |file: ReplayedFile<'_>| -> Result<(), Error> {
-            let stats = file.read_stats().map(Arc::new);
-            entries.push(FileEntry {
-                stats,
-                ..file.entry
-            });
-            Ok(())
-        };
-        replay_files(snapshot, engine, &shape, &mut keep_entry).unwrap();
-        entries
+        read_files(snapshot, engine, &shape)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.entry)
+            .collect()
     }
 
     /// Every live file of the table at `uri` at its latest version.
     fn load_entries(uri: &Url, engine: &DeltaEngine) -> Vec<FileEntry> {
-        replay_entries(&open_snapshot(uri, engine).unwrap(), engine)
+        read_entries(&open_snapshot(uri, engine).unwrap(), engine)
     }
 
     /// Exercise the whole Kernel write path the catalog relies on end to end at
@@ -1748,7 +1704,7 @@ mod tests {
         ));
     }
 
-    /// A file's persisted Parquet stats round-trip through the log: `load_table`
+    /// A file's persisted Parquet stats round-trip through the log: `read_files`
     /// reads them back off the Delta `Add` (as Kernel's typed `stats_parsed`),
     /// with no footer in hand -- so a reloaded file can be pruned by range.
     #[test]
@@ -2242,7 +2198,7 @@ mod tests {
 
         assert_eq!(rebuilt.version(), ours.version());
         assert_eq!(
-            replay_entries(&rebuilt, &table.engine).len(),
+            read_entries(&rebuilt, &table.engine).len(),
             1,
             "the rebuilt snapshot names our file alone, not the later writer's"
         );

@@ -20,13 +20,29 @@
 //! to, an insert's or a merge's output alike, which the table's format
 //! reads from the metadata written since; a partition nothing was added to
 //! is not walked, and a format that holds its files a partition at a time
-//! does not load it. Nothing is remembered when the compacter starts, so
-//! its first round examines every partition once. `COMPACT ... FINAL`
-//! examines every partition, one after another. What a round remembers of
-//! a partition's layout ([`overlap::OverlapCache`]) is dropped when the
-//! round is done with the partition. No round examines a partition whose
-//! files the table's format does not rewrite: an Iceberg table's partition
-//! written under a partition spec other than the table's default.
+//! does not load it. A format that keeps no record of what a commit added
+//! tells every partition, and a round over it examines them all. Nothing
+//! is remembered when the compacter starts, so its first round examines
+//! every partition once. `COMPACT ... FINAL` examines every partition, one
+//! after another. No round examines a partition whose files the table's
+//! format does not rewrite: an Iceberg table's partition written under a
+//! partition spec other than the table's default.
+//!
+//! # What the rounds remember of a partition's layout
+//!
+//! Per partition, the rounds remember which files they measured and the
+//! pairs of them that clear the contested bar, each with its share
+//! ([`overlap::OverlapCache`]), so a round over a partition measures only
+//! the files no round measured before, and a round over an unchanged
+//! partition measures nothing. A pair below the bar is not remembered: a
+//! final sweep, which merges those too, measures every pair of a partition
+//! again when it reaches it, and lets go of the ones below the bar when it
+//! is done with the partition. A file that is gone is forgotten by the next
+//! round that examines its partition, and a partition left without a file
+//! a layout merge may rewrite leaves nothing remembered. A partition the
+//! table no longer has is forgotten by the next round that lists every
+//! partition of the table, its first or a final sweep, and a table the
+//! datastore no longer holds by the next round over any table.
 //!
 //! # Small files
 //!
@@ -307,9 +323,9 @@ pub struct CompacterActor {
 /// What the rounds over one table remember from one to the next.
 #[derive(Default)]
 struct TableRounds {
-    /// The table's pair overlaps, a partition at a time, so a pass only
-    /// measures the files it has not seen before (see
-    /// [`overlap::OverlapCache`]).
+    /// What the rounds know of the layout of each partition they examined
+    /// that holds a file a layout merge may rewrite, so a pass only measures
+    /// the files no round measured before (see [`overlap::OverlapCache`]).
     overlaps: PartitionOverlaps,
     /// Where the version a round began on stood among the table's commits,
     /// for the last round that ended with nothing left to merge: no file a
@@ -325,8 +341,8 @@ struct RoundOutcome {
     examined: Vec<Vec<u8>>,
 }
 
-/// One table's pair overlaps, by the partition the files of a pair sit in,
-/// as a walk names it.
+/// What the rounds know of the layout of one table's partitions, by the
+/// partition, as a walk names it.
 type PartitionOverlaps = HashMap<Vec<u8>, overlap::OverlapCache>;
 
 impl CompacterHandle {
@@ -405,6 +421,7 @@ impl CompacterActor {
                 biased;
                 command = self.commands.recv() => match command {
                     Some(command) => {
+                        self.forget_dropped_tables();
                         let res = self
                             .compact_table(&command.name, command.table, command.pass)
                             .await;
@@ -427,11 +444,17 @@ impl CompacterActor {
         }
     }
 
+    /// Forget what the rounds remember of the tables the datastore no
+    /// longer holds.
+    fn forget_dropped_tables(&mut self) {
+        let datastore = &self.datastore;
+        self.tables
+            .retain(|id, _| datastore.table_handle_by_id(id).is_some());
+    }
+
     async fn compact_all(&mut self) {
-        let tables = self.datastore.tables();
-        let live: HashSet<Uuid> = tables.iter().map(|(_, table)| table.id()).collect();
-        self.tables.retain(|id, _| live.contains(id));
-        for (name, table) in tables {
+        self.forget_dropped_tables();
+        for (name, table) in self.datastore.tables() {
             match self
                 .compact_table(&name, table, CompactionPass::Routine)
                 .await
@@ -458,7 +481,8 @@ impl CompacterActor {
     ///
     /// A routine round examines the partitions a commit added a file to
     /// since the table was last examined, every partition when it never
-    /// was; a final one examines them all.
+    /// was; a final one examines them all. A round that lists every
+    /// partition of the table forgets what is remembered of any other.
     ///
     /// The round works off its one refreshed copy rather than reloading the
     /// metadata per pass: each of its own merges is folded in as it commits,
@@ -481,8 +505,10 @@ impl CompacterActor {
             .tables
             .get(&id)
             .and_then(|rounds| rounds.examined_through);
+        let listed = list_round_partitions(&table, pass, examined_through).await?;
+        self.forget_partitions_not_among(id, &listed);
         let mut progress = RoundProgress {
-            partitions: list_round_partitions(&table, pass, examined_through).await?,
+            partitions: listed.partitions,
             ..RoundProgress::default()
         };
         loop {
@@ -555,14 +581,15 @@ impl CompacterActor {
                     // The reloaded copy may hold work in a partition the
                     // round was done with, or had no reason to examine.
                     progress.finished.clear();
-                    progress.partitions =
-                        match list_round_partitions(&table, pass, examined_through).await {
-                            Ok(partitions) => partitions,
-                            Err(error) => {
-                                drain_merges(&mut in_flight).await;
-                                return Err(error);
-                            }
-                        };
+                    let listed = match list_round_partitions(&table, pass, examined_through).await {
+                        Ok(listed) => listed,
+                        Err(error) => {
+                            drain_merges(&mut in_flight).await;
+                            return Err(error);
+                        }
+                    };
+                    self.forget_partitions_not_among(id, &listed);
+                    progress.partitions = listed.partitions;
                 }
                 Err(error) => {
                     drain_merges(&mut in_flight).await;
@@ -570,6 +597,23 @@ impl CompacterActor {
                 }
             }
         }
+    }
+
+    /// Forget what is remembered of the partitions of the table `id` that
+    /// are not among `listed`, when the round listed every partition of the
+    /// table: the table no longer has a file a rewrite may replace in any
+    /// other.
+    fn forget_partitions_not_among(&mut self, id: Uuid, listed: &RoundPartitions) {
+        if !listed.lists_every_partition {
+            return;
+        }
+        let Some(rounds) = self.tables.get_mut(&id) else {
+            return;
+        };
+        let listed: HashSet<&[u8]> = listed.partitions.iter().map(Vec::as_slice).collect();
+        rounds
+            .overlaps
+            .retain(|partition, _| listed.contains(partition.as_slice()));
     }
 
     /// The next merge a pass can start (see [`MergeSelection::next_batch`]),
@@ -611,6 +655,16 @@ impl CompacterActor {
     }
 }
 
+/// The partitions a round examines.
+struct RoundPartitions {
+    /// The partitions, as a walk names them, in the order the round
+    /// examines them.
+    partitions: Vec<Vec<u8>>,
+    /// Whether the round listed every partition of the table whose files a
+    /// rewrite may replace, and not only those a commit added a file to.
+    lists_every_partition: bool,
+}
+
 /// The partitions a round over `table`, refreshed to the version it works
 /// on, examines, in the order it does: those a commit added a file to
 /// since the one standing at `examined_through`, for a routine round over
@@ -621,16 +675,21 @@ async fn list_round_partitions(
     table: &CatalogTable,
     pass: CompactionPass,
     examined_through: Option<u64>,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<RoundPartitions> {
     let table = table.clone();
     let listed = tokio::task::spawn_blocking(move || {
-        let partitions = match (pass, examined_through) {
-            (CompactionPass::Routine, Some(commit_position)) => {
-                table.list_partitions_added_after(commit_position)
-            }
-            _ => table.list_partitions(),
+        let added_after = match (pass, examined_through) {
+            (CompactionPass::Routine, Some(commit_position)) => Some(commit_position),
+            _ => None,
+        };
+        let partitions = match added_after {
+            Some(commit_position) => table.list_partitions_added_after(commit_position),
+            None => table.list_partitions(),
         }?;
-        table.select_rewritable_partitions(partitions)
+        Ok::<_, Error>(RoundPartitions {
+            partitions: table.select_rewritable_partitions(partitions)?,
+            lists_every_partition: added_after.is_none(),
+        })
     })
     .await;
     listed.map_err(|error| Error::CompactionJobPanicked(error.to_string()))?
@@ -677,10 +736,11 @@ impl MergeSelection {
     ///
     /// A pass looks at the partitions `progress` lists for the round, one
     /// at a time and never at one it records as finished. A partition with
-    /// nothing to start and no merge in flight is finished, and what
-    /// `overlaps` remembers of it is dropped. The partitions are indexed a
-    /// few ahead of the look, so a pass over many partitions does not read
-    /// the table's metadata again for each.
+    /// nothing to start and no merge in flight is finished, and `overlaps`
+    /// keeps of it what the rounds remember between them: nothing, when it
+    /// holds no file a layout merge may rewrite. The partitions are indexed
+    /// a few ahead of the look, so a pass over many partitions does not
+    /// read the table's metadata again for each.
     fn next_batch(
         &self,
         overlaps: &mut PartitionOverlaps,
@@ -705,14 +765,8 @@ impl MergeSelection {
                         kind: MergeKind::SmallFiles,
                     }));
                 }
-                let overlap_cache = overlaps.entry(partition.clone()).or_default();
-                let group = self.next_layout_optimization(
-                    overlap_cache,
-                    table,
-                    &partition,
-                    reserved,
-                    pass,
-                )?;
+                let group =
+                    self.next_layout_optimization(overlaps, table, &partition, reserved, pass)?;
                 if let Some(inputs) = group {
                     return Ok(Some(MergeBatch {
                         partition,
@@ -723,7 +777,12 @@ impl MergeSelection {
                 if progress.merging.contains(&partition) {
                     continue;
                 }
-                overlaps.remove(&partition);
+                if let Some(cache) = overlaps.get_mut(&partition) {
+                    cache.forget_pairs_below_bar();
+                    if cache.is_empty() {
+                        overlaps.remove(&partition);
+                    }
+                }
                 progress.finished.insert(partition);
             }
         }
@@ -763,14 +822,14 @@ impl MergeSelection {
     }
 
     /// The next group of at-least-half-full files of `partition` one merge
-    /// should rewrite together, chosen by the partition's
-    /// [`overlap::OverlapCache`]: a full clique in a routine round, any
-    /// connected group in a final sweep. Reserved files stay in view so
-    /// their remembered overlaps survive a failed merge; selection passes
-    /// their pairs over.
+    /// should rewrite together, chosen by what `overlaps` knows of the
+    /// partition ([`overlap::OverlapCache`]): a full clique in a routine
+    /// round, any connected group in a final sweep. Reserved files stay in
+    /// view so their remembered overlaps survive a failed merge; selection
+    /// passes their pairs over.
     fn next_layout_optimization(
         &self,
-        cache: &mut overlap::OverlapCache,
+        overlaps: &mut PartitionOverlaps,
         table: &CatalogTable,
         partition: &[u8],
         reserved: &HashSet<ObjectPath>,
@@ -785,7 +844,8 @@ impl MergeSelection {
             partition,
             target_bytes: self.target_bytes,
         };
-        cache.observe(&candidates, table.sort_by())?;
+        let cache = overlaps.entry(partition.to_vec()).or_default();
+        cache.observe(&candidates, table.sort_by(), pass)?;
         let Some(group) = cache.select_group(reserved, pass, self.layout_clique_size) else {
             return Ok(None);
         };
@@ -2682,6 +2742,132 @@ mod tests {
             path: ObjectPath::new(path),
             size,
         }
+    }
+
+    /// A Delta datastore holding the sorted table `events` over one file,
+    /// with the directory that keeps it alive.
+    fn datastore_with_one_sorted_file(
+        dispatch: &Dispatch,
+    ) -> (tempfile::TempDir, Arc<PivotlakeDatastore>) {
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_parquet_file(&adopted, "a.parquet", vec![0, 100]);
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(Path::new("events")),
+            true,
+        );
+        (db, datastore)
+    }
+
+    /// A compaction actor over `datastore` that nothing drives but the
+    /// test, for which every file is full enough for layout work.
+    fn layout_actor(datastore: Arc<PivotlakeDatastore>) -> CompacterActor {
+        let (_, actor) = CompacterHandle::new(
+            2,
+            u64::MAX,
+            usize::MAX,
+            DEFAULT_COMPACT_PARALLELISM,
+            2,
+            None,
+            datastore,
+        );
+        actor
+    }
+
+    /// Run `rounds`, what a test drives a compaction actor through, to
+    /// completion on a temporary runtime.
+    fn block_on_rounds<Outcome>(rounds: impl Future<Output = Outcome>) -> Outcome {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(rounds)
+    }
+
+    /// One round of `actor` running `pass` over the table `name` as its
+    /// datastore holds it.
+    fn run_round(
+        actor: &mut CompacterActor,
+        name: &SchemaQualifiedTableName,
+        pass: CompactionPass,
+    ) {
+        let table = actor.datastore.table_handle(name).unwrap();
+        block_on_rounds(actor.compact_table(name, table, pass)).unwrap();
+    }
+
+    /// Whether `actor` remembers anything of the layout of the table `id`.
+    fn remembers_a_layout_of(actor: &CompacterActor, id: Uuid) -> bool {
+        actor
+            .tables
+            .get(&id)
+            .is_some_and(|rounds| !rounds.overlaps.is_empty())
+    }
+
+    #[test]
+    fn a_final_sweep_forgets_the_partition_its_table_no_longer_has() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let (_db, datastore) = datastore_with_one_sorted_file(&dispatch);
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let mut table = datastore.table_handle(&name).unwrap();
+        let mut actor = layout_actor(datastore.clone());
+        run_round(&mut actor, &name, CompactionPass::Routine);
+        let remembered_with_the_file = remembers_a_layout_of(&actor, table.id());
+        let files: Vec<ObjectPath> = table
+            .file_refs()
+            .unwrap()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        table.replace_data_files(&files, &[]).unwrap();
+        datastore.refresh_from_store().unwrap();
+
+        run_round(&mut actor, &name, CompactionPass::Final);
+
+        assert!(remembered_with_the_file);
+        assert!(!remembers_a_layout_of(&actor, table.id()));
+        dispatch.exit();
+    }
+
+    #[test]
+    fn a_round_forgets_the_table_its_datastore_no_longer_holds() {
+        use catalog::datastore::DatastoreTransaction as _;
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let (_db, datastore) = datastore_with_one_sorted_file(&dispatch);
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let id = datastore.table_handle(&name).unwrap().id();
+        let mut actor = layout_actor(datastore.clone());
+        run_round(&mut actor, &name, CompactionPass::Routine);
+        let remembered_before_the_drop = actor.tables.contains_key(&id);
+        let transaction = datastore.clone().begin_transaction();
+        transaction
+            .bind_drop_table(planner::catalog::DropTableRequest {
+                datastore_name: None,
+                schema_name: None,
+                name: "events".to_string(),
+                if_exists: false,
+            })
+            .unwrap()
+            .compile(dispatch.dispatcher())
+            .unwrap()
+            .collect()
+            .unwrap();
+        block_on_rounds(transaction.commit()).unwrap();
+
+        block_on_rounds(actor.compact_all());
+
+        assert!(remembered_before_the_drop);
+        assert!(!actor.tables.contains_key(&id));
+        dispatch.exit();
     }
 
     #[test]

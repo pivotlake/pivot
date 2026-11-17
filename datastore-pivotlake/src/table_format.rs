@@ -172,7 +172,8 @@ pub(crate) trait Table: Send + Sync {
     fn select_rewritable_partitions(&self, partitions: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>>;
     /// Index each of `partitions` together, so that loading their files
     /// one after another reads none of the table's metadata again for
-    /// each.
+    /// each. A format whose version holds every partition's files has
+    /// nothing to do.
     fn index_partitions(&self, partitions: &[Vec<u8>]) -> Result<()>;
     /// The live data files of `partition`, as the index the version keeps
     /// them in; `None` when this version has no file in the partition.
@@ -214,10 +215,10 @@ pub(crate) trait Table: Send + Sync {
     /// that resolves them by name.
     fn field_ids(&self) -> Option<Vec<i32>>;
     /// The row groups of each of `files` (live files of this very version),
-    /// in the order given: what a merge and a layout measurement read. The
-    /// footers are kept in a cache: those it does not hold are read, and
-    /// the caller keeps what it is handed only for as long as it works on
-    /// it.
+    /// in the order given: what a merge and a layout measurement read. A
+    /// format that keeps its footers in a cache reads those the cache does
+    /// not hold, and the caller keeps what it is handed only for as long as
+    /// it works on it.
     fn row_groups(&self, files: &[FileRef]) -> Result<Vec<Vec<Arc<RowGroupMetadata>>>>;
     /// Whether each column (in `columns` order) may hold a NULL in a file
     /// of this version, as the metadata held declares it with nothing read;

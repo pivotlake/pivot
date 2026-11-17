@@ -181,6 +181,20 @@ impl Database {
         Self::open_at_in_format(TempDir::new().unwrap(), None, format)
     }
 
+    /// A fresh database whose tables are kept in `format` and whose
+    /// `COMPACT` statements run with `compaction`'s sizes, and no timers.
+    pub fn in_format_with_compaction(format: TableFormat, compaction: CompactionConfig) -> Self {
+        Self::open_at_in_format(
+            TempDir::new().unwrap(),
+            Some(MaintenanceConfig {
+                refresh_interval: Duration::from_secs(3600),
+                compaction: Some(compaction),
+                vacuum: None,
+            }),
+            format,
+        )
+    }
+
     /// Reopen the database in `dir`, whose tables are kept in `format`, the
     /// way a restarted server would.
     pub fn reopen_in_format(dir: TempDir, format: TableFormat) -> Self {

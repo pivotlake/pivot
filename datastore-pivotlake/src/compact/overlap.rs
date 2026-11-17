@@ -245,7 +245,7 @@ struct SweptFile {
     /// bytes.
     lowest: Range<usize>,
     highest: Range<usize>,
-    /// Whether no earlier observation saw the file.
+    /// Whether no earlier observation measured the file.
     is_new: bool,
 }
 
@@ -282,8 +282,8 @@ impl PartitionSweep {
     /// The files are swept in order of their lowest key, keeping in reach
     /// those whose highest key has not yet been passed; only those can share
     /// a stretch of the key with the current file. A new file is paired
-    /// with every file in reach, a file seen before only with the new ones,
-    /// so a partition without a new file yields nothing, and the first
+    /// with every file in reach, a file measured before only with the new
+    /// ones, so a partition without a new file yields nothing, and the first
     /// observation of a table yields its overlapping pairs rather than all
     /// pairs.
     fn collect_pairs_into(&mut self, pairs: &mut Vec<(Arc<ObjectPath>, Arc<ObjectPath>)>) {
@@ -322,45 +322,77 @@ impl PartitionSweep {
     }
 }
 
-/// The pair overlaps of one partition of a table, remembered between
-/// rounds.
+/// What the rounds know of the layout of one partition of a table.
 ///
 /// An overlap depends only on the two files' footers and manifest stats, so
-/// it is measured once: a round measures the files it has not seen before
-/// against the files of the partition they can interleave with, and
-/// forgets the files that are gone. Every pair sharing a stretch of the key
-/// is kept under both of its files, so a file's partners are one lookup
-/// away. Paths are shared, so each is stored once however many pairs
+/// it is measured once: a round measures the files no round measured before
+/// against the files of the partition they can interleave with, and forgets
+/// the files that are gone.
+///
+/// Between rounds it holds which files were measured and the pairs that
+/// clear the contested bar, each with its share, and nothing else: a pair
+/// below the bar is one no routine round merges. A final sweep, which
+/// merges those too, measures every pair again when it reaches the
+/// partition, holds them all while it works on it and lets go of the ones
+/// below the bar when it is done.
+///
+/// A pair is kept under both of its files, so a file's partners are one
+/// lookup away. Paths are shared, so each is stored once however many pairs
 /// contain it.
 #[derive(Default)]
 pub(super) struct OverlapCache {
-    /// One shared copy of each live file's path, the handle partner lists
-    /// are keyed by.
-    known_paths: HashSet<Arc<ObjectPath>>,
-    /// Each live file's remembered partners and how far they overlap it.
+    /// One shared copy of the path of each file an observation measured,
+    /// the handle the pairs name the file by.
+    measured: HashSet<Arc<ObjectPath>>,
+    /// The partners of each file that has one, and how far they overlap it.
     partners: HashMap<Arc<ObjectPath>, HashMap<Arc<ObjectPath>, PairOverlap>>,
+    /// Whether the pairs below the contested bar are held too: while a
+    /// final sweep works on the partition.
+    holds_every_pair: bool,
 }
 
 impl OverlapCache {
     /// Bring the cache up to date with the candidates `source` walks, the
-    /// partition's: measure the files no earlier round has seen against
-    /// the files they can interleave with, and forget the files that are
-    /// gone.
+    /// partition's, for a round running `pass`: measure the files no
+    /// earlier observation measured against the files they can interleave
+    /// with, and forget the files that are gone. The first observation of a
+    /// final sweep measures every file again.
     ///
     /// The walk reads no footer and decodes no bound: which pairs may share
     /// a stretch of the key is decided on the sort ranges it hands out (see
     /// [`PartitionSweep::collect_pairs_into`]). Only the files of those
     /// pairs have their bounds decoded, and only those of the pairs the
-    /// bounds do not rule out have their footers read.
-    pub(super) fn observe(&mut self, source: &dyn LayoutSource, sort_by: &[String]) -> Result<()> {
+    /// bounds do not rule out have their footers read. A file counts as
+    /// measured once that has succeeded.
+    pub(super) fn observe(
+        &mut self,
+        source: &dyn LayoutSource,
+        sort_by: &[String],
+        pass: CompactionPass,
+    ) -> Result<()> {
         if sort_by.is_empty() {
             return Ok(());
         }
-        let mut live = HashSet::new();
+        match pass {
+            CompactionPass::Final if !self.holds_every_pair => {
+                *self = Self {
+                    holds_every_pair: true,
+                    ..Self::default()
+                };
+            }
+            CompactionPass::Final => {}
+            CompactionPass::Routine => self.forget_pairs_below_bar(),
+        }
+        // The candidates walked, each by the copy of its path held for it
+        // since it was measured, or by a new one.
+        let mut live = HashSet::with_capacity(self.measured.len());
         let mut sweep = PartitionSweep::default();
         let mut pairs = Vec::new();
         source.walk_candidates(&mut |partition, file| {
-            let (path, is_new) = self.intern(&file.file().path);
+            let (path, is_new) = match self.measured.get(&file.file().path) {
+                Some(measured) => (measured.clone(), false),
+                None => (Arc::new(file.file().path.clone()), true),
+            };
             live.insert(path.clone());
             if !sweep.is_collecting(partition) {
                 sweep.collect_pairs_into(&mut pairs);
@@ -373,12 +405,35 @@ impl OverlapCache {
             }
         })?;
         sweep.collect_pairs_into(&mut pairs);
-        self.retain_live_files(&live);
-        self.measure_pairs(source, pairs, sort_by)
+        self.forget_gone_files(&live);
+        self.measure_pairs(source, pairs, sort_by)?;
+        self.measured = live;
+        Ok(())
     }
 
-    /// Measure each of `pairs` and remember those that share a stretch of
-    /// the sort key, under both of their files.
+    /// Let go of the pairs below the contested bar, which only the final
+    /// sweep that measured them merges: what stays is what the rounds
+    /// remember between them.
+    pub(super) fn forget_pairs_below_bar(&mut self) {
+        if !self.holds_every_pair {
+            return;
+        }
+        for partners in self.partners.values_mut() {
+            partners.retain(|_, overlap| overlap.clears_bar);
+        }
+        self.partners.retain(|_, partners| !partners.is_empty());
+        self.holds_every_pair = false;
+    }
+
+    /// Whether nothing is remembered: no file measured, and so no pair.
+    pub(super) fn is_empty(&self) -> bool {
+        self.measured.is_empty() && self.partners.is_empty()
+    }
+
+    /// Measure each of `pairs` and remember, under both of their files,
+    /// those that share a stretch of the sort key and that the cache holds:
+    /// every one during a final sweep, else those that clear the contested
+    /// bar.
     fn measure_pairs(
         &mut self,
         source: &dyn LayoutSource,
@@ -431,6 +486,9 @@ impl OverlapCache {
             ) else {
                 continue;
             };
+            if !self.holds_every_pair && !overlap.clears_bar {
+                continue;
+            }
             self.partners
                 .entry(left.clone())
                 .or_default()
@@ -589,33 +647,24 @@ impl OverlapCache {
             .collect()
     }
 
-    /// The shared copy of `path`, the handle partner lists are keyed by, and
-    /// whether no earlier observation saw the file.
-    fn intern(&mut self, path: &ObjectPath) -> (Arc<ObjectPath>, bool) {
-        if let Some(known) = self.known_paths.get(path) {
-            return (known.clone(), false);
-        }
-        let shared = Arc::new(path.clone());
-        self.partners.entry(shared.clone()).or_default();
-        self.known_paths.insert(shared.clone());
-        (shared, true)
-    }
-
-    /// Forget the files not in `live` and every pair containing one, at the
-    /// cost of the gone files' pairs rather than of every remembered pair.
-    fn retain_live_files(&mut self, live: &HashSet<Arc<ObjectPath>>) {
+    /// Forget every pair that holds a file not in `live`, at the cost of
+    /// the gone files' pairs rather than of every remembered pair.
+    fn forget_gone_files(&mut self, live: &HashSet<Arc<ObjectPath>>) {
         let gone: Vec<Arc<ObjectPath>> = self
-            .known_paths
-            .iter()
+            .partners
+            .keys()
             .filter(|path| !live.contains(*path))
             .cloned()
             .collect();
         for path in gone {
-            self.known_paths.remove(&path);
             let partners = self.partners.remove(&path).unwrap_or_default();
             for partner in partners.keys() {
-                if let Some(partner_pairs) = self.partners.get_mut(partner) {
-                    partner_pairs.remove(&path);
+                let is_left_alone = self.partners.get_mut(partner).is_some_and(|pairs| {
+                    pairs.remove(&path);
+                    pairs.is_empty()
+                });
+                if is_left_alone {
+                    self.partners.remove(partner);
                 }
             }
         }
@@ -791,24 +840,27 @@ mod tests {
     }
 
     /// Bring `cache` up to date with `partitions`, each one partition's
-    /// candidates. Returns the files whose footers the observation read.
+    /// candidates, for a round running `pass`. Returns the files whose
+    /// footers the observation read.
     fn observe_candidates(
         cache: &mut OverlapCache,
         partitions: &[&[LayoutCandidate<'_>]],
         sort_by: &[String],
+        pass: CompactionPass,
     ) -> Vec<String> {
         let source = CandidateFiles {
             partitions,
             sort_by,
             footers_read: Default::default(),
         };
-        cache.observe(&source, sort_by).unwrap();
+        cache.observe(&source, sort_by, pass).unwrap();
         source.footers_read.into_inner()
     }
 
     /// The best remembered bar-clearing pair in `cache` among `partitions`,
-    /// measuring the files no earlier round has seen: the pair a routine
-    /// round seeds a clique from, so tests can probe the scoring directly.
+    /// measuring the files no earlier routine round measured: the pair a
+    /// routine round seeds a clique from, so tests can probe the scoring
+    /// directly.
     /// Reserved files' pairs are passed over; ties go to the
     /// lexicographically first pair.
     fn select_best_pair(
@@ -817,7 +869,7 @@ mod tests {
         sort_by: &[String],
         reserved: &HashSet<ObjectPath>,
     ) -> Option<(f64, Arc<ObjectPath>, Arc<ObjectPath>)> {
-        let _ = observe_candidates(cache, partitions, sort_by);
+        let _ = observe_candidates(cache, partitions, sort_by, CompactionPass::Routine);
         let (left, right, overlap) = cache
             .partners
             .iter()
@@ -846,7 +898,7 @@ mod tests {
         Some((overlap.contested_share, left.clone(), right.clone()))
     }
 
-    /// Every pair the cache remembers, bar or no bar.
+    /// Every pair the cache holds, bar or no bar.
     fn remembered_pairs(cache: &OverlapCache) -> usize {
         cache.partners.values().map(HashMap::len).sum::<usize>() / 2
     }
@@ -877,7 +929,7 @@ mod tests {
     }
 
     /// Select a group over one partition with nothing remembered and nothing
-    /// reserved.
+    /// reserved, as a round running `pass` does.
     fn select_group(
         files: &[LayoutCandidate<'_>],
         sort_by: &[String],
@@ -885,7 +937,7 @@ mod tests {
         clique_size: usize,
     ) -> Option<Vec<Arc<ObjectPath>>> {
         let mut cache = OverlapCache::default();
-        observe_candidates(&mut cache, &[files], sort_by);
+        observe_candidates(&mut cache, &[files], sort_by, pass);
         cache.select_group(&HashSet::new(), pass, clique_size)
     }
 
@@ -1444,7 +1496,12 @@ mod tests {
         ];
         let reserved = HashSet::from([ObjectPath::new("c")]);
         let mut cache = OverlapCache::default();
-        observe_candidates(&mut cache, &[&files], &["id".into()]);
+        observe_candidates(
+            &mut cache,
+            &[&files],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
 
         let clique = cache.select_group(&reserved, CompactionPass::Routine, 3);
         let settled = cache
@@ -1569,25 +1626,248 @@ mod tests {
         assert_eq!(group.len(), 5);
     }
 
-    /// A pair below the contested bar is remembered for the final sweep but
-    /// never selected by a routine round, which counts no eligible pair.
-    #[test]
-    fn remembers_a_below_bar_pair_for_the_final_sweep_only() {
-        let wide = stats_entry("wide", &[("id", int_stat(1), int_stat(100))]);
-        let narrow = stats_entry("narrow", &[("id", int_stat(3), int_stat(4))]);
-        let files = [
-            candidate_with_row_groups(&wide, &[(1, 20), (20, 40), (40, 60), (60, 80), (80, 100)]),
-            candidate_with_row_groups(&narrow, &[(3, 3), (3, 4), (4, 4), (4, 4), (4, 4)]),
-        ];
-        let mut cache = OverlapCache::default();
-        observe_candidates(&mut cache, &[&files], &["id".into()]);
+    /// A wide file and a narrow one inside its range: a pair below the
+    /// contested bar.
+    fn below_bar_entries() -> (FileEntry, FileEntry) {
+        (
+            stats_entry("wide", &[("id", int_stat(1), int_stat(100))]),
+            stats_entry("narrow", &[("id", int_stat(3), int_stat(4))]),
+        )
+    }
 
-        let routine = cache.select_group(&HashSet::new(), CompactionPass::Routine, 6);
+    /// The candidates of [`below_bar_entries`], five row groups each.
+    fn below_bar_candidates<'a>(
+        wide: &'a FileEntry,
+        narrow: &'a FileEntry,
+    ) -> [LayoutCandidate<'a>; 2] {
+        [
+            candidate_with_row_groups(wide, &[(1, 20), (20, 40), (40, 60), (60, 80), (80, 100)]),
+            candidate_with_row_groups(narrow, &[(3, 3), (3, 4), (4, 4), (4, 4), (4, 4)]),
+        ]
+    }
+
+    /// A routine round measures a pair below the contested bar and remembers
+    /// nothing of it but that its files were measured.
+    #[test]
+    fn a_routine_round_does_not_remember_a_pair_below_the_bar() {
+        let (wide, narrow) = below_bar_entries();
+        let files = below_bar_candidates(&wide, &narrow);
+        let mut cache = OverlapCache::default();
+
+        let read = observe_candidates(
+            &mut cache,
+            &[&files],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+
+        assert_eq!(read, ["wide", "narrow"]);
+        assert_eq!(remembered_pairs(&cache), 0);
+        assert_eq!(cache.measured.len(), 2);
+        assert!(
+            cache
+                .select_group(&HashSet::new(), CompactionPass::Routine, 6)
+                .is_none()
+        );
+    }
+
+    /// A final sweep measures again the pair a routine round did not
+    /// remember, and merges it.
+    #[test]
+    fn a_final_sweep_measures_again_a_pair_below_the_bar_and_takes_it() {
+        let (wide, narrow) = below_bar_entries();
+        let files = below_bar_candidates(&wide, &narrow);
+        let mut cache = OverlapCache::default();
+        observe_candidates(
+            &mut cache,
+            &[&files],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+
+        let read = observe_candidates(&mut cache, &[&files], &["id".into()], CompactionPass::Final);
         let settled = cache.select_group(&HashSet::new(), CompactionPass::Final, 6);
 
-        assert!(routine.is_none());
-        assert_eq!(eligible_pairs(&cache), 0);
+        assert_eq!(read, ["wide", "narrow"]);
         assert_eq!(group_paths(&settled.unwrap()), ["narrow", "wide"]);
+    }
+
+    /// Once a final sweep is done with a partition, the pairs below the bar
+    /// it held are gone, and the files stay measured.
+    #[test]
+    fn a_final_sweep_leaves_no_pair_below_the_bar_behind() {
+        let (wide, narrow) = below_bar_entries();
+        let files = below_bar_candidates(&wide, &narrow);
+        let mut cache = OverlapCache::default();
+        observe_candidates(&mut cache, &[&files], &["id".into()], CompactionPass::Final);
+
+        cache.forget_pairs_below_bar();
+        let read_by_the_next_round = observe_candidates(
+            &mut cache,
+            &[&files],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+
+        assert_eq!(remembered_pairs(&cache), 0);
+        assert!(read_by_the_next_round.is_empty());
+    }
+
+    /// A second routine round over the files the first one measured reads
+    /// no footer.
+    #[test]
+    fn a_second_routine_round_over_unchanged_files_measures_nothing() {
+        let files = layered_candidates();
+        let mut cache = OverlapCache::default();
+        let read_first = observe_candidates(
+            &mut cache,
+            &[&files],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+
+        let read_second = observe_candidates(
+            &mut cache,
+            &[&files],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+
+        assert!(!read_first.is_empty());
+        assert!(read_second.is_empty());
+    }
+
+    /// A round after one file was added measures the pairs that file is in
+    /// and no other: the pair measured before is not read again.
+    #[test]
+    fn a_round_after_one_new_file_measures_only_its_pairs() {
+        let shape = [(0, 50), (50, 100)];
+        let far_shape = [(500, 550), (550, 600)];
+        let first = stats_entry("first", &[("id", int_stat(0), int_stat(100))]);
+        let second = stats_entry("second", &[("id", int_stat(0), int_stat(100))]);
+        let far = stats_entry("far", &[("id", int_stat(500), int_stat(600))]);
+        let added = stats_entry("added", &[("id", int_stat(500), int_stat(600))]);
+        let mut cache = OverlapCache::default();
+        let before = [
+            candidate_with_row_groups(&first, &shape),
+            candidate_with_row_groups(&second, &shape),
+            candidate_with_row_groups(&far, &far_shape),
+        ];
+        observe_candidates(
+            &mut cache,
+            &[&before],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+        let after = [
+            candidate_with_row_groups(&first, &shape),
+            candidate_with_row_groups(&second, &shape),
+            candidate_with_row_groups(&far, &far_shape),
+            candidate_with_row_groups(&added, &far_shape),
+        ];
+
+        let mut read = observe_candidates(
+            &mut cache,
+            &[&after],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+
+        read.sort();
+        assert_eq!(read, ["added", "far"]);
+        assert_eq!(remembered_pairs(&cache), 2);
+    }
+
+    /// A file the partition no longer holds is forgotten, with its pairs.
+    #[test]
+    fn a_file_that_is_gone_is_forgotten() {
+        let shape = [(0, 50), (50, 100)];
+        let first = stats_entry("first", &[("id", int_stat(0), int_stat(100))]);
+        let second = stats_entry("second", &[("id", int_stat(0), int_stat(100))]);
+        let mut cache = OverlapCache::default();
+        let both = [
+            candidate_with_row_groups(&first, &shape),
+            candidate_with_row_groups(&second, &shape),
+        ];
+        observe_candidates(
+            &mut cache,
+            &[&both],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+        let survivor = [candidate_with_row_groups(&first, &shape)];
+
+        observe_candidates(
+            &mut cache,
+            &[&survivor],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+
+        assert_eq!(remembered_pairs(&cache), 0);
+        assert_eq!(cache.measured.len(), 1);
+    }
+
+    /// A file in a pair is named, wherever the pair names it, by the one
+    /// copy of its path held for it as a measured file.
+    #[test]
+    fn a_paired_file_is_named_by_the_one_copy_of_its_path() {
+        let shape = [(0, 50), (50, 100)];
+        let first = stats_entry("first", &[("id", int_stat(0), int_stat(100))]);
+        let second = stats_entry("second", &[("id", int_stat(0), int_stat(100))]);
+        let mut cache = OverlapCache::default();
+        let both = [
+            candidate_with_row_groups(&first, &shape),
+            candidate_with_row_groups(&second, &shape),
+        ];
+
+        observe_candidates(
+            &mut cache,
+            &[&both],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+
+        let is_the_measured_copy = |path: &Arc<ObjectPath>| {
+            cache
+                .measured
+                .get(path)
+                .is_some_and(|measured| Arc::ptr_eq(measured, path))
+        };
+        assert_eq!(remembered_pairs(&cache), 1);
+        assert!(cache.partners.iter().all(|(path, partners)| {
+            is_the_measured_copy(path) && partners.keys().all(is_the_measured_copy)
+        }));
+    }
+
+    /// A partition left without a file a layout merge may rewrite leaves
+    /// nothing remembered.
+    #[test]
+    fn nothing_is_remembered_of_a_partition_left_without_a_candidate() {
+        let shape = [(0, 50), (50, 100)];
+        let first = stats_entry("first", &[("id", int_stat(0), int_stat(100))]);
+        let second = stats_entry("second", &[("id", int_stat(0), int_stat(100))]);
+        let mut cache = OverlapCache::default();
+        let both = [
+            candidate_with_row_groups(&first, &shape),
+            candidate_with_row_groups(&second, &shape),
+        ];
+        observe_candidates(
+            &mut cache,
+            &[&both],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+        let none: [LayoutCandidate<'_>; 0] = [];
+
+        observe_candidates(
+            &mut cache,
+            &[&none],
+            &["id".into()],
+            CompactionPass::Routine,
+        );
+
+        assert!(cache.is_empty());
     }
 
     /// A hub's second satellite is below the bar, so no clique of three
@@ -1904,8 +2184,6 @@ mod tests {
             for (path, partner) in [(left, right), (right, left)] {
                 let path = Arc::new(ObjectPath::new(*path));
                 let partner = Arc::new(ObjectPath::new(*partner));
-                cache.known_paths.insert(path.clone());
-                cache.known_paths.insert(partner.clone());
                 cache.partners.entry(path).or_default().insert(
                     partner,
                     PairOverlap {

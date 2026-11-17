@@ -1602,7 +1602,7 @@ fn a_refresh_advances_a_copy_onto_another_copys_commit() {
 /// version already current and reconciles nothing, so it would serve, and
 /// commit on top of, a file set missing the rows it claims.
 #[test]
-fn a_refresh_reads_no_footer_and_the_scan_reports_the_file_it_cannot_read() {
+fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
@@ -1612,7 +1612,7 @@ fn a_refresh_reads_no_footer_and_the_scan_reports_the_file_it_cannot_read() {
     let version = reader.version();
 
     // Another writer commits an `Add` for a file that is not in the store, so
-    // whatever reads that file's footer fails.
+    // any copy reloading onto that version fails to read its footer.
     let mut writer = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
@@ -1624,18 +1624,17 @@ fn a_refresh_reads_no_footer_and_the_scan_reports_the_file_it_cannot_read() {
     )];
     assert!(writer.replace_data_files(&[], &absent).is_err());
 
-    let advanced = reader.refresh().unwrap();
-
-    assert!(advanced);
-    assert_eq!(reader.version(), version + 1);
+    assert!(reader.refresh().is_err());
+    assert_eq!(reader.version(), version, "the copy stays at its version");
     assert_eq!(
         reader.file_refs().unwrap().len(),
-        2,
-        "the copy lists the files of the version it advanced to"
+        1,
+        "with the files of that version"
     );
-    assert!(
-        reader.select_scan(&[]).is_err(),
-        "the scan that needs the absent file's footer reports it"
+    assert_eq!(
+        reader.select_scan(&[]).unwrap().row_groups().len(),
+        3,
+        "and still scans them"
     );
 }
 

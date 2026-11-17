@@ -1,5 +1,5 @@
 //! A Delta file's partition as bytes equal for exactly the files of one
-//! partition: what its table's file index names the partition by.
+//! partition: what its table names the partition by.
 //!
 //! A Delta log records a file's partition as a map of typed values, with no
 //! spec to number partitions by, so the bytes are derived from the values:
@@ -8,16 +8,13 @@
 //! of how their values order.
 //!
 //! A file's tuple reaches here from the writer that committed the file or
-//! from a replay of the log, which need not hold a value as the same Arrow
+//! from a read of the log, which need not hold a value as the same Arrow
 //! type. Each value is encoded as its column's own type, so a partition is
 //! named alike wherever its files' tuples came from.
 //!
 //! A file recorded without a tuple and one whose tuple lacks every column
 //! name one partition: the log records both as an empty map, so a file
 //! read back from it cannot tell them apart.
-
-use std::collections::HashMap;
-use std::sync::Arc;
 
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::DataType;
@@ -34,12 +31,9 @@ struct PartitionColumn {
     converter: RowConverter,
 }
 
-/// Encodes the partition tuples of one table's files, handing out one
-/// shared copy of each partition's bytes.
+/// Encodes the partition tuples of one table's files.
 pub(crate) struct PartitionKeyEncoder {
     partition_columns: Vec<PartitionColumn>,
-    /// One shared copy of each partition's bytes met so far.
-    keys: HashMap<Vec<u8>, Arc<[u8]>>,
 }
 
 impl PartitionKeyEncoder {
@@ -64,25 +58,12 @@ impl PartitionKeyEncoder {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(Self {
-            partition_columns,
-            keys: HashMap::new(),
-        })
+        Ok(Self { partition_columns })
     }
 
     /// The bytes of the partition a file recorded with the tuple
     /// `partition` sits in.
-    pub(crate) fn encode(&mut self, partition: Option<&PartitionValues>) -> Result<Arc<[u8]>> {
-        let bytes = self.encode_bytes(partition)?;
-        if let Some(key) = self.keys.get(&bytes) {
-            return Ok(Arc::clone(key));
-        }
-        let key: Arc<[u8]> = Arc::from(bytes.as_slice());
-        self.keys.insert(bytes, Arc::clone(&key));
-        Ok(key)
-    }
-
-    fn encode_bytes(&self, partition: Option<&PartitionValues>) -> Result<Vec<u8>> {
+    pub(crate) fn encode(&self, partition: Option<&PartitionValues>) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         for column in &self.partition_columns {
             let Some(value) = partition.and_then(|partition| partition.get(&column.name)) else {
