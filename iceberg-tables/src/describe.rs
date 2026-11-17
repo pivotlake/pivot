@@ -75,6 +75,16 @@ impl Table {
             }
             Ok(ControlFlow::Continue(()))
         })?;
+        // A column is a partition key when a field of the default partition
+        // spec is the column itself or a transform of it.
+        let schema = self.metadata().current_schema();
+        let partition_sources: Vec<&str> = self
+            .metadata()
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .filter_map(|field| schema.name_by_field_id(field.source_id))
+            .collect();
         let columns = self
             .columns()
             .iter()
@@ -87,7 +97,7 @@ impl Table {
                     position,
                     bytes,
                     bytes_uncompressed,
-                    is_partition_key: self.partition_by().contains(&column.name),
+                    is_partition_key: partition_sources.contains(&column.name.as_str()),
                     is_sort_key: self.sort_by().contains(&column.name),
                 },
             )

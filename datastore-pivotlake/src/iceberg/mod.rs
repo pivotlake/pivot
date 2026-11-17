@@ -35,7 +35,7 @@ use dispatch::DataFlowDispatcher;
 use iceberg_tables::commit::{COMMIT_RETRIES, TableCreation};
 use iceberg_tables::files::data_files::DataFileEntry;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
-use iceberg_tables::{IndexedFile, TableLocation};
+use iceberg_tables::{IndexedFile, PartitionKeys, TableLocation, check_partition_terms};
 use object_storage::{FileRef, ObjectPath, ObjectStore};
 use parquet_engine::{RowGroupMetadata, ScanSelection};
 use planner::catalog::{Column, SchemaQualifiedTableName};
@@ -66,10 +66,36 @@ impl IcebergTableFactory {
 }
 
 impl TableFactory for IcebergTableFactory {
+    /// Each term is a column, or a transform of one that Iceberg takes over
+    /// the column's type and an INSERT computes. A table that adopts files
+    /// is partitioned by columns alone: an adopted file sits in one
+    /// partition when its statistics prove every partition column constant,
+    /// which they do not prove of a transform.
+    fn check_partition_by(
+        &self,
+        name: &SchemaQualifiedTableName,
+        columns: &[Column],
+        partition_by: &[String],
+        adopts_files: bool,
+    ) -> crate::Result<()> {
+        check_partition_terms(&name.to_string(), columns, partition_by)?;
+        // A term that passed the check and names no column is a transform.
+        let transform = partition_by
+            .iter()
+            .find(|term| columns.iter().all(|column| &column.name != *term));
+        match transform {
+            Some(term) if adopts_files => {
+                Err(crate::Error::AdoptingIntoPartitionTransform { term: term.clone() })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Write the table's first metadata version, holding the adopted files as
     /// its first snapshot when there are any. An adopted file of a partitioned
-    /// table must sit in one partition, which its statistics prove; an
-    /// Iceberg tuple has no "unknown" value, so one that does not is refused.
+    /// table must sit in one partition, which its statistics prove of the
+    /// partition columns; an Iceberg tuple has no "unknown" value, so one
+    /// that does not is refused.
     fn create_table(
         &self,
         directory: &ObjectPath,
@@ -234,6 +260,13 @@ impl Table for IcebergTable {
 
     fn partition_by(&self) -> &[String] {
         self.table.partition_by()
+    }
+
+    /// Planned from the default partition spec: a column's identity field
+    /// named after it is a key the rows carry, every other field a key
+    /// computed from a row by the field's transform.
+    fn plan_partition_keys(&self) -> crate::Result<PartitionKeys> {
+        Ok(self.table.plan_partition_keys()?)
     }
 
     fn sort_by(&self) -> &[String] {

@@ -146,9 +146,9 @@ pub fn to_pivot_type(iceberg_type: &IcebergType) -> Option<Type> {
     })
 }
 
-/// The columns `fields` (a partition spec's or a sort order's, each a source
-/// field id and its transform) name directly, in order. A transformed field
-/// (bucket, truncate, a date part) is not a column of the table.
+/// The columns `fields` (a sort order's, each a source field id and its
+/// transform) name directly, in order. A transformed field (bucket,
+/// truncate, a date part) is not a column of the table.
 pub(crate) fn identity_columns<'a>(
     schema: &SchemaRef,
     fields: impl Iterator<Item = (i32, &'a Transform)>,

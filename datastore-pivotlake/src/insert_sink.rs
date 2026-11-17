@@ -6,15 +6,17 @@ use dispatch::RecordBatchOperatorSpec;
 use crate::{CatalogTable, PendingInsert, PivotlakeDatastore};
 
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
-/// emits the inserted-row count. Each finished file is pushed onto the
-/// target's uploaded files for the statement's transaction to commit. Driven by
+/// emits the inserted-row count, or refuse the INSERT before any file is
+/// written when a partition key of the table cannot be computed. Each
+/// finished file is pushed onto the target's uploaded files for the
+/// statement's transaction to commit. Driven by
 /// the binding's `BoundTable::compile_insert` impl (see [`parquet_engine::ParquetTableBinding`]).
 pub(super) fn build_insert_spec(
     table: &CatalogTable,
     commit_actions: CommitQueue<PivotlakeDatastore>,
     input: RecordBatchOperatorSpec,
 ) -> crate::Result<RecordBatchOperatorSpec> {
-    let target = table.insert_target();
+    let target = table.plan_insert_target()?;
     // The pending insert this statement commits with. Staged before any file
     // can land, so whatever lands is owned by a staged action the transaction
     // can commit or discard.

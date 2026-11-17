@@ -17,7 +17,7 @@ use iceberg_tables::types::schema::{
     LOGICAL_TYPES_PROPERTY, build_partition_spec, build_schema, build_sort_order,
     find_writer_sort_order_id, logical_types_property, name_mapping_property,
 };
-use iceberg_tables::{Error, PartitionKeys};
+use iceberg_tables::{Error, PartitionKeys, check_partition_terms};
 use planner::catalog::Column;
 use planner::types::Type;
 use support::{Fixture, column, create_table_of, load};
@@ -119,6 +119,142 @@ fn partition_and_sort_columns_bind_to_their_fields_by_identity() {
     assert_eq!(order.order_id, 1);
     assert_eq!(order.fields[0].source_id, 2);
     assert!(build_sort_order(&schema, &[]).unwrap().is_unsorted());
+}
+
+#[test]
+fn partition_terms_become_fields_with_their_transform_and_conventional_name() {
+    let columns = [
+        column("id", Type::Int64),
+        column("ts", Type::Timestamp),
+        column("name", Type::Utf8),
+        column("region", Type::Utf8),
+    ];
+    let schema = build_schema(&columns).unwrap();
+    let terms = [
+        "year(ts)",
+        "bucket(16, id)",
+        "TRUNCATE( 4 , name )",
+        "region",
+    ]
+    .map(String::from);
+
+    let spec = build_partition_spec(&schema, &terms).unwrap();
+
+    let fields: Vec<(i32, Transform, &str)> = spec
+        .fields()
+        .iter()
+        .map(|field| (field.source_id, field.transform, field.name.as_str()))
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            (2, Transform::Year, "ts_year"),
+            (1, Transform::Bucket(16), "id_bucket"),
+            (3, Transform::Truncate(4), "name_trunc"),
+            (4, Transform::Identity, "region"),
+        ]
+    );
+}
+
+#[test]
+fn a_loaded_table_spells_its_partition_fields_as_the_terms_that_made_them() {
+    let columns = [
+        column("id", Type::Int64),
+        column("ts", Type::Timestamp),
+        column("region", Type::Utf8),
+    ];
+    let terms = ["day(ts)", "bucket(8, id)", "region"].map(String::from);
+    let (fixture, _created) = create_table_of(&columns, &terms, &[]);
+
+    let loaded = load(&fixture);
+    let keys = loaded.plan_partition_keys().unwrap();
+
+    assert_eq!(loaded.partition_by(), terms);
+    assert_eq!(keys.list_column_keys(), ["region"]);
+    assert_eq!(keys.list_derived_keys(), ["ts_day", "id_bucket"]);
+}
+
+#[test]
+fn the_plural_time_transforms_are_the_singular_ones_and_are_shown_singular() {
+    let columns = [
+        column("a", Type::Timestamp),
+        column("b", Type::Date),
+        column("c", Type::TimestampTz),
+        column("d", Type::Timestamp),
+    ];
+    let terms = ["years(a)", "months(b)", "DAYS(c)", "hours(d)"].map(String::from);
+    let (fixture, _created) = create_table_of(&columns, &terms, &[]);
+
+    let loaded = load(&fixture);
+
+    assert_eq!(
+        loaded.partition_by(),
+        ["year(a)", "month(b)", "day(c)", "hour(d)"]
+    );
+    let transforms: Vec<Transform> = loaded
+        .metadata()
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .map(|field| field.transform)
+        .collect();
+    assert_eq!(
+        transforms,
+        [
+            Transform::Year,
+            Transform::Month,
+            Transform::Day,
+            Transform::Hour
+        ]
+    );
+}
+
+#[test]
+fn a_term_a_table_cannot_be_partitioned_by_is_refused_naming_it() {
+    let columns = [
+        column("id", Type::Int64),
+        column("ts", Type::Timestamp),
+        column("name", Type::Utf8),
+        column("d", Type::Date),
+    ];
+    let terms = [
+        "day(name)",
+        "hour(d)",
+        "weekly(ts)",
+        "month(nope)",
+        "nope",
+        "bucket(0, name)",
+        "truncate(4, ts)",
+        "day(ts",
+    ];
+
+    let refusals: Vec<Error> = terms
+        .iter()
+        .map(|term| {
+            check_partition_terms("db.t", &columns, &[term.to_string()])
+                .expect_err("the term is refused")
+        })
+        .collect();
+
+    for (term, refusal) in terms.iter().zip(&refusals) {
+        assert!(
+            matches!(refusal, Error::InvalidPartitionTerm { term: refused, .. } if refused == term),
+            "{term}: {refusal}"
+        );
+    }
+}
+
+#[test]
+fn a_transform_of_an_unsigned_bigint_is_refused_as_one_an_insert_cannot_compute() {
+    let columns = [column("id", Type::UInt64)];
+
+    let error = check_partition_terms("db.t", &columns, &["bucket(4, id)".to_string()])
+        .expect_err("a bucket of a UBIGINT is refused");
+
+    assert!(
+        matches!(&error, Error::UnsupportedPartitionTransform { field, .. } if field == "id_bucket"),
+        "{error}"
+    );
 }
 
 /// The metadata of a table of `columns` whose default sort order is the

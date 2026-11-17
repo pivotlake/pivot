@@ -12,7 +12,9 @@ use std::thread;
 use bin::server::{Config, Server};
 use catalog::PivotCatalog;
 use catalog::metastore::Metastore;
-use common::{connect_client, pick_free_port, select_rows, wait_until_listening};
+use common::{
+    RawConn, command_tag, connect_client, pick_free_port, select_rows, wait_until_listening,
+};
 use dispatch::Dispatch;
 use metastore_disk::DiskMetastore;
 use tempfile::TempDir;
@@ -135,4 +137,78 @@ datastores:
             .is_file()
     );
     assert!(!metadata_dir.join("version-hint.text").exists());
+}
+
+/// `PARTITIONED BY` names what the `partition_by` option names, and a COPY
+/// writes through the path an INSERT does: its rows land in a file per day,
+/// the table shows the term it was created by, and a filter on the
+/// timestamp returns the rows of the days it keeps.
+#[test]
+fn a_copy_into_a_table_partitioned_by_day_lands_a_file_per_day() {
+    let location = TempDir::new().unwrap();
+    let config = format!(
+        "datastores:
+  events:
+    kind: pivotlake
+    table_format: iceberg
+    location: {}
+    default: true
+    vacuum: false
+",
+        location.path().display()
+    );
+    let port = start_server_from_config(&config);
+
+    let (copied, partition_key, partitions, march) = block_on(async {
+        let client = connect_client(port).await;
+        client
+            .simple_query("CREATE TABLE events (id BIGINT, ts TIMESTAMP) PARTITIONED BY (day(ts))")
+            .await
+            .unwrap();
+        let copied = tokio::task::spawn_blocking(move || {
+            let mut raw = RawConn::connect(port);
+            raw.query("COPY events FROM STDIN");
+            let (kind, _) = raw.read_message();
+            assert_eq!(kind, b'G', "expected CopyInResponse");
+            raw.copy_data(
+                b"1\t2024-02-29 23:59:59\n2\t2024-03-01 00:00:00\n3\t2024-03-01 08:00:00\n",
+            );
+            raw.copy_done();
+            command_tag(&raw.read_until_ready())
+        })
+        .await
+        .unwrap();
+        let partition_key = select_rows(
+            &client,
+            "SELECT partition_key FROM system.tables WHERE name = 'events'",
+        )
+        .await;
+        let partitions = select_rows(
+            &client,
+            "SELECT f.partition \
+             FROM system.table_files f JOIN system.tables t ON f.table_id = t.id \
+             WHERE t.name = 'events' ORDER BY f.partition",
+        )
+        .await;
+        let march = select_rows(
+            &client,
+            "SELECT id FROM events WHERE ts >= TIMESTAMP '2024-03-01 00:00:00' ORDER BY id",
+        )
+        .await;
+        (copied, partition_key, partitions, march)
+    });
+
+    assert_eq!(copied.as_deref(), Some("COPY 3"));
+    assert_eq!(partition_key, vec![vec![Some("day(ts)".to_string())]]);
+    assert_eq!(
+        partitions,
+        vec![
+            vec![Some("ts_day=2024-02-29".to_string())],
+            vec![Some("ts_day=2024-03-01".to_string())],
+        ]
+    );
+    assert_eq!(
+        march,
+        vec![vec![Some("2".to_string())], vec![Some("3".to_string())]]
+    );
 }

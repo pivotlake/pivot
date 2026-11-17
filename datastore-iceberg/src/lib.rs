@@ -151,9 +151,9 @@ use iceberg_catalog_rest::RestCatalog;
 use object_storage::{ExternalStoreFactory, ObjectStore};
 use parquet_engine::ParquetTableBinding;
 use planner::catalog::{
-    BoundTable, CreateTableRequest, DropTableRequest, Error as CatalogError,
-    Result as CatalogResult, SchemaQualifiedTableName, TableCreation, TableDrop, TableReference,
-    TableRevision,
+    BoundTable, CreateTableRequest, DropTableRequest, Error as CatalogError, PARTITION_BY_OPTION,
+    Result as CatalogResult, SORT_BY_OPTION, SchemaQualifiedTableName, TableCreation, TableDrop,
+    TableReference, TableRevision,
 };
 
 use crate::binding::BoundIcebergTable;
@@ -163,6 +163,7 @@ use crate::storage::PivotStorageFactory;
 use iceberg_tables::block_on;
 use iceberg_tables::{
     IndexedFile, MetadataFile, MetadataStore, Table as LoadedTable, TableLocation,
+    check_partition_terms,
 };
 
 use crate::table_store::{fetch_manifest_list_size, open_table_store};
@@ -714,6 +715,8 @@ impl std::fmt::Debug for IcebergTransaction {
 struct PendingTableCreation {
     name: SchemaQualifiedTableName,
     columns: Vec<planner::catalog::Column>,
+    /// The terms the table is partitioned by, in order, each a column or a
+    /// transform of one.
     partition_by: Vec<String>,
     sort_by: Vec<String>,
     /// Whether the statement used `IF NOT EXISTS`, so the commit treats a
@@ -765,11 +768,8 @@ impl CommitAction<IcebergDatastore> for PendingTableDrop {
     fn discard(self: Box<Self>) {}
 }
 
-/// `WITH (partition_by = 'a, b')` and `WITH (sort_by = 'a, b')`: ordered,
-/// comma-separated columns. The only options a catalog table takes; a
-/// catalog assigns the table's location, and adopting files is not offered.
-const PARTITION_BY_OPTION: &str = "partition_by";
-const SORT_BY_OPTION: &str = "sort_by";
+/// The only options a catalog table takes; a catalog assigns the table's
+/// location, and adopting files is not offered.
 const TABLE_OPTIONS: [&str; 2] = [PARTITION_BY_OPTION, SORT_BY_OPTION];
 
 /// The columns `option` names in `request`, each a declared column.
@@ -895,7 +895,8 @@ impl DatastoreTransaction for IcebergTransaction {
 
     /// Resolve a `CREATE TABLE` against the catalog as the query sees it: the
     /// namespace must exist, the name must be free unless `IF NOT EXISTS`,
-    /// and the options are the partition and sort columns.
+    /// and the options are the partition terms, each a column or a transform
+    /// of one that an INSERT can compute, and the sort columns.
     fn bind_create_table(
         &self,
         request: CreateTableRequest,
@@ -918,7 +919,9 @@ impl DatastoreTransaction for IcebergTransaction {
         if !request.if_not_exists && self.index.contains_table(&name) {
             return Err(Error::TableExists(name.to_string()).into());
         }
-        let partition_by = parse_spec_columns(&request, PARTITION_BY_OPTION)?;
+        let partition_by = request.list_partition_terms();
+        check_partition_terms(&name.to_string(), &request.columns, &partition_by)
+            .map_err(Error::from)?;
         let sort_by = parse_spec_columns(&request, SORT_BY_OPTION)?;
         Ok(Box::new(IcebergTableCreation {
             commit_actions: self.staged.queue(),

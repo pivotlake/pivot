@@ -3529,6 +3529,154 @@ fn create_table_registers_a_v3_table_with_pivots_logical_types() {
     assert_eq!(int64_column(&rows, 1), [Some(80)]);
 }
 
+/// A table created with a transform among its partition terms is partitioned
+/// by it in the catalog: an INSERT cuts its files by the transformed values,
+/// and Pivot and the reference reader both find a row by its source column.
+#[test]
+fn create_table_records_partition_transforms_and_an_insert_cuts_its_files_by_them() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("transformed", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE transformed.events (id BIGINT, ts TIMESTAMP, region VARCHAR) \
+             WITH (partition_by = 'day(ts), region')",
+        )
+        .unwrap();
+    harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO transformed.events VALUES \
+             (1, TIMESTAMP '1969-12-31 23:59:59.999999', 'eu'), \
+             (2, TIMESTAMP '1970-01-01 00:00:00', 'eu'), \
+             (3, TIMESTAMP '1970-01-01 00:00:00', 'us')",
+        )
+        .unwrap();
+    let from_the_epoch = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM transformed.events WHERE ts >= TIMESTAMP '1970-01-01 00:00:00' ORDER BY id",
+    );
+
+    let table = harness.load(&namespace, "events");
+    let metadata = table.metadata();
+    let fields: Vec<(String, &str, &str)> = metadata
+        .default_partition_spec()
+        .fields()
+        .iter()
+        .map(|field| {
+            (
+                field.transform.to_string(),
+                metadata
+                    .current_schema()
+                    .name_by_field_id(field.source_id)
+                    .unwrap(),
+                field.name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            ("day".to_string(), "ts", "ts_day"),
+            ("identity".to_string(), "region", "region")
+        ]
+    );
+    let mut partitions: Vec<(i32, String, u64)> = harness
+        .live_data_files(&namespace, "events")
+        .iter()
+        .map(|file| {
+            let [
+                Some(Literal::Primitive(PrimitiveLiteral::Int(day))),
+                Some(Literal::Primitive(PrimitiveLiteral::String(region))),
+            ] = file.partition().fields()
+            else {
+                panic!("a day and a region: {:?}", file.partition());
+            };
+            (*day, region.clone(), file.record_count())
+        })
+        .collect();
+    partitions.sort();
+    assert_eq!(
+        partitions,
+        [
+            (-1, "eu".to_string(), 1),
+            (0, "eu".to_string(), 1),
+            (0, "us".to_string(), 1)
+        ]
+    );
+    assert_eq!(int64_column(&from_the_epoch, 0), [Some(2), Some(3)]);
+    assert_eq!(
+        harness.scan_ids(
+            &namespace,
+            "events",
+            Reference::new("ts").less_than(Datum::timestamp_micros(0))
+        ),
+        [1]
+    );
+}
+
+#[test]
+fn create_table_refuses_a_term_the_table_cannot_be_partitioned_by() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("untransformed", "orders", orders_schema());
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "CREATE TABLE untransformed.events (id BIGINT, name VARCHAR) \
+             WITH (partition_by = 'day(name)')",
+        )
+        .unwrap_err();
+
+    assert!(error.contains("`day(name)`"), "{error}");
+    let listed = harness
+        .block_on(harness.writer.list_tables(&namespace))
+        .unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+}
+
+/// A bucket of a column Pivot reads as a `UBIGINT` has no value for an id
+/// above the signed range, so an INSERT is refused before it writes a file
+/// rather than filing such a row under a NULL bucket.
+#[test]
+fn an_insert_refuses_a_bucket_of_an_unsigned_bigint() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.partitioned_namespace(
+        "unsignedids",
+        "orders",
+        orders_schema(),
+        1,
+        "id_bucket",
+        Transform::Bucket(4),
+    );
+    harness.set_property(
+        &namespace,
+        "orders",
+        "pivot.logical-types",
+        r#"{"1":"UInt64"}"#,
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let error = harness
+        .execute(
+            &catalog,
+            &mut planner,
+            "INSERT INTO unsignedids.orders VALUES (1, 'ann', 1.0)",
+        )
+        .unwrap_err();
+
+    assert!(error.contains("id_bucket"), "{error}");
+    assert!(error.contains("UBIGINT"), "{error}");
+    assert!(harness.live_data_files(&namespace, "orders").is_empty());
+}
+
 #[test]
 fn an_insert_records_a_sort_columns_long_string_bounds_whole_and_cuts_another_columns() {
     let Some(harness) = harness() else { return };

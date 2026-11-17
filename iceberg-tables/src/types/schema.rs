@@ -1,6 +1,7 @@
 //! A managed table's declared shape as Iceberg metadata, and back: its columns
-//! as an Iceberg schema, its partition and sort columns as a spec and a sort
-//! order, and the Pivot types Iceberg has no spelling for as a table property.
+//! as an Iceberg schema, its partition terms and sort columns as a spec and a
+//! sort order, and the Pivot types Iceberg has no spelling for as a table
+//! property.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use iceberg::spec::{
 use planner::catalog::Column;
 use planner::types::Type;
 
+use crate::types::partitioning::PartitionTerm;
 use crate::{Error, Result};
 
 pub use crate::types::columns::LOGICAL_TYPES_PROPERTY;
@@ -96,24 +98,44 @@ pub fn logical_types_property(schema: &Schema, columns: &[Column]) -> Option<Str
         .then(|| serde_json::to_string(&recorded).expect("a string map serializes"))
 }
 
-/// An identity partition spec over `partition_by`, in order. Partition field
-/// ids start at 1000, the Iceberg convention; names are the columns' own.
+/// The partition spec of the terms `partition_by`, in order: one field per
+/// term, a column's by identity and named after it, a transform's named by
+/// the convention Iceberg's writers share ([`PartitionTerm::field_name`]).
+/// Partition field ids start at 1000, the Iceberg convention. A term is
+/// refused, by name, when it does not parse, names no column of `schema`,
+/// applies a transform Iceberg does not take over its column's type, or
+/// cannot stand beside the other fields and the columns.
 pub fn build_partition_spec(
     schema: &Schema,
     partition_by: &[String],
 ) -> Result<UnboundPartitionSpec> {
     let mut builder = UnboundPartitionSpec::builder().with_spec_id(0);
-    for column in partition_by {
-        let source_id =
-            schema
-                .field_id_by_name(column)
-                .ok_or_else(|| Error::UnknownSpecColumn {
-                    option: "partition_by".to_string(),
-                    column: column.clone(),
-                })?;
+    for term in partition_by {
+        let refuse = |message: String| Error::InvalidPartitionTerm {
+            term: term.clone(),
+            message,
+        };
+        let PartitionTerm {
+            transform,
+            column,
+            field_name,
+        } = PartitionTerm::parse(term)?;
+        let source = schema
+            .field_by_name(&column)
+            .ok_or_else(|| refuse(format!("`{column}` is not a declared column of the table")))?;
+        transform
+            .result_type(&source.field_type)
+            .map_err(|error| refuse(error.message().to_string()))?;
+        // A field named like a column could not be told from it: Iceberg
+        // lets only a column's own identity field share its name.
+        if transform != Transform::Identity && schema.field_by_name(&field_name).is_some() {
+            return Err(refuse(format!(
+                "its partition field would be named `{field_name}`, as a column of the table is"
+            )));
+        }
         builder = builder
-            .add_partition_field(source_id, column, Transform::Identity)
-            .map_err(Error::spec)?;
+            .add_partition_field(source.id, field_name, transform)
+            .map_err(|error| refuse(error.message().to_string()))?;
     }
     Ok(builder.build())
 }

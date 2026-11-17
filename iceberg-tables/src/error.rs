@@ -59,6 +59,8 @@ pub enum Error {
     },
     #[error("`{option}` column `{column}` is not a declared column of the table")]
     UnknownSpecColumn { option: String, column: String },
+    #[error("`partition_by` term `{term}` cannot partition the table: {message}")]
+    InvalidPartitionTerm { term: String, message: String },
     #[error(
         "table `{table}` carries delete files in its current snapshot (manifest `{manifest}`); row-level deletes are not applied, so the table is not served"
     )]

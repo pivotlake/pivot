@@ -1,6 +1,7 @@
 //! The sort order a managed table's manifests record for its data files: the
 //! table's own for a file whose rows a writer put in that order, the unsorted
-//! order for a file written in none, and nothing for a file adopted as it lay.
+//! order for a file written in none, and nothing for a file adopted as it lay;
+//! and `SORTED BY` as another spelling of the `sort_by` option.
 
 mod iceberg_support;
 
@@ -96,6 +97,63 @@ fn an_inserted_file_of_a_sorted_table_records_the_tables_sort_order() {
         read_values_in_file_order(&live[0].0),
         [None, Some(1), Some(2), Some(3)]
     );
+}
+
+#[test]
+fn sorted_by_sorts_a_tables_files_as_the_sort_by_option_does() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE t (n BIGINT) SORTED BY (n)");
+
+    db.execute("INSERT INTO t VALUES (3), (NULL), (1), (2)");
+
+    let table_path = db.table_path("t");
+    let live = read_live_sort_order_ids(&table_path);
+    let sort_order_id = read_current_metadata(&table_path).default_sort_order_id();
+    assert_eq!(sort_order_id, 1);
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0].1, Some(1));
+    assert_eq!(
+        read_values_in_file_order(&live[0].0),
+        [None, Some(1), Some(2), Some(3)]
+    );
+}
+
+#[test]
+fn a_sorted_by_key_that_is_not_a_column_is_refused_naming_the_key() {
+    let mut db = Database::new();
+
+    let error = db
+        .try_execute("CREATE TABLE t (n BIGINT) SORTED BY (n + 1)")
+        .unwrap_err();
+
+    assert!(error.contains("SORTED BY key `(n + 1)`"), "{error}");
+}
+
+#[test]
+fn a_direction_or_a_null_ordering_in_sorted_by_is_refused() {
+    let mut db = Database::new();
+
+    let descending = db
+        .try_execute("CREATE TABLE t (n BIGINT) SORTED BY (n DESC)")
+        .unwrap_err();
+    let nulls_last = db
+        .try_execute("CREATE TABLE t (n BIGINT) SORTED BY (n NULLS LAST)")
+        .unwrap_err();
+
+    assert!(descending.contains("syntax error"), "{descending}");
+    assert!(nulls_last.contains("syntax error"), "{nulls_last}");
+}
+
+#[test]
+fn sorted_by_beside_the_sort_by_option_is_refused() {
+    let mut db = Database::new();
+
+    let error = db
+        .try_execute("CREATE TABLE t (n BIGINT) SORTED BY (n) WITH (sort_by = 'n')")
+        .unwrap_err();
+
+    assert!(error.contains("SORTED BY"), "{error}");
+    assert!(error.contains("`sort_by`"), "{error}");
 }
 
 #[test]

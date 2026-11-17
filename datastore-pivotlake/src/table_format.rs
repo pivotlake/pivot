@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use catalog::datastore::DatastoreTableMetadata;
+use iceberg_tables::PartitionKeys;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
 use object_storage::{FileRef, ObjectPath};
 use parquet_engine::{RowGroupMetadata, ScanSelection};
@@ -104,9 +105,23 @@ pub(crate) type VisitPartition<'v> = dyn FnMut(&[u8], &dyn PartitionFiles) -> Co
 
 /// What creates and loads tables in one format on one database's storage.
 pub(crate) trait TableFactory: Send + Sync {
+    /// Refuse `partition_by`, the terms `CREATE TABLE` gave for the new
+    /// table `name` of `columns`, each a column or a transform of one
+    /// (`day(ts)`), unless the format can partition the table by every one
+    /// of them. `adopts_files` says the table adopts files as its initial
+    /// data, which no partition transform cut.
+    fn check_partition_by(
+        &self,
+        name: &SchemaQualifiedTableName,
+        columns: &[Column],
+        partition_by: &[String],
+        adopts_files: bool,
+    ) -> Result<()>;
+
     /// Write the initial version of a new table at `directory` (its own
     /// directory under the database root) holding `adopted`, whose footers
     /// the caller already read, and return the table at that version.
+    /// `partition_by` passed [`check_partition_by`](Self::check_partition_by).
     #[allow(clippy::too_many_arguments)] // one call per table creation; each field is needed
     fn create_table(
         &self,
@@ -142,7 +157,13 @@ pub(crate) trait Table: Send + Sync {
     /// higher.
     fn version(&self) -> u64;
     fn columns(&self) -> &[Column];
+    /// The terms a new file of the table is partitioned by, in order, each
+    /// as `CREATE TABLE` spells it: a column, or a transform of one.
     fn partition_by(&self) -> &[String];
+    /// The key columns a new file of the table is cut by, one per term of
+    /// [`partition_by`](Self::partition_by): which of them the rows carry
+    /// as columns, and how the others are computed from a row.
+    fn plan_partition_keys(&self) -> Result<PartitionKeys>;
     fn sort_by(&self) -> &[String];
 
     /// Visit every partition this version has a file in with its files, in

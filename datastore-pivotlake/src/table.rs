@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::Error;
-use crate::file_entry::FileEntry;
+use crate::file_entry::{FileEntry, PartitionValues};
 use crate::table_format::{RemovedFiles, Table, VisitPartition};
 use arrow_array::RecordBatch;
 use catalog::datastore::DatastoreTableMetadata;
@@ -392,8 +392,10 @@ impl CatalogTable {
         self.id
     }
 
-    /// The table's partition columns, in order (empty = unpartitioned). A
-    /// partitioning writer routes each row to a file by these columns' values.
+    /// The terms the table is partitioned by, in order (empty =
+    /// unpartitioned), each as `CREATE TABLE` spells it: a column, or a
+    /// transform of one (`day(ts)`). A partitioning writer routes each row
+    /// to a file by the value of every term.
     pub fn partition_by(&self) -> &[String] {
         self.table.partition_by()
     }
@@ -626,11 +628,35 @@ impl CatalogTable {
             Projection::all(columns),
             false,
         );
-        // The selector guarantees that all inputs share one partition, so its
-        // recorded tuple can key every decoded batch without repartitioning it.
-        let partition = input_entries
+        // The selector guarantees that all inputs share one partition, whose
+        // tuple the table records for each of them.
+        let input_partition = input_entries
             .first()
             .and_then(|first| first.partition.clone());
+        let partition_keys = self.table.plan_partition_keys()?;
+        // The keys the rows carry as columns are read off each output's
+        // rows; the inputs' tuple keys every decoded batch by them without
+        // repartitioning it.
+        let column_keys: Arc<[String]> = partition_keys.list_column_keys().into();
+        let row_partition = input_partition.clone().filter(|_| !column_keys.is_empty());
+        // A key computed from a row (a transform of a column) is in no row.
+        // The outputs hold the inputs' rows and no other, so they sit in the
+        // inputs' partition: its value of each such key is theirs.
+        let derived_partition_values = partition_keys
+            .list_derived_keys()
+            .into_iter()
+            .map(|key| {
+                let value = input_partition
+                    .as_ref()
+                    .and_then(|tuple| tuple.get(&key))
+                    .cloned()
+                    .ok_or_else(|| Error::PartitionValueMissing {
+                        location: self.storage.location.as_str().to_string(),
+                        field: key.clone(),
+                    })?;
+                Ok::<_, Error>((key, value))
+            })
+            .collect::<crate::Result<PartitionValues>>()?;
         // The merge keeps each input's rows in the order the input had them,
         // so its outputs are in the table's sort order only when every input
         // is recorded as written in it: a file adopted as it lay is not.
@@ -673,8 +699,8 @@ impl CatalogTable {
         let encoded = parquet_engine::writing::encode_compaction_batches_spec(
             scan,
             output_schema,
-            partition,
-            Arc::from(self.partition_by()),
+            row_partition,
+            column_keys,
             Arc::from(sort_by),
             inputs_are_sorted,
             target_rows_per_group,
@@ -708,6 +734,15 @@ impl CatalogTable {
                 let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
                     &row_groups,
                 )));
+                // What the writer read off the rows, with the keys no row
+                // carries.
+                let partition = if derived_partition_values.is_empty() {
+                    partition
+                } else {
+                    let mut tuple = partition.unwrap_or_default();
+                    tuple.extend(derived_partition_values.clone());
+                    Some(tuple)
+                };
                 let entry = FileEntry {
                     file,
                     partition,
@@ -745,19 +780,21 @@ impl CatalogTable {
 
     /// What an INSERT into this table writes: files directly in the table's
     /// directory, in the declared columns, with the field ids the format
-    /// assigns when it resolves columns by id, cut by the partition columns
-    /// (every partition field of a table created here is the identity of a
-    /// column, named after it).
-    pub(crate) fn insert_target(&self) -> iceberg_tables::io::sink::InsertTarget {
-        iceberg_tables::io::sink::InsertTarget {
+    /// assigns when it resolves columns by id, cut by the keys of the
+    /// table's partition terms; or why the table's format cannot compute
+    /// one of those keys.
+    pub(crate) fn plan_insert_target(
+        &self,
+    ) -> crate::Result<iceberg_tables::io::sink::InsertTarget> {
+        Ok(iceberg_tables::io::sink::InsertTarget {
             uploaded_files: UploadedFiles::new(),
             store: self.store(),
             directory: self.storage.location.clone(),
             columns: self.columns(),
             nullability: self.schema_nullability(),
             field_ids: self.field_ids(),
-            partition_keys: iceberg_tables::PartitionKeys::by_columns(self.partition_by()),
+            partition_keys: self.table.plan_partition_keys()?,
             sort_by: self.sort_by().to_vec(),
-        }
+        })
     }
 }

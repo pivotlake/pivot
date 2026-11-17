@@ -26,9 +26,7 @@ use iceberg_tables::metadata::layout::DATA_PATH_PROPERTY;
 use iceberg_tables::types::schema::{
     build_partition_spec, build_schema, build_sort_order, logical_types_property,
 };
-use iceberg_tables::{
-    LOGICAL_TYPES_PROPERTY, PartitionKeys, Table as LoadedTable, block_on, build_table_ident,
-};
+use iceberg_tables::{LOGICAL_TYPES_PROPERTY, Table as LoadedTable, block_on, build_table_ident};
 use object_storage::FileRef;
 use parquet_engine::FileStats;
 use parquet_engine::writing::upload::{UploadedFile, UploadedFiles};
@@ -50,12 +48,7 @@ fn plan_insert_target(table: &LoadedTable) -> Result<InsertTarget> {
     }
     let schema = metadata.current_schema();
     let columns = table.columns().to_vec();
-    let partition_keys = PartitionKeys::plan(
-        &table.name().to_string(),
-        schema,
-        metadata.default_partition_spec(),
-        &columns,
-    )?;
+    let partition_keys = table.plan_partition_keys()?;
     let data_directory = table.location().data_directory_for(
         metadata
             .properties()
@@ -294,10 +287,11 @@ fn file_stats_under_current_names(
 }
 
 /// Create the table `name` in the catalog with the shape asked for: format
-/// version 3, every column optional, identity partitioning and sorting by
-/// the columns named. The catalog assigns the location and the field ids,
-/// so the property naming the Pivot types Iceberg has no spelling for is
-/// set afterwards, keyed by the ids it assigned.
+/// version 3, every column optional, partitioned by the terms `partition_by`
+/// (each a column or a transform of one) and sorted by the columns
+/// `sort_by`. The catalog assigns the location and the field ids, so the
+/// property naming the Pivot types Iceberg has no spelling for is set
+/// afterwards, keyed by the ids it assigned.
 pub(crate) fn create_table(
     catalog: &RestCatalog,
     name: &SchemaQualifiedTableName,

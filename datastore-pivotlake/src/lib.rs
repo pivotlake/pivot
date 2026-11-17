@@ -86,8 +86,8 @@ use parquet_engine::writing::upload::{UploadedFile, UploadedFiles};
 use parquet_engine::{ParquetTableBinding, ParquetTableError};
 use planner::catalog::{
     BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Error as CatalogError,
-    Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop,
-    TableRevision,
+    PARTITION_BY_OPTION, Result as CatalogResult, SORT_BY_OPTION, SchemaCreation,
+    SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
 };
 use table::TableStorage;
 pub use table::{CatalogTable, TableFile};
@@ -97,10 +97,6 @@ use thiserror::Error as ThisError;
 /// `WITH (with_pre_existing_parquets = 'dir')`: a directory of Parquet files the new
 /// table adopts as its initial data, where they already sit.
 const PRE_EXISTING_PARQUETS_OPTION: &str = "with_pre_existing_parquets";
-/// `WITH (partition_by = 'a, b')` — ordered, comma-separated partition columns.
-const PARTITION_BY_OPTION: &str = "partition_by";
-/// `WITH (sort_by = 'a, b')` — ordered, comma-separated sort columns.
-const SORT_BY_OPTION: &str = "sort_by";
 
 /// Every option `CREATE TABLE` understands. An option outside this set is
 /// rejected rather than ignored: a statement that asks for something the
@@ -123,6 +119,18 @@ pub enum Error {
     UnknownOption { option: String, known: String },
     #[error("`{option}` column `{column}` is not a declared column of the table")]
     UnknownSpecColumn { option: String, column: String },
+    #[error(
+        "`partition_by` term `{term}` is a transform of a column, which Delta Lake has none of: a database in the `delta` table format partitions its tables by columns"
+    )]
+    PartitionTransformInDelta { term: String },
+    #[error(
+        "`partition_by` term `{term}` is a transform of a column, and a table that adopts files with `with_pre_existing_parquets` is partitioned by columns alone: no transform cut the files it adopts"
+    )]
+    AdoptingIntoPartitionTransform { term: String },
+    #[error(
+        "table at `{location}` cannot merge files whose partition records no value for the partition field `{field}`"
+    )]
+    PartitionValueMissing { location: String, field: String },
     #[error(transparent)]
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
@@ -996,10 +1004,12 @@ impl PivotlakeTransaction {
     }
 
     /// Resolve a `CREATE TABLE` against this datastore: check the schema exists
-    /// and the name is still free, parse the layout options, and locate the
-    /// Parquet files the table adopts. Returns a [`PivotlakeTableCreation`] whose
-    /// `compile` builds the footer-fetch-and-stage dataflow. This part runs on
-    /// the coordinator; compiling needs the pool.
+    /// and the name is still free, parse the layout options, refuse a
+    /// partition term the database's table format cannot partition by, and
+    /// locate the Parquet files the table adopts. Returns a
+    /// [`PivotlakeTableCreation`] whose `compile` builds the
+    /// footer-fetch-and-stage dataflow. This part runs on the coordinator;
+    /// compiling needs the pool.
     ///
     /// The table's own storage is always a directory of its own under the
     /// database root, named after its identity. `WITH (with_pre_existing_parquets = '…')`
@@ -1032,7 +1042,13 @@ impl PivotlakeTransaction {
         // log's `metaData.id` when version 0 is written.
         let id = Uuid::new_v4();
         let location = ObjectPath::new(id.to_string());
-        let partition_by = Self::parse_spec_columns(&request, PARTITION_BY_OPTION)?;
+        let partition_by = request.list_partition_terms();
+        self.datastore.table_factory.check_partition_by(
+            &name,
+            &request.columns,
+            &partition_by,
+            request.options.contains_key(PRE_EXISTING_PARQUETS_OPTION),
+        )?;
         let sort_by = Self::parse_spec_columns(&request, SORT_BY_OPTION)?;
         let files = self.adopted_data_files(&request)?;
 
@@ -1159,9 +1175,9 @@ impl PivotlakeTransaction {
             .map_err(Error::from)
     }
 
-    /// Parse a comma-separated column-list option (`partition_by` / `sort_by`)
-    /// into an ordered `Vec<String>`, validating each name is a declared column.
-    /// Absent or empty → no columns.
+    /// Parse a comma-separated column-list option (`sort_by`) into an ordered
+    /// `Vec<String>`, validating each name is a declared column. Absent or
+    /// empty → no columns.
     fn parse_spec_columns(request: &CreateTableRequest, option: &str) -> Result<Vec<String>> {
         let Some(raw) = request.options.get(option) else {
             return Ok(Vec::new());

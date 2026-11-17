@@ -26,9 +26,10 @@
 //!   ([`maintenance::retention`]), and what an expiry leaves to delete,
 //!   found from the snapshots it dropped and the oldest one it kept
 //!   ([`maintenance::expired_objects`]);
-//! - the partition keys an INSERT's files are cut by, computed from the
-//!   spec's transforms ([`types::partitioning`]), and the dataflow that
-//!   writes the files ([`io::sink`]).
+//! - the terms a table's partitioning is spelled in, and the partition keys
+//!   an INSERT's files are cut by, computed from the spec's transforms
+//!   ([`types::partitioning`]), and the dataflow that writes the files
+//!   ([`io::sink`]).
 //!
 //! What differs is only where a table's metadata versions are kept and how
 //! a new version is made current: that is the [`MetadataStore`] seam, which
@@ -60,7 +61,7 @@ pub use metadata::layout::{TableLocation, split_location};
 pub use metadata::metadata_store::{MetadataFile, MetadataStore, build_table_ident};
 pub use table::{Table, forget_cached_table};
 pub use types::columns::LOGICAL_TYPES_PROPERTY;
-pub use types::partitioning::PartitionKeys;
+pub use types::partitioning::{PartitionKeys, check_partition_terms};
 
 /// The spec crate this crate's types come from, so a dependant names one
 /// version of it.

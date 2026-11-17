@@ -128,7 +128,10 @@ pub struct TableRevision {
 /// datastore).
 ///
 /// `options` carries the `WITH (...)` clause verbatim so the target datastore
-/// implementation can decide what to do with backend-specific keys.
+/// implementation can decide what to do with backend-specific keys. A
+/// `PARTITIONED BY (...)` clause arrives in it as the [`PARTITION_BY_OPTION`]
+/// and a `SORTED BY (...)` clause as the [`SORT_BY_OPTION`], the options
+/// they are other spellings of.
 ///
 /// `datastore_name` and `schema_name` are the qualifiers this create targets.
 /// DuckDB resolves both while binding the statement, so in practice each is
@@ -146,6 +149,45 @@ pub struct CreateTableRequest {
     pub if_not_exists: bool,
 }
 
+/// The table option naming what a new table is partitioned by:
+/// `WITH (partition_by = 'day(ts), region')`, ordered, comma-separated terms,
+/// each a column or a transform of one. `PARTITIONED BY (day(ts), region)`
+/// says the same.
+pub const PARTITION_BY_OPTION: &str = "partition_by";
+
+/// The table option naming the columns a new table's files are sorted by,
+/// each ascending with NULLs first: `WITH (sort_by = 'ts, id')`, ordered and
+/// comma-separated. `SORTED BY (ts, id)` says the same.
+pub const SORT_BY_OPTION: &str = "sort_by";
+
+/// The partition terms `text` lists, in the order given, each trimmed: what
+/// the [`PARTITION_BY_OPTION`] holds, and what a table's partitioning reads
+/// as when its terms are shown comma-separated. A comma inside parentheses
+/// belongs to its term (`bucket(16, id)`).
+pub fn split_partition_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut term = String::new();
+    let mut open_parentheses = 0usize;
+    for character in text.chars() {
+        match character {
+            '(' => open_parentheses += 1,
+            ')' => open_parentheses = open_parentheses.saturating_sub(1),
+            ',' if open_parentheses == 0 => {
+                terms.push(std::mem::take(&mut term));
+                continue;
+            }
+            _ => {}
+        }
+        term.push(character);
+    }
+    terms.push(term);
+    terms
+        .iter()
+        .map(|term| term.trim().to_string())
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
 impl CreateTableRequest {
     /// The name the target datastore will register the new table under: the
     /// schema the statement named, or the default when it named none.
@@ -156,6 +198,15 @@ impl CreateTableRequest {
                 .unwrap_or(crate::DEFAULT_SCHEMA_NAME),
             self.name.clone(),
         )
+    }
+
+    /// The terms of the [`PARTITION_BY_OPTION`], in the order given; none
+    /// when the option is absent or empty.
+    pub fn list_partition_terms(&self) -> Vec<String> {
+        self.options
+            .get(PARTITION_BY_OPTION)
+            .map(|option| split_partition_terms(option))
+            .unwrap_or_default()
     }
 }
 

@@ -99,6 +99,7 @@ use crate::metadata::layout::TableLocation;
 use crate::metadata::metadata_store::MetadataFile;
 use crate::metadata::metadata_store::MetadataStore;
 use crate::types::columns::{LOGICAL_TYPES_PROPERTY, identity_columns, read_table_columns};
+use crate::types::partitioning::{PartitionKeys, format_partition_fields};
 use crate::types::schema::{UNSORTED_ORDER_ID, find_writer_sort_order_id};
 use crate::{Error, Result};
 
@@ -185,6 +186,8 @@ pub struct Table {
     metadata_file: Arc<MetadataFile>,
     /// The declared columns, keyed by the field ids the files carry.
     columns: TableColumns,
+    /// The fields of the default partition spec, as the terms `CREATE
+    /// TABLE` spells them.
     partition_by: Vec<String>,
     sort_by: Vec<String>,
     /// The id of the default sort order when rows ordered by `sort_by`, each
@@ -439,14 +442,7 @@ impl Table {
         }
         let schema = metadata.current_schema();
         let columns = read_table_columns(&name.to_string(), metadata)?;
-        let partition_by = identity_columns(
-            schema,
-            metadata
-                .default_partition_spec()
-                .fields()
-                .iter()
-                .map(|field| (field.source_id, &field.transform)),
-        );
+        let partition_by = format_partition_fields(schema, metadata.default_partition_spec());
         let sort_by = identity_columns(
             schema,
             metadata
@@ -1440,11 +1436,23 @@ impl Table {
         self.columns.columns()
     }
 
-    /// The columns the table's default partition spec partitions by their
-    /// own values, in spec order: what a new file is cut by. A file written
-    /// under an earlier spec sits in a partition of that spec's fields.
+    /// The terms the table's default partition spec partitions by, in spec
+    /// order, each as `CREATE TABLE` spells it: a column, or a transform of
+    /// one (`day(ts)`). A file written under an earlier spec sits in a
+    /// partition of that spec's fields.
     pub fn partition_by(&self) -> &[String] {
         &self.partition_by
+    }
+
+    /// The key columns the default partition spec cuts an INSERT's files
+    /// by, or why an INSERT cannot partition by it.
+    pub fn plan_partition_keys(&self) -> Result<PartitionKeys> {
+        PartitionKeys::plan(
+            &self.name.to_string(),
+            self.metadata().current_schema(),
+            self.metadata().default_partition_spec(),
+            self.columns(),
+        )
     }
 
     /// The identity-sorted columns, in sort-order order.

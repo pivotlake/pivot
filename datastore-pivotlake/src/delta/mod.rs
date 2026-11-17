@@ -50,11 +50,12 @@ use std::time::Duration;
 
 use catalog::datastore::DatastoreTableMetadata;
 use dispatch::DataFlowDispatcher;
+use iceberg_tables::PartitionKeys;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
 use imbl::OrdMap;
 use object_storage::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use parquet_engine::{ParquetTable, PushedPredicate, RowGroupMetadata, ScanSelection};
-use planner::catalog::{Column, SchemaQualifiedTableName};
+use planner::catalog::{Column, PARTITION_BY_OPTION, SchemaQualifiedTableName};
 use planner::expression::{CompareType, Expression};
 use table_file_index::{IndexedRecord, PartitionFiles};
 use tracing::{info, warn};
@@ -150,6 +151,32 @@ impl DeltaTableFactory {
 }
 
 impl TableFactory for DeltaTableFactory {
+    /// A Delta table is partitioned by columns alone: every term is a
+    /// declared column, and a transform of one is refused as what Delta
+    /// Lake does not have.
+    fn check_partition_by(
+        &self,
+        _name: &SchemaQualifiedTableName,
+        columns: &[Column],
+        partition_by: &[String],
+        _adopts_files: bool,
+    ) -> Result<()> {
+        for term in partition_by {
+            if columns.iter().any(|column| &column.name == term) {
+                continue;
+            }
+            return Err(if term.contains('(') {
+                Error::PartitionTransformInDelta { term: term.clone() }
+            } else {
+                Error::UnknownSpecColumn {
+                    option: PARTITION_BY_OPTION.to_string(),
+                    column: term.clone(),
+                }
+            });
+        }
+        Ok(())
+    }
+
     /// Write Delta version 0 with its protocol, metadata and initial `Add`
     /// actions. An adopted file whose partition columns are constant is
     /// stamped with that partition from its stats, so it is recorded in the log
@@ -497,6 +524,11 @@ impl Table for DeltaTable {
 
     fn partition_by(&self) -> &[String] {
         &self.shape.partition_by
+    }
+
+    /// Every partition column is a key the rows carry.
+    fn plan_partition_keys(&self) -> Result<PartitionKeys> {
+        Ok(PartitionKeys::by_columns(&self.shape.partition_by))
     }
 
     fn sort_by(&self) -> &[String] {

@@ -54,6 +54,8 @@ pub struct TableCreation<'a> {
     /// The table's identity across every metadata version.
     pub table_uuid: Uuid,
     pub columns: &'a [Column],
+    /// The terms the table is partitioned by, in order, each a column or a
+    /// transform of one as `CREATE TABLE` spells it (`day(ts)`).
     pub partition_by: &'a [String],
     pub sort_by: &'a [String],
     /// Files the table adopts as its initial data, each with its statistics
