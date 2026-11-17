@@ -1,0 +1,27 @@
+[package]
+name = "pivot-web-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+# Not published to crates.io.
+publish = false
+description = "The pivot web page's backend: reads a pivot server's system tables over the PostgreSQL wire protocol and serves them to the page as JSON."
+
+[[bin]]
+name = "pivot-web"
+path = "src/main.rs"
+
+# A workspace of its own, so it resolves and locks apart from the database.
+[workspace]
+
+[dependencies]
+axum = "0.7"
+# Parses the timestamps a pivot server renders as text.
+chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+tokio-postgres = "0.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"

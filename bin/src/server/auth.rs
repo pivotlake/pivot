@@ -12,18 +12,24 @@
 //! selected trust or SCRAM handler only for the lifetime of that connection.
 //! Consequently users added and verifiers changed while the process is running
 //! apply to subsequent logins.
+//!
+//! A connection whose startup completes is added to the catalog's
+//! [`ConnectionRegistry`], which is what `system.connections` reports.
 
 use std::fmt::Debug;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use catalog::connections::ConnectionRegistry;
 use catalog::metastore::{Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth};
 use futures::Sink;
 use pgwire::api::auth::sasl::SASLAuthStartupHandler;
 use pgwire::api::auth::sasl::scram::ScramAuth;
 use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password};
 use pgwire::api::auth::{StartupHandler, noop::NoopStartupHandler};
-use pgwire::api::{ClientInfo, ConnectionManager};
+use pgwire::api::{
+    ClientInfo, ConnectionManager, METADATA_APPLICATION_NAME, METADATA_USER, PgWireConnectionState,
+};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sha2::{Digest, Sha256};
@@ -113,11 +119,17 @@ pub struct Authenticator {
     auth_source: Arc<MetastoreAuthSource>,
     parameters: Arc<DefaultServerParameterProvider>,
     manager: Arc<ConnectionManager>,
+    connections: Arc<ConnectionRegistry>,
 }
 
 impl Authenticator {
-    /// Build authentication over the live metastore.
-    pub fn new(metastore: Arc<dyn Metastore>, manager: Arc<ConnectionManager>) -> Self {
+    /// Build authentication over the live metastore. Connections that log in
+    /// are registered in `connections`.
+    pub fn new(
+        metastore: Arc<dyn Metastore>,
+        manager: Arc<ConnectionManager>,
+        connections: Arc<ConnectionRegistry>,
+    ) -> Self {
         info!("authenticating connections against the metastore");
         Self {
             auth_source: Arc::new(MetastoreAuthSource {
@@ -126,6 +138,7 @@ impl Authenticator {
             }),
             parameters: Arc::new(DefaultServerParameterProvider::default()),
             manager,
+            connections,
         }
     }
 
@@ -136,6 +149,7 @@ impl Authenticator {
             auth_source: self.auth_source.clone(),
             parameters: self.parameters.clone(),
             manager: self.manager.clone(),
+            connections: self.connections.clone(),
             selected: OnceLock::new(),
         })
     }
@@ -147,6 +161,7 @@ pub struct UserStartupHandler {
     auth_source: Arc<MetastoreAuthSource>,
     parameters: Arc<DefaultServerParameterProvider>,
     manager: Arc<ConnectionManager>,
+    connections: Arc<ConnectionRegistry>,
     selected: OnceLock<SelectedUserAuth>,
 }
 
@@ -201,9 +216,33 @@ impl StartupHandler for UserStartupHandler {
             }
         };
         match selected {
-            SelectedUserAuth::Trust(handler) => handler.on_startup(client, message).await,
-            SelectedUserAuth::Scram(handler) => handler.on_startup(client, message).await,
+            SelectedUserAuth::Trust(handler) => handler.on_startup(client, message).await?,
+            SelectedUserAuth::Scram(handler) => handler.on_startup(client, message).await?,
         }
+
+        // The message that completes the startup leaves the connection ready
+        // for queries, and no startup message follows it, so this registers the
+        // connection once. The registration lives in the session's extensions,
+        // which drop with the connection and so remove it from the registry.
+        if matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            let user_name = client
+                .metadata()
+                .get(METADATA_USER)
+                .expect("a startup without a user name is refused before it completes")
+                .clone();
+            // A client is free not to name itself.
+            let application_name = client
+                .metadata()
+                .get(METADATA_APPLICATION_NAME)
+                .cloned()
+                .unwrap_or_default();
+            let client_address = client.socket_addr();
+            client.session_extensions().get_or_insert_with(|| {
+                self.connections
+                    .register(user_name, application_name, client_address)
+            });
+        }
+        Ok(())
     }
 }
 

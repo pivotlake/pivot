@@ -12,9 +12,13 @@
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::connections::{ConnectionRegistry, ConnectionStatus};
 use crate::datastore::{DatastoreColumnMetadata, DatastoreTableMetadata, DatastoreTransaction};
-use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringViewArray};
+use arrow_array::{
+    ArrayRef, BooleanArray, Int64Array, RecordBatch, StringViewArray, TimestampMicrosecondArray,
+};
 use arrow_schema::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use dispatch::{
@@ -26,7 +30,7 @@ use planner::catalog::{
     DynamicScanPredicate, Error as CatalogError, Result, SchemaCreation, SchemaQualifiedTableName,
     TableCreation, TableDrop, TableReference, TableRevision,
 };
-use planner::types::{Type, physical_arrow_type, sql_type_name};
+use planner::types::{Type, UTC_TIMEZONE, physical_arrow_type, sql_type_name};
 
 pub const DATASTORE_NAME: &str = "system";
 const DATASTORES_NAME: &str = "datastores";
@@ -34,6 +38,7 @@ const TABLES_NAME: &str = "tables";
 const COLUMNS_NAME: &str = "columns";
 const TABLE_FILES_NAME: &str = "table_files";
 const MEMORY_BLOCKS_NAME: &str = "memory_blocks";
+const CONNECTIONS_NAME: &str = "connections";
 
 /// The type `system.datastores` reports this datastore itself as. It stores
 /// nothing, so it is neither a pivotlake datastore nor any other stored format.
@@ -80,11 +85,13 @@ struct GlobalTableMetadata {
 }
 
 /// Everything the relations are built from: the datastores this transaction
-/// spans, and every table each of them holds. Assembled once per binding, so
-/// the relations of one query describe one view of the catalog.
+/// spans, every table each of them holds, and the connections the server has
+/// open. Assembled once per binding, so the relations of one query describe
+/// one view of the catalog.
 struct Inventory {
     datastores: Vec<DatastoreDescription>,
     tables: Vec<GlobalTableMetadata>,
+    connections: Vec<ConnectionStatus>,
 }
 
 /// How one relation is built from the global inventory, over the columns it
@@ -115,7 +122,7 @@ struct SystemRelation {
 
 /// Every relation this datastore serves. The one place a system table is
 /// registered: binding one, and reporting it in the inventory, both read this.
-const RELATIONS: [SystemRelation; 5] = [
+const RELATIONS: [SystemRelation; 6] = [
     SystemRelation {
         name: DATASTORES_NAME,
         id: "da7aba5e-5e75-4a11-ab1e-5e1ec7edda7a",
@@ -183,14 +190,32 @@ const RELATIONS: [SystemRelation; 5] = [
         ],
         build: build_memory_blocks,
     },
+    SystemRelation {
+        name: CONNECTIONS_NAME,
+        id: "5e551005-ca11-4e25-acce-55edc11e0750",
+        columns: &[
+            ("id", Type::Int64),
+            ("user_name", Type::Utf8),
+            ("application_name", Type::Utf8),
+            ("client_address", Type::Utf8),
+            ("connected_at", Type::TimestampTz),
+            ("state", Type::Utf8),
+            ("state_changed_at", Type::TimestampTz),
+            ("statement", Type::Utf8),
+            ("copy_bytes", Type::Int64),
+        ],
+        build: build_connections,
+    },
 ];
 
 /// The `system` datastore's transaction: the sub-transaction of every other
-/// datastore, since each of its relations is assembled from them all. The
-/// composite opens them before building this, so a query that reads a datastore
+/// datastore, since each of its relations is assembled from them all, and the
+/// registry of the server's connections. The composite opens the
+/// sub-transactions before building this, so a query that reads a datastore
 /// directly and through `system.tables` reads one snapshot of it either way.
 pub struct SystemTransaction {
     datastores: Vec<DatastoreEntry>,
+    connections: Arc<ConnectionRegistry>,
 }
 
 impl Debug for SystemTransaction {
@@ -209,8 +234,11 @@ impl Debug for SystemTransaction {
 }
 
 impl SystemTransaction {
-    pub fn new(datastores: Vec<DatastoreEntry>) -> Self {
-        Self { datastores }
+    pub fn new(datastores: Vec<DatastoreEntry>, connections: Arc<ConnectionRegistry>) -> Self {
+        Self {
+            datastores,
+            connections,
+        }
     }
 
     /// Every datastore and every table of every datastore, this one included:
@@ -248,7 +276,11 @@ impl SystemTransaction {
             table,
         }));
 
-        Ok(Inventory { datastores, tables })
+        Ok(Inventory {
+            datastores,
+            tables,
+            connections: self.connections.read_all(),
+        })
     }
 }
 
@@ -561,6 +593,59 @@ fn state_name(state: MemoryBlockState) -> &'static str {
     }
 }
 
+/// Build the `system.connections` relation: one row per connection the server
+/// has open, the one running the query among them.
+fn build_connections(
+    reference: TableReference,
+    columns: Vec<Column>,
+    inventory: &Inventory,
+) -> Box<dyn BoundTable> {
+    let connections = &inventory.connections;
+    build_table(
+        reference,
+        columns,
+        vec![
+            int_array(connections.iter().map(|connection| connection.id as i64)),
+            string_array(
+                connections
+                    .iter()
+                    .map(|connection| connection.user_name.clone()),
+            ),
+            string_array(
+                connections
+                    .iter()
+                    .map(|connection| connection.application_name.clone()),
+            ),
+            string_array(
+                connections
+                    .iter()
+                    .map(|connection| connection.client_address.to_string()),
+            ),
+            timestamp_array(connections.iter().map(|connection| connection.connected_at)),
+            string_array(
+                connections
+                    .iter()
+                    .map(|connection| connection.state.name().to_string()),
+            ),
+            timestamp_array(
+                connections
+                    .iter()
+                    .map(|connection| connection.state_changed_at),
+            ),
+            string_array(
+                connections
+                    .iter()
+                    .map(|connection| connection.statement.clone()),
+            ),
+            int_array(
+                connections
+                    .iter()
+                    .map(|connection| connection.copy_bytes as i64),
+            ),
+        ],
+    )
+}
+
 /// Compile a relation that reads itself when scanned, into the operator that
 /// emits its projected rows.
 type CompileScan = fn(&DataFlowDispatcher, SchemaRef, Projection) -> RecordBatchOperatorSpec;
@@ -794,6 +879,17 @@ fn variant_array(values: impl IntoIterator<Item = String>) -> ArrayRef {
 
 fn int_array(values: impl IntoIterator<Item = i64>) -> ArrayRef {
     Arc::new(Int64Array::from_iter_values(values))
+}
+
+/// Instants as the UTC microseconds backing `TIMESTAMP WITH TIME ZONE`.
+fn timestamp_array(values: impl IntoIterator<Item = SystemTime>) -> ArrayRef {
+    let microseconds = values.into_iter().map(|instant| {
+        instant
+            .duration_since(UNIX_EPOCH)
+            .expect("the system clock reads a time after 1970")
+            .as_micros() as i64
+    });
+    Arc::new(TimestampMicrosecondArray::from_iter_values(microseconds).with_timezone(UTC_TIMEZONE))
 }
 
 fn boolean_array(values: impl IntoIterator<Item = bool>) -> ArrayRef {
