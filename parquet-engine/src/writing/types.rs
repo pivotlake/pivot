@@ -75,13 +75,20 @@ impl TextIndexDefinition {
 
     /// Where the index named `index_name` keeps its index file of
     /// `data_file`, relative to its table's indexes directory: in the
-    /// index's directory, under the data file's path with `.textindex`
+    /// index's directory, under the data file's name with `.textindex`
     /// after it.
+    ///
+    /// Only the name of the data file counts, not the directories it is
+    /// under: a table names one file differently at different times (by its
+    /// bare name when it has just written it, by its whole address once it
+    /// has read it back from its metadata), and the name is all those have
+    /// in common. The files a table writes are named so that no two share a
+    /// name.
     pub fn path_of_index_file(index_name: &str, data_file: &ObjectPath) -> ObjectPath {
         ObjectPath::new(format!(
             "{}/{}{}",
             Self::directory_name(index_name),
-            data_file.as_str(),
+            data_file.name(),
             Self::INDEX_FILE_SUFFIX
         ))
     }
