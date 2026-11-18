@@ -84,7 +84,7 @@ function NodeBar({ memory }: { memory: NodeMemory }) {
         </div>
         {hovered && (
           <div
-            className="memory-tooltip"
+            className="tooltip"
             role="tooltip"
             style={{
               left: ((hovered.startBytes + hovered.bytes / 2) / memory.totalBytes) * barWidth,

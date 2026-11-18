@@ -65,3 +65,27 @@ export function placeSlot(layout: GraphLayout, slot: number): SlotPlacement {
     serverHandle: isFirstSide ? Position.Top : Position.Bottom,
   };
 }
+
+// How far from the server's middle a web backend's card sits, and how far
+// apart two of them are.
+const WEB_BACKEND_OFFSET_WIDE = 300;
+const WEB_BACKEND_OFFSET_TALL = 350;
+const WEB_BACKEND_SPACING = 80;
+
+// Where a web backend's own connection is drawn: out of the clients' way,
+// below the server in the wide layout and beside it in the tall one. `order`
+// is which of the web backends connected it is, from 0.
+export function placeWebBackend(layout: GraphLayout, order: number): SlotPlacement {
+  if (layout === "wide") {
+    return {
+      position: { x: 0, y: WEB_BACKEND_OFFSET_WIDE + order * WEB_BACKEND_SPACING },
+      clientHandle: Position.Top,
+      serverHandle: Position.Bottom,
+    };
+  }
+  return {
+    position: { x: WEB_BACKEND_OFFSET_TALL, y: order * WEB_BACKEND_SPACING },
+    clientHandle: Position.Left,
+    serverHandle: Position.Right,
+  };
+}

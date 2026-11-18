@@ -19,6 +19,18 @@ export type ServerConnection = {
   // Empty while idle.
   statement: string;
   copyBytes: number;
+  // Whether the connection is a web backend's: the one this page is read
+  // through, or another page's.
+  isWebBackend: boolean;
+};
+
+// The machine a pivot server runs on.
+export type Machine = {
+  hostname: string;
+  cores: number;
+  memoryBytes: number;
+  architecture: string;
+  operatingSystem: string;
 };
 
 export type ConnectionsReading = {
@@ -27,6 +39,12 @@ export type ConnectionsReading = {
   readAtMs: number;
   // The pivot server the connections belong to, as `host:port`.
   pivotAddress: string;
+  // The host of that address alone.
+  pivotHost: string;
+  // The machine the server runs on. A server does not report it, so the
+  // backend knows it only when the server is on the backend's own machine,
+  // and it is null otherwise.
+  machine: Machine | null;
   connections: ServerConnection[];
 };
 
