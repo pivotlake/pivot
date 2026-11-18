@@ -50,7 +50,7 @@ mod setup;
 mod slot_tenants;
 
 pub use cached::Cached;
-pub use compressed::{CacheLookup, CompressedCache, MissingExtent};
+pub use compressed::{CacheLookup, CachedFileWriter, CompressedCache, MissingExtent};
 pub use decompressed_page::{DecompressedPage, DecompressedPageMeta, PageCaches};
 pub use derived_cache::{Cache, CacheKey, Segment};
 pub use family::FamilySpec;

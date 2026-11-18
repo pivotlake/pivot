@@ -10,6 +10,12 @@
 //! once by the encoder, and every stage after that moves the slab rather than
 //! its bytes.
 //!
+//! A run is either a slab or a view of a compressed cache slot. A file that
+//! is put in the cache as it is written
+//! ([`CachedFileWriter`](super::cache::CachedFileWriter)) is written out from
+//! the cache's own copy, and each view keeps its slot pinned until the write
+//! that holds it is done.
+//!
 //! The two questions the I/O layer asks are the reason this is a type rather
 //! than a bare `Vec<Slab>`: how many bytes there are in total, and which bytes
 //! come next after `n` of them have been written. The second one is subtle,
@@ -17,17 +23,35 @@
 //! finding the run holding that byte and continuing from partway into it.
 
 use crate::memory::slab::{FrozenSlab, Slab};
+use bytes::Bytes;
+
+/// One run of a file's bytes.
+pub(crate) enum FileRun {
+    /// A slab the bytes were produced in.
+    Slab(FrozenSlab),
+    /// A view of the compressed cache slot the bytes were copied into.
+    Cached(Bytes),
+}
+
+impl FileRun {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            FileRun::Slab(slab) => slab.as_slice(),
+            FileRun::Cached(view) => view,
+        }
+    }
+}
 
 /// The bytes of one output file, as the runs they were produced in. The runs
-/// are frozen: a file's bytes are never changed once they are in it, only
-/// written out, and freezing is what lets the same slab also be held
-/// elsewhere, as a spilled buffer's rows are.
+/// are never changed once they are in it, only written out. A slab is frozen,
+/// which is what lets the same slab also be held elsewhere, as a spilled
+/// buffer's rows are.
 ///
 /// Every run is ring memory, so the last owner has to drop on a dispatch
 /// worker: releasing a slab reaches the worker's memory context.
 #[derive(Default)]
 pub struct FileBytes {
-    runs: Vec<FrozenSlab>,
+    runs: Vec<FileRun>,
     len: usize,
 }
 
@@ -46,7 +70,19 @@ impl FileBytes {
     /// Append a run that is already frozen, which may also be held elsewhere.
     pub fn push_frozen_slab(&mut self, run: FrozenSlab) {
         self.len += run.size();
-        self.runs.push(run);
+        self.runs.push(FileRun::Slab(run));
+    }
+
+    /// Append a view of a compressed cache slot, which keeps the slot pinned.
+    pub(crate) fn push_cached(&mut self, view: Bytes) {
+        self.len += view.len();
+        self.runs.push(FileRun::Cached(view));
+    }
+
+    /// The runs in order, each given up as it is taken, so a caller that
+    /// copies the file elsewhere releases its memory as it goes.
+    pub(crate) fn into_runs(self) -> impl Iterator<Item = FileRun> {
+        self.runs.into_iter()
     }
 
     /// Append every run of `other`, in order.
@@ -71,7 +107,7 @@ impl FileBytes {
 
     /// The runs in order. Concatenated, they are the file.
     pub fn runs(&self) -> impl Iterator<Item = &[u8]> {
-        self.runs.iter().map(FrozenSlab::as_slice)
+        self.runs.iter().map(FileRun::as_slice)
     }
 
     /// Everything left to write once `offset` bytes have been written, run by

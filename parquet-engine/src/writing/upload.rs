@@ -2,6 +2,11 @@
 //! assembled files into an object store, reports each one for its owner to
 //! commit, and emits the written row count.
 //!
+//! Every file is put in the compressed cache before it is written, so the
+//! first query to read it finds it there. Its bytes are copied into the
+//! cache, which gives up the buffers they were encoded in, and the write goes
+//! out from the cache's copy, which stays in memory until the write lands.
+//!
 //! The sink knows nothing about what records the files afterwards: an
 //! INSERT's transaction and a compaction both drain what it uploaded and
 //! commit it through their own table format.
@@ -17,6 +22,8 @@ use crossbeam_deque::{Injector, Steal};
 use dispatch::io::{
     FsWriteRequest, HttpUploadRequest, LocalFile, OpenFile, OperatorIO, RemoteFile,
 };
+use dispatch::memory::CachedFileWriter;
+use dispatch::memory_ctx;
 use dispatch::{
     BuildContext, Built, BuiltUnary, OperatorFactory, OperatorSpec, RecordBatchOperatorSpec,
     Sender, Unary, UnaryFactory, stealable,
@@ -284,13 +291,9 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
     ) -> dispatch::UnaryResult<()> {
         let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
         let key = self.directory.resolve(&path);
-        let data = Arc::new(encoded.bytes);
-        // The write/upload request below shares this `Arc`, so its address keys
-        // the in-flight entry a later completion resolves against.
-        let id = Arc::as_ptr(&data) as usize;
         let file = object_storage::FileRef {
             path,
-            size: data.len() as u64,
+            size: encoded.bytes.len() as u64,
         };
 
         let open_file = match self.store.sink(&key).map_err(crate::op_err)? {
@@ -303,12 +306,27 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
                 OpenFile::Local(LocalFile::new(file_handle).map_err(crate::op_err)?)
             }
             DataFileLocation::Remote { url, auth } => {
-                let remote = RemoteFile::open(url, auth, data.len() as u64)
+                let remote = RemoteFile::open(url, auth, file.size)
                     .map(Arc::new)
                     .map_err(crate::op_err)?;
                 OpenFile::Remote(remote)
             }
         };
+        // The file goes into the cache its readers will look in, under the
+        // open they will look it up by, and is written out from there.
+        let readable_file = self
+            .store
+            .source(&key)
+            .map_err(crate::op_err)?
+            .open_read(file.size)
+            .map_err(crate::op_err)?;
+        let mut cached_file =
+            CachedFileWriter::new(&memory_ctx().page_caches().compressed, readable_file);
+        let data = Arc::new(cached_file.append(encoded.bytes));
+        cached_file.finish();
+        // The write/upload request below shares this `Arc`, so its address keys
+        // the in-flight entry a later completion resolves against.
+        let id = Arc::as_ptr(&data) as usize;
         io.write(open_file, data.clone())?;
         self.in_flight.insert(
             id,

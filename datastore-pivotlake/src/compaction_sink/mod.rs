@@ -14,8 +14,13 @@
 //! [`UPLOAD_PART_BYTES`] of them, which are then uploaded as the next part,
 //! so only the part being collected and the parts in flight stay in memory.
 //! An object in any other remote store is uploaded in one request, so its
-//! row groups collect, copied into buffers of their own, until the file is
-//! closed.
+//! row groups collect until the file is closed.
+//!
+//! Every file is put in the compressed cache as it is written, so the first
+//! query to read it finds it there. A row group's bytes are copied into the
+//! cache when they are appended, which gives up the buffers they were encoded
+//! in, and each write goes out from the cache's copy, which stays in memory
+//! until the write lands.
 //!
 //! The compaction reserves memory for the rows of every row group and reads
 //! further rows only while its budget has room. The reservation arrives
@@ -199,6 +204,7 @@ impl Unary<EncodedRowGroup, RecordBatch> for RowGroupWriter {
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
         let bytes = file.builder.append_row_group(group, allocator);
+        let bytes = file.cached_file.append(bytes);
         self.append_to_file(io, file.number, &mut file.destination, bytes, memory)?;
         file.rows += rows;
 

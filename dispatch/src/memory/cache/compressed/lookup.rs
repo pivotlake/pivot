@@ -245,6 +245,15 @@ impl MissingExtent {
         (self.pin.ptr as usize + self.extent.first_slot_block as usize * BLOCK_SIZE) as *mut u8
     }
 
+    /// A zero-copy view of the extent's bytes within the file byte range
+    /// `[start_offset, end_offset)`, which keeps the extent's slot pinned for
+    /// as long as it lives. The bytes are meaningful once they have been put
+    /// in the slot.
+    pub(crate) fn view_bytes(&self, start_offset: usize, end_offset: usize) -> Bytes {
+        self.extent
+            .clipped_bytes(&self.pin, start_offset, end_offset)
+    }
+
     /// Mark the extent's blocks valid - call once its bytes have been read into
     /// the slot.
     pub fn commit(&self) {

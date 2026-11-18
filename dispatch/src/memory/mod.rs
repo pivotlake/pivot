@@ -36,9 +36,9 @@ pub use layout::RingLayout;
 
 pub mod cache;
 pub use cache::{
-    Cache, CacheFill, CacheId, CacheKey, CacheLookup, Cached, Caches, CompressedCache,
-    DecompressedPage, DecompressedPageMeta, MissingExtent, PageCaches, RingCache, Segment,
-    SourceRange,
+    Cache, CacheFill, CacheId, CacheKey, CacheLookup, Cached, CachedFileWriter, Caches,
+    CompressedCache, DecompressedPage, DecompressedPageMeta, MissingExtent, PageCaches, RingCache,
+    Segment, SourceRange,
 };
 
 pub mod clock;

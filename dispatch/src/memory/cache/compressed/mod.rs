@@ -36,9 +36,11 @@
 //! read names the compressed cache it fills by [`CacheId`].
 
 mod extent;
+mod file_writer;
 mod lookup;
 mod valid_bitmap;
 
+pub use file_writer::CachedFileWriter;
 pub use lookup::{CacheLookup, MissingExtent};
 
 use crate::io::OpenFile;

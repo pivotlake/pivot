@@ -5,17 +5,13 @@ use std::sync::Arc;
 
 use dispatch::UnaryResult;
 use dispatch::io::{LocalFile, OpenFile, OperatorIO, RemoteFile};
-use dispatch::memory::{FileBytes, SlabAllocator};
+use dispatch::memory::{CachedFileWriter, FileBytes, SlabAllocator};
+use dispatch::memory_ctx;
 use object_storage::{DataFileLocation, FileRef, ObjectPath, S3Store};
 use parquet_engine::writing::{MemoryReservation, ParquetFileBuilder, WrittenFileMetadata};
 
 use super::multipart::MultipartUpload;
 use super::{CompactedFile, RowGroupWriter};
-
-/// The largest piece an encoded row group is copied in when it is held for
-/// the upload of a whole object, small enough that the pieces fill their ring
-/// buffers.
-pub(super) const PACKED_PIECE_BYTES: usize = 256 * 1024;
 
 /// Where an output file's bytes go.
 pub(super) enum Destination {
@@ -42,6 +38,9 @@ pub(super) struct OpenOutputFile {
     pub(super) key: ObjectPath,
     pub(super) builder: ParquetFileBuilder,
     pub(super) destination: Destination,
+    /// Puts the file in the cache its readers will look in. Every byte of
+    /// the file goes through it and is written out from the cache.
+    pub(super) cached_file: CachedFileWriter,
 }
 
 /// A file whose last byte has been issued, waiting for its writes to land.
@@ -125,6 +124,15 @@ impl RowGroupWriter {
                 },
             },
         };
+        // The cache knows a file by where it is, so the size, which is not
+        // known until the file is closed, is left out of the open.
+        let readable_file = self
+            .output
+            .store
+            .source(&key)
+            .map_err(parquet_engine::op_err)?
+            .open_read(0)
+            .map_err(parquet_engine::op_err)?;
         Ok(OpenOutputFile {
             number,
             rows: 0,
@@ -132,6 +140,10 @@ impl RowGroupWriter {
             key,
             builder: ParquetFileBuilder::new(self.output.schema.clone()),
             destination,
+            cached_file: CachedFileWriter::new(
+                &memory_ctx().page_caches().compressed,
+                readable_file,
+            ),
         })
     }
 
@@ -179,10 +191,10 @@ impl RowGroupWriter {
         Ok(())
     }
 
-    /// Put `bytes` at the end of output file `file_number`: written now to a
-    /// local file, collected for the next part of an S3 object, kept for the
-    /// upload of any other remote one. `memory` is what the compaction
-    /// reserved for the rows they hold.
+    /// Put `bytes`, which the file's cache writer returned, at the end of
+    /// output file `file_number`: written now to a local file, collected for
+    /// the next part of an S3 object, kept for the upload of any other remote
+    /// one. `memory` is what the compaction reserved for the rows they hold.
     pub(super) fn append_to_file(
         &mut self,
         io: &mut OperatorIO,
@@ -236,22 +248,7 @@ impl RowGroupWriter {
                 Ok(())
             }
             Destination::Remote { bytes: held, .. } => {
-                // An encoded page shares its ring buffers with whatever else
-                // its encoder allocated, so holding the pages as they came
-                // would keep many times their size in memory until the
-                // upload. Copied into buffers of their own, a file's pages
-                // take only their size.
-                let allocator = self
-                    .allocator
-                    .get_or_insert_with(|| SlabAllocator::new(false));
-                for run in bytes.runs() {
-                    for piece in run.chunks(PACKED_PIECE_BYTES) {
-                        let mut packed = allocator.get_slab_of_size(piece.len(), false);
-                        packed.as_mut_slice().copy_from_slice(piece);
-                        held.push_slab(packed);
-                    }
-                }
-                drop(bytes);
+                held.append(bytes);
                 // The rows are encoded and wait only for their file's upload.
                 drop(memory);
                 Ok(())
@@ -271,12 +268,15 @@ impl RowGroupWriter {
             key,
             builder,
             mut destination,
+            mut cached_file,
             ..
         } = file;
         let allocator = self
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
         let (footer, metadata) = builder.finish(allocator)?;
+        let footer = cached_file.append(footer);
+        cached_file.finish();
         self.append_to_file(io, number, &mut destination, footer, Vec::new())?;
         let size = match destination {
             Destination::Local { end, .. } => end,

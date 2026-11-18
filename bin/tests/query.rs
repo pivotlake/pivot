@@ -1178,6 +1178,26 @@ async fn drop_cache_evicts_compressed_cache(#[future] conn: Conn) {
     assert_eq!(second, 0, "second drop should find an empty cache");
 }
 
+/// An INSERT puts the file it writes in the compressed cache, so the first
+/// query to read the file finds it there: with the cache emptied before the
+/// INSERT, a drop right after it has that file to evict.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_leaves_the_file_it_wrote_in_the_cache(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE insert_cached (id BIGINT)")
+        .await
+        .unwrap();
+    select_one_i64(&conn, "SELECT drop_cache()").await;
+
+    conn.simple_query("INSERT INTO insert_cached VALUES (1), (2)")
+        .await
+        .unwrap();
+
+    let evicted = select_one_i64(&conn, "SELECT drop_cache()").await;
+    assert!(evicted >= 1, "expected the written file's region evicted");
+}
+
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]

@@ -1948,6 +1948,72 @@ mod tests {
         dispatch.exit();
     }
 
+    /// A compaction puts the file it writes in the compressed cache, so the
+    /// first read of the file takes nothing from storage.
+    #[test]
+    fn compaction_leaves_the_file_it_wrote_in_the_cache() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted_dir = db.path().join("events");
+        std::fs::create_dir_all(&adopted_dir).unwrap();
+        write_parquet_file(&adopted_dir, "a.parquet", vec![1, 2, 3]);
+        write_parquet_file(&adopted_dir, "b.parquet", vec![4, 5]);
+        write_parquet_file(&adopted_dir, "c.parquet", vec![6, 7, 8, 9]);
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(Path::new("events")),
+            false,
+        );
+
+        let input_bytes: u64 = ["a.parquet", "b.parquet", "c.parquet"]
+            .iter()
+            .map(|name| std::fs::metadata(adopted_dir.join(name)).unwrap().len())
+            .sum();
+        let target = (input_bytes as f64 / DEFAULT_MERGE_TARGET_MULTIPLIER).floor() as u64;
+
+        run_one_sweep(target, datastore.clone());
+
+        let table_dir = std::fs::read_dir(db.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.join("_delta_log").is_dir())
+            .expect("the table has a directory of its own");
+        let compacted_file = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "parquet")
+            })
+            .expect("the compaction wrote a file");
+        let size = std::fs::metadata(&compacted_file).unwrap().len() as usize;
+        let is_whole_file_cached = dispatch
+            .dispatcher()
+            .run_on_worker(move || {
+                let reopened = dispatch::io::OpenFile::Local(
+                    dispatch::io::LocalFile::new(std::fs::File::open(&compacted_file).unwrap())
+                        .unwrap(),
+                );
+                dispatch::memory_ctx()
+                    .page_caches()
+                    .compressed
+                    .get(&reopened, 0, size)
+                    .iter()
+                    .all(|lookup| lookup.missing_extent().is_none())
+            })
+            .unwrap();
+        assert!(is_whole_file_cached);
+        dispatch.exit();
+    }
+
     /// End-to-end compaction: several registered small files merge into one, the
     /// datastore swaps to the merged file in one log commit, and it decodes back to
     /// all the original rows.
