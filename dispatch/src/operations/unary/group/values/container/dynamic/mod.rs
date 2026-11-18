@@ -392,8 +392,9 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
     }
 
     /// Merges a tracking partial: numeric identity cells absorb so their merge
-    /// stays unconditional; only a string extreme, whose unseen cell must
-    /// never resolve through the arena, consults the seen bits. Masks union.
+    /// stays unconditional. A string extreme, whose unseen cell must never
+    /// resolve through the arena, and an `ANY_VALUE` or `FIRST`, which keeps
+    /// whichever side is set, consult the seen bits. Masks union.
     fn merge_tracked(
         &mut self,
         source: &Self,
@@ -407,7 +408,12 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
             let source_cell = source.1[slot_index];
             if ONLY_ADDITIVE {
                 self.1[slot_index] = self.1[slot_index] + source_cell;
-            } else if slot.output_type == DataType::Utf8View {
+            } else if slot.output_type == DataType::Utf8View
+                || matches!(
+                    slot.kind,
+                    AggregationKind::AnyValue | AggregationKind::First
+                )
+            {
                 let destination_seen = bits & (1 << slot_index) != 0;
                 let source_seen = source_bits & (1 << slot_index) != 0;
                 match (destination_seen, source_seen) {
@@ -613,8 +619,14 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
                     F64Max::<A>::finish(name, builder, nulls)
                 }
                 AggregationKind::Max => Max::<A>::finish(name, builder, nulls),
-                AggregationKind::First => {
-                    unreachable!("the planner rejects FIRST inside a GROUP BY")
+                AggregationKind::AnyValue | AggregationKind::First if *ty == DataType::Utf8View => {
+                    <A as StringCell>::finish(name, builder, arena, nulls)
+                }
+                AggregationKind::AnyValue | AggregationKind::First if ty.is_floating() => {
+                    A::finish_float(name, builder, nulls)
+                }
+                AggregationKind::AnyValue | AggregationKind::First => {
+                    <A as IntCell>::finish(name, builder, nulls)
                 }
             };
             fields.push(field);

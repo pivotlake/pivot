@@ -17,7 +17,8 @@ use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::output::topk_pruning::TopKWeight;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Decimal64Type, Decimal128Type, Int64Type};
-use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
+use arrow_array::{Array, ArrayRef, BooleanArray, PrimitiveArray, RecordBatch};
+use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -55,9 +56,16 @@ pub enum AggregationKind {
     Min,
     /// `MAX(col)`. See [`Min`](AggregationKind::Min).
     Max,
-    /// `FIRST(col)` — one of the column's values, whichever a worker sees
-    /// first. Global aggregates only; the grouped path rejects it at planning.
+    /// `FIRST(col)`: one of the column's values. Without a GROUP BY it is the
+    /// value of whichever row a worker sees first, NULL included. Inside a
+    /// GROUP BY it shares the [`AnyValue`](AggregationKind::AnyValue) slot:
+    /// which row of a group comes first is not defined, so any of the
+    /// group's values is a valid first.
     First,
+    /// `ANY_VALUE(col)`: one non-NULL value of the column, NULL only when the
+    /// column has none. A slot keeps the first value stored in it; later rows
+    /// and merged partials leave a set slot alone.
+    AnyValue,
 }
 
 /// One aggregate output slot: which aggregate, over which input column, and the
@@ -88,13 +96,27 @@ impl AggregationSlot {
         matches!(self.kind, AggregationKind::Min | AggregationKind::Max)
             && self.output_type == DataType::Utf8View
     }
+
+    /// Returns whether a grouped slot keeps its string in the value arena:
+    /// MIN, MAX, ANY_VALUE or FIRST over strings.
+    #[inline(always)]
+    pub fn keeps_string_in_arena(&self) -> bool {
+        matches!(
+            self.kind,
+            AggregationKind::Min
+                | AggregationKind::Max
+                | AggregationKind::AnyValue
+                | AggregationKind::First
+        ) && self.output_type == DataType::Utf8View
+    }
 }
 
 /// Cast a rendered value column to its slot's declared `output_type`, rebuilding
 /// the field to match. A no-op (a cheap `Arc` clone) when the rendered type
 /// already equals the declared one, so a slot whose accumulator width is its
 /// output type pays nothing; a `COUNT` rendered from an `i128` cell narrows to
-/// `Int64` here, a narrow `SUM` widens to `Decimal128`.
+/// `Int64` here, a narrow `SUM` widens to `Decimal128`, and a boolean, which a
+/// cell stores as `0` or `1`, becomes `Boolean`.
 ///
 /// A conversion to a declared decimal type is a metadata restamp (or a lossless
 /// width change on the raw values), never an arrow cast: the cells hold the raw
@@ -157,6 +179,14 @@ pub(crate) fn cast_value_column(
                     .with_precision_and_scale(*precision, *scale)
                     .expect("declared decimal shape is valid"),
             )
+        }
+        // A boolean held in a wide cell. Arrow casts an integer to `Boolean`
+        // (the narrow cell takes the arm below) but not a decimal.
+        (DataType::Decimal128(_, _), DataType::Boolean) => {
+            let wide = column.as_primitive::<Decimal128Type>();
+            let cells = wide.values();
+            let values = BooleanBuffer::collect_bool(cells.len(), |row| cells[row] != 0);
+            Arc::new(BooleanArray::new(values, wide.nulls().cloned()))
         }
         _ => arrow::compute::cast(&column, output_type).expect("aggregate output column cast"),
     };

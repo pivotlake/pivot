@@ -860,6 +860,55 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             )
         },
     );
+
+    // (k) Low-cardinality string key with a SUM beside two ANY_VALUE slots, one
+    //     over a string and one over a small integer. Models `GROUP BY name
+    //     SUM(v), ANY_VALUE(label), ANY_VALUE(flag)`: after a group's first row
+    //     the two ANY_VALUE slots keep what they hold, so the per-row cost is
+    //     the key probe and the sum.
+    bench(
+        c,
+        d,
+        "group_by/string_lowcard_sum_any_value",
+        rows,
+        || {
+            let sch = schema(vec![
+                Field::new("k", DataType::Utf8View, false),
+                Field::new("v", DataType::Int32, false),
+                Field::new("label", DataType::Utf8View, false),
+                Field::new("flag", DataType::Int16, false),
+            ]);
+            let keys = dict_block(&string_dict(2_000, "name ", 24));
+            let labels = dict_block(&string_dict(500, "label ", 40));
+            let mut rng = Rng::new(11);
+            batch_sizes(rows)
+                .map(|n| {
+                    batch(
+                        &sch,
+                        vec![
+                            string_col(&mut rng, n, &keys),
+                            i32_keys(&mut rng, n, 1_000),
+                            string_col(&mut rng, n, &labels),
+                            i16_value(&mut rng, n, 4),
+                        ],
+                    )
+                })
+                .collect()
+        },
+        |s| {
+            s.group_by_aggregate::<StringKeyExtractor, Dynamic<i128>>(
+                vec![0],
+                vec![
+                    AggregationSlot::new(AggregationKind::Sum, 1, DataType::Decimal128(38, 0)),
+                    AggregationSlot::new(AggregationKind::AnyValue, 2, DataType::Utf8View),
+                    AggregationSlot::new(AggregationKind::AnyValue, 3, DataType::Int16),
+                ],
+                None,
+                (),
+            )
+            .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
+        },
+    );
 }
 
 /// The `(i64 id, sparse free-text phrase)` dataset shared by the row-key and

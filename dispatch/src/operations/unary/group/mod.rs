@@ -268,11 +268,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
         let value_output_types: Arc<[DataType]> =
             value_slots.iter().map(|s| s.output_type.clone()).collect();
-        // A string extreme persists its winner lazily during the in-place fold, so
-        // it must not take the radix scatter path (which seeds — and thus
-        // persists — every row's string before any comparison). Disable the switch
-        // when any value slot is a string extreme; other signatures keep radix.
-        let radix = if value_slots.iter().any(|s| s.is_string_extreme()) {
+        // A string extreme persists its winner lazily during the in-place fold,
+        // and a string ANY_VALUE persists once per group, so neither may take the
+        // radix scatter path (which seeds, and thus persists, every row's string).
+        // Disable the switch when any value slot keeps a string in the arena;
+        // other signatures keep radix.
+        let radix = if value_slots.iter().any(|s| s.keeps_string_in_arena()) {
             radix.without_radix()
         } else {
             radix
@@ -1322,6 +1323,63 @@ mod tests {
             .map(|k| (k, format!("a{k:04}"), format!("z{k:04}")))
             .collect();
         assert_eq!(rows, expected);
+    }
+
+    /// Group 1 has only NULL names on the first worker and one repeated name on
+    /// the second, so the merge has to take the side that holds a value. Group
+    /// 2 has no name on either worker.
+    #[test]
+    fn any_value_merges_across_workers_and_skips_nulls() {
+        use arrow_array::Array;
+        use arrow_array::cast::AsArray;
+
+        let name = "a name longer than twelve bytes";
+        let nullable_batch = |ids: &[i64], names: &[Option<&str>]| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8View, true),
+            ]));
+            let id: ArrayRef = Arc::new(arrow_array::Int64Array::from(ids.to_vec()));
+            let names: ArrayRef = Arc::new(StringViewArray::from(names.to_vec()));
+            RecordBatch::try_new(schema, vec![id, names]).unwrap()
+        };
+        let first_worker = nullable_batch(&[1, 1, 2], &[None, None, None]);
+        let second_worker = nullable_batch(&[2, 1, 1], &[None, Some(name), Some(name)]);
+        let slots = vec![AggregationSlot::new(
+            AggregationKind::AnyValue,
+            1,
+            DataType::Utf8View,
+        )];
+
+        let sender = run_group_full::<
+            IntKeyExtractor<arrow_array::types::Int64Type>,
+            Dynamic<i128, false, u8>,
+        >(
+            vec![vec![first_worker], vec![second_worker]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        let mut rows: Vec<(i64, Option<String>)> = sender
+            .items
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>();
+                let names = batch.column(1).as_string_view();
+                (0..batch.num_rows())
+                    .map(|row| {
+                        let name = names.is_valid(row).then(|| names.value(row).to_string());
+                        (ids.value(row), name)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![(1, Some(name.to_string())), (2, None)]);
     }
 
     // ---- LIMIT pushdown (per-worker TopK / First) ----

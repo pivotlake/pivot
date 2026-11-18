@@ -263,3 +263,47 @@ fn group_by_a_null_field_of_unnested_tuples(mut testing_planner: TestingPlanner)
     groups.sort();
     assert_eq!(groups, vec![(None, 5), (Some(5), 5)]);
 }
+
+// The whole facet-count shape: group, turn each grouped row into one
+// (category, name) tuple per grouping column, filter and regroup the tuples,
+// then regroup once more carrying two labels along with any_value.
+#[rstest]
+fn regroup_unnested_tuples_carrying_labels_with_any_value(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT category, name, sum(value) AS value, \
+                any_value(is_estimated) AS is_estimated, any_value(skip_column) AS skip_column \
+         FROM ( \
+             SELECT pair.category AS category, pair.name AS name, sum(row_count) AS value, \
+                    false AS is_estimated, 'none' AS skip_column \
+             FROM ( \
+                 SELECT unnest([{'category': 'name', 'name': name}, \
+                                {'category': 'a', 'name': CAST(a AS VARCHAR)}]) AS pair, \
+                        row_count \
+                 FROM (SELECT name, a, count(*) AS row_count FROM example_table \
+                       WHERE b BETWEEN 10 AND 40 GROUP BY name, a) \
+             ) \
+             WHERE pair.name != 'bob' OR pair.category = 'a' \
+             GROUP BY pair.category, pair.name \
+         ) \
+         GROUP BY category, name \
+         ORDER BY category, name",
+    );
+
+    let labelled = |category: &str, name: &str| {
+        json!({"category": category, "name": name, "value": 1,
+               "is_estimated": false, "skip_column": "none"})
+    };
+    assert_eq!(
+        rows,
+        vec![
+            labelled("a", "1"),
+            labelled("a", "2"),
+            labelled("a", "3"),
+            labelled("a", "4"),
+            labelled("name", "alice"),
+            labelled("name", "charlie"),
+            labelled("name", "dave"),
+        ]
+    );
+}

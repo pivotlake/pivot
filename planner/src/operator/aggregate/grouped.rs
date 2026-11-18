@@ -302,10 +302,11 @@ pub(super) fn build_group_by_operator(
         other => other,
     };
 
-    // Cell width: i128 when a string extreme needs its 128-bit `ArenaKey` cell, or
-    // when an aggregate reads a column whose values need the wide accumulator (a
-    // 64-bit SUM, or any aggregate over a decimal); else the narrow i64 entry.
-    let requires_wide_cells = slots.iter().any(AggregationSlot::is_string_extreme)
+    // Cell width: i128 when a string MIN/MAX/ANY_VALUE needs its 128-bit
+    // `ArenaKey` cell, or when an aggregate reads a column whose values need the
+    // wide accumulator (a 64-bit SUM, or any aggregate over a decimal); else the
+    // narrow i64 entry.
+    let requires_wide_cells = slots.iter().any(AggregationSlot::keeps_string_in_arena)
         || needs_wide_accumulator(&unique_exprs);
 
     let grouped = dispatch_group_by(
@@ -372,7 +373,7 @@ fn reexpand_coalesced(
 /// (both count every row), so it collapses into [`CountStar`](FoldKey::CountStar);
 /// over a nullable column it counts only the non-NULL rows, so it folds per
 /// column. A SUM/MIN/MAX of a given column is identical to another of the same
-/// column either way (both skip the same NULLs).
+/// column either way (both skip the same NULLs), and so is an ANY_VALUE.
 #[derive(PartialEq)]
 enum FoldKey {
     CountStar,
@@ -380,6 +381,7 @@ enum FoldKey {
     Sum(usize),
     Min(usize),
     Max(usize),
+    AnyValue(usize),
 }
 
 fn fold_key(e: &Expression, nullability: &[bool]) -> Result<FoldKey, Error> {
@@ -399,8 +401,35 @@ fn fold_key(e: &Expression, nullability: &[bool]) -> Result<FoldKey, Error> {
         AggregateFunc::Sum(a) => FoldKey::Sum(a.column().column_idx),
         AggregateFunc::Min(a) => FoldKey::Min(a.column().column_idx),
         AggregateFunc::Max(a) => FoldKey::Max(a.column().column_idx),
+        // A grouped FIRST runs in the ANY_VALUE slot, so the two fold alike.
+        AggregateFunc::AnyValue(a) | AggregateFunc::First(a)
+            if is_grouped_any_value_type(&a.column().return_type) =>
+        {
+            FoldKey::AnyValue(a.column().column_idx)
+        }
         _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
     })
+}
+
+/// Whether a grouped `ANY_VALUE` slot can hold a column of type `ty`: the types
+/// the grouped value readers read (a `Date`/`Timestamp` as the int it stores),
+/// plus booleans. Any other type gets a clean `UnsupportedAggregateExpression`
+/// instead of a worker panic in the reader.
+fn is_grouped_any_value_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Boolean
+            | Type::Utf8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::Float32
+            | Type::Float64
+            | Type::Date
+            | Type::Timestamp
+            | Type::TimestampTz
+            | Type::Decimal { .. }
+    )
 }
 
 /// Whether `column` can hold NULLs, conservatively `true` when the vector does

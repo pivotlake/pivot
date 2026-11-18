@@ -1,9 +1,15 @@
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{
-    ArrayRef, Date32Array, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    StringViewArray,
+use arrow_array::cast::AsArray;
+use arrow_array::types::{
+    Date32Type, Decimal64Type, Decimal128Type, Float64Type, Int16Type, Int64Type,
+    TimestampMicrosecondType,
 };
+use arrow_array::{
+    ArrayRef, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringViewArray,
+};
+use arrow_schema::DataType;
 use dispatch::Dispatch;
 use dispatch::{Built, BuiltNullary};
 
@@ -2530,4 +2536,280 @@ fn group_by_a_function_of_a_null_producing_case(mut testing_planner: TestingPlan
         .collect();
     groups.sort();
     assert_eq!(groups, vec![(None, 3), (Some(2), 1), (Some(4), 1)]);
+}
+
+#[rstest]
+fn grouped_any_value_of_a_string_and_a_boolean_beside_sum(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT name, sum(a) AS total, any_value(a > 0) AS positive, any_value(name) AS label \
+         FROM example_table GROUP BY name",
+    );
+
+    let alice = rows.iter().find(|row| row["name"] == "alice").unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(alice["total"], 6);
+    assert_eq!(alice["positive"], true);
+    assert_eq!(alice["label"], "alice");
+}
+
+/// `(k Int32, v Int32, s Utf8, flag Boolean)`: group 1 starts with NULLs and
+/// then repeats one value per column, group 2 holds only NULLs.
+fn add_sparse_table(testing_planner: &TestingPlanner) {
+    testing_planner.add_table(
+        "sparse",
+        &[
+            ("k", Type::Int32, int_col(vec![1, 1, 1, 2, 2])),
+            (
+                "v",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![None, Some(7), Some(7), None, None])) as ArrayRef,
+            ),
+            (
+                "s",
+                Type::Utf8,
+                Arc::new(StringViewArray::from(vec![
+                    None,
+                    Some("a string longer than twelve bytes"),
+                    Some("a string longer than twelve bytes"),
+                    None,
+                    None,
+                ])) as ArrayRef,
+            ),
+            (
+                "flag",
+                Type::Boolean,
+                Arc::new(BooleanArray::from(vec![None, None, Some(true), None, None])) as ArrayRef,
+            ),
+        ],
+    );
+}
+
+#[rstest]
+fn grouped_any_value_skips_nulls_and_an_all_null_group_is_null(
+    mut testing_planner: TestingPlanner,
+) {
+    add_sparse_table(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT k, any_value(v) AS v, any_value(s) AS s, any_value(flag) AS flag, count(*) AS n \
+         FROM sparse GROUP BY k ORDER BY k",
+    );
+
+    assert_eq!(
+        rows,
+        vec![
+            serde_json::json!({"k": 1, "v": 7, "s": "a string longer than twelve bytes", "flag": true, "n": 3}),
+            serde_json::json!({"k": 2, "n": 2}),
+        ]
+    );
+}
+
+#[rstest]
+fn global_any_value_skips_a_leading_null(mut testing_planner: TestingPlanner) {
+    add_sparse_table(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT any_value(v) AS v, any_value(s) AS s FROM sparse",
+    );
+
+    assert_eq!(
+        rows,
+        vec![serde_json::json!({"v": 7, "s": "a string longer than twelve bytes"})]
+    );
+}
+
+#[rstest]
+fn global_any_value_over_only_nulls_is_null(mut testing_planner: TestingPlanner) {
+    add_sparse_table(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT any_value(v) AS v FROM sparse WHERE k = 2",
+    );
+
+    assert!(rows[0]["v"].is_null());
+}
+
+// Every row of a group shares the value of each aggregated column, so the
+// result does not depend on which row a slot keeps.
+#[rstest]
+fn grouped_any_value_keeps_each_column_type(mut testing_planner: TestingPlanner) {
+    let keys: Vec<i32> = (0..3000).map(|row| row % 3).collect();
+    testing_planner.add_table(
+        "typed",
+        &[
+            ("k", Type::Int32, int_col(keys.clone())),
+            (
+                "small",
+                Type::Int16,
+                int16_col(keys.iter().map(|&k| k as i16 - 1).collect()),
+            ),
+            (
+                "big",
+                Type::Int64,
+                Arc::new(Int64Array::from_iter_values(
+                    keys.iter().map(|&k| k as i64 * 5_000_000_000),
+                )) as ArrayRef,
+            ),
+            (
+                "ratio",
+                Type::Float64,
+                Arc::new(Float64Array::from_iter_values(
+                    keys.iter().map(|&k| k as f64 + 0.5),
+                )) as ArrayRef,
+            ),
+            (
+                "day",
+                Type::Date,
+                Arc::new(Date32Array::from_iter_values(
+                    keys.iter().map(|&k| 19_000 + k),
+                )) as ArrayRef,
+            ),
+            (
+                "price",
+                Type::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                Arc::new(
+                    Decimal64Array::from_iter_values(keys.iter().map(|&k| k as i64 * 100 + 25))
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ) as ArrayRef,
+            ),
+            (
+                "wide_price",
+                Type::Decimal {
+                    precision: 30,
+                    scale: 2,
+                },
+                Arc::new(
+                    Decimal128Array::from_iter_values(
+                        keys.iter().map(|&k| (k as i128 + 1) * 10_i128.pow(22)),
+                    )
+                    .with_precision_and_scale(30, 2)
+                    .unwrap(),
+                ) as ArrayRef,
+            ),
+        ],
+    );
+
+    let batches = run_batches(
+        &mut testing_planner,
+        "SELECT k, any_value(small), any_value(big), any_value(ratio), any_value(day), \
+         any_value(price), any_value(wide_price), any_value(day + INTERVAL 1 DAY) \
+         FROM typed GROUP BY k ORDER BY k",
+    );
+
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(
+        batch.column(1).as_primitive::<Int16Type>().values(),
+        &[-1, 0, 1]
+    );
+    assert_eq!(
+        batch.column(2).as_primitive::<Int64Type>().values(),
+        &[0, 5_000_000_000, 10_000_000_000]
+    );
+    assert_eq!(
+        batch.column(3).as_primitive::<Float64Type>().values(),
+        &[0.5, 1.5, 2.5]
+    );
+    assert_eq!(
+        batch.column(4).as_primitive::<Date32Type>().values(),
+        &[19_000, 19_001, 19_002]
+    );
+    assert_eq!(batch.column(5).data_type(), &DataType::Decimal64(10, 2));
+    assert_eq!(
+        batch.column(5).as_primitive::<Decimal64Type>().values(),
+        &[25, 125, 225]
+    );
+    assert_eq!(batch.column(6).data_type(), &DataType::Decimal128(30, 2));
+    assert_eq!(
+        batch.column(6).as_primitive::<Decimal128Type>().values(),
+        &[10_i128.pow(22), 2 * 10_i128.pow(22), 3 * 10_i128.pow(22)]
+    );
+    assert_eq!(
+        batch
+            .column(7)
+            .as_primitive::<TimestampMicrosecondType>()
+            .value(0),
+        19_001 * 86_400_000_000
+    );
+}
+
+#[rstest]
+fn grouped_any_value_of_an_unsupported_type_fails_to_compile(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "tiny",
+        &[
+            ("k", Type::Int32, int_col(vec![1, 1])),
+            (
+                "t",
+                Type::Int8,
+                Arc::new(Int8Array::from(vec![4_i8, 4])) as ArrayRef,
+            ),
+        ],
+    );
+
+    let compiled = testing_planner
+        .plan("SELECT k, any_value(t) FROM tiny GROUP BY k")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        );
+
+    let error = compiled
+        .err()
+        .expect("TINYINT has no grouped any_value")
+        .to_string();
+    assert!(error.contains("AnyValue"), "{error}");
+}
+
+// Every row of a group carries the group's own name, so whichever row is
+// first, the answer is that name.
+#[rstest]
+#[case::first("first")]
+#[case::arbitrary("arbitrary")]
+fn first_inside_group_by(mut testing_planner: TestingPlanner, #[case] function: &str) {
+    let rows = run(
+        &mut testing_planner,
+        &format!(
+            "SELECT name, {function}(name) AS first_name, count(*) AS row_count \
+             FROM example_table GROUP BY name ORDER BY name"
+        ),
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"name": "alice", "first_name": "alice", "row_count": 2},
+            {"name": "bob", "first_name": "bob", "row_count": 1},
+            {"name": "charlie", "first_name": "charlie", "row_count": 1},
+            {"name": "dave", "first_name": "dave", "row_count": 1},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+// A boolean any_value with no wide aggregate beside it, so its cells are the
+// narrow ones. Each group has one row, which makes the kept value unambiguous.
+#[rstest]
+fn any_value_of_a_boolean_alone(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT a, any_value(a > 2) AS above_two FROM example_table GROUP BY a ORDER BY a",
+    );
+
+    let above_two: Vec<bool> = rows
+        .iter()
+        .map(|row| row["above_two"].as_bool().unwrap())
+        .collect();
+    assert_eq!(above_two, vec![false, false, true, true, true]);
 }

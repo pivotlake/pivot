@@ -330,7 +330,13 @@ impl AggregateFunc {
                 return_type,
                 function,
             )?)),
-            "first" => Ok(AggregateFunc::First(numeric_aggregate(
+            // `arbitrary` is DuckDB's other name for `first`.
+            "first" | "arbitrary" => Ok(AggregateFunc::First(numeric_aggregate(
+                params,
+                return_type,
+                function,
+            )?)),
+            "any_value" => Ok(AggregateFunc::AnyValue(numeric_aggregate(
                 params,
                 return_type,
                 function,
