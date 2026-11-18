@@ -75,7 +75,6 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let cancelled = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "perf")]
         let profiled = self.dispatcher.profiled();
-        let background = self.dispatcher.is_background();
         let wakers = self
             .dispatcher
             .push_data_flow(self.factories.into_iter().map(|f| {
@@ -92,7 +91,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
                 );
                 #[cfg(feature = "perf")]
                 let builder = builder.with_profiling(profiled);
-                builder.with_background(background)
+                builder
             }));
         // Close our local copies of the senders so the channels close once
         // every worker drops theirs.

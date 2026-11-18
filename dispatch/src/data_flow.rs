@@ -371,10 +371,6 @@ pub struct DataFlow {
     /// [`DataFlowDispatcher::with_profiling`](crate::DataFlowDispatcher::with_profiling)).
     #[cfg(feature = "perf")]
     profiled: bool,
-    /// Whether this dataflow is background work: a worker gives it CPU work
-    /// only on a pass in which no other dataflow had any (see
-    /// [`DataFlowDispatcher::in_background`](crate::DataFlowDispatcher::in_background)).
-    background: bool,
     /// Whether this dataflow's operators were registered with the memory
     /// context as evictors (see [`DataflowEvict`]), and so must be unregistered
     /// when it drops. False when no operator declared one.
@@ -483,7 +479,6 @@ impl DataFlow {
             next_request_id: 0,
             #[cfg(feature = "perf")]
             profiled: false,
-            background: false,
             registered_evictors,
         }
     }
@@ -503,18 +498,6 @@ impl DataFlow {
         }
         self.profiled = profiled;
         self
-    }
-
-    /// Mark this dataflow as background work. `pub(crate)`: only the builder
-    /// uses it.
-    pub(crate) fn with_background(mut self, background: bool) -> Self {
-        self.background = background;
-        self
-    }
-
-    /// Whether this dataflow is background work.
-    pub fn is_background(&self) -> bool {
-        self.background
     }
 
     /// Whether this dataflow is profiled (and so runs exclusively).

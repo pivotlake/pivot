@@ -207,34 +207,12 @@ pub struct DataFlowDispatcher {
     /// refresh and compaction loops) observe that the pool is tearing down and
     /// stop, without the pool having to hand out its `Shutdown`.
     shutdown_flag: Arc<AtomicBool>,
-    /// Whether every dataflow launched through this handle runs in the
-    /// background (see [`in_background`](Self::in_background)); `false` on
-    /// the shared handle.
-    background: bool,
     /// Whether every dataflow launched through this handle is marked profiled.
     /// Set only on a per-query clone (see [`with_profiling`](Self::with_profiling))
     /// so profiling (and the exclusive execution it triggers) is scoped to one
     /// query's dataflows; `false` on the shared handle.
     #[cfg(feature = "perf")]
     profiled: bool,
-}
-
-impl DataFlowDispatcher {
-    /// Return this dispatcher marking every dataflow it launches as
-    /// background work: a worker gives such a dataflow CPU work only on a
-    /// pass in which no other dataflow had any for it. For maintenance that
-    /// may take as long as it takes, such as a compaction, so that it does
-    /// not share the workers evenly with the queries and writes running
-    /// beside it. Clone the shared handle and call this on the clone.
-    pub fn in_background(mut self) -> Self {
-        self.background = true;
-        self
-    }
-
-    /// Whether this handle marks its dataflows as background work.
-    pub(crate) fn is_background(&self) -> bool {
-        self.background
-    }
 }
 
 #[cfg(feature = "perf")]
@@ -489,7 +467,6 @@ impl Dispatch {
                 buffers: layout.total_slots(),
                 next_worker: Arc::new(AtomicUsize::new(0)),
                 shutdown_flag: should_exit.clone(),
-                background: false,
                 #[cfg(feature = "perf")]
                 profiled: false,
             },

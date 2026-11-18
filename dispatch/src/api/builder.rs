@@ -180,9 +180,6 @@ pub struct DataFlowBuilder {
     /// launching dispatcher was marked (see [`with_profiling`](Self::with_profiling)).
     #[cfg(feature = "perf")]
     profiled: bool,
-    /// Whether this dataflow is background work (see
-    /// [`DataFlowDispatcher::in_background`](crate::DataFlowDispatcher::in_background)).
-    background: bool,
     /// Builds the per-worker operator graph.
     build: Box<dyn FnOnce(&mut BuildContext) -> OperatorGraphBuilder + Send>,
 }
@@ -202,15 +199,8 @@ impl DataFlowBuilder {
             collect_stats,
             #[cfg(feature = "perf")]
             profiled: false,
-            background: false,
             build,
         }
-    }
-
-    /// Mark this builder's dataflow as background work.
-    pub fn with_background(mut self, background: bool) -> Self {
-        self.background = background;
-        self
     }
 
     /// Mark this builder's dataflow profiled, so it runs exclusively while a
@@ -263,7 +253,7 @@ impl DataFlowBuilder {
         );
         #[cfg(feature = "perf")]
         let data_flow = data_flow.with_profiling(self.profiled);
-        Ok(data_flow.with_background(self.background))
+        Ok(data_flow)
     }
 }
 
