@@ -19,9 +19,17 @@ axum = "0.7"
 # Parses the timestamps a pivot server renders as text.
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
+# Reads a statement's result as it arrives, to stop at the row limit.
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
+# A file's column bounds arrive as a JSON document and are passed on as one.
+serde_json = "1"
+# Reads this machine's name and memory, for when it is the pivot server's.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 tokio-postgres = "0.7"
+# Serves the built page's files.
+tower-http = { version = "0.5", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"

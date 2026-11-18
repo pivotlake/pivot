@@ -5,3 +5,7 @@
 .DS_Store
 /dist
 /dist-pgo
+**/node_modules
+/web/dist
+/.tmp
+/.claude
