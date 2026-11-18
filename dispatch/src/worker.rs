@@ -154,6 +154,8 @@ pub struct Worker {
     /// Did the worker do work on last iteration? This is used to decide whether the worker should
     /// do background tasks, just as cleaning
     did_work_last_iteration: bool,
+    /// When a background dataflow last had a unit of CPU work on this worker.
+    last_background_unit: std::time::Instant,
     /// Shared park/notify object. Keeping an owned `Arc` here means the
     /// [`init_worker_waker`] raw pointer stays valid for the lifetime of the
     /// worker thread.
@@ -179,6 +181,10 @@ pub struct Worker {
     /// has fails when eviction finds none to give it.
     spill_directory: Option<SpillDirectory>,
 }
+
+/// How long a worker that has another dataflow holds its background
+/// dataflows' work back before it gives them a unit anyway.
+const BACKGROUND_HOLD_LIMIT: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl Worker {
     /// Spawn a worker thread pinned to `core`. Blocks on `ready_barrier` before
@@ -242,6 +248,7 @@ impl Worker {
                     idle_saturating_passes_to_skip: 0,
                     data_flow_queue: receiver,
                     did_work_last_iteration: false,
+                    last_background_unit: std::time::Instant::now(),
                     should_exit,
                     waker,
                     last_seen_wake_count,
@@ -386,10 +393,25 @@ impl Worker {
         }
     }
 
+    /// Whether this worker is holding its background dataflows' work back:
+    /// it has another dataflow, and a background dataflow had a unit less
+    /// than [`BACKGROUND_HOLD_LIMIT`] ago.
+    ///
+    /// A dataflow ends stage by stage, and a stage has ended only once every
+    /// worker has come round to it. A worker that fits a background unit
+    /// into each pass makes every stage of a query wait for that unit, even
+    /// though the query has no work left for it. So background work waits
+    /// while the worker has any other dataflow, but not for longer than the
+    /// limit, so that it is never kept waiting for good.
+    fn holds_background_work(&self) -> bool {
+        self.last_background_unit.elapsed() < BACKGROUND_HOLD_LIMIT
+            && self.data_flows.values().any(|flow| !flow.is_background())
+    }
+
     /// Run one unit of CPU work of every dataflow that has work ready. A
-    /// background dataflow gets its unit only when no other dataflow had one:
-    /// its units may be long, and a query or a write sharing the worker waits
-    /// through each of them.
+    /// background dataflow gets its unit only when no other dataflow had
+    /// one, and when the worker is not holding background work back (see
+    /// [`holds_background_work`](Self::holds_background_work)).
     fn step_run_ready_cpu_work(&mut self) {
         let mut foreground_ran = false;
         // While a `perf` capture is in progress, run only the profiled dataflow
@@ -410,6 +432,9 @@ impl Worker {
             self.did_work_last_iteration = true;
             return;
         }
+        if self.holds_background_work() {
+            return;
+        }
         for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
             if Self::paused_for_profiling(flow) {
@@ -420,6 +445,7 @@ impl Worker {
             }
             if let WorkStatus::Ran = flow.run_ready_cpu_work(&self.io) {
                 self.did_work_last_iteration = true;
+                self.last_background_unit = std::time::Instant::now();
             }
         }
     }
@@ -574,13 +600,20 @@ impl Worker {
 
     /// Attempt to steal work from sibling workers' channels when this worker is idle.
     fn try_steal_work(&mut self) {
+        let holds_background_work = self.holds_background_work();
         for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
             if Self::paused_for_profiling(flow) {
                 continue;
             }
+            if flow.is_background() && holds_background_work {
+                continue;
+            }
             if let WorkStatus::Ran = flow.try_stealing_work(&self.io) {
                 self.did_work_last_iteration = true;
+                if flow.is_background() {
+                    self.last_background_unit = std::time::Instant::now();
+                }
             }
         }
     }
