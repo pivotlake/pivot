@@ -43,6 +43,10 @@ unqualified table name refers to it. `events` and the Iceberg tables in `lake`
 are read with the `example-bucket` secret, and the Iceberg catalog itself is
 authenticated to with `lake-catalog`.
 
+On AWS, the `example-bucket` secret can be left out: the server then signs
+requests with [its own AWS identity](#aws-credentials-of-the-server), such as
+the IAM role of the instance it runs on.
+
 ## Datastores
 
 Each entry under `datastores` is keyed by the datastore's name, which is how
@@ -165,11 +169,33 @@ secrets:
 | Key | Default | Description |
 | --- | --- | --- |
 | `type` | Required | `s3`. |
-| `access_key_id` | Required | The access key ID. |
-| `secret_access_key` | Required | The secret access key. |
+| `access_key_id` | None | The access key ID. Set it together with `secret_access_key`. |
+| `secret_access_key` | None | The secret access key. |
+| `anonymous` | `false` | Send requests unsigned, for a public bucket. Cannot be combined with keys. |
 | `scope` | Every `s3://` location | The `s3://bucket/prefix` the secret covers. See [Scopes](#scopes). |
 | `region` | Discovered from the bucket | The bucket's region. |
 | `endpoint` | AWS S3 | An S3-compatible endpoint, such as `http://minio:9000`. Requests to it use path-style addressing. |
+
+An S3 secret authenticates its locations in one of three ways:
+
+- **With its own keys.** Set `access_key_id` and `secret_access_key`.
+- **As the server's own AWS identity.** Leave the keys out. The server signs
+  requests with the [AWS credentials it finds](#aws-credentials-of-the-server),
+  such as the IAM role of the EC2 instance it runs on.
+- **Anonymously.** Set `anonymous: true` to send requests unsigned. Use it for
+  a public bucket that the server's own identity is not allowed to read.
+
+```yaml
+secrets:
+  instance-role:
+    type: s3
+    scope: s3://example-bucket/      # signed as the server's own identity
+    region: us-east-1
+  open-data:
+    type: s3
+    scope: s3://public-datasets/     # read without signing
+    anonymous: true
+```
 
 ### GCS secrets
 
@@ -216,15 +242,48 @@ scheme: an `s3` secret scoped to `gs://example-bucket/` is a startup error.
 
 ### Locations without a secret
 
-When no secret covers a location:
+When no secret covers a location, the server opens it as its own identity:
 
-- **S3** locations are read with anonymous, unsigned requests. This works for
-  public buckets and for S3-compatible services that require no
-  authentication.
+- **S3** locations use the [AWS credentials of the server](#aws-credentials-of-the-server).
 - **GCS** locations use Application Default Credentials: the key file named by
   `GOOGLE_APPLICATION_CREDENTIALS`, then the credentials written by
   `gcloud auth application-default login`, then the identity of the Google
   Cloud instance the server runs on.
+
+### AWS credentials of the server
+
+For an S3 location that no secret covers, or whose secret has no keys, the
+server uses the first of these that provides credentials:
+
+| Order | Source | Configured by |
+| --- | --- | --- |
+| 1 | Environment variables | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` for temporary keys. |
+| 2 | Container credentials, such as an ECS task role or EKS Pod Identity | `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `AWS_CONTAINER_CREDENTIALS_FULL_URI`. |
+| 3 | EC2 instance role | The instance metadata service (IMDSv2). `AWS_EC2_METADATA_DISABLED=true` skips it. |
+
+Temporary credentials from a container or an instance role are refreshed
+automatically before they expire, so a long-running server keeps working.
+
+If no source provides credentials, requests are sent unsigned. This is enough
+to read a public bucket. A private bucket answers such a request with a 403
+error, and the error message says that no credentials were found.
+
+Profiles in `~/.aws/credentials` and `~/.aws/config`, and web identity tokens
+such as an EKS service account's, are not read.
+
+:::note[Instance roles inside a container]
+A server in a container on EC2 can reach the instance metadata service only
+if the instance's metadata hop limit is at least 2, or the container uses the
+host's network.
+:::
+
+:::caution[Public buckets and the server's identity]
+Once the server has an AWS identity, it signs every request to a location
+that no secret covers, including requests to public buckets. AWS denies a
+signed request when that identity has no permission to read the bucket, even
+if the bucket is public. Add a secret with `anonymous: true` for such a
+bucket.
+:::
 
 ### Iceberg catalog secrets
 
@@ -249,8 +308,8 @@ secrets:
 Set exactly one of `token` and `credential`.
 
 :::caution[Protect files that hold secrets]
-S3 keys, Iceberg tokens, and Iceberg credentials are written in the file
-itself. Make the configuration file and the metastore file readable only by
+S3 keys and session tokens, Iceberg tokens, and Iceberg credentials are
+written in the file itself. Make the configuration file and the metastore file readable only by
 the user the server runs as.
 :::
 

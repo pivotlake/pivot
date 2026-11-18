@@ -28,7 +28,7 @@ use delta_kernel::expressions::ColumnName;
 use delta_kernel::expressions::Scalar as DeltaScalar;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::StaticCredentialProvider;
-use delta_kernel::object_store::aws::AmazonS3Builder;
+use delta_kernel::object_store::aws::{AmazonS3Builder, AwsCredential};
 use delta_kernel::object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::StatsOptions;
@@ -47,7 +47,7 @@ use planner::types::Type;
 use url::Url;
 
 use crate::manifest::DeltaFileEntry;
-use object_storage::{FileRef, ObjectPath, ObjectStore, StoreConnection};
+use object_storage::{FileRef, ObjectPath, ObjectStore, S3SigningKeys, StoreConnection};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -977,20 +977,16 @@ fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObject
         StoreConnection::S3 {
             uri,
             region,
-            credentials,
+            signing_keys,
             endpoint,
         } => {
             let mut builder = AmazonS3Builder::new().with_url(uri).with_region(region);
-            if let Some(credentials) = credentials {
-                builder = builder
-                    .with_access_key_id(credentials.keys.access_key)
-                    .with_secret_access_key(credentials.keys.secret_key);
-                if let Some(session_token) = credentials.keys.session_token {
-                    builder = builder.with_token(session_token);
+            builder = match signing_keys {
+                Some(signing_keys) => {
+                    builder.with_credentials(Arc::new(CurrentS3Keys(signing_keys)))
                 }
-            } else {
-                builder = builder.with_skip_signature(true);
-            }
+                None => builder.with_skip_signature(true),
+            };
             if let Some(endpoint) = endpoint {
                 builder = builder
                     .with_endpoint(endpoint)
@@ -1023,6 +1019,43 @@ fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObject
         }
     };
     Ok(store)
+}
+
+/// Hands the Delta client the keys the datastore's own store signs with at the
+/// moment of each request, read again first when they are close to expiring,
+/// so the log's reads and commits outlive a session's keys as the data files'
+/// do.
+#[derive(Debug)]
+struct CurrentS3Keys(S3SigningKeys);
+
+#[async_trait::async_trait]
+impl delta_kernel::object_store::CredentialProvider for CurrentS3Keys {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> delta_kernel::object_store::Result<Arc<AwsCredential>> {
+        let signing_keys = self.0.clone();
+        // Reading the keys again blocks on their source, so it runs off the
+        // runtime's workers.
+        let keys = tokio::task::spawn_blocking(move || signing_keys.refresh())
+            .await
+            .map_err(wrap_s3_credential_error)?
+            .map_err(wrap_s3_credential_error)?;
+        Ok(Arc::new(AwsCredential {
+            key_id: keys.access_key.clone(),
+            secret_key: keys.secret_key.clone(),
+            token: keys.session_token.clone(),
+        }))
+    }
+}
+
+/// The Delta client's error for S3 keys that could not be read.
+fn wrap_s3_credential_error(
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> delta_kernel::object_store::Error {
+    delta_kernel::object_store::Error::Generic {
+        store: "S3",
+        source: Box::new(source),
+    }
 }
 
 /// Fallback multi-threaded runtime for Kernel's engine I/O (log reads and,

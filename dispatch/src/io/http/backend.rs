@@ -261,14 +261,7 @@ mod blocking_engine {
     /// Issue the range GET on `conn` and read its body to where the read's
     /// parts say it goes, returning the connection for re-pooling on success.
     fn do_read(mut conn: Conn, read: &RemoteRead) -> Result<Conn> {
-        let auth = read.remote.auth_header();
-        let request = proto::build_range_get(
-            read.remote.host_header(),
-            read.remote.request_target(),
-            read.offset,
-            read.len(),
-            auth.as_deref(),
-        );
+        let request = RemoteRequest::Read(read.clone()).request_head()?;
         conn.write_all(&request)?;
         conn.flush()?;
 
@@ -350,7 +343,7 @@ mod blocking_engine {
     }
 
     fn do_upload(mut conn: Conn, upload: &RemoteUpload) -> Result<Option<Conn>> {
-        let request = RemoteRequest::Upload(upload.clone()).request_head();
+        let request = RemoteRequest::Upload(upload.clone()).request_head()?;
         conn.write_all(&request)?;
         for run in upload.data.runs() {
             conn.write_all(run)?;
@@ -742,13 +735,16 @@ mod uring_engine {
     }
 
     impl HttpExchange {
-        fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Self {
+        /// Bind `request` to `conn`, with its head built (and so authenticated)
+        /// for this attempt; a head that cannot be authenticated fails the
+        /// attempt before anything is sent.
+        fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Result<Self> {
             let expected_body_len = match &request {
                 RemoteRequest::Read(read) => read.expected_body_len(),
                 RemoteRequest::Upload(_) => 0,
             };
-            let request_bytes = request.request_head();
-            Self {
+            let request_bytes = request.request_head()?;
+            Ok(Self {
                 conn,
                 id,
                 body_cursor: BodyCursor::default(),
@@ -769,7 +765,7 @@ mod uring_engine {
                 recv_in_dest: false,
                 conn_reusable: true,
                 state,
-            }
+            })
         }
 
         /// Finish this exchange and return only its reusable connection. Every
@@ -1157,7 +1153,7 @@ mod uring_engine {
             request: RemoteRequest,
         ) -> Result<()> {
             let (conn, state) = self.take_connection(&request)?;
-            let exchange = HttpExchange::new(conn, id, request, state);
+            let exchange = HttpExchange::new(conn, id, request, state)?;
             self.launch(ring, exchange)
         }
 
@@ -1324,14 +1320,17 @@ mod uring_engine {
             drop(conn); // close the stalled socket before issuing the read again
             self.reissued.push(id);
 
-            match self.take_connection(&request) {
-                Ok((conn, state)) => {
-                    let mut fresh = HttpExchange::new(conn, id, request, state);
+            let fresh = self
+                .take_connection(&request)
+                .and_then(|(conn, state)| HttpExchange::new(conn, id, request, state));
+            match fresh {
+                Ok(mut fresh) => {
                     fresh.retries = retries;
                     fresh.deadline_reissues = deadline_reissues + 1;
                     self.launch(ring, fresh)
                 }
-                // Couldn't even build the socket — treat as a terminal failure.
+                // Couldn't even build the socket or authenticate the request —
+                // treat as a terminal failure.
                 Err(error) => {
                     self.failed.push((id, error));
                     Ok(())
@@ -1363,15 +1362,18 @@ mod uring_engine {
             drop(conn); // close the failed socket before reconnecting
 
             if is_retryable(&err) && retries < MAX_HTTP_RETRIES {
-                match self.new_conn(key, &request) {
-                    Ok(conn) => {
-                        let mut fresh = HttpExchange::new(conn, id, request, State::Connecting);
+                let fresh = self
+                    .new_conn(key, &request)
+                    .and_then(|conn| HttpExchange::new(conn, id, request, State::Connecting));
+                match fresh {
+                    Ok(mut fresh) => {
                         fresh.retries = retries + 1;
                         fresh.deadline_reissues = deadline_reissues;
                         let new_idx = self.alloc_slot(fresh);
                         return self.start_connect(ring, new_idx);
                     }
-                    // Couldn't even build the socket — treat as a terminal failure.
+                    // Couldn't even build the socket or authenticate the
+                    // request — treat as a terminal failure.
                     Err(e) => {
                         self.active -= 1;
                         self.failed.push((id, e));

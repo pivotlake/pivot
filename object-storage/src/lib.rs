@@ -9,19 +9,21 @@
 //! function we call inline (the tokio it transitively links is never driven);
 //! GCS requests carry an OAuth2 bearer token. Credentials come from whoever
 //! opened the store: a metastore hands them in per datastore, and [`open_store`]
-//! falls back to the environment. [`StoreConnection`] exposes those resolved
-//! settings to format-specific adapters without making this crate depend on
-//! them. S3 falls back to unsigned anonymous requests when no credentials are
-//! available. This runs off the io_uring ring on purpose: a
+//! falls back to the identity the process runs as (the AWS credential chain,
+//! Google's Application Default Credentials). [`StoreConnection`]
+//! exposes those resolved settings to format-specific adapters without making
+//! this crate depend on them. S3 falls back to unsigned anonymous requests when
+//! no credentials are available. This runs off the io_uring ring on purpose: a
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
-use dispatch::io::{AuthHeader, OpenFile, RemoteFile, open_direct_read};
+use dispatch::io::{OpenFile, RemoteFile, RequestAuth, open_direct_read};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod aws_credentials;
 pub mod file_injector;
 mod file_slice_injector;
 mod gcs;
@@ -32,6 +34,7 @@ mod object_path;
 mod s3;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+pub use aws_credentials::AwsCredentialChain;
 pub use gcs::GcsStore;
 pub use instance_bandwidth::{
     INSTANCE_METADATA_ENDPOINT, InstanceBandwidth, InstanceBandwidthError,
@@ -40,7 +43,7 @@ pub use instance_bandwidth::{
 pub use local::LocalStore;
 pub use object_fetcher::{FileSlice, LoadedObject, load_file_slices, load_objects};
 pub use object_path::ObjectPath;
-pub use s3::{S3Credentials, S3Keys, S3Store};
+pub use s3::{S3Auth, S3Credentials, S3Keys, S3SigningKeys, S3Store};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -132,20 +135,21 @@ pub struct DataFile {
 
 /// Where a data file's bytes live, for reading or writing: a local filesystem
 /// path (via the io_uring file path) or a remote URL (HTTP on the same ring). A
-/// remote URL either carries its own auth (an S3 presigned URL), needs no auth
-/// (anonymous S3), or pairs a stable URL with an [`AuthHeader`] that mints a
-/// fresh bearer token per request. Which variant a store yields is its business,
-/// not the caller's.
+/// remote URL is stable; it either needs no auth (anonymous S3, a public URL)
+/// or pairs with a [`RequestAuth`] that mints the headers authenticating each
+/// request (a GCS bearer token, an S3 signature) from state the store keeps
+/// current. Which a store yields is its business, not the caller's.
 ///
-/// The same key maps to a different URL per direction — [`source`](ObjectStore::source)
-/// builds the read URL, [`sink`](ObjectStore::sink) the write URL (e.g. S3 presigns
-/// a GET vs a PUT) — so both return this one type. Uploads are always a `PUT`.
+/// The same key may map to a different URL per direction — [`source`](ObjectStore::source)
+/// builds the read URL, [`sink`](ObjectStore::sink) the write URL (GCS reads
+/// over its JSON API and writes over its XML one) — so both return this one
+/// type. Uploads are always a `PUT`.
 #[derive(Clone)]
 pub enum DataFileLocation {
     Local(PathBuf),
     Remote {
         url: url::Url,
-        auth: Option<AuthHeader>,
+        auth: Option<Arc<dyn RequestAuth>>,
     },
 }
 
@@ -265,8 +269,8 @@ pub trait ObjectStore: Debug + Send + Sync {
     ) -> Result<DirectoryListing>;
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
-    /// a filesystem path, a remote one a GET URL — either presigned or paired
-    /// with a per-request bearer token. (Identity — the [`FileRef`] — is the
+    /// a filesystem path, a remote one a GET URL, paired with what authenticates
+    /// each request when the store signs. (Identity — the [`FileRef`] — is the
     /// caller's; this is only how to read the bytes.)
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation>;
 
@@ -324,7 +328,10 @@ pub enum StoreConnection {
     S3 {
         uri: String,
         region: String,
-        credentials: Option<S3Credentials>,
+        /// The keys the store signs with at any moment, which another client
+        /// reads for each of its own requests; `None` for a store that sends
+        /// its requests unsigned.
+        signing_keys: Option<S3SigningKeys>,
         endpoint: Option<String>,
     },
     Gcs {
@@ -467,12 +474,12 @@ pub(crate) fn update_by_version_swap(
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
 /// `gs://bucket/prefix`, or a local path (optionally `file://`). Credentials are
-/// whatever the process itself can resolve. S3 uses anonymous access when both
-/// key variables are absent; a caller holding its own opens the backend directly
-/// (`S3Store::with_credentials`, `GcsStore::with_credentials_file`).
+/// whatever the process itself can resolve. S3 uses anonymous access when its
+/// credential chain finds no keys; a caller holding its own opens the backend
+/// directly (`S3Store::with_credentials`, `GcsStore::with_credentials_file`).
 pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     match StoreScheme::of(uri)? {
-        StoreScheme::S3 => Ok(Box::new(S3Store::with_env_credentials(uri)?)),
+        StoreScheme::S3 => Ok(Box::new(S3Store::with_default_credentials(uri)?)),
         StoreScheme::Gcs => Ok(Box::new(GcsStore::with_default_credentials(uri)?)),
         StoreScheme::Local => Ok(Box::new(LocalStore::new(local_path(uri))?)),
     }
@@ -539,6 +546,14 @@ pub(crate) fn percent_encode(s: &str) -> String {
 pub(crate) fn parse_iso8601_millis(s: &str) -> Option<u64> {
     let nanos = arrow_cast::parse::string_to_timestamp_nanos(s).ok()?;
     u64::try_from(nanos / 1_000_000).ok()
+}
+
+/// The current time in Unix seconds, as credentials state their expiry.
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 /// The bucket-root-absolute form of a store key, for a backend whose keys live

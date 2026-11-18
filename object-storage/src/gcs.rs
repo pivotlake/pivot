@@ -28,12 +28,12 @@
 use super::{
     DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
     ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, object_key,
-    parse_iso8601_millis, percent_encode,
+    parse_iso8601_millis, percent_encode, unix_now,
 };
 use base64::Engine;
+use dispatch::io::RequestAuth;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Re-mint a token once it's within this many seconds of expiry. Generous so a
 /// token primed at query start stays valid for the whole query's worker reads.
@@ -601,11 +601,29 @@ impl GcsStore {
             return Ok(DataFileLocation::Remote { url, auth: None });
         }
         self.auth.header()?;
-        let auth = self.auth.clone();
         Ok(DataFileLocation::Remote {
             url,
-            auth: Some(Arc::new(move || auth.current())),
+            auth: Some(Arc::new(BearerToken(Arc::clone(&self.auth)))),
         })
+    }
+}
+
+/// The token the store last minted, as each request's `Authorization` header.
+/// Never mints: the store primes the cell before it hands a location out, and
+/// a request before any mint is an error rather than an unauthenticated one.
+struct BearerToken(Arc<GcsAuth>);
+
+impl RequestAuth for BearerToken {
+    fn authenticate(
+        &self,
+        _method: &str,
+        _request_target: &str,
+    ) -> std::io::Result<Vec<(String, String)>> {
+        let header = self
+            .0
+            .current()
+            .ok_or_else(|| std::io::Error::other("no GCS token has been minted for this store"))?;
+        Ok(vec![("Authorization".to_string(), header.to_string())])
     }
 }
 
@@ -680,13 +698,6 @@ fn field(credentials: &serde_json::Value, name: &str) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| StoreError::Config(format!("credential file missing `{name}`")))
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs()
 }
 
 fn base64url(bytes: &[u8]) -> String {

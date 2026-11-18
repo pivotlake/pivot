@@ -158,8 +158,8 @@ fn an_s3_datastore_is_served_with_the_secret_scoped_to_it() {
     };
     // The harness publishes MinIO's coordinates in the environment for stores
     // that resolve their own credentials. Here they go into a secret instead:
-    // a configured datastore never consults the environment, and the decoy
-    // below covers every other `s3://` location with an endpoint nothing
+    // a location a secret covers is opened with what the secret says, and the
+    // decoy below covers every other `s3://` location with an endpoint nothing
     // answers on, so reaching MinIO at all means the scoped secret won.
     let config = format!(
         "{}secrets:
@@ -183,6 +183,39 @@ fn an_s3_datastore_is_served_with_the_secret_scoped_to_it() {
         region = std::env::var("AWS_REGION").unwrap(),
         access_key_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
         secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
+        endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap(),
+    );
+
+    let (table_rows, external_rows) = block_on(async {
+        let client = events_server(&backend, &config).await;
+        let table_rows = select_rows(&client, "SELECT COUNT(value) FROM events").await;
+        let external_rows = select_rows(&client, &external_parquet_query(&backend.root)).await;
+        (table_rows, external_rows)
+    });
+
+    assert_eq!(table_rows, vec![vec![Some("5".to_string())]]);
+    assert_eq!(external_rows, vec![vec![Some("2".to_string())]]);
+}
+
+#[test]
+fn an_s3_secret_without_keys_serves_its_datastore_as_the_server_identity() {
+    let Some(backend) = test_support::s3("secrets-s3-server-identity") else {
+        return;
+    };
+    // The secret says where the bucket is and nothing about who is asking, so
+    // the server signs with the keys its own credential chain finds: the ones
+    // the harness published in the environment.
+    let config = format!(
+        "{}secrets:
+  minio:
+    type: s3
+    scope: {root}
+    region: {region}
+    endpoint: {endpoint}
+",
+        datastores_section(&backend.root),
+        root = backend.root,
+        region = std::env::var("AWS_REGION").unwrap(),
         endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap(),
     );
 

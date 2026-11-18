@@ -8,6 +8,12 @@
 //! and no two secrets may claim the same scope, so that "most specific" is
 //! never a coin toss.
 //!
+//! An S3 secret says how the requests to its locations are authenticated, in
+//! one of three ways: with the access keys it carries, with the identity the
+//! server itself runs as when it carries none, or not at all when it says
+//! `anonymous: true`. An S3 location no secret covers is opened like one
+//! covered by a secret without keys.
+//!
 //! ```yaml
 //! secrets:
 //!   analytics:
@@ -19,9 +25,11 @@
 //!   analytics-archive:
 //!     type: s3
 //!     scope: s3://analytics/archive/  # more specific: wins under archive/
-//!     region: us-east-1
-//!     access_key_id: AKIA...
-//!     secret_access_key: "..."
+//!     region: us-east-1               # no keys: the server's own AWS identity
+//!   open-data:
+//!     type: s3
+//!     scope: s3://open-data/
+//!     anonymous: true                 # a public bucket, read unsigned
 //!   google:
 //!     type: gcs                       # no scope: every gs:// location
 //!     credentials_file: /etc/pivot/gcs-key.json
@@ -31,7 +39,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use datastore_iceberg::IcebergCatalogAuth;
-use object_storage::{S3Credentials, S3Keys, StoreScheme};
+use object_storage::{AwsCredentialChain, S3Auth, S3Credentials, S3Keys, StoreScheme};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -54,8 +62,16 @@ pub enum SecretConfig {
         /// discovered from the bucket before the store is opened.
         #[serde(skip_serializing_if = "Option::is_none")]
         region: Option<String>,
-        access_key_id: String,
-        secret_access_key: String,
+        /// The access key requests are signed with, written together with
+        /// `secret_access_key`. Both omitted, requests are signed as the
+        /// identity the server runs as, found through its AWS credential chain.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        access_key_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        secret_access_key: Option<String>,
+        /// Send requests unsigned, for a public bucket. Written without keys.
+        #[serde(default, skip_serializing_if = "is_false")]
+        anonymous: bool,
         /// A path-style S3-compatible endpoint (e.g. MinIO). Omitted, requests
         /// go to AWS virtual-hosted style.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +105,11 @@ pub enum SecretConfig {
     },
 }
 
+/// Serde's `skip_serializing_if` for a flag that is off by default.
+fn is_false(flag: &bool) -> bool {
+    !flag
+}
+
 /// By hand with the S3 keys redacted: a secret must not leak into a log
 /// through a `{:?}` of some struct that holds one.
 impl std::fmt::Debug for SecretConfig {
@@ -97,14 +118,20 @@ impl std::fmt::Debug for SecretConfig {
             Self::S3 {
                 scope,
                 region,
+                access_key_id,
+                secret_access_key,
+                anonymous,
                 endpoint,
-                ..
             } => f
                 .debug_struct("S3")
                 .field("scope", scope)
                 .field("region", region)
-                .field("access_key_id", &"redacted")
-                .field("secret_access_key", &"redacted")
+                .field("access_key_id", &access_key_id.as_ref().map(|_| "redacted"))
+                .field(
+                    "secret_access_key",
+                    &secret_access_key.as_ref().map(|_| "redacted"),
+                )
+                .field("anonymous", anonymous)
                 .field("endpoint", endpoint)
                 .finish(),
             Self::Gcs {
@@ -187,24 +214,53 @@ fn split_segments(uri: &str) -> Vec<String> {
         .collect()
 }
 
-/// An S3 secret as resolved: what signing a request needs.
-#[derive(Clone)]
+/// An S3 secret as resolved: where its locations are and how requests to them
+/// are authenticated. Its `{:?}` shows no key: [`S3Keys`] redacts its own.
+#[derive(Clone, Debug)]
 struct S3Secret {
     region: Option<String>,
-    access_key_id: String,
-    secret_access_key: String,
+    auth: S3SecretAuth,
     endpoint: Option<String>,
 }
 
-/// By hand with the keys redacted, for the same reason as [`SecretConfig`]'s.
-impl std::fmt::Debug for S3Secret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3Secret")
-            .field("region", &self.region)
-            .field("access_key_id", &"redacted")
-            .field("secret_access_key", &"redacted")
-            .field("endpoint", &self.endpoint)
-            .finish()
+/// How an S3 secret says requests are authenticated.
+#[derive(Clone, Debug)]
+enum S3SecretAuth {
+    /// Signed with the keys the secret carries.
+    Keys(S3Keys),
+    /// Signed as the identity the server runs as.
+    ServerIdentity,
+    Anonymous,
+}
+
+impl S3SecretAuth {
+    /// What the secret `name` says, from the fields it was written with. A
+    /// combination that says two things at once is refused rather than read as
+    /// either.
+    fn from_fields(
+        name: &str,
+        access_key_id: &Option<String>,
+        secret_access_key: &Option<String>,
+        anonymous: bool,
+    ) -> Result<Self> {
+        match (access_key_id, secret_access_key) {
+            (Some(access_key), Some(secret_key)) if !anonymous => Ok(Self::Keys(S3Keys {
+                access_key: access_key.clone(),
+                secret_key: secret_key.clone(),
+                session_token: None,
+            })),
+            (None, None) => Ok(if anonymous {
+                Self::Anonymous
+            } else {
+                Self::ServerIdentity
+            }),
+            (Some(_), None) | (None, Some(_)) if !anonymous => Err(Error::S3SecretLoneKey {
+                name: name.to_string(),
+            }),
+            _ => Err(Error::S3SecretAnonymousWithKeys {
+                name: name.to_string(),
+            }),
+        }
     }
 }
 
@@ -255,6 +311,7 @@ impl Secrets {
                     region,
                     access_key_id,
                     secret_access_key,
+                    anonymous,
                     endpoint,
                 } => insert_secret(
                     &mut secrets.s3,
@@ -262,8 +319,12 @@ impl Secrets {
                     name,
                     S3Secret {
                         region: region.clone(),
-                        access_key_id: access_key_id.clone(),
-                        secret_access_key: secret_access_key.clone(),
+                        auth: S3SecretAuth::from_fields(
+                            name,
+                            access_key_id,
+                            secret_access_key,
+                            *anonymous,
+                        )?,
                         endpoint: endpoint.clone(),
                     },
                 )?,
@@ -318,19 +379,27 @@ impl Secrets {
             })
     }
 
-    /// The credentials an S3 `location` is opened with, from the most specific
-    /// scope covering it.
-    pub(crate) fn resolve_s3(&self, location: &str) -> Option<S3Credentials> {
-        let secret = &find_most_specific(&self.s3, StoreScheme::S3, location)?.secret;
-        Some(S3Credentials {
+    /// What an S3 `location` is opened with, from the most specific scope
+    /// covering it. Nothing covering it opens it as the identity the server
+    /// runs as, at AWS's own endpoint.
+    pub(crate) fn resolve_s3(&self, location: &str) -> S3Credentials {
+        let Some(covering) = find_most_specific(&self.s3, StoreScheme::S3, location) else {
+            return S3Credentials {
+                region: None,
+                auth: S3Auth::Chain(AwsCredentialChain::ambient()),
+                endpoint: None,
+            };
+        };
+        let secret = &covering.secret;
+        S3Credentials {
             region: secret.region.clone(),
-            keys: S3Keys {
-                access_key: secret.access_key_id.clone(),
-                secret_key: secret.secret_access_key.clone(),
-                session_token: None,
+            auth: match &secret.auth {
+                S3SecretAuth::Keys(keys) => S3Auth::Keys(keys.clone()),
+                S3SecretAuth::ServerIdentity => S3Auth::Chain(AwsCredentialChain::ambient()),
+                S3SecretAuth::Anonymous => S3Auth::Anonymous,
             },
             endpoint: secret.endpoint.clone(),
-        })
+        }
     }
 
     /// The Google key file a GCS `location` is opened with, from the most

@@ -22,8 +22,8 @@
 //! ## Layout
 //!
 //! One **sparse** file per object under the cache directory, named by a stable
-//! 128-bit hash of the object's identity (its authority + path, never the
-//! presign query). The file mirrors the object's byte layout: object byte `X`
+//! 128-bit hash of the object's identity (its authority + path, never its
+//! query string). The file mirrors the object's byte layout: object byte `X`
 //! lives at file offset `X`, so only fetched ranges consume disk. A 128-bit digest makes
 //! a filename collision between two distinct objects astronomically unlikely, so
 //! the name alone identifies the object - no on-disk identity check needed.

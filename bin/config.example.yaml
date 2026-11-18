@@ -82,8 +82,10 @@ datastores:
 # a location authenticates it, and two secrets may not claim the same scope.
 # Omit `scope` to cover every location of the type.
 #
-# An `s3://` datastore without a covering secret uses anonymous requests, for
-# public buckets. A `gs://` one without a secret falls back to the ambient
+# A datastore without a covering secret is opened as the identity the server
+# runs as. For `s3://` that is the first of these that has keys: the AWS_* key
+# variables, a container's credentials endpoint, or the role of the EC2
+# instance; requests are sent unsigned when none has. For `gs://` it is the
 # Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS, `gcloud
 # auth application-default login`, or the workload identity of the Google
 # compute instance).
@@ -92,9 +94,16 @@ secrets:
     type: s3
     scope: s3://example-bucket/
     region: us-east-1
+    # Leave both keys out to sign as the server's own AWS identity.
     access_key_id: replace-me
     secret_access_key: replace-me
     # endpoint: http://localhost:9000 # MinIO / S3-compatible
+
+  # A public bucket, read without signing.
+  # open-data:
+  #   type: s3
+  #   scope: s3://public-datasets/
+  #   anonymous: true
 
   # google:
   #   type: gcs

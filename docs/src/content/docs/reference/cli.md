@@ -81,12 +81,19 @@ Open a local datastore, creating it if needed:
 pivot open ./pivot-data
 ```
 
-Open a datastore in S3:
+Open a datastore in S3, with access keys:
 
 ```sh
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_REGION=us-east-1
+pivot open s3://example-bucket/pivot/
+```
+
+Open a datastore in S3 from an EC2 instance, with the IAM role attached to
+the instance:
+
+```sh
 pivot open s3://example-bucket/pivot/
 ```
 
@@ -274,11 +281,19 @@ pool, which is an error. Pass an absolute size instead, such as
 
 | Variable | Description |
 | --- | --- |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | S3 credentials. Set both, or neither for anonymous access. |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | S3 credentials. Set both, or neither to use the next source of AWS credentials. |
 | `AWS_SESSION_TOKEN` | A session token for temporary S3 credentials. Only used together with the keys above. |
 | `AWS_REGION`, `AWS_DEFAULT_REGION` | The bucket's region. When neither is set, the region is discovered from the bucket. |
 | `AWS_ENDPOINT_URL` | An S3-compatible endpoint, such as MinIO. Requests use path-style addressing. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | A GCS service-account key file. |
+
+S3 uses the first of these that provides credentials: the variables above,
+a container's credentials endpoint, and the IAM role of the EC2 instance.
+Temporary credentials are refreshed before they expire. When no source
+provides credentials, requests are sent unsigned, which is enough for a public
+bucket. See
+[AWS credentials of the server](/docs/reference/server/datastores/#aws-credentials-of-the-server)
+for each source and the variables that configure it.
 
 GCS follows Application Default Credentials: it tries
 `GOOGLE_APPLICATION_CREDENTIALS`, then the `gcloud` login file, then the

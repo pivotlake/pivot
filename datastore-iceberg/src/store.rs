@@ -16,8 +16,8 @@ use iceberg::io::{
     CLIENT_REGION, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
 };
 use object_storage::{
-    DataFile, ExternalStoreFactory, FileRef, ObjectPath, ObjectStore, S3Credentials, S3Keys,
-    S3Store, StoreScheme, local_path,
+    DataFile, ExternalStoreFactory, FileRef, ObjectPath, ObjectStore, S3Auth, S3Credentials,
+    S3Keys, S3Store, StoreScheme, local_path,
 };
 
 use crate::{Error, Result};
@@ -120,11 +120,11 @@ pub(crate) fn read_vended_s3_credentials(
                 .get(CLIENT_REGION)
                 .or_else(|| properties.get(S3_REGION))
                 .cloned(),
-            keys: S3Keys {
+            auth: S3Auth::Keys(S3Keys {
                 access_key: access_key.clone(),
                 secret_key: secret_key.clone(),
                 session_token: properties.get(S3_SESSION_TOKEN).cloned(),
-            },
+            }),
             endpoint: properties.get(S3_ENDPOINT).cloned(),
         })),
         (None, None) => Ok(None),
@@ -277,9 +277,12 @@ mod tests {
             .unwrap()
             .expect("both keys were vended");
 
-        assert_eq!(credentials.keys.access_key, "access");
-        assert_eq!(credentials.keys.secret_key, "secret");
-        assert_eq!(credentials.keys.session_token.as_deref(), Some("token"));
+        let S3Auth::Keys(keys) = &credentials.auth else {
+            panic!("vended keys sign requests directly");
+        };
+        assert_eq!(keys.access_key, "access");
+        assert_eq!(keys.secret_key, "secret");
+        assert_eq!(keys.session_token.as_deref(), Some("token"));
         assert_eq!(credentials.region.as_deref(), Some("eu-west-1"));
         assert_eq!(
             credentials.endpoint.as_deref(),

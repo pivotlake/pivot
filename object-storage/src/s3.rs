@@ -1,38 +1,52 @@
 //! S3 (and S3-compatible) backend: blocking HTTP via [`ureq`], with
 //! authenticated requests signed through `aws_sigv4::http_request::sign` (a
-//! pure function — no runtime). When no credentials are configured, requests
-//! are sent anonymously instead, which supports public buckets and S3-compatible
-//! endpoints that do not require authentication.
+//! pure function — no runtime).
 //!
-//! Credentials come from one of two places. [`S3Store::with_env_credentials`]
-//! reads them from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-//! and `AWS_SESSION_TOKEN` when the keys are an STS session's; optional region
-//! from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional `AWS_ENDPOINT_URL`
-//! selects a path-style S3-compatible endpoint like MinIO).
-//! [`S3Store::with_credentials`] takes them explicitly, so a metastore can supply
-//! a datastore's own key/secret/region/endpoint rather than relying on whatever
-//! the process was started with.
+//! What a store signs with is its [`S3Auth`]: keys handed over directly (a
+//! metastore's secret, the keys a catalog vended), the keys an
+//! [`AwsCredentialChain`] finds for the identity the process runs as, or
+//! nothing at all. A chain that finds no keys leaves the store unsigned as
+//! well, which is what reads a public bucket on a machine without an AWS
+//! identity; a request S3 then denies says that no keys were found.
 //!
-//! If neither key is present in the environment, the store uses anonymous
-//! access; setting only one key is rejected as an incomplete configuration.
+//! Every request is signed as it is sent, with the keys the store holds at
+//! that moment: the control-plane requests issued here, and the ring's range
+//! reads and uploads, through the [`RequestAuth`] a [`DataFileLocation`]
+//! carries. A chain's keys are a session's and expire. The store reads them
+//! again, a blocking call, whenever it signs a request of its own or hands a
+//! file out ([`S3SigningKeys::refresh`]), so a worker on the ring only ever
+//! reads the keys held ([`S3SigningKeys::current`]). A file opened before its
+//! keys were replaced is therefore read on with the new ones, and nothing is
+//! signed ahead of time that a long-running server could hold past its expiry.
+//!
+//! [`S3Store::with_default_credentials`] opens a store the way a command-line
+//! tool does: authenticated by the process's own chain, with the region from
+//! `AWS_REGION`/`AWS_DEFAULT_REGION` and an optional `AWS_ENDPOINT_URL`
+//! selecting a path-style S3-compatible endpoint like MinIO.
+//! [`S3Store::with_credentials`] takes all three explicitly, so a metastore
+//! can supply what its secret for a location says.
+//!
 //! When no region is supplied, the store sends an unsigned `HeadBucket` request
 //! and takes the region from S3's `x-amz-bucket-region` response header.
 //! Either way the resolved parameters are kept on the store and exposed through
 //! [`ObjectStore::connection`] so another client can address the same bucket
-//! without resolving credentials again.
+//! and sign with the same keys.
 
 use super::{
     DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
     ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, object_key,
     parse_iso8601_millis, percent_encode,
 };
+use crate::aws_credentials::{AwsCredentialChain, KEY_SOURCES};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
+    PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
+use dispatch::io::RequestAuth;
 use std::io::Read;
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 #[derive(Debug)]
 pub struct S3Store {
@@ -42,29 +56,51 @@ pub struct S3Store {
     /// In-bucket prefix under which this datastore's keys live.
     prefix: String,
     region: String,
-    /// What requests are signed with; `None` for anonymous access.
-    keys: Option<S3Keys>,
+    /// What requests are signed with; `None` for a store that sends them
+    /// unsigned. Shared with the signers of the files opened through this
+    /// store, so keys read again reach their next request.
+    keys: Option<S3SigningKeys>,
+    /// Whether the store sends its requests unsigned because the credential
+    /// chain it was opened with found no keys, rather than by choice.
+    chain_found_no_keys: bool,
     /// The path-style endpoint override this store was opened with, if any.
     endpoint: Option<String>,
     /// Base origin, e.g. `https://bucket.s3.us-east-1.amazonaws.com` (virtual
     /// hosted) or `http://localhost:9000/bucket` (path-style endpoint override).
     base: String,
+    /// Scheme and authority alone (`https://bucket.s3.us-east-1.amazonaws.com`,
+    /// `http://localhost:9000`): what a request target the ring sends is
+    /// appended to for the URL a signature covers.
+    origin: String,
     /// `Host` header value for signing.
     host: String,
     agent: ureq::Agent,
 }
 
-/// Explicit S3 credentials and connection parameters for
-/// [`S3Store::with_credentials`], as a metastore holds them per datastore.
-#[derive(Clone)]
+/// Where an S3 location is and how requests to it are authenticated, for
+/// [`S3Store::with_credentials`], as a metastore holds them per location.
+#[derive(Clone, Debug)]
 pub struct S3Credentials {
     /// Optional signing region. When not set, it is discovered with an
     /// unsigned `HeadBucket` request before the store is opened.
     pub region: Option<String>,
-    pub keys: S3Keys,
+    pub auth: S3Auth,
     /// A path-style S3-compatible endpoint (e.g. MinIO). `None` uses AWS
     /// virtual-hosted style.
     pub endpoint: Option<String>,
+}
+
+/// How a store's requests are authenticated.
+#[derive(Clone, Debug)]
+pub enum S3Auth {
+    /// Signed with keys handed over directly.
+    Keys(S3Keys),
+    /// Signed with the keys the chain finds, read again before they expire.
+    /// Unsigned when the chain finds none.
+    Chain(Arc<AwsCredentialChain>),
+    /// Unsigned: a public bucket, or an endpoint that requires no
+    /// authentication.
+    Anonymous,
 }
 
 /// The keys a store signs with: a long-lived pair, or an STS session's pair
@@ -102,11 +138,49 @@ impl S3Keys {
     }
 }
 
+/// The keys a store signs with at any moment. A clone shares them, so every
+/// holder signs with the keys last read.
+#[derive(Clone, Debug)]
+pub enum S3SigningKeys {
+    /// Keys handed over directly, the same for as long as the store lives.
+    Fixed(Arc<S3Keys>),
+    /// The keys a credential chain finds, which expire and are read again.
+    Chain(Arc<AwsCredentialChain>),
+}
+
+impl S3SigningKeys {
+    /// The keys to sign with now, read from their source again when the ones
+    /// held are close to expiring. That read blocks, so this is for the
+    /// control thread; a worker on the ring calls [`current`](Self::current).
+    pub fn refresh(&self) -> Result<Arc<S3Keys>> {
+        match self {
+            Self::Fixed(keys) => Ok(Arc::clone(keys)),
+            Self::Chain(chain) => chain.refresh_keys()?.ok_or_else(report_missing_chain_keys),
+        }
+    }
+
+    /// The keys last read. Never asks their source and never blocks.
+    pub fn current(&self) -> Result<Arc<S3Keys>> {
+        match self {
+            Self::Fixed(keys) => Ok(Arc::clone(keys)),
+            Self::Chain(chain) => chain.current_keys().ok_or_else(report_missing_chain_keys),
+        }
+    }
+}
+
+/// The error for a store that signs with a chain's keys and finds the chain
+/// holding none.
+fn report_missing_chain_keys() -> StoreError {
+    StoreError::Config(format!(
+        "no AWS credentials are held for this store: none were found in {KEY_SOURCES}"
+    ))
+}
+
 impl S3Store {
-    /// Open `s3://bucket/prefix` with the credentials, region, and endpoint the
-    /// environment carries. If neither key is set, use anonymous access. A
-    /// partial key pair is rejected rather than silently changing auth modes.
-    pub fn with_env_credentials(uri: &str) -> Result<Self> {
+    /// Open `s3://bucket/prefix` as the identity the process runs as: signed
+    /// with the keys the ambient credential chain finds, unsigned when it finds
+    /// none. The region and endpoint are the ones the environment names.
+    pub fn with_default_credentials(uri: &str) -> Result<Self> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
 
         let region = env_any(&["AWS_REGION", "AWS_DEFAULT_REGION"]);
@@ -115,18 +189,9 @@ impl S3Store {
             bucket,
             prefix,
             region,
-            env_credentials()?,
+            S3Auth::Chain(AwsCredentialChain::ambient()),
             std::env::var("AWS_ENDPOINT_URL").ok(),
         )
-    }
-
-    /// Open `s3://bucket/prefix` anonymously against AWS's standard endpoint.
-    /// This deliberately does not consult the environment, so a metastore can
-    /// preserve its scoped-secret policy while allowing an uncovered public
-    /// location to be read.
-    pub fn anonymous(uri: &str) -> Result<Self> {
-        let (bucket, prefix) = parse_s3_uri(uri)?;
-        Self::build(uri, bucket, prefix, None, None, None)
     }
 
     /// Open anonymously with explicit connection parameters. Useful for an
@@ -137,7 +202,14 @@ impl S3Store {
         endpoint: Option<String>,
     ) -> Result<Self> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
-        Self::build(uri, bucket, prefix, Some(region.into()), None, endpoint)
+        Self::build(
+            uri,
+            bucket,
+            prefix,
+            Some(region.into()),
+            S3Auth::Anonymous,
+            endpoint,
+        )
     }
 
     /// Whether this store sends S3 requests without SigV4 authentication.
@@ -145,9 +217,10 @@ impl S3Store {
         self.keys.is_none()
     }
 
-    /// Parse `s3://bucket/prefix` but take credentials/region/endpoint from
-    /// `credentials` instead of the environment, the path a metastore uses to
-    /// open a datastore with its own configured keys.
+    /// Parse `s3://bucket/prefix` but take the region, the endpoint and how
+    /// requests are authenticated from `credentials` instead of the
+    /// environment, the path a metastore uses to open a location with what its
+    /// secret says.
     pub fn with_credentials(uri: &str, credentials: S3Credentials) -> Result<Self> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
         Self::build(
@@ -155,7 +228,7 @@ impl S3Store {
             bucket,
             prefix,
             credentials.region,
-            Some(credentials.keys),
+            credentials.auth,
             credentials.endpoint,
         )
     }
@@ -168,15 +241,23 @@ impl S3Store {
         bucket: &str,
         prefix: &str,
         region: Option<String>,
-        keys: Option<S3Keys>,
+        auth: S3Auth,
         endpoint: Option<String>,
     ) -> Result<Self> {
+        let (keys, chain_found_no_keys) = match auth {
+            S3Auth::Keys(keys) => (Some(S3SigningKeys::Fixed(Arc::new(keys))), false),
+            S3Auth::Chain(chain) => match chain.refresh_keys()? {
+                Some(_) => (Some(S3SigningKeys::Chain(chain)), false),
+                None => (None, true),
+            },
+            S3Auth::Anonymous => (None, false),
+        };
         let agent = ureq::AgentBuilder::new().build();
         let region = match region.filter(|region| !region.trim().is_empty()) {
             Some(region) => region,
             None => discover_bucket_region(&agent, bucket, endpoint.as_deref())?,
         };
-        let (base, host) = match endpoint.as_deref() {
+        let (base, origin, host) = match endpoint.as_deref() {
             // Path-style against a custom endpoint (MinIO etc.).
             Some(ep) => {
                 let ep = ep.trim_end_matches('/');
@@ -188,12 +269,13 @@ impl S3Store {
                     .next()
                     .unwrap_or(ep)
                     .to_string();
-                (format!("{ep}/{bucket}"), host)
+                (format!("{ep}/{bucket}"), ep.to_string(), host)
             }
             // Virtual-hosted style on AWS.
             None => {
                 let host = format!("{bucket}.s3.{region}.amazonaws.com");
-                (format!("https://{host}"), host)
+                let origin = format!("https://{host}");
+                (origin.clone(), origin, host)
             }
         };
 
@@ -202,8 +284,10 @@ impl S3Store {
             prefix: prefix.to_string(),
             region,
             keys,
+            chain_found_no_keys,
             endpoint,
             base,
+            origin,
             host,
             agent,
         })
@@ -214,9 +298,9 @@ impl S3Store {
         format!("{}/{}", self.base, object)
     }
 
-    /// Compute the SigV4 headers (Authorization, x-amz-date, x-amz-content-sha256,
-    /// optional x-amz-security-token) to attach to a request. `query` is the
-    /// canonical query string (without leading `?`), included in the signature.
+    /// The SigV4 headers for a blocking request with `body`, signed with the
+    /// store's keys, read again first when they are close to expiring; none
+    /// for a store that sends its requests unsigned.
     fn sign(
         &self,
         method: &str,
@@ -227,46 +311,93 @@ impl S3Store {
         let Some(keys) = &self.keys else {
             return Ok(Vec::new());
         };
-        let identity = keys.credentials().into();
-
-        let mut settings = SigningSettings::default();
-        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-
-        let params = v4::SigningParams::builder()
-            .identity(&identity)
-            .region(&self.region)
-            .name("s3")
-            .time(SystemTime::now())
-            .settings(settings)
-            .build()
-            .map_err(|e| StoreError::Http(format!("sigv4 params: {e}")))?;
-
-        // Headers that participate in the signature. `host` is mandatory.
-        let mut sign_headers: Vec<(&str, &str)> = vec![("host", &self.host)];
-        sign_headers.extend_from_slice(extra_headers);
-
-        let signable = SignableRequest::new(
+        let keys = keys.refresh()?;
+        sign_request(
+            &keys,
+            &self.region,
+            &self.host,
             method,
             url,
-            sign_headers.iter().copied(),
+            extra_headers,
             SignableBody::Bytes(body),
         )
-        .map_err(|e| StoreError::Http(format!("sigv4 signable: {e}")))?;
+    }
 
-        let (instructions, _signature) = sign(signable, &params.into())
-            .map_err(|e| StoreError::Http(format!("sigv4 sign: {e}")))?
-            .into_parts();
-
-        let mut out = Vec::new();
-        for (name, value) in instructions.headers() {
-            out.push((name.to_string(), value.to_string()));
-        }
-        Ok(out)
+    /// The object at `key` as the ring addresses it: its URL, with a signer
+    /// for each request's headers when this store signs, bare when it does
+    /// not. Reads and uploads differ only in method, which the signer is told
+    /// per request. Keys close to expiring are read again here, on the control
+    /// thread (a blocking read is fine off the ring), so the query's workers
+    /// find current ones and never read them themselves.
+    fn remote_location(&self, key: &ObjectPath) -> Result<DataFileLocation> {
+        let object = object_key(&self.prefix, key);
+        let url = url::Url::parse(&self.url_for(&object))
+            .map_err(|e| StoreError::Http(format!("parsing S3 url: {e}")))?;
+        let Some(keys) = &self.keys else {
+            return Ok(DataFileLocation::Remote { url, auth: None });
+        };
+        keys.refresh()?;
+        Ok(DataFileLocation::Remote {
+            url,
+            auth: Some(Arc::new(RequestSigner {
+                keys: keys.clone(),
+                region: self.region.clone(),
+                host: self.host.clone(),
+                origin: self.origin.clone(),
+            })),
+        })
     }
 
     /// Apply signed + extra headers to a ureq request builder.
     fn apply(req: ureq::Request, headers: &[(String, String)]) -> ureq::Request {
         headers.iter().fold(req, |r, (k, v)| r.set(k, v))
+    }
+
+    /// The error for a `verb` request about `target` that failed. A refusal is
+    /// reported with the code and message of S3's error document. One that
+    /// turns on who is asking also says what the request was signed with,
+    /// since S3 words a denial the same whether the keys were wrong or never
+    /// sent.
+    fn explain_failure(&self, verb: &str, target: &str, error: ureq::Error) -> StoreError {
+        let ureq::Error::Status(status, response) = error else {
+            return StoreError::Http(format!("{verb} {target}: {error}"));
+        };
+        let mut explanation = format!(
+            "{verb} {target}: {}: status code {status}",
+            response.get_url()
+        );
+        let refusal = response
+            .into_string()
+            .ok()
+            .and_then(|body| quick_xml::de::from_str::<ErrorDocument>(&body).ok());
+        if let Some(refusal) = &refusal {
+            explanation.push_str(&format!(" ({}: {})", refusal.code, refusal.message));
+        }
+        let turns_on_identity = matches!(status, 401 | 403)
+            || refusal.is_some_and(|refusal| REFUSED_TOKEN_CODES.contains(&refusal.code.as_str()));
+        if turns_on_identity {
+            explanation.push_str("; ");
+            explanation.push_str(&self.describe_signature());
+        }
+        StoreError::Http(explanation)
+    }
+
+    /// What this store's requests are signed with, or why they are not.
+    fn describe_signature(&self) -> String {
+        match &self.keys {
+            Some(keys) => match keys.current() {
+                Ok(keys) => format!(
+                    "the request was signed with the access key `{}`",
+                    keys.access_key
+                ),
+                Err(error) => error.to_string(),
+            },
+            None if self.chain_found_no_keys => format!(
+                "the request was sent unsigned because no AWS credentials were found in {KEY_SOURCES}"
+            ),
+            None => "the request was sent unsigned, as the store is opened for anonymous access"
+                .to_string(),
+        }
     }
 
     /// The error for a redirect `ureq` handed back as a success it did not
@@ -319,11 +450,7 @@ impl ObjectStore for S3Store {
         StoreConnection::S3 {
             uri: self.uri.clone(),
             region: self.region.clone(),
-            credentials: self.keys.as_ref().map(|keys| S3Credentials {
-                region: Some(self.region.clone()),
-                keys: keys.clone(),
-                endpoint: self.endpoint.clone(),
-            }),
+            signing_keys: self.keys.clone(),
             endpoint: self.endpoint.clone(),
         }
     }
@@ -340,7 +467,7 @@ impl ObjectStore for S3Store {
         match req.send_bytes(data) {
             Ok(response) if is_redirect(&response) => Err(self.explain_redirect("PUT", &response)),
             Ok(_) => Ok(()),
-            Err(e) => Err(StoreError::Http(format!("PUT {object}: {e}"))),
+            Err(e) => Err(self.explain_failure("PUT", &object, e)),
         }
     }
 
@@ -367,7 +494,7 @@ impl ObjectStore for S3Store {
             }
             // DELETE is idempotent; a missing key is the goal state.
             Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
-            Err(e) => Err(StoreError::Http(format!("DELETE {object}: {e}"))),
+            Err(e) => Err(self.explain_failure("DELETE", &object, e)),
         }
     }
 
@@ -405,9 +532,7 @@ impl ObjectStore for S3Store {
                 Ok(response) => response
                     .into_string()
                     .map_err(|error| StoreError::Http(format!("LIST body: {error}")))?,
-                Err(error) => {
-                    return Err(StoreError::Http(format!("LIST {object_prefix}: {error}")));
-                }
+                Err(error) => return Err(self.explain_failure("LIST", &object_prefix, error)),
             };
             let parsed: ListBucketResult = quick_xml::de::from_str(&body)
                 .map_err(|error| StoreError::Http(format!("LIST parse: {error}")))?;
@@ -454,21 +579,89 @@ impl ObjectStore for S3Store {
     }
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {
-        // Authenticated S3 presigns the URL, while anonymous S3 returns the
-        // same object URL without query parameters. Neither needs a per-request
-        // header from the range reader.
-        Ok(DataFileLocation::Remote {
-            url: self.presign_get(key)?,
-            auth: None,
-        })
+        self.remote_location(key)
     }
 
     fn sink(&self, key: &ObjectPath) -> Result<DataFileLocation> {
-        Ok(DataFileLocation::Remote {
-            url: self.presign("PUT", key)?,
-            auth: None,
-        })
+        self.remote_location(key)
     }
+}
+
+/// Signs the ring's requests to one store's objects, each with the keys the
+/// store holds at that moment. It never reads the keys again itself: the store
+/// does before it hands a file out. The signature covers `host` alone and
+/// declares the payload unsigned, so the ring's `Range` header and an upload's
+/// body take no part in it.
+struct RequestSigner {
+    keys: S3SigningKeys,
+    region: String,
+    host: String,
+    origin: String,
+}
+
+impl RequestAuth for RequestSigner {
+    fn authenticate(
+        &self,
+        method: &str,
+        request_target: &str,
+    ) -> std::io::Result<Vec<(String, String)>> {
+        let url = format!("{}{request_target}", self.origin);
+        let keys = self.keys.current().map_err(std::io::Error::other)?;
+        sign_request(
+            &keys,
+            &self.region,
+            &self.host,
+            method,
+            &url,
+            &[],
+            SignableBody::UnsignedPayload,
+        )
+        .map_err(std::io::Error::other)
+    }
+}
+
+/// The SigV4 headers (`Authorization`, `x-amz-date`, `x-amz-content-sha256`,
+/// and `x-amz-security-token` for a session's keys) for a `method` request to
+/// `url`, signing `host` and `extra_headers`, with `body` hashed into the
+/// signature or declared unsigned.
+fn sign_request(
+    keys: &S3Keys,
+    region: &str,
+    host: &str,
+    method: &str,
+    url: &str,
+    extra_headers: &[(&str, &str)],
+    body: SignableBody<'_>,
+) -> Result<Vec<(String, String)>> {
+    let identity = keys.credentials().into();
+
+    let mut settings = SigningSettings::default();
+    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+
+    let params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name("s3")
+        .time(SystemTime::now())
+        .settings(settings)
+        .build()
+        .map_err(|e| StoreError::Http(format!("sigv4 params: {e}")))?;
+
+    // Headers that participate in the signature. `host` is mandatory.
+    let mut sign_headers: Vec<(&str, &str)> = vec![("host", host)];
+    sign_headers.extend_from_slice(extra_headers);
+
+    let signable = SignableRequest::new(method, url, sign_headers.iter().copied(), body)
+        .map_err(|e| StoreError::Http(format!("sigv4 signable: {e}")))?;
+
+    let (instructions, _signature) = sign(signable, &params.into())
+        .map_err(|e| StoreError::Http(format!("sigv4 sign: {e}")))?
+        .into_parts();
+
+    Ok(instructions
+        .headers()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect())
 }
 
 impl S3Store {
@@ -493,7 +686,7 @@ impl S3Store {
                 Ok(Some((buf, etag)))
             }
             Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(e) => Err(StoreError::Http(format!("GET {object}: {e}"))),
+            Err(e) => Err(self.explain_failure("GET", &object, e)),
         }
     }
 
@@ -535,61 +728,22 @@ impl S3Store {
             Err(ureq::Error::Status(412 | 409, _)) => Err(StoreError::VersionConflict {
                 key: key.to_string(),
             }),
-            Err(e) => Err(StoreError::Http(format!("PUT {object}: {e}"))),
+            Err(e) => Err(self.explain_failure("PUT", &object, e)),
         }
     }
+}
 
-    /// A GET URL for `key`: time-limited and signed in the query string when
-    /// credentials exist, bare when this store is anonymous. Either form lets
-    /// the io_uring HTTP reader range-read it with no auth headers.
-    fn presign_get(&self, key: &ObjectPath) -> Result<url::Url> {
-        self.presign("GET", key)
-    }
+/// The error codes S3 refuses a session's token with, lapsed or malformed,
+/// which it answers as a bad request rather than a denial.
+const REFUSED_TOKEN_CODES: [&str; 3] = ["ExpiredToken", "InvalidToken", "TokenRefreshRequired"];
 
-    fn presign(&self, method: &str, key: &ObjectPath) -> Result<url::Url> {
-        let object = object_key(&self.prefix, key);
-        let url = self.url_for(&object);
-        let Some(keys) = &self.keys else {
-            return url::Url::parse(&url)
-                .map_err(|e| StoreError::Http(format!("parsing anonymous S3 url: {e}")));
-        };
-        let identity = keys.credentials().into();
-
-        let mut settings = SigningSettings::default();
-        settings.signature_location = SignatureLocation::QueryParams;
-        settings.expires_in = Some(Duration::from_secs(3600));
-
-        let params = v4::SigningParams::builder()
-            .identity(&identity)
-            .region(&self.region)
-            .name("s3")
-            .time(SystemTime::now())
-            .settings(settings)
-            .build()
-            .map_err(|e| StoreError::Http(format!("sigv4 presign params: {e}")))?;
-
-        // A presigned GET signs only `host`; the payload is unsigned so the ring
-        // can add a `Range` header the signature doesn't cover.
-        let host_header = [("host", self.host.as_str())];
-        let signable = SignableRequest::new(
-            method,
-            &url,
-            host_header.iter().copied(),
-            SignableBody::UnsignedPayload,
-        )
-        .map_err(|e| StoreError::Http(format!("sigv4 presign signable: {e}")))?;
-
-        let (instructions, _signature) = sign(signable, &params.into())
-            .map_err(|e| StoreError::Http(format!("sigv4 presign: {e}")))?
-            .into_parts();
-
-        let mut signed = url::Url::parse(&url)
-            .map_err(|e| StoreError::Http(format!("parsing presign url: {e}")))?;
-        for (name, value) in instructions.params() {
-            signed.query_pairs_mut().append_pair(name, value);
-        }
-        Ok(signed)
-    }
+/// The document S3 answers a request it refuses with.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ErrorDocument {
+    code: String,
+    #[serde(default)]
+    message: String,
 }
 
 /// The object keys and immediate child prefixes from ListObjectsV2.
@@ -669,25 +823,6 @@ fn discover_bucket_region(
 
 fn env_any(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|k| std::env::var(k).ok())
-}
-
-/// The keys the environment carries, or `None` for anonymous access. A
-/// session token without keys is meaningless and is ignored with them absent.
-fn env_credentials() -> Result<Option<S3Keys>> {
-    match (
-        std::env::var("AWS_ACCESS_KEY_ID").ok(),
-        std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
-    ) {
-        (Some(access_key), Some(secret_key)) => Ok(Some(S3Keys {
-            access_key,
-            secret_key,
-            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
-        })),
-        (None, None) => Ok(None),
-        _ => Err(StoreError::Config(
-            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together".to_string(),
-        )),
-    }
 }
 
 #[cfg(test)]
@@ -782,7 +917,7 @@ mod tests {
         assert!(matches!(
             store.connection(),
             StoreConnection::S3 {
-                credentials: None,
+                signing_keys: None,
                 ..
             }
         ));
@@ -796,11 +931,11 @@ mod tests {
             "s3://private-bucket/root",
             S3Credentials {
                 region: None,
-                keys: S3Keys {
+                auth: S3Auth::Keys(S3Keys {
                     access_key: "access".to_string(),
                     secret_key: "secret".to_string(),
                     session_token: None,
-                },
+                }),
                 endpoint: Some(endpoint),
             },
         )
@@ -830,21 +965,46 @@ mod tests {
         request.join().unwrap();
     }
 
-    #[test]
-    fn configured_credentials_still_sign_requests() {
-        let store = S3Store::with_credentials(
+    /// A store at a fixed endpoint that signs with `keys`.
+    fn store_signing_with(keys: S3Keys) -> S3Store {
+        S3Store::with_credentials(
             "s3://private-bucket/root",
             S3Credentials {
                 region: Some("us-east-1".to_string()),
-                keys: S3Keys {
-                    access_key: "access".to_string(),
-                    secret_key: "secret".to_string(),
-                    session_token: None,
-                },
+                auth: S3Auth::Keys(keys),
                 endpoint: Some("http://objects.example".to_string()),
             },
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// The headers the ring would send to read `key` through `store`.
+    fn ring_read_headers(store: &S3Store, key: &str) -> (url::Url, Vec<(String, String)>) {
+        let DataFileLocation::Remote { url, auth } = store.source(&ObjectPath::new(key)).unwrap()
+        else {
+            panic!("S3 source must be remote");
+        };
+        let headers = auth
+            .expect("a signing store authenticates the ring's requests")
+            .authenticate("GET", url.path())
+            .unwrap();
+        (url, headers)
+    }
+
+    fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn configured_credentials_still_sign_requests() {
+        let store = store_signing_with(S3Keys {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+        });
 
         let headers = store
             .sign(
@@ -854,41 +1014,38 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert!(
-            headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        let (url, ring_headers) = ring_read_headers(&store, "part.parquet");
+
+        assert!(find_header(&headers, "authorization").is_some());
+        assert_eq!(
+            url.as_str(),
+            "http://objects.example/private-bucket/root/part.parquet"
         );
-        let DataFileLocation::Remote { url, .. } =
-            store.source(&ObjectPath::new("part.parquet")).unwrap()
-        else {
-            panic!("S3 source must be remote");
-        };
-        assert!(url.query().is_some());
+        assert!(
+            find_header(&ring_headers, "authorization")
+                .unwrap()
+                .contains("Credential=access/")
+        );
+        assert_eq!(
+            find_header(&ring_headers, "x-amz-content-sha256"),
+            Some("UNSIGNED-PAYLOAD")
+        );
         assert!(matches!(
             store.connection(),
             StoreConnection::S3 {
-                credentials: Some(_),
+                signing_keys: Some(_),
                 ..
             }
         ));
     }
 
     #[test]
-    fn session_credentials_carry_their_token_in_signatures_and_presigned_urls() {
-        let store = S3Store::with_credentials(
-            "s3://private-bucket/root",
-            S3Credentials {
-                region: Some("us-east-1".to_string()),
-                keys: S3Keys {
-                    access_key: "access".to_string(),
-                    secret_key: "secret".to_string(),
-                    session_token: Some("session-token".to_string()),
-                },
-                endpoint: Some("http://objects.example".to_string()),
-            },
-        )
-        .unwrap();
+    fn session_credentials_carry_their_token_in_every_signature() {
+        let store = store_signing_with(S3Keys {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: Some("session-token".to_string()),
+        });
 
         let headers = store
             .sign(
@@ -898,19 +1055,78 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let DataFileLocation::Remote { url, .. } =
-            store.source(&ObjectPath::new("part.parquet")).unwrap()
-        else {
-            panic!("S3 source must be remote");
-        };
+        let (_, ring_headers) = ring_read_headers(&store, "part.parquet");
 
-        assert!(headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("x-amz-security-token") && value == "session-token"
-        }));
-        assert!(
-            url.query_pairs()
-                .any(|(name, value)| name == "X-Amz-Security-Token" && value == "session-token")
+        assert_eq!(
+            find_header(&headers, "x-amz-security-token"),
+            Some("session-token")
         );
+        assert_eq!(
+            find_header(&ring_headers, "x-amz-security-token"),
+            Some("session-token")
+        );
+    }
+
+    /// The response S3 denies a request with.
+    fn access_denied() -> String {
+        let body = "<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code>\
+                    <Message>Access Denied</Message></Error>";
+        format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn a_denied_request_of_an_anonymous_store_says_it_was_sent_unsigned() {
+        let (endpoint, request) = serve_once(access_denied());
+        let store = S3Store::anonymous_with_options(
+            "s3://private-bucket/root",
+            "us-east-1",
+            Some(endpoint),
+        )
+        .unwrap();
+
+        let error = store.get(&ObjectPath::new("manifest.json")).unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("status code 403 (AccessDenied: Access Denied)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("sent unsigned, as the store is opened for anonymous access"),
+            "{message}"
+        );
+        request.join().unwrap();
+    }
+
+    #[test]
+    fn a_denied_signed_request_names_the_access_key_it_was_signed_with() {
+        let (endpoint, request) = serve_once(access_denied());
+        let store = S3Store::with_credentials(
+            "s3://private-bucket/root",
+            S3Credentials {
+                region: Some("us-east-1".to_string()),
+                auth: S3Auth::Keys(S3Keys {
+                    access_key: "AKIAEXAMPLE".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                }),
+                endpoint: Some(endpoint),
+            },
+        )
+        .unwrap();
+
+        let error = store.get(&ObjectPath::new("manifest.json")).unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("signed with the access key `AKIAEXAMPLE`"),
+            "{message}"
+        );
+        assert!(!message.contains("secret"), "{message}");
+        request.join().unwrap();
     }
 
     #[test]

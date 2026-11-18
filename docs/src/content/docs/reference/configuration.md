@@ -86,8 +86,9 @@ datastores:
 secrets:
   <name>:
     type: s3
-    access_key_id: replace-me
+    access_key_id: replace-me   # omit both keys to use the server's AWS identity
     secret_access_key: replace-me
+    # anonymous: false
     # scope: s3://example-bucket/
     # region: <discovered from the bucket>
     # endpoint: <AWS S3>
