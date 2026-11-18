@@ -195,6 +195,7 @@ fn adopted_entry(file: &TableFile, partition_by: &[String]) -> Result<DataFileEn
         // Nobody here ordered the file's rows, so its entry names no order.
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     })
 }
 
@@ -227,6 +228,7 @@ impl IcebergTable {
                     .find_sort_order_id_of_rows_sorted_by(&file.entry.sorted_by),
             ),
             first_row_id: None,
+            manifest_path: None,
         }
     }
 

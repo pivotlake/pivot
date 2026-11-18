@@ -438,6 +438,7 @@ pub fn entry(name: &str, rows: i64, low: i64, high: i64) -> DataFileEntry {
         })),
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     }
 }
 

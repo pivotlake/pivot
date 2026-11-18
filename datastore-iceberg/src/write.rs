@@ -247,6 +247,7 @@ impl PendingInsert {
                         bound.find_sort_order_id_of_rows_sorted_by(&file.sorted_by),
                     ),
                     first_row_id: None,
+                    manifest_path: None,
                 })
             })
             .collect()

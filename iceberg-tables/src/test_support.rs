@@ -23,7 +23,8 @@ impl Table {
         let mut entries = Vec::new();
         self.visit_partitions(&mut |_, index| {
             for file in index.files() {
-                entries.push(file.to_entry(self.metadata(), self.columns())?);
+                let manifest_path = index.find_manifest_of(file).cloned();
+                entries.push(file.to_entry(self.metadata(), self.columns(), manifest_path)?);
             }
             Ok(ControlFlow::Continue(()))
         })?;
