@@ -3,7 +3,7 @@
 //!
 //! When the last worker finishes consuming, it groups every worker's runs by
 //! bucket and queues one task per bucket. From then on every worker takes
-//! tasks from its NUMA node's queue until no bucket is left:
+//! tasks until no bucket is left:
 //!
 //! ```text
 //!  PlanMerge(bucket's runs)
@@ -18,6 +18,22 @@
 //! A bucket whose runs need no merging (a single run, or runs that already
 //! line up end to end) skips the slices and is evaluated by the worker that
 //! planned it.
+//!
+//! # NUMA nodes
+//!
+//! Every worker buckets the rows it receives, so on a machine with several
+//! NUMA nodes each bucket's runs are spread over all of them, and merging a
+//! bucket has to read the other nodes' runs once wherever it runs. What can
+//! stay local is everything after that read. So each bucket is given to one
+//! node, the buckets in turn so the nodes share the rows evenly, and all of
+//! its tasks are queued on that node: its merged rows are then written to
+//! that node's memory, and evaluating the functions and sending the rows
+//! downstream read only local memory.
+//!
+//! A worker takes tasks from its own node's queue first, and from the other
+//! nodes' queues when its own is empty, so a node that finishes early helps
+//! with what is left. With one node there is one queue and none of this
+//! changes anything.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,7 +49,7 @@ use crate::Topology;
 use crate::arrays::accumulator::BatchAccumulator;
 use crate::gather_barrier::GatherBarrier;
 use crate::memory::SlabAllocator;
-use crate::operations::channels::{NodeIdOutput, Sender};
+use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::order_by::{KWayMergePlan, KWayMergeTask, MergeRun, MergedOutput};
 use crate::operations::unary::pipeline_breaker::{OutputStatus, Outputter};
@@ -95,12 +111,11 @@ impl SharedBuckets {
                         .map(move |run| MergeRun::new(run, node_id))
                 })
                 .collect();
-            match runs.first() {
-                None => self.finish_bucket(),
-                Some(first_run) => {
-                    let node_id = first_run.node_id();
-                    self.queue_task(node_id, BucketTask::PlanMerge(runs));
-                }
+            if runs.is_empty() {
+                self.finish_bucket();
+            } else {
+                let bucket_node = bucket % self.topology.node_count;
+                self.queue_task(bucket_node, BucketTask::PlanMerge(runs));
             }
         }
     }
@@ -110,14 +125,28 @@ impl SharedBuckets {
         waker_set().notify_one_near(node_id);
     }
 
+    /// Takes a task for a worker on node `node_id`: from that node's queue
+    /// when it has one, otherwise from the first other node's queue that
+    /// does.
     fn claim_task(&self, node_id: usize) -> Option<BucketTask> {
-        loop {
-            match self.tasks_by_node[node_id].steal() {
-                Steal::Success(task) => return Some(task),
-                Steal::Retry => continue,
-                Steal::Empty => return None,
+        let node_count = self.tasks_by_node.len();
+        for offset in 0..node_count {
+            let queue = &self.tasks_by_node[(node_id + offset) % node_count];
+            // Checking for emptiness first costs a plain load, where a steal
+            // from an empty queue costs more and is repeated by every idle
+            // worker until the last bucket is emitted.
+            if queue.is_empty() {
+                continue;
+            }
+            loop {
+                match queue.steal() {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Retry => continue,
+                    Steal::Empty => break,
+                }
             }
         }
+        None
     }
 
     /// Records that one more bucket needs no further work.
@@ -202,9 +231,12 @@ impl WindowOutputter {
                         self.emit_bucket(sorted_bucket, sender)?
                     }
                     KWayMergePlan::Parallel(slices) => {
+                        // The bucket stays on the node that planned it, which
+                        // is the bucket's own node unless a worker of another
+                        // node took the planning task over.
                         for slice in slices {
                             self.shared
-                                .queue_task(slice.node_id(), BucketTask::MergeSlice(slice));
+                                .queue_task(self.node_id, BucketTask::MergeSlice(slice));
                         }
                     }
                 }
