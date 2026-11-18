@@ -718,6 +718,48 @@ mod uring_engine {
         in_buf: Vec<u8>,
     }
 
+    impl Conn {
+        /// Whether this connection, idle since its last exchange, can carry
+        /// another one. A store closes a keep-alive connection it has not
+        /// heard from for a while, and its close waits unread on the socket.
+        /// Nothing else can be waiting there: the last response was read to
+        /// its end, so any byte is the store saying goodbye (a TLS close
+        /// alert) and a read of zero is the close itself.
+        ///
+        /// A request sent on a closed connection is not always refused. A
+        /// store behind a load balancer can drop the packets instead, and TCP
+        /// then resends them for many minutes before it reports an error.
+        fn is_open_and_quiet(&self) -> bool {
+            let mut waiting_byte = 0u8;
+            let received = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    &mut waiting_byte as *mut u8 as *mut libc::c_void,
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            received < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+        }
+    }
+
+    /// A connection waiting in the keep-alive pool for its next exchange.
+    struct IdleConn {
+        conn: Conn,
+        idle_since: Instant,
+    }
+
+    /// How long a connection may wait in the keep-alive pool. Stores close
+    /// idle connections after a few seconds (S3 after about six), so one that
+    /// has waited longer is discarded instead of being kept for a reuse that
+    /// would find it closed.
+    const MAX_POOLED_IDLE: Duration = Duration::from_secs(5);
+
+    /// How many pooled connections in a row a request finds closed by the
+    /// store before it discards the rest of that host's pool unchecked. The
+    /// ones left are older still, so they are very likely closed too.
+    const MAX_CLOSED_POOLED_IN_A_ROW: usize = 64;
+
     /// One complete HTTP request/response exchange, owning a connection while it
     /// is active. Dropping this value releases all request-specific resources;
     /// successful completion first moves `conn` back into the keep-alive pool.
@@ -1165,8 +1207,8 @@ mod uring_engine {
         /// [`HTTP_TAG`]) is the SQE `user_data`.
         exchanges: Vec<Option<HttpExchange>>,
         free_slots: Vec<usize>,
-        /// host_key -> idle reusable connections.
-        pool: HashMap<String, Vec<Conn>>,
+        /// host_key -> idle reusable connections, the longest idle first.
+        pool: HashMap<String, Vec<IdleConn>>,
         /// Requests in flight (not counting idle pooled connections).
         active: usize,
         /// Ids whose body fully landed during the last completion routing pass,
@@ -1267,14 +1309,46 @@ mod uring_engine {
         /// connection fails. A `POST` always gets a fresh socket: an idle
         /// connection may have been closed by the store, which a request that
         /// is sent only once cannot recover from.
+        ///
+        /// The most recently used idle connection is tried first, and one the
+        /// store has closed meanwhile is closed here for the next. Once the
+        /// youngest left has idled too long, so have all the others, and the
+        /// whole pool for that host is closed.
         fn take_connection(&mut self, request: &RemoteRequest) -> Result<(Conn, State)> {
             let key = host_key(request.remote());
             if !request.is_post()
-                && let Some(conn) = self.pool.get_mut(&key).and_then(Vec::pop)
+                && let Some(idle) = self.pool.get_mut(&key)
             {
-                return Ok((conn, State::Sending));
+                let mut closed_in_a_row = 0;
+                while let Some(candidate) = idle.pop() {
+                    let idled_too_long = candidate.idle_since.elapsed() > MAX_POOLED_IDLE;
+                    if !idled_too_long && candidate.conn.is_open_and_quiet() {
+                        return Ok((candidate.conn, State::Sending));
+                    }
+                    closed_in_a_row += 1;
+                    if idled_too_long || closed_in_a_row == MAX_CLOSED_POOLED_IN_A_ROW {
+                        idle.clear();
+                    }
+                }
             }
             Ok((self.new_conn(key, request)?, State::Connecting))
+        }
+
+        /// Keep `conn` for the next request to its host, and close the
+        /// connections to that host that have idled past [`MAX_POOLED_IDLE`].
+        /// Requests take the youngest connection, so after a burst the rest
+        /// would otherwise sit in the pool, closed by the store, until a
+        /// later burst reached them.
+        fn return_connection(&mut self, conn: Conn) {
+            let now = Instant::now();
+            let idle = self.pool.entry(conn.host_key.clone()).or_default();
+            let expired =
+                idle.partition_point(|kept| now.duration_since(kept.idle_since) > MAX_POOLED_IDLE);
+            idle.drain(..expired);
+            idle.push(IdleConn {
+                conn,
+                idle_since: now,
+            });
         }
 
         /// Put `exchange` in flight: give it a slot and submit its first SQE.
@@ -1348,8 +1422,7 @@ mod uring_engine {
                 // still hold unread bytes; dropping it closes the socket
                 // instead of poisoning the pool.
                 if reusable {
-                    let key = conn.host_key.clone();
-                    self.pool.entry(key).or_default().push(conn);
+                    self.return_connection(conn);
                 }
                 self.active -= 1;
                 self.completed.push((id, answer));
