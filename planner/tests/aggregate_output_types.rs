@@ -10,7 +10,7 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::Int32Array;
+use arrow_array::{Date32Array, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use common::*;
 use rstest::rstest;
@@ -97,4 +97,45 @@ fn min_of_int_cast_to_text_compares_lexicographically(mut testing_planner: Testi
     // raw int column instead would return 2 (and crash reading it as text).
     let rows = batches_to_json(&results);
     assert_eq!(rows[0]["mn"].as_str().unwrap(), "10");
+}
+
+#[rstest]
+#[case("SELECT SUM(customer_id) AS total, MIN(day) AS extreme FROM daily_sales")]
+#[case(
+    "SELECT SUM(customer_id) AS total, MAX(day) AS extreme FROM daily_sales GROUP BY customer_id"
+)]
+fn date_extreme_beside_wide_sum_is_date32(
+    mut testing_planner: TestingPlanner,
+    #[case] query: &str,
+) {
+    testing_planner.add_table(
+        "daily_sales",
+        &[
+            (
+                "customer_id",
+                planner::types::Type::Int64,
+                Arc::new(Int64Array::from(vec![1, 1, 2])),
+            ),
+            (
+                "day",
+                planner::types::Type::Date,
+                Arc::new(Date32Array::from(vec![19002, 19000, 19001])),
+            ),
+        ],
+    );
+
+    let results = testing_planner
+        .plan(query)
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let schema = results[0].schema();
+    let extreme = schema.field_with_name("extreme").unwrap();
+    assert_eq!(extreme.data_type(), &DataType::Date32);
 }
