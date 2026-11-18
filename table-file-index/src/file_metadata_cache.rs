@@ -79,7 +79,7 @@ pub enum LookupUse {
 }
 
 /// The budget of the cache every table uses unless it is given another.
-pub const DEFAULT_FILE_METADATA_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_FILE_METADATA_CACHE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 /// What the cache's own record of one entry takes besides the bytes of the
 /// entry's name: the entry's place in its table and in the order of last
