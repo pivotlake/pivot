@@ -1,19 +1,28 @@
 //! The rows a worker has received and not yet sorted, divided by hash bucket.
 //!
-//! [`BucketedRows`] does three things to each batch it is given, none of
-//! which copies a row:
+//! [`BucketedRows`] does three things to each batch it is given:
 //!
 //! 1. Hash the partition keys of every row to a bucket number. Rows with
 //!    equal keys must get the same bucket, on every worker.
-//! 2. Group the batch's row numbers by bucket.
-//! 3. Keep the batch as it arrived, next to that grouping.
+//! 2. Work out the order that puts the batch's rows of each bucket next to
+//!    each other.
+//! 3. Copy the batch's rows into that order and keep the copy.
 //!
 //! When enough rows are pending, the worker takes them all out with
 //! [`BucketedRows::take_batches_by_bucket`] and sorts each bucket's rows into
-//! a run, which is the first time rows are copied.
+//! a run.
+//!
+//! The copy in step 3 is there for that sort. A batch has only a few rows of
+//! any one bucket, scattered over the whole batch, and a worker holds far
+//! more pending rows than fit in its cache. Sorting a bucket reads the keys
+//! of its rows many times and then copies the rows out, so with scattered
+//! rows nearly every one of those reads would fetch a cache line for a
+//! single value. A batch, on the other hand, fits in the cache while it is
+//! being copied, so putting its rows in bucket order is cheap, and afterwards
+//! the bucket's rows of each batch are one contiguous stretch.
 //!
 //! A window without partition keys has one bucket. Its batches are kept
-//! as they are, with no hashing and no grouping.
+//! as they are, with no hashing and no copy.
 
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
@@ -21,6 +30,7 @@ use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_row::{RowConverter, Rows, SortField};
 use arrow_schema::{ArrowError, DataType};
 
+use crate::arrays::take_chunked;
 use crate::memory::{SlabAllocator, SlabBuffer};
 
 /// Seeds of the hash applied to string keys. Every worker must send equal
@@ -44,17 +54,15 @@ const NULL_KEY_NUMBER: u64 = 0x7fb5_d329_728e_a185;
 /// depend on every bit below them.
 const FOLD_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
 
-/// Which rows of one batch belong to each bucket. The row numbers are held
-/// on slab memory, since there is one for every pending row.
+/// Which rows of one pending batch belong to each bucket.
 pub enum BucketGrouping {
     /// A batch of a window with one bucket: all its rows belong to it.
     SingleBucket { row_count: u32 },
+    /// A batch whose rows are in bucket order.
     Grouped {
-        /// Every row of the batch, ordered by bucket.
-        rows_by_bucket: SlabBuffer<u32>,
-        /// Where each bucket's rows start in `rows_by_bucket`, with the
-        /// batch's row count as a final entry. Bucket `b` is rows
-        /// `bucket_starts[b]..bucket_starts[b + 1]` of `rows_by_bucket`.
+        /// Where each bucket's rows start in the batch, with the batch's row
+        /// count as a final entry. Bucket `b` is rows
+        /// `bucket_starts[b]..bucket_starts[b + 1]`.
         bucket_starts: SlabBuffer<u32>,
     },
 }
@@ -72,18 +80,9 @@ impl BucketGrouping {
             BucketGrouping::SingleBucket { row_count } => {
                 positions.extend((0..*row_count).map(|row| (batch_index, row)));
             }
-            BucketGrouping::Grouped {
-                rows_by_bucket,
-                bucket_starts,
-            } => {
-                let start = bucket_starts[bucket] as usize;
-                let end = bucket_starts[bucket + 1] as usize;
-                // SAFETY: `group_rows_by_bucket` wrote every row number up to
-                // the batch's row count, which is the last bucket's end.
-                let bucket_rows = unsafe {
-                    std::slice::from_raw_parts(rows_by_bucket.ptr_at_index(start), end - start)
-                };
-                positions.extend(bucket_rows.iter().map(|&row| (batch_index, row)));
+            BucketGrouping::Grouped { bucket_starts } => {
+                let bucket_rows = bucket_starts[bucket]..bucket_starts[bucket + 1];
+                positions.extend(bucket_rows.map(|row| (batch_index, row)));
             }
         }
     }
@@ -107,22 +106,24 @@ pub struct BucketedRows {
     row_encoders: Vec<Option<(RowConverter, Rows)>>,
     /// Scratch space reused from batch to batch: each row's running hash, the
     /// number the column being folded in contributes for each row, each
-    /// row's bucket, and where the next row of each bucket goes while a
-    /// grouping is filled in.
+    /// row's bucket, where the next row of each bucket goes while the bucket
+    /// order is worked out, and the batch's rows in bucket order (each as
+    /// batch 0 and its row number, which is how a copy names a row).
     row_hashes: Vec<u64>,
     key_numbers: Vec<u64>,
     bucket_of_row: Vec<u16>,
     next_position_of_bucket: Vec<u32>,
-    /// Ring memory that holds only the groupings. Taken on first use.
+    rows_in_bucket_order: Vec<(u32, u32)>,
+    /// Ring memory that holds only the pending batches and their groupings.
+    /// Taken on first use.
     ///
-    /// The groupings are all dropped each time the pending rows are taken
-    /// out. An allocator reuses a buffer once every slab cut from it is
-    /// gone, so with an allocator of their own the groupings keep landing in
-    /// the same few buffers. Sharing the allocator the sorted runs are
-    /// written with would put groupings and runs in the same buffers, and
-    /// the groupings' space would stay unusable for as long as the runs
-    /// live.
-    grouping_allocator: Option<SlabAllocator>,
+    /// These are all dropped each time the pending rows are taken out. An
+    /// allocator reuses a buffer once every slab cut from it is gone, so with
+    /// an allocator of their own the pending rows keep landing in the same
+    /// buffers. Sharing the allocator the sorted runs are written with would
+    /// put pending rows and runs in the same buffers, and the pending rows'
+    /// space would stay unusable for as long as the runs live.
+    pending_allocator: Option<SlabAllocator>,
 }
 
 impl BucketedRows {
@@ -141,19 +142,38 @@ impl BucketedRows {
             key_numbers: Vec::new(),
             bucket_of_row: Vec::new(),
             next_position_of_bucket: Vec::new(),
-            grouping_allocator: None,
+            rows_in_bucket_order: Vec::new(),
+            pending_allocator: None,
         }
     }
 
-    /// Adds a batch, working out which of its rows belong to each bucket.
+    /// Adds a batch. With more than one bucket, what is kept is a copy of the
+    /// batch with its rows in bucket order.
     pub fn push(&mut self, batch: RecordBatch) -> Result<(), ArrowError> {
-        let grouping = if self.bucket_count == 1 {
-            BucketGrouping::SingleBucket {
-                row_count: batch.num_rows() as u32,
-            }
+        let (batch, grouping) = if self.bucket_count == 1 {
+            let row_count = batch.num_rows() as u32;
+            (batch, BucketGrouping::SingleBucket { row_count })
         } else {
             self.assign_buckets(&batch)?;
-            self.group_rows_by_bucket()
+            let bucket_starts = self.order_rows_by_bucket();
+            let allocator = self
+                .pending_allocator
+                .get_or_insert_with(|| SlabAllocator::new(false));
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| {
+                    take_chunked(
+                        allocator,
+                        std::slice::from_ref(column),
+                        &self.rows_in_bucket_order,
+                    )
+                })
+                .collect::<Result<Vec<ArrayRef>, _>>()?;
+            (
+                RecordBatch::try_new(batch.schema(), columns)?,
+                BucketGrouping::Grouped { bucket_starts },
+            )
         };
         self.row_count += batch.num_rows();
         self.batches.push(batch);
@@ -281,14 +301,16 @@ impl BucketedRows {
         }
     }
 
-    /// Groups the rows of the batch whose buckets are in `self.bucket_of_row`.
+    /// Writes the rows of the batch whose buckets are in `self.bucket_of_row`
+    /// into `self.rows_in_bucket_order`, and returns where each bucket's rows
+    /// start in that order, with the batch's row count as a final entry.
     ///
-    /// The grouping is a counting sort: one pass counts the rows of each
-    /// bucket, which gives every bucket's first position, and a second pass
-    /// places each row at its bucket's next free position.
-    fn group_rows_by_bucket(&mut self) -> BucketGrouping {
+    /// This is a counting sort: one pass counts the rows of each bucket,
+    /// which gives every bucket's first position, and a second pass places
+    /// each row at its bucket's next free position.
+    fn order_rows_by_bucket(&mut self) -> SlabBuffer<u32> {
         let allocator = self
-            .grouping_allocator
+            .pending_allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
         let next_position_of_bucket = &mut self.next_position_of_bucket;
         next_position_of_bucket.clear();
@@ -306,30 +328,29 @@ impl BucketedRows {
             bucket_starts[bucket] = start;
         }
 
-        let mut rows_by_bucket: SlabBuffer<u32> =
-            allocator.create_slab_buffer(self.bucket_of_row.len(), false);
+        self.rows_in_bucket_order.clear();
+        self.rows_in_bucket_order
+            .resize(self.bucket_of_row.len(), (0, 0));
         for (row, &bucket) in self.bucket_of_row.iter().enumerate() {
             let position = &mut next_position_of_bucket[bucket as usize];
-            rows_by_bucket[*position as usize] = row as u32;
+            self.rows_in_bucket_order[*position as usize] = (0, row as u32);
             *position += 1;
         }
-        BucketGrouping::Grouped {
-            rows_by_bucket,
-            bucket_starts,
-        }
+        bucket_starts
     }
 
     pub fn row_count(&self) -> usize {
         self.row_count
     }
 
-    /// Takes everything out, leaving nothing pending. Returns the batches as
-    /// they arrived and, for each of them, which of its rows belong to each
+    /// Takes everything out, leaving nothing pending. Returns the pending
+    /// batches and, for each of them, which of its rows belong to each
     /// bucket.
     ///
-    /// The rows are handed out as row numbers instead of per-bucket arrays
-    /// because building an array of a bucket's rows would copy them, and the
-    /// caller is about to copy them once anyway, in sorted order.
+    /// A bucket's rows are handed out as row numbers of those batches instead
+    /// of as one array per bucket, because joining a bucket's stretches into
+    /// an array would copy them, and the caller is about to copy them anyway,
+    /// in sorted order.
     pub fn take_batches_by_bucket(&mut self) -> (Vec<RecordBatch>, Vec<BucketGrouping>) {
         self.row_count = 0;
         (
@@ -359,13 +380,15 @@ mod tests {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
     }
 
-    /// Takes everything out of `pending` and lists the `(batch, row)`
-    /// positions in each of `bucket_count` buckets.
-    fn take_positions_by_bucket(
+    /// Takes everything out of `pending` and lists, for each of
+    /// `bucket_count` buckets, the values its rows have in the Int64 column
+    /// `column`.
+    fn take_values_by_bucket(
         pending: &mut BucketedRows,
         bucket_count: usize,
-    ) -> Vec<Vec<(u32, u32)>> {
-        let (_, groupings) = pending.take_batches_by_bucket();
+        column: usize,
+    ) -> Vec<Vec<Option<i64>>> {
+        let (batches, groupings) = pending.take_batches_by_bucket();
         (0..bucket_count)
             .map(|bucket| {
                 let mut positions = Vec::new();
@@ -373,6 +396,16 @@ mod tests {
                     grouping.append_bucket_positions(bucket, batch_index as u32, &mut positions);
                 }
                 positions
+                    .into_iter()
+                    .map(|(batch_index, row)| {
+                        let values = batches[batch_index as usize]
+                            .column(column)
+                            .as_primitive::<arrow_array::types::Int64Type>();
+                        values
+                            .is_valid(row as usize)
+                            .then(|| values.value(row as usize))
+                    })
+                    .collect()
             })
             .collect()
     }
@@ -388,15 +421,15 @@ mod tests {
         let batch = key_batch(vec![Arc::new(names), Arc::new(numbers), Arc::new(flags)]);
         pending.push(batch).unwrap();
 
-        let buckets = take_positions_by_bucket(&mut pending, 256);
-        let bucket_of = |row: u32| {
+        let buckets = take_values_by_bucket(&mut pending, 256, 1);
+        let most_rows_in_one_bucket = |value: Option<i64>| {
             buckets
                 .iter()
-                .position(|bucket| bucket.contains(&(0, row)))
-                .unwrap()
+                .map(|bucket| bucket.iter().filter(|&&row| row == value).count())
+                .max()
         };
-        assert_eq!(bucket_of(0), bucket_of(2));
-        assert_eq!(bucket_of(1), bucket_of(3));
+        assert_eq!(most_rows_in_one_bucket(Some(7)), Some(2));
+        assert_eq!(most_rows_in_one_bucket(None), Some(2));
     }
 
     #[test]
@@ -407,7 +440,7 @@ mod tests {
         let batch = key_batch(vec![Arc::new(Int64Array::from_iter_values(0..10_000))]);
         pending.push(batch).unwrap();
 
-        let buckets = take_positions_by_bucket(&mut pending, 256);
+        let buckets = take_values_by_bucket(&mut pending, 256, 0);
         assert!(buckets.iter().all(|bucket| !bucket.is_empty()));
     }
 
@@ -421,14 +454,11 @@ mod tests {
             pending.push(batch).unwrap();
         }
 
-        let buckets = take_positions_by_bucket(&mut pending, 16);
-        let mut positions: Vec<_> = buckets.into_iter().flatten().collect();
-        positions.sort_unstable();
-        let every_row: Vec<(u32, u32)> = (0..100)
-            .map(|row| (0, row))
-            .chain((0..50).map(|row| (1, row)))
-            .collect();
-        assert_eq!(positions, every_row);
+        let buckets = take_values_by_bucket(&mut pending, 16, 0);
+        let mut values: Vec<_> = buckets.into_iter().flatten().collect();
+        values.sort_unstable();
+        let every_value: Vec<Option<i64>> = (0..150).map(Some).collect();
+        assert_eq!(values, every_value);
     }
 
     #[test]
@@ -441,7 +471,7 @@ mod tests {
             pending.push(batch).unwrap();
         }
 
-        let buckets = take_positions_by_bucket(&mut pending, 1);
-        assert_eq!(buckets, vec![vec![(0, 0), (0, 1), (1, 0)]]);
+        let buckets = take_values_by_bucket(&mut pending, 1, 0);
+        assert_eq!(buckets, vec![vec![Some(10), Some(11), Some(20)]]);
     }
 }

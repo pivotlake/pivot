@@ -1,9 +1,10 @@
 //! The output phase: merges each bucket's runs, evaluates the window
 //! functions over the sorted bucket, and emits it.
 //!
-//! When the last worker finishes consuming, it groups every worker's runs by
-//! bucket and queues one task per bucket. From then on every worker takes
-//! tasks until no bucket is left:
+//! A worker that finishes consuming adds its runs to each bucket's shared
+//! list. When the last worker has done so, it queues every bucket for
+//! planning, and from then on every worker takes tasks until no bucket is
+//! left:
 //!
 //! ```text
 //!  PlanMerge(bucket's runs)
@@ -21,34 +22,54 @@
 //!
 //! # NUMA nodes
 //!
-//! Every worker buckets the rows it receives, so on a machine with several
-//! NUMA nodes each bucket's runs are spread over all of them, and merging a
-//! bucket has to read the other nodes' runs once wherever it runs. What can
-//! stay local is everything after that read. So each bucket is given to one
-//! node, the buckets in turn so the nodes share the rows evenly, and all of
-//! its tasks are queued on that node: its merged rows are then written to
-//! that node's memory, and evaluating the functions and sending the rows
-//! downstream read only local memory.
+//! Reading another node's memory is several times slower than reading the
+//! worker's own, and the output phase reads every row more than once. So
+//! each bucket is given to one node, the buckets in turn so the nodes share
+//! the rows evenly, and everything about the bucket is kept on that node:
 //!
-//! A worker takes tasks from its own node's queue first, and from the other
-//! nodes' queues when its own is empty, so a node that finishes early helps
-//! with what is left. With one node there is one queue and none of this
-//! changes anything.
+//! - The consume phase writes every worker's run of the bucket into that
+//!   node's memory, also the workers of other nodes (see
+//!   [`SharedBuckets::lend_buffer`]). Each row crosses to its bucket's node
+//!   once, as part of a copy that is made anyway.
+//! - All of the bucket's tasks wait on that node. Its merged rows are then
+//!   written to that node's memory, and merging, evaluating the functions
+//!   and sending the rows downstream read only local memory.
+//!
+//! A worker takes tasks of its own node first, and of the other nodes when
+//! its own has none, so a node that finishes early helps with what is left.
+//! With one node none of this changes anything.
+//!
+//! # The order slices are merged in
+//!
+//! A planned bucket's slices wait in [`PlannedBuckets`], which hands out the
+//! slices of the bucket planned first until it has none left, then those of
+//! the next. Two things follow from that, and both matter on a machine with
+//! many workers:
+//!
+//! - A planner adds its bucket in one step, however many slices it has.
+//!   When every worker finishes planning at about the same moment, as they
+//!   do at the start of the output phase, adding slices one at a time to a
+//!   queue shared by a node's workers makes them wait for each other for
+//!   longer than the planning itself takes.
+//! - A node's workers merge one bucket together and finish it before they
+//!   start the next. A slice is merged faster that way than when the node's
+//!   workers are spread over many buckets at once, because the workers on a
+//!   bucket read the same runs.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use crossbeam_deque::{Injector, Steal};
+use crossbeam_queue::SegQueue;
 
 use super::WindowLayout;
-use super::consume::bucket_runs::SortedRun;
 use super::evaluate::WindowEvaluator;
 use crate::Topology;
 use crate::arrays::accumulator::BatchAccumulator;
 use crate::gather_barrier::GatherBarrier;
-use crate::memory::SlabAllocator;
+use crate::memory::{SlabAllocator, WriteBuffer};
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::order_by::{KWayMergePlan, KWayMergeTask, MergeRun, MergedOutput};
@@ -57,20 +78,88 @@ use crate::waker::waker_set;
 
 /// One unit of output-phase work.
 enum BucketTask {
-    /// Plan the merge of one bucket's runs.
-    PlanMerge(Vec<MergeRun>),
+    /// Plan the merge of the runs of the bucket with this index.
+    PlanMerge(usize),
     /// Produce one slice of a bucket's merged output.
     MergeSlice(KWayMergeTask),
 }
 
+/// The planned buckets of one node whose slices wait to be merged, in the
+/// order their planning finished (see the module docs).
+struct PlannedBuckets {
+    /// One place per bucket of the operator, filled in the order the buckets
+    /// are added. Each holds a bucket's slices that no worker has started.
+    slices_by_arrival: Box<[OnceLock<SegQueue<KWayMergeTask>>]>,
+    /// How many places have been given to planners.
+    arrived: AtomicUsize,
+    /// The first place that may still have slices.
+    oldest: AtomicUsize,
+}
+
+impl PlannedBuckets {
+    fn new(bucket_count: usize) -> Self {
+        Self {
+            slices_by_arrival: (0..bucket_count).map(|_| OnceLock::new()).collect(),
+            arrived: AtomicUsize::new(0),
+            oldest: AtomicUsize::new(0),
+        }
+    }
+
+    /// Adds a planned bucket's slices behind the buckets already added.
+    fn add_bucket(&self, slices: Vec<KWayMergeTask>) {
+        let bucket_slices = SegQueue::new();
+        for slice in slices {
+            bucket_slices.push(slice);
+        }
+        let place = self.arrived.fetch_add(1, Ordering::AcqRel);
+        if self.slices_by_arrival[place].set(bucket_slices).is_err() {
+            unreachable!("a place is given to one planner");
+        }
+    }
+
+    /// Takes a slice of the oldest bucket that has one. Returns `None` when
+    /// no slice waits.
+    fn take_slice(&self) -> Option<KWayMergeTask> {
+        loop {
+            let oldest = self.oldest.load(Ordering::Acquire);
+            // A place that was given out and is not filled yet is filled
+            // within moments. Until then nothing is handed out, also not from
+            // the places behind it, and the caller asks again.
+            let bucket_slices = self.slices_by_arrival.get(oldest)?.get()?;
+            if let Some(slice) = bucket_slices.pop() {
+                return Some(slice);
+            }
+            // The bucket has no slices left. Whichever worker notices first
+            // moves on to the next; the others find it already moved.
+            let _ = self.oldest.compare_exchange(
+                oldest,
+                oldest + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
 /// Coordination shared by every worker of one window operator.
 pub struct SharedBuckets {
-    layout: Arc<WindowLayout>,
     topology: Topology,
-    /// Collects every worker's NUMA node and its runs per bucket. The last
-    /// worker to arrive queues the buckets' merges.
-    worker_runs: GatherBarrier<(usize, Vec<Vec<SortedRun>>)>,
-    tasks_by_node: Box<[Injector<BucketTask>]>,
+    /// Per bucket, the runs of the workers that have finished consuming.
+    /// Each worker adds its own runs, so the workers share that work, which
+    /// grows with the number of workers times the number of buckets, and
+    /// each one reads only runs it wrote itself. Workers add to a bucket at
+    /// once without waiting for each other.
+    runs_by_bucket: Box<[SegQueue<MergeRun>]>,
+    /// Counts the workers that have added their runs. The last one queues
+    /// the buckets' merges.
+    workers_arrived: GatherBarrier<()>,
+    /// Per node, the buckets whose merge no worker has started to plan.
+    unplanned_by_node: Box<[Injector<usize>]>,
+    /// Per node, the planned buckets whose slices wait to be merged.
+    planned_by_node: Box<[PlannedBuckets]>,
+    /// Per node, ring buffers of that node which its workers lent to the
+    /// workers of the other nodes (see [`lend_buffer`](Self::lend_buffer)).
+    lent_buffers_by_node: Box<[Arc<SegQueue<WriteBuffer>>]>,
     /// Buckets not yet emitted. Starts at the bucket count, so it only
     /// reaches zero after the last worker has arrived and every bucket has
     /// either been found empty or been emitted.
@@ -78,72 +167,111 @@ pub struct SharedBuckets {
 }
 
 impl SharedBuckets {
-    pub fn new(layout: Arc<WindowLayout>, topology: Topology) -> Self {
+    pub fn new(layout: &WindowLayout, topology: Topology) -> Self {
         Self {
-            worker_runs: GatherBarrier::new(topology.total_workers()),
-            tasks_by_node: (0..topology.node_count).map(|_| Injector::new()).collect(),
+            runs_by_bucket: (0..layout.bucket_count).map(|_| SegQueue::new()).collect(),
+            workers_arrived: GatherBarrier::new(topology.total_workers()),
+            unplanned_by_node: (0..topology.node_count).map(|_| Injector::new()).collect(),
+            planned_by_node: (0..topology.node_count)
+                .map(|_| PlannedBuckets::new(layout.bucket_count))
+                .collect(),
+            lent_buffers_by_node: (0..topology.node_count)
+                .map(|_| Arc::new(SegQueue::new()))
+                .collect(),
             buckets_remaining: AtomicUsize::new(layout.bucket_count),
-            layout,
             topology,
         }
     }
 
-    /// Hands over the runs per bucket of worker `worker_id`, which runs on
-    /// NUMA node `node_id` and has finished consuming. The last worker to
-    /// arrive starts the output phase.
-    pub fn arrive(&self, worker_id: usize, node_id: usize, runs_by_bucket: Vec<Vec<SortedRun>>) {
-        self.worker_runs
-            .arrive_at(worker_id, (node_id, runs_by_bucket), |all_workers| {
-                self.queue_bucket_merges(all_workers)
-            });
+    /// The node that `bucket` is given to (see the module docs).
+    pub fn find_node_of_bucket(&self, bucket: usize) -> usize {
+        bucket % self.topology.node_count
     }
 
-    /// Groups every worker's runs by bucket and queues one planning task per
-    /// bucket that has rows.
-    fn queue_bucket_merges(&self, mut all_workers: Vec<(usize, Vec<Vec<SortedRun>>)>) {
-        for bucket in 0..self.layout.bucket_count {
-            let runs: Vec<MergeRun> = all_workers
-                .iter_mut()
-                .flat_map(|(node_id, runs_by_bucket)| {
-                    let node_id = *node_id;
-                    std::mem::take(&mut runs_by_bucket[bucket])
-                        .into_iter()
-                        .map(move |run| MergeRun::new(run, node_id))
-                })
-                .collect();
+    /// Lends `buffer`, a ring buffer of node `node_id` taken by one of that
+    /// node's workers, to the workers of the other nodes.
+    ///
+    /// A worker can only take buffers of its own node, and it has to write
+    /// its runs of the other nodes' buckets into those nodes' memory. So
+    /// while rows arrive, every worker lends buffers of its node here, and
+    /// the workers of the other nodes write those runs with an allocator
+    /// that draws on them (see
+    /// [`lent_buffers_of_node`](Self::lent_buffers_of_node)).
+    pub fn lend_buffer(&self, node_id: usize, buffer: WriteBuffer) {
+        self.lent_buffers_by_node[node_id].push(buffer);
+    }
+
+    /// The buffers of node `node_id` lent to the workers of other nodes and
+    /// not yet taken by one.
+    pub fn lent_buffers_of_node(&self, node_id: usize) -> Arc<SegQueue<WriteBuffer>> {
+        self.lent_buffers_by_node[node_id].clone()
+    }
+
+    /// Hands over the runs per bucket of worker `worker_id`, which has
+    /// finished consuming. The last worker to arrive starts the output
+    /// phase.
+    pub fn arrive(&self, worker_id: usize, runs_by_bucket: Vec<Vec<MergeRun>>) {
+        for (bucket, runs) in runs_by_bucket.into_iter().enumerate() {
+            for run in runs {
+                self.runs_by_bucket[bucket].push(run);
+            }
+        }
+        self.workers_arrived
+            .arrive_at(worker_id, (), |_| self.queue_bucket_merges());
+    }
+
+    /// Queues every bucket that has rows for planning. Every worker has
+    /// added its runs by now.
+    fn queue_bucket_merges(&self) {
+        // No worker writes runs any more, so the lent buffers that were not
+        // needed go back to their node's pool.
+        for lent_buffers in self.lent_buffers_by_node.iter() {
+            while lent_buffers.pop().is_some() {}
+        }
+        for (bucket, runs) in self.runs_by_bucket.iter().enumerate() {
             if runs.is_empty() {
                 self.finish_bucket();
             } else {
-                let bucket_node = bucket % self.topology.node_count;
-                self.queue_task(bucket_node, BucketTask::PlanMerge(runs));
+                let bucket_node = self.find_node_of_bucket(bucket);
+                self.unplanned_by_node[bucket_node].push(bucket);
+                waker_set().notify_one_near(bucket_node);
             }
         }
     }
 
-    fn queue_task(&self, node_id: usize, task: BucketTask) {
-        self.tasks_by_node[node_id].push(task);
-        waker_set().notify_one_near(node_id);
+    /// Makes the slices of a planned bucket of node `node_id` available to
+    /// the workers.
+    fn queue_slices(&self, node_id: usize, slices: Vec<KWayMergeTask>) {
+        let slice_count = slices.len();
+        self.planned_by_node[node_id].add_bucket(slices);
+        for _ in 0..slice_count {
+            waker_set().notify_one_near(node_id);
+        }
     }
 
-    /// Takes a task for a worker on node `node_id`: from that node's queue
-    /// when it has one, otherwise from the first other node's queue that
+    /// Takes a task for a worker on node `node_id`: a bucket to plan while
+    /// one waits, and a slice otherwise. Both are taken from the worker's
+    /// own node when it has one, otherwise from the first other node that
     /// does.
     fn claim_task(&self, node_id: usize) -> Option<BucketTask> {
-        let node_count = self.tasks_by_node.len();
-        for offset in 0..node_count {
-            let queue = &self.tasks_by_node[(node_id + offset) % node_count];
+        let node_count = self.topology.node_count;
+        let nodes_from_own = (0..node_count).map(|offset| (node_id + offset) % node_count);
+        for node in nodes_from_own.clone() {
+            let unplanned = &self.unplanned_by_node[node];
             // Checking for emptiness first costs a plain load, where a steal
             // from an empty queue costs more and is repeated by every idle
             // worker until the last bucket is emitted.
-            if queue.is_empty() {
-                continue;
-            }
-            loop {
-                match queue.steal() {
-                    Steal::Success(task) => return Some(task),
+            while !unplanned.is_empty() {
+                match unplanned.steal() {
+                    Steal::Success(bucket) => return Some(BucketTask::PlanMerge(bucket)),
                     Steal::Retry => continue,
                     Steal::Empty => break,
                 }
+            }
+        }
+        for node in nodes_from_own {
+            if let Some(slice) = self.planned_by_node[node].take_slice() {
+                return Some(BucketTask::MergeSlice(slice));
             }
         }
         None
@@ -219,26 +347,33 @@ impl WindowOutputter {
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         match task {
-            BucketTask::PlanMerge(runs) => {
+            BucketTask::PlanMerge(bucket) => {
+                // Only this task takes the bucket's runs, and every worker
+                // added its runs before the bucket was queued.
+                let bucket_runs = &self.shared.runs_by_bucket[bucket];
+                let runs: Vec<MergeRun> = std::iter::from_fn(|| bucket_runs.pop()).collect();
                 let plan = KWayMergePlan::try_new(
                     self.layout.sort_key.clone(),
                     runs,
                     self.shared.topology.node_count,
                 )?;
-                match plan {
-                    KWayMergePlan::Empty => self.shared.finish_bucket(),
-                    KWayMergePlan::Identity(sorted_bucket) => {
-                        self.emit_bucket(sorted_bucket, sender)?
+                let already_sorted = match plan {
+                    KWayMergePlan::Empty => {
+                        self.shared.finish_bucket();
+                        None
                     }
+                    KWayMergePlan::Identity(sorted_bucket) => Some(sorted_bucket),
                     KWayMergePlan::Parallel(slices) => {
-                        // The bucket stays on the node that planned it, which
-                        // is the bucket's own node unless a worker of another
-                        // node took the planning task over.
-                        for slice in slices {
-                            self.shared
-                                .queue_task(self.node_id, BucketTask::MergeSlice(slice));
-                        }
+                        // The slices go to the bucket's own node even when a
+                        // worker of another node planned it, because that is
+                        // where the bucket's runs are.
+                        let bucket_node = self.shared.find_node_of_bucket(bucket);
+                        self.shared.queue_slices(bucket_node, slices);
+                        None
                     }
+                };
+                if let Some(sorted_bucket) = already_sorted {
+                    self.emit_bucket(sorted_bucket, sender)?;
                 }
             }
             BucketTask::MergeSlice(slice) => {

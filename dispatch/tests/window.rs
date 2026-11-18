@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
@@ -305,7 +305,7 @@ fn expected_row_numbers(rows: &[(Option<i64>, i64)], limit: i64) -> Vec<Vec<Opti
 /// once, so buckets are merged from several runs.
 #[test]
 fn many_rows_over_many_runs_are_numbered_per_partition() {
-    let input_rows = scattered_rows(600_000, 37);
+    let input_rows = scattered_rows(2_000_000, 37);
 
     let rows = run_window(
         per_team_by_score(vec![WindowFunction::RowNumber]),
@@ -318,7 +318,7 @@ fn many_rows_over_many_runs_are_numbered_per_partition() {
 
 #[test]
 fn a_row_limit_over_many_runs_keeps_the_first_rows_of_each_partition() {
-    let input_rows = scattered_rows(600_000, 37);
+    let input_rows = scattered_rows(2_000_000, 37);
     let mut spec = per_team_by_score(vec![WindowFunction::RowNumber]);
     spec.row_limit = Some(WindowRowLimit {
         function_index: 0,
@@ -359,4 +359,50 @@ fn an_unpartitioned_window_larger_than_one_merge_slice_is_numbered_in_order() {
     let rows = run_window(spec, 3, split_into_batches(&input_rows));
 
     assert_eq!(rows, expected_row_numbers(&input_rows, i64::MAX));
+}
+
+#[test]
+fn a_string_in_the_middle_of_the_order_key_orders_rows_before_the_next_key() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("team", DataType::Int64, false),
+        Field::new("grade", DataType::Utf8View, false),
+        Field::new("score", DataType::Int64, false),
+    ]));
+    let grades = vec!["b", "a", "a grade of over twelve bytes", "a"];
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
+            Arc::new(StringViewArray::from(grades)),
+            Arc::new(Int64Array::from(vec![40, 30, 20, 10])),
+        ],
+    )
+    .unwrap();
+    let spec = WindowSpec {
+        partition_by: vec![TEAM],
+        order_by: vec![OrderBy::new(1, false, false), OrderBy::new(2, false, false)],
+        functions: vec![WindowFunction::RowNumber],
+        row_limit: None,
+    };
+    let dispatch = dispatch(2);
+
+    let output = values_input(&dispatch, vec![batch])
+        .record_batches()
+        .window(spec)
+        .collect()
+        .unwrap();
+
+    let mut row_numbers_by_score: Vec<(i64, i64)> = output
+        .iter()
+        .flat_map(|batch| {
+            let scores = batch.column(2).as_primitive::<Int64Type>().values();
+            let row_numbers = batch.column(3).as_primitive::<Int64Type>().values();
+            scores.iter().copied().zip(row_numbers.iter().copied())
+        })
+        .collect();
+    row_numbers_by_score.sort();
+    assert_eq!(
+        row_numbers_by_score,
+        vec![(10, 1), (20, 3), (30, 2), (40, 4)]
+    );
 }
