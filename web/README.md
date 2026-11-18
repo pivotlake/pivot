@@ -145,9 +145,11 @@ docker run -p 8080:8080 -e PIVOT_HOST=pivot.internal pivot-web
 Loopback inside a container reaches nothing, so the image has to be told
 where the pivot server is with `PIVOT_HOST` (and `PIVOT_PORT`, `PIVOT_USER`,
 `PIVOT_PASSWORD` as needed), unless the container shares the host's network.
-The release workflow (`.github/workflows/deploy.yml`, `push_docker_web`)
-builds it for amd64 and arm64 and pushes it as `pivotlake/pivot-web`, tagged
-like the server image.
+The Deploy Web Dashboard workflow (`.github/workflows/deploy-dashboard.yml`)
+builds it for amd64 and arm64 and pushes it as `pivotlake/pivot-web`. It
+versions the image like the server's: a candidate is `<version>-rc<sha>`, a
+real release is the workspace version and also moves `latest`, and each
+published version gets a `web-v<version>` git tag.
 
 ## Layout of the source
 
