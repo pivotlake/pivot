@@ -621,7 +621,10 @@ impl RecordBatchOperatorSpec {
     /// See the `operations::unary::order_by` module.
     pub fn order_by(self, order_by: Vec<OrderBy>) -> Self {
         let topology = self.dispatcher.topology();
-        let mut result = self.unary(OrderByFactory::create_for_workers(order_by, topology));
+        let wakers = self.dispatcher.waker_set();
+        let mut result = self.unary(OrderByFactory::create_for_workers(
+            order_by, topology, wakers,
+        ));
         result.stream_ordered = true;
         result
     }
@@ -636,10 +639,12 @@ impl RecordBatchOperatorSpec {
     pub fn window(self, spec: WindowSpec) -> Self {
         let topology = self.dispatcher.topology();
         let arena_buffers = self.dispatcher.buffers;
+        let wakers = self.dispatcher.waker_set();
         let mut result = self.unary(WindowFactory::create_for_workers(
             spec,
             topology,
             arena_buffers,
+            wakers,
         ));
         result.stream_ordered = false;
         result
@@ -651,8 +656,12 @@ impl RecordBatchOperatorSpec {
         let topology = self.dispatcher.topology();
         let worker_count = self.worker_count();
         let collector_worker = self.dispatcher.next_worker();
-        let (sorters, collectors) =
-            create_normalizing_order_by_factories(order_by, topology, collector_worker);
+        let (sorters, collectors) = create_normalizing_order_by_factories(
+            order_by,
+            topology,
+            self.dispatcher.waker_set(),
+            collector_worker,
+        );
         let input_siblings = Arc::new(AtomicUsize::new(worker_count));
         let collector_siblings = Arc::new(AtomicUsize::new(worker_count));
         let group_channels = to_single_worker_mpsc(worker_count, collector_worker);

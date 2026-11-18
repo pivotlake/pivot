@@ -1,4 +1,4 @@
-use crate::api::BuildContext;
+use crate::api::{BuildContext, Placement};
 use crate::operations::channels::{
     ChannelFactory, RootChannelFactory, Sender, StealableChannelFactory, mpsc_channel, stealable,
 };
@@ -75,24 +75,30 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let cancelled = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "perf")]
         let profiled = self.dispatcher.profiled();
-        let wakers = self
-            .dispatcher
-            .push_data_flow(self.factories.into_iter().map(|f| {
-                let tx = tx.clone();
-                let build = Box::new(move |context: &mut BuildContext| {
-                    Box::new(f).build(Box::new(tx), context)
-                });
-                let builder = DataFlowBuilder::new(
-                    build,
-                    cancelled.clone(),
-                    err_tx.clone(),
-                    stats_tx.clone(),
-                    collect_stats,
-                );
-                #[cfg(feature = "perf")]
-                let builder = builder.with_profiling(profiled);
-                builder
-            }));
+        let topology = self.dispatcher.topology();
+        let dataflow_wakers = self.dispatcher.waker_set();
+        let builders = self.factories.into_iter().enumerate().map(|(worker, f)| {
+            let tx = tx.clone();
+            let build = Box::new(move |context: &mut BuildContext| {
+                Box::new(f).build(Box::new(tx), context)
+            });
+            let builder = DataFlowBuilder::new(
+                build,
+                Placement {
+                    worker,
+                    node: topology.node_of_worker(worker),
+                    wakers: dataflow_wakers.clone(),
+                },
+                cancelled.clone(),
+                err_tx.clone(),
+                stats_tx.clone(),
+                collect_stats,
+            );
+            #[cfg(feature = "perf")]
+            let builder = builder.with_profiling(profiled);
+            builder
+        });
+        let wakers = self.dispatcher.push_data_flow(builders);
         // Close our local copies of the senders so the channels close once
         // every worker drops theirs.
         drop(err_tx);

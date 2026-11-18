@@ -116,7 +116,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
 
     fn build_unary(
         self,
-        _context: &mut BuildContext,
+        context: &mut BuildContext,
     ) -> BuiltUnary<PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>>> {
         // The group-by and the memory context share the evictor: the group-by
         // pushes spilled scatter buffers into it, the memory context frees
@@ -138,6 +138,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
             self.topk_threshold,
             self.shared_bin_totals,
             evictor.clone(),
+            context.worker_idx(),
+            context.node(),
         );
         Built::with_evictor(PipelineBreaker::Consuming(group), Box::new(evictor))
     }

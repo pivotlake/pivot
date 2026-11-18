@@ -89,7 +89,7 @@ impl<I: 'static, O: 'static, UF: UnaryFactory<I, O>, C: ChannelFactory<I>, OP: O
         sender: Box<dyn Sender<O>>,
         context: &mut BuildContext,
     ) -> OperatorGraphBuilder {
-        let (tx, rx) = self.channel_factory.build();
+        let (tx, rx) = self.channel_factory.build(context);
         let chain = Box::new(self.head).build(Box::new(tx), context);
         let Built {
             inner: unary,
@@ -133,7 +133,7 @@ impl<I: 'static, O: 'static, UF: UnaryFactory<I, O>, C: RootChannelFactory<I>> O
         sender: Box<dyn Sender<O>>,
         context: &mut BuildContext,
     ) -> OperatorGraphBuilder {
-        let rx = self.channel_factory.build();
+        let rx = self.channel_factory.build(context);
         let Built {
             inner: unary,
             evictor,

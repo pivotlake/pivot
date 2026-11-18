@@ -4,7 +4,7 @@
 
 use crate::FileSlice;
 use crossbeam_deque::{Injector, Steal};
-use dispatch::{Receiver, RootChannelFactory};
+use dispatch::{BuildContext, Receiver, RootChannelFactory};
 use std::sync::Arc;
 
 /// Builds a [`FileSliceInjector`] per worker, all sharing one queue of the slices.
@@ -28,7 +28,7 @@ impl FileSliceInjectorFactory {
 impl RootChannelFactory<FileSlice> for FileSliceInjectorFactory {
     type Receiver = FileSliceInjector;
 
-    fn build(self) -> FileSliceInjector {
+    fn build(self, _context: &BuildContext) -> FileSliceInjector {
         FileSliceInjector {
             slices: self.slices,
         }
@@ -111,7 +111,8 @@ mod tests {
         let waker = Arc::new(WorkerWaker::new(1));
         init_worker_waker(&waker);
         init_waker_set(WakerSet::new(vec![waker.clone()], 1));
-        let injector = FileSliceInjectorFactory::new(&[file_slice("a"), file_slice("b")]).build();
+        let injector = FileSliceInjectorFactory::new(&[file_slice("a"), file_slice("b")])
+            .build(&BuildContext::new(0));
 
         let before = waker.wake_count();
         injector.steal().expect("first slice");

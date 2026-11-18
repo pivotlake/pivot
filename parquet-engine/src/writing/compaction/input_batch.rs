@@ -19,17 +19,15 @@ use crate::reading::record_batch_metadata::{global_row_group, row_index};
 /// the column that numbers them in it.
 pub(crate) struct DecodedBatch {
     batch: RecordBatch,
-    /// The worker that took the batch from the decoder.
+    /// The worker that took the batch from the decoder, as its index among
+    /// the dataflow's workers.
     worker: usize,
 }
 
 impl DecodedBatch {
-    /// `batch` as the decoder emitted it, taken by the worker this runs on.
-    pub(super) fn new(batch: RecordBatch) -> Self {
-        Self {
-            batch,
-            worker: dispatch::worker::WORKER_IDX.get(),
-        }
+    /// `batch` as the decoder emitted it, taken by `worker`.
+    pub(super) fn new(batch: RecordBatch, worker: usize) -> Self {
+        Self { batch, worker }
     }
 
     pub(super) fn row_count(&self) -> usize {

@@ -41,7 +41,7 @@ use crate::operations::unary::pipeline_breaker::{
 use crate::operations::unary::{
     BatchesOutputter, CollectorFactory, InitializableOutputter, NormalizationBatches, Normalizer,
 };
-use crate::waker::waker_set;
+use crate::waker::{WakerSet, waker_set};
 
 use batch_sort::{
     batch_arrives_sorted, sort_chunked_row_positions, sort_packed_rows, sorted_row_indices,
@@ -257,6 +257,9 @@ struct SharedMergeState {
     node_outputs: Box<[OnceLock<MergedOutput>]>,
     nodes_remaining: AtomicUsize,
     tasks_by_node: Box<[Injector<MergeTask>]>,
+    /// The wakers of the dataflow's workers, to wake one on the node a task
+    /// was queued for.
+    wakers: WakerSet,
     sorted_output: OnceLock<MergedOutput>,
     merges_complete: AtomicBool,
     output_claimed: AtomicBool,
@@ -310,7 +313,7 @@ impl SharedMergeState {
         for merge in tasks {
             let node_id = merge.node_id();
             self.tasks_by_node[node_id].push(MergeTask { level, merge });
-            waker_set().notify_one_near(node_id);
+            self.wakers.notify_one_near(node_id);
         }
     }
 
@@ -390,7 +393,12 @@ type NormalizingOrderByFactories = (Vec<NormalizingOrderByFactory>, Vec<OrderByC
 
 impl OrderByFactory<RunMerger> {
     /// Creates one factory per worker with shared merge coordination.
-    pub fn create_for_workers(order_by: Vec<OrderBy>, topology: Topology) -> Vec<OrderByFactory> {
+    /// `topology` and `wakers` are those of the dataflow's workers.
+    pub fn create_for_workers(
+        order_by: Vec<OrderBy>,
+        topology: Topology,
+        wakers: WakerSet,
+    ) -> Vec<OrderByFactory> {
         let order_by: Arc<[OrderBy]> = order_by.into();
         let shared = Arc::new(SharedMergeState {
             order_by: order_by.clone(),
@@ -401,6 +409,7 @@ impl OrderByFactory<RunMerger> {
             node_outputs: (0..topology.node_count).map(|_| OnceLock::new()).collect(),
             nodes_remaining: AtomicUsize::new(topology.node_count),
             tasks_by_node: (0..topology.node_count).map(|_| Injector::new()).collect(),
+            wakers,
             sorted_output: OnceLock::new(),
             merges_complete: AtomicBool::new(false),
             output_claimed: AtomicBool::new(false),
@@ -430,9 +439,10 @@ impl OrderByFactory<RunMerger> {
 pub(crate) fn create_normalizing_for_workers(
     order_by: Vec<OrderBy>,
     topology: Topology,
+    wakers: WakerSet,
     collector_worker: usize,
 ) -> NormalizingOrderByFactories {
-    let direct = OrderByFactory::create_for_workers(order_by, topology);
+    let direct = OrderByFactory::create_for_workers(order_by, topology, wakers);
     let normalizers = Normalizer::create_for_workers(topology.total_workers());
     let mut sorters = Vec::with_capacity(topology.total_workers());
     let mut collectors = Vec::with_capacity(topology.total_workers());
@@ -661,7 +671,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     fn consumers(order_by: Vec<OrderBy>, worker_count: usize) -> Vec<OrderBySorter> {
-        OrderByFactory::create_for_workers(order_by, Topology::single_node(worker_count))
+        let wakers = WakerSet::new(vec![Arc::new(WorkerWaker::new(worker_count))], worker_count);
+        OrderByFactory::create_for_workers(order_by, Topology::single_node(worker_count), wakers)
             .into_iter()
             .map(
                 |factory| match factory.build_unary(&mut BuildContext::new(0)).inner {
@@ -722,9 +733,10 @@ mod tests {
         };
         let node_wakers: Vec<_> = (0..2).map(|_| Arc::new(WorkerWaker::new(1))).collect();
         init_worker_waker(&node_wakers[0]);
-        init_waker_set(WakerSet::new(node_wakers, 1));
+        let wakers = WakerSet::new(node_wakers, 1);
+        init_waker_set(wakers.clone());
         let mut consumers: Vec<_> =
-            OrderByFactory::create_for_workers(ascending_by_key(), topology)
+            OrderByFactory::create_for_workers(ascending_by_key(), topology, wakers)
                 .into_iter()
                 .map(
                     |factory| match factory.build_unary(&mut BuildContext::new(0)).inner {

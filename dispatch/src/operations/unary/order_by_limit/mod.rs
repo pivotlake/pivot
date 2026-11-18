@@ -252,6 +252,8 @@ pub struct OrderByLimit {
     offset: usize,
     order_by: Vec<OrderBy>,
     gather: Arc<GatherBarrier<Option<RecordBatch>>>,
+    /// This worker's index among the dataflow's workers.
+    worker: usize,
     /// When set, this worker is a boundary producer that pools each batch's
     /// keys into `key_window`, shared by every worker of this Top-N (see
     /// [`offer_to_window`]): the leading key orders nulls last and the fetch
@@ -290,6 +292,7 @@ impl OrderByLimit {
         gather: Arc<GatherBarrier<Option<RecordBatch>>>,
         boundary_slot: Option<Arc<BoundarySlot>>,
         key_window: Arc<Mutex<Option<ArrayRef>>>,
+        worker: usize,
     ) -> Self {
         let nulls_last_leading = order_by.first().is_some_and(|leading| !leading.nulls_first);
         let pool = nulls_last_leading && (1..=SHARED_WINDOW_MAX_FETCH).contains(&(limit + offset));
@@ -301,6 +304,7 @@ impl OrderByLimit {
             limit,
             offset,
             gather,
+            worker,
             pooled_slot,
             key_window,
             publish_slot,
@@ -495,20 +499,22 @@ impl Unary<RecordBatch, RecordBatch> for OrderByLimit {
         let order_by = &self.order_by;
         let limit = self.limit;
         let offset = self.offset;
-        let completion =
-            self.gather
-                .arrive(self.running_top_k.take(), |values| -> unary::Result<()> {
-                    let batches: Vec<RecordBatch> = values.into_iter().flatten().collect();
-                    if batches.is_empty() {
-                        return Ok(());
-                    }
-                    debug!("from {:?} batches", batches.len());
-                    let start = Instant::now();
-                    let output = get_top_k_from_top_ks(batches, order_by, limit + offset, offset)?;
-                    sender.send(output)?;
-                    debug!("took {:?}", start.elapsed());
-                    Ok(())
-                });
+        let completion = self.gather.arrive_at(
+            self.worker,
+            self.running_top_k.take(),
+            |values| -> unary::Result<()> {
+                let batches: Vec<RecordBatch> = values.into_iter().flatten().collect();
+                if batches.is_empty() {
+                    return Ok(());
+                }
+                debug!("from {:?} batches", batches.len());
+                let start = Instant::now();
+                let output = get_top_k_from_top_ks(batches, order_by, limit + offset, offset)?;
+                sender.send(output)?;
+                debug!("took {:?}", start.elapsed());
+                Ok(())
+            },
+        );
         if let Some(result) = completion {
             result?;
         }
@@ -555,6 +561,7 @@ mod tests {
             Arc::new(GatherBarrier::new(1)),
             boundary_slot,
             Arc::new(Mutex::new(None)),
+            0,
         )
     }
 
@@ -653,8 +660,9 @@ mod tests {
             gather.clone(),
             Some(slot.clone()),
             window.clone(),
+            0,
         );
-        let mut second = OrderByLimit::new(order_by(), 3, 0, gather, Some(slot.clone()), window);
+        let mut second = OrderByLimit::new(order_by(), 3, 0, gather, Some(slot.clone()), window, 1);
         let mut sink = CollectSender::new();
 
         // Neither worker alone sees 3 rows, but the pooled window does.
@@ -800,7 +808,7 @@ mod tests {
         let gather = Arc::new(GatherBarrier::new(worker_count));
 
         let consumers: Vec<_> = (0..worker_count)
-            .map(|_| {
+            .map(|worker| {
                 OrderByLimit::new(
                     vec![OrderBy::new(0, descending, false)],
                     limit,
@@ -808,6 +816,7 @@ mod tests {
                     gather.clone(),
                     None,
                     Arc::new(Mutex::new(None)),
+                    worker,
                 )
             })
             .collect();
@@ -910,6 +919,7 @@ mod tests {
             Arc::new(GatherBarrier::new(1)),
             None,
             Arc::new(Mutex::new(None)),
+            0,
         );
         let mut sender = CollectSender::new();
 

@@ -58,6 +58,9 @@ use std::sync::Arc;
 /// read: a table scan's injector, or the queue a late materialization sends
 /// them to.
 pub struct RowGroupFetcher<IoRowGroupsReceiver: Receiver<QueryRowGroupMetadata>> {
+    /// This worker's index among the dataflow's workers, which the row
+    /// groups it claims are decoded on.
+    worker: usize,
     /// The columns the scan reads from every row group.
     projection: Arc<Projection>,
     /// The medium the table is read from, whose read-ahead budget the
@@ -90,8 +93,10 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
         io_row_groups_receiver: I,
         uncached_row_groups_sender: SharedWorkQueueSender<QueryRowGroupMetadata>,
         uncached_row_groups_receiver: SharedWorkQueueReceiver<QueryRowGroupMetadata>,
+        worker: usize,
     ) -> Self {
         Self {
+            worker,
             projection,
             read_medium,
             reads_ahead_of_cpu_work,
@@ -139,7 +144,11 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
             // In memory after all. It still waits its turn behind the row
             // groups that were expected to be.
             self.fetched_row_groups
-                .push_back(request.into_row_group_buffer(None, Some(read_ahead_charge)));
+                .push_back(request.into_row_group_buffer(
+                    None,
+                    Some(read_ahead_charge),
+                    self.worker,
+                ));
         } else if request.bypasses_caches() {
             // Read into slabs of the fetcher's own, around the compressed
             // cache: nothing reads these bytes a second time.
@@ -175,7 +184,7 @@ impl<I: Receiver<QueryRowGroupMetadata>> Unary<QueryRowGroupMetadata, RowGroupBu
     ) -> dispatch::UnaryResult<()> {
         let request = RowGroupRequest::from(row_group, &self.projection);
         if request.reads_nothing() {
-            sender.send(request.into_row_group_buffer(None, None))?;
+            sender.send(request.into_row_group_buffer(None, None, self.worker))?;
             return Ok(());
         }
         self.uncached_row_groups_sender
@@ -211,7 +220,11 @@ impl<I: Receiver<QueryRowGroupMetadata>> Unary<QueryRowGroupMetadata, RowGroupBu
             .remove(&response.id())
             .expect("response for an unknown row-group request");
         self.fetched_row_groups
-            .push_back(request.into_row_group_buffer(Some(response), Some(read_ahead_charge)));
+            .push_back(request.into_row_group_buffer(
+                Some(response),
+                Some(read_ahead_charge),
+                self.worker,
+            ));
         Ok(())
     }
 

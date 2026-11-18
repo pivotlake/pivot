@@ -4,7 +4,6 @@
 //! all published values, runs the completion work, and wakes the worker pool.
 
 use crate::waker::waker_set;
-use crate::worker::WORKER_IDX;
 use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,22 +49,16 @@ impl<T> GatherBarrier<T> {
         }
     }
 
-    /// Publishes `value` for the calling worker.
+    /// Publishes `value` for the worker with index `worker_index` among the
+    /// workers the barrier gathers from: those of a dataflow, or those of
+    /// one of its nodes for a node-local barrier.
     ///
     /// The final worker to arrive invokes `on_complete` with every value in
     /// worker order, then wakes all workers. It receives the closure's result;
     /// earlier arrivals return `None` without waiting.
     ///
-    /// Panics if the calling thread has no valid worker index or that worker has
+    /// Panics if the barrier expects no such worker or that worker has
     /// already arrived.
-    pub fn arrive<R>(&self, value: T, on_complete: impl FnOnce(Vec<T>) -> R) -> Option<R> {
-        self.arrive_at(WORKER_IDX.get(), value, on_complete)
-    }
-
-    /// Publishes `value` in an explicitly selected slot.
-    ///
-    /// This is useful for node-local barriers, whose slots are indexed by a
-    /// worker's position within its NUMA node instead of its global worker ID.
     pub fn arrive_at<R>(
         &self,
         worker_index: usize,
@@ -109,7 +102,6 @@ impl<T> GatherBarrier<T> {
 mod tests {
     use super::*;
     use crate::waker::{WakerSet, WorkerWaker, init_waker_set};
-    use crate::worker::WORKER_IDX;
     use std::sync::Arc;
     use std::thread;
 
@@ -123,9 +115,8 @@ mod tests {
             let barrier = barrier.clone();
             let wakers = wakers.clone();
             thread::spawn(move || {
-                WORKER_IDX.set(worker_index);
                 init_waker_set(wakers);
-                barrier.arrive(worker_index * 10, |values| values)
+                barrier.arrive_at(worker_index, worker_index * 10, |values| values)
             })
         });
         let completions: Vec<Vec<usize>> = arrivals
@@ -148,11 +139,10 @@ mod tests {
             waker.wait_if_unchanged(wake_count, 0) > wake_count
         });
         ready_receiver.recv().unwrap();
-        WORKER_IDX.set(0);
         init_waker_set(wakers);
         let barrier = GatherBarrier::new(1);
 
-        let completion = barrier.arrive(42, |values| values[0]);
+        let completion = barrier.arrive_at(0, 42, |values| values[0]);
 
         assert_eq!(completion, Some(42));
         assert!(parked_worker.join().unwrap());
@@ -164,10 +154,8 @@ mod tests {
         init_waker_set(WakerSet::new(vec![waker], 1));
         let barrier = GatherBarrier::new(2);
 
-        WORKER_IDX.set(0);
-        let first = barrier.arrive(String::from("first"), |_| unreachable!());
-        WORKER_IDX.set(1);
-        let second = barrier.arrive(String::from("second"), |values| values);
+        let first = barrier.arrive_at(0, String::from("first"), |_| unreachable!());
+        let second = barrier.arrive_at(1, String::from("second"), |values| values);
 
         assert!(first.is_none());
         assert_eq!(second.unwrap(), ["first", "second"]);

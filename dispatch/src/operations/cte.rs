@@ -67,7 +67,7 @@ impl OperatorFactory<RecordBatch> for CteScanFactory {
         sender: Box<dyn Sender<RecordBatch>>,
         context: &mut BuildContext,
     ) -> OperatorGraphBuilder {
-        let (tx, rx) = self.channel_factory.build();
+        let (tx, rx) = self.channel_factory.build(context);
         context.deposit_cte_sender(self.cte_index, tx);
         OperatorGraphBuilder::root(
             Box::new(UnaryOperator::new(

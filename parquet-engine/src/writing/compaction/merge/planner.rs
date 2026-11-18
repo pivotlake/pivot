@@ -9,7 +9,7 @@ use dispatch::{
     BuildContext, Built, BuiltUnary, ChannelInputSender, DataFlowDispatcher, KWayMergePlan,
     MapFactory, MergeRun, OperatorFactory, OperatorSpec, OrderBy, Projection, Sender, Unary,
     UnaryFactory, UnaryResult, WorkStatus, channel_input, count_rows_not_after, is_batch_sorted,
-    stealable_fifo, to_single_worker_mpsc,
+    stealable, stealable_fifo, to_single_worker_mpsc,
 };
 
 use super::super::RANGES_DECODED_AT_A_TIME_PER_FILE;
@@ -134,7 +134,14 @@ impl MergePlanner {
         // first, so the worker that takes a batch here is normally the one
         // that decoded it.
         crate::reading::decode_ranges(released, dispatch::RECORD_BATCH_SIZE, true)
-            .map_each(|batch: RecordBatch| Ok(DecodedBatch::new(batch)))
+            .chain(
+                stealable::<RecordBatch>(topology).into_iter().collect(),
+                (0..worker_count)
+                    .map(|worker| {
+                        MapFactory(move |batch: RecordBatch| Ok(DecodedBatch::new(batch, worker)))
+                    })
+                    .collect(),
+            )
             .chain(
                 to_single_worker_mpsc::<DecodedBatch>(worker_count, compaction_worker)
                     .into_iter()

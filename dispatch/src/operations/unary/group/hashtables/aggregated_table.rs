@@ -701,7 +701,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     /// Finishes worker state for the merge phase, returning the worker's
     /// top-k bin totals beside the output so the caller can fold them into the
     /// pool's shared accumulators before arriving at the gather barrier.
-    pub fn flush(mut self) -> (AggregatedTableOutput<K, V>, Option<HashBinTotals>) {
+    /// `node` is the node this worker is on, among the nodes the dataflow
+    /// runs on.
+    pub fn flush(mut self, node: usize) -> (AggregatedTableOutput<K, V>, Option<HashBinTotals>) {
         if self.switched_to_radix {
             // Add pre-transition groups to the scatter-side estimate.
             for table in &self.tables {
@@ -758,7 +760,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         self.key_arena.flush();
         self.worker_context.flush();
         let output = AggregatedTableOutput {
-            node: crate::worker::current_node(),
+            node,
             tables: self.tables,
             buffers: scattered.map(PartitionBuffers::new),
             hll: self.hll,
@@ -1071,7 +1073,7 @@ mod tests {
         let mut values: Vec<i32> = (0..4000).collect();
         values.extend(std::iter::repeat_n(999_999, 1000));
         consume_all(&mut table, &values);
-        let (output, _totals) = table.flush();
+        let (output, _totals) = table.flush(0);
 
         assert!(
             scatter_row_count(&output) > 4500,
@@ -1096,7 +1098,7 @@ mod tests {
         // rows and stays comfortably under the fallback threshold.
         let values: Vec<i32> = (0..2000).flat_map(|k| [k, k]).collect();
         consume_all(&mut table, &values);
-        let (output, _totals) = table.flush();
+        let (output, _totals) = table.flush(0);
 
         assert!(
             scatter_row_count(&output) < 2500,
@@ -1122,7 +1124,7 @@ mod tests {
         // equals the row count and the merge's bounds stay valid.
         let values: Vec<i32> = (0..6000).flat_map(|k| [k, k]).collect();
         consume_all(&mut table, &values);
-        let (output, totals) = table.flush();
+        let (output, totals) = table.flush(0);
 
         assert!(output.buffers.is_some(), "fills drain into buffers");
         let totals = totals.expect("drained fills keep the bin totals fed");
@@ -1150,7 +1152,7 @@ mod tests {
         // widen its bounds with.
         let values: Vec<i32> = (0..6000).collect();
         consume_all(&mut table, &values);
-        let (output, totals) = table.flush();
+        let (output, totals) = table.flush(0);
 
         assert!(output.buffers.is_some(), "fallback allocates buffers");
         assert!(scatter_row_count(&output) > 1000, "tail rows scatter raw");
@@ -1229,7 +1231,7 @@ mod tests {
         let mut parts = SpillerParts::new(9_000_020);
 
         let spilled = table.spill(&mut parts.spiller(), 1).unwrap();
-        let (output, _totals) = table.flush();
+        let (output, _totals) = table.flush(0);
         parts.finish_writes();
 
         let in_place: usize = output.tables.iter().map(|table| table.len()).sum();

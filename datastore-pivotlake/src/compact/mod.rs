@@ -1791,6 +1791,52 @@ mod tests {
         dispatch.exit();
     }
 
+    /// A merge works on one node of the pool and the next merge on the next
+    /// node, so two merges on a two-node pool cover both.
+    #[test]
+    fn merges_on_each_node_of_a_two_node_pool_keep_every_row() {
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 8 * RING_BUFFERS);
+        let db = tempfile::tempdir().unwrap();
+        let adopted_dir = db.path().join("events");
+        std::fs::create_dir_all(&adopted_dir).unwrap();
+        for (file, rows) in [
+            ("a.parquet", vec![0, 100]),
+            ("b.parquet", vec![0, 100]),
+            ("c.parquet", vec![1_000, 1_100]),
+            ("d.parquet", vec![1_000, 1_100]),
+        ] {
+            write_parquet_file(&adopted_dir, file, rows);
+        }
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            dispatch.dispatcher(),
+            Some(crate::TableFormat::Delta),
+        )
+        .unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(Path::new("events")),
+            true,
+        );
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let files = datastore.table_files(&name).unwrap().unwrap();
+        let target = files.iter().map(|file| file.size).min().unwrap();
+
+        run_one_sweep_with_pair_layout(target, datastore.clone());
+
+        let files = datastore.table_files(&name).unwrap().unwrap();
+        assert_eq!(files.len(), 2, "each pair was merged: {files:?}");
+        let rows: i64 = fresh_parquet(&datastore, "events")
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows)
+            .sum();
+        assert_eq!(rows, 8);
+        dispatch.exit();
+    }
+
     #[test]
     fn final_command_bypasses_small_file_guards() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
@@ -2591,6 +2637,65 @@ mod tests {
             .flat_map(|key| [key, key])
             .collect();
         assert_eq!(keys, expected);
+        dispatch.exit();
+    }
+
+    /// Each merge runs on the next node, so two merges of the same
+    /// many-row-group inputs on a two-node pool run one on each node, and
+    /// each writes every row in key order.
+    #[test]
+    fn a_merge_of_many_row_group_inputs_on_each_node_keeps_every_row_in_order() {
+        const ROWS_PER_INPUT: usize = 40_000;
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 16 * RING_BUFFERS);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_wide_parquet_row_groups(&adopted, "left.parquet", ROWS_PER_INPUT, 11, 3_000);
+        write_wide_parquet_row_groups(&adopted, "right.parquet", ROWS_PER_INPUT, 29, 3_000);
+        let datastore =
+            PivotlakeDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
+        let table = datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+            .unwrap();
+        let partition = table.list_partitions().unwrap().remove(0);
+        let inputs = table.file_refs().unwrap();
+
+        let merges_per_node: Vec<_> = (0..2)
+            .map(|_| {
+                table
+                    .merge_files(&partition, &inputs, 5_000, u64::MAX)
+                    .unwrap()
+            })
+            .collect();
+
+        let expected: Vec<i64> = (1..=ROWS_PER_INPUT as i64)
+            .flat_map(|key| [key, key])
+            .collect();
+        for outputs in merges_per_node {
+            assert_eq!(outputs.len(), 1);
+            let output = std::fs::File::open(
+                db.path()
+                    .join(table.location())
+                    .join(outputs[0].file_ref().path.as_str()),
+            )
+            .unwrap();
+            let keys: Vec<i64> =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(output, 8_192)
+                    .unwrap()
+                    .flat_map(|batch| {
+                        batch
+                            .unwrap()
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+            assert_eq!(keys, expected);
+        }
         dispatch.exit();
     }
 

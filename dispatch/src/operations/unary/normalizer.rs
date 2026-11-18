@@ -155,14 +155,18 @@ impl<G: NormalizationBatches> NormalizerState<G> {
 /// groups unchanged in shape once every normalization job has landed.
 pub(crate) struct Normalizer<G> {
     shared: Arc<NormalizerState<G>>,
+    /// The index, among the dataflow's workers, of the worker this
+    /// normalizer is for.
+    worker: usize,
 }
 
 impl<G: NormalizationBatches> Normalizer<G> {
     pub(crate) fn create_for_workers(worker_count: usize) -> Vec<Self> {
         let shared = Arc::new(NormalizerState::new(worker_count));
         (0..worker_count)
-            .map(|_| Self {
+            .map(|worker| Self {
                 shared: shared.clone(),
+                worker,
             })
             .collect()
     }
@@ -171,7 +175,7 @@ impl<G: NormalizationBatches> Normalizer<G> {
 impl<G: NormalizationBatches> BatchesOutputter<G, G> for Normalizer<G> {
     fn accept(&mut self, group: G) -> unary::Result<()> {
         let shared = self.shared.clone();
-        self.shared.gather.arrive(group, |groups| {
+        self.shared.gather.arrive_at(self.worker, group, |groups| {
             shared.initialize(groups);
         });
         Ok(())

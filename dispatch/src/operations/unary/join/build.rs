@@ -273,6 +273,8 @@ pub struct JoinBuilder<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool> {
     build_ready: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
     gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
+    /// This worker's index among the dataflow's workers.
+    worker: usize,
     /// Hash partitions of the build, one scatter job each; see [`partitions_for`].
     partitions: usize,
     build_output_indices: Vec<usize>,
@@ -401,6 +403,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
         build_ready: Arc<AtomicBool>,
         remaining_jobs: Arc<AtomicUsize>,
         gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
+        worker: usize,
         partitions: usize,
         build_output_indices: Vec<usize>,
         build_filters: Vec<JoinBuildFilter>,
@@ -414,6 +417,7 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
             build_ready,
             remaining_jobs,
             gather,
+            worker,
             partitions,
             build_output_indices,
             build_filters,
@@ -652,7 +656,10 @@ impl<K: Copy + Send, const TRACK_MATCHED_BUILD_ROWS: bool>
 {
     fn accept(&mut self, group: BuildWorkerOutput<K>) -> unary::Result<()> {
         let gather = self.gather.clone();
-        if let Some(result) = gather.arrive(group, |groups| self.initialize_groups(groups)) {
+        let worker = self.worker;
+        if let Some(result) =
+            gather.arrive_at(worker, group, |groups| self.initialize_groups(groups))
+        {
             result?;
         }
         Ok(())

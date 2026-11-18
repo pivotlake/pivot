@@ -75,7 +75,7 @@
 //!   `MpscSender`. Sent to a worker thread, which calls `.build()` to produce a `DataFlow`.
 
 mod build_context;
-pub use build_context::BuildContext;
+pub use build_context::{BuildContext, Placement};
 mod builder;
 pub use builder::{DataFlowBuilder, OperatorGraphBuilder};
 

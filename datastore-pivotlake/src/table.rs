@@ -620,15 +620,19 @@ impl CatalogTable {
         let max_file_size = usize::try_from(max_output_file_size).unwrap_or(usize::MAX);
 
         // The first dataflow settles the output's layout from a sample of the
-        // input; the second merges the files and writes the result.
+        // input; the second merges the files and writes the result. Both run
+        // on one NUMA node, and each merge takes the next node in turn, so a
+        // merge leaves the other nodes to the queries and writes running
+        // beside it and no node carries every merge.
+        let dispatcher = self.dispatcher.on_next_node();
         let shredding = parquet_engine::writing::plan_compaction_shredding(
-            &self.dispatcher,
+            &dispatcher,
             &parquet,
             output_schema,
         )
         .map_err(crate::Error::Merge)?;
         let compaction = parquet_engine::writing::compact_files_spec(
-            &self.dispatcher,
+            &dispatcher,
             parquet,
             shredding.clone(),
             &merged_by,

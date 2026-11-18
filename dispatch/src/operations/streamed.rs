@@ -12,6 +12,7 @@
 //! `on_claim` callback fires each time a worker takes an item, so an async
 //! producer can sleep on its own primitive and retry when space opens up.
 
+use crate::api::BuildContext;
 use crate::operations::channels::{Receiver, RootChannelFactory};
 use crate::waker::{WakerSet, waker_set};
 use crossbeam_queue::ArrayQueue;
@@ -89,7 +90,7 @@ impl<T> Clone for ChannelSourceFactory<T> {
 
 impl<T: Send> ChannelSourceFactory<T> {
     /// Build the producer and per-worker-source halves. `wakers` must be the
-    /// worker pool's waker set, so pushes reach parked workers.
+    /// waker set of the dataflow's workers, so pushes reach the parked ones.
     pub(crate) fn new(
         capacity: usize,
         on_claim: Box<dyn Fn() + Send + Sync>,
@@ -113,7 +114,7 @@ impl<T: Send> ChannelSourceFactory<T> {
 impl<T: Send + 'static> RootChannelFactory<T> for ChannelSourceFactory<T> {
     type Receiver = ChannelSource<T>;
 
-    fn build(self) -> Self::Receiver {
+    fn build(self, _context: &BuildContext) -> Self::Receiver {
         ChannelSource {
             shared: self.shared,
         }

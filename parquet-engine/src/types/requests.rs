@@ -338,7 +338,8 @@ impl RowGroupRequest {
     /// Pair this row group's domain metadata with dispatch's resolved
     /// `response`, `None` for a request that [reads nothing](Self::reads_nothing).
     /// Runs on the claiming worker (the fetcher emits from the worker that
-    /// admitted the request), so the buffer records it as the decode owner.
+    /// admitted the request), so the buffer records it as the decode owner:
+    /// `worker` is that worker's index among the dataflow's workers.
     ///
     /// `read_ahead_charge` is what the claim counts against its worker's
     /// read-ahead budget, `None` for a row group that was expected to be in
@@ -348,6 +349,7 @@ impl RowGroupRequest {
         self,
         response: Option<ReadResponse>,
         read_ahead_charge: Option<ReadAheadCharge>,
+        worker: usize,
     ) -> RowGroupBuffer {
         let locations = response
             .map(|response| response.into_locations())
@@ -402,7 +404,7 @@ impl RowGroupRequest {
         RowGroupBuffer {
             metadata: self.metadata,
             columns,
-            worker_id: dispatch::worker::WORKER_IDX.get(),
+            worker_id: worker,
             read_ahead_charge,
         }
     }

@@ -221,7 +221,7 @@ pub fn create_for_workers<
     let hs_clone = hash_state.clone();
     let probe_gate = build_ready.clone();
     let build_factories = (0..worker_count)
-        .map(|_| {
+        .map(|worker| {
             let filter_arrays: WorkerFilterArrays = Arc::new(OnceLock::new());
             let outputter = JoinBuilder::new(
                 table.clone(),
@@ -230,6 +230,7 @@ pub fn create_for_workers<
                 build_ready.clone(),
                 remaining_jobs.clone(),
                 gather.clone(),
+                worker,
                 partitions,
                 spec.build_output_indices.clone(),
                 spec.build_filters.clone(),
@@ -424,7 +425,7 @@ where
         sender: Box<dyn Sender<RecordBatch>>,
         context: &mut BuildContext,
     ) -> OperatorGraphBuilder {
-        let (probe_tx, probe_rx) = self.probe_channel_factory.build();
+        let (probe_tx, probe_rx) = self.probe_channel_factory.build(context);
         let probe_head = self
             .probe_head
             .build(Box::new(probe_tx), context)

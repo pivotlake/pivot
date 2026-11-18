@@ -289,9 +289,10 @@ impl RootChannelFactory<QueryRowGroupMetadata> for RowGroupInjectorFactory {
 
     /// Runs on the worker thread, so the receiver can snapshot which node's
     /// queue is local to it.
-    fn build(self) -> Self::Receiver {
+    fn build(self, context: &dispatch::BuildContext) -> Self::Receiver {
         RowGroupInjector {
-            numa_node_idx: dispatch::worker::current_node(),
+            numa_node_idx: context.node(),
+            wakers: context.wakers(),
             row_group_queues: self.row_group_queues,
             queues_claimed_first: self.queues_claimed_first,
             filter: self.filter,
@@ -310,8 +311,11 @@ pub struct RowGroupInjector {
     /// throttle may have refused, or another worker may have been at the
     /// queue), so the queues themselves are asked.
     queues_claimed_first: Option<RowGroupQueues>,
-    /// Index of this worker's node's queue in `row_group_queues`.
+    /// Index of this worker's node's queue in `row_group_queues`: its node
+    /// among the nodes the dataflow runs on.
     numa_node_idx: usize,
+    /// The wakers of the dataflow's workers.
+    wakers: dispatch::waker::WakerSet,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
 }
@@ -455,7 +459,7 @@ impl RowGroupInjector {
             // to claim, and decode through, the other node's cached bytes
             // even when local workers were available.
             gate.admitted_claims.fetch_add(1, Ordering::Relaxed);
-            dispatch::waker::waker_set().notify_one_near(self.numa_node_idx);
+            self.wakers.notify_one_near(self.numa_node_idx);
         }
         ticket.transfer_to_row_group();
         Some(row_group)

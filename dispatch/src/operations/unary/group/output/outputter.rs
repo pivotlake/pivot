@@ -21,7 +21,6 @@ use crate::operations::unary::group::output::topk_pruning::{
     HashBinTotals, SharedBinTotals, TopKBounds, TopKThreshold,
 };
 use crate::operations::unary::pipeline_breaker::{OutputStatus, Outputter};
-use crate::worker::current_node;
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
@@ -122,10 +121,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         count_only: bool,
         topk_threshold: Arc<TopKThreshold>,
         shared_bin_totals: Arc<SharedBinTotals>,
+        node: usize,
     ) -> Self {
         Self {
             key_arena,
-            node: current_node(),
+            node,
             injectors,
             partition_jobs_injected,
             key_config,

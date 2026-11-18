@@ -4,7 +4,7 @@
 
 use crate::DataFile;
 use crossbeam_deque::{Injector, Steal};
-use dispatch::{Receiver, RootChannelFactory};
+use dispatch::{BuildContext, Receiver, RootChannelFactory};
 use std::sync::Arc;
 
 /// Builds a [`FileInjector`] per worker, all sharing one queue of the files.
@@ -28,7 +28,7 @@ impl FileInjectorFactory {
 impl RootChannelFactory<DataFile> for FileInjectorFactory {
     type Receiver = FileInjector;
 
-    fn build(self) -> FileInjector {
+    fn build(self, _context: &BuildContext) -> FileInjector {
         FileInjector { files: self.files }
     }
 }
@@ -134,7 +134,8 @@ mod tests {
     #[test]
     fn claiming_the_last_file_wakes_the_pool() {
         let waker = observable_waker();
-        let injector = FileInjectorFactory::new(&[data_file("a"), data_file("b")]).build();
+        let injector = FileInjectorFactory::new(&[data_file("a"), data_file("b")])
+            .build(&BuildContext::new(0));
 
         let before = waker.wake_count();
         injector.steal().expect("first file");
@@ -157,7 +158,7 @@ mod tests {
     #[test]
     fn the_eager_claim_path_also_wakes_the_pool_on_drain() {
         let waker = observable_waker();
-        let injector = FileInjectorFactory::new(&[data_file("only")]).build();
+        let injector = FileInjectorFactory::new(&[data_file("only")]).build(&BuildContext::new(0));
 
         let before = waker.wake_count();
         // `try_recv` is deliberately single-shot, so retry past a lost steal race.

@@ -37,7 +37,7 @@ use crate::operations::channels::{NodeIdOutput, Sender};
 use crate::operations::unary;
 use crate::operations::unary::order_by::{KWayMergePlan, KWayMergeTask, MergeRun, MergedOutput};
 use crate::operations::unary::pipeline_breaker::{OutputStatus, Outputter};
-use crate::waker::waker_set;
+use crate::waker::{WakerSet, waker_set};
 
 /// One unit of output-phase work.
 enum BucketTask {
@@ -55,6 +55,9 @@ pub struct SharedBuckets {
     /// worker to arrive queues the buckets' merges.
     worker_runs: GatherBarrier<(usize, Vec<Vec<SortedRun>>)>,
     tasks_by_node: Box<[Injector<BucketTask>]>,
+    /// The wakers of the dataflow's workers, to wake one on the node a task
+    /// was queued for.
+    wakers: WakerSet,
     /// Buckets not yet emitted. Starts at the bucket count, so it only
     /// reaches zero after the last worker has arrived and every bucket has
     /// either been found empty or been emitted.
@@ -62,8 +65,10 @@ pub struct SharedBuckets {
 }
 
 impl SharedBuckets {
-    pub fn new(layout: Arc<WindowLayout>, topology: Topology) -> Self {
+    /// `topology` and `wakers` are those of the dataflow's workers.
+    pub fn new(layout: Arc<WindowLayout>, topology: Topology, wakers: WakerSet) -> Self {
         Self {
+            wakers,
             worker_runs: GatherBarrier::new(topology.total_workers()),
             tasks_by_node: (0..topology.node_count).map(|_| Injector::new()).collect(),
             buckets_remaining: AtomicUsize::new(layout.bucket_count),
@@ -107,7 +112,7 @@ impl SharedBuckets {
 
     fn queue_task(&self, node_id: usize, task: BucketTask) {
         self.tasks_by_node[node_id].push(task);
-        waker_set().notify_one_near(node_id);
+        self.wakers.notify_one_near(node_id);
     }
 
     fn claim_task(&self, node_id: usize) -> Option<BucketTask> {

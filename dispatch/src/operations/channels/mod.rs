@@ -26,6 +26,7 @@
 //!   worker that owns related state (e.g. decompressed pages returning to the worker
 //!   that holds the corresponding row group decoder).
 
+use crate::api::BuildContext;
 use arrow_schema::ArrowError;
 use crossbeam_deque::Injector;
 use thiserror::Error;
@@ -68,11 +69,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// Each [`ChannelFactory`] is consumed once during the build step to create the channel
 /// endpoints. The factory itself is `Send` (shipped to worker threads), but the
-/// produced sender/receiver may not be (e.g. `Rc<Worker<T>>`).
+/// produced sender/receiver may not be (e.g. `Rc<Worker<T>>`). `context` is
+/// the build of the worker the endpoints are for, which tells them that
+/// worker's place in the dataflow.
 pub trait ChannelFactory<T>: Send {
     type Sender: Sender<T> + 'static;
     type Receiver: Receiver<T> + 'static;
-    fn build(self) -> (Self::Sender, Self::Receiver);
+    fn build(self, context: &BuildContext) -> (Self::Sender, Self::Receiver);
 }
 
 /// Factory for the root (source) operator's input channel, which has no sender.
@@ -81,7 +84,7 @@ pub trait ChannelFactory<T>: Send {
 /// queue), so only a receiver is produced.
 pub trait RootChannelFactory<T>: Send {
     type Receiver: Receiver<T> + 'static;
-    fn build(self) -> Self::Receiver;
+    fn build(self, context: &BuildContext) -> Self::Receiver;
 }
 
 /// Writing end of a channel between operators.

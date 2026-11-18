@@ -10,6 +10,7 @@
 //! a perfectly parallel job pipeline — e.g. one Parquet *page* encode per item,
 //! stolen across workers.
 
+use crate::api::BuildContext;
 use crate::operations::channels::{Receiver, RootChannelFactory, Sender};
 use crate::operations::unary::{self, Unary};
 use crate::waker::waker_set;
@@ -57,7 +58,7 @@ impl<T: Send> InjectorSourceFactory<T> {
 impl<T: Send + 'static> RootChannelFactory<T> for InjectorSourceFactory<T> {
     type Receiver = InjectorSource<T>;
 
-    fn build(self) -> Self::Receiver {
+    fn build(self, _context: &BuildContext) -> Self::Receiver {
         InjectorSource {
             items: self.items,
             remaining: self.remaining,

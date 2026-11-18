@@ -9,9 +9,11 @@
 //! other workers' receivers stay empty.
 
 use crate::Identifier;
+use crate::api::BuildContext;
 use crate::operations::channels;
-use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel_to};
+use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel};
 use crate::operations::channels::{ChannelFactory, Sender};
+use crate::waker::WakerSet;
 use std::sync::Arc;
 
 /// Factory for one worker's end of the funnel: the shared sender slice (every
@@ -26,11 +28,12 @@ impl<T: 'static + Send> ChannelFactory<T> for SingleWorkerMpscFactory<T> {
     type Sender = SingleWorkerSender<T>;
     type Receiver = MpscReceiver<T>;
 
-    fn build(self) -> (Self::Sender, Self::Receiver) {
+    fn build(self, context: &BuildContext) -> (Self::Sender, Self::Receiver) {
         (
             SingleWorkerSender {
                 senders: self.senders,
                 target: self.target,
+                wakers: context.wakers(),
             },
             self.receiver,
         )
@@ -41,11 +44,14 @@ impl<T: 'static + Send> ChannelFactory<T> for SingleWorkerMpscFactory<T> {
 pub struct SingleWorkerSender<O> {
     senders: Arc<[MpscSender<O>]>,
     target: Identifier,
+    /// Wakes the target, which may be parked.
+    wakers: WakerSet,
 }
 
 impl<O> Sender<O> for SingleWorkerSender<O> {
     fn send(&mut self, item: O) -> channels::Result<()> {
         self.senders[self.target].send_ref(item)?;
+        self.wakers.notify_worker(self.target);
         Ok(())
     }
 }
@@ -55,9 +61,7 @@ pub fn to_single_worker_mpsc<T: 'static + Send>(
     count: usize,
     target: Identifier,
 ) -> impl IntoIterator<Item = SingleWorkerMpscFactory<T>> {
-    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
-        .map(|worker| mpsc_channel_to::<T>(worker))
-        .unzip();
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count).map(|_| mpsc_channel::<T>()).unzip();
     let senders: Arc<[MpscSender<T>]> = senders.into();
 
     receivers

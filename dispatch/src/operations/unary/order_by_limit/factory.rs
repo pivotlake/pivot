@@ -48,7 +48,7 @@ impl OrderByLimitFactory {
 impl UnaryFactory<RecordBatch, RecordBatch> for OrderByLimitFactory {
     type Unary = OrderByLimit;
 
-    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<OrderByLimit> {
+    fn build_unary(self, context: &mut BuildContext) -> BuiltUnary<OrderByLimit> {
         Built::new(OrderByLimit::new(
             self.order_by,
             self.limit,
@@ -56,6 +56,7 @@ impl UnaryFactory<RecordBatch, RecordBatch> for OrderByLimitFactory {
             self.gather,
             self.boundary_slot,
             self.key_window,
+            context.worker_idx(),
         ))
     }
 }

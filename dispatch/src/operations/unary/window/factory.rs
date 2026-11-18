@@ -27,10 +27,12 @@ impl WindowFactory {
     ///
     /// `arena_buffers` is how many ring buffers an arena of partition keys
     /// may grow to, the same bound GROUP BY's key arenas are given.
+    /// `topology` and `wakers` are those of the dataflow's workers.
     pub fn create_for_workers(
         spec: WindowSpec,
         topology: Topology,
         arena_buffers: usize,
+        wakers: crate::waker::WakerSet,
     ) -> Vec<WindowFactory> {
         assert!(
             !spec.functions.is_empty(),
@@ -49,7 +51,7 @@ impl WindowFactory {
             topology.total_workers(),
             arena_buffers,
         ));
-        let shared = Arc::new(SharedBuckets::new(layout.clone(), topology));
+        let shared = Arc::new(SharedBuckets::new(layout.clone(), topology, wakers));
         (0..topology.total_workers())
             .map(|worker_id| WindowFactory {
                 layout: layout.clone(),

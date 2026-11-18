@@ -64,16 +64,17 @@ where
 
     /// Runs on the worker thread, where the receivers are built: a table
     /// scan's snapshots which node's queue is local to the worker.
-    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
+    fn build_unary(self, context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
         let (uncached_row_groups_sender, uncached_row_groups_receiver) =
-            dispatch::ChannelFactory::build(self.uncached_row_groups_channel);
+            dispatch::ChannelFactory::build(self.uncached_row_groups_channel, context);
         Built::new(RowGroupFetcher::new(
             self.projection,
             self.read_medium,
             self.reads_ahead_of_cpu_work,
-            dispatch::RootChannelFactory::build(self.io_row_groups_receiver_factory),
+            dispatch::RootChannelFactory::build(self.io_row_groups_receiver_factory, context),
             uncached_row_groups_sender,
             uncached_row_groups_receiver,
+            context.worker_idx(),
         ))
     }
 }

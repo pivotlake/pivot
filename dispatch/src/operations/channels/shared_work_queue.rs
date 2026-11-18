@@ -10,6 +10,7 @@
 //! locality. Callers should therefore reserve it for work large enough to
 //! justify those costs.
 
+use crate::api::BuildContext;
 use crate::operations::channels;
 use crate::operations::channels::{ChannelFactory, Receiver, RootChannelFactory, Sender};
 use crate::waker::worker_waker;
@@ -46,7 +47,7 @@ impl<T: Send> SharedWorkQueueChannelFactory<T> {
 impl<T: Send + 'static> RootChannelFactory<T> for SharedWorkQueueChannelFactory<T> {
     type Receiver = SharedWorkQueueReceiver<T>;
 
-    fn build(self) -> Self::Receiver {
+    fn build(self, _context: &BuildContext) -> Self::Receiver {
         SharedWorkQueueReceiver { queue: self.queue }
     }
 }
@@ -55,7 +56,7 @@ impl<T: Send + 'static> ChannelFactory<T> for SharedWorkQueueChannelFactory<T> {
     type Sender = SharedWorkQueueSender<T>;
     type Receiver = SharedWorkQueueReceiver<T>;
 
-    fn build(self) -> (Self::Sender, Self::Receiver) {
+    fn build(self, _context: &BuildContext) -> (Self::Sender, Self::Receiver) {
         (
             SharedWorkQueueSender {
                 queue: self.queue.clone(),

@@ -96,7 +96,7 @@ fn make_worker_tables(
     );
     // The test data is low-cardinality, so the worker never switches to radix:
     // `buffers` is None and the full result is in the in-place stack.
-    let out = agg.flush().0;
+    let out = agg.flush(0).0;
     assert!(out.buffers.is_none(), "low-cardinality test stays in-place");
     out.tables
 }
@@ -318,7 +318,7 @@ fn make_worker_output(
             &COUNT_CFG,
         );
     }
-    agg.flush().0
+    agg.flush(0).0
 }
 
 /// A worker with enough distinct keys to switch to radix produces scatter

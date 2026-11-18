@@ -247,6 +247,10 @@ pub struct Group<K: KeyExtractor, V: AggregationValue + ?Sized> {
     aggregated_table: AggregatedTable<K, V>,
     gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
     outputter: GroupOutputter<K, V>,
+    /// This worker's index among the dataflow's workers.
+    worker: usize,
+    /// The node this worker is on, among the nodes the dataflow runs on.
+    node: usize,
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
@@ -267,6 +271,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         topk_threshold: Arc<TopKThreshold>,
         shared_bin_totals: Arc<SharedBinTotals>,
         evictor: SharedPartitionEvictor,
+        worker: usize,
+        node: usize,
     ) -> Self {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
         let value_output_types: Arc<[DataType]> =
@@ -308,9 +314,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
                 count_only,
                 topk_threshold,
                 shared_bin_totals,
+                node,
             ),
             gather,
             aggregated_table,
+            worker,
+            node,
         }
     }
 }
@@ -341,11 +350,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
     }
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
-        let (tables, topk_bin_totals) = self.aggregated_table.flush();
+        let (tables, topk_bin_totals) = self.aggregated_table.flush(self.node);
         if let Some(totals) = topk_bin_totals {
             self.outputter.add_bin_totals(totals);
         }
-        self.gather.arrive(tables, |values| {
+        self.gather.arrive_at(self.worker, tables, |values| {
             self.outputter.create_partition_jobs(values)
         });
         Ok(Some(self.outputter))
@@ -548,7 +557,8 @@ mod tests {
             .collect();
         let groups: Vec<_> = evictors
             .iter()
-            .map(|evictor| {
+            .enumerate()
+            .map(|(worker, evictor)| {
                 Group::<K, V>::new(
                     key_arena.clone(),
                     value_arena.clone(),
@@ -565,6 +575,8 @@ mod tests {
                     topk_threshold.clone(),
                     shared_bin_totals.clone(),
                     evictor.clone(),
+                    worker,
+                    0,
                 )
             })
             .collect();
@@ -903,7 +915,7 @@ mod tests {
         let topk_threshold = Arc::new(TopKThreshold::for_limit(None));
         let shared_bin_totals = Arc::new(SharedBinTotals::new(1));
         let groups: Vec<_> = (0..worker_count)
-            .map(|_| {
+            .map(|worker| {
                 Group::<RowKeyExtractor, V>::new(
                     key_arena.clone(),
                     value_arena.clone(),
@@ -922,6 +934,8 @@ mod tests {
                     std::rc::Rc::new(std::cell::RefCell::new(
                         crate::memory::PartitionEvictor::new(),
                     )),
+                    worker,
+                    0,
                 )
             })
             .collect();

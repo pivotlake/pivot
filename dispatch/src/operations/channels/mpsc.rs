@@ -8,7 +8,6 @@
 
 use crate::operations::channels;
 use crate::operations::channels::{Receiver, Sender};
-use crate::waker::waker_set;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -18,12 +17,6 @@ use std::sync::mpsc::channel;
 pub struct MpscSender<T> {
     inner: mpsc::Sender<T>,
     count: Arc<AtomicUsize>,
-    /// The global index of the worker that reads this channel, when the reader
-    /// is a worker: each send wakes that worker's node so a parked receiver
-    /// (possibly on another NUMA node than the sender) picks the item up.
-    /// `None` when the receiver is not a worker (the final output channel,
-    /// whose consumer blocks on the inner mpsc directly).
-    receiving_worker: Option<usize>,
 }
 
 impl<T> Clone for MpscSender<T> {
@@ -31,7 +24,6 @@ impl<T> Clone for MpscSender<T> {
         Self {
             inner: self.inner.clone(),
             count: self.count.clone(),
-            receiving_worker: self.receiving_worker,
         }
     }
 }
@@ -40,6 +32,9 @@ impl<T> MpscSender<T> {
     /// Send without requiring `&mut`, for callers that route through a shared
     /// sender slice (see `return_to_worker`). The inner mpsc sender is `&self`
     /// already; the [`Sender`] trait's `&mut` is just its calling convention.
+    ///
+    /// Nobody is woken. A channel whose receiver is a worker, which may be
+    /// parked, wakes that worker after the send.
     pub fn send_ref(&self, item: T) -> channels::Result<()> {
         self.inner
             .send(item)
@@ -50,13 +45,6 @@ impl<T> MpscSender<T> {
         // corresponding inner.send is guaranteed to have completed, so
         // `try_recv` will find the item.
         self.count.fetch_add(1, Ordering::Release);
-        // Wake the receiving worker (which may be parked) so it picks up the
-        // freshly-sent item. `return_to_worker` routes cross-worker messages
-        // through this channel, so without a notify the target worker can sit
-        // parked while its mpsc has work waiting.
-        if let Some(worker) = self.receiving_worker {
-            waker_set().notify_worker(worker);
-        }
         Ok(())
     }
 }
@@ -114,8 +102,9 @@ impl<O> Receiver<O> for MpscReceiver<O> {
     }
 }
 
-/// An mpsc channel whose receiver is not a worker (e.g. the final output
-/// channel drained by the query's caller): sends bump the count but wake nobody.
+/// An mpsc channel whose sends bump the count but wake nobody, as suits a
+/// receiver that is not a worker (e.g. the final output channel drained by
+/// the query's caller).
 pub fn mpsc_channel<T>() -> (MpscSender<T>, MpscReceiver<T>) {
     let (tx, rx) = channel();
     let count = Arc::new(AtomicUsize::default());
@@ -123,21 +112,7 @@ pub fn mpsc_channel<T>() -> (MpscSender<T>, MpscReceiver<T>) {
         MpscSender {
             inner: tx,
             count: count.clone(),
-            receiving_worker: None,
         },
         MpscReceiver { inner: rx, count },
-    )
-}
-
-/// Build an mpsc channel read by the worker with global index
-/// `receiving_worker`; every send wakes that worker's node.
-pub fn mpsc_channel_to<T>(receiving_worker: usize) -> (MpscSender<T>, MpscReceiver<T>) {
-    let (tx, rx) = mpsc_channel();
-    (
-        MpscSender {
-            receiving_worker: Some(receiving_worker),
-            ..tx
-        },
-        rx,
     )
 }

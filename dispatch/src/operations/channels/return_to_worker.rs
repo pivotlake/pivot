@@ -9,9 +9,11 @@
 //! only messages destined for it.
 
 use crate::Identifier;
+use crate::api::BuildContext;
 use crate::operations::channels;
-use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel_to};
+use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel};
 use crate::operations::channels::{ChannelFactory, Sender};
+use crate::waker::WakerSet;
 use std::sync::Arc;
 
 /// Factory for building a return-to-worker channel.
@@ -27,12 +29,16 @@ impl<T: 'static + Send + WorkerIdOutput> ChannelFactory<T> for ReturnToWorkerMps
     type Sender = WorkerAwareSender<T>;
     type Receiver = MpscReceiver<T>;
 
-    fn build(self) -> (Self::Sender, Self::Receiver) {
-        (WorkerAwareSender::new(self.senders), self.receiver)
+    fn build(self, context: &BuildContext) -> (Self::Sender, Self::Receiver) {
+        (
+            WorkerAwareSender::new(self.senders, context.wakers()),
+            self.receiver,
+        )
     }
 }
 
-/// Implemented by message types that know which worker they belong to.
+/// Implemented by message types that know which worker they belong to, as
+/// its index among the dataflow's workers.
 pub trait WorkerIdOutput: 'static {
     fn worker_id(&self) -> Identifier;
 }
@@ -41,11 +47,13 @@ pub trait WorkerIdOutput: 'static {
 /// based on [`WorkerIdOutput::worker_id`].
 pub struct WorkerAwareSender<O> {
     senders: Arc<[MpscSender<O>]>,
+    /// Wakes the worker a message was routed to, which may be parked.
+    wakers: WakerSet,
 }
 
 impl<O> WorkerAwareSender<O> {
-    pub fn new(senders: Arc<[MpscSender<O>]>) -> Self {
-        Self { senders }
+    pub fn new(senders: Arc<[MpscSender<O>]>, wakers: WakerSet) -> Self {
+        Self { senders, wakers }
     }
 }
 
@@ -53,6 +61,7 @@ impl<O: WorkerIdOutput> Sender<O> for WorkerAwareSender<O> {
     fn send(&mut self, item: O) -> channels::Result<()> {
         let worker_idx = item.worker_id();
         self.senders[worker_idx].send_ref(item)?;
+        self.wakers.notify_worker(worker_idx);
         Ok(())
     }
 }
@@ -64,9 +73,7 @@ impl<O: WorkerIdOutput> Sender<O> for WorkerAwareSender<O> {
 pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(
     count: usize,
 ) -> impl IntoIterator<Item = ReturnToWorkerMpscFactory<T>> {
-    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
-        .map(|worker| mpsc_channel_to::<T>(worker))
-        .unzip();
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count).map(|_| mpsc_channel::<T>()).unzip();
     let senders: Arc<[MpscSender<T>]> = senders.into();
 
     receivers

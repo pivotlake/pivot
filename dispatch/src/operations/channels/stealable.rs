@@ -16,6 +16,7 @@
 //! return it to the worker that sent out, since it needs to be sent to the Decoder of that row group.
 //! Therefore it should *not* be in a stealable channel (but in `return_to_worker`)
 
+use crate::api::BuildContext;
 use crate::numa::Topology;
 use crate::operations::channels;
 use crate::operations::channels::{ChannelFactory, Receiver, Sender};
@@ -39,7 +40,7 @@ impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
     type Sender = Rc<Worker<T>>;
     type Receiver = StealableReceiver<T>;
 
-    fn build(self) -> (Rc<Worker<T>>, StealableReceiver<T>) {
+    fn build(self, _context: &BuildContext) -> (Rc<Worker<T>>, StealableReceiver<T>) {
         let worker = Rc::new(self.worker);
         (
             worker.clone(),
@@ -175,7 +176,7 @@ mod tests {
             node_count: 2,
         })
         .into_iter()
-        .map(ChannelFactory::build)
+        .map(|factory| factory.build(&BuildContext::new(0)))
         .collect()
     }
 
@@ -196,7 +197,7 @@ mod tests {
             node_count: 1,
         })
         .into_iter()
-        .map(ChannelFactory::build)
+        .map(|factory| factory.build(&BuildContext::new(0)))
         .collect();
         endpoints[0].0.send(1).unwrap();
         endpoints[0].0.send(2).unwrap();

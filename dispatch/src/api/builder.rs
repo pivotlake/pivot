@@ -1,5 +1,5 @@
 use crate::Identifier;
-use crate::api::BuildContext;
+use crate::api::{BuildContext, Placement};
 use crate::data_flow::DataFlow;
 use crate::memory::Evict;
 use crate::operations::Operator;
@@ -167,6 +167,8 @@ impl OperatorGraphBuilder {
 /// one per worker. The worker calls [`build`](DataFlowBuilder::build) to produce a `DataFlow`,
 /// which triggers the recursive factory build chain on the worker thread.
 pub struct DataFlowBuilder {
+    /// The place in the dataflow of the worker this builder is sent to.
+    placement: Placement,
     /// A flag shared across all workers (and the DataFlowHandle) on whether to cancel this query
     cancelled: Arc<AtomicBool>,
     /// A sender for errors that may occur during running
@@ -187,12 +189,14 @@ pub struct DataFlowBuilder {
 impl DataFlowBuilder {
     pub fn new(
         build: Box<dyn FnOnce(&mut BuildContext) -> OperatorGraphBuilder + Send>,
+        placement: Placement,
         cancelled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<crate::data_flow::Error>,
         stats_tx: mpsc::Sender<DataFlowStats>,
         collect_stats: bool,
     ) -> Self {
         Self {
+            placement,
             cancelled,
             err_tx,
             stats_tx,
@@ -217,7 +221,7 @@ impl DataFlowBuilder {
         // The id is chosen before any operator exists, so operators can learn it
         // from the context while they are being built.
         let dataflow_id = next_dataflow_id();
-        let mut context = BuildContext::new(dataflow_id);
+        let mut context = BuildContext::placed(dataflow_id, self.placement);
         let graph = match catch_unwind(AssertUnwindSafe(|| (self.build)(&mut context))) {
             Ok(graph) => graph,
             Err(e) => {

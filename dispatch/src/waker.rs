@@ -376,6 +376,12 @@ impl WakerSet {
         }
     }
 
+    /// The set of `node`'s workers alone, numbered from zero as that node
+    /// numbers them, for a dataflow that runs on that node only.
+    pub fn of_node(&self, node: usize) -> Self {
+        Self::new(vec![self.node_wakers[node].clone()], self.workers_per_node)
+    }
+
     pub(crate) fn workers_per_node(&self) -> usize {
         self.workers_per_node
     }
@@ -384,13 +390,19 @@ impl WakerSet {
         self.node_wakers.len() * self.workers_per_node
     }
 
-    /// Whether `other` wakes the same workers, i.e. both sets came from the
-    /// same worker pool.
+    /// Whether `other` wakes the same workers under the same numbers: both
+    /// are a pool's whole set, or both are the set of the same node of it.
     pub fn wakes_same_pool(&self, other: &WakerSet) -> bool {
-        Arc::ptr_eq(&self.node_wakers, &other.node_wakers)
+        self.node_wakers.len() == other.node_wakers.len()
+            && self
+                .node_wakers
+                .iter()
+                .zip(other.node_wakers.iter())
+                .all(|(ours, theirs)| Arc::ptr_eq(ours, theirs))
     }
 
-    /// Wake `worker`, expressed as a global worker index, if it is parked.
+    /// Wake `worker`, expressed as its index among this set's workers, if it
+    /// is parked.
     pub fn notify_worker(&self, worker: usize) {
         self.node_wakers[worker / self.workers_per_node]
             .notify_slot(worker % self.workers_per_node);

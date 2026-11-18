@@ -1,6 +1,7 @@
 //! A shared work queue for each NUMA node.
 //!
-//! Every message names its preferred node. Producers route directly to that
+//! Every message names its preferred node, among the nodes the dataflow runs
+//! on. Producers route directly to that
 //! node's queue, and workers only poll the queue for their own node. This keeps
 //! memory-heavy work near its input while still balancing it across all local
 //! workers.
@@ -10,7 +11,8 @@ use std::sync::Arc;
 use crossbeam_deque::{Injector, Steal};
 
 use crate::Topology;
-use crate::waker::waker_set;
+use crate::api::BuildContext;
+use crate::waker::WakerSet;
 
 use super::{ChannelFactory, Receiver, Result, Sender};
 
@@ -28,10 +30,11 @@ impl<T: NodeIdOutput + Send + 'static> ChannelFactory<T> for NodeWorkQueueChanne
     type Sender = NodeWorkQueueSender<T>;
     type Receiver = NodeWorkQueueReceiver<T>;
 
-    fn build(self) -> (Self::Sender, Self::Receiver) {
+    fn build(self, context: &BuildContext) -> (Self::Sender, Self::Receiver) {
         (
             NodeWorkQueueSender {
                 queues: self.queues.clone(),
+                wakers: context.wakers(),
             },
             NodeWorkQueueReceiver {
                 queues: self.queues,
@@ -43,6 +46,8 @@ impl<T: NodeIdOutput + Send + 'static> ChannelFactory<T> for NodeWorkQueueChanne
 
 pub struct NodeWorkQueueSender<T> {
     queues: Arc<[Injector<T>]>,
+    /// Wakes a worker of the node a message was queued for.
+    wakers: WakerSet,
 }
 
 impl<T: NodeIdOutput> Sender<T> for NodeWorkQueueSender<T> {
@@ -53,7 +58,7 @@ impl<T: NodeIdOutput> Sender<T> for NodeWorkQueueSender<T> {
             .get(node_id)
             .unwrap_or_else(|| panic!("NUMA node {node_id} is outside the worker topology"));
         queue.push(item);
-        waker_set().notify_one_near(node_id);
+        self.wakers.notify_one_near(node_id);
         Ok(())
     }
 }
@@ -117,7 +122,7 @@ mod tests {
         init_waker_set(WakerSet::new(wakers, 1));
         let mut endpoints: Vec<_> = node_work_queue(topology)
             .into_iter()
-            .map(ChannelFactory::build)
+            .map(|factory| factory.build(&BuildContext::new(0)))
             .collect();
 
         endpoints[0].0.send(Work(1)).unwrap();

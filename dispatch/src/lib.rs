@@ -207,6 +207,9 @@ pub struct DataFlowDispatcher {
     /// refresh and compaction loops) observe that the pool is tearing down and
     /// stop, without the pool having to hand out its `Shutdown`.
     shutdown_flag: Arc<AtomicBool>,
+    /// Shared by every clone so successive single-node handles (see
+    /// [`on_next_node`](Self::on_next_node)) take the pool's nodes in turn.
+    next_node: Arc<AtomicUsize>,
     /// Whether every dataflow launched through this handle is marked profiled.
     /// Set only on a per-query clone (see [`with_profiling`](Self::with_profiling))
     /// so profiling (and the exclusive execution it triggers) is scoped to one
@@ -239,25 +242,26 @@ impl DataFlowDispatcher {
         self.waker_set.clone()
     }
 
-    /// Dispatch one pre-built `DataFlow` bundle across the node groups.
-    /// Builder `i` goes to global worker `i` (node `i / workers_per_node`). A
-    /// full bundle has one builder per worker; a shorter one reaches only the
-    /// first workers, consistent with the dense `0..builder_count` indexing its
-    /// channels were built for. Returns the wakers of every node, so cancellation
-    /// can wake parked workers on any node.
+    /// Dispatch one pre-built `DataFlow` bundle to this dispatcher's workers.
+    /// Builder `i` goes to worker `i` of them (on their node
+    /// `i / workers_per_node`). A full bundle has one builder per worker; a
+    /// shorter one reaches only the first workers, consistent with the dense
+    /// `0..builder_count` indexing its channels were built for. Returns the
+    /// wakers of those workers, so cancellation can wake the parked ones.
     pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) -> WakerSet {
         for (worker, builder) in builders.into_iter().enumerate() {
             self.senders[worker].send(builder).unwrap();
         }
-        // Wake idle workers on every node so they pick up the new dataflow
-        // without waiting out their park.
+        // Wake the idle workers so they pick up the new dataflow without
+        // waiting out their park.
         self.waker_set.notify_all_delegated();
         self.waker_set.clone()
     }
 
-    /// The total worker count across all node groups. Every dataflow's
-    /// operator chain is built at this size, since a dataflow runs on every
-    /// worker.
+    /// How many workers this dispatcher reaches: every worker of the pool,
+    /// or those of one node (see [`on_next_node`](Self::on_next_node)). A
+    /// dataflow's operator chain is built at this size, since the dataflow
+    /// runs on every one of them.
     pub fn worker_count(&self) -> usize {
         self.topology.total_workers()
     }
@@ -265,6 +269,31 @@ impl DataFlowDispatcher {
     /// Choose the next worker for a stage that needs one arbitrary host.
     pub fn next_worker(&self) -> usize {
         self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_count()
+    }
+
+    /// Return a dispatcher over the workers of one NUMA node alone: a
+    /// dataflow launched through it is built and run only by them, so the
+    /// memory it touches stays on the node. Successive calls, on any clone,
+    /// take the pool's nodes in turn. For long maintenance work such as a
+    /// compaction, which then leaves the other nodes' workers and memory to
+    /// the queries running beside it.
+    ///
+    /// To the dataflows launched through it the node is the whole pool: its
+    /// workers are numbered from zero, on one node. A worker learns its
+    /// place in the dataflow it is building from the
+    /// [`BuildContext`](crate::api::BuildContext).
+    pub fn on_next_node(&self) -> Self {
+        let node = self.next_node.fetch_add(1, Ordering::Relaxed) % self.topology.node_count;
+        let node_workers = self
+            .topology
+            .node_siblings(node * self.topology.workers_per_node);
+        Self {
+            senders: self.senders[node_workers].to_vec(),
+            topology: numa::Topology::single_node(self.topology.workers_per_node),
+            waker_set: self.waker_set.of_node(node),
+            buffers: self.buffers / self.topology.node_count,
+            ..self.clone()
+        }
     }
 
     /// The worker/node shape of the pool, for code that partitions per-worker
@@ -381,6 +410,20 @@ impl Dispatch {
         Self::spin_up_groups(groups, buffers, disk_cache, spill_directory)
     }
 
+    /// Spawn `node_count` node groups of `workers_per_node` workers each,
+    /// whatever nodes the machine has, for tests of work that is laid out by
+    /// node. Every worker is pinned to the machine's first core.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn spin_up_synthetic_nodes(
+        node_count: usize,
+        workers_per_node: usize,
+        buffers: usize,
+    ) -> Self {
+        let core = core_affinity::get_core_ids().unwrap()[0];
+        let core_groups = vec![vec![core; workers_per_node]; node_count];
+        Self::spin_up_groups(core_groups, buffers, None, None)
+    }
+
     /// Spawn one worker group per entry in `core_groups` (every group must be the
     /// same length). The total ring budget `buffers` is divided evenly across the
     /// groups' regions. Shared by the public constructors and tests that inject
@@ -467,6 +510,7 @@ impl Dispatch {
                 buffers: layout.total_slots(),
                 next_worker: Arc::new(AtomicUsize::new(0)),
                 shutdown_flag: should_exit.clone(),
+                next_node: Arc::new(AtomicUsize::new(0)),
                 #[cfg(feature = "perf")]
                 profiled: false,
             },
@@ -515,18 +559,9 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Mutex;
 
-    /// Build `node_count` groups of `workers_per_node` workers from real core ids,
-    /// duplicating the first core so the test runs on any machine.
-    fn synthetic_groups(node_count: usize, workers_per_node: usize) -> Vec<Vec<CoreId>> {
-        let core = core_affinity::get_core_ids().unwrap()[0];
-        (0..node_count)
-            .map(|_| vec![core; workers_per_node])
-            .collect()
-    }
-
     #[test]
     fn a_dataflow_spans_every_node_group() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, None);
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 16);
 
         let nodes = dispatch
             .dispatcher()
@@ -543,7 +578,7 @@ mod tests {
 
     #[test]
     fn all_node_groups_share_one_ring() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, None);
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 16);
 
         let rings = dispatch
             .dispatcher()
@@ -555,7 +590,7 @@ mod tests {
 
     #[test]
     fn workers_carry_dense_global_indices() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, None);
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 16);
 
         let mut indices = dispatch
             .dispatcher()
@@ -568,7 +603,7 @@ mod tests {
 
     #[test]
     fn single_worker_hosts_rotate_across_dispatcher_clones() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(1, 3), 16, None, None);
+        let dispatch = Dispatch::spin_up_synthetic_nodes(1, 3, 16);
         let first_handle = dispatch.dispatcher().clone();
         let second_handle = first_handle.clone();
 
@@ -580,20 +615,79 @@ mod tests {
         dispatch.exit();
     }
 
+    /// The nodes whose workers handled the items of a dataflow launched
+    /// through `dispatcher`.
+    fn collect_working_nodes(dispatcher: &DataFlowDispatcher) -> HashSet<usize> {
+        values_input(dispatcher, 0..1000)
+            .map_each(|_: i32| Ok(crate::worker::current_node()))
+            .collect()
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
     #[test]
-    fn group_by_merges_correctly_across_node_groups() {
+    fn confined_dataflows_each_work_on_one_node_and_take_the_nodes_in_turn() {
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 16);
+        let dispatcher = dispatch.dispatcher();
+
+        let nodes_of_each: Vec<HashSet<usize>> = (0..3)
+            .map(|_| collect_working_nodes(&dispatcher.on_next_node()))
+            .collect();
+
+        assert_eq!(
+            nodes_of_each,
+            vec![HashSet::from([0]), HashSet::from([1]), HashSet::from([0])]
+        );
+        dispatch.exit();
+    }
+
+    #[test]
+    fn a_single_node_handle_reaches_only_the_workers_of_its_node() {
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 16);
+        let dispatcher = dispatch.dispatcher();
+        let _on_first_node = dispatcher.on_next_node();
+
+        let mut workers = dispatcher
+            .on_next_node()
+            .run_on_workers(|| crate::worker::WORKER_IDX.get());
+
+        workers.sort();
+        assert_eq!(workers, vec![2, 3]);
+        dispatch.exit();
+    }
+
+    #[test]
+    fn a_message_for_a_worker_of_a_single_node_dataflow_reaches_that_worker() {
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 16);
+        let dispatcher = dispatch.dispatcher();
+        let _on_first_node = dispatcher.on_next_node();
+        let on_second_node = dispatcher.on_next_node();
+
+        let receivers = values_input(&on_second_node, 0..100)
+            .chain(
+                to_single_worker_mpsc::<i32>(2, 1).into_iter().collect(),
+                (0..2)
+                    .map(|_| MapFactory(|_: i32| Ok(crate::worker::WORKER_IDX.get())))
+                    .collect(),
+            )
+            .collect()
+            .unwrap();
+
+        assert_eq!(receivers, vec![3; 100]);
+        dispatch.exit();
+    }
+
+    /// Count the rows of each of 100 keys, every one of which is in each of
+    /// 8 batches, in a dataflow launched through `dispatcher`. Returns each
+    /// key with its count, in key order.
+    fn count_rows_per_key(dispatcher: &DataFlowDispatcher) -> Vec<(i32, i64)> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::{Int32Type, Int64Type};
         use arrow_array::{ArrayRef, Int32Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema};
 
-        // Enough ring slots per node region for the group-by's arenas, slab
-        // tables, and merge targets.
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 256, None, None);
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
-        // Every key appears once per batch, so each of the 8 batches contributes
-        // to every group and the per-node aggregated tables must merge across
-        // nodes to produce the right counts.
         let batches: Vec<RecordBatch> = (0..8)
             .map(|_| {
                 let keys: ArrayRef = Arc::new(Int32Array::from((0..100).collect::<Vec<_>>()));
@@ -601,7 +695,7 @@ mod tests {
             })
             .collect();
 
-        let results = values_input(dispatch.dispatcher(), batches)
+        let results = values_input(dispatcher, batches)
             .record_batches()
             .group_by_aggregate::<IntKeyExtractor<Int32Type>, Compiled<(CountSlot,), u8>>(
                 vec![0],
@@ -627,17 +721,77 @@ mod tests {
             })
             .collect();
         counts.sort();
-        assert_eq!(counts.len(), 100, "one row per group");
-        assert!(
-            counts.iter().all(|&(_, c)| c == 8),
-            "every key seen 8 times"
-        );
+        counts
+    }
+
+    #[test]
+    fn group_by_merges_correctly_across_node_groups() {
+        // Enough ring slots per node region for the group-by's arenas, slab
+        // tables, and merge targets. Each batch holds every key, so the
+        // per-node aggregated tables must merge across nodes to produce the
+        // right counts.
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 256);
+
+        let counts = count_rows_per_key(dispatch.dispatcher());
+
+        assert_eq!(counts, (0..100).map(|key| (key, 8)).collect::<Vec<_>>());
+        dispatch.exit();
+    }
+
+    #[test]
+    fn a_group_by_on_the_second_node_counts_every_row() {
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 512);
+        let dispatcher = dispatch.dispatcher();
+        let _on_first_node = dispatcher.on_next_node();
+
+        let counts = count_rows_per_key(&dispatcher.on_next_node());
+
+        assert_eq!(counts, (0..100).map(|key| (key, 8)).collect::<Vec<_>>());
+        dispatch.exit();
+    }
+
+    #[test]
+    fn an_order_by_on_the_second_node_sorts_every_row() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 512);
+        let dispatcher = dispatch.dispatcher();
+        let _on_first_node = dispatcher.on_next_node();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|batch| {
+                let keys: ArrayRef = Arc::new(Int32Array::from_iter_values(
+                    (0..100).map(|i| 8 * i + batch),
+                ));
+                RecordBatch::try_new(schema.clone(), vec![keys]).unwrap()
+            })
+            .collect();
+
+        let sorted: Vec<i32> = values_input(&dispatcher.on_next_node(), batches)
+            .record_batches()
+            .order_by(vec![OrderBy::new(0, false, false)])
+            .collect()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+
+        assert_eq!(sorted, (0..800).collect::<Vec<_>>());
         dispatch.exit();
     }
 
     #[test]
     fn channel_input_streams_items_fed_while_the_flow_runs() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, None);
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 16);
         let claimed = Arc::new((Mutex::new(()), std::sync::Condvar::new()));
         let on_claim = {
             let claimed = claimed.clone();
@@ -677,7 +831,7 @@ mod tests {
 
     #[test]
     fn run_on_workers_reaches_every_worker() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, None);
+        let dispatch = Dispatch::spin_up_synthetic_nodes(2, 2, 16);
         let seen = Arc::new(Mutex::new(HashSet::new()));
 
         let collector = seen.clone();
