@@ -5,7 +5,7 @@
 //! a variant column's documents into typed leaves is the heaviest step of a
 //! write, so the shredder does not take such a column in one call. It holds
 //! one column at a time and advances a cursor over its rows, shredding and
-//! converting at most [`RECORD_BATCH_SIZE`] rows to Parquet leaves per worker
+//! converting at most [`SHRED_STEP_ROWS`] rows to Parquet leaves per worker
 //! turn. Between turns the worker serves its other dataflows, and the columns
 //! still queued stay available for peer workers to steal. Once the cursor
 //! reaches the end, the column's leaves go out as one [`LeafChunkJob`] each.
@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use arrow_array::{Array, ArrayRef};
 use dispatch::arrays::take_chunked;
 use dispatch::memory::SlabAllocator;
-use dispatch::{DefaultUnaryFactory, RECORD_BATCH_SIZE, Sender, Unary, UnaryResult, WorkStatus};
+use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult, WorkStatus};
 use parquet_variant_compute::VariantArray;
 
 use super::error::WriteResult;
@@ -44,6 +44,17 @@ pub(super) type ShredderFactory = DefaultUnaryFactory<Shredder>;
 pub(super) fn factories(worker_count: usize) -> Vec<ShredderFactory> {
     DefaultUnaryFactory::create_for_workers(worker_count)
 }
+
+/// How many rows of a column one turn shreds. Folding a variant row back and
+/// shredding it again takes several microseconds, and a worker takes no
+/// other work during a turn: every dataflow that shares the worker waits for
+/// it. A turn of this many rows stays within a few milliseconds.
+const SHRED_STEP_ROWS: usize = 512;
+
+/// How many rows one copy into output order takes, of a column that is only
+/// copied and split into its leaves. Copying a row is far cheaper than
+/// shredding it.
+const GATHER_STEP_ROWS: usize = dispatch::RECORD_BATCH_SIZE;
 
 #[derive(Default)]
 pub(super) struct Shredder {
@@ -105,7 +116,7 @@ impl Shredder {
         mut column: HeldColumn,
         sender: &mut dyn Sender<LeafChunkJob>,
     ) -> UnaryResult<()> {
-        column.convert_next_slice(RECORD_BATCH_SIZE, &mut self.allocator)?;
+        column.convert_next_slice(SHRED_STEP_ROWS, &mut self.allocator)?;
         if !column.is_exhausted() {
             self.held = Some(column);
             return Ok(());
@@ -242,7 +253,7 @@ impl HeldColumn {
             Some(gather) => {
                 let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
                 let row_sources = &gather.row_sources()[self.rows_gathered..];
-                let rows = row_sources.len().min(row_cap).min(RECORD_BATCH_SIZE);
+                let rows = row_sources.len().min(row_cap).min(GATHER_STEP_ROWS);
                 self.rows_gathered += rows;
                 if self.arrived_shredded {
                     Self::gather_unshredded(allocator, &self.job.batches, &row_sources[..rows])?
@@ -518,7 +529,7 @@ mod tests {
     fn a_wide_shredded_batch_is_stepped_in_record_batch_sized_slices() {
         let mut shredder = Shredder::default();
         let mut sender = CollectSender::new();
-        let rows = 2 * RECORD_BATCH_SIZE + 1;
+        let rows = 2 * SHRED_STEP_ROWS + 1;
         let job = shredded_variant_job(vec![documents(0..rows as i64)]);
 
         let turns = drive(&mut shredder, job, &mut sender);

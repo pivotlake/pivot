@@ -63,6 +63,7 @@ fn read_selection(
         values_input(dispatch.dispatcher(), vec![request]),
         table,
         projection,
+        dispatch::RECORD_BATCH_SIZE,
         false,
     )
     .record_batches()
@@ -319,6 +320,7 @@ fn two_reads_of_one_row_group_in_one_dataflow_return_the_rows_of_each() {
         values_input(dispatch.dispatcher(), requests),
         &table,
         Projection::columns([0, 1]),
+        dispatch::RECORD_BATCH_SIZE,
         false,
     )
     .record_batches()

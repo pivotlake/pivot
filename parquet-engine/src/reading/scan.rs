@@ -134,6 +134,7 @@ pub fn fetch_row_groups<OF>(
     requests: OperatorSpec<QueryRowGroupMetadata, OF>,
     table: &ParquetTable,
     projection: Projection,
+    batch_size: usize,
     add_row_group_metadata: bool,
 ) -> OperatorSpec<RecordBatch, impl OperatorFactory<RecordBatch> + use<OF> + 'static>
 where
@@ -143,7 +144,7 @@ where
     read_parquet(
         buffers,
         projection,
-        RECORD_BATCH_SIZE,
+        batch_size,
         add_row_group_metadata,
         Arc::new(Vec::new()),
         // Row groups are claimed by explicit request, not by the injector,

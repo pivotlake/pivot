@@ -184,6 +184,12 @@ pub fn encode_record_batches_spec(
 /// How many input row groups a compaction's shredding plan reads.
 const PLAN_SAMPLE_ROW_GROUPS: usize = 8;
 
+/// How many rows a batch of the sample holds. A batch is folded back to
+/// plain variants in one call, which takes several microseconds a row and
+/// keeps its worker from every other dataflow meanwhile, so the batches are
+/// small.
+const PLAN_SAMPLE_BATCH_ROWS: usize = 512;
+
 /// Plan the shredding of a compaction's output before the merge writes its
 /// first row group. Only variant columns are shredded, so a table without
 /// any reads nothing. Otherwise the plan comes from the variant columns of a
@@ -219,8 +225,13 @@ pub fn plan_compaction_shredding(
         })
         .collect();
     let projection = crate::types::projection::Projection::columns(variant_columns.clone());
-    let sample =
-        crate::fetch_row_groups(values_input(dispatcher, requests), table, projection, false);
+    let sample = crate::fetch_row_groups(
+        values_input(dispatcher, requests),
+        table,
+        projection,
+        PLAN_SAMPLE_BATCH_ROWS,
+        false,
+    );
     let batches = unshred_batches_spec(sample.record_batches()).collect()?;
     let shredding = shredding::plan_shredding_from_sample(schema, &variant_columns, &batches)
         .map_err(|error| {
