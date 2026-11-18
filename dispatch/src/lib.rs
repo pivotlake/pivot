@@ -629,6 +629,73 @@ mod tests {
     }
 
     #[test]
+    fn a_window_numbers_partitions_whose_rows_span_node_groups() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        // Enough rows for every worker of both groups to hold several runs of
+        // every bucket, so each bucket's merge reads runs from both groups.
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 256, None, None);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("team", DataType::Int64, false),
+            Field::new("score", DataType::Int64, false),
+        ]));
+        let (team_count, rows_per_team) = (40i64, 15_000i64);
+        let row_count = team_count * rows_per_team;
+        let batches: Vec<RecordBatch> = (0..row_count)
+            .collect::<Vec<i64>>()
+            .chunks(4_096)
+            .map(|rows| {
+                let teams: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    rows.iter().map(|row| row % team_count),
+                ));
+                // Distinct scores within a team, in an order unrelated to
+                // the order the rows arrive in.
+                let scores: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    rows.iter().map(|row| (row * 7_919) % 1_000_003),
+                ));
+                RecordBatch::try_new(schema.clone(), vec![teams, scores]).unwrap()
+            })
+            .collect();
+
+        let results = values_input(dispatch.dispatcher(), batches)
+            .record_batches()
+            .window(WindowSpec {
+                partition_by: vec![0],
+                order_by: vec![OrderBy::new(1, false, false)],
+                functions: vec![WindowFunction::RowNumber],
+                row_limit: None,
+            })
+            .collect()
+            .unwrap();
+
+        let mut numbered: Vec<(i64, i64, i64)> = results
+            .iter()
+            .flat_map(|batch| {
+                let teams = batch.column(0).as_primitive::<Int64Type>();
+                let scores = batch.column(1).as_primitive::<Int64Type>();
+                let row_numbers = batch.column(2).as_primitive::<Int64Type>();
+                (0..batch.num_rows())
+                    .map(|row| (teams.value(row), scores.value(row), row_numbers.value(row)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        numbered.sort();
+        assert_eq!(numbered.len() as i64, row_count);
+        assert!(
+            numbered
+                .iter()
+                .enumerate()
+                .all(|(position, &(_, _, row_number))| row_number
+                    == position as i64 % rows_per_team + 1),
+            "each team's rows are numbered from 1 in score order"
+        );
+        dispatch.exit();
+    }
+
+    #[test]
     fn channel_input_streams_items_fed_while_the_flow_runs() {
         let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, None);
         let claimed = Arc::new((Mutex::new(()), std::sync::Condvar::new()));
