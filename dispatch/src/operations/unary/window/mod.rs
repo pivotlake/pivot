@@ -16,7 +16,8 @@
 //!                │  RecordBatch (channel from the operator below)
 //!                ▼
 //!    ┌───────────────────────┐   CONSUME, on every worker:
-//!    │ WindowConsumer        │   1. hash partition keys, note each row's bucket
+//!    │ WindowConsumer        │   1. hash partition keys, copy each batch so a
+//!    │                       │      bucket's rows are next to each other
 //!    │                       │   2. once enough rows are pending, sort each
 //!    │                       │      bucket's rows into a run
 //!    │                       │   3. with a row limit, drop rows that cannot pass
@@ -104,9 +105,13 @@ pub struct WindowRowLimit {
 }
 
 /// Rows a worker buffers per bucket, on average, before it sorts them into
-/// runs. Sorting a full batch at a time keeps runs long, and long runs keep
-/// the number of runs a bucket's merge has to combine small.
-const PENDING_ROWS_PER_BUCKET: usize = RECORD_BATCH_SIZE;
+/// runs. Two costs pull in opposite directions. Buffering more makes runs
+/// longer, so a bucket's merge has fewer runs to combine and each of its
+/// slices takes longer stretches from them, which merge faster. Buffering
+/// less keeps the rows a worker sorts within what its cache holds. A few
+/// batches per bucket is where queries whose merge dominates gain most of
+/// what longer runs give, before queries whose sort dominates lose much.
+const PENDING_ROWS_PER_BUCKET: usize = 4 * RECORD_BATCH_SIZE;
 
 /// The fewest batches of rows a worker buffers before sorting them, however
 /// few buckets there are. An unpartitioned window has one bucket, and this
@@ -139,7 +144,8 @@ impl WindowLayout {
                 .next_power_of_two()
                 .clamp(MIN_BUCKET_COUNT, MAX_BUCKET_COUNT)
         };
-        let pending_row_capacity = bucket_count.max(MIN_PENDING_BATCHES) * PENDING_ROWS_PER_BUCKET;
+        let pending_row_capacity =
+            (bucket_count * PENDING_ROWS_PER_BUCKET).max(MIN_PENDING_BATCHES * RECORD_BATCH_SIZE);
         let sort_key: Vec<OrderBy> = spec
             .partition_by
             .iter()
