@@ -26,6 +26,12 @@
 //! that answers it is overloaded is sent fewer requests at once for a while,
 //! and the request it refused goes again only after a wait.
 //!
+//! A peer that is gone is noticed by the kernel, for reads and uploads alike.
+//! Every socket has TCP keepalive on and a bound on how long sent bytes may
+//! stay unacknowledged, so a connection whose packets vanish fails with a
+//! timeout within about ten seconds, whether it is in use or idle in the pool,
+//! and the request goes out again on a fresh one.
+//!
 //! On non-Linux (macOS) there is no ring: the engine hands each range read to a
 //! shared pool of blocking `std::net` + `rustls::StreamOwned` threads (mirroring
 //! the file path's `pread` pool) and collects their completions over a channel,
@@ -737,6 +743,21 @@ mod uring_engine {
     /// A step that misses its longest deadline counts here like any other
     /// connection error.
     const MAX_HTTP_RETRIES: u32 = 3;
+
+    /// How long bytes sent on a connection may stay unacknowledged, and how
+    /// long keepalive probes may go unanswered, before the kernel fails the
+    /// connection with a timeout. Acknowledgements come from the peer's
+    /// kernel, however busy the store is, so only a peer that is gone or
+    /// unreachable misses this. It spans five retransmissions of a lost
+    /// packet, so ordinary loss does not trip it.
+    const DEAD_PEER_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// How long a connection is quiet before the kernel probes whether the
+    /// peer is still there.
+    const KEEPALIVE_IDLE: Duration = Duration::from_secs(5);
+
+    /// How long the kernel waits between two keepalive probes.
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 
     /// Whether a transport error is worth retrying at once on a fresh
     /// connection. Socket teardown (a closed keep-alive, a reset, a refused
@@ -2315,6 +2336,42 @@ mod uring_engine {
                 return Err(Error::Io(std::io::Error::last_os_error()));
             }
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            // The kernel fails a connection whose peer has stopped
+            // acknowledging, in use or idle, within `DEAD_PEER_TIMEOUT`.
+            let unanswered_probes = DEAD_PEER_TIMEOUT.as_secs() / KEEPALIVE_INTERVAL.as_secs();
+            for (level, option, value) in [
+                (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1),
+                (
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPIDLE,
+                    KEEPALIVE_IDLE.as_secs(),
+                ),
+                (
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPINTVL,
+                    KEEPALIVE_INTERVAL.as_secs(),
+                ),
+                (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, unanswered_probes),
+                (
+                    libc::IPPROTO_TCP,
+                    libc::TCP_USER_TIMEOUT,
+                    DEAD_PEER_TIMEOUT.as_millis() as u64,
+                ),
+            ] {
+                let value = value as libc::c_int;
+                let set = unsafe {
+                    libc::setsockopt(
+                        fd.as_raw_fd(),
+                        level,
+                        option,
+                        &value as *const libc::c_int as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    )
+                };
+                if set < 0 {
+                    return Err(Error::Io(std::io::Error::last_os_error()));
+                }
+            }
             let (sockaddr, sockaddr_len) = to_sockaddr(addr);
 
             let transport = if remote.is_https() {
