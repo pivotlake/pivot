@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import os from "node:os";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -9,21 +8,11 @@ if (!workspaceVersion) {
   throw new Error("no [workspace.package] version in ../Cargo.toml");
 }
 
-// A pivot server does not report the machine it runs on, so the machine
-// running Vite stands in for it on the server card.
-const serverHost = {
-  hostname: os.hostname(),
-  version: workspaceVersion[1],
-  cores: os.cpus().length,
-  memoryBytes: os.totalmem(),
-  architecture: os.arch(),
-  platform: os.platform(),
-};
-
 export default defineConfig({
   plugins: [react()],
   define: {
-    __PIVOT_SERVER_HOST__: JSON.stringify(serverHost),
+    // The version of pivot the page was built beside, shown on the server card.
+    __PIVOT_VERSION__: JSON.stringify(workspaceVersion[1]),
   },
   server: {
     port: 5174,

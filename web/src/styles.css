@@ -21,6 +21,8 @@
   --accent: light-dark(#3049c9, #78d18b);
   --accent-soft: light-dark(#dfe3f8, #16301d);
   --connection-dot: light-dark(#a8aab1, #5a5a5a);
+  /* The TypeScript constant HEADER_HEIGHT_PX says the same. */
+  --header-height: 48px;
   --failure: light-dark(#b3261e, #f2857c);
 
   /* The uses of memory: red for memory that is held, two shades of light
@@ -30,6 +32,26 @@
   --memory-compressed-cache: #a3cff7;
   --memory-other: #c3ccd6;
   --memory-free: #58c283;
+
+  /* Text on a fill of the accent. */
+  --accent-ink: light-dark(#ffffff, #0d0d0d);
+
+  /* SQL in the query editor: keywords in the accent, and a hue each for
+     text, numbers and types. */
+  --sql-keyword: var(--accent);
+  --sql-string: light-dark(#a3470a, #e6b073);
+  --sql-number: light-dark(#7b3fa6, #c9a0f0);
+  --sql-type: light-dark(#0a6f72, #6fd0c8);
+  --sql-selection: light-dark(#d5dcf7, #2d4433);
+
+  /* A table's files: neutral while nothing would merge them, and the
+     page's accent for the small ones a merge would rewrite. */
+  --file-fill: light-dark(#d6d4cd, #3a3a3a);
+  --file-border: light-dark(#a3a199, #5c5c5c);
+  --file-waiting: light-dark(#b9b7b0, #4a4a4a);
+  --file-waiting-alternate: light-dark(#cfcdc6, #3a3a3a);
+  --file-merging: var(--accent);
+  --file-merging-alternate: color-mix(in srgb, var(--accent) 72%, var(--surface));
 }
 
 *,
@@ -107,10 +129,41 @@ body {
 
 /* Page furniture */
 
-.title-panel {
+.app-header {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  align-items: center;
+  gap: 28px;
+  height: var(--header-height);
+  padding: 0 16px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--canvas);
+}
+
+.app-nav {
+  display: flex;
+  gap: 4px;
+}
+
+.app-nav a {
+  padding: 5px 11px;
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.app-nav a:hover {
+  color: var(--text);
+}
+
+.app-nav a[aria-current="page"] {
+  background: var(--surface-inset);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  color: var(--text);
+}
+
+.app-page {
+  height: calc(100% - var(--header-height));
 }
 
 .wordmark {
@@ -352,8 +405,8 @@ body {
   filter: brightness(1.08);
 }
 
-/* Black in both themes, centred over the part it describes. */
-.memory-tooltip {
+/* Black in both themes, centred over what it describes. */
+.tooltip {
   position: absolute;
   bottom: calc(100% + 8px);
   z-index: 10;
@@ -376,13 +429,17 @@ body {
   z-index: 1000 !important;
 }
 
-.memory-tooltip strong {
+.tooltip strong {
   display: block;
   color: #ffffff;
   font-weight: 700;
 }
 
-.memory-tooltip::after {
+.tooltip-line {
+  display: block;
+}
+
+.tooltip::after {
   content: "";
   position: absolute;
   top: 100%;
@@ -394,65 +451,6 @@ body {
   border-left: 0;
   background: #000000;
   transform: translate(-50%, -50%) rotate(45deg);
-}
-
-.compaction {
-  padding: 12px 18px 16px;
-  border-top: 1px solid var(--hairline);
-}
-
-.compaction-heading,
-.compaction-figures {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.simulated-tag {
-  margin-left: 4px;
-  padding: 0 5px;
-  border: 1px solid var(--hairline);
-  border-radius: 3px;
-  letter-spacing: 0;
-  text-transform: none;
-}
-
-.compaction-table {
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.compaction.is-running .compaction-table {
-  color: var(--text);
-  font-weight: 500;
-}
-
-.compaction-track {
-  height: 6px;
-  margin: 9px 0;
-  overflow: hidden;
-  border-radius: 3px;
-  background: var(--surface-inset);
-  box-shadow: inset 0 0 0 1px var(--hairline);
-}
-
-.compaction-fill {
-  height: 100%;
-  border-radius: 3px;
-  background: var(--accent);
-  transition: width 250ms linear;
-}
-
-.compaction-figures {
-  color: var(--text-muted);
-  font-size: 11.5px;
-}
-
-.compaction-figures strong {
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 700;
 }
 
 /* Clients */
@@ -579,6 +577,26 @@ body {
   }
 }
 
+/* The web backend's own connection: a fixture of the page, quieter than a
+   client and without anything that moves. */
+.web-backend-card {
+  width: 190px;
+  padding: 8px 12px;
+  border: 1px dashed var(--hairline-strong);
+  border-radius: 8px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.web-backend-name {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.web-backend-role {
+  font-size: 11px;
+}
+
 /* Connections */
 
 .connection-path {
@@ -591,6 +609,13 @@ body {
 
 .connection-path.is-query {
   stroke: var(--text-muted);
+}
+
+.connection-path.is-fixture {
+  stroke: var(--hairline-strong);
+  stroke-width: 1.25;
+  stroke-dasharray: 4 5;
+  stroke-linecap: butt;
 }
 
 .connection-path.is-copy {
@@ -635,6 +660,447 @@ body {
 @media (max-width: 640px) {
   .react-flow__controls {
     display: none;
+  }
+}
+
+/* Tables page */
+
+.tables-page {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  height: 100%;
+}
+
+.table-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 16px 10px;
+  overflow-y: auto;
+  border-right: 1px solid var(--hairline);
+}
+
+.table-list > .section-label {
+  padding: 0 8px 8px;
+}
+
+.table-link {
+  display: flex;
+  flex-direction: column;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.table-list-divider {
+  margin-top: 14px;
+}
+
+.table-link:hover {
+  background: var(--surface-inset);
+}
+
+.table-link[aria-current="page"] {
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--hairline-strong);
+}
+
+.table-link-name {
+  overflow: hidden;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.table-link-facts {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.table-detail {
+  padding: 20px 28px 40px;
+  overflow-y: auto;
+}
+
+.table-heading h1 {
+  margin: 0 0 10px;
+  font-family: var(--font-display);
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+
+.table-qualifier {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.detail-heading {
+  margin: 26px 0 10px;
+}
+
+.partition-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 18px;
+}
+
+.partition-picker .section-label {
+  margin-right: 6px;
+}
+
+.partition-picker button {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.partition-picker button[aria-pressed="true"] {
+  border-color: var(--hairline-strong);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.partition-count {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.page-note {
+  margin: 8px 0;
+  color: var(--text-muted);
+}
+
+/* The two kinds of file the compacter treats differently, side by side. */
+.file-panes {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
+  margin-top: 18px;
+}
+
+.file-pane {
+  min-width: 0;
+  padding: 16px 18px 18px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.pane-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.pane-heading h2 {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.pane-figure {
+  margin: 10px 0 2px;
+  color: var(--text-secondary);
+}
+
+.pane-figure strong {
+  margin-right: 4px;
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 600;
+}
+
+.pane-rule {
+  margin: 0 0 14px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.pane-rule.is-leading {
+  margin-top: 10px;
+}
+
+/* Small files: a pile measured against the size a merge starts at. */
+.pile-group {
+  margin-bottom: 12px;
+}
+
+.pile-row-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+.pile-group.is-ready .pile-row-heading {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.pile-track {
+  display: flex;
+  height: 18px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: var(--surface-inset);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+
+/* Files alternate between two tones, so each reads as a block of its own. */
+.pile-file {
+  min-width: 1px;
+  background: var(--file-waiting);
+}
+
+.pile-file:nth-child(even) {
+  background: var(--file-waiting-alternate);
+}
+
+.pile-group.is-ready .pile-file {
+  background: var(--file-merging);
+}
+
+.pile-group.is-ready .pile-file:nth-child(even) {
+  background: var(--file-merging-alternate);
+}
+
+.pile-note {
+  margin: 5px 0 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+/* Large files: bars along the table's sort order, stacked in rows. */
+.key-map-plot {
+  position: relative;
+  border-bottom: 1px solid var(--hairline-strong);
+}
+
+.key-map-file {
+  position: absolute;
+  min-width: 3px;
+  border: 1px solid var(--file-border);
+  border-radius: 2px;
+  background: var(--file-fill);
+}
+
+.key-map-file.is-outlined {
+  z-index: 1;
+  border-color: var(--text);
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.key-map-axis {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 6px 0 14px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.key-map-axis-name {
+  color: var(--text-secondary);
+}
+
+.file-list-scroller {
+  max-height: 320px;
+  margin-top: 14px;
+  overflow: auto;
+}
+
+.file-list {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.file-list th {
+  padding: 6px 12px 6px 0;
+  border-bottom: 1px solid var(--hairline-strong);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.file-list td {
+  padding: 5px 12px 5px 0;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.file-list .is-number {
+  text-align: right;
+}
+
+.file-list .file-path {
+  max-width: 170px;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 760px) {
+  .tables-page {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+
+  .table-list {
+    max-height: 220px;
+    border-right: 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  .table-detail {
+    padding: 16px;
+    overflow-x: auto;
+  }
+
+}
+
+/* Query page */
+
+.query-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 20px 28px 24px;
+  overflow: hidden;
+}
+
+/* The frame of the SQL editor, which fills it and can be dragged taller. */
+.query-editor {
+  height: 190px;
+  min-height: 90px;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  resize: vertical;
+}
+
+.query-editor:focus-within {
+  border-color: var(--accent);
+}
+
+.query-run:focus-visible,
+.table-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.query-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 0 14px;
+}
+
+.query-run {
+  padding: 6px 18px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.query-run:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.query-hint {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.query-status {
+  margin-left: auto;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.query-failure {
+  max-width: none;
+  white-space: pre-wrap;
+}
+
+.query-result {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+}
+
+/* Column names are shown as the server gives them, case and all. */
+.query-result .file-list th {
+  position: sticky;
+  top: 0;
+  padding: 8px 14px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.query-result .file-list td {
+  padding: 5px 14px;
+}
+
+.query-value {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-list td.is-null {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* The two panes need room side by side; below it they stack. */
+@media (max-width: 1100px) {
+  .file-panes {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
