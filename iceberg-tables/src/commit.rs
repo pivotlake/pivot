@@ -222,7 +222,10 @@ impl Table {
                 .map(|entry| entry.create_data_file(self.metadata(), self.location()))
                 .collect()
         };
-        let removed = to_data_files(removed)?;
+        let removed: Vec<(DataFile, Option<Arc<str>>)> = to_data_files(removed)?
+            .into_iter()
+            .zip(removed.iter().map(|entry| entry.manifest_path.clone()))
+            .collect();
         let added = to_data_files(&added)?;
         self.commit_transaction(Vec::new(), move |transaction| {
             // The files were just written under fresh names, so none is in
@@ -241,8 +244,16 @@ impl Table {
                 .rewrite_files()
                 .with_check_duplicate(false)
                 .with_manifest_merge(true);
-            for file in removed {
-                rewrite = rewrite.delete_file(file);
+            // A file's entry is read from the manifest that lists it, so
+            // the rewrite reads as many manifests as its files are listed
+            // in, not every manifest of the table.
+            for (file, manifest_path) in removed {
+                rewrite = match manifest_path {
+                    Some(manifest_path) => {
+                        rewrite.delete_file_listed_in(file, manifest_path.as_ref())
+                    }
+                    None => rewrite.delete_file(file),
+                };
             }
             for file in added {
                 rewrite = rewrite.add_file(file);

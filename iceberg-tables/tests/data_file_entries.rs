@@ -61,6 +61,7 @@ fn entry_in(name: &str, rows: i64, partition: PartitionValues) -> DataFileEntry 
         stats: Some(stats(rows, &[], &[])),
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     }
 }
 
@@ -100,6 +101,7 @@ fn an_entry_round_trips_through_a_manifest_record() {
         )),
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     };
     let hundred_rows_before = append(&created, vec![entry_in("pivot-0", 100, on_day(19_999))]);
 
@@ -512,6 +514,7 @@ fn bounds_iceberg_cannot_hold_are_left_out() {
         )),
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     };
 
     let data_file = entry
@@ -535,6 +538,7 @@ fn a_partitioned_table_refuses_an_entry_without_a_tuple() {
         stats: Some(stats(1, &[], &[])),
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     };
 
     let error = entry
@@ -567,6 +571,7 @@ fn a_missing_derived_partition_value_is_refused() {
         stats: Some(stats(1, &[], &[])),
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     };
 
     let error = entry
@@ -589,6 +594,7 @@ fn an_entry_without_stats_cannot_be_recorded() {
         stats: None,
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     };
 
     let error = entry
@@ -620,6 +626,7 @@ fn build_page_entry(columns: &[&str]) -> DataFileEntry {
         stats: Some(stats(2, &bounds, &[])),
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     }
 }
 
