@@ -23,6 +23,10 @@ on:
         description: "publish on dockerhub"
         type: boolean
         default: true
+      push_docker_web:
+        description: "publish the web page's image (pivotlake/pivot-web) on dockerhub"
+        type: boolean
+        default: true
       publish_install:
         description: "Publish the CLI binaries"
         type: boolean
@@ -52,9 +56,9 @@ on:
 #                            (clickbench-hits-subset/ and tpch-sf1/, see
 #                            packaging/pgo/train.sh). GCP_SA_KEY needs read
 #                            access on it.
-# For the Docker Hub push (push_docker), the org-level DOCKERHUB_USERNAME /
-# DOCKERHUB_TOKEN secrets are used; that account must have push access to
-# pivotlake/pivot.
+# For the Docker Hub pushes (push_docker, push_docker_web), the org-level
+# DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets are used; that account must have
+# push access to pivotlake/pivot and pivotlake/pivot-web.
 # publish_install puts the CLI binaries in a public bucket, reusing GCP_SA_KEY,
 # which needs objectAdmin on it. The install script and the docs are published
 # separately by the Deploy Web workflow; the script always resolves the newest
@@ -603,15 +607,70 @@ jobs:
           cache-from: type=gha,scope=server
           cache-to: type=gha,scope=server,mode=max
 
+  # The web page's image: one process, the page's backend, serving the built
+  # page (see web/Dockerfile). Tagged exactly like the server image above, so
+  # the two that belong together carry one version: release candidates get
+  # their versioned rc tag only, real releases also move `latest`.
+  #
+  # Unlike the server image this one is compiled here, from the commit being
+  # released: the page and its backend are released no other way, so there is
+  # no binary from the deploy matrix to wrap, and the job waits only for the
+  # version. The arm64 leg is cross-compiled inside the build and its final
+  # stage only copies files in, so nothing runs under emulation and the job
+  # needs no QEMU.
+  docker-web:
+    name: Build & push the web page's Docker image
+    needs: [version]
+    if: ${{ inputs.push_docker_web }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve Docker tags
+        id: docker_tags
+        env:
+          VERSION: ${{ needs.version.outputs.release }}
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "pivotlake/pivot-web:$VERSION"
+            if [ "${{ inputs.release_candidate }}" != "true" ]; then
+              echo "pivotlake/pivot-web:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.docker_tags.outputs.tags }}
+          cache-from: type=gha,scope=web
+          # ignore-error keeps a cache-service outage from failing a build
+          # whose image is already pushed; the next run is just colder.
+          cache-to: type=gha,scope=web,mode=max,ignore-error=true
+
   # Every published version gets a git tag pointing at the commit it was
   # built from, named exactly like the artifacts elsewhere in this workflow:
   # v0.3.0 for a real release, v0.3.0-rc<sha> for a candidate.
   tag-release:
     name: Tag the release
-    needs: [deploy, version, publish-install, publish-apt, docker]
+    needs: [deploy, version, publish-install, publish-apt, docker, docker-web]
     # Publishers are skipped when deselected; tag once at least one published a
-    # version and every selected publisher succeeded.
-    if: ${{ always() && needs.deploy.result == 'success' && needs.version.result == 'success' && (needs.publish-install.result == 'success' || needs.publish-install.result == 'skipped') && (needs.publish-apt.result == 'success' || needs.publish-apt.result == 'skipped') && (needs.docker.result == 'success' || needs.docker.result == 'skipped') && (needs.publish-install.result == 'success' || needs.publish-apt.result == 'success' || needs.docker.result == 'success') }}
+    # version of the server and every selected publisher succeeded, the web
+    # page's image among them.
+    if: ${{ always() && needs.deploy.result == 'success' && needs.version.result == 'success' && (needs.publish-install.result == 'success' || needs.publish-install.result == 'skipped') && (needs.publish-apt.result == 'success' || needs.publish-apt.result == 'skipped') && (needs.docker.result == 'success' || needs.docker.result == 'skipped') && (needs.docker-web.result == 'success' || needs.docker-web.result == 'skipped') && (needs.publish-install.result == 'success' || needs.publish-apt.result == 'success' || needs.docker.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
