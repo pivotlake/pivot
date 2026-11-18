@@ -2896,7 +2896,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#097c4581ee84a6ac41dd91e89b5525014b2f84e5"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#508182d36e806296ef6c22203654d4bed5290667"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2955,7 +2955,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#097c4581ee84a6ac41dd91e89b5525014b2f84e5"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#508182d36e806296ef6c22203654d4bed5290667"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2975,7 +2975,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#097c4581ee84a6ac41dd91e89b5525014b2f84e5"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#508182d36e806296ef6c22203654d4bed5290667"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2985,7 +2985,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#097c4581ee84a6ac41dd91e89b5525014b2f84e5"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#508182d36e806296ef6c22203654d4bed5290667"
 dependencies = [
  "anyhow",
  "async-trait",
