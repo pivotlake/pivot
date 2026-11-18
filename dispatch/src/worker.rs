@@ -386,13 +386,36 @@ impl Worker {
         }
     }
 
-    /// Run one unit of CPU work from the first dataflow that has work ready.
+    /// Run one unit of CPU work of every dataflow that has work ready. A
+    /// background dataflow gets its unit only when no other dataflow had one:
+    /// its units may be long, and a query or a write sharing the worker waits
+    /// through each of them.
     fn step_run_ready_cpu_work(&mut self) {
+        let mut foreground_ran = false;
         // While a `perf` capture is in progress, run only the profiled dataflow
         // so the profile isn't polluted by other queries / ingest on the pool.
         for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
             if Self::paused_for_profiling(flow) {
+                continue;
+            }
+            if flow.is_background() {
+                continue;
+            }
+            if let WorkStatus::Ran = flow.run_ready_cpu_work(&self.io) {
+                foreground_ran = true;
+            }
+        }
+        if foreground_ran {
+            self.did_work_last_iteration = true;
+            return;
+        }
+        for flow in self.data_flows.values_mut() {
+            #[cfg(feature = "perf")]
+            if Self::paused_for_profiling(flow) {
+                continue;
+            }
+            if !flow.is_background() {
                 continue;
             }
             if let WorkStatus::Ran = flow.run_ready_cpu_work(&self.io) {
