@@ -146,11 +146,17 @@ impl ParallelKWayMerge {
         // A slice reads one stretch of each run. The key readers and the row
         // copy are bound to the batches those stretches touch, so the cost of
         // a slice does not grow with the size of the whole merge.
-        let mut slice_runs = Vec::with_capacity(self.run_indexes.len());
+        //
+        // The batches are borrowed from the plan. Cloning them would write to
+        // the reference counts of every batch and column the slice touches,
+        // and those counts are shared with the workers on the plan's other
+        // slices: each write would take the count's cache line away from
+        // them.
+        let mut slice_runs: Vec<&[RecordBatch]> = Vec::with_capacity(self.run_indexes.len());
         let mut slice_run_rows = Vec::with_capacity(self.run_indexes.len());
         for (run, rows) in self.run_indexes.iter().zip(&slice.run_rows) {
             if rows.is_empty() {
-                slice_runs.push(Vec::new());
+                slice_runs.push(&[]);
                 slice_run_rows.push(0..0);
                 continue;
             }
@@ -162,14 +168,13 @@ impl ParallelKWayMerge {
                 .first_row_by_batch
                 .partition_point(|&first_row| first_row < rows.end);
             let rows_before_first_batch = run.first_row_by_batch[first_batch];
-            slice_runs.push(
-                self.batches[run.first_batch + first_batch..run.first_batch + end_batch].to_vec(),
-            );
+            slice_runs
+                .push(&self.batches[run.first_batch + first_batch..run.first_batch + end_batch]);
             slice_run_rows
                 .push(rows.start - rows_before_first_batch..rows.end - rows_before_first_batch);
         }
         let slice_run_indexes = build_run_indexes(&slice_runs);
-        let slice_batches: Vec<RecordBatch> = slice_runs.into_iter().flatten().collect();
+        let slice_batches: Vec<&RecordBatch> = slice_runs.into_iter().flatten().collect();
 
         // The slice's rows, one run's stretch after another. Each stretch is
         // in key order, so ordering the slice is a merge of the stretches.
@@ -193,9 +198,9 @@ impl ParallelKWayMerge {
         let schema = slice_batches[0].schema();
         let mut output_columns = Vec::with_capacity(schema.fields().len());
         for column_index in 0..schema.fields().len() {
-            let input_columns: Vec<ArrayRef> = slice_batches
+            let input_columns: Vec<&ArrayRef> = slice_batches
                 .iter()
-                .map(|batch| batch.column(column_index).clone())
+                .map(|batch| batch.column(column_index))
                 .collect();
             output_columns.push(take_chunked(allocator, &input_columns, &mapping)?);
         }
@@ -515,10 +520,11 @@ impl RunIndex {
     }
 }
 
-fn build_run_indexes(runs: &[Vec<RecordBatch>]) -> Vec<RunIndex> {
+fn build_run_indexes(runs: &[impl AsRef<[RecordBatch]>]) -> Vec<RunIndex> {
     let mut first_batch = 0;
     runs.iter()
         .map(|batches| {
+            let batches = batches.as_ref();
             let mut first_row_by_batch = Vec::with_capacity(batches.len());
             let mut row_count = 0;
             for batch in batches {

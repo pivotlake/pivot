@@ -16,7 +16,8 @@
 //!                │  RecordBatch (channel from the operator below)
 //!                ▼
 //!    ┌───────────────────────┐   CONSUME, on every worker:
-//!    │ WindowConsumer        │   1. hash partition keys, note each row's bucket
+//!    │ WindowConsumer        │   1. hash partition keys, copy each batch so a
+//!    │                       │      bucket's rows are next to each other
 //!    │                       │   2. once enough rows are pending, sort each
 //!    │                       │      bucket's rows into a run
 //!    │                       │   3. with a row limit, drop rows that cannot pass

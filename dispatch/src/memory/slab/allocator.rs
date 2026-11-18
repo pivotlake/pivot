@@ -1,6 +1,7 @@
 use crate::memory::slab::slab_buffer::SlabBuffer;
 use crate::memory::slab::{MultiSlabBuffer, Slab, SlabBacking};
 use crate::memory::{BUFFER_SIZE, WriteBuffer, memory_ctx};
+use crossbeam_queue::SegQueue;
 use std::sync::Arc;
 
 /// Bump allocator that carves [`Slab`]s out of 2MB [`WriteBuffer`]s.
@@ -27,6 +28,10 @@ pub struct SlabAllocator {
     working_buffer_zeroed: bool,
     /// Ring buffers this allocator has taken so far, the working one included.
     buffers_taken: usize,
+    /// Buffers other workers lent to this allocator (see
+    /// [`new_from_lent_buffers`](Self::new_from_lent_buffers)). `None` for an
+    /// allocator that only takes buffers from the calling worker's own pool.
+    lent_buffers: Option<Arc<SegQueue<WriteBuffer>>>,
 }
 
 impl SlabAllocator {
@@ -39,6 +44,30 @@ impl SlabAllocator {
             working_buffer: Arc::new(working_buffer),
             offset: 0,
             buffers_taken: 1,
+            lent_buffers: None,
+        }
+    }
+
+    /// Creates an allocator that takes its buffers from `lent_buffers` while
+    /// there are any, and from the calling worker's own pool once they run
+    /// out.
+    ///
+    /// A worker can only take buffers of its own NUMA node from its pool.
+    /// This is how it writes into another node's memory: workers of that node
+    /// put buffers of theirs into `lent_buffers`, and what this allocator
+    /// hands out then lies on their node. Whoever lends decides how many
+    /// buffers to lend, so the allocator has to keep working when they run
+    /// out; from then on its slabs lie on the calling worker's node.
+    pub fn new_from_lent_buffers(lent_buffers: Arc<SegQueue<WriteBuffer>>) -> Self {
+        let working_buffer = lent_buffers
+            .pop()
+            .unwrap_or_else(|| memory_ctx().get_write_buffer(false));
+        Self {
+            working_buffer_zeroed: working_buffer.zeroed,
+            working_buffer: Arc::new(working_buffer),
+            offset: 0,
+            buffers_taken: 1,
+            lent_buffers: Some(lent_buffers),
         }
     }
 
@@ -80,7 +109,11 @@ impl SlabAllocator {
     /// Discards the remaining space in the current buffer and acquires a fresh one.
     fn advance_to_new_buffer(&mut self, zeroed: bool) {
         self.offset = 0;
-        let working_buffer = memory_ctx().get_write_buffer(zeroed);
+        let working_buffer = self
+            .lent_buffers
+            .as_ref()
+            .and_then(|lent_buffers| lent_buffers.pop())
+            .unwrap_or_else(|| memory_ctx().get_write_buffer(zeroed));
         self.working_buffer_zeroed = working_buffer.zeroed;
         self.working_buffer = Arc::new(working_buffer);
         self.buffers_taken += 1;
@@ -243,6 +276,22 @@ mod tests {
 
         let slice = unsafe { std::slice::from_raw_parts(slab.ptr, 1024) };
         assert!(slice.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn takes_lent_buffers_before_its_own_pool() {
+        init_test_free_pool(4);
+        let lent_buffer = memory_ctx().get_write_buffer(false);
+        let lent_start = lent_buffer.ptr;
+        let lent_buffers = Arc::new(SegQueue::new());
+        lent_buffers.push(lent_buffer);
+
+        let mut alloc = SlabAllocator::new_from_lent_buffers(lent_buffers);
+        let from_lent_buffer = alloc.get_slab_of_size(BUFFER_SIZE, false);
+        let from_own_pool = alloc.get_slab_of_size(64, false);
+
+        assert_eq!(from_lent_buffer.ptr, lent_start);
+        assert_ne!(from_own_pool.ptr, lent_start);
     }
 
     #[test]

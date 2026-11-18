@@ -49,7 +49,7 @@ impl WindowFactory {
             topology.total_workers(),
             arena_buffers,
         ));
-        let shared = Arc::new(SharedBuckets::new(layout.clone(), topology));
+        let shared = Arc::new(SharedBuckets::new(&layout, topology));
         (0..topology.total_workers())
             .map(|worker_id| WindowFactory {
                 layout: layout.clone(),

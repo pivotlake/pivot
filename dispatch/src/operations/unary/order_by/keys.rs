@@ -44,6 +44,7 @@ use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_ord::ord::{DynComparator, make_comparator};
 use arrow_schema::{ArrowError, DataType, SortOptions, TimeUnit};
+use std::borrow::Borrow;
 
 use crate::operations::unary::order_by_limit::OrderBy;
 
@@ -89,11 +90,17 @@ pub(super) use with_key_ordering;
 
 /// Pick the fastest ordering the key allows for these chunks (see the module
 /// docs). The chunks must all share the schema the key columns index into.
-pub(super) fn select_key_ordering<'chunks>(
+///
+/// The chunks may be owned batches or references to them, so a caller that
+/// orders batches it only borrows does not have to clone them.
+pub(super) fn select_key_ordering<'chunks, Batch: Borrow<RecordBatch>>(
     order_by: &[OrderBy],
-    left_chunks: &'chunks [RecordBatch],
-    right_chunks: &'chunks [RecordBatch],
+    left_chunks: &'chunks [Batch],
+    right_chunks: &'chunks [Batch],
 ) -> Result<SelectedKeyOrdering<'chunks>, ArrowError> {
+    let left_chunks: Vec<&'chunks RecordBatch> = left_chunks.iter().map(Borrow::borrow).collect();
+    let right_chunks: Vec<&'chunks RecordBatch> = right_chunks.iter().map(Borrow::borrow).collect();
+    let (left_chunks, right_chunks) = (left_chunks.as_slice(), right_chunks.as_slice());
     if let [single_key] = order_by {
         let key_column = single_key.column_idx();
         let null_free = left_chunks
@@ -124,14 +131,14 @@ pub(super) fn select_key_ordering<'chunks>(
     }
     Ok(SelectedKeyOrdering::General(ComparatorKeyOrdering {
         order_by: order_by.to_vec(),
-        left_chunks,
-        right_chunks,
+        left_chunks: left_chunks.to_vec(),
+        right_chunks: right_chunks.to_vec(),
         comparators_by_chunks: HashMap::new(),
     }))
 }
 
 /// The key column's type; either side may be empty, but never both.
-fn data_type_of(key_column: usize, left: &[RecordBatch], right: &[RecordBatch]) -> DataType {
+fn data_type_of(key_column: usize, left: &[&RecordBatch], right: &[&RecordBatch]) -> DataType {
     left.iter()
         .chain(right)
         .next()
@@ -159,7 +166,7 @@ struct FixedWidthChunk<'chunks> {
 
 fn fixed_width_chunks<'chunks>(
     key_column: usize,
-    chunks: &'chunks [RecordBatch],
+    chunks: &[&'chunks RecordBatch],
 ) -> Vec<FixedWidthChunk<'chunks>> {
     chunks
         .iter()
@@ -362,7 +369,12 @@ struct PackedColumn<'chunks> {
 
 impl<'chunks> PackedKeyPrefix<'chunks> {
     /// `None` when the key's first column cannot be packed.
-    pub(super) fn try_new(order_by: &[OrderBy], chunks: &'chunks [RecordBatch]) -> Option<Self> {
+    pub(super) fn try_new<Batch: Borrow<RecordBatch>>(
+        order_by: &[OrderBy],
+        chunks: &'chunks [Batch],
+    ) -> Option<Self> {
+        let chunks: Vec<&'chunks RecordBatch> = chunks.iter().map(Borrow::borrow).collect();
+        let chunks = chunks.as_slice();
         let mut columns = Vec::new();
         let mut used_bits = 0;
         for key in order_by {
@@ -497,7 +509,7 @@ const INLINE_VIEW_LEN: u32 = 12;
 
 fn view_chunks<'chunks>(
     key_column: usize,
-    chunks: &'chunks [RecordBatch],
+    chunks: &[&'chunks RecordBatch],
 ) -> Vec<ViewChunk<'chunks>> {
     chunks
         .iter()
@@ -629,7 +641,7 @@ impl<'chunks> KeyColumn<'chunks> {
     /// The values of a boolean key column, per chunk.
     fn boolean_chunks(
         key_column: usize,
-        chunks: &'chunks [RecordBatch],
+        chunks: &[&'chunks RecordBatch],
     ) -> Vec<&'chunks BooleanBuffer> {
         chunks
             .iter()
@@ -641,7 +653,7 @@ impl<'chunks> KeyColumn<'chunks> {
     /// nulls.
     fn chunk_validities(
         key_column: usize,
-        chunks: &'chunks [RecordBatch],
+        chunks: &[&'chunks RecordBatch],
     ) -> Vec<Option<&'chunks NullBuffer>> {
         chunks
             .iter()
@@ -657,8 +669,8 @@ impl<'chunks> ColumnwiseKeyOrdering<'chunks> {
     /// `None` when some key column is of a type this ordering cannot read.
     fn try_new(
         order_by: &[OrderBy],
-        left_chunks: &'chunks [RecordBatch],
-        right_chunks: &'chunks [RecordBatch],
+        left_chunks: &[&'chunks RecordBatch],
+        right_chunks: &[&'chunks RecordBatch],
     ) -> Option<Self> {
         let columns = order_by
             .iter()
@@ -784,8 +796,8 @@ const MAX_CACHED_COMPARATOR_PAIRS: usize = 1024;
 /// many chunk pairs, so the cache is a map rather than the last pair alone.
 pub(super) struct ComparatorKeyOrdering<'chunks> {
     order_by: Vec<OrderBy>,
-    left_chunks: &'chunks [RecordBatch],
-    right_chunks: &'chunks [RecordBatch],
+    left_chunks: Vec<&'chunks RecordBatch>,
+    right_chunks: Vec<&'chunks RecordBatch>,
     /// One comparator per key column, in key order, per chunk pair compared.
     comparators_by_chunks: HashMap<(usize, usize), Vec<DynComparator>>,
 }

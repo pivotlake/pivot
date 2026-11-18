@@ -85,9 +85,9 @@ pub struct ChunkedRowSorter<'chunks> {
 }
 
 impl<'chunks> ChunkedRowSorter<'chunks> {
-    pub fn try_new(
+    pub fn try_new<Batch: std::borrow::Borrow<RecordBatch>>(
         order_by: &[OrderBy],
-        chunks: &'chunks [RecordBatch],
+        chunks: &'chunks [Batch],
     ) -> Result<Self, arrow_schema::ArrowError> {
         Ok(Self {
             ordering: select_key_ordering(order_by, chunks, chunks)?,
