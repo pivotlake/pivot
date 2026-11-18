@@ -43,7 +43,8 @@ const STRING_BOUND_CODE_POINTS: usize = 16;
 /// INSERT stamps on it (`None` for an unpartitioned table; keyed by partition
 /// field name, each value in the type the field's transform produces), its
 /// statistics, the sort order its rows are in, and, once committed, the
-/// partition spec its tuple is laid out by and the id of its first row.
+/// partition spec its tuple is laid out by, the id of its first row and the
+/// manifest that lists it.
 #[derive(Clone)]
 pub struct DataFileEntry {
     pub file: FileRef,
@@ -69,6 +70,11 @@ pub struct DataFileEntry {
     /// `None` for a file not committed yet, and in a table whose rows have
     /// no ids. A commit that carries or retires the file records it again.
     pub first_row_id: Option<i64>,
+    /// The path of the manifest that lists the file in the version the
+    /// entry was read from, as that version's manifest list records it;
+    /// `None` for a file not committed yet. A commit that removes the file
+    /// reads its entry from that manifest.
+    pub manifest_path: Option<Arc<str>>,
 }
 
 /// The Pivot type of the declared column `column`.

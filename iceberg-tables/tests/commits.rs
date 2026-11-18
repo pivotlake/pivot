@@ -361,7 +361,7 @@ fn commits_merging_manifests_read_the_carried_ones_from_the_store() {
 }
 
 #[test]
-fn a_rewrite_reads_every_data_manifest_of_the_table_from_the_store() {
+fn a_rewrite_reads_only_the_manifest_that_lists_the_file_it_replaces() {
     let (fixture, _created) = create_table(&[]);
     let faults = Arc::new(Faults::default());
     let mut table = load_over_faulty_store(&fixture, &faults);
@@ -381,11 +381,27 @@ fn a_rewrite_reads_every_data_manifest_of_the_table_from_the_store() {
     assert_eq!(count_manifests(&table), manifests as usize);
     assert!(rewritten.unwrap().is_some());
     // The manifest list the rewrite is built on, once to look for deletes
-    // committed since and once for the manifests it lists; each of those
-    // manifests, for the entry of the file replaced; and the manifest list
-    // it wrote.
-    assert_eq!(requests.object_reads, manifests as usize + 3);
+    // committed since and once for the manifests it lists; the manifest
+    // that lists the file replaced, for its entry; and the manifest list it
+    // wrote.
+    assert_eq!(requests.object_reads, 4);
     assert_eq!(requests.listings, 0);
+}
+
+#[test]
+fn a_rewrite_replaces_a_file_whose_entry_names_no_manifest() {
+    let (_fixture, created) = create_table(&[]);
+    let table = append(&created, vec![entry("a", 10, 0, 0)]);
+    let table = append(&table, vec![entry("b", 10, 1, 1)]);
+    let mut replaced = live_entry(&table, "b.parquet");
+    replaced.manifest_path = None;
+
+    let rewritten = table
+        .commit(&[replaced], vec![entry("merged", 10, 1, 1)])
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(paths_in_order(&rewritten), ["a.parquet", "merged.parquet"]);
 }
 
 #[test]

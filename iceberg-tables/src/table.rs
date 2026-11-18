@@ -1096,19 +1096,18 @@ impl Table {
         ))
     }
 
-    /// The live file at `path` in the partition with the key `partition`,
-    /// or `None` when this version has no such file.
-    fn find_file(&self, partition: &[u8], path: &ObjectPath) -> Result<Option<Arc<IndexedFile>>> {
-        let partition = self.find_keyed_partition(partition)?;
-        Ok(self.load_partition(partition)?.find(path).cloned())
-    }
-
     /// The live file at `path` in the partition with the key `partition`
     /// as a commit records it, or `None` when this version has no such
     /// file.
     pub fn find_entry(&self, partition: &[u8], path: &ObjectPath) -> Result<Option<DataFileEntry>> {
-        self.find_file(partition, path)?
-            .map(|file| file.to_entry(self.metadata(), self.columns()))
+        let partition = self.find_keyed_partition(partition)?;
+        let index = self.load_partition(partition)?;
+        index
+            .find(path)
+            .map(|file| {
+                let manifest_path = index.find_manifest_of(file).cloned();
+                file.to_entry(self.metadata(), self.columns(), manifest_path)
+            })
             .transpose()
     }
 

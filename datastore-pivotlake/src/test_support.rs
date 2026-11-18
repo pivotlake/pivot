@@ -260,6 +260,7 @@ fn commit_from_outside(
             })),
             sort_order_id: None,
             first_row_id: None,
+            manifest_path: None,
         };
         if let Some(committed) = table.commit(&removed_entries, vec![added])? {
             return Ok(metadata_location_version(committed.metadata_location())?);

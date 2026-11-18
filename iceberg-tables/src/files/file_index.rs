@@ -579,9 +579,15 @@ impl IndexedFile {
     }
 
     /// The file as a commit records and removes it: its tuple under the
-    /// partition spec it was written under, that spec's id, and the
-    /// statistics of every declared column, as the datastore holds them.
-    pub fn to_entry(&self, metadata: &TableMetadata, columns: &[Column]) -> Result<DataFileEntry> {
+    /// partition spec it was written under, that spec's id, the statistics
+    /// of every declared column, as the datastore holds them, and
+    /// `manifest_path`, the manifest that lists it.
+    pub fn to_entry(
+        &self,
+        metadata: &TableMetadata,
+        columns: &[Column],
+        manifest_path: Option<Arc<str>>,
+    ) -> Result<DataFileEntry> {
         Ok(DataFileEntry {
             file: self.facts.file().clone(),
             partition: read_partition_values(
@@ -594,6 +600,7 @@ impl IndexedFile {
             stats: Some(Arc::new(self.file_stats(metadata, columns.iter()))),
             sort_order_id: self.data.sort_order_id(),
             first_row_id: self.first_row_id,
+            manifest_path,
         })
     }
 
@@ -988,6 +995,14 @@ impl PartitionIndex {
             && listed
                 .into_iter()
                 .all(|manifest| self.manifests.contains_key(manifest))
+    }
+
+    /// The path of the manifest the index has `file` from.
+    pub fn find_manifest_of(&self, file: &Arc<IndexedFile>) -> Option<&Arc<str>> {
+        self.manifests
+            .iter()
+            .find(|(_, files)| files.iter().any(|listed| Arc::ptr_eq(listed, file)))
+            .map(|(path, _)| path)
     }
 
     /// Whether the index was built from the manifest at `manifest_path`.

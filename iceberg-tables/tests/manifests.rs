@@ -333,6 +333,7 @@ fn entry_holding(name: &str, column: &str, value: ArrayRef) -> DataFileEntry {
         })),
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     }
 }
 

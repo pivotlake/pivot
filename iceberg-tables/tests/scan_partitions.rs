@@ -411,6 +411,7 @@ fn event_at(fields: &[SpecField], name: &str, v: i64, at_micros: i64) -> DataFil
         })),
         sort_order_id: None,
         first_row_id: None,
+        manifest_path: None,
     }
 }
 
