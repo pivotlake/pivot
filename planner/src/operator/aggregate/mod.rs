@@ -233,11 +233,12 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
                 AggregateFunc::First(a) => (AggregationKind::First, a.column().column_idx),
                 _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
             };
-            Ok(AggregationSlot::new(
-                kind,
-                column,
-                crate::types::physical_arrow_type(func.return_type()),
-            ))
+            // A temporal result leaves the operator as its backing int. The
+            // accumulator may hold it in a wide cell, and a wide cell casts to
+            // an int but not to a date.
+            let declared_type = crate::types::physical_arrow_type(func.return_type());
+            let output_type = temporal_to_int(&declared_type).unwrap_or(declared_type);
+            Ok(AggregationSlot::new(kind, column, output_type))
         })
         .collect()
 }
