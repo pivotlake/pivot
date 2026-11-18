@@ -107,6 +107,23 @@ pub enum Error {
 
 pub type Result<T, E = Error> = result::Result<T, E>;
 
+impl Error {
+    /// Whether this is an operator's send failing because the operator that
+    /// was to receive the item has been dropped.
+    fn is_send_to_dropped_receiver(&self) -> bool {
+        use crate::operations::channels::Error::MpscSendError;
+        use crate::operations::{Error as OperationError, nullary};
+        match self {
+            Error::Operation(OperationError::Unary(error)) => error.is_send_to_dropped_receiver(),
+            Error::Operation(
+                OperationError::Channel(MpscSendError)
+                | OperationError::Nullary(nullary::Error::Channel(MpscSendError)),
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Whether an operator did useful work in this step.
 #[derive(PartialEq, Eq, Copy, Clone)]
 pub enum WorkStatus {
@@ -332,6 +349,9 @@ pub struct DataFlow {
     /// once at construction so the hot loop only polls the (usually empty) list,
     /// never every operator. An entry is dropped once it has fired.
     upstream_cancellers: Vec<(usize, Arc<AtomicBool>)>,
+    /// Whether this worker has abandoned the upstream of an operator that
+    /// asked for it.
+    has_abandoned_upstream: bool,
     /// Operators that issue reads when asked to saturate the available IO (see
     /// [`Operator::saturates_available_io`]), in the order CPU work visits
     /// them. Collected once at construction, like `upstream_cancellers`.
@@ -451,6 +471,7 @@ impl DataFlow {
             id,
             graph,
             upstream_cancellers,
+            has_abandoned_upstream: false,
             io_saturators,
             cancelled: canceled,
             err_tx,
@@ -545,6 +566,10 @@ impl DataFlow {
         }
         match outcome {
             Ok(Ok(v)) => v,
+            Ok(Err(e)) if self.is_send_to_abandoned_upstream(&e) => {
+                self.cancel_upstream_if_requested();
+                default
+            }
             Ok(Err(e)) => {
                 self.bail_and_cancel(e);
                 default
@@ -590,14 +615,32 @@ impl DataFlow {
         // Retain only the cancellers that haven't fired yet; abandon the
         // ancestors of the ones that have, so each request is acted on once.
         let graph = &mut self.graph;
+        let has_abandoned_upstream = &mut self.has_abandoned_upstream;
         self.upstream_cancellers.retain(|(node, flag)| {
             if flag.load(Ordering::Relaxed) {
                 graph.abandon_ancestors(*node);
+                *has_abandoned_upstream = true;
                 false
             } else {
                 true
             }
         });
+    }
+
+    /// Whether `error` is only this worker finding out that an upstream was
+    /// abandoned. Every worker abandons the upstream of a satisfied `LIMIT` by
+    /// itself, the next time it looks at the flag, and drops its operators
+    /// there with the receiving ends of their channels. A worker that has not
+    /// looked yet can be in the middle of a step that sends to one of those
+    /// operators, and its send fails. Nothing is lost: the rows were for an
+    /// upstream whose output is no longer wanted.
+    fn is_send_to_abandoned_upstream(&self, error: &Error) -> bool {
+        error.is_send_to_dropped_receiver()
+            && (self.has_abandoned_upstream
+                || self
+                    .upstream_cancellers
+                    .iter()
+                    .any(|(_, flag)| flag.load(Ordering::Relaxed)))
     }
 
     /// Deliver a fully resolved logical read to its operator.
@@ -1094,6 +1137,103 @@ mod tests {
         fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
             Ok(FinishStatus::Pending)
         }
+    }
+
+    /// An operator whose step sends to an operator that is gone.
+    struct SendToDroppedReceiverOperator;
+    impl Operator for SendToDroppedReceiverOperator {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
+            Err(crate::operations::channels::Error::MpscSendError.into())
+        }
+        fn process_fs_write_response(
+            &mut self,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
+            Ok(FinishStatus::Pending)
+        }
+    }
+
+    /// An operator that asks for its upstream to be abandoned once `0` is set.
+    struct UpstreamCancellingOperator(Arc<AtomicBool>);
+    impl Operator for UpstreamCancellingOperator {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
+            Ok(WorkStatus::Pending)
+        }
+        fn process_fs_write_response(
+            &mut self,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
+            Ok(FinishStatus::Pending)
+        }
+        fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// A dataflow of an operator whose step sends to a dropped receiver,
+    /// feeding one that asks for its upstream to be abandoned once the flag
+    /// returned is set. Also returns where the dataflow reports a failure.
+    fn build_flow_sending_to_a_dropped_receiver()
+    -> (DataFlow, Arc<AtomicBool>, mpsc::Receiver<Error>) {
+        let upstream_cancel = Arc::new(AtomicBool::new(false));
+        let (err_tx, err_rx) = mpsc::channel();
+        let (stats_tx, _stats_rx) = mpsc::channel();
+        let flow = DataFlow::new(
+            0,
+            Arc::new(AtomicBool::new(false)),
+            err_tx,
+            vec![
+                Box::new(SendToDroppedReceiverOperator),
+                Box::new(UpstreamCancellingOperator(upstream_cancel.clone())),
+            ],
+            vec![None, None],
+            vec![(0, 1)],
+            HashMap::default(),
+            stats_tx,
+            false,
+        );
+        (flow, upstream_cancel, err_rx)
+    }
+
+    #[test]
+    fn a_send_to_an_abandoned_upstream_does_not_fail_the_dataflow() {
+        let (mut flow, upstream_cancel, err_rx) = build_flow_sending_to_a_dropped_receiver();
+        upstream_cancel.store(true, Ordering::Release);
+
+        flow.run_ready_cpu_work(&RefCell::new(IORequester::default()));
+
+        assert!(err_rx.try_recv().is_err());
+        assert!(!flow.cancelled());
+        assert!(flow.graph.graph.node(0).is_finished());
+    }
+
+    #[test]
+    fn a_send_to_a_dropped_receiver_fails_a_dataflow_whose_upstream_is_wanted() {
+        crate::waker::install_test_worker_waker();
+        let (mut flow, _upstream_cancel, err_rx) = build_flow_sending_to_a_dropped_receiver();
+
+        flow.run_ready_cpu_work(&RefCell::new(IORequester::default()));
+
+        assert!(err_rx.try_recv().is_ok());
+        assert!(flow.cancelled());
     }
 
     /// Build a linear chain `0 -> 1 -> ... -> n-1` of [`LiveOperator`]s, where

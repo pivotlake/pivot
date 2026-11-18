@@ -136,6 +136,18 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// Whether this is a send failing because the operator that was to
+    /// receive the item has been dropped.
+    pub(crate) fn is_send_to_dropped_receiver(&self) -> bool {
+        use super::channels::Error::MpscSendError;
+        matches!(
+            self,
+            Error::Channel(MpscSendError) | Error::Group(group::Error::Channel(MpscSendError))
+        )
+    }
+}
+
 /// The core transform trait for unary operators.
 ///
 /// `I` is the input type (read from the upstream channel), `O` is the output type
