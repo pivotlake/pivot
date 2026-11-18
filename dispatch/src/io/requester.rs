@@ -2132,6 +2132,71 @@ mod tests {
         assert_eq!(server.join().unwrap(), sent);
     }
 
+    /// A store closes a keep-alive connection it has not heard from, and may
+    /// never answer what is sent on it afterwards. The next upload goes out
+    /// on a new connection instead of the closed one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_upload_avoids_a_pooled_connection_the_store_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_sender, closed_receiver) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut closed, _) = listener.accept().unwrap();
+            read_upload_body(&mut closed);
+            closed
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            // Closed for sending only: the socket still takes what arrives on
+            // it and answers none of it.
+            closed.shutdown(std::net::Shutdown::Write).unwrap();
+            closed_sender.send(()).unwrap();
+            let (mut fresh, _) = listener.accept().unwrap();
+            let body = read_upload_body(&mut fresh);
+            fresh
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            (closed, body)
+        });
+        // More than the two sockets hold between them, so an upload that
+        // nobody reads cannot finish sending.
+        init_test_free_pool(20);
+        let mut allocator = crate::memory::SlabAllocator::new(false);
+        let mut bytes = crate::memory::FileBytes::new();
+        for _ in 0..16 {
+            bytes.push_slab(allocator.get_slab_of_size(crate::memory::BUFFER_SIZE, true));
+        }
+        let data = Arc::new(bytes);
+        let url = Url::parse(&format!("http://{addr}/object.parquet")).unwrap();
+        let remote = Arc::new(RemoteFile::open(url, None, data.len() as u64).unwrap());
+        let mut requester = IORequester::default();
+        let upload_and_wait = |requester: &mut IORequester| {
+            let upload = HttpRequest::Upload(HttpUploadRequest {
+                remote: remote.clone(),
+                data: data.clone(),
+            });
+            requester
+                .submit_http_request_to_backend(DataFlowRequest::new(7, 11, upload))
+                .unwrap();
+            loop {
+                if let Some(completion) = requester.completions().unwrap().into_iter().next() {
+                    break completion;
+                }
+                requester.wait().unwrap();
+            }
+        };
+        assert!(upload_and_wait(&mut requester).is_ok());
+        closed_receiver.recv().unwrap();
+        // The close crosses the loopback after the server's call returns.
+        thread::sleep(Duration::from_millis(50));
+
+        let completion = upload_and_wait(&mut requester);
+
+        assert!(matches!(completion, Ok(Completion::HttpUpload(_))));
+        let sent: Vec<u8> = data.runs().flatten().copied().collect();
+        assert_eq!(server.join().unwrap().1, sent);
+    }
+
     /// Read one range request and write back its `206` response body.
     fn serve_one_range<S: Read + Write>(tls: &mut S) {
         let head = read_head(tls);
