@@ -1068,40 +1068,53 @@ fn small_file_batch(
     merge_target_bytes: u64,
     min_files: usize,
 ) -> Option<Vec<FileRef>> {
-    let mut total = 0u64;
-    let mut batch = Vec::with_capacity(MAX_SMALL_FILES_PER_MERGE);
-    for file in files.into_iter().take(MAX_SMALL_FILES_PER_MERGE) {
-        total += file.size;
-        batch.push(file);
-        if batch.len() >= 2 && total >= merge_target_bytes {
+    // A merge takes neighbours in the partition's order, at most
+    // `MAX_SMALL_FILES_PER_MERGE` of them. The first such run of files that
+    // makes a merge is taken: when the files a partition starts with make
+    // none, the ones after them still do.
+    for first in 0..files.len() {
+        let window = &files[first..files.len().min(first + MAX_SMALL_FILES_PER_MERGE)];
+        let mut total = 0u64;
+        let mut batch = Vec::with_capacity(window.len());
+        let mut reaches_merge_target = false;
+        for file in window {
+            total += file.size;
+            batch.push(file.clone());
+            if batch.len() >= 2 && total >= merge_target_bytes {
+                reaches_merge_target = true;
+                break;
+            }
+        }
+        if reaches_merge_target {
             return Some(batch);
         }
-    }
 
-    // A pile of as many files as a merge takes is merged whatever count was
-    // asked for: it would otherwise never be.
-    if batch.len() < min_files.clamp(2, MAX_SMALL_FILES_PER_MERGE) {
-        return None;
-    }
-
-    // A few disproportionately large files can make the whole pile a poor
-    // merge. Remove the current largest and run the same balance test again on
-    // everything that remains; the count threshold is only the entry condition.
-    while batch.len() >= 2 {
-        let largest = batch
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, file)| file.size)
-            .map(|(index, _)| index)
-            .expect("a non-empty batch has a largest file");
-        let largest_size = batch[largest].size;
-        let ratio = (total as f64 + FIXED_FILE_COST_BYTES * batch.len() as f64)
-            / (largest_size as f64 + FIXED_FILE_COST_BYTES);
-        if ratio >= MIN_BALANCE_RATIO {
-            return Some(batch);
+        // A run of as many files as a merge takes is merged whatever count
+        // was asked for: it would otherwise never be.
+        if batch.len() < min_files.clamp(2, MAX_SMALL_FILES_PER_MERGE) {
+            continue;
         }
-        total -= largest_size;
-        batch.swap_remove(largest);
+
+        // A few disproportionately large files can make the whole run a poor
+        // merge. Remove the current largest and run the same balance test
+        // again on everything that remains; the count threshold is only the
+        // entry condition.
+        while batch.len() >= 2 {
+            let largest = batch
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, file)| file.size)
+                .map(|(index, _)| index)
+                .expect("a non-empty batch has a largest file");
+            let largest_size = batch[largest].size;
+            let ratio = (total as f64 + FIXED_FILE_COST_BYTES * batch.len() as f64)
+                / (largest_size as f64 + FIXED_FILE_COST_BYTES);
+            if ratio >= MIN_BALANCE_RATIO {
+                return Some(batch);
+            }
+            total -= largest_size;
+            batch.swap_remove(largest);
+        }
     }
     None
 }
@@ -3259,6 +3272,21 @@ mod tests {
 
         assert_eq!(batch.len(), 9, "the check continues below 10 files");
         assert!(batch.iter().all(|file| file.path.as_str() != "outlier"));
+    }
+
+    #[test]
+    fn files_that_make_no_merge_do_not_keep_the_ones_after_them_from_merging() {
+        const MIB: u64 = 1024 * 1024;
+        let mut files: Vec<_> = [314, 56, 51, 45, 39]
+            .iter()
+            .map(|size| file_of_size(&format!("large-{size}"), size * MIB))
+            .collect();
+        files.extend((0..15).map(|index| file_of_size(&format!("fresh-{index}"), 7 * MIB)));
+
+        let batch = small_file_batch(files, 1300 * MIB, 10).unwrap();
+
+        assert!(batch.len() >= 2);
+        assert!(batch.iter().all(|file| file.size == 7 * MIB));
     }
 
     #[test]
