@@ -68,10 +68,10 @@ struct Options {
     static_dir: Option<PathBuf>,
     /// The pivot server's `compact_bytes`, in bytes: the size it cuts merged
     /// files at. The page tells which files a compaction would merge by it.
-    #[arg(long, env = "PIVOT_COMPACT_BYTES", default_value_t = 64 * 1024 * 1024)]
+    #[arg(long, env = "PIVOT_COMPACT_BYTES", default_value_t = 1024 * 1024 * 1024)]
     compact_bytes: u64,
     /// The pivot server's `compact_min_files`.
-    #[arg(long, env = "PIVOT_COMPACT_MIN_FILES", default_value_t = 100)]
+    #[arg(long, env = "PIVOT_COMPACT_MIN_FILES", default_value_t = 10)]
     compact_min_files: u64,
 }
 

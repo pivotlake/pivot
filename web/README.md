@@ -42,7 +42,7 @@ routine round would start.
 
 The server does not report a datastore's compaction settings, so the backend
 is told them: `--compact-bytes` and `--compact-min-files`, which default to
-the server's own defaults (64 MiB and 100).
+1 GiB and 10.
 
 ## Large files
 
