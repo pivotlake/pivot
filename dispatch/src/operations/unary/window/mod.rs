@@ -176,8 +176,10 @@ const BUCKETS_PER_WORKER: usize = 4;
 
 /// The most buckets a window uses. Every worker keeps a list of runs per
 /// bucket, and each bucket's sort handles its rows separately, so the
-/// per-bucket overhead has to stay small against a batch of rows.
-const MAX_BUCKET_COUNT: usize = 256;
+/// per-bucket overhead has to stay small against a batch of rows. The limit
+/// is high enough to keep [`BUCKETS_PER_WORKER`] on a machine with a couple
+/// of hundred workers.
+const MAX_BUCKET_COUNT: usize = 1024;
 
 /// The fewest buckets a partitioned window uses. The cost of planning a merge
 /// grows with the square of the rows in it, so even a small worker pool
