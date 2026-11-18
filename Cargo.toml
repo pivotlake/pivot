@@ -20,7 +20,7 @@ members = [
 exclude = ["arrow-rs", "perfy", "web"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # None of these crates is published to crates.io.

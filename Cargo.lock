@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "benchmarks"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "clap",
@@ -835,7 +835,7 @@ checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
 
 [[package]]
 name = "bin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1140,7 +1140,7 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "catalog"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "datastore-iceberg"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "datastore-pivotlake"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "dispatch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "duckdb-planner"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "autocxx",
@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "iceberg-tables"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -3677,7 +3677,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "metastore-disk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "catalog",
@@ -3909,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "object-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow-cast",
  "aws-credential-types",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "parquet-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4469,7 +4469,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "planner"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -6009,7 +6009,7 @@ dependencies = [
 
 [[package]]
 name = "table-file-index"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ahash 0.8.12",
  "hashbrown 0.17.1",
