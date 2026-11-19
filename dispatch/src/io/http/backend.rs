@@ -17,6 +17,10 @@
 //! outlives its deadline is cancelled by the kernel and the read is issued
 //! again on another connection.
 //!
+//! A new connection needs an address for the store's host. The engine asks a
+//! name server for it on the same ring and keeps the answer for the next
+//! connections, so a worker never blocks on resolving a name.
+//!
 //! On non-Linux (macOS) there is no ring: the engine hands each range read to a
 //! shared pool of blocking `std::net` + `rustls::StreamOwned` threads (mirroring
 //! the file path's `pread` pool) and collects their completions over a channel,
@@ -235,7 +239,15 @@ mod blocking_engine {
 
     fn connect(client_config: &Arc<rustls::ClientConfig>, request: &RemoteRequest) -> Result<Conn> {
         let remote = request.remote();
-        let tcp = TcpStream::connect_timeout(&remote.addr(), CONNECT_TIMEOUT)?;
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(remote.host(), remote.port()))?
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "host resolved to no addresses",
+                )
+            })?;
+        let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
         tcp.set_nodelay(true).ok();
         // These bound every read/write so a hung server can't pin a pool thread
         // (and stall Drop) forever, so a failure to set them must fail the
@@ -557,6 +569,7 @@ mod blocking_engine {
 mod uring_engine {
     use super::*;
     use crate::Identifier;
+    use crate::io::http::dns::{self, AddressBook, AddressChoice, DnsError, NameServers};
     use crate::io::http::http1;
     use crate::io::http::{Error, Result};
     use io_uring::{IoUring, opcode, squeue, types};
@@ -572,6 +585,20 @@ mod uring_engine {
     /// opposed to the CQE of the operation itself. Only the operation's own CQE
     /// drives an exchange, so a CQE carrying this bit is dropped on arrival.
     const STEP_DEADLINE_TAG: u64 = 1 << 62;
+
+    /// Marks the CQE of a host lookup's send or recv, as opposed to an
+    /// exchange's. The rest of its `user_data` is the lookup's slot. Bit 61
+    /// is taken by the timer of the receive allowance.
+    const LOOKUP_TAG: u64 = 1 << 60;
+
+    /// How long a name server's answer is waited for before the question is
+    /// sent again. A name server on the machine or its network answers in a
+    /// few milliseconds, so an answer this late was lost.
+    const LOOKUP_ATTEMPT_DEADLINE: Duration = Duration::from_millis(100);
+
+    /// How many times a lookup's question is sent before the requests waiting
+    /// for its answer fail.
+    const MAX_LOOKUP_ATTEMPTS: u32 = 5;
 
     /// A read's connect or recv that completes nothing for this many typical
     /// read times is taken for stalled. One step is a fraction of a whole read,
@@ -705,6 +732,8 @@ mod uring_engine {
         fd: OwnedFd,
         transport: Transport,
         host_key: String,
+        /// The address of the store this connection goes to.
+        addr: SocketAddr,
         /// Connect target; boxed so the SQE can hold a stable pointer to it.
         sockaddr: Box<libc::sockaddr_storage>,
         sockaddr_len: libc::socklen_t,
@@ -759,6 +788,71 @@ mod uring_engine {
     /// store before it discards the rest of that host's pool unchecked. The
     /// ones left are older still, so they are very likely closed too.
     const MAX_CLOSED_POOLED_IN_A_ROW: usize = 64;
+
+    /// A request that has no connection yet, with what it has used of its
+    /// retries so far.
+    struct WaitingRequest {
+        id: Identifier,
+        request: RemoteRequest,
+        retries: u32,
+        deadline_reissues: u32,
+    }
+
+    /// What a lookup's last in-flight SQE was.
+    enum LookupStep {
+        SendingQuestion,
+        ReceivingAnswer,
+    }
+
+    /// One question to a name server for the addresses of a host, and the
+    /// requests that cannot connect until it is answered. A lookup that only
+    /// brings a host's addresses up to date has nobody waiting.
+    struct Lookup {
+        host: String,
+        waiting: Vec<WaitingRequest>,
+        /// How many times the question has been sent.
+        attempts: u32,
+        /// The socket of the current attempt, pointed at its name server.
+        /// Each attempt has its own, so a late answer to an earlier attempt
+        /// is never read.
+        socket: Option<OwnedFd>,
+        question: Vec<u8>,
+        question_id: u16,
+        /// Where the answer is received. Boxed, like `deadline`, so the
+        /// address the SQE carries stays put while the lookup slab grows.
+        answer: Box<[u8; dns::MAX_ANSWER_LEN]>,
+        deadline: Box<types::Timespec>,
+        step: LookupStep,
+    }
+
+    impl Lookup {
+        /// Open a datagram socket that sends to and receives from `server`
+        /// only. Pointing a datagram socket at its peer sends nothing, so
+        /// this returns at once.
+        fn open_socket(server: SocketAddr) -> std::io::Result<OwnedFd> {
+            let domain = match server {
+                SocketAddr::V4(_) => libc::AF_INET,
+                SocketAddr::V6(_) => libc::AF_INET6,
+            };
+            let raw = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+            let (sockaddr, sockaddr_len) = to_sockaddr(server);
+            let connected = unsafe {
+                libc::connect(
+                    socket.as_raw_fd(),
+                    sockaddr.as_ref() as *const libc::sockaddr_storage as *const libc::sockaddr,
+                    sockaddr_len,
+                )
+            };
+            if connected < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(socket)
+        }
+    }
 
     /// One complete HTTP request/response exchange, owning a connection while it
     /// is active. Dropping this value releases all request-specific resources;
@@ -1209,7 +1303,16 @@ mod uring_engine {
         free_slots: Vec<usize>,
         /// host_key -> idle reusable connections, the longest idle first.
         pool: HashMap<String, Vec<IdleConn>>,
-        /// Requests in flight (not counting idle pooled connections).
+        /// Where host names are resolved, as the machine configures it.
+        name_servers: NameServers,
+        /// What each host last resolved to.
+        address_book: AddressBook,
+        /// Stable-index slab of the lookups in flight; the index (tagged with
+        /// [`LOOKUP_TAG`]) is the SQE `user_data`.
+        lookups: Vec<Option<Lookup>>,
+        free_lookup_slots: Vec<usize>,
+        /// Requests in flight, counting the ones waiting for a lookup and not
+        /// counting idle pooled connections.
         active: usize,
         /// Ids whose body fully landed during the last completion routing pass,
         /// each with what the store answered beyond a read's bytes.
@@ -1235,6 +1338,10 @@ mod uring_engine {
                 exchanges: Vec::new(),
                 free_slots: Vec::new(),
                 pool: HashMap::new(),
+                name_servers: NameServers::load(),
+                address_book: AddressBook::new(),
+                lookups: Vec::new(),
+                free_lookup_slots: Vec::new(),
                 active: 0,
                 completed: Vec::new(),
                 failed: Vec::new(),
@@ -1252,6 +1359,19 @@ mod uring_engine {
         #[cfg(test)]
         pub fn force_step_deadline_bounds(&mut self, shortest: Duration, longest: Duration) {
             self.step_deadline_bounds = StepDeadlineBounds { shortest, longest };
+        }
+
+        /// Ask `servers` for host addresses instead of the machine's name
+        /// servers, so a test controls what a host resolves to.
+        #[cfg(test)]
+        pub fn force_name_servers(&mut self, servers: Vec<SocketAddr>) {
+            self.name_servers.force_servers(servers);
+        }
+
+        /// Look a host up again once its answer is `refresh_after` old.
+        #[cfg(test)]
+        pub fn force_address_refresh_age(&mut self, refresh_after: Duration) {
+            self.address_book.force_refresh_after(refresh_after);
         }
 
         /// Ids of the reads issued again for a missed step deadline since the
@@ -1298,23 +1418,33 @@ mod uring_engine {
             id: Identifier,
             request: RemoteRequest,
         ) -> Result<()> {
-            let (conn, state) = self.take_connection(&request)?;
-            let exchange = HttpExchange::new(conn, id, request, state);
-            self.launch(ring, exchange)
+            if let Some(conn) = self.take_pooled_connection(&request) {
+                let exchange = HttpExchange::new(conn, id, request, State::Sending);
+                return self.launch(ring, exchange);
+            }
+            self.active += 1;
+            self.connect_or_await_address(
+                ring,
+                WaitingRequest {
+                    id,
+                    request,
+                    retries: 0,
+                    deadline_reissues: 0,
+                },
+            )
         }
 
-        /// A connection for `request` and the state its exchange starts in: an
-        /// idle keep-alive connection ready to send on, or a fresh socket still
-        /// to connect. The exchange owns it until the response completes or the
-        /// connection fails. A `POST` always gets a fresh socket: an idle
-        /// connection may have been closed by the store, which a request that
-        /// is sent only once cannot recover from.
+        /// An idle keep-alive connection `request` can be sent on, if the
+        /// pool has one. The exchange owns it until the response completes or
+        /// the connection fails. A `POST` never gets one: an idle connection
+        /// may have been closed by the store, which a request that is sent
+        /// only once cannot recover from.
         ///
         /// The most recently used idle connection is tried first, and one the
         /// store has closed meanwhile is closed here for the next. Once the
         /// youngest left has idled too long, so have all the others, and the
         /// whole pool for that host is closed.
-        fn take_connection(&mut self, request: &RemoteRequest) -> Result<(Conn, State)> {
+        fn take_pooled_connection(&mut self, request: &RemoteRequest) -> Option<Conn> {
             let key = host_key(request.remote());
             if !request.is_post()
                 && let Some(idle) = self.pool.get_mut(&key)
@@ -1323,7 +1453,7 @@ mod uring_engine {
                 while let Some(candidate) = idle.pop() {
                     let idled_too_long = candidate.idle_since.elapsed() > MAX_POOLED_IDLE;
                     if !idled_too_long && candidate.conn.is_open_and_quiet() {
-                        return Ok((candidate.conn, State::Sending));
+                        return Some(candidate.conn);
                     }
                     closed_in_a_row += 1;
                     if idled_too_long || closed_in_a_row == MAX_CLOSED_POOLED_IN_A_ROW {
@@ -1331,7 +1461,214 @@ mod uring_engine {
                     }
                 }
             }
-            Ok((self.new_conn(key, request)?, State::Connecting))
+            None
+        }
+
+        /// Open a new connection for `waiting`, a request already counted in
+        /// `active`. A host whose addresses are not known is looked up first,
+        /// and the request connects when the answer arrives.
+        fn connect_or_await_address(
+            &mut self,
+            ring: &mut IoUring,
+            waiting: WaitingRequest,
+        ) -> Result<()> {
+            let host = waiting.request.remote().host().to_string();
+            let port = waiting.request.remote().port();
+            let address = match self.name_servers.find_fixed_address(&host) {
+                Some(address) => address,
+                None => match self.address_book.choose_address(&host, Instant::now()) {
+                    AddressChoice::Fresh(address) => address,
+                    AddressChoice::DueForRefresh(address) => {
+                        if self.find_lookup(&host).is_none() {
+                            self.start_lookup(ring, host, Vec::new())?;
+                        }
+                        address
+                    }
+                    AddressChoice::Unknown => {
+                        return match self.find_lookup(&host) {
+                            Some(idx) => {
+                                let lookup = self.lookups[idx].as_mut().unwrap();
+                                lookup.waiting.push(waiting);
+                                Ok(())
+                            }
+                            None => self.start_lookup(ring, host, vec![waiting]),
+                        };
+                    }
+                },
+            };
+
+            let WaitingRequest {
+                id,
+                request,
+                retries,
+                deadline_reissues,
+            } = waiting;
+            let key = host_key(request.remote());
+            match self.new_conn(key, &request, SocketAddr::new(address, port)) {
+                Ok(conn) => {
+                    let mut exchange = HttpExchange::new(conn, id, request, State::Connecting);
+                    exchange.retries = retries;
+                    exchange.deadline_reissues = deadline_reissues;
+                    let idx = self.alloc_slot(exchange);
+                    self.start_connect(ring, idx)
+                }
+                // Couldn't even build the socket — treat as a terminal failure.
+                Err(error) => {
+                    self.active -= 1;
+                    self.failed.push((id, error));
+                    Ok(())
+                }
+            }
+        }
+
+        /// The slot of the lookup in flight for `host`, if there is one.
+        fn find_lookup(&self, host: &str) -> Option<usize> {
+            self.lookups
+                .iter()
+                .position(|lookup| lookup.as_ref().is_some_and(|lookup| lookup.host == host))
+        }
+
+        /// Ask a name server for the addresses of `host`. The requests in
+        /// `waiting` connect once it answers.
+        fn start_lookup(
+            &mut self,
+            ring: &mut IoUring,
+            host: String,
+            waiting: Vec<WaitingRequest>,
+        ) -> Result<()> {
+            let lookup = Lookup {
+                host,
+                waiting,
+                attempts: 0,
+                socket: None,
+                question: Vec::new(),
+                question_id: 0,
+                answer: Box::new([0u8; dns::MAX_ANSWER_LEN]),
+                deadline: Box::new(
+                    types::Timespec::new()
+                        .sec(LOOKUP_ATTEMPT_DEADLINE.as_secs())
+                        .nsec(LOOKUP_ATTEMPT_DEADLINE.subsec_nanos()),
+                ),
+                step: LookupStep::SendingQuestion,
+            };
+            let idx = match self.free_lookup_slots.pop() {
+                Some(idx) => {
+                    self.lookups[idx] = Some(lookup);
+                    idx
+                }
+                None => {
+                    self.lookups.push(Some(lookup));
+                    self.lookups.len() - 1
+                }
+            };
+            self.send_question(ring, idx)
+        }
+
+        /// Send the question of the lookup at slot `idx` to the next name
+        /// server, on a socket of its own. A lookup that has used all its
+        /// attempts fails the requests waiting for it.
+        fn send_question(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
+            let lookup = self.lookups[idx].as_ref().unwrap();
+            let host = lookup.host.clone();
+            let attempts = lookup.attempts;
+            if attempts == MAX_LOOKUP_ATTEMPTS {
+                return self.fail_lookup(idx, || {
+                    DnsError::NoAnswer {
+                        host: host.clone(),
+                        attempts,
+                    }
+                    .into()
+                });
+            }
+            let Some(server) = self.name_servers.choose_server(attempts) else {
+                return self
+                    .fail_lookup(idx, || DnsError::NoNameServer { host: host.clone() }.into());
+            };
+            let question_id = rand::random::<u16>();
+            let question = match dns::encode_question(question_id, &host) {
+                Ok(question) => question,
+                Err(error) => return self.fail_lookup(idx, || error.clone().into()),
+            };
+            let socket = match Lookup::open_socket(server) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    let kind = error.kind();
+                    let description = error.to_string();
+                    return self.fail_lookup(idx, || {
+                        Error::Io(std::io::Error::new(kind, description.clone()))
+                    });
+                }
+            };
+
+            let lookup = self.lookups[idx].as_mut().unwrap();
+            lookup.attempts += 1;
+            lookup.question_id = question_id;
+            lookup.question = question;
+            lookup.step = LookupStep::SendingQuestion;
+            let entry = opcode::Send::new(
+                types::Fd(socket.as_raw_fd()),
+                lookup.question.as_ptr(),
+                lookup.question.len() as u32,
+            )
+            .build()
+            .user_data(HTTP_TAG | LOOKUP_TAG | idx as u64);
+            lookup.socket = Some(socket);
+            push(ring, &entry)
+        }
+
+        /// Advance the lookup at slot `idx` after its SQE completed with
+        /// kernel result `result`. A question that could not be sent, or
+        /// whose answer did not arrive in time, is sent again.
+        fn on_lookup_cqe(&mut self, ring: &mut IoUring, idx: usize, result: i32) -> Result<()> {
+            if result < 0 {
+                return self.send_question(ring, idx);
+            }
+            let lookup = self.lookups[idx]
+                .as_mut()
+                .expect("cqe for a lookup in flight");
+            if let LookupStep::SendingQuestion = lookup.step {
+                lookup.step = LookupStep::ReceivingAnswer;
+                let socket = lookup
+                    .socket
+                    .as_ref()
+                    .expect("a sent question has a socket");
+                let entry = opcode::Recv::new(
+                    types::Fd(socket.as_raw_fd()),
+                    lookup.answer.as_mut_ptr(),
+                    dns::MAX_ANSWER_LEN as u32,
+                )
+                .build()
+                .user_data(HTTP_TAG | LOOKUP_TAG | idx as u64);
+                let deadline = &*lookup.deadline as *const types::Timespec;
+                return push_with_step_deadline(ring, entry, deadline, idx);
+            }
+
+            let answer = &lookup.answer[..result as usize];
+            let addresses = match dns::parse_answer(answer, lookup.question_id) {
+                Ok(addresses) => addresses,
+                Err(DnsError::AnswerToAnotherQuestion) => return self.send_question(ring, idx),
+                Err(error) => return self.fail_lookup(idx, || error.clone().into()),
+            };
+            let lookup = self.lookups[idx].take().unwrap();
+            self.free_lookup_slots.push(idx);
+            self.address_book
+                .record_answer(&lookup.host, &addresses, Instant::now());
+            for waiting in lookup.waiting {
+                self.connect_or_await_address(ring, waiting)?;
+            }
+            Ok(())
+        }
+
+        /// End the lookup at slot `idx` without an answer and fail every
+        /// request waiting for it with the error `build_error` makes.
+        fn fail_lookup(&mut self, idx: usize, build_error: impl Fn() -> Error) -> Result<()> {
+            let lookup = self.lookups[idx].take().unwrap();
+            self.free_lookup_slots.push(idx);
+            for waiting in lookup.waiting {
+                self.active -= 1;
+                self.failed.push((waiting.id, build_error()));
+            }
+            Ok(())
         }
 
         /// Keep `conn` for the next request to its host, and close the
@@ -1351,16 +1688,12 @@ mod uring_engine {
             });
         }
 
-        /// Put `exchange` in flight: give it a slot and submit its first SQE.
+        /// Put `exchange`, which has a connected connection, in flight: give
+        /// it a slot and submit its first SQE.
         fn launch(&mut self, ring: &mut IoUring, exchange: HttpExchange) -> Result<()> {
-            let connecting = matches!(exchange.state, State::Connecting);
             let idx = self.alloc_slot(exchange);
             self.active += 1;
-            if connecting {
-                self.start_connect(ring, idx)
-            } else {
-                self.pump(ring, idx)
-            }
+            self.pump(ring, idx)
         }
 
         /// Advance the connection identified by a tagged `user_data` after its SQE
@@ -1381,6 +1714,10 @@ mod uring_engine {
         pub fn on_cqe(&mut self, ring: &mut IoUring, user_data: u64, result: i32) -> Result<()> {
             if user_data & STEP_DEADLINE_TAG != 0 {
                 return Ok(());
+            }
+            if user_data & LOOKUP_TAG != 0 {
+                let idx = (user_data & !(HTTP_TAG | LOOKUP_TAG)) as usize;
+                return self.on_lookup_cqe(ring, idx, result);
             }
             let idx = (user_data & !HTTP_TAG) as usize;
 
@@ -1497,7 +1834,6 @@ mod uring_engine {
                 .take()
                 .expect("cqe for an active HTTP exchange");
             self.free_slots.push(idx);
-            self.active -= 1;
             let HttpExchange {
                 conn,
                 id,
@@ -1506,22 +1842,31 @@ mod uring_engine {
                 request,
                 ..
             } = stalled;
+            self.address_book.record_failure(
+                request.remote().host(),
+                conn.addr.ip(),
+                Instant::now(),
+            );
             drop(conn); // close the stalled socket before issuing the read again
             self.reissued.push(id);
 
-            match self.take_connection(&request) {
-                Ok((conn, state)) => {
-                    let mut fresh = HttpExchange::new(conn, id, request, state);
-                    fresh.retries = retries;
-                    fresh.deadline_reissues = deadline_reissues + 1;
-                    self.launch(ring, fresh)
-                }
-                // Couldn't even build the socket — treat as a terminal failure.
-                Err(error) => {
-                    self.failed.push((id, error));
-                    Ok(())
-                }
+            if let Some(conn) = self.take_pooled_connection(&request) {
+                let mut fresh = HttpExchange::new(conn, id, request, State::Sending);
+                fresh.retries = retries;
+                fresh.deadline_reissues = deadline_reissues + 1;
+                // `launch` counts the read as active again.
+                self.active -= 1;
+                return self.launch(ring, fresh);
             }
+            self.connect_or_await_address(
+                ring,
+                WaitingRequest {
+                    id,
+                    request,
+                    retries,
+                    deadline_reissues: deadline_reissues + 1,
+                },
+            )
         }
 
         /// Handle a dead connection for the request at slot `idx`: tear it down
@@ -1542,29 +1887,32 @@ mod uring_engine {
                 retries,
                 deadline_reissues,
                 request,
+                state,
                 ..
             } = dead;
-            let key = conn.host_key.clone();
+            // An address that does not accept a connection is passed over
+            // for the next ones.
+            if let State::Connecting = state {
+                self.address_book.record_failure(
+                    request.remote().host(),
+                    conn.addr.ip(),
+                    Instant::now(),
+                );
+            }
             drop(conn); // close the failed socket before reconnecting
 
             // A `POST` is sent once: the store may have acted on it before
             // the connection failed.
             if is_retryable(&err) && retries < MAX_HTTP_RETRIES && !request.is_post() {
-                match self.new_conn(key, &request) {
-                    Ok(conn) => {
-                        let mut fresh = HttpExchange::new(conn, id, request, State::Connecting);
-                        fresh.retries = retries + 1;
-                        fresh.deadline_reissues = deadline_reissues;
-                        let new_idx = self.alloc_slot(fresh);
-                        return self.start_connect(ring, new_idx);
-                    }
-                    // Couldn't even build the socket — treat as a terminal failure.
-                    Err(e) => {
-                        self.active -= 1;
-                        self.failed.push((id, e));
-                        return Ok(());
-                    }
-                }
+                return self.connect_or_await_address(
+                    ring,
+                    WaitingRequest {
+                        id,
+                        request,
+                        retries: retries + 1,
+                        deadline_reissues,
+                    },
+                );
             }
 
             self.active -= 1;
@@ -1572,9 +1920,8 @@ mod uring_engine {
             Ok(())
         }
 
-        fn new_conn(&self, key: String, request: &RemoteRequest) -> Result<Conn> {
+        fn new_conn(&self, key: String, request: &RemoteRequest, addr: SocketAddr) -> Result<Conn> {
             let remote = request.remote();
-            let addr = remote.addr();
             let domain = match addr {
                 SocketAddr::V4(_) => libc::AF_INET,
                 SocketAddr::V6(_) => libc::AF_INET6,
@@ -1601,6 +1948,7 @@ mod uring_engine {
                 fd,
                 transport,
                 host_key: key,
+                addr,
                 sockaddr,
                 sockaddr_len,
                 out_buf: Vec::new(),
