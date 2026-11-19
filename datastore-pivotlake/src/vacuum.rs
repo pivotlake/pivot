@@ -188,7 +188,7 @@ impl Vacuumer {
             return Ok(None);
         }
         let commit_queue = table.commit_queue();
-        let _committing = commit_queue.lock_to_commit();
+        let _committing = commit_queue.take_turn();
         let mut latest = self
             .datastore
             .table_handle_by_id(&table.id())
