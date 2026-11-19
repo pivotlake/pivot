@@ -53,6 +53,19 @@ impl LeafDecoder for AbsentLeafDecoder {
         Ok(null_array_on_slabs(allocator, &self.data_type, size))
     }
 
+    fn read_selected(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        _rows: usize,
+        positions: &[u32],
+    ) -> Result<ArrayRef> {
+        Ok(null_array_on_slabs(
+            allocator,
+            &self.data_type,
+            positions.len(),
+        ))
+    }
+
     /// The column holds no value, so no constant can ever match; the query's
     /// own `Filter` rejects every row, which needs no help from here.
     fn set_eq_constant(&mut self, _value: &Scalar<ArrayRef>) {}

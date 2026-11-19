@@ -9,8 +9,8 @@ use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, equality_predicates, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, ScanPushdown, materialize, prune_parquet, row_group_filter_from,
+    scan_order_from, table_input_with_filter_and_pushdown,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
@@ -43,9 +43,12 @@ pub struct TableBinding {
     /// Per-column footer-derived nullability, in `columns` order (see
     /// [`CatalogTable::nullability`](super::table::CatalogTable)).
     nullability: Vec<bool>,
-    /// Single-column predicates pushed down for this binding (recorded here
+    /// The filters pushed down for this binding, as offered (recorded here
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
-    /// `compile`); applied as a filter when the scan is compiled.
+    /// `compile`); the scan drops the rows it can decide they fail.
+    filters: Vec<Expression>,
+    /// The single-column comparisons among `filters`, which prune files and
+    /// row groups when the scan is compiled.
     predicates: Vec<PushedPredicate>,
     /// The transaction's staging queue, shared (`Arc`) with the
     /// [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
@@ -79,6 +82,7 @@ impl TableBinding {
             table,
             columns,
             nullability,
+            filters: Vec::new(),
             predicates: Vec::new(),
             commit_actions,
         }
@@ -169,21 +173,21 @@ impl BoundTable for TableBinding {
 
         // A variant path predicate reaches its shredded typed leaf only in the
         // files that shred it, so each row group resolves the path itself.
-        let eq_predicates = equality_predicates(&self.predicates);
+        let pushdown = ScanPushdown::new(&self.filters, &projection);
 
         // Prune the row groups by the pushed-down predicates' stats.
         let parquet = Arc::new(self.pruned_parquet(&current));
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_filter_and_pushdown(
             dispatcher,
             &parquet,
             projection,
             emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
             scan_order,
-            Arc::new(eq_predicates),
+            pushdown,
         ))
     }
 
@@ -237,11 +241,13 @@ impl BoundTable for TableBinding {
 
     fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
         // Just record it. The actual pruning (min/max row-group elimination and
-        // equality/dictionary pruning) happens in `compile`, once the row-group
-        // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
-        // so this is purely an optimization and never affects correctness.
+        // equality/dictionary pruning) and the scan's own row filtering happen
+        // in `compile`, once the row-group metadata exists. The upstream
+        // `Filter` is kept (we return `Ok(false)`), so this is purely an
+        // optimization and never affects correctness.
         self.predicates
             .extend(PushedPredicate::from_filter(&filter));
+        self.filters.push(filter);
 
         Ok(false)
     }

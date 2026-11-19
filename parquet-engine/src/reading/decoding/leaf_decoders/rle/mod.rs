@@ -313,6 +313,93 @@ impl Run {
         }
     }
 
+    /// How many values this run yields when at most `limit` are wanted.
+    fn count_values_up_to(&self, limit: usize) -> usize {
+        match self {
+            Run::Rle { count, .. } => (*count).min(limit),
+            Run::BitPacked {
+                remaining_in_run, ..
+            } => (*remaining_in_run).min(limit),
+        }
+    }
+
+    /// Consumes up to `limit` values of this run, pushing the entries of the
+    /// ones at `positions` into `builder`. `positions` are ascending, all
+    /// inside the consumed values, and the first of those is position
+    /// `first`.
+    ///
+    /// A repeated run looks its entry up once. A bit-packed run unpacks its
+    /// keys in bulk and looks up only the kept ones.
+    ///
+    /// Returns the rest of the run when it was not consumed whole.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_into<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+        self,
+        builder: &mut B,
+        scratch: &mut [u32; 1024],
+        data: &[Bytes],
+        bit_width: u8,
+        position: &mut ReaderPosition,
+        dict: &D,
+        limit: usize,
+        positions: &[u32],
+        first: u32,
+    ) -> Option<Self> {
+        match self {
+            Run::Rle { value, mut count } => {
+                // A run's value fills whole bytes, so it can exceed both the
+                // bit width and the dictionary, and slab-backed dictionaries
+                // index with no bounds check of their own.
+                assert!(
+                    (value as usize) < dict.len(),
+                    "dictionary key {value} out of range ({} entries)",
+                    dict.len()
+                );
+                builder.push(&dict.entry(value as usize), positions.len());
+                count -= count.min(limit);
+                (count > 0).then_some(Run::Rle { value, count })
+            }
+            Run::BitPacked {
+                remaining_in_run,
+                partial,
+                partial_count,
+            } => {
+                let keys_in_range = (1u64 << bit_width) as usize <= dict.len();
+                let mut kept_keys = [0u32; 1024];
+                // The position of the chunk about to be unpacked, and how far
+                // into `positions` the chunks so far reached. Both only move
+                // forward, so no chunk searches for its positions.
+                let mut chunk_first = first as usize;
+                let mut cursor = 0;
+                let (_, leftover) = decode_bitpacked(
+                    remaining_in_run,
+                    partial,
+                    partial_count,
+                    scratch,
+                    data,
+                    bit_width,
+                    position,
+                    limit,
+                    |scratch, count| {
+                        let chunk_end = chunk_first + count;
+                        let mut kept = 0;
+                        while cursor < positions.len() && (positions[cursor] as usize) < chunk_end {
+                            kept_keys[kept] = scratch[positions[cursor] as usize - chunk_first];
+                            kept += 1;
+                            cursor += 1;
+                        }
+                        if kept > 0 {
+                            let keys = &kept_keys[..kept];
+                            push_entries_for_keys(builder, dict, keys, keys_in_range);
+                        }
+                        chunk_first = chunk_end;
+                    },
+                );
+                leftover
+            }
+        }
+    }
+
     /// Advances past up to `amount` values without writing them.
     ///
     /// Returns `(skipped, remaining_run)` — the number of values actually
@@ -425,6 +512,60 @@ impl RleDecoder {
             self.run = run;
             size -= skipped;
         }
+    }
+
+    /// Decodes the values at `positions` out of the next `span` values,
+    /// looking each one up in `dict`, and steps over the rest. `positions` are
+    /// ascending, and the first of the `span` values is position `first`.
+    ///
+    /// Only the runs that hold a kept value are decoded. The values before
+    /// the first kept one, after the last, and every run in between that
+    /// holds none are skipped, which for a bit-packed run is a jump over
+    /// whole groups.
+    pub fn gather<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+        &mut self,
+        builder: &mut B,
+        dict: &D,
+        positions: &[u32],
+        first: u32,
+        span: usize,
+    ) {
+        let (Some(&lowest), Some(&highest)) = (positions.first(), positions.last()) else {
+            self.skip(span);
+            return;
+        };
+        let mut consumed = (lowest - first) as usize;
+        self.skip(consumed);
+        let end = (highest - first) as usize + 1;
+        let mut cursor = 0;
+        while consumed < end {
+            let run = self.get_or_set_next_run();
+            let taken = run.count_values_up_to(end - consumed);
+            let run_first = first + consumed as u32;
+            let run_end = run_first + taken as u32;
+            let start = cursor;
+            while cursor < positions.len() && positions[cursor] < run_end {
+                cursor += 1;
+            }
+            self.run = if start == cursor {
+                run.skip(&self.data, self.bit_width, &mut self.position, taken)
+                    .1
+            } else {
+                run.gather_into(
+                    builder,
+                    &mut self.buffer,
+                    &self.data,
+                    self.bit_width,
+                    &mut self.position,
+                    dict,
+                    taken,
+                    &positions[start..cursor],
+                    run_first,
+                )
+            };
+            consumed += taken;
+        }
+        self.skip(span - end);
     }
 
     /// Decodes runs straight out of the current buffer for as long as each
@@ -693,6 +834,56 @@ mod tests {
         let result = push_all(&mut allocator, &mut dec, &dict, 26);
 
         assert_eq!(result, mixed_short_runs_values());
+    }
+
+    fn gather_strings(
+        allocator: &mut SlabAllocator,
+        decoder: &mut RleDecoder,
+        dict: &ViewDict<StringViewType>,
+        positions: &[u32],
+        first: u32,
+        span: usize,
+    ) -> Vec<String> {
+        let mut buf = ViewBuilder::with_capacity(allocator, positions.len());
+        dict.register_onto(&mut buf);
+        decoder.gather(&mut buf, dict, positions, first, span);
+        extract_strings(buf)
+    }
+
+    /// A gather emits the values at its positions whichever kind of run holds
+    /// them, and leaves the decoder past the whole span.
+    #[test]
+    fn gathers_positions_from_repeated_and_bit_packed_runs() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let mut dec = new_decoder(MIXED_SHORT_RUNS.to_vec(), 2);
+        let positions = [0, 6, 8, 12, 14, 21];
+
+        let gathered = gather_strings(&mut allocator, &mut dec, &dict, &positions, 0, 24);
+        let rest = push_all(&mut allocator, &mut dec, &dict, 2);
+
+        let values = mixed_short_runs_values();
+        let expected: Vec<&str> = positions.iter().map(|&p| values[p as usize]).collect();
+        assert_eq!(gathered, expected);
+        assert_eq!(rest, vec!["AA"; 2]);
+    }
+
+    /// The values before the first position, the run between the two that
+    /// holds none, and the values after the last are all stepped over. The
+    /// span's first value is position 100.
+    #[test]
+    fn gather_steps_over_runs_holding_no_position() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let mut dec = new_decoder(MIXED_SHORT_RUNS.to_vec(), 2);
+
+        let gathered = gather_strings(&mut allocator, &mut dec, &dict, &[109, 122], 100, 24);
+        let rest = push_all(&mut allocator, &mut dec, &dict, 2);
+
+        assert_eq!(gathered, vec!["AA", "CC"]);
+        assert_eq!(rest, vec!["AA"; 2]);
     }
 
     /// Reads that end inside a repeated run and inside a bit-packed group

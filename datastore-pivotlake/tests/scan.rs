@@ -1750,7 +1750,9 @@ fn scan_pushed_bare_extract_yields_a_subvariant() {
 fn scan_pushed_extract_filters_by_an_equality_constant() {
     use arrow_array::Scalar;
     use dispatch::VariantExtract;
-    use parquet_engine::{ScanEqualityPredicate, table_input_with_filter_and_eq_predicates};
+    use parquet_engine::{
+        ScanEqualityPredicate, ScanPushdown, table_input_with_filter_and_pushdown,
+    };
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let dispatch = dispatch(1);
@@ -1783,14 +1785,17 @@ fn scan_pushed_extract_filters_by_an_equality_constant() {
         value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
     };
 
-    let results = table_input_with_filter_and_eq_predicates(
+    let results = table_input_with_filter_and_pushdown(
         &dispatch,
         &table,
         projection,
         false,
         None,
         None,
-        Arc::new(vec![predicate]),
+        ScanPushdown {
+            eq_predicates: Arc::new(vec![predicate]),
+            conditions: Arc::default(),
+        },
     )
     .collect()
     .unwrap();
@@ -1810,7 +1815,9 @@ fn scan_pushed_extract_filters_by_an_equality_constant() {
 fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
     use arrow_array::Scalar;
     use dispatch::VariantExtract;
-    use parquet_engine::{ScanEqualityPredicate, table_input_with_filter_and_eq_predicates};
+    use parquet_engine::{
+        ScanEqualityPredicate, ScanPushdown, table_input_with_filter_and_pushdown,
+    };
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let dispatch = dispatch(1);
@@ -1842,14 +1849,17 @@ fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
         value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
     };
 
-    let results = table_input_with_filter_and_eq_predicates(
+    let results = table_input_with_filter_and_pushdown(
         &dispatch,
         &table,
         projection,
         false,
         None,
         None,
-        Arc::new(vec![predicate]),
+        ScanPushdown {
+            eq_predicates: Arc::new(vec![predicate]),
+            conditions: Arc::default(),
+        },
     )
     .collect()
     .unwrap();
@@ -1868,7 +1878,9 @@ fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
 fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
     use arrow_array::Scalar;
     use dispatch::VariantExtract;
-    use parquet_engine::{ScanEqualityPredicate, table_input_with_filter_and_eq_predicates};
+    use parquet_engine::{
+        ScanEqualityPredicate, ScanPushdown, table_input_with_filter_and_pushdown,
+    };
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let dispatch = dispatch(1);
@@ -1902,14 +1914,17 @@ fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
         value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
     };
 
-    let results = table_input_with_filter_and_eq_predicates(
+    let results = table_input_with_filter_and_pushdown(
         &dispatch,
         &table,
         projection,
         false,
         None,
         None,
-        Arc::new(vec![predicate]),
+        ScanPushdown {
+            eq_predicates: Arc::new(vec![predicate]),
+            conditions: Arc::default(),
+        },
     )
     .collect()
     .unwrap();
@@ -1918,6 +1933,337 @@ fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
         results[0].column(0).as_string::<i32>(),
         &arrow_array::StringArray::from(vec!["alice", "bob"])
     );
+}
+
+/// `CAST(doc-><path> AS <as_type>) = <value>`, the shape a typed variant
+/// comparison is pushed down in.
+fn create_variant_path_equality(
+    path: &str,
+    as_type: planner::types::Type,
+    value: ArrayRef,
+) -> planner::expression::Expression {
+    use planner::expression::{Compare, CompareType, Expression, Function, Ref, VariantGet};
+    use planner::types::Type;
+
+    Expression::Compare(Compare {
+        left: Box::new(Expression::Function(Function::VariantGet(VariantGet {
+            input: Box::new(Expression::Ref(Ref {
+                column_idx: 0,
+                return_type: Type::Variant,
+                name: None,
+            })),
+            path: vec![path.to_string()],
+            as_type: Some(as_type),
+        }))),
+        right: Box::new(Expression::Constant(arrow_array::Scalar::new(value))),
+        compare_type: CompareType::Equal,
+        return_type: Type::Boolean,
+    })
+}
+
+/// Scans `documents`, one row group of a variant column that shreds `kind` as
+/// text and nothing else, with `filter` pushed down. Each row comes back as
+/// its `kind` and its `retries` read as an integer. No query `Filter` runs
+/// above the scan, so the rows returned are the ones the scan itself kept.
+fn scan_kind_and_retries(
+    documents: &[String],
+    filter: planner::expression::Expression,
+) -> Vec<(String, Option<i64>)> {
+    use arrow_array::Array;
+    use dispatch::VariantExtract;
+    use parquet_engine::{ScanPushdown, table_input_with_filter_and_pushdown};
+
+    let dispatch = dispatch(1);
+    let documents: Vec<&str> = documents.iter().map(String::as_str).collect();
+    let batch = shredded_variant_batch(&documents, "kind", &DataType::Utf8View);
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    let read_path = |path: &str, as_type: DataType| {
+        Some(VariantExtract {
+            path: vec![path.to_string()],
+            as_type: Some(as_type),
+        })
+    };
+    let projection = Projection::columns_with_extracts(
+        vec![0, 0],
+        vec![
+            read_path("kind", DataType::Utf8View),
+            read_path("retries", DataType::Int64),
+        ],
+    );
+    let pushdown = ScanPushdown::new(&[filter], &projection);
+
+    let results = table_input_with_filter_and_pushdown(
+        &dispatch, &table, projection, false, None, None, pushdown,
+    )
+    .collect()
+    .unwrap();
+
+    results
+        .iter()
+        .flat_map(|batch| {
+            let kinds = batch.column(0).as_string_view();
+            let retries = batch.column(1).as_primitive::<Int64Type>();
+            (0..batch.num_rows())
+                .map(|row| {
+                    let retries = retries.is_valid(row).then(|| retries.value(row));
+                    (kinds.value(row).to_string(), retries)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// `kind = <kind>` as the scan's pushed-down filter.
+fn create_kind_equality(kind: &str) -> planner::expression::Expression {
+    create_variant_path_equality(
+        "kind",
+        planner::types::Type::Utf8,
+        Arc::new(StringViewArray::from(vec![kind])),
+    )
+}
+
+/// A pushed condition on a shredded path is decided before a path the file
+/// does not shred is parsed. The row failing it holds text where a count is
+/// read, which no integer read survives, so the scan succeeding proves that
+/// row was never parsed. A passing row without the path still reads as NULL.
+#[test]
+fn scan_drops_rows_failing_a_pushed_condition_before_parsing_an_unshredded_path() {
+    let documents = [
+        r#"{"kind":"slow","retries":3}"#.to_string(),
+        r#"{"kind":"fast","retries":"none"}"#.to_string(),
+        r#"{"kind":"slow"}"#.to_string(),
+    ];
+
+    let rows = scan_kind_and_retries(&documents, create_kind_equality("slow"));
+
+    assert_eq!(
+        rows,
+        vec![("slow".to_string(), Some(3)), ("slow".to_string(), None)]
+    );
+}
+
+/// A condition on the unshredded path itself cannot be decided before that
+/// path is parsed, so the scan keeps every row for the query's own `Filter`.
+#[test]
+fn scan_keeps_every_row_for_a_pushed_condition_on_an_unshredded_path() {
+    let documents = [
+        r#"{"kind":"slow","retries":3}"#.to_string(),
+        r#"{"kind":"fast","retries":7}"#.to_string(),
+    ];
+    let retries_equal_three = create_variant_path_equality(
+        "retries",
+        planner::types::Type::Int64,
+        Arc::new(Int64Array::from(vec![3])),
+    );
+
+    let rows = scan_kind_and_retries(&documents, retries_equal_three);
+
+    assert_eq!(
+        rows,
+        vec![("slow".to_string(), Some(3)), ("fast".to_string(), Some(7))]
+    );
+}
+
+/// Dropping one row in a hundred would copy the other ninety-nine to spare a
+/// single parse, so the batch leaves the scan whole.
+#[test]
+fn scan_keeps_a_batch_whole_when_nearly_every_row_passes_a_pushed_condition() {
+    let mut documents = vec![r#"{"kind":"slow","retries":3}"#.to_string(); 99];
+    documents.push(r#"{"kind":"fast","retries":7}"#.to_string());
+
+    let rows = scan_kind_and_retries(&documents, create_kind_equality("slow"));
+
+    assert_eq!(rows.len(), 100);
+}
+
+/// A row group whose first batches all pass and whose later ones all fail:
+/// the scan stops evaluating the condition while it drops nothing, and must
+/// still lose no passing row and go back to dropping the failing ones.
+#[test]
+fn scan_loses_no_passing_row_across_batches_a_pushed_condition_stops_narrowing() {
+    let passing_count = 10_000;
+    let documents: Vec<String> = (0..120_000)
+        .map(|row| {
+            let kind = if row < passing_count { "slow" } else { "fast" };
+            format!(r#"{{"kind":"{kind}","retries":{row}}}"#)
+        })
+        .collect();
+
+    let rows = scan_kind_and_retries(&documents, create_kind_equality("slow"));
+
+    let passing: Vec<i64> = rows
+        .iter()
+        .filter(|(kind, _)| kind == "slow")
+        .map(|(_, retries)| retries.unwrap())
+        .collect();
+    assert_eq!(passing, (0..passing_count).collect::<Vec<i64>>());
+    assert!(rows.len() < documents.len());
+}
+
+/// One row of a [`create_mixed_columns_batch`] batch, without its `bucket`.
+type MixedColumnsRow = (i64, i16, String, String, Option<f64>, bool);
+
+/// The row at position `row`: a unique integer, an integer stored wider than
+/// its type, a string alternating between one that inlines in its view and
+/// one that does not, a string of three distinct values, a float that is NULL
+/// every fourth row, and a boolean.
+fn create_mixed_columns_row(row: i64) -> MixedColumnsRow {
+    let name = if row % 2 == 0 {
+        format!("s{row}")
+    } else {
+        format!("value {row} with enough tail to not inline")
+    };
+    (
+        5_000_000 + row * 7919,
+        (row % 30_011) as i16,
+        name,
+        ["red", "green", "blue"][row as usize % 3].to_string(),
+        (row % 4 != 0).then_some(row as f64 / 2.0),
+        row % 3 == 0,
+    )
+}
+
+/// `row_count` rows of a `bucket` column cycling through ten values, followed
+/// by the columns of [`create_mixed_columns_row`].
+fn create_mixed_columns_batch(row_count: i64) -> RecordBatch {
+    use arrow_array::{BooleanArray, Int16Array};
+
+    let rows: Vec<MixedColumnsRow> = (0..row_count).map(create_mixed_columns_row).collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("bucket", DataType::Int64, false),
+            Field::new("key", DataType::Int64, false),
+            Field::new("narrow", DataType::Int16, false),
+            Field::new("name", DataType::Utf8View, false),
+            Field::new("label", DataType::Utf8View, false),
+            Field::new("score", DataType::Float64, true),
+            Field::new("flag", DataType::Boolean, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..row_count).map(|row| row % 10),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+            Arc::new(Int16Array::from_iter_values(rows.iter().map(|row| row.1))),
+            Arc::new(StringViewArray::from_iter_values(
+                rows.iter().map(|row| row.2.as_str()),
+            )),
+            Arc::new(StringViewArray::from_iter_values(
+                rows.iter().map(|row| row.3.as_str()),
+            )),
+            Arc::new(Float64Array::from_iter(rows.iter().map(|row| row.4))),
+            Arc::new(BooleanArray::from_iter(rows.iter().map(|row| Some(row.5)))),
+        ],
+    )
+    .unwrap()
+}
+
+/// Scans every column of `table`, which holds a [`create_mixed_columns_batch`]
+/// batch, with `bucket = 3` pushed down, and returns the rows ordered by key.
+/// No query `Filter` runs above the scan, so they are the rows the scan
+/// itself kept.
+fn scan_mixed_columns_of_bucket_three(
+    dispatch: &DispatchGuard,
+    table: &Arc<ParquetTable>,
+) -> Vec<MixedColumnsRow> {
+    use arrow_array::Array;
+    use arrow_array::types::{Float64Type, Int16Type};
+    use parquet_engine::{ScanPushdown, table_input_with_filter_and_pushdown};
+    use planner::expression::{Compare, CompareType, Expression, Ref};
+    use planner::types::Type;
+
+    let bucket_equals_three = Expression::Compare(Compare {
+        left: Box::new(Expression::Ref(Ref {
+            column_idx: 0,
+            return_type: Type::Int64,
+            name: None,
+        })),
+        right: Box::new(Expression::Constant(arrow_array::Scalar::new(
+            Arc::new(Int64Array::from(vec![3])) as ArrayRef,
+        ))),
+        compare_type: CompareType::Equal,
+        return_type: Type::Boolean,
+    });
+    let projection = Projection::all(7);
+    let pushdown = ScanPushdown::new(&[bucket_equals_three], &projection);
+    let results = table_input_with_filter_and_pushdown(
+        dispatch, table, projection, false, None, None, pushdown,
+    )
+    .collect()
+    .unwrap();
+
+    let mut rows: Vec<MixedColumnsRow> = results
+        .iter()
+        .flat_map(|batch| {
+            let keys = batch.column(1).as_primitive::<Int64Type>();
+            let narrows = batch.column(2).as_primitive::<Int16Type>();
+            let names = batch.column(3).as_string_view();
+            let labels = batch.column(4).as_string_view();
+            let scores = batch.column(5).as_primitive::<Float64Type>();
+            let flags = batch.column(6).as_boolean();
+            (0..batch.num_rows())
+                .map(|row| {
+                    (
+                        keys.value(row),
+                        narrows.value(row),
+                        names.value(row).to_string(),
+                        labels.value(row).to_string(),
+                        scores.is_valid(row).then(|| scores.value(row)),
+                        flags.value(row),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort_by_key(|row| row.0);
+    rows
+}
+
+/// The rows of a [`create_mixed_columns_batch`] batch whose `bucket` is 3.
+fn create_mixed_columns_rows_of_bucket_three(row_count: i64) -> Vec<MixedColumnsRow> {
+    (0..row_count)
+        .filter(|row| row % 10 == 3)
+        .map(create_mixed_columns_row)
+        .collect()
+}
+
+/// A pushed condition on one column is decided before the other columns are
+/// decoded, and those are then decoded for the passing rows alone. Whatever a
+/// column's type and nullability, a passing row comes back whole. The file is
+/// our own writer's, which delta-encodes integers and string lengths.
+#[test]
+fn scan_decodes_the_other_columns_for_the_rows_passing_a_pushed_condition() {
+    let dispatch = dispatch_with_buffers(2, 32);
+    let dir = TempDir::new().unwrap();
+    let batch = create_mixed_columns_batch(50_000);
+    let written = write_parquet_files(&dispatch, dir.path(), vec![batch]);
+    let table = parquet_table_from_dir(&dispatch, &written);
+
+    let rows = scan_mixed_columns_of_bucket_three(&dispatch, &table);
+
+    assert_eq!(rows, create_mixed_columns_rows_of_bucket_three(50_000));
+}
+
+/// The same over dictionary encoded pages.
+#[test]
+fn scan_decodes_dictionary_encoded_columns_for_the_rows_passing_a_pushed_condition() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(&dispatch, &[create_mixed_columns_batch(50_000)], true);
+
+    let rows = scan_mixed_columns_of_bucket_three(&dispatch, &table);
+
+    assert_eq!(rows, create_mixed_columns_rows_of_bucket_three(50_000));
+}
+
+/// The same over plain encoded pages.
+#[test]
+fn scan_decodes_plain_encoded_columns_for_the_rows_passing_a_pushed_condition() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(&dispatch, &[create_mixed_columns_batch(50_000)], false);
+
+    let rows = scan_mixed_columns_of_bucket_three(&dispatch, &table);
+
+    assert_eq!(rows, create_mixed_columns_rows_of_bucket_three(50_000));
 }
 
 /// Two pushed extracts on one variant column resolve to overlapping leaves: the

@@ -3,14 +3,16 @@
 //! Planner filters are translated into [`PushedPredicate`]s once, then reused
 //! for partition, file, row-group, and decoder pruning. The row-group decision
 //! itself remains in [`super::row_group_stats`] so static and dynamic pruning
-//! share the same min/max semantics.
+//! share the same min/max semantics. A scan also evaluates the filters it can
+//! as [`ScanCondition`]s, to drop rows before extracting their variant paths.
 
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Scalar, TimestampMicrosecondArray};
 use arrow_schema::{DataType, TimeUnit};
+use dispatch::{Projection, VariantExtract};
 
-use planner::expression::{CompareType, Expression, Function, JsonPath};
+use planner::expression::{CompareType, Expression, Function, JsonPath, Ref};
 use planner::types::{Type, UTC_TIMEZONE, physical_arrow_type};
 
 use super::row_group_stats::row_group_eliminated;
@@ -19,7 +21,7 @@ use super::types::leaves::{
 };
 use super::types::metadata::RowGroupMetadata;
 use super::types::table::ParquetTable;
-use crate::ScanEqualityPredicate;
+use crate::{ScanCondition, ScanEqualityPredicate, ScanPushdown};
 
 /// A single-column constant comparison offered by DuckDB during filter
 /// pushdown. Parquet-backed bindings record it and apply it when they compile,
@@ -152,7 +154,7 @@ impl PushedPredicate {
 
 /// The equality predicates among `predicates`, in the shape a scan applies
 /// per row group (dictionary pruning and batch pre-filtering).
-pub fn equality_predicates(predicates: &[PushedPredicate]) -> Vec<ScanEqualityPredicate> {
+fn equality_predicates(predicates: &[PushedPredicate]) -> Vec<ScanEqualityPredicate> {
     predicates
         .iter()
         .filter(|predicate| matches!(predicate.compare_type, CompareType::Equal))
@@ -162,6 +164,118 @@ pub fn equality_predicates(predicates: &[PushedPredicate]) -> Vec<ScanEqualityPr
             value: predicate.value.clone(),
         })
         .collect()
+}
+
+impl ScanPushdown {
+    /// What a scan of `projection` applies of the `filters` pushed down into
+    /// its table.
+    pub fn new(filters: &[Expression], projection: &Projection) -> Self {
+        let predicates: Vec<PushedPredicate> = filters
+            .iter()
+            .flat_map(PushedPredicate::from_filter)
+            .collect();
+        Self {
+            eq_predicates: Arc::new(equality_predicates(&predicates)),
+            conditions: Arc::new(
+                filters
+                    .iter()
+                    .filter_map(|filter| create_scan_condition(filter, projection))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// `filter` as a condition over the output columns of a scan of `projection`,
+/// when it is one such a scan can decide: comparisons, ranges, `IN` lists and
+/// NULL checks of columns the scan emits, and boolean combinations of those.
+///
+/// Evaluating one of these cannot fail, so the scan deciding it on rows the
+/// query's `Filter` would never have reached changes no outcome. Every other
+/// filter is left to that `Filter` alone.
+fn create_scan_condition(filter: &Expression, projection: &Projection) -> Option<ScanCondition> {
+    if filter.result_type().ok()? != Type::Boolean {
+        return None;
+    }
+    let mut condition = filter.clone();
+    let mut output_columns = Vec::new();
+    if !rebind_to_scan_outputs(&mut condition, projection, &mut output_columns) {
+        return None;
+    }
+    // A condition that does not compile is the `Filter`'s to report.
+    let evaluator = condition.compile().ok()?;
+    Some(ScanCondition::new(evaluator, output_columns))
+}
+
+/// Rewrites every column `condition` reads, by its index in the table, into
+/// the output column of `projection` holding the same read, collecting those
+/// into `output_columns`. A variant path read becomes a plain reference to
+/// the output that extracts that path as that type.
+///
+/// Returns whether the whole condition was rewritten. It is not when it has
+/// a shape a scan does not decide, or reads something the scan does not emit.
+fn rebind_to_scan_outputs(
+    condition: &mut Expression,
+    projection: &Projection,
+    output_columns: &mut Vec<usize>,
+) -> bool {
+    let mut rebind =
+        |operand: &mut Expression| rebind_to_scan_outputs(operand, projection, output_columns);
+    match condition {
+        Expression::Constant(_) => true,
+        Expression::Ref(column) => {
+            let Some(output_idx) = find_output_column(projection, column.column_idx, None) else {
+                return false;
+            };
+            column.column_idx = output_idx;
+            output_columns.push(output_idx);
+            true
+        }
+        Expression::Function(Function::VariantGet(read)) => {
+            let Expression::Ref(column) = read.input.as_ref() else {
+                return false;
+            };
+            let extract = VariantExtract {
+                path: read.path.clone(),
+                as_type: read.as_type.as_ref().map(physical_arrow_type),
+            };
+            let Some(output_idx) =
+                find_output_column(projection, column.column_idx, Some(&extract))
+            else {
+                return false;
+            };
+            let return_type = read.result_type();
+            *condition = Expression::Ref(Ref {
+                column_idx: output_idx,
+                return_type,
+                name: None,
+            });
+            output_columns.push(output_idx);
+            true
+        }
+        Expression::Compare(compare) => rebind(&mut compare.left) && rebind(&mut compare.right),
+        Expression::Between(between) => {
+            rebind(&mut between.input) && rebind(&mut between.lower) && rebind(&mut between.upper)
+        }
+        Expression::InList(list) => rebind(&mut list.input) && list.values.iter_mut().all(rebind),
+        Expression::Conjunction(conjunction) => conjunction.children.iter_mut().all(rebind),
+        Expression::Not(not) => rebind(&mut not.input),
+        Expression::IsNull(is_null) => rebind(&mut is_null.input),
+        _ => false,
+    }
+}
+
+/// The output column of `projection` that reads table column `column_idx`:
+/// whole when `extract` is `None`, else through exactly that extract.
+fn find_output_column(
+    projection: &Projection,
+    column_idx: usize,
+    extract: Option<&VariantExtract>,
+) -> Option<usize> {
+    (0..projection.column_indices.len()).find(|&output_idx| {
+        projection.column_indices[output_idx] == column_idx
+            && projection.extract_at(output_idx) == extract
+    })
 }
 
 /// Clone a table and retain only the row groups which the recorded predicates

@@ -20,8 +20,8 @@ use arrow_buffer::ArrowNativeType;
 
 use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::{
-    DecodePlain, DeltaPacking, Dict, DictFromBytes, DictFromVecBytes, LeafDecoder, LeafType,
-    Result, TypedLeafDecoder, Unsupported,
+    ArrayBuilder, DecodePlain, DeltaPacking, Dict, DictFromBytes, DictFromVecBytes, LeafDecoder,
+    LeafType, Result, Stretch, TypedLeafDecoder, Unsupported, for_each_stretch,
 };
 use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::page::DecompressedPage;
@@ -282,6 +282,43 @@ where
         let mut reader = MultiBufferReader::new(&self.data, &mut self.position);
         reader.skip(size * T::Native::PHYSICAL_SIZE);
     }
+
+    /// A fixed width puts every value at an offset known up front, so the
+    /// kept ones are read straight from theirs and the others are never
+    /// touched. That holds while the span lies whole inside the current
+    /// buffer and the values are stored at their native width; any other
+    /// span is read a stretch at a time.
+    fn gather(
+        &mut self,
+        builder: &mut PrimitiveBuilder<T>,
+        positions: &[u32],
+        first: u32,
+        span: usize,
+    ) {
+        let byte_width = T::Native::PHYSICAL_SIZE;
+        let fits_current_buffer = self
+            .data
+            .get(self.position.buffer_index)
+            .is_some_and(|buffer| (buffer.len() - self.position.offset) / byte_width >= span);
+        if !fits_current_buffer || byte_width != mem::size_of::<T::Native>() {
+            for_each_stretch(positions, first, span, |stretch| match stretch {
+                Stretch::Skipped(count) => self.skip(count),
+                Stretch::Kept(count) => self.read(builder, count),
+            });
+            return;
+        }
+        let bytes: &[u8] = &self.data[self.position.buffer_index];
+        let base = self.position.offset;
+        let slots = builder.spare_mut(positions.len());
+        for (slot, &position) in slots.iter_mut().zip(positions) {
+            let offset = base + (position - first) as usize * byte_width;
+            // SAFETY: the span lies inside the buffer and every position is
+            // inside the span. Parquet packs values with no padding, so the
+            // value is read unaligned.
+            *slot = unsafe { (bytes.as_ptr().add(offset) as *const T::Native).read_unaligned() };
+        }
+        self.position.offset = base + span * byte_width;
+    }
 }
 
 /// [`Dict`] implementation for fixed-width primitives, generic over the
@@ -472,6 +509,19 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
         let array = self.inner.read(allocator, size)?;
+        Ok(Arc::new(attach_timestamp_timezone(
+            array,
+            self.timezone.clone(),
+        )))
+    }
+
+    fn read_selected(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        rows: usize,
+        positions: &[u32],
+    ) -> Result<ArrayRef> {
+        let array = self.inner.read_selected(allocator, rows, positions)?;
         Ok(Arc::new(attach_timestamp_timezone(
             array,
             self.timezone.clone(),
@@ -797,6 +847,43 @@ mod tests {
 
         let result = dec.read(&mut allocator, 3).unwrap();
         assert_eq!(extract_i32s(&result), vec![10, 20, 30]);
+    }
+
+    /// A selected read whose rows run past the current buffer reads the
+    /// values on both sides of the boundary, where the second value is split
+    /// across it.
+    #[test]
+    fn a_selected_read_crosses_a_buffer_boundary() {
+        let data = encode_i32s(&[10, 20, 30, 40]);
+        let page = make_data_page_multi_buffer(
+            vec![data[..6].to_vec(), data[6..].to_vec()],
+            4,
+            Encoding::PLAIN,
+            0,
+        );
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
+        dec.insert_page(page);
+
+        let selected = dec.read_selected(&mut allocator, 4, &[1, 3]).unwrap();
+
+        assert_eq!(extract_i32s(&selected), vec![20, 40]);
+    }
+
+    /// A type stored wider than its native width is read at its stored width.
+    #[test]
+    fn a_selected_read_of_a_narrowed_type_reads_its_stored_width() {
+        let values = encode_i16_as_parquet(&[1, -2, 3, -4, 5]);
+        let page = make_data_page(values, 5, Encoding::PLAIN, 0);
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
+        dec.insert_page(page);
+
+        let selected = dec.read_selected(&mut allocator, 5, &[1, 4]).unwrap();
+
+        assert_eq!(extract_i16s(&selected), vec![-2, 5]);
     }
 
     // -- Dict-encoded --

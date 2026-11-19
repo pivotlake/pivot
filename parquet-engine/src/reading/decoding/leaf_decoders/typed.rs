@@ -73,6 +73,40 @@ fn skip_run<L: LeafType>(decoder: &mut ValueDecoder<L>, n: usize) {
     }
 }
 
+/// Decode the values at `positions` out of the next `span` values into
+/// `builder` and step over the rest. `positions` are ascending, and the first
+/// of the `span` values is position `first`.
+fn gather_run<D, L>(
+    decoder: &mut ValueDecoder<L>,
+    builder: &mut L::Builder,
+    dict: Option<&D>,
+    positions: &[u32],
+    first: u32,
+    span: usize,
+) where
+    D: Dict<Builder = L::Builder, Item = <L::Builder as ArrayBuilder>::Element>,
+    L: LeafType,
+{
+    match decoder {
+        ValueDecoder::Plain(p) => p.gather(builder, positions, first, span),
+        ValueDecoder::Dictionary(r) => r.gather(
+            builder,
+            dict.expect("No dict available!"),
+            positions,
+            first,
+            span,
+        ),
+        ValueDecoder::DeltaBinaryPacked(d) => d.gather(builder, positions, first, span),
+        ValueDecoder::DeltaLengthByteArray(d) => d.gather(builder, positions, first, span),
+        ValueDecoder::Rle(d) => d.gather(builder, positions, first, span),
+    }
+}
+
+/// Splits off the positions below `end` from the front of `positions`.
+fn split_positions_below(positions: &[u32], end: u32) -> (&[u32], &[u32]) {
+    positions.split_at(positions.partition_point(|&position| position < end))
+}
+
 /// A nullable page's definition levels: `present[i]` is whether logical row `i`
 /// holds a value (vs a null), consumed run-wise via a cursor.
 struct DefLevels {
@@ -200,6 +234,96 @@ impl<L: LeafType> ReadPage<L> {
             }
         }
         self.remaining -= builder.len() - start_len;
+    }
+
+    /// Decodes the rows at `positions` out of this page's next `rows` kept
+    /// rows into `builder` and steps over the others. `positions` are
+    /// ascending, and the first of those rows is position `first`.
+    ///
+    /// The page's own filter mask still applies: the rows it skips are not
+    /// among the `rows`, and are stepped over as they come.
+    pub fn gather_into<D>(
+        &mut self,
+        dict: Option<&D>,
+        builder: &mut L::Builder,
+        mut positions: &[u32],
+        first: u32,
+        rows: usize,
+    ) where
+        D: Dict<Builder = L::Builder, Item = <L::Builder as ArrayBuilder>::Element>,
+    {
+        let mut row = 0;
+        while row < rows {
+            let (keep, run) = match self.running_filter_mask_opt.as_mut() {
+                Some(mask) => mask.next_run(rows - row),
+                None => (true, rows - row),
+            };
+            if !keep {
+                skip_run(&mut self.decoder, run);
+                continue;
+            }
+            let run_first = first + row as u32;
+            let (in_run, after_run) = split_positions_below(positions, run_first + run as u32);
+            gather_run(&mut self.decoder, builder, dict, in_run, run_first, run);
+            positions = after_run;
+            row += run;
+        }
+        self.remaining -= rows;
+    }
+
+    /// Like [`gather_into`](Self::gather_into) but for a page with nulls: a
+    /// kept present row is decoded, a kept null gets a zeroed slot, and a
+    /// validity bit is pushed for each kept row.
+    ///
+    /// The value stream holds only the present values, so each run of present
+    /// rows gathers the positions it covers out of the values it contributes.
+    pub fn gather_into_nullable<D>(
+        &mut self,
+        dict: Option<&D>,
+        builder: &mut L::Builder,
+        validity: &mut ValidityBuilder,
+        mut positions: &[u32],
+        first: u32,
+        rows: usize,
+    ) where
+        D: Dict<Builder = L::Builder, Item = <L::Builder as ArrayBuilder>::Element>,
+    {
+        let mut row = 0;
+        while row < rows {
+            let (keep, run) = match self.running_filter_mask_opt.as_mut() {
+                Some(mask) => mask.next_run(rows - row),
+                None => (true, rows - row),
+            };
+            let def = self
+                .def_levels
+                .as_mut()
+                .expect("nullable page has def levels");
+            let mut run_left = run;
+            while run_left > 0 {
+                let (present, n) = def.next_run(run_left);
+                run_left -= n;
+                if !keep {
+                    if present {
+                        skip_run(&mut self.decoder, n);
+                    }
+                    continue;
+                }
+                let run_first = first + row as u32;
+                let (in_run, after_run) = split_positions_below(positions, run_first + n as u32);
+                if present {
+                    gather_run(&mut self.decoder, builder, dict, in_run, run_first, n);
+                } else {
+                    builder.push(
+                        &<L::Builder as ArrayBuilder>::Element::default(),
+                        in_run.len(),
+                    );
+                }
+                validity.append_n(in_run.len(), present);
+                positions = after_run;
+                row += n;
+            }
+        }
+        self.remaining -= rows;
     }
 }
 
@@ -533,6 +657,102 @@ impl<L: LeafType> LeafDecoder for TypedLeafDecoder<L> {
                     v.append_n(builder.len() - before, true);
                 }
             }
+        }
+
+        let null_buffer = validity.map(|v| v.into_buffer());
+        Ok(builder.into_array(null_buffer))
+    }
+
+    fn read_selected(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        rows: usize,
+        mut positions: &[u32],
+    ) -> Result<ArrayRef> {
+        let kept = positions.len();
+        let mut builder = L::Builder::with_capacity(allocator, kept);
+        match self.dict.as_deref() {
+            Some(DictStorage::Contiguous(d)) => d.register_onto(&mut builder),
+            Some(DictStorage::Scattered(d)) => d.register_onto(&mut builder),
+            None => {}
+        }
+        let mut validity: Option<ValidityBuilder> = None;
+
+        let mut consumed = 0;
+        while consumed < rows {
+            if self
+                .read_page
+                .as_ref()
+                .is_some_and(|read_page| read_page.remaining == 0)
+            {
+                self.read_page = None;
+                self.page_idx += 1;
+            }
+            if self.read_page.is_none() {
+                match self.create_next_read_page()? {
+                    Some(()) => {}
+                    None => break,
+                }
+            }
+
+            let read_page = self.read_page.as_mut().unwrap();
+            let page_rows = (rows - consumed).min(read_page.remaining);
+            let first = consumed as u32;
+            let (in_page, after_page) = split_positions_below(positions, first + page_rows as u32);
+            if read_page.def_levels.is_some() {
+                let v = validity.get_or_insert_with(|| {
+                    let mut vb = ValidityBuilder::with_capacity(allocator, kept);
+                    vb.append_n(builder.len(), true);
+                    vb
+                });
+                match self.dict.as_deref() {
+                    Some(DictStorage::Contiguous(d)) => read_page.gather_into_nullable(
+                        Some(d),
+                        &mut builder,
+                        v,
+                        in_page,
+                        first,
+                        page_rows,
+                    ),
+                    Some(DictStorage::Scattered(d)) => read_page.gather_into_nullable(
+                        Some(d),
+                        &mut builder,
+                        v,
+                        in_page,
+                        first,
+                        page_rows,
+                    ),
+                    None => read_page.gather_into_nullable(
+                        None::<&L::ContiguousDict>,
+                        &mut builder,
+                        v,
+                        in_page,
+                        first,
+                        page_rows,
+                    ),
+                }
+            } else {
+                match self.dict.as_deref() {
+                    Some(DictStorage::Contiguous(d)) => {
+                        read_page.gather_into(Some(d), &mut builder, in_page, first, page_rows)
+                    }
+                    Some(DictStorage::Scattered(d)) => {
+                        read_page.gather_into(Some(d), &mut builder, in_page, first, page_rows)
+                    }
+                    None => read_page.gather_into(
+                        None::<&L::ContiguousDict>,
+                        &mut builder,
+                        in_page,
+                        first,
+                        page_rows,
+                    ),
+                }
+                if let Some(v) = &mut validity {
+                    v.append_n(in_page.len(), true);
+                }
+            }
+            positions = after_page;
+            consumed += page_rows;
         }
 
         let null_buffer = validity.map(|v| v.into_buffer());
@@ -987,5 +1207,88 @@ mod tests {
         load_dictionary(&mut dec, &[100, 200, 300], &mut alloc);
 
         assert_eq!(dec.available(), 8);
+    }
+
+    // -- Selected reads --
+
+    /// A selected read emits the rows at its positions and steps over the
+    /// other rows it covers, so the next read goes on after all of them.
+    #[test]
+    fn a_selected_read_emits_the_rows_at_its_positions() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.insert_page(data_page(encode_i32s(&[10, 20, 30, 40, 50, 60]), 6, 0));
+
+        let selected = dec.read_selected(&mut alloc, 5, &[1, 3]).unwrap();
+        let rest = dec.read(&mut alloc, 1).unwrap();
+
+        assert_eq!(extract_i32s(&selected), vec![20, 40]);
+        assert_eq!(extract_i32s(&rest), vec![60]);
+    }
+
+    /// Positions count from the first row of the read, through every page it
+    /// covers.
+    #[test]
+    fn a_selected_read_spans_pages() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.insert_page(data_page(encode_i32s(&[1, 2, 3]), 3, 0));
+        dec.insert_page(data_page(encode_i32s(&[4, 5]), 2, 1));
+
+        let selected = dec.read_selected(&mut alloc, 5, &[0, 2, 3]).unwrap();
+
+        assert_eq!(extract_i32s(&selected), vec![1, 3, 4]);
+    }
+
+    /// A selected read with no positions only steps over its rows.
+    #[test]
+    fn a_selected_read_of_no_positions_steps_over_its_rows() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.insert_page(data_page(encode_i32s(&[10, 20, 30]), 3, 0));
+
+        let selected = dec.read_selected(&mut alloc, 2, &[]).unwrap();
+        let rest = dec.read(&mut alloc, 1).unwrap();
+
+        assert!(selected.is_empty());
+        assert_eq!(extract_i32s(&rest), vec![30]);
+    }
+
+    /// A page's own filter mask still applies, so positions count the rows
+    /// the mask keeps.
+    #[test]
+    fn a_selected_read_counts_the_rows_a_page_mask_keeps() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        let mask = FilterMask::for_row_range(0, 5, &(2..5));
+        dec.insert_page(filtered_data_page(
+            encode_i32s(&[10, 20, 30, 40, 50]),
+            5,
+            0,
+            mask,
+        ));
+
+        let selected = dec.read_selected(&mut alloc, 3, &[0, 2]).unwrap();
+
+        assert_eq!(extract_i32s(&selected), vec![30, 50]);
+    }
+
+    /// A selected read of a dictionary encoded page looks up the keys at its
+    /// positions.
+    #[test]
+    fn a_selected_read_looks_its_positions_up_in_the_dictionary() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        load_dictionary(&mut dec, &[100, 200, 300], &mut alloc);
+        dec.insert_page(rle_page_over_three_entries(0));
+
+        let selected = dec.read_selected(&mut alloc, 8, &[1, 2, 7]).unwrap();
+
+        assert_eq!(extract_i32s(&selected), vec![200, 300, 100]);
     }
 }

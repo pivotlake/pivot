@@ -134,6 +134,19 @@ pub trait LeafDecoder {
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
 
+    /// Decodes the rows at `positions` out of the next `rows` rows into an
+    /// array of `positions.len()` values, and steps over the others.
+    ///
+    /// `positions` are ascending and count from the first of those rows. Every
+    /// leaf of a batch is read through the same positions, so the arrays stay
+    /// aligned row for row.
+    fn read_selected(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        rows: usize,
+        positions: &[u32],
+    ) -> Result<ArrayRef>;
+
     /// Installs a pushed-down equality constant. A constant whose type does
     /// not match the column is ignored (the query's `Filter` still applies
     /// the condition). The constant decides row-group pruning when the
@@ -197,6 +210,56 @@ pub trait DecodePlain {
 
     /// Advances past `size` values without decoding them.
     fn skip(&mut self, size: usize);
+
+    /// Decodes the values at `positions` out of the next `span` values and
+    /// steps over the rest. `positions` are ascending, and the first of the
+    /// `span` values is position `first`.
+    ///
+    /// The default reads each stretch of adjacent positions and skips the
+    /// gaps between them, which costs two calls per stretch. An encoding that
+    /// can reach a value without walking the ones before it overrides this.
+    fn gather(&mut self, builder: &mut Self::Builder, positions: &[u32], first: u32, span: usize) {
+        for_each_stretch(positions, first, span, |stretch| match stretch {
+            Stretch::Skipped(count) => self.skip(count),
+            Stretch::Kept(count) => self.read(builder, count),
+        });
+    }
+}
+
+/// A run of adjacent values a selection keeps, or the gap before the next one.
+pub(crate) enum Stretch {
+    Kept(usize),
+    Skipped(usize),
+}
+
+/// Walks the next `span` values as the stretches `positions` cut them into,
+/// in order. `positions` are ascending, and the first of the `span` values is
+/// position `first`.
+pub(crate) fn for_each_stretch(
+    positions: &[u32],
+    first: u32,
+    span: usize,
+    mut visit: impl FnMut(Stretch),
+) {
+    let mut consumed = 0;
+    let mut index = 0;
+    while index < positions.len() {
+        let start = (positions[index] - first) as usize;
+        let mut end = start + 1;
+        index += 1;
+        while index < positions.len() && (positions[index] - first) as usize == end {
+            end += 1;
+            index += 1;
+        }
+        if start > consumed {
+            visit(Stretch::Skipped(start - consumed));
+        }
+        visit(Stretch::Kept(end - start));
+        consumed = end;
+    }
+    if span > consumed {
+        visit(Stretch::Skipped(span - consumed));
+    }
 }
 
 /// Reads values stored in one of the encodings besides PLAIN and the
@@ -217,6 +280,16 @@ pub trait DecodeEncoding: Sized {
     /// Advances past `size` values. A delta decoder still decodes them,
     /// because each delta is relative to the one before it.
     fn skip(&mut self, size: usize);
+
+    /// Decodes the values at `positions` out of the next `span` values and
+    /// steps over the rest. `positions` are ascending, and the first of the
+    /// `span` values is position `first`.
+    fn gather(&mut self, builder: &mut Self::Builder, positions: &[u32], first: u32, span: usize) {
+        for_each_stretch(positions, first, span, |stretch| match stretch {
+            Stretch::Skipped(count) => self.skip(count),
+            Stretch::Kept(count) => self.read(builder, count),
+        });
+    }
 }
 
 /// The decoder a [`LeafType`] names for an encoding it does not read. It has

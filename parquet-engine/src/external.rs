@@ -17,8 +17,8 @@ use planner::expression::Expression;
 use planner::types::{Type, type_from_physical};
 
 use crate::{
-    ParquetTable, PushedPredicate, is_variant_field, materialize, prune_parquet,
-    table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, ScanPushdown, is_variant_field, materialize, prune_parquet,
+    table_input_with_filter_and_pushdown,
 };
 use object_storage::{
     DataFile, ExternalStoreFactory, FileRef, ObjectPath, ObjectStore, StoreScheme, local_path,
@@ -70,6 +70,9 @@ struct ExternalParquetTable {
     location: String,
     columns: Vec<Column>,
     parquet: Arc<ParquetTable>,
+    /// The filters pushed down so far, as offered.
+    filters: Vec<Expression>,
+    /// The comparisons among `filters` that statistics can prune by.
     predicates: Vec<PushedPredicate>,
 }
 
@@ -104,16 +107,16 @@ impl BoundTable for ExternalParquetTable {
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        let equality_predicates = crate::equality_predicates(&self.predicates);
+        let pushdown = ScanPushdown::new(&self.filters, &projection);
         let parquet = Arc::new(prune_parquet(&self.parquet, &self.predicates));
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_filter_and_pushdown(
             dispatcher,
             &parquet,
             projection,
             emit_row_group_metadata,
             crate::row_group_filter_from(dynamic_filters),
             None,
-            Arc::new(equality_predicates),
+            pushdown,
         ))
     }
 
@@ -148,8 +151,10 @@ impl BoundTable for ExternalParquetTable {
     fn pushdown_filter(&mut self, filter: Expression) -> CatalogResult<bool> {
         self.predicates
             .extend(PushedPredicate::from_filter(&filter));
-        // Statistics and dictionaries may skip work, but the SQL filter stays
-        // above the scan and remains responsible for query correctness.
+        self.filters.push(filter);
+        // Statistics, dictionaries and the scan's own row filtering may skip
+        // work, but the SQL filter stays above the scan and remains
+        // responsible for query correctness.
         Ok(false)
     }
 
@@ -178,6 +183,7 @@ fn bind_external_table(
         location: location.to_string(),
         columns,
         parquet: Arc::new(parquet),
+        filters: Vec::new(),
         predicates: Vec::new(),
     })
 }

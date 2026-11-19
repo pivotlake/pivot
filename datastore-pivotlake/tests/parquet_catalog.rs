@@ -2057,6 +2057,18 @@ fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
 /// JSON, with `shred_path` shredded into a typed Int64 leaf when given, one
 /// row group per document, so a per-group min/max prune is observable.
 fn write_docs_file_into(dir: &Path, name: &str, docs: &[String], shred_path: Option<&str>) {
+    write_docs_file_with_row_groups(dir, name, docs, shred_path, 1);
+}
+
+/// Like [`write_docs_file_into`], with `rows_per_row_group` documents in each
+/// row group.
+fn write_docs_file_with_row_groups(
+    dir: &Path,
+    name: &str,
+    docs: &[String],
+    shred_path: Option<&str>,
+    rows_per_row_group: usize,
+) {
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let json: ArrayRef = Arc::new(StringArray::from(
@@ -2082,7 +2094,7 @@ fn write_docs_file_into(dir: &Path, name: &str, docs: &[String], shred_path: Opt
 
     let props = WriterProperties::builder()
         .set_statistics_enabled(EnabledStatistics::Chunk)
-        .set_max_row_group_row_count(Some(1))
+        .set_max_row_group_row_count(Some(rows_per_row_group))
         .build();
     let file = File::create(dir.join(name)).unwrap();
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
@@ -2197,6 +2209,39 @@ fn variant_pushdown_keeps_all_groups_for_an_unshredded_path() {
         .unwrap();
 
     assert_eq!(row_group_count(&datastore, "docs", &table), 3);
+}
+
+/// A WHERE on a shredded path is decided inside the scan, row by row within a
+/// row group its statistics cannot prune, before a path the file does not
+/// shred is parsed for the rows that fail. The failing row holds text where a
+/// count is read, which no integer read survives, so the query succeeding
+/// proves it was never parsed. A passing row without the path, and one
+/// holding a JSON null, still read as NULL.
+#[test]
+fn filter_on_a_shredded_path_spares_parsing_the_rows_it_drops() {
+    use arrow_array::types::Int64Type;
+
+    let dir = TempDir::new().unwrap();
+    let docs = vec![
+        r#"{"age":10,"bonus":5}"#.to_string(),
+        r#"{"age":30,"bonus":"none"}"#.to_string(),
+        r#"{"age":12}"#.to_string(),
+        r#"{"age":14,"bonus":null}"#.to_string(),
+    ];
+    write_docs_file_with_row_groups(dir.path(), "docs.parquet", &docs, Some("age"), docs.len());
+    let (_database, datastore, _table) = shredded_docs_datastore(dir.path());
+
+    let batches = run_sql(
+        &datastore,
+        "SELECT CAST(doc.bonus AS BIGINT) AS bonus FROM docs \
+         WHERE CAST(doc.age AS BIGINT) < 20 ORDER BY bonus",
+    );
+
+    let bonuses: Vec<Option<i64>> = batches
+        .iter()
+        .flat_map(|batch| batch.column(0).as_primitive::<Int64Type>().iter())
+        .collect();
+    assert_eq!(bonuses, [Some(5), None, None]);
 }
 
 /// Soundness: a row may store the path's value in the binary `value` fallback

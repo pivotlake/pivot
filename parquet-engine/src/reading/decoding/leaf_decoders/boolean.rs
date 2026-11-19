@@ -437,6 +437,34 @@ mod tests {
         assert_eq!(read, expected);
     }
 
+    /// A selected read emits the values at its positions, adjacent or apart,
+    /// and steps over the rest.
+    #[test]
+    fn plain_page_reads_selected_positions() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let values = pattern(45);
+        let mut decoder = BooleanLeafDecoder::new(0);
+        decoder.insert_page(data_page(
+            vec![Bytes::from(pack_bits(&values))],
+            45,
+            Encoding::PLAIN,
+            None,
+        ));
+        let positions = [0u32, 1, 2, 9, 20, 21, 39];
+
+        let selected = values_of(
+            &decoder
+                .read_selected(&mut allocator, 40, &positions)
+                .unwrap(),
+        );
+        let rest = values_of(&decoder.read(&mut allocator, 5).unwrap());
+
+        let expected: Vec<bool> = positions.iter().map(|&p| values[p as usize]).collect();
+        assert_eq!(selected, expected);
+        assert_eq!(rest, values[40..]);
+    }
+
     #[test]
     fn rle_page_reads_runs_and_packed_groups() {
         init_test_free_pool(4);

@@ -14,7 +14,7 @@ use crate::reading::decoding::leaf_decoders::{
     AbsentLeafDecoder, BooleanLeafDecoder, BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder,
     TimestampMicrosecondLeafDecoder, decimal_decoder,
 };
-use crate::types::leaves::{OutputRead, reconstruct_column_from_leaves};
+use crate::types::leaves::{OutputRead, reconstruct_column_from_leaves, variant_shredded_leaves};
 use crate::types::metadata::ColumnChunkMeta;
 use arrow_array::types::{
     BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
@@ -24,6 +24,7 @@ use arrow_array::{ArrayRef, StructArray, new_null_array};
 use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, TimeUnit};
 use dispatch::VariantExtract;
+use dispatch::memory::SlabAllocator;
 use parquet_variant::{VariantPath, VariantPathElement};
 use parquet_variant_compute::cast_to_variant;
 use planner::expression::cast_variant_array;
@@ -133,6 +134,8 @@ pub struct ColumnDecoder {
     pre_transform_field: FieldRef,
     /// Finishes the folded array. `None` for a plain column.
     transform: Option<OutputTransform>,
+    /// Whether the transform extracts a path with no typed leaf in this file.
+    parses_binary_variant_rows: bool,
     /// The field this column contributes to the batch schema.
     output_field: FieldRef,
 }
@@ -217,10 +220,15 @@ impl ColumnDecoder {
                 )
             }
         };
+        let parses_binary_variant_rows = matches!(transform, Some(OutputTransform::Extract { .. }))
+            && extract.is_some_and(|extract| {
+                variant_shredded_leaves(fields, column, &extract.path).is_none()
+            });
         Ok(Self {
             leaf_positions,
             pre_transform_field,
             transform,
+            parses_binary_variant_rows,
             output_field,
         })
     }
@@ -245,6 +253,19 @@ impl ColumnDecoder {
         }
     }
 
+    /// Whether this column extracts a path its file keeps no typed leaf for.
+    /// Every value then comes out of a row's binary variant, parsed row by
+    /// row, which costs far more than any other read.
+    pub fn parses_binary_variant_rows(&self) -> bool {
+        self.parses_binary_variant_rows
+    }
+
+    /// The positions within the row group's decoded leaves that this column
+    /// folds.
+    pub fn leaf_positions(&self) -> &[usize] {
+        &self.leaf_positions
+    }
+
     /// Folds this column's share of the row group's `decoded` leaves into its
     /// output array.
     pub fn read(&self, decoded: &[ArrayRef]) -> Result<ArrayRef> {
@@ -258,6 +279,28 @@ impl ColumnDecoder {
             None => Ok(column),
         }
     }
+}
+
+/// Decodes the next `row_count` rows of every leaf and folds them into the
+/// output columns.
+///
+/// Every distinct leaf is decoded once; the output columns then fold their
+/// own views of the result, so two extracts over one variant column share the
+/// decode instead of repeating it.
+pub fn read_columns(
+    column_decoders: &[ColumnDecoder],
+    leaf_decoders: &mut [Box<dyn LeafDecoder>],
+    allocator: &mut SlabAllocator,
+    row_count: usize,
+) -> Result<Vec<ArrayRef>> {
+    let decoded = leaf_decoders
+        .iter_mut()
+        .map(|leaf| leaf.read(allocator, row_count).map_err(Into::into))
+        .collect::<Result<Vec<_>>>()?;
+    column_decoders
+        .iter()
+        .map(|decoder| decoder.read(&decoded))
+        .collect()
 }
 
 /// The type `variant_get` yields for `path` over this variant shape.

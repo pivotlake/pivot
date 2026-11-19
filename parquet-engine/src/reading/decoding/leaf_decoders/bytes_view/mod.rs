@@ -462,4 +462,43 @@ mod tests {
 
         assert_eq!(nulls(&result), vec![true, true]);
     }
+
+    /// A selected read of a PLAIN page views the strings at its positions,
+    /// inlined or not, and steps over the others.
+    #[test]
+    fn a_selected_read_views_the_strings_at_its_positions() {
+        init_test_free_pool(4);
+        let strings = ["a", "a string too long to inline", "c", "d", "e"];
+        let page = make_data_page(encode_plain_strings(&strings), 5, Encoding::PLAIN, 0);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(0);
+        dec.insert_page(page);
+
+        let selected = dec.read_selected(&mut allocator, 4, &[1, 3]).unwrap();
+        let rest = dec.read(&mut allocator, 1).unwrap();
+
+        assert_eq!(
+            extract_strings(&selected),
+            vec!["a string too long to inline", "d"]
+        );
+        assert_eq!(extract_strings(&rest), vec!["e"]);
+    }
+
+    /// Positions count rows, nulls included, while the page stores a value
+    /// for the present rows only.
+    #[test]
+    fn a_selected_read_of_a_nullable_page_counts_null_rows() {
+        init_test_free_pool(4);
+        // Rows: present, null, present, null, present.
+        let page =
+            make_plain_page_with_def_levels(&[true, false, true, false, true], &["a", "c", "e"], 0);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1);
+        dec.insert_page(page);
+
+        let selected = dec.read_selected(&mut allocator, 5, &[1, 2, 4]).unwrap();
+
+        assert_eq!(extract_strings(&selected), vec!["", "c", "e"]);
+        assert_eq!(nulls(&selected), vec![true, false, false]);
+    }
 }

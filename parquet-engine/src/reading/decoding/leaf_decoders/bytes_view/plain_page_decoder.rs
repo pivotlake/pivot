@@ -223,6 +223,59 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
         Ok(())
     }
 
+    /// Steps over the values of the next `span` that lie whole inside the
+    /// current buffer, appending a view for each one at `positions`, and
+    /// stops at a value that runs past the buffer's end. `positions` are
+    /// ascending, and the first of the `span` values is position `first`.
+    ///
+    /// Returns how many values were stepped over and how many of them were
+    /// appended.
+    fn gather_from_current_buffer(
+        &mut self,
+        output: &mut ViewBuilder<V>,
+        positions: &[u32],
+        first: u32,
+        span: usize,
+    ) -> (usize, usize) {
+        let buf: &[u8] = self.data[self.position.buffer_index].as_ref();
+        let end = buf.len();
+        let mut block_id: Option<u32> = None;
+        let mut offset = self.position.offset;
+        let mut walked = 0;
+        let mut appended = 0;
+
+        while walked != span && offset + 4 <= end {
+            if offset + WALK_PREFETCH_BYTES < end {
+                prefetch_line(unsafe { buf.as_ptr().add(offset + WALK_PREFETCH_BYTES) });
+            }
+            // SAFETY: `offset + 4 <= end` was just checked.
+            let len = unsafe { read_u32_le_at(buf, offset) };
+            let start = offset + 4;
+            let stop = start + len as usize;
+            if stop > end {
+                break;
+            }
+            if positions.get(appended) == Some(&(first + walked as u32)) {
+                // SAFETY: the string's bytes lie inside `buf`.
+                let view = if len as usize > MAX_INLINE_STRING_VIEW {
+                    let block = *block_id.get_or_insert_with(|| {
+                        output.append_block(self.buffers[self.position.buffer_index].clone())
+                    });
+                    unsafe { long_view_at(buf, start, len, block) }
+                } else {
+                    unsafe { inline_view_at(buf, start, len) }
+                };
+                unsafe { output.append_raw_view_unchecked(&view) };
+                appended += 1;
+            }
+            offset = stop;
+            walked += 1;
+        }
+        self.position.offset = offset;
+
+        (walked, appended)
+    }
+
     /// Skip values within the current buffer. Returns the number of values
     /// fully skipped and an optional error if a value straddled the boundary.
     fn skip_within_buffer(&mut self, size: usize) -> (usize, Option<Error>) {
@@ -314,6 +367,44 @@ impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
                     reader.skip(len as usize);
                     size -= 1;
                 }
+            }
+        }
+    }
+
+    /// A value is found only by walking the lengths before it, so every value
+    /// up to the last kept one is stepped over, and a view is written for the
+    /// kept ones alone. One pass does both in step with the positions, so a
+    /// scattered selection costs nothing per stretch.
+    fn gather(&mut self, builder: &mut Self::Builder, positions: &[u32], first: u32, span: usize) {
+        let mut walked = 0;
+        let mut appended = 0;
+        while walked < span {
+            if appended == positions.len() {
+                self.skip(span - walked);
+                return;
+            }
+            if self.position.offset >= self.data[self.position.buffer_index].len() {
+                self.position.buffer_index += 1;
+                self.position.offset = 0;
+            }
+            let (walked_here, appended_here) = self.gather_from_current_buffer(
+                builder,
+                &positions[appended..],
+                first + walked as u32,
+                span - walked,
+            );
+            walked += walked_here;
+            appended += appended_here;
+            if walked < span {
+                // The next value runs past the buffer's end, which reading
+                // and skipping a single value both handle.
+                if positions.get(appended) == Some(&(first + walked as u32)) {
+                    self.read(builder, 1);
+                    appended += 1;
+                } else {
+                    self.skip(1);
+                }
+                walked += 1;
             }
         }
     }
@@ -451,6 +542,26 @@ mod tests {
         dec.read(&mut out, 2);
 
         assert_eq!(extract(out), vec!["ab", "cd"]);
+    }
+
+    /// A gather walks the values on both sides of a buffer boundary and the
+    /// one whose body crosses it, whether that one is kept or stepped over.
+    #[test]
+    fn gathers_positions_around_a_value_crossing_buffers() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let all = encode_plain(&["ab", "hello", "v1", "v2", "v3", "v4"]);
+        let data = make_data(vec![all[..12].to_vec(), all[12..].to_vec()]);
+        let mut keeping_decoder = PlainPageDecoder::new(data.clone(), ReaderPosition::default());
+        let mut skipping_decoder = PlainPageDecoder::new(data, ReaderPosition::default());
+        let mut crossing_kept = ViewBuilder::with_capacity(&mut allocator, 3);
+        let mut crossing_skipped = ViewBuilder::with_capacity(&mut allocator, 2);
+
+        keeping_decoder.gather(&mut crossing_kept, &[0, 1, 4], 0, 6);
+        skipping_decoder.gather(&mut crossing_skipped, &[2, 5], 0, 6);
+
+        assert_eq!(extract(crossing_kept), vec!["ab", "hello", "v3"]);
+        assert_eq!(extract(crossing_skipped), vec!["v1", "v4"]);
     }
 
     /// Regression: skip with a string body crossing a buffer boundary must

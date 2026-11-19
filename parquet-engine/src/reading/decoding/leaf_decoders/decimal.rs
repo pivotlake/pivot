@@ -382,6 +382,16 @@ impl<T: DecimalCarrier, S: DecimalStorage> DecimalLeafDecoder<T, S> {
             scale,
         }
     }
+
+    /// Gives a decoded array the column's declared precision and scale.
+    fn restamp(&self, array: ArrayRef) -> ArrayRef {
+        let restamped = array
+            .as_primitive::<T>()
+            .clone()
+            .with_precision_and_scale(self.precision, self.scale)
+            .expect("the declared decimal shape was validated at footer parse");
+        Arc::new(restamped)
+    }
 }
 
 impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T, S> {
@@ -412,12 +422,17 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
         let array = self.inner.read(allocator, size)?;
-        let restamped = array
-            .as_primitive::<T>()
-            .clone()
-            .with_precision_and_scale(self.precision, self.scale)
-            .expect("the declared decimal shape was validated at footer parse");
-        Ok(Arc::new(restamped))
+        Ok(self.restamp(array))
+    }
+
+    fn read_selected(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        rows: usize,
+        positions: &[u32],
+    ) -> Result<ArrayRef> {
+        let array = self.inner.read_selected(allocator, rows, positions)?;
+        Ok(self.restamp(array))
     }
 
     fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
