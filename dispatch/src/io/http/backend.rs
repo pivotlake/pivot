@@ -824,6 +824,9 @@ mod uring_engine {
         counted_as_active: bool,
         /// How many times the question about the current name has been sent.
         attempts: u32,
+        /// How many questions the lookup has sent about all its names. Each
+        /// goes to the next name server in turn.
+        questions_sent: u32,
         /// What the name server last answered instead of addresses, reported
         /// if no attempt does better.
         last_failure: Option<DnsError>,
@@ -1566,6 +1569,7 @@ mod uring_engine {
                 waiting,
                 counted_as_active,
                 attempts: 0,
+                questions_sent: 0,
                 last_failure: None,
                 socket: None,
                 question: Vec::new(),
@@ -1606,28 +1610,32 @@ mod uring_engine {
                     .unwrap_or(DnsError::NoAnswer { host, attempts });
                 return self.fail_lookup(idx, || error.clone().into());
             }
-            let Some(server) = self.name_servers.choose_server(attempts) else {
+            let Some(server) = self.name_servers.choose_server(lookup.questions_sent) else {
                 return self
                     .fail_lookup(idx, || DnsError::NoNameServer { host: host.clone() }.into());
             };
             let question_id = rand::random::<u16>();
             let question = match dns::encode_question(question_id, &name) {
                 Ok(question) => question,
-                Err(error) => return self.fail_lookup(idx, || error.clone().into()),
-            };
-            let socket = match Lookup::open_socket(server) {
-                Ok(socket) => socket,
-                Err(error) => {
-                    let kind = error.kind();
-                    let description = error.to_string();
-                    return self.fail_lookup(idx, || {
-                        Error::Io(std::io::Error::new(kind, description.clone()))
-                    });
-                }
+                // This name cannot be asked about. The host's next name may be.
+                Err(error) => return self.ask_about_next_name(ring, idx, error),
             };
 
             let lookup = self.lookups[idx].as_mut().unwrap();
             lookup.attempts += 1;
+            lookup.questions_sent += 1;
+            let socket = match Lookup::open_socket(server) {
+                Ok(socket) => socket,
+                // This machine cannot reach the name server at all. The
+                // attempt is spent and the next one goes to the next server.
+                Err(error) => {
+                    lookup.last_failure = Some(DnsError::NameServerUnreachable {
+                        server: server.to_string(),
+                        reason: error.to_string(),
+                    });
+                    return self.wait_to_ask_again(ring, idx);
+                }
+            };
             lookup.question_id = question_id;
             lookup.question = question;
             lookup.step = LookupStep::SendingQuestion;
@@ -1639,7 +1647,50 @@ mod uring_engine {
             .build()
             .user_data(HTTP_TAG | LOOKUP_TAG | idx as u64);
             lookup.socket = Some(socket);
-            push(ring, &entry)
+            self.submit_lookup_operation(ring, idx, entry, None)
+        }
+
+        /// Submit the next operation of the lookup at slot `idx`, with the
+        /// timeout that cancels it when `deadline` is given. A lookup whose
+        /// operation the ring does not take has nothing in flight to move it
+        /// on, so it ends and the requests waiting for it fail.
+        fn submit_lookup_operation(
+            &mut self,
+            ring: &mut IoUring,
+            idx: usize,
+            operation: squeue::Entry,
+            deadline: Option<*const types::Timespec>,
+        ) -> Result<()> {
+            let submitted = match deadline {
+                Some(deadline) => push_with_step_deadline(ring, operation, deadline, idx),
+                None => push(ring, &operation),
+            };
+            if let Err(error) = submitted {
+                let description = error.to_string();
+                return self.fail_lookup(idx, || {
+                    Error::Io(std::io::Error::other(description.clone()))
+                });
+            }
+            Ok(())
+        }
+
+        /// Move the lookup at slot `idx` on to the host's next name, with all
+        /// its attempts, because the current one has no address. A lookup
+        /// with no name left fails with `error`.
+        fn ask_about_next_name(
+            &mut self,
+            ring: &mut IoUring,
+            idx: usize,
+            error: DnsError,
+        ) -> Result<()> {
+            let lookup = self.lookups[idx].as_mut().unwrap();
+            lookup.asked_name += 1;
+            if lookup.asked_name == lookup.names.len() {
+                return self.fail_lookup(idx, || error.clone().into());
+            }
+            lookup.attempts = 0;
+            lookup.last_failure = None;
+            self.send_question(ring, idx)
         }
 
         /// Wait out one attempt's deadline before the lookup at slot `idx`
@@ -1652,7 +1703,7 @@ mod uring_engine {
             let entry = opcode::Timeout::new(&*lookup.deadline as *const types::Timespec)
                 .build()
                 .user_data(HTTP_TAG | LOOKUP_TAG | idx as u64);
-            push(ring, &entry)
+            self.submit_lookup_operation(ring, idx, entry, None)
         }
 
         /// Advance the lookup at slot `idx` after its SQE completed with
@@ -1683,7 +1734,7 @@ mod uring_engine {
                     .build()
                     .user_data(HTTP_TAG | LOOKUP_TAG | idx as u64);
                     let deadline = &*lookup.deadline as *const types::Timespec;
-                    return push_with_step_deadline(ring, entry, deadline, idx);
+                    return self.submit_lookup_operation(ring, idx, entry, Some(deadline));
                 }
                 LookupStep::ReceivingAnswer => {}
             }
@@ -1691,19 +1742,9 @@ mod uring_engine {
             let answer = &lookup.answer[..result as usize];
             let addresses = match dns::parse_answer(answer, lookup.question_id) {
                 Ok(addresses) => addresses,
-                // This name has no address. The host's next name is asked
-                // about, with all its attempts.
                 Err(DnsError::NameUnknown | DnsError::NoAddresses) => {
-                    lookup.asked_name += 1;
-                    if lookup.asked_name == lookup.names.len() {
-                        let host = lookup.host.clone();
-                        return self.fail_lookup(idx, || {
-                            DnsError::HostNotFound { host: host.clone() }.into()
-                        });
-                    }
-                    lookup.attempts = 0;
-                    lookup.last_failure = None;
-                    return self.send_question(ring, idx);
+                    let host = lookup.host.clone();
+                    return self.ask_about_next_name(ring, idx, DnsError::HostNotFound { host });
                 }
                 Err(DnsError::AnswerToAnotherQuestion) => return self.send_question(ring, idx),
                 Err(error @ DnsError::TruncatedAnswer) => {
