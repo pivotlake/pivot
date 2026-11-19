@@ -1,0 +1,11 @@
+log: info
+server:
+  bind: 127.0.0.1:5432
+datastores:
+  lake:
+    kind: pivotlake
+    location: s3://pivot-compaction-test-20261116/lake
+    default: true
+    compact: true
+    compact_bytes: 1g
+    vacuum: false
