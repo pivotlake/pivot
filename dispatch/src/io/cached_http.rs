@@ -47,7 +47,8 @@ use std::time::{Duration, Instant};
 
 /// The `user_data` of the timeout that wakes a worker's ring once the receive
 /// allowance covers its oldest held fetch. It carries [`HTTP_TAG`] so the
-/// requester routes it here, and a bit no exchange slot or step deadline uses.
+/// requester routes it here, and a bit no exchange slot, step deadline or host
+/// lookup uses.
 #[cfg(target_os = "linux")]
 const RECEIVE_ALLOWANCE_TIMER: u64 = HTTP_TAG | (1 << 61);
 
@@ -239,6 +240,19 @@ impl CachedHttpEngine {
         longest: std::time::Duration,
     ) {
         self.http.force_step_deadline_bounds(shortest, longest);
+    }
+
+    /// Ask `servers` for host addresses instead of the machine's name
+    /// servers, so a test controls what a host resolves to.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn force_name_servers(&mut self, servers: Vec<std::net::SocketAddr>) {
+        self.http.force_name_servers(servers);
+    }
+
+    /// Look a host up again once its answer is `refresh_after` old.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn force_address_refresh_age(&mut self, refresh_after: std::time::Duration) {
+        self.http.force_address_refresh_age(refresh_after);
     }
 
     /// Join ranges with up to `bytes` between them into one request, so a

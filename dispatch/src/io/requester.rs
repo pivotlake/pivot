@@ -358,6 +358,19 @@ impl IORequester {
         self.http.force_step_deadline_bounds(shortest, longest);
     }
 
+    /// Ask `servers` for host addresses instead of the machine's name
+    /// servers, so a test controls what a host resolves to.
+    #[cfg(all(test, target_os = "linux"))]
+    fn force_name_servers(&mut self, servers: Vec<std::net::SocketAddr>) {
+        self.http.force_name_servers(servers);
+    }
+
+    /// Look a host up again once its answer is `refresh_after` old.
+    #[cfg(all(test, target_os = "linux"))]
+    fn force_address_refresh_age(&mut self, refresh_after: std::time::Duration) {
+        self.http.force_address_refresh_age(refresh_after);
+    }
+
     /// Resolve one logical read through the memory caches and immediately submit
     /// every physical cache fill it still needs.
     pub fn request_read(
@@ -2787,6 +2800,148 @@ mod tests {
         let results = fetch_results(&mut requester, &loc, 0, 4096);
 
         assert!(results.iter().all(|result| result.is_err()));
+    }
+
+    /// Spawn a name server that answers every question with `addresses`,
+    /// except the first `unanswered_questions`, which it ignores. Returns
+    /// where it listens and a channel that receives once per question asked.
+    #[cfg(target_os = "linux")]
+    fn spawn_name_server(
+        addresses: Vec<std::net::Ipv4Addr>,
+        unanswered_questions: usize,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<()>) {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listening_at = socket.local_addr().unwrap();
+        let (asked_sender, asked_receiver) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let mut question = [0u8; 512];
+            for question_number in 0.. {
+                let (len, asker) = socket.recv_from(&mut question).unwrap();
+                // The test may have stopped listening for questions.
+                let _ = asked_sender.send(());
+                if question_number < unanswered_questions {
+                    continue;
+                }
+                // The asker's id, the flags of an answer, one question and one
+                // record per address, then the question as it was asked.
+                let mut answer = question[..2].to_vec();
+                answer.extend_from_slice(&[0x81, 0x80, 0, 1, 0, addresses.len() as u8, 0, 0, 0, 0]);
+                answer.extend_from_slice(&question[12..len]);
+                for address in &addresses {
+                    // A pointer to the name in the question, the address record
+                    // type, the internet class, five seconds to live, four bytes.
+                    answer.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 5, 0, 4]);
+                    answer.extend_from_slice(&address.octets());
+                }
+                socket.send_to(&answer, asker).unwrap();
+            }
+        });
+
+        (listening_at, asked_receiver)
+    }
+
+    /// The object `/obj` of a store reached by the host name `host`.
+    #[cfg(target_os = "linux")]
+    fn named_remote_loc(host: &str, port: u16) -> OpenFile {
+        let url = Url::parse(&format!("https://{host}:{port}/obj")).unwrap();
+        OpenFile::Remote(Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap()))
+    }
+
+    /// A store named by host is found by asking the name server, with no
+    /// lookup when the object is opened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_resolves_its_host_through_the_name_server() {
+        init_test_free_pool(16);
+        let (name_server, _asked) = spawn_name_server(vec![std::net::Ipv4Addr::LOCALHOST], 0);
+        let loc = named_remote_loc("resolved.store.test", spawn_server(1));
+        let mut requester = IORequester::with_http_config(client_config());
+        requester.force_name_servers(vec![name_server]);
+
+        fetch(&mut requester, &loc, 0, 4096);
+
+        assert_cached(&loc, 0, 4096);
+    }
+
+    /// A question the name server never answers is asked again instead of
+    /// being waited on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lookup_whose_answer_is_lost_is_asked_again() {
+        init_test_free_pool(16);
+        let (name_server, asked) = spawn_name_server(vec![std::net::Ipv4Addr::LOCALHOST], 1);
+        let loc = named_remote_loc("lost.store.test", spawn_server(1));
+        let mut requester = IORequester::with_http_config(client_config());
+        requester.force_name_servers(vec![name_server]);
+
+        fetch(&mut requester, &loc, 0, 4096);
+
+        assert_cached(&loc, 0, 4096);
+        assert_eq!(asked.try_iter().count(), 2);
+    }
+
+    /// A host no name server answers for fails the read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_of_a_host_no_name_server_answers_for_fails() {
+        init_test_free_pool(16);
+        let (name_server, _asked) = spawn_name_server(Vec::new(), usize::MAX);
+        let loc = named_remote_loc("unanswered.store.test", 443);
+        let mut requester = IORequester::with_http_config(client_config());
+        requester.force_name_servers(vec![name_server]);
+
+        let results = fetch_results(&mut requester, &loc, 0, 4096);
+
+        assert!(results.iter().all(|result| result.is_err()));
+    }
+
+    /// A host resolves to several addresses, and a read whose connection one
+    /// of them refuses goes to the others.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_connects_to_another_address_after_one_refuses() {
+        init_test_free_pool(16);
+        let nobody_listening = [
+            std::net::Ipv4Addr::new(127, 0, 0, 2),
+            std::net::Ipv4Addr::new(127, 0, 0, 3),
+        ];
+        let (name_server, _asked) = spawn_name_server(
+            vec![
+                nobody_listening[0],
+                nobody_listening[1],
+                std::net::Ipv4Addr::LOCALHOST,
+            ],
+            0,
+        );
+        let loc = named_remote_loc("several.store.test", spawn_server(1));
+        let mut requester = IORequester::with_http_config(client_config());
+        requester.force_name_servers(vec![name_server]);
+
+        fetch(&mut requester, &loc, 0, 4096);
+
+        assert_cached(&loc, 0, 4096);
+    }
+
+    /// A host whose answer has aged is looked up again by the next new
+    /// connection to it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_aged_answer_is_looked_up_again() {
+        init_test_free_pool(16);
+        let (name_server, asked) = spawn_name_server(vec![std::net::Ipv4Addr::LOCALHOST], 0);
+        let mut requester = IORequester::with_http_config(client_config());
+        requester.force_name_servers(vec![name_server]);
+        requester.force_address_refresh_age(Duration::ZERO);
+        let first_store = named_remote_loc("aged.store.test", spawn_server(1));
+        let second_store = named_remote_loc("aged.store.test", spawn_server(1));
+        fetch(&mut requester, &first_store, 0, 4096);
+
+        fetch(&mut requester, &second_store, 0, 4096);
+
+        assert_cached(&second_store, 0, 4096);
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
+        asked.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
     /// Hold `requester`'s remote reads to a receive allowance that, as of

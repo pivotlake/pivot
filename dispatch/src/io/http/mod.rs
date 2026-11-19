@@ -20,6 +20,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 mod backend;
+mod dns;
 mod http1;
 mod proto;
 mod tls;
@@ -42,6 +43,8 @@ pub enum Error {
     Http1(#[from] http1::Http1Error),
     #[error("tls error: {0}")]
     Tls(#[from] rustls::Error),
+    #[error("{0}")]
+    Dns(#[from] dns::DnsError),
     #[error("invalid dns name: {0}")]
     InvalidDnsName(#[from] rustls::pki_types::InvalidDnsNameError),
 }
