@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::Error;
@@ -127,20 +127,30 @@ impl TableStorage {
 }
 
 /// The commits in-process writers wait to make to one table, in the order
-/// they arrived, and the lock the writer making the next of them holds.
+/// they arrived, and whose turn it is to make them.
 ///
-/// A writer queues its commit, then takes the lock. Holding it, the writer
+/// A writer queues its commit, then waits until the commit is made or the
+/// turn to commit is free, whichever comes first. A writer with the turn
 /// makes the commits at the front of the queue, its own or not, until its own
 /// is made: the inserts waiting one after another go into the table as one
-/// version, and a commit that removes files is a version of its own. A writer
-/// that gets the lock after another made its commit finds the outcome waiting
-/// and writes nothing. So the store is asked for one version per group of
+/// version, and any other commit is a version of its own. A writer whose
+/// commit another one made is woken as soon as that version is written, and
+/// writes nothing itself. So the store is asked for one version per group of
 /// waiting inserts, however many writers wait, and a rewrite waits behind at
 /// most the commits queued before it.
 #[derive(Default)]
 pub(super) struct CommitQueue {
-    committing: Mutex<()>,
-    waiting: Mutex<VecDeque<QueuedCommit>>,
+    state: Mutex<CommitQueueState>,
+    /// Signalled when a version has been written and when the turn is given
+    /// up: what a waiting writer waits for.
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct CommitQueueState {
+    waiting: VecDeque<QueuedCommit>,
+    /// Whether a writer has the turn to commit.
+    is_turn_taken: bool,
 }
 
 /// One writer's commit, waiting to be made.
@@ -154,7 +164,7 @@ struct QueuedCommit {
 }
 
 /// Where a queued commit's writer finds how the commit went, once a writer
-/// holding the lock has made it.
+/// with the turn has made it.
 #[derive(Default)]
 pub(super) struct CommitOutcome {
     committed: Mutex<Option<crate::Result<()>>>,
@@ -167,74 +177,27 @@ impl CommitOutcome {
     }
 }
 
-/// The queued commits that go into a table as one version.
-pub(super) struct CommitGroup {
-    removed_partition: Vec<u8>,
-    removed_paths: Vec<ObjectPath>,
-    added: Vec<TableFile>,
-    data_change: bool,
-    outcomes: Vec<Arc<CommitOutcome>>,
+/// What a writer that queued a commit waited for.
+pub(super) enum CommitWait<'q> {
+    /// Another writer made the commit, and this is how it went.
+    Committed(crate::Result<()>),
+    /// The turn to commit, with the commit still in the queue.
+    Turn(CommitTurn<'q>),
 }
 
-impl CommitGroup {
-    /// Commit the group's files against `table` as one version.
-    pub(super) fn commit_to(&mut self, table: &mut CatalogTable) -> crate::Result<()> {
-        let removed = RemovedFiles {
-            partition: &self.removed_partition,
-            paths: &self.removed_paths,
-        };
-        table.commit_files(removed, std::mem::take(&mut self.added), self.data_change)
-    }
-
-    /// Tell every writer of the group how its commit went. The only writer
-    /// of a version is handed its failure itself; the writers of a version
-    /// they share are each handed the one failure
-    /// ([`Error::SharedCommit`]).
-    pub(super) fn report(self, committed: crate::Result<()>) {
-        if let [only] = self.outcomes.as_slice() {
-            *only.committed.lock().unwrap() = Some(committed);
-            return;
-        }
-        let committed = committed.map_err(Arc::new);
-        for outcome in &self.outcomes {
-            let shared = committed.clone().map_err(Error::SharedCommit);
-            *outcome.committed.lock().unwrap() = Some(shared);
-        }
-    }
+/// The turn to commit to a table, held by one writer at a time and given up
+/// when dropped, which wakes the writers waiting for it.
+pub(super) struct CommitTurn<'q> {
+    queue: &'q CommitQueue,
 }
 
-impl CommitQueue {
-    /// Queue a commit behind those already waiting. The writer then takes
-    /// the lock ([`lock_to_commit`](Self::lock_to_commit)) and looks at the
-    /// outcome handed back.
-    pub(super) fn enqueue(
-        &self,
-        removed: RemovedFiles<'_>,
-        added: Vec<TableFile>,
-        data_change: bool,
-    ) -> Arc<CommitOutcome> {
-        let outcome = Arc::new(CommitOutcome::default());
-        self.waiting.lock().unwrap().push_back(QueuedCommit {
-            removed_partition: removed.partition.to_vec(),
-            removed_paths: removed.paths.to_vec(),
-            added,
-            data_change,
-            outcome: Arc::clone(&outcome),
-        });
-        outcome
-    }
-
-    /// Wait to be the one writer committing to the table.
-    pub(super) fn lock_to_commit(&self) -> MutexGuard<'_, ()> {
-        self.committing.lock().unwrap()
-    }
-
+impl CommitTurn<'_> {
     /// Take the commits at the front of the queue that make the next
     /// version: every insert waiting before the next commit of another
     /// kind, else that one commit alone. An insert removes nothing and
     /// changes the table's rows. `None` when nothing waits.
     pub(super) fn take_next_group(&self) -> Option<CommitGroup> {
-        let mut waiting = self.waiting.lock().unwrap();
+        let waiting = &mut self.queue.state.lock().unwrap().waiting;
         let first = waiting.pop_front()?;
         let mut group = CommitGroup {
             removed_partition: first.removed_partition,
@@ -255,6 +218,126 @@ impl CommitQueue {
             group.outcomes.push(next.outcome);
         }
         Some(group)
+    }
+
+    /// Tell every writer of `group` how its commit went, and wake them: they
+    /// return without waiting for the turn.
+    pub(super) fn report(&self, group: CommitGroup, committed: crate::Result<()>) {
+        group.record(committed);
+        self.wake_waiting_writers();
+    }
+
+    /// Wake every waiting writer to look at its outcome and at the turn. The
+    /// queue's state is locked for the wake-up, so a writer that just found
+    /// neither is already waiting and does not miss it.
+    fn wake_waiting_writers(&self) {
+        let _state = self.queue.state.lock().unwrap();
+        self.queue.changed.notify_all();
+    }
+}
+
+impl Drop for CommitTurn<'_> {
+    fn drop(&mut self) {
+        self.queue.state.lock().unwrap().is_turn_taken = false;
+        self.queue.changed.notify_all();
+    }
+}
+
+/// The queued commits that go into a table as one version.
+pub(super) struct CommitGroup {
+    removed_partition: Vec<u8>,
+    removed_paths: Vec<ObjectPath>,
+    added: Vec<TableFile>,
+    data_change: bool,
+    /// The outcome of each commit of the group, until it is recorded.
+    outcomes: Vec<Arc<CommitOutcome>>,
+}
+
+impl CommitGroup {
+    /// Commit the group's files against `table` as one version.
+    pub(super) fn commit_to(&mut self, table: &mut CatalogTable) -> crate::Result<()> {
+        let removed = RemovedFiles {
+            partition: &self.removed_partition,
+            paths: &self.removed_paths,
+        };
+        table.commit_files(removed, std::mem::take(&mut self.added), self.data_change)
+    }
+
+    /// Record how the group's commit went for every writer of it. The only
+    /// writer of a version is handed its failure itself; the writers of a
+    /// version they share are each handed the one failure
+    /// ([`Error::SharedCommit`]).
+    fn record(mut self, committed: crate::Result<()>) {
+        let outcomes = std::mem::take(&mut self.outcomes);
+        if let [only] = outcomes.as_slice() {
+            *only.committed.lock().unwrap() = Some(committed);
+            return;
+        }
+        let committed = committed.map_err(Arc::new);
+        for outcome in &outcomes {
+            let shared = committed.clone().map_err(Error::SharedCommit);
+            *outcome.committed.lock().unwrap() = Some(shared);
+        }
+    }
+}
+
+impl Drop for CommitGroup {
+    /// A group dropped with no outcome recorded was being committed by a
+    /// writer that panicked. Its writers are told so, and that their commit
+    /// may have been made, instead of waiting for an outcome that never
+    /// comes.
+    fn drop(&mut self) {
+        for outcome in &self.outcomes {
+            *outcome.committed.lock().unwrap() = Some(Err(Error::CommitterPanicked));
+        }
+    }
+}
+
+impl CommitQueue {
+    /// Queue a commit behind those already waiting. The writer then waits
+    /// for the outcome handed back ([`wait_to_commit`](Self::wait_to_commit)).
+    pub(super) fn enqueue(
+        &self,
+        removed: RemovedFiles<'_>,
+        added: Vec<TableFile>,
+        data_change: bool,
+    ) -> Arc<CommitOutcome> {
+        let outcome = Arc::new(CommitOutcome::default());
+        self.state.lock().unwrap().waiting.push_back(QueuedCommit {
+            removed_partition: removed.partition.to_vec(),
+            removed_paths: removed.paths.to_vec(),
+            added,
+            data_change,
+            outcome: Arc::clone(&outcome),
+        });
+        outcome
+    }
+
+    /// Wait until the queued commit with `outcome` has been made, or until
+    /// the turn to commit is free and take it, whichever comes first.
+    pub(super) fn wait_to_commit(&self, outcome: &CommitOutcome) -> CommitWait<'_> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(committed) = outcome.take() {
+                return CommitWait::Committed(committed);
+            }
+            if !state.is_turn_taken {
+                state.is_turn_taken = true;
+                return CommitWait::Turn(CommitTurn { queue: self });
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    /// Wait for the turn to commit and take it, for a writer that changes
+    /// the table without queueing a commit.
+    pub(super) fn take_turn(&self) -> CommitTurn<'_> {
+        let mut state = self.state.lock().unwrap();
+        while state.is_turn_taken {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.is_turn_taken = true;
+        CommitTurn { queue: self }
     }
 }
 

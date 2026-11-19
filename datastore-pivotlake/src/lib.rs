@@ -182,6 +182,10 @@ pub enum Error {
     #[error("committing together with other writers of the table: {0}")]
     SharedCommit(#[source] Arc<Error>),
     #[error(
+        "the writer that was making this commit with its own panicked; whether the commit was made is unknown"
+    )]
+    CommitterPanicked,
+    #[error(
         "compaction of table `{table}` stopped: a merge selected from version {version} found its input file `{file}` no longer active, and a refresh from storage left the table at that version"
     )]
     CompactionConflictWithoutProgress {
@@ -215,6 +219,7 @@ impl Error {
         match self {
             Self::Iceberg(error) => error.may_have_committed(),
             Self::SharedCommit(error) => error.may_have_committed(),
+            Self::CommitterPanicked => true,
             _ => false,
         }
     }
@@ -746,13 +751,16 @@ impl PivotlakeDatastore {
             .ok_or_else(|| Error::TableNotFound(id.to_string()))?
             .commit_queue();
         let outcome = commit_queue.enqueue(removed, added, data_change);
-        let _committing = commit_queue.lock_to_commit();
+        let turn = match commit_queue.wait_to_commit(&outcome) {
+            table::CommitWait::Committed(committed) => return committed,
+            table::CommitWait::Turn(turn) => turn,
+        };
 
         loop {
             if let Some(committed) = outcome.take() {
                 return committed;
             }
-            let mut group = commit_queue
+            let mut group = turn
                 .take_next_group()
                 .expect("a commit with no outcome yet is still queued");
             let committed = self
@@ -763,7 +771,7 @@ impl PivotlakeDatastore {
                     self.publish_table(table);
                     Ok(())
                 });
-            group.report(committed);
+            turn.report(group, committed);
         }
     }
 
