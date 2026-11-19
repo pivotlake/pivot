@@ -93,8 +93,9 @@ fn count_committed_rows(datastore: &PivotlakeDatastore) -> i64 {
         .sum()
 }
 
-/// Eight clients INSERT at once. Every commit appends one version on top of the
-/// one the previous commit produced, so all eight commit: eight versions above the
+/// Eight clients INSERT at once. Every commit appends a version on top of the
+/// one the previous commit produced, and the inserts waiting for the table
+/// together share one, so all eight commit: at most eight versions above the
 /// CREATE, with every row present.
 #[test]
 fn parallel_inserts_into_one_table_all_land() {
@@ -107,7 +108,10 @@ fn parallel_inserts_into_one_table_all_land() {
         }
     });
 
-    assert_eq!(published_version(&datastore), 8, "one version per INSERT");
+    assert!(
+        (1..=8).contains(&published_version(&datastore)),
+        "at most one version per INSERT"
+    );
     assert_eq!(count_committed_rows(&datastore), 8);
 }
 

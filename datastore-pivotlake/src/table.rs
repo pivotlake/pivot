@@ -2,8 +2,9 @@
 //! whichever format keeps it: what every reader, writer and maintenance sweep
 //! holds and evolves, over the format's own [`Table`].
 
+use std::collections::VecDeque;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::Error;
@@ -125,9 +126,143 @@ impl TableStorage {
     }
 }
 
+/// The commits in-process writers wait to make to one table, in the order
+/// they arrived, and the lock the writer making the next of them holds.
+///
+/// A writer queues its commit, then takes the lock. Holding it, the writer
+/// makes the commits at the front of the queue, its own or not, until its own
+/// is made: the inserts waiting one after another go into the table as one
+/// version, and a commit that removes files is a version of its own. A writer
+/// that gets the lock after another made its commit finds the outcome waiting
+/// and writes nothing. So the store is asked for one version per group of
+/// waiting inserts, however many writers wait, and a rewrite waits behind at
+/// most the commits queued before it.
+#[derive(Default)]
+pub(super) struct CommitQueue {
+    committing: Mutex<()>,
+    waiting: Mutex<VecDeque<QueuedCommit>>,
+}
+
+/// One writer's commit, waiting to be made.
+struct QueuedCommit {
+    /// The partition of the files the commit removes, as a walk names it.
+    removed_partition: Vec<u8>,
+    removed_paths: Vec<ObjectPath>,
+    added: Vec<TableFile>,
+    data_change: bool,
+    outcome: Arc<CommitOutcome>,
+}
+
+/// Where a queued commit's writer finds how the commit went, once a writer
+/// holding the lock has made it.
+#[derive(Default)]
+pub(super) struct CommitOutcome {
+    committed: Mutex<Option<Result<(), Arc<Error>>>>,
+}
+
+impl CommitOutcome {
+    /// How the commit went, when it has been made. A failure of a version
+    /// that held other writers' commits too is shared with them
+    /// ([`Error::SharedCommit`]); the only writer of a version gets the
+    /// failure itself.
+    pub(super) fn take(&self) -> Option<crate::Result<()>> {
+        let committed = self.committed.lock().unwrap().take()?;
+        Some(committed.map_err(|error| Arc::try_unwrap(error).unwrap_or_else(Error::SharedCommit)))
+    }
+}
+
+/// The queued commits that go into a table as one version.
+pub(super) struct CommitGroup {
+    removed_partition: Vec<u8>,
+    removed_paths: Vec<ObjectPath>,
+    added: Vec<TableFile>,
+    data_change: bool,
+    outcomes: Vec<Arc<CommitOutcome>>,
+}
+
+impl CommitGroup {
+    /// Commit the group's files against `table` as one version.
+    pub(super) fn commit_to(&mut self, table: &mut CatalogTable) -> crate::Result<()> {
+        let removed = RemovedFiles {
+            partition: &self.removed_partition,
+            paths: &self.removed_paths,
+        };
+        table.commit_files(removed, std::mem::take(&mut self.added), self.data_change)
+    }
+
+    /// Tell every writer of the group how its commit went. The last writer
+    /// told is handed the outcome itself, so the only writer of a version
+    /// holds its failure alone.
+    pub(super) fn report(mut self, committed: crate::Result<()>) {
+        let committed = committed.map_err(Arc::new);
+        let last = self
+            .outcomes
+            .pop()
+            .expect("a group holds at least one commit");
+        for outcome in self.outcomes {
+            *outcome.committed.lock().unwrap() = Some(committed.clone());
+        }
+        *last.committed.lock().unwrap() = Some(committed);
+    }
+}
+
+impl CommitQueue {
+    /// Queue a commit behind those already waiting. The writer then takes
+    /// the lock ([`lock_to_commit`](Self::lock_to_commit)) and looks at the
+    /// outcome handed back.
+    pub(super) fn enqueue(
+        &self,
+        removed: RemovedFiles<'_>,
+        added: Vec<TableFile>,
+        data_change: bool,
+    ) -> Arc<CommitOutcome> {
+        let outcome = Arc::new(CommitOutcome::default());
+        self.waiting.lock().unwrap().push_back(QueuedCommit {
+            removed_partition: removed.partition.to_vec(),
+            removed_paths: removed.paths.to_vec(),
+            added,
+            data_change,
+            outcome: Arc::clone(&outcome),
+        });
+        outcome
+    }
+
+    /// Wait to be the one writer committing to the table.
+    pub(super) fn lock_to_commit(&self) -> MutexGuard<'_, ()> {
+        self.committing.lock().unwrap()
+    }
+
+    /// Take the commits at the front of the queue that make the next
+    /// version: one that removes files alone, else every insert waiting
+    /// before the next commit that removes files. `None` when nothing waits.
+    pub(super) fn take_next_group(&self) -> Option<CommitGroup> {
+        let mut waiting = self.waiting.lock().unwrap();
+        let first = waiting.pop_front()?;
+        let mut group = CommitGroup {
+            removed_partition: first.removed_partition,
+            removed_paths: first.removed_paths,
+            added: first.added,
+            data_change: first.data_change,
+            outcomes: vec![first.outcome],
+        };
+        if !group.removed_paths.is_empty() {
+            return Some(group);
+        }
+        while let Some(next) = waiting.front()
+            && next.removed_paths.is_empty()
+            && next.data_change == group.data_change
+        {
+            let next = waiting.pop_front().unwrap();
+            group.added.extend(next.added);
+            group.outcomes.push(next.outcome);
+        }
+        Some(group)
+    }
+}
+
 /// A table at one committed version: its durable identity and storage, the
-/// format's own view of that version, and the lock in-process writers take to
-/// commit on top of it.
+/// format's own view of that version, and the queue in-process writers commit
+/// on top of it through.
 ///
 /// A copy handed out for reading drifts as soon as anything commits; it is
 /// never a commit base, since writes go through the datastore, which commits
@@ -149,8 +284,8 @@ pub struct CatalogTable {
     /// This exists only for throughput: the format's own conditional write
     /// already ensures correctness, but concurrent in-process writers can all
     /// start at `V` and race for `V + 1`, forcing every loser to reload and
-    /// retry.
-    commit_lock: Arc<std::sync::Mutex<()>>,
+    /// retry, and each would write a version of its own.
+    commit_queue: Arc<CommitQueue>,
 }
 
 impl CatalogTable {
@@ -165,14 +300,14 @@ impl CatalogTable {
             storage,
             table,
             dispatcher,
-            commit_lock: Arc::default(),
+            commit_queue: Arc::default(),
         }
     }
 
     /// An owned handle to this table's
-    /// [commit lock](field@Self::commit_lock).
-    pub(super) fn commit_lock(&self) -> Arc<std::sync::Mutex<()>> {
-        self.commit_lock.clone()
+    /// [commit queue](field@Self::commit_queue).
+    pub(super) fn commit_queue(&self) -> Arc<CommitQueue> {
+        self.commit_queue.clone()
     }
 
     /// Advance this copy to the latest committed version. Returns whether it
@@ -194,7 +329,7 @@ impl CatalogTable {
     /// copy is refreshed onto it, or stays where it was for the next refresh.
     ///
     /// In-process callers follow the table's
-    /// [commit-lock protocol](field@Self::commit_lock), so this retry path
+    /// [commit queue](field@Self::commit_queue), so this retry path
     /// normally handles contention from another process on a shared remote
     /// store.
     ///
