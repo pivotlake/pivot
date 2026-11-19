@@ -17,13 +17,13 @@ use thiserror::Error;
 
 /// How long an answer is used before the host is looked up again. Stores
 /// publish their addresses for about this long.
-pub(crate) const REFRESH_ADDRESSES_AFTER: Duration = Duration::from_secs(5);
+const REFRESH_ADDRESSES_AFTER: Duration = Duration::from_secs(5);
 
 /// How long an address is kept after a name server last gave it. A store
 /// keeps serving at an address well after it stops publishing it, and
 /// keeping addresses from several answers spreads connections over more of
 /// the store's servers.
-const MAX_ADDRESS_AGE: Duration = Duration::from_secs(30);
+const FORGET_ADDRESSES_AFTER: Duration = Duration::from_secs(30);
 
 /// The most addresses kept for one host.
 const MAX_ADDRESSES_PER_HOST: usize = 32;
@@ -39,8 +39,10 @@ pub(crate) const MAX_ANSWER_LEN: usize = 512;
 const ADDRESS_RECORD_TYPE: u16 = 1;
 const INTERNET_CLASS: u16 = 1;
 const HEADER_LEN: usize = 12;
+/// The answer code of a name server that knows the name does not exist.
+const NAME_UNKNOWN_CODE: u8 = 3;
 
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Clone, PartialEq, Error)]
 pub enum DnsError {
     #[error("{host} cannot be resolved: /etc/resolv.conf names no name server")]
     NoNameServer { host: String },
@@ -48,15 +50,19 @@ pub enum DnsError {
     InvalidHostName { host: String },
     #[error("no name server answered for {host} in {attempts} attempts")]
     NoAnswer { host: String, attempts: u32 },
+    #[error("no name server knows an address for {host}")]
+    HostNotFound { host: String },
     #[error("the name server's answer is malformed")]
     MalformedAnswer,
     #[error("the name server's answer is for another question")]
     AnswerToAnotherQuestion,
     #[error("the name server's answer does not fit in one datagram")]
     TruncatedAnswer,
-    #[error("the name server refused the question with code {code}")]
-    Refused { code: u8 },
-    #[error("the name server knows no address for the host")]
+    #[error("the name server failed to answer, with code {code}")]
+    ServerFailed { code: u8 },
+    #[error("the name server knows no such name")]
+    NameUnknown,
+    #[error("the name server knows no address for the name")]
     NoAddresses,
 }
 
@@ -64,14 +70,20 @@ pub enum DnsError {
 /// the machine configures them.
 pub(crate) struct NameServers {
     servers: Vec<SocketAddr>,
+    /// Domains a short host name is completed with, in the order they are
+    /// tried.
+    search_domains: Vec<String>,
+    /// A host name with fewer dots than this is tried with the search
+    /// domains before it is tried as written.
+    dots_of_a_complete_name: usize,
     /// Host names with a fixed address, in lower case.
     fixed_addresses: HashMap<String, IpAddr>,
 }
 
 impl NameServers {
-    /// Read the machine's name servers from `/etc/resolv.conf` and its fixed
-    /// host addresses from `/etc/hosts`. A machine without one of the files
-    /// has no name servers or no fixed addresses.
+    /// Read the machine's name servers and search domains from
+    /// `/etc/resolv.conf` and its fixed host addresses from `/etc/hosts`. A
+    /// machine without one of the files has none of what the file lists.
     pub fn load() -> Self {
         let resolver_configuration =
             std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
@@ -79,16 +91,36 @@ impl NameServers {
         Self::parse(&resolver_configuration, &hosts_file)
     }
 
-    fn parse(resolver_configuration: &str, hosts_file: &str) -> Self {
-        let servers = resolver_configuration
-            .lines()
-            .filter_map(|line| {
-                let mut words = line.split_whitespace();
-                (words.next() == Some("nameserver")).then(|| words.next())?
-            })
-            .filter_map(|address| address.parse::<IpAddr>().ok())
-            .map(|address| SocketAddr::new(address, 53))
-            .collect();
+    pub fn parse(resolver_configuration: &str, hosts_file: &str) -> Self {
+        let mut servers = Vec::new();
+        let mut search_domains = Vec::new();
+        let mut dots_of_a_complete_name = 1;
+        for line in resolver_configuration.lines() {
+            let mut words = line.split_whitespace();
+            match words.next() {
+                Some("nameserver") => {
+                    if let Some(Ok(address)) = words.next().map(str::parse::<IpAddr>) {
+                        servers.push(SocketAddr::new(address, 53));
+                    }
+                }
+                // The last of these lines is the one in effect.
+                Some("search" | "domain") => {
+                    search_domains = words
+                        .map(|domain| domain.trim_end_matches('.').to_string())
+                        .collect();
+                }
+                Some("options") => {
+                    for option in words {
+                        if let Some(Ok(dots)) =
+                            option.strip_prefix("ndots:").map(str::parse::<usize>)
+                        {
+                            dots_of_a_complete_name = dots;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         let mut fixed_addresses: HashMap<String, IpAddr> = HashMap::new();
         for line in hosts_file.lines() {
             let line = line.split('#').next().unwrap_or_default();
@@ -109,6 +141,8 @@ impl NameServers {
         }
         Self {
             servers,
+            search_domains,
+            dots_of_a_complete_name,
             fixed_addresses,
         }
     }
@@ -136,9 +170,29 @@ impl NameServers {
         if let Ok(address) = unbracketed.parse::<IpAddr>() {
             return Some(address);
         }
-        self.fixed_addresses
-            .get(&host.to_ascii_lowercase())
-            .copied()
+        let name = host.trim_end_matches('.').to_ascii_lowercase();
+        self.fixed_addresses.get(&name).copied()
+    }
+
+    /// The names a name server is asked about for `host`, in order, until one
+    /// has an address. A host written with a final dot is complete and is
+    /// asked about as written. Any other is also tried with each of the
+    /// machine's search domains appended, before the name as written when it
+    /// has few dots and after it otherwise.
+    pub fn list_names_to_ask(&self, host: &str) -> Vec<String> {
+        if host.ends_with('.') {
+            return vec![host.to_string()];
+        }
+        let completed = self
+            .search_domains
+            .iter()
+            .map(|domain| format!("{host}.{domain}"));
+        let dots = host.matches('.').count();
+        if dots >= self.dots_of_a_complete_name {
+            std::iter::once(host.to_string()).chain(completed).collect()
+        } else {
+            completed.chain(std::iter::once(host.to_string())).collect()
+        }
     }
 }
 
@@ -201,9 +255,10 @@ pub(crate) fn parse_answer(answer: &[u8], id: u16) -> Result<Vec<Ipv4Addr>, DnsE
     if flags & 0x0200 != 0 {
         return Err(DnsError::TruncatedAnswer);
     }
-    let code = (flags & 0x000F) as u8;
-    if code != 0 {
-        return Err(DnsError::Refused { code });
+    match (flags & 0x000F) as u8 {
+        0 => {}
+        NAME_UNKNOWN_CODE => return Err(DnsError::NameUnknown),
+        code => return Err(DnsError::ServerFailed { code }),
     }
     let question_count = read_u16(4)?;
     let record_count = read_u16(6)?;
@@ -232,6 +287,7 @@ pub(crate) fn parse_answer(answer: &[u8], id: u16) -> Result<Vec<Ipv4Addr>, DnsE
 }
 
 /// What the address book knows for a host a connection is about to open to.
+#[derive(Debug, PartialEq)]
 pub(crate) enum AddressChoice {
     /// Connect to this address.
     Fresh(IpAddr),
@@ -255,13 +311,15 @@ struct HostAddresses {
     next: usize,
 }
 
-/// The addresses each host last resolved to, for one worker. Connections to
-/// a host go to its addresses in turn, so they spread over the store's
-/// servers, and an address a connection just failed on is passed over for a
-/// while.
+/// The addresses each host resolved to in its recent answers, for one
+/// worker. Connections to a host go to its addresses in turn, so they spread
+/// over the store's servers, and an address a connection just failed on is
+/// passed over for a while. A host whose last answer is too old is forgotten
+/// and has to be looked up again.
 pub(crate) struct AddressBook {
     hosts: HashMap<String, HostAddresses>,
     refresh_after: Duration,
+    forget_after: Duration,
 }
 
 impl AddressBook {
@@ -269,13 +327,16 @@ impl AddressBook {
         Self {
             hosts: HashMap::new(),
             refresh_after: REFRESH_ADDRESSES_AFTER,
+            forget_after: FORGET_ADDRESSES_AFTER,
         }
     }
 
-    /// Look a host up again once its answer is `refresh_after` old.
+    /// Look a host up again once its answer is `refresh_after` old, and
+    /// forget what it resolved to once the answer is `forget_after` old.
     #[cfg(test)]
-    pub fn force_refresh_after(&mut self, refresh_after: Duration) {
+    pub fn force_address_ages(&mut self, refresh_after: Duration, forget_after: Duration) {
         self.refresh_after = refresh_after;
+        self.forget_after = forget_after;
     }
 
     /// Choose the address the next connection to `host` goes to.
@@ -284,7 +345,8 @@ impl AddressBook {
             return AddressChoice::Unknown;
         };
         let age = now.duration_since(known.answered_at);
-        if age > MAX_ADDRESS_AGE {
+        if age > self.forget_after {
+            self.hosts.remove(host);
             return AddressChoice::Unknown;
         }
         // The first address in turn that no connection failed on lately. When
@@ -303,9 +365,13 @@ impl AddressBook {
         }
     }
 
-    /// Record a name server's answer for `host`. Addresses from earlier
-    /// answers stay until they are [`MAX_ADDRESS_AGE`] old.
+    /// Record a name server's answer for `host`. Addresses from its earlier
+    /// answers stay until no answer has listed them for a while, and every
+    /// other host whose last answer has grown too old is forgotten.
     pub fn record_answer(&mut self, host: &str, answered: &[Ipv4Addr], now: Instant) {
+        let forget_after = self.forget_after;
+        self.hosts
+            .retain(|_, known| now.duration_since(known.answered_at) <= forget_after);
         let known = self
             .hosts
             .entry(host.to_string())
@@ -333,7 +399,7 @@ impl AddressBook {
         }
         known
             .addresses
-            .retain(|kept| now.duration_since(kept.last_answered) <= MAX_ADDRESS_AGE);
+            .retain(|kept| now.duration_since(kept.last_answered) <= forget_after);
         known
             .addresses
             .sort_by_key(|kept| std::cmp::Reverse(kept.last_answered));
@@ -354,5 +420,171 @@ impl AddressBook {
         {
             kept.avoided_until = now + AVOID_FAILED_ADDRESS_FOR;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An answer to a question with id 7 about `a.test`, carrying an alias
+    /// record and then one address record for each of `addresses`.
+    fn build_answer(flags: [u8; 2], addresses: &[[u8; 4]]) -> Vec<u8> {
+        let mut answer = vec![0, 7, flags[0], flags[1], 0, 1, 0, 0, 0, 0, 0, 0];
+        answer[7] = addresses.len() as u8 + 1;
+        answer.extend_from_slice(&[1, b'a', 4, b't', b'e', b's', b't', 0, 0, 1, 0, 1]);
+        // The alias record: a pointer to the name, the alias type, the
+        // internet class, a time to live, and the two-byte name it points to.
+        answer.extend_from_slice(&[0xC0, 12, 0, 5, 0, 1, 0, 0, 0, 5, 0, 2, 0xC0, 12]);
+        for address in addresses {
+            answer.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 5, 0, 4]);
+            answer.extend_from_slice(address);
+        }
+        answer
+    }
+
+    #[test]
+    fn an_answer_with_an_alias_gives_the_addresses_behind_it() {
+        let answer = build_answer([0x81, 0x80], &[[10, 0, 0, 1], [10, 0, 0, 2]]);
+
+        let addresses = parse_answer(&answer, 7);
+
+        assert_eq!(
+            addresses,
+            Ok(vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)])
+        );
+    }
+
+    #[test]
+    fn an_answer_cut_short_anywhere_is_an_error() {
+        let answer = build_answer([0x81, 0x80], &[[10, 0, 0, 1]]);
+
+        let outcomes: Vec<_> = (0..answer.len())
+            .map(|len| parse_answer(&answer[..len], 7))
+            .collect();
+
+        assert!(outcomes.iter().all(|outcome| outcome.is_err()));
+    }
+
+    #[test]
+    fn an_answer_says_why_it_carries_no_address() {
+        let for_another_question = parse_answer(&build_answer([0x81, 0x80], &[[10, 0, 0, 1]]), 8);
+        let truncated = parse_answer(&build_answer([0x83, 0x80], &[]), 7);
+        let server_failed = parse_answer(&build_answer([0x81, 0x82], &[]), 7);
+        let name_unknown = parse_answer(&build_answer([0x81, 0x83], &[]), 7);
+        let no_addresses = parse_answer(&build_answer([0x81, 0x80], &[]), 7);
+
+        assert_eq!(for_another_question, Err(DnsError::AnswerToAnotherQuestion));
+        assert_eq!(truncated, Err(DnsError::TruncatedAnswer));
+        assert_eq!(server_failed, Err(DnsError::ServerFailed { code: 2 }));
+        assert_eq!(name_unknown, Err(DnsError::NameUnknown));
+        assert_eq!(no_addresses, Err(DnsError::NoAddresses));
+    }
+
+    #[test]
+    fn a_short_host_name_is_tried_with_the_search_domains_first() {
+        let name_servers = NameServers::parse(
+            "nameserver 10.0.0.2\nsearch storage.svc.cluster.local svc.cluster.local\noptions ndots:2\n",
+            "",
+        );
+
+        let short = name_servers.list_names_to_ask("minio.storage");
+        let long = name_servers.list_names_to_ask("bucket.s3.amazonaws.com");
+        let complete = name_servers.list_names_to_ask("minio.");
+
+        assert_eq!(
+            short,
+            [
+                "minio.storage.storage.svc.cluster.local",
+                "minio.storage.svc.cluster.local",
+                "minio.storage"
+            ]
+        );
+        assert_eq!(long[0], "bucket.s3.amazonaws.com");
+        assert_eq!(complete, ["minio."]);
+    }
+
+    #[test]
+    fn a_host_in_the_hosts_file_or_written_as_an_address_needs_no_name_server() {
+        let name_servers = NameServers::parse(
+            "",
+            "::1 localhost\n127.0.0.1 localhost # loopback\n10.0.0.9 Store.Internal\n",
+        );
+
+        let listed_twice = name_servers.find_fixed_address("localhost");
+        let other_case = name_servers.find_fixed_address("store.internal.");
+        let written_as_address = name_servers.find_fixed_address("[::1]");
+        let unlisted = name_servers.find_fixed_address("elsewhere.test");
+
+        assert_eq!(listed_twice, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(other_case, Some("10.0.0.9".parse().unwrap()));
+        assert_eq!(written_as_address, Some("::1".parse().unwrap()));
+        assert_eq!(unlisted, None);
+    }
+
+    #[test]
+    fn connections_go_to_the_addresses_of_a_host_in_turn() {
+        let now = Instant::now();
+        let mut book = AddressBook::new();
+        let answered = [Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)];
+        book.record_answer("store.test", &answered, now);
+
+        let chosen: Vec<_> = (0..4)
+            .map(|_| book.choose_address("store.test", now))
+            .collect();
+
+        assert_ne!(chosen[0], chosen[1]);
+        assert_eq!(chosen[0], chosen[2]);
+        assert_eq!(chosen[1], chosen[3]);
+    }
+
+    #[test]
+    fn an_address_a_connection_failed_on_is_passed_over() {
+        let now = Instant::now();
+        let mut book = AddressBook::new();
+        let failed = Ipv4Addr::new(10, 0, 0, 1);
+        let healthy = Ipv4Addr::new(10, 0, 0, 2);
+        book.record_answer("store.test", &[failed, healthy], now);
+
+        book.record_failure("store.test", IpAddr::V4(failed), now);
+
+        let chosen: Vec<_> = (0..4)
+            .map(|_| book.choose_address("store.test", now))
+            .collect();
+        assert_eq!(
+            chosen,
+            [(); 4].map(|_| AddressChoice::Fresh(IpAddr::V4(healthy)))
+        );
+    }
+
+    #[test]
+    fn an_answer_ages_into_a_refresh_and_then_is_forgotten() {
+        let answered_at = Instant::now();
+        let mut book = AddressBook::new();
+        let address = Ipv4Addr::new(10, 0, 0, 1);
+        book.record_answer("store.test", &[address], answered_at);
+
+        let fresh = book.choose_address("store.test", answered_at + Duration::from_secs(4));
+        let due = book.choose_address("store.test", answered_at + Duration::from_secs(6));
+        let forgotten = book.choose_address("store.test", answered_at + Duration::from_secs(31));
+
+        assert_eq!(fresh, AddressChoice::Fresh(IpAddr::V4(address)));
+        assert_eq!(due, AddressChoice::DueForRefresh(IpAddr::V4(address)));
+        assert_eq!(forgotten, AddressChoice::Unknown);
+    }
+
+    #[test]
+    fn a_host_keeps_no_more_addresses_than_the_most_recent() {
+        let now = Instant::now();
+        let mut book = AddressBook::new();
+        let answered: Vec<_> = (0..40).map(|last| Ipv4Addr::new(10, 0, 0, last)).collect();
+
+        book.record_answer("store.test", &answered, now);
+
+        let chosen: std::collections::HashSet<_> = (0..100)
+            .map(|_| book.choose_address("store.test", now))
+            .map(|choice| format!("{choice:?}"))
+            .collect();
+        assert_eq!(chosen.len(), MAX_ADDRESSES_PER_HOST);
     }
 }
