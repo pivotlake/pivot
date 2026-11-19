@@ -52,6 +52,8 @@ pub enum DnsError {
     NoAnswer { host: String, attempts: u32 },
     #[error("no name server knows an address for {host}")]
     HostNotFound { host: String },
+    #[error("the name server {server} cannot be reached: {reason}")]
+    NameServerUnreachable { server: String, reason: String },
     #[error("the name server's answer is malformed")]
     MalformedAnswer,
     #[error("the name server's answer is for another question")]
