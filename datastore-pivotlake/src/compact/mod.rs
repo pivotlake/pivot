@@ -863,6 +863,10 @@ impl MergeSelection {
             }
             ControlFlow::Continue(())
         });
+        // A merge takes files of about one size, the smallest first, so a
+        // file merged before is not weighed against the ones just written.
+        // Files of one size keep the partition's order.
+        small_files.sort_by_key(|file| file.size);
         Ok(match pass {
             CompactionPass::Routine => {
                 small_file_batch(small_files, self.merge_target_bytes, self.min_files)
