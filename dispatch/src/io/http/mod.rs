@@ -33,6 +33,10 @@ pub(crate) use backend::HTTP_TAG;
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) use backend::HttpCompletion;
 pub(crate) use backend::HttpEngine;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use backend::SHORTEST_OVERLOAD_WAIT;
+#[cfg(target_os = "linux")]
+pub(crate) use backend::{MAX_COMPLETIONS_PER_REQUEST, MAX_REQUESTS_IN_FLIGHT};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -49,6 +53,20 @@ pub enum Error {
     Dns(#[from] dns::DnsError),
     #[error("invalid dns name: {0}")]
     InvalidDnsName(#[from] rustls::pki_types::InvalidDnsNameError),
+}
+
+impl Error {
+    /// Whether this is a 5xx answer: the store saying it is overloaded or
+    /// failing for the moment, which a later attempt may not meet.
+    pub(crate) fn is_overloaded_answer(&self) -> bool {
+        matches!(
+            self,
+            Error::Proto(
+                proto::ProtoError::UnexpectedUploadStatus(status)
+                    | proto::ProtoError::UnexpectedStatus(status),
+            ) if (500..600).contains(status)
+        )
+    }
 }
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;

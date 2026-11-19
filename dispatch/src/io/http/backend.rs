@@ -21,6 +21,11 @@
 //! name server for it on the same ring and keeps the answer for the next
 //! connections, so a worker never blocks on resolving a name.
 //!
+//! The engine keeps a bounded number of requests in flight. A request past
+//! the cap waits in the engine and goes out as another finishes. A store
+//! that answers it is overloaded is sent fewer requests at once for a while,
+//! and the request it refused goes again only after a wait.
+//!
 //! On non-Linux (macOS) there is no ring: the engine hands each range read to a
 //! shared pool of blocking `std::net` + `rustls::StreamOwned` threads (mirroring
 //! the file path's `pread` pool) and collects their completions over a channel,
@@ -31,8 +36,10 @@ use super::{BodyCursor, BodyWindow, RemoteRead, RemoteRequest, RemoteUpload, Res
 
 const IO_CHUNK_SIZE: usize = 16 * 1024;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use uring_engine::SHORTEST_OVERLOAD_WAIT;
 #[cfg(target_os = "linux")]
-pub(crate) use uring_engine::HttpEngine;
+pub(crate) use uring_engine::{HttpEngine, MAX_COMPLETIONS_PER_REQUEST, MAX_REQUESTS_IN_FLIGHT};
 
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) use blocking_engine::{HttpCompletion, HttpEngine};
@@ -574,7 +581,7 @@ mod uring_engine {
     use crate::io::http::{Error, Result};
     use io_uring::{IoUring, opcode, squeue, types};
     use rustls::ClientConnection;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::io::{Read, Write};
     use std::net::SocketAddr;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -590,6 +597,51 @@ mod uring_engine {
     /// exchange's. The rest of its `user_data` is the lookup's slot. Bit 61
     /// is taken by the timer of the receive allowance.
     const LOOKUP_TAG: u64 = 1 << 60;
+
+    /// Marks the CQE of the timer a request waits out before it is sent again
+    /// to a store that answered it was overloaded. The rest of its
+    /// `user_data` is the wait's slot.
+    const OVERLOAD_WAIT_TAG: u64 = 1 << 59;
+
+    /// The most requests one engine has in flight at once. A request past it
+    /// waits in the engine until another finishes. Every request in flight
+    /// holds a socket, its buffers and a TLS session, and a store answers a
+    /// burst far past what it serves at once by refusing requests.
+    pub(crate) const MAX_REQUESTS_IN_FLIGHT: usize = 2048;
+
+    /// The most completions the ring can hold for one request in flight that
+    /// the engine has not taken yet: its connect, send or recv with the
+    /// timeout linked to it, and the cancelled timeout of the step before,
+    /// which the kernel may post after that step's own completion. A lookup
+    /// has the same operations, and either requests in flight wait for it or
+    /// it holds the place of one. The ring's completion queue is sized by
+    /// this, so it holds whatever the engine can have outstanding.
+    pub(crate) const MAX_COMPLETIONS_PER_REQUEST: usize = 4;
+
+    /// The cap on requests in flight is never lowered below this fraction of
+    /// its highest value.
+    const LOWEST_CAP_DIVISOR: usize = 32;
+
+    /// Overloaded answers that arrive within this long of a lowering of the
+    /// cap do not lower it again. They answer requests sent before the cap
+    /// came down, so they say nothing about the lower one.
+    const CAP_LOWERING_SPACING: Duration = Duration::from_millis(200);
+
+    /// How long the store must go without an overloaded answer before a
+    /// lowered cap doubles, and again before each doubling after that.
+    const CAP_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// The shortest wait before a request the store was too busy for is sent
+    /// again. The wait doubles with each such answer to the same request, and
+    /// up to as much again is added at random so that the requests of one
+    /// burst do not all come back at the same moment.
+    pub(crate) const SHORTEST_OVERLOAD_WAIT: Duration = Duration::from_millis(50);
+
+    /// How many times a request is sent again after the store answered it was
+    /// overloaded before the request fails. Counted apart from
+    /// [`MAX_HTTP_RETRIES`]: an overloaded store asks for patience, and the
+    /// waits between these attempts add up to several seconds.
+    const MAX_OVERLOAD_RETRIES: u32 = 8;
 
     /// How long a name server's answer is waited for before the question is
     /// sent again. A name server on the machine or its network answers in a
@@ -686,18 +738,14 @@ mod uring_engine {
     /// connection error.
     const MAX_HTTP_RETRIES: u32 = 3;
 
-    /// Whether a transport error is worth retrying on a fresh connection. Socket
-    /// teardown (a closed keep-alive, a reset, a refused reconnect) is transient,
-    /// and so is a 5xx answer: object stores return one while they are briefly
-    /// overloaded. A TLS or protocol error is not — retrying would just fail
-    /// the same way.
+    /// Whether a transport error is worth retrying at once on a fresh
+    /// connection. Socket teardown (a closed keep-alive, a reset, a refused
+    /// reconnect) is transient. A TLS or protocol error is not — retrying
+    /// would just fail the same way. A 5xx answer is retried too, after a
+    /// wait (see [`Error::is_overloaded_answer`]).
     fn is_retryable(err: &Error) -> bool {
-        use crate::io::http::proto::ProtoError;
         use std::io::ErrorKind::*;
         match err {
-            Error::Proto(
-                ProtoError::UnexpectedUploadStatus(status) | ProtoError::UnexpectedStatus(status),
-            ) => (500..600).contains(status),
             Error::Io(e) => matches!(
                 e.kind(),
                 UnexpectedEof
@@ -710,6 +758,70 @@ mod uring_engine {
                     | Interrupted
             ),
             _ => false,
+        }
+    }
+
+    /// How many requests the engine may have in flight right now. An
+    /// overloaded answer halves it, and it doubles back toward its highest
+    /// value once the store has gone a while without another.
+    struct InFlightCap {
+        highest: usize,
+        current: usize,
+        /// When the cap was last lowered, if it ever was.
+        lowered_at: Option<Instant>,
+        /// When the store last answered it was overloaded or the cap was last
+        /// raised, whichever is later. The next raise is counted from here.
+        settled_at: Instant,
+    }
+
+    impl InFlightCap {
+        fn new(highest: usize) -> Self {
+            Self {
+                highest,
+                current: highest,
+                lowered_at: None,
+                settled_at: Instant::now(),
+            }
+        }
+
+        /// The lowest the cap goes.
+        fn find_lowest(&self) -> usize {
+            (self.highest / LOWEST_CAP_DIVISOR).max(1)
+        }
+
+        /// Take note of an overloaded answer that arrived at `now`, and halve
+        /// the cap unless it was lowered a moment ago.
+        fn record_overloaded_answer(&mut self, now: Instant) {
+            self.raise_after_quiet(now);
+            self.settled_at = now;
+            let lowered_recently = self
+                .lowered_at
+                .is_some_and(|lowered_at| now.duration_since(lowered_at) < CAP_LOWERING_SPACING);
+            if !lowered_recently {
+                self.current = (self.current / 2).max(self.find_lowest());
+                self.lowered_at = Some(now);
+                tracing::warn!(
+                    requests_in_flight_cap = self.current,
+                    "a store answered that it is overloaded; this worker keeps fewer requests in flight for now"
+                );
+            }
+        }
+
+        /// Double a lowered cap once for every [`CAP_RECOVERY_INTERVAL`] the
+        /// store has gone without an overloaded answer.
+        fn raise_after_quiet(&mut self, now: Instant) {
+            while self.current < self.highest
+                && now.duration_since(self.settled_at) >= CAP_RECOVERY_INTERVAL
+            {
+                self.current = (self.current * 2).min(self.highest);
+                self.settled_at += CAP_RECOVERY_INTERVAL;
+            }
+        }
+
+        /// The cap as of `now`.
+        fn find_current(&mut self, now: Instant) -> usize {
+            self.raise_after_quiet(now);
+            self.current
         }
     }
 
@@ -796,6 +908,16 @@ mod uring_engine {
         request: RemoteRequest,
         retries: u32,
         deadline_reissues: u32,
+        overload_retries: u32,
+    }
+
+    /// A request waiting out the pause before it is sent again to a store
+    /// that answered it was overloaded.
+    struct OverloadWait {
+        waiting: WaitingRequest,
+        /// How long the timer waits. Boxed so the address its SQE carries
+        /// stays put while the slab of waits grows.
+        pause: Box<types::Timespec>,
     }
 
     /// What a lookup's last in-flight SQE was.
@@ -896,6 +1018,9 @@ mod uring_engine {
         /// step is not an error until the deadline has stopped doubling, so up
         /// to [`MAX_STEP_DEADLINE_DOUBLINGS`] misses leave `retries` alone.
         deadline_reissues: u32,
+        /// How many times the store has answered this request that it was
+        /// overloaded; bounded by [`MAX_OVERLOAD_RETRIES`].
+        overload_retries: u32,
         /// When this attempt started, to learn what a read typically takes.
         started_at: Instant,
         /// The deadline the timeout linked to the in-flight connect or recv
@@ -939,7 +1064,16 @@ mod uring_engine {
     }
 
     impl HttpExchange {
-        fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Self {
+        /// The next attempt at `waiting` on `conn`, whose first step is
+        /// `state`.
+        fn new(conn: Conn, waiting: WaitingRequest, state: State) -> Self {
+            let WaitingRequest {
+                id,
+                request,
+                retries,
+                deadline_reissues,
+                overload_retries,
+            } = waiting;
             let expected_body_len = match &request {
                 RemoteRequest::Read(read) => read.expected_body_len(),
                 RemoteRequest::Upload(_) => 0,
@@ -953,8 +1087,9 @@ mod uring_engine {
                 request_bytes,
                 request_queued: false,
                 request,
-                retries: 0,
-                deadline_reissues: 0,
+                retries,
+                deadline_reissues,
+                overload_retries,
                 started_at: Instant::now(),
                 step_deadline: Box::new(types::Timespec::new()),
                 armed_step_deadline: Duration::ZERO,
@@ -1329,9 +1464,20 @@ mod uring_engine {
         /// [`LOOKUP_TAG`]) is the SQE `user_data`.
         lookups: Vec<Option<Lookup>>,
         free_lookup_slots: Vec<usize>,
-        /// Requests in flight, counting the ones waiting for a lookup and not
-        /// counting idle pooled connections.
+        /// Requests in flight, counting the ones waiting for a lookup or to
+        /// be sent again, and not counting idle pooled connections. A lookup
+        /// nobody waits for counts as one too.
         active: usize,
+        /// How many requests may be in flight at once.
+        in_flight_cap: InFlightCap,
+        /// Requests past the cap, in the order they were started. Each goes
+        /// out when a request in flight finishes.
+        queued: VecDeque<WaitingRequest>,
+        /// Stable-index slab of the requests waiting to be sent again after
+        /// an overloaded answer; the index (tagged with
+        /// [`OVERLOAD_WAIT_TAG`]) is the SQE `user_data`.
+        overload_waits: Vec<Option<OverloadWait>>,
+        free_overload_wait_slots: Vec<usize>,
         /// Ids whose body fully landed during the last completion routing pass,
         /// each with what the store answered beyond a read's bytes.
         completed: Vec<(Identifier, ResponseAnswer)>,
@@ -1361,6 +1507,10 @@ mod uring_engine {
                 lookups: Vec::new(),
                 free_lookup_slots: Vec::new(),
                 active: 0,
+                in_flight_cap: InFlightCap::new(MAX_REQUESTS_IN_FLIGHT),
+                queued: VecDeque::new(),
+                overload_waits: Vec::new(),
+                free_overload_wait_slots: Vec::new(),
                 completed: Vec::new(),
                 failed: Vec::new(),
                 reissued: Vec::new(),
@@ -1400,8 +1550,22 @@ mod uring_engine {
             std::mem::take(&mut self.reissued)
         }
 
+        /// Keep at most `cap` requests in flight, so a test reaches the cap
+        /// with a handful of requests.
+        #[cfg(test)]
+        pub fn force_requests_in_flight_cap(&mut self, cap: usize) {
+            self.in_flight_cap = InFlightCap::new(cap);
+        }
+
+        /// How many requests the engine keeps in flight at once right now.
+        #[cfg(test)]
+        pub fn find_requests_in_flight_cap(&mut self) -> usize {
+            self.in_flight_cap.find_current(Instant::now())
+        }
+
+        /// Whether any request is in flight or waiting for its turn.
         pub fn has_active(&self) -> bool {
-            self.active > 0
+            self.active > 0 || !self.queued.is_empty()
         }
 
         pub fn take_completed(&mut self) -> Vec<(Identifier, ResponseAnswer)> {
@@ -1438,20 +1602,47 @@ mod uring_engine {
             id: Identifier,
             request: RemoteRequest,
         ) -> Result<()> {
-            if let Some(conn) = self.take_pooled_connection(&request) {
-                let exchange = HttpExchange::new(conn, id, request, State::Sending);
+            let waiting = WaitingRequest {
+                id,
+                request,
+                retries: 0,
+                deadline_reissues: 0,
+                overload_retries: 0,
+            };
+            // A request never overtakes one already waiting for its turn.
+            if !self.queued.is_empty()
+                || self.active >= self.in_flight_cap.find_current(Instant::now())
+            {
+                self.queued.push_back(waiting);
+                return Ok(());
+            }
+            self.put_in_flight(ring, waiting)
+        }
+
+        /// Count `waiting` as in flight and send it, on an idle keep-alive
+        /// connection when the pool has one and on a new connection otherwise.
+        fn put_in_flight(&mut self, ring: &mut IoUring, waiting: WaitingRequest) -> Result<()> {
+            self.active += 1;
+            if let Some(conn) = self.take_pooled_connection(&waiting.request) {
+                let exchange = HttpExchange::new(conn, waiting, State::Sending);
                 return self.launch(ring, exchange);
             }
-            self.active += 1;
-            self.connect_or_await_address(
-                ring,
-                WaitingRequest {
-                    id,
-                    request,
-                    retries: 0,
-                    deadline_reissues: 0,
-                },
-            )
+            self.connect_or_await_address(ring, waiting)
+        }
+
+        /// Send the requests that waited for their turn, oldest first, for as
+        /// long as the cap has room for them.
+        fn start_queued_requests(&mut self, ring: &mut IoUring) -> Result<()> {
+            if self.queued.is_empty() {
+                return Ok(());
+            }
+            let cap = self.in_flight_cap.find_current(Instant::now());
+            while self.active < cap
+                && let Some(waiting) = self.queued.pop_front()
+            {
+                self.put_in_flight(ring, waiting)?;
+            }
+            Ok(())
         }
 
         /// An idle keep-alive connection `request` can be sent on, if the
@@ -1499,7 +1690,11 @@ mod uring_engine {
                 None => match self.address_book.choose_address(&host, Instant::now()) {
                     AddressChoice::Fresh(address) => address,
                     AddressChoice::DueForRefresh(address) => {
-                        if self.find_lookup(&host).is_none() {
+                        // A lookup nobody waits for counts as a request in
+                        // flight. With none to spare, the address in hand
+                        // serves and a later connection brings it up to date.
+                        if self.find_lookup(&host).is_none() && self.active < MAX_REQUESTS_IN_FLIGHT
+                        {
                             self.start_lookup(ring, host, Vec::new())?;
                         }
                         address
@@ -1517,25 +1712,17 @@ mod uring_engine {
                 },
             };
 
-            let WaitingRequest {
-                id,
-                request,
-                retries,
-                deadline_reissues,
-            } = waiting;
-            let key = host_key(request.remote());
-            match self.new_conn(key, &request, SocketAddr::new(address, port)) {
+            let key = host_key(waiting.request.remote());
+            match self.new_conn(key, &waiting.request, SocketAddr::new(address, port)) {
                 Ok(conn) => {
-                    let mut exchange = HttpExchange::new(conn, id, request, State::Connecting);
-                    exchange.retries = retries;
-                    exchange.deadline_reissues = deadline_reissues;
+                    let exchange = HttpExchange::new(conn, waiting, State::Connecting);
                     let idx = self.alloc_slot(exchange);
                     self.start_connect(ring, idx)
                 }
                 // Couldn't even build the socket — treat as a terminal failure.
                 Err(error) => {
                     self.active -= 1;
-                    self.failed.push((id, error));
+                    self.failed.push((waiting.id, error));
                     Ok(())
                 }
             }
@@ -1802,12 +1989,60 @@ mod uring_engine {
             });
         }
 
-        /// Put `exchange`, which has a connected connection, in flight: give
-        /// it a slot and submit its first SQE.
+        /// Give `exchange`, which has a connected connection and is already
+        /// counted as in flight, a slot and submit its first SQE.
         fn launch(&mut self, ring: &mut IoUring, exchange: HttpExchange) -> Result<()> {
             let idx = self.alloc_slot(exchange);
-            self.active += 1;
             self.pump(ring, idx)
+        }
+
+        /// Have the request `waiting`, which the store was too busy for, wait
+        /// before it is sent again. The pause doubles with each overloaded
+        /// answer the request has had. A request whose timer the ring does
+        /// not take has nothing in flight to bring it back, so it fails.
+        fn wait_out_overload(&mut self, ring: &mut IoUring, waiting: WaitingRequest) -> Result<()> {
+            let shortest = SHORTEST_OVERLOAD_WAIT * 2u32.pow(waiting.overload_retries - 1);
+            let pause = shortest + shortest.mul_f64(rand::random::<f64>());
+            let id = waiting.id;
+            let wait = OverloadWait {
+                waiting,
+                pause: Box::new(
+                    types::Timespec::new()
+                        .sec(pause.as_secs())
+                        .nsec(pause.subsec_nanos()),
+                ),
+            };
+            let timespec = &*wait.pause as *const types::Timespec;
+            let idx = match self.free_overload_wait_slots.pop() {
+                Some(idx) => {
+                    self.overload_waits[idx] = Some(wait);
+                    idx
+                }
+                None => {
+                    self.overload_waits.push(Some(wait));
+                    self.overload_waits.len() - 1
+                }
+            };
+            let timer = opcode::Timeout::new(timespec)
+                .build()
+                .user_data(HTTP_TAG | OVERLOAD_WAIT_TAG | idx as u64);
+            if let Err(error) = push(ring, &timer) {
+                self.overload_waits[idx] = None;
+                self.free_overload_wait_slots.push(idx);
+                self.active -= 1;
+                self.failed.push((id, error));
+            }
+            Ok(())
+        }
+
+        /// Send the request at slot `idx` of the overload waits again, now
+        /// that its pause is over.
+        fn on_overload_wait_cqe(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
+            let wait = self.overload_waits[idx]
+                .take()
+                .expect("cqe for a request waiting out an overload");
+            self.free_overload_wait_slots.push(idx);
+            self.connect_or_await_address(ring, wait.waiting)
         }
 
         /// Advance the connection identified by a tagged `user_data` after its SQE
@@ -1825,9 +2060,23 @@ mod uring_engine {
         /// still double, that is a stalled attempt rather than a failed one, and
         /// the read is issued again. A miss of the longest deadline is a
         /// transport error like the others.
+        ///
+        /// Whatever the completion ended leaves room under the cap, which
+        /// the requests waiting for their turn take.
         pub fn on_cqe(&mut self, ring: &mut IoUring, user_data: u64, result: i32) -> Result<()> {
+            self.route_cqe(ring, user_data, result)?;
+            self.start_queued_requests(ring)
+        }
+
+        /// Hand a completion to the lookup, the waiting request or the
+        /// exchange its `user_data` names.
+        fn route_cqe(&mut self, ring: &mut IoUring, user_data: u64, result: i32) -> Result<()> {
             if user_data & STEP_DEADLINE_TAG != 0 {
                 return Ok(());
+            }
+            if user_data & OVERLOAD_WAIT_TAG != 0 {
+                let idx = (user_data & !(HTTP_TAG | OVERLOAD_WAIT_TAG)) as usize;
+                return self.on_overload_wait_cqe(ring, idx);
             }
             if user_data & LOOKUP_TAG != 0 {
                 let idx = (user_data & !(HTTP_TAG | LOOKUP_TAG)) as usize;
@@ -1953,6 +2202,7 @@ mod uring_engine {
                 id,
                 retries,
                 deadline_reissues,
+                overload_retries,
                 request,
                 ..
             } = stalled;
@@ -1964,23 +2214,18 @@ mod uring_engine {
             drop(conn); // close the stalled socket before issuing the read again
             self.reissued.push(id);
 
-            if let Some(conn) = self.take_pooled_connection(&request) {
-                let mut fresh = HttpExchange::new(conn, id, request, State::Sending);
-                fresh.retries = retries;
-                fresh.deadline_reissues = deadline_reissues + 1;
-                // `launch` counts the read as active again.
-                self.active -= 1;
+            let waiting = WaitingRequest {
+                id,
+                request,
+                retries,
+                deadline_reissues: deadline_reissues + 1,
+                overload_retries,
+            };
+            if let Some(conn) = self.take_pooled_connection(&waiting.request) {
+                let fresh = HttpExchange::new(conn, waiting, State::Sending);
                 return self.launch(ring, fresh);
             }
-            self.connect_or_await_address(
-                ring,
-                WaitingRequest {
-                    id,
-                    request,
-                    retries,
-                    deadline_reissues: deadline_reissues + 1,
-                },
-            )
+            self.connect_or_await_address(ring, waiting)
         }
 
         /// Handle a dead connection for the request at slot `idx`: tear it down
@@ -2000,6 +2245,7 @@ mod uring_engine {
                 id,
                 retries,
                 deadline_reissues,
+                overload_retries,
                 request,
                 state,
                 ..
@@ -2015,6 +2261,29 @@ mod uring_engine {
             }
             drop(conn); // close the failed socket before reconnecting
 
+            // A store that answers it is overloaded is sent fewer requests
+            // at once for a while, and this one waits before it goes again.
+            if err.is_overloaded_answer() {
+                self.in_flight_cap.record_overloaded_answer(Instant::now());
+                // A `POST` is sent once: the store may have acted on it
+                // before it answered.
+                if overload_retries < MAX_OVERLOAD_RETRIES && !request.is_post() {
+                    return self.wait_out_overload(
+                        ring,
+                        WaitingRequest {
+                            id,
+                            request,
+                            retries,
+                            deadline_reissues,
+                            overload_retries: overload_retries + 1,
+                        },
+                    );
+                }
+                self.active -= 1;
+                self.failed.push((id, err));
+                return Ok(());
+            }
+
             // A `POST` is sent once: the store may have acted on it before
             // the connection failed.
             if is_retryable(&err) && retries < MAX_HTTP_RETRIES && !request.is_post() {
@@ -2025,6 +2294,7 @@ mod uring_engine {
                         request,
                         retries: retries + 1,
                         deadline_reissues,
+                        overload_retries,
                     },
                 );
             }

@@ -260,6 +260,19 @@ impl CachedHttpEngine {
         self.http.force_address_ages(refresh_after, forget_after);
     }
 
+    /// Keep at most `cap` network requests in flight, so a test reaches the
+    /// cap with a handful of requests.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn force_requests_in_flight_cap(&mut self, cap: usize) {
+        self.http.force_requests_in_flight_cap(cap);
+    }
+
+    /// How many network requests are kept in flight at once right now.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn find_requests_in_flight_cap(&mut self) -> usize {
+        self.http.find_requests_in_flight_cap()
+    }
+
     /// Join ranges with up to `bytes` between them into one request, so a
     /// test controls what is dropped.
     #[cfg(test)]

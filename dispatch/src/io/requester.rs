@@ -41,6 +41,19 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// each accepted operation to the kernel.
 pub const RING_SIZE: u32 = 64;
 
+/// Number of completion-queue entries in each worker's io_uring. It holds
+/// every completion the HTTP engine can have outstanding at its cap on
+/// requests in flight, and as many again for the local-file operations and
+/// timers that share the ring.
+#[cfg(target_os = "linux")]
+const COMPLETION_QUEUE_SIZE: u32 = (2
+    * crate::io::http::MAX_COMPLETIONS_PER_REQUEST
+    * crate::io::http::MAX_REQUESTS_IN_FLIGHT) as u32;
+
+/// Off Linux no ring carries the completions, so nothing is sized by this.
+#[cfg(not(target_os = "linux"))]
+const COMPLETION_QUEUE_SIZE: u32 = 2 * RING_SIZE;
+
 /// One in-flight operator-owned local-file operation.
 struct InFlightFsOp {
     request: DataFlowRequest<FsRequest>,
@@ -259,7 +272,8 @@ impl IORequester {
     /// Build a requester sharing `disk_cache` (or `None` to disable disk caching).
     pub fn new(disk_cache: Option<Arc<DiskCache>>) -> Self {
         Self {
-            backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
+            backend: IOBackend::with_queue_sizes(RING_SIZE, COMPLETION_QUEUE_SIZE)
+                .expect("Unable to create backend"),
             pending_reads: Vec::new(),
             free_pending_reads_slots: Vec::new(),
             physical_read_ids_to_pending_reads_indexes: HashMap::new(),
@@ -289,7 +303,8 @@ impl IORequester {
         disk_cache: Option<Arc<DiskCache>>,
     ) -> Self {
         Self {
-            backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
+            backend: IOBackend::with_queue_sizes(RING_SIZE, COMPLETION_QUEUE_SIZE)
+                .expect("Unable to create backend"),
             pending_reads: Vec::new(),
             free_pending_reads_slots: Vec::new(),
             physical_read_ids_to_pending_reads_indexes: HashMap::new(),
@@ -1570,7 +1585,7 @@ mod tests {
     use crate::memory::{init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2805,6 +2820,132 @@ mod tests {
         let results = fetch_results(&mut requester, &loc, 0, 4096);
 
         assert!(results.iter().all(|result| result.is_err()));
+    }
+
+    /// Spawn a server that answers each range GET after a pause, on as many
+    /// connections as it is given, and returns with its port the most
+    /// requests it was ever answering at once.
+    #[cfg(target_os = "linux")]
+    fn spawn_slow_server() -> (u16, Arc<AtomicUsize>) {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let answering = Arc::new(AtomicUsize::new(0));
+        let most_answering = Arc::new(AtomicUsize::new(0));
+        let most_answering_for_thread = most_answering.clone();
+
+        thread::spawn(move || {
+            for tcp in listener.incoming() {
+                let server_config = server_config.clone();
+                let answering = answering.clone();
+                let most_answering = most_answering_for_thread.clone();
+                thread::spawn(move || {
+                    let conn = rustls::ServerConnection::new(server_config).unwrap();
+                    let mut tls = rustls::StreamOwned::new(conn, tcp.unwrap());
+                    loop {
+                        let head = read_head(&mut tls);
+                        if head.is_empty() {
+                            break; // client closed the connection
+                        }
+                        let now_answering = answering.fetch_add(1, Ordering::SeqCst) + 1;
+                        most_answering.fetch_max(now_answering, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(20));
+                        let (start, end) = parse_range(&head);
+                        let len = end - start + 1;
+                        let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
+                        let resp = format!(
+                            "HTTP/1.1 206 Partial Content\r\n\
+                             Content-Length: {len}\r\n\
+                             Content-Range: bytes {start}-{end}/1000000\r\n\
+                             Connection: keep-alive\r\n\r\n"
+                        );
+                        answering.fetch_sub(1, Ordering::SeqCst);
+                        tls.write_all(resp.as_bytes()).unwrap();
+                        tls.write_all(&body).unwrap();
+                        tls.flush().unwrap();
+                    }
+                });
+            }
+        });
+
+        (port, most_answering)
+    }
+
+    /// Requests past the cap on requests in flight wait for the ones before
+    /// them to finish, and every one of them completes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn requests_past_the_cap_wait_their_turn_and_all_complete() {
+        init_test_free_pool(16);
+        let (port, most_answering) = spawn_slow_server();
+        let loc = remote_loc(port);
+        let mut requester = IORequester::with_http_config(client_config());
+        requester.http.force_requests_in_flight_cap(2);
+        let ranges: Vec<(usize, usize)> = (0..8).map(|i| (i * 64 * 1024, 4096)).collect();
+
+        fetch_together(&mut requester, &loc, &ranges);
+
+        assert_eq!(most_answering.load(Ordering::SeqCst), 2);
+        for (offset, len) in ranges {
+            assert_cached(&loc, offset, len);
+        }
+    }
+
+    /// Spawn a server that answers the range GET on its first connection
+    /// that it is overloaded, and serves the one on its second.
+    #[cfg(target_os = "linux")]
+    fn spawn_overloaded_then_serving_server() -> u16 {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config.clone()).unwrap();
+            let mut overloaded = rustls::StreamOwned::new(conn, tcp);
+            read_head(&mut overloaded);
+            overloaded
+                .write_all(b"HTTP/1.1 503 Slow Down\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            overloaded.flush().unwrap();
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut recovered = rustls::StreamOwned::new(conn, tcp);
+            serve_one_range(&mut recovered);
+        });
+
+        port
+    }
+
+    /// A read the store was too busy for is sent again after a wait, and
+    /// then completes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_the_store_was_too_busy_for_is_sent_again_after_a_wait() {
+        init_test_free_pool(16);
+        let loc = remote_loc(spawn_overloaded_then_serving_server());
+        let mut requester = IORequester::with_http_config(client_config());
+        let started_at = Instant::now();
+
+        fetch(&mut requester, &loc, 0, 4096);
+
+        assert!(started_at.elapsed() >= crate::io::http::SHORTEST_OVERLOAD_WAIT);
+        assert_cached(&loc, 0, 4096);
+    }
+
+    /// A store that answers it is overloaded is sent fewer requests at once
+    /// afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overloaded_answer_lowers_the_cap_on_requests_in_flight() {
+        init_test_free_pool(16);
+        let loc = remote_loc(spawn_overloaded_then_serving_server());
+        let mut requester = IORequester::with_http_config(client_config());
+        requester.http.force_requests_in_flight_cap(8);
+
+        fetch(&mut requester, &loc, 0, 4096);
+
+        assert_eq!(requester.http.find_requests_in_flight_cap(), 4);
     }
 
     /// What a test's name server does with the first questions it is asked.
