@@ -713,7 +713,7 @@ impl PivotlakeDatastore {
         }
     }
 
-    /// In one Delta commit for table `id`, add every file in `added` and remove
+    /// In one version of table `id`, add every file in `added` and remove
     /// every path in `removed`. `data_change` is `true` for a logical change such
     /// as INSERT, or `false` for a compaction rearrangement that incremental log
     /// readers can skip.

@@ -157,17 +157,13 @@ struct QueuedCommit {
 /// holding the lock has made it.
 #[derive(Default)]
 pub(super) struct CommitOutcome {
-    committed: Mutex<Option<Result<(), Arc<Error>>>>,
+    committed: Mutex<Option<crate::Result<()>>>,
 }
 
 impl CommitOutcome {
-    /// How the commit went, when it has been made. A failure of a version
-    /// that held other writers' commits too is shared with them
-    /// ([`Error::SharedCommit`]); the only writer of a version gets the
-    /// failure itself.
+    /// How the commit went, when it has been made.
     pub(super) fn take(&self) -> Option<crate::Result<()>> {
-        let committed = self.committed.lock().unwrap().take()?;
-        Some(committed.map_err(|error| Arc::try_unwrap(error).unwrap_or_else(Error::SharedCommit)))
+        self.committed.lock().unwrap().take()
     }
 }
 
@@ -190,19 +186,20 @@ impl CommitGroup {
         table.commit_files(removed, std::mem::take(&mut self.added), self.data_change)
     }
 
-    /// Tell every writer of the group how its commit went. The last writer
-    /// told is handed the outcome itself, so the only writer of a version
-    /// holds its failure alone.
-    pub(super) fn report(mut self, committed: crate::Result<()>) {
-        let committed = committed.map_err(Arc::new);
-        let last = self
-            .outcomes
-            .pop()
-            .expect("a group holds at least one commit");
-        for outcome in self.outcomes {
-            *outcome.committed.lock().unwrap() = Some(committed.clone());
+    /// Tell every writer of the group how its commit went. The only writer
+    /// of a version is handed its failure itself; the writers of a version
+    /// they share are each handed the one failure
+    /// ([`Error::SharedCommit`]).
+    pub(super) fn report(self, committed: crate::Result<()>) {
+        if let [only] = self.outcomes.as_slice() {
+            *only.committed.lock().unwrap() = Some(committed);
+            return;
         }
-        *last.committed.lock().unwrap() = Some(committed);
+        let committed = committed.map_err(Arc::new);
+        for outcome in &self.outcomes {
+            let shared = committed.clone().map_err(Error::SharedCommit);
+            *outcome.committed.lock().unwrap() = Some(shared);
+        }
     }
 }
 
@@ -233,8 +230,9 @@ impl CommitQueue {
     }
 
     /// Take the commits at the front of the queue that make the next
-    /// version: one that removes files alone, else every insert waiting
-    /// before the next commit that removes files. `None` when nothing waits.
+    /// version: every insert waiting before the next commit of another
+    /// kind, else that one commit alone. An insert removes nothing and
+    /// changes the table's rows. `None` when nothing waits.
     pub(super) fn take_next_group(&self) -> Option<CommitGroup> {
         let mut waiting = self.waiting.lock().unwrap();
         let first = waiting.pop_front()?;
@@ -245,12 +243,12 @@ impl CommitQueue {
             data_change: first.data_change,
             outcomes: vec![first.outcome],
         };
-        if !group.removed_paths.is_empty() {
+        if !group.removed_paths.is_empty() || !group.data_change {
             return Some(group);
         }
         while let Some(next) = waiting.front()
             && next.removed_paths.is_empty()
-            && next.data_change == group.data_change
+            && next.data_change
         {
             let next = waiting.pop_front().unwrap();
             group.added.extend(next.added);
