@@ -238,8 +238,9 @@ pub fn forget_cached_table(location: &TableLocation) {
 
 /// What a scan over some filters selected of a table version.
 pub(crate) struct SelectedFiles {
-    /// The files, each located for reading, in the order they are scanned.
-    pub(crate) files: Vec<DataFile>,
+    /// The files, each under the path the table names it by, in the order
+    /// they are scanned.
+    pub(crate) files: Vec<FileRef>,
     /// The keys of the partitions the files were selected from.
     partitions: Vec<Arc<[u8]>>,
     /// Whether each declared column may hold a NULL in one of the files
@@ -499,10 +500,15 @@ impl Table {
             .select_delete_manifests(filters)
             .map_err(invalid_partition_metadata)?;
         let delete_manifests = self.read_manifests(selected_deletes)?;
-        let deletion_vectors =
-            read_deletion_vectors(delete_manifests, &files, &self.location, &self.dispatcher)?;
         let mut footers = self.open_footers(&files, FooterUse::Kept)?;
         FileMetadataCache::process_wide().mark_indexes_used(&self.cache_key, &partitions);
+        let scanned_files: Vec<&FileRef> = footers.iter().map(|footer| &footer.file).collect();
+        let deletion_vectors = read_deletion_vectors(
+            delete_manifests,
+            &scanned_files,
+            &self.location,
+            &self.dispatcher,
+        )?;
         for (footer, deleted) in footers.iter_mut().zip(deletion_vectors) {
             if let Some(deleted) = deleted {
                 footer.mark_deleted_rows(deleted);
@@ -523,8 +529,8 @@ impl Table {
         })
     }
 
-    /// What a scan over `filters` selects: the files it reads, each located
-    /// for reading, in the order
+    /// What a scan over `filters` selects: the files it reads, each under
+    /// the path the table names it by, in the order
     /// [`visit_selected_files`](Self::visit_selected_files) visits them,
     /// the partitions they were selected from, and whether each declared
     /// column may hold a NULL in one of them.
@@ -538,10 +544,7 @@ impl Table {
             if partitions.last() != Some(partition_key) {
                 partitions.push(Arc::clone(partition_key));
             }
-            files.push(
-                self.location
-                    .data_file_at(&file.facts.file().path, file.facts.file().size)?,
-            );
+            files.push(file.facts.file().clone());
             Ok(())
         })?;
         Ok(SelectedFiles {
@@ -692,49 +695,42 @@ impl Table {
     /// row deleted. The footers are taken from the cache, where those read
     /// are kept.
     pub fn load_footers(&self, files: &[FileRef]) -> Result<Vec<FileRowGroups>> {
-        self.open_footers(&self.locate_files(files)?, FooterUse::Kept)
+        self.open_footers(files, FooterUse::Kept)
     }
 
     /// [`load_footers`](Self::load_footers) for a pass over more files than
     /// are worth keeping the footers of: one the cache holds is not read,
     /// and the cache is left as it was.
     pub(crate) fn read_footers_unrecorded(&self, files: &[FileRef]) -> Result<Vec<FileRowGroups>> {
-        self.open_footers(&self.locate_files(files)?, FooterUse::Unrecorded)
+        self.open_footers(files, FooterUse::Unrecorded)
     }
 
-    /// Each of `files`, under the path the table names it by, located for
-    /// reading.
-    fn locate_files(&self, files: &[FileRef]) -> Result<Vec<DataFile>> {
-        files
-            .iter()
-            .map(|file| self.location.data_file_at(&file.path, file.size))
-            .collect()
-    }
-
-    /// The row groups of each of `files`, distinct files of the table, in
-    /// the order given, with no row deleted, shared with the cache and with
-    /// whatever else took them. A file whose footer the cache holds is
-    /// neither opened nor read; the others' footers are read and parsed in
-    /// one pass over the pool, which is not run when the cache holds them
-    /// all, and, with [`FooterUse::Kept`], cached.
-    fn open_footers(
-        &self,
-        files: &[DataFile],
-        footer_use: FooterUse,
-    ) -> Result<Vec<FileRowGroups>> {
+    /// The row groups of each of `files`, distinct files of the table each
+    /// under the path the table names it by, in the order given, with no
+    /// row deleted, shared with the cache and with whatever else took them.
+    /// A file whose footer the cache holds is neither located, opened nor
+    /// read: locating a file of a remote store signs a URL for it, which a
+    /// scan of a table of many files cannot afford for every file. The
+    /// others' footers are read and parsed in one pass over the pool, which
+    /// is not run when the cache holds them all, and, with
+    /// [`FooterUse::Kept`], cached.
+    fn open_footers(&self, files: &[FileRef], footer_use: FooterUse) -> Result<Vec<FileRowGroups>> {
         let cache = FileMetadataCache::process_wide();
-        let paths = files.iter().map(|file| file.file.path.as_str());
+        let uris = files
+            .iter()
+            .map(|file| self.location.uri_for(&file.path))
+            .collect::<Result<Vec<String>>>()?;
         let lookup_use = match footer_use {
             FooterUse::Kept => LookupUse::Counted,
             FooterUse::Unrecorded => LookupUse::Uncounted,
         };
-        let held = cache.find_footers(&self.cache_key, paths, lookup_use);
-        let unheld: Vec<DataFile> = files
+        let held = cache.find_footers(&self.cache_key, uris.iter().map(String::as_str), lookup_use);
+        let unheld = files
             .iter()
             .zip(&held)
             .filter(|(_, held)| held.is_none())
-            .map(|(file, _)| file.clone())
-            .collect();
+            .map(|(file, _)| self.location.data_file_at(&file.path, file.size))
+            .collect::<Result<Vec<DataFile>>>()?;
         let read = load_file_row_groups(&self.dispatcher, &unheld, self.columns.clone())?;
         if footer_use == FooterUse::Kept {
             let kept = read
@@ -749,10 +745,14 @@ impl Table {
         let mut read = read.into_iter();
         Ok(files
             .iter()
+            .zip(uris)
             .zip(held)
-            .map(|(file, held)| match held {
+            .map(|((file, uri), held)| match held {
                 Some(row_groups) => FileRowGroups {
-                    file: file.file.clone(),
+                    file: FileRef {
+                        path: ObjectPath::new(uri),
+                        size: file.size,
+                    },
                     row_groups,
                 },
                 None => read
