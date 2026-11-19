@@ -689,7 +689,7 @@ mod uring_engine {
     /// Whether a transport error is worth retrying on a fresh connection. Socket
     /// teardown (a closed keep-alive, a reset, a refused reconnect) is transient,
     /// and so is a 5xx answer: object stores return one while they are briefly
-    /// overloaded. A TLS/protocol/DNS error is not — retrying would just fail
+    /// overloaded. A TLS or protocol error is not — retrying would just fail
     /// the same way.
     fn is_retryable(err: &Error) -> bool {
         use crate::io::http::proto::ProtoError;
@@ -799,9 +799,12 @@ mod uring_engine {
     }
 
     /// What a lookup's last in-flight SQE was.
+    #[derive(Clone, Copy)]
     enum LookupStep {
         SendingQuestion,
         ReceivingAnswer,
+        /// A timeout that spaces one attempt from the next.
+        WaitingToAskAgain,
     }
 
     /// One question to a name server for the addresses of a host, and the
@@ -809,9 +812,21 @@ mod uring_engine {
     /// brings a host's addresses up to date has nobody waiting.
     struct Lookup {
         host: String,
+        /// The names the host is asked about, in order, until one has an
+        /// address: the host as written and with the machine's search
+        /// domains appended.
+        names: Vec<String>,
+        /// Index in `names` of the name being asked about.
+        asked_name: usize,
         waiting: Vec<WaitingRequest>,
-        /// How many times the question has been sent.
+        /// Whether the lookup itself is counted in the engine's `active`,
+        /// which it is when it started with nobody waiting for it.
+        counted_as_active: bool,
+        /// How many times the question about the current name has been sent.
         attempts: u32,
+        /// What the name server last answered instead of addresses, reported
+        /// if no attempt does better.
+        last_failure: Option<DnsError>,
         /// The socket of the current attempt, pointed at its name server.
         /// Each attempt has its own, so a late answer to an earlier attempt
         /// is never read.
@@ -1368,10 +1383,12 @@ mod uring_engine {
             self.name_servers.force_servers(servers);
         }
 
-        /// Look a host up again once its answer is `refresh_after` old.
+        /// Look a host up again once its answer is `refresh_after` old, and
+        /// forget what it resolved to once the answer is `forget_after` old.
         #[cfg(test)]
-        pub fn force_address_refresh_age(&mut self, refresh_after: Duration) {
-            self.address_book.force_refresh_after(refresh_after);
+        pub fn force_address_ages(&mut self, refresh_after: Duration, forget_after: Duration) {
+            self.address_book
+                .force_address_ages(refresh_after, forget_after);
         }
 
         /// Ids of the reads issued again for a missed step deadline since the
@@ -1529,17 +1546,27 @@ mod uring_engine {
         }
 
         /// Ask a name server for the addresses of `host`. The requests in
-        /// `waiting` connect once it answers.
+        /// `waiting` connect once it answers. A lookup nobody waits for counts
+        /// as a request in flight itself, so the engine is never taken for
+        /// idle while the ring holds an operation that points into it.
         fn start_lookup(
             &mut self,
             ring: &mut IoUring,
             host: String,
             waiting: Vec<WaitingRequest>,
         ) -> Result<()> {
+            let counted_as_active = waiting.is_empty();
+            if counted_as_active {
+                self.active += 1;
+            }
             let lookup = Lookup {
+                names: self.name_servers.list_names_to_ask(&host),
+                asked_name: 0,
                 host,
                 waiting,
+                counted_as_active,
                 attempts: 0,
+                last_failure: None,
                 socket: None,
                 question: Vec::new(),
                 question_id: 0,
@@ -1570,22 +1597,21 @@ mod uring_engine {
         fn send_question(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
             let lookup = self.lookups[idx].as_ref().unwrap();
             let host = lookup.host.clone();
+            let name = lookup.names[lookup.asked_name].clone();
             let attempts = lookup.attempts;
             if attempts == MAX_LOOKUP_ATTEMPTS {
-                return self.fail_lookup(idx, || {
-                    DnsError::NoAnswer {
-                        host: host.clone(),
-                        attempts,
-                    }
-                    .into()
-                });
+                let error = lookup
+                    .last_failure
+                    .clone()
+                    .unwrap_or(DnsError::NoAnswer { host, attempts });
+                return self.fail_lookup(idx, || error.clone().into());
             }
             let Some(server) = self.name_servers.choose_server(attempts) else {
                 return self
                     .fail_lookup(idx, || DnsError::NoNameServer { host: host.clone() }.into());
             };
             let question_id = rand::random::<u16>();
-            let question = match dns::encode_question(question_id, &host) {
+            let question = match dns::encode_question(question_id, &name) {
                 Ok(question) => question,
                 Err(error) => return self.fail_lookup(idx, || error.clone().into()),
             };
@@ -1616,41 +1642,85 @@ mod uring_engine {
             push(ring, &entry)
         }
 
+        /// Wait out one attempt's deadline before the lookup at slot `idx`
+        /// asks again. A name server that is not running refuses a question
+        /// at once, and asking it again without a pause would use up every
+        /// attempt before it could come back.
+        fn wait_to_ask_again(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
+            let lookup = self.lookups[idx].as_mut().unwrap();
+            lookup.step = LookupStep::WaitingToAskAgain;
+            let entry = opcode::Timeout::new(&*lookup.deadline as *const types::Timespec)
+                .build()
+                .user_data(HTTP_TAG | LOOKUP_TAG | idx as u64);
+            push(ring, &entry)
+        }
+
         /// Advance the lookup at slot `idx` after its SQE completed with
-        /// kernel result `result`. A question that could not be sent, or
-        /// whose answer did not arrive in time, is sent again.
+        /// kernel result `result`.
         fn on_lookup_cqe(&mut self, ring: &mut IoUring, idx: usize, result: i32) -> Result<()> {
-            if result < 0 {
-                return self.send_question(ring, idx);
-            }
             let lookup = self.lookups[idx]
                 .as_mut()
                 .expect("cqe for a lookup in flight");
-            if let LookupStep::SendingQuestion = lookup.step {
-                lookup.step = LookupStep::ReceivingAnswer;
-                let socket = lookup
-                    .socket
-                    .as_ref()
-                    .expect("a sent question has a socket");
-                let entry = opcode::Recv::new(
-                    types::Fd(socket.as_raw_fd()),
-                    lookup.answer.as_mut_ptr(),
-                    dns::MAX_ANSWER_LEN as u32,
-                )
-                .build()
-                .user_data(HTTP_TAG | LOOKUP_TAG | idx as u64);
-                let deadline = &*lookup.deadline as *const types::Timespec;
-                return push_with_step_deadline(ring, entry, deadline, idx);
+            match lookup.step {
+                LookupStep::WaitingToAskAgain => return self.send_question(ring, idx),
+                // The answer did not arrive within the attempt's deadline,
+                // which is the pause before the next attempt.
+                LookupStep::ReceivingAnswer if result == -libc::ECANCELED => {
+                    return self.send_question(ring, idx);
+                }
+                _ if result < 0 => return self.wait_to_ask_again(ring, idx),
+                LookupStep::SendingQuestion => {
+                    lookup.step = LookupStep::ReceivingAnswer;
+                    let socket = lookup
+                        .socket
+                        .as_ref()
+                        .expect("a sent question has a socket");
+                    let entry = opcode::Recv::new(
+                        types::Fd(socket.as_raw_fd()),
+                        lookup.answer.as_mut_ptr(),
+                        dns::MAX_ANSWER_LEN as u32,
+                    )
+                    .build()
+                    .user_data(HTTP_TAG | LOOKUP_TAG | idx as u64);
+                    let deadline = &*lookup.deadline as *const types::Timespec;
+                    return push_with_step_deadline(ring, entry, deadline, idx);
+                }
+                LookupStep::ReceivingAnswer => {}
             }
 
             let answer = &lookup.answer[..result as usize];
             let addresses = match dns::parse_answer(answer, lookup.question_id) {
                 Ok(addresses) => addresses,
+                // This name has no address. The host's next name is asked
+                // about, with all its attempts.
+                Err(DnsError::NameUnknown | DnsError::NoAddresses) => {
+                    lookup.asked_name += 1;
+                    if lookup.asked_name == lookup.names.len() {
+                        let host = lookup.host.clone();
+                        return self.fail_lookup(idx, || {
+                            DnsError::HostNotFound { host: host.clone() }.into()
+                        });
+                    }
+                    lookup.attempts = 0;
+                    lookup.last_failure = None;
+                    return self.send_question(ring, idx);
+                }
                 Err(DnsError::AnswerToAnotherQuestion) => return self.send_question(ring, idx),
-                Err(error) => return self.fail_lookup(idx, || error.clone().into()),
+                Err(error @ DnsError::TruncatedAnswer) => {
+                    return self.fail_lookup(idx, || error.clone().into());
+                }
+                // The name server could not answer. The next attempt goes to
+                // the next name server.
+                Err(error) => {
+                    lookup.last_failure = Some(error);
+                    return self.wait_to_ask_again(ring, idx);
+                }
             };
             let lookup = self.lookups[idx].take().unwrap();
             self.free_lookup_slots.push(idx);
+            if lookup.counted_as_active {
+                self.active -= 1;
+            }
             self.address_book
                 .record_answer(&lookup.host, &addresses, Instant::now());
             for waiting in lookup.waiting {
@@ -1664,6 +1734,9 @@ mod uring_engine {
         fn fail_lookup(&mut self, idx: usize, build_error: impl Fn() -> Error) -> Result<()> {
             let lookup = self.lookups[idx].take().unwrap();
             self.free_lookup_slots.push(idx);
+            if lookup.counted_as_active {
+                self.active -= 1;
+            }
             for waiting in lookup.waiting {
                 self.active -= 1;
                 self.failed.push((waiting.id, build_error()));

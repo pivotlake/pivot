@@ -249,10 +249,15 @@ impl CachedHttpEngine {
         self.http.force_name_servers(servers);
     }
 
-    /// Look a host up again once its answer is `refresh_after` old.
+    /// Look a host up again once its answer is `refresh_after` old, and
+    /// forget what it resolved to once the answer is `forget_after` old.
     #[cfg(all(test, target_os = "linux"))]
-    pub fn force_address_refresh_age(&mut self, refresh_after: std::time::Duration) {
-        self.http.force_address_refresh_age(refresh_after);
+    pub fn force_address_ages(
+        &mut self,
+        refresh_after: std::time::Duration,
+        forget_after: std::time::Duration,
+    ) {
+        self.http.force_address_ages(refresh_after, forget_after);
     }
 
     /// Join ranges with up to `bytes` between them into one request, so a
