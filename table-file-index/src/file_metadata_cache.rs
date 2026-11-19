@@ -1,7 +1,7 @@
 //! What this process holds of its tables' files between uses: one cache for
 //! every table, of whichever format, within one budget of memory.
 //!
-//! Two things are held, and both cost reads and a decode to get again:
+//! Three things are held, and each costs reads and a decode to get again:
 //!
 //! - A partition's index, built from the table's metadata. The cache keeps
 //!   the index a version built for a partition so the next scan, commit or
@@ -19,6 +19,11 @@
 //!   A local file held here is held open, so the footer of a file the
 //!   table deletes is dropped with it
 //!   ([`FileMetadataCache::remove_footers`]).
+//! - The partitions a manifest of the table's metadata holds a live file
+//!   of, as the table's format writes them down. A manifest never changes,
+//!   so what one version read of it serves every version that lists it,
+//!   and a version finds its partitions by reading only the manifests no
+//!   version before it read.
 //!
 //! An item is found in two steps: by its table ([`TableKey`]), a value the
 //! table's format computes, and then by what it is, a partition's index
@@ -141,11 +146,13 @@ pub struct FileMetadataCache {
     table_unlocked: Condvar,
 }
 
-/// What an entry holds: a partition's index, or a data file's footer.
+/// What an entry holds: a partition's index, a data file's footer, or the
+/// partitions of a manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum EntryKind {
     PartitionIndex,
     Footer,
+    ManifestPartitions,
 }
 
 /// Which item of a table: of which kind, and by what name, a partition's
@@ -370,6 +377,50 @@ impl FileMetadataCache {
                 .items
                 .remove(table, &name_item(EntryKind::Footer, path.as_bytes()));
         }
+    }
+
+    /// The partitions `table` holds for each of the manifests at `paths`,
+    /// in the order given, shared with the cache; finding a manifest's is a
+    /// use of them. Everything that stores them under one table key stores
+    /// them as one `Partitions`.
+    pub fn find_manifest_partitions<'p, Partitions: Send + Sync + 'static>(
+        &self,
+        table: &TableKey,
+        paths: impl Iterator<Item = &'p str>,
+    ) -> Vec<Option<Arc<Partitions>>> {
+        let mut state = self.state.lock().unwrap();
+        paths
+            .map(|path| {
+                let key = name_item(EntryKind::ManifestPartitions, path.as_bytes());
+                let partitions = state
+                    .find(table, &key, LookupUse::Counted)?
+                    .downcast_ref::<Arc<Partitions>>()
+                    .expect("a table holds the partitions of its manifests as one type");
+                Some(Arc::clone(partitions))
+            })
+            .collect()
+    }
+
+    /// Hold in `table` the partitions the manifest at `path` holds a live
+    /// file of, which take `heap_bytes` of memory. Then, while the cache
+    /// holds more than its budget, let go of the entry used longest ago,
+    /// but never of this one.
+    pub fn store_manifest_partitions<Partitions: Send + Sync + 'static>(
+        &self,
+        table: &TableKey,
+        path: &str,
+        partitions: Arc<Partitions>,
+        heap_bytes: u64,
+    ) {
+        let key = name_item(
+            EntryKind::ManifestPartitions,
+            Arc::<[u8]>::from(path.as_bytes()),
+        );
+        let entry_bytes = heap_bytes + measure_entry_record(path.len());
+        let mut state = self.state.lock().unwrap();
+        state
+            .items
+            .insert(table.clone(), key, Box::new(partitions), entry_bytes);
     }
 
     /// Let go of every item of every table named `table`, whatever else

@@ -96,7 +96,7 @@ impl Partition {
 
     /// An estimate of the memory the partition holds, itself included, as
     /// one shared allocation: its tuple.
-    fn estimate_heap_bytes(&self) -> usize {
+    pub(crate) fn estimate_heap_bytes(&self) -> usize {
         let tuple = self.tuple.fields();
         measure_shared_allocation(size_of::<Self>())
             + measure_allocation(size_of_val(tuple))

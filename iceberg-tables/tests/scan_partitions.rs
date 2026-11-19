@@ -184,7 +184,7 @@ fn manifests_of_two_specs_holding_the_same_value_list_a_partition_of_each() {
 }
 
 #[test]
-fn nothing_is_kept_of_a_manifest_read_for_the_partitions_it_holds() {
+fn the_partitions_of_a_manifest_are_listed_again_with_no_manifest_read() {
     let (fixture, created) = create_partitioned_table();
     append(
         &created,
@@ -197,10 +197,44 @@ fn nothing_is_kept_of_a_manifest_read_for_the_partitions_it_holds() {
 
     let partitions = opened.partitions().unwrap();
     fixture.delete_data_manifests(&opened);
-    let listed_again = opened.partitions();
+    let listed_again = opened.partitions().unwrap();
 
     assert_eq!(list_values(&partitions), [7, 9]);
-    assert!(listed_again.is_err());
+    assert_eq!(list_values(&listed_again), [7, 9]);
+}
+
+#[test]
+fn an_unfiltered_scan_after_a_commit_reads_only_the_manifest_the_commit_wrote() {
+    let (fixture, created) = create_partitioned_table();
+    let first = append(
+        &created,
+        vec![
+            fixture.write_file("seven", 7),
+            fixture.write_file("nine", 9),
+        ],
+    );
+    selected(&first, &[]);
+
+    let second = append(
+        &first,
+        vec![
+            fixture.write_file("seven_again", 7),
+            fixture.write_file("nine_again", 9),
+        ],
+    );
+    fixture.delete_data_manifests(&first);
+    let mut files = selected(&second, &[]);
+    files.sort();
+
+    assert_eq!(
+        files,
+        [
+            "nine.parquet",
+            "nine_again.parquet",
+            "seven.parquet",
+            "seven_again.parquet"
+        ]
+    );
 }
 
 #[test]
@@ -896,13 +930,10 @@ fn a_range_spanning_more_partitions_than_are_computed_from_a_filter_lists_those_
         compare(0, CompareType::GreaterEqual, int_scalar(0)),
         compare(0, CompareType::Less, int_scalar(1000)),
     ];
-    let first = selected(&written, &wide_range);
-    fixture.delete_data_manifests(&written);
 
-    let second = written.select_scan(&wide_range);
+    let files = selected(&written, &wide_range);
 
-    assert_eq!(first, ["five.parquet", "late.parquet"]);
-    assert!(second.is_err());
+    assert_eq!(files, ["five.parquet", "late.parquet"]);
 }
 
 #[test]

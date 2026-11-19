@@ -14,8 +14,9 @@
 //!
 //! # Which manifests hold a partition
 //!
-//! Nothing is kept of a manifest once it was decoded but the files that
-//! went into a partition's index, in the cache. Which manifests a
+//! Two things are kept of a manifest once it was decoded, both in the
+//! cache: the files that went into a partition's index, and, of a manifest
+//! that holds several partitions, which ones. Which manifests a
 //! partition's files are in is read off the manifest list every time: an
 //! entry bounds each partition field's values across its manifest, so it
 //! rules a partition in or out and says nothing more.
@@ -31,13 +32,16 @@
 //! whatever the cache holds or let go of, for as long as its manifests are
 //! in the store.
 //!
-//! Which partitions a version has is not kept either. An entry that leaves
-//! its manifest one partition, of a spec without fields or with every
-//! field bounded to a single value, names it; any other manifest is
-//! decoded for the partitions it holds whenever they are asked for. A scan
-//! asks the manifests its filters cannot rule out by their entries, so it
-//! decodes none of the others, and decodes those of them that hold several
-//! partitions every time it is planned.
+//! Which partitions a version has is read off its manifests. An entry
+//! that leaves its manifest one partition, of a spec without fields or
+//! with every field bounded to a single value, names it; any other
+//! manifest is decoded once for the partitions it holds, which the cache
+//! then keeps under the manifest's path, where every version that lists
+//! the manifest finds them. A scan asks the manifests its filters cannot
+//! rule out by their entries, so it decodes none of the others, and of
+//! those that hold several partitions only the ones no version before it
+//! decoded: a table whose every commit writes to several partitions would
+//! otherwise decode all its manifests for every version a scan plans.
 //!
 //! A scan indexes the partitions its filters keep together, so a manifest
 //! is decoded once to index all of them, and it holds the indexes of every
@@ -80,6 +84,7 @@ use object_storage::{DataFile, FileRef, ObjectPath, load_objects};
 use parquet_engine::file_entry::FileEntry;
 use parquet_engine::{
     FileRowGroups, ParquetTable, ScanSelection, TableColumns, load_file_row_groups,
+    measure_shared_allocation,
 };
 use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 use planner::expression::Expression;
@@ -284,6 +289,10 @@ impl KeyedPartition {
         }
     }
 }
+
+/// The partitions a data manifest holds a live file of, each under its key,
+/// in key order: what the cache holds of a manifest that spans several.
+type ManifestPartitions = Vec<(Arc<[u8]>, Arc<Partition>)>;
 
 /// A partition whose index a load has to build: where the partition sits
 /// among those asked for, the manifests whose manifest-list entries do not
@@ -778,8 +787,8 @@ impl Table {
 
     /// Every partition this version has a file in, in key order. The data
     /// manifests whose manifest-list entries do not name their one
-    /// partition are read for the partitions they hold, a few at a time,
-    /// and nothing of them is kept.
+    /// partition, and whose partitions the cache does not hold, are read
+    /// for the partitions they hold, a few at a time.
     pub fn partitions(&self) -> Result<Vec<Arc<Partition>>> {
         let manifests: Vec<&ListedManifest> =
             self.manifest_list.listed_data_manifests().iter().collect();
@@ -793,10 +802,12 @@ impl Table {
 
     /// The partitions `manifests`, data manifests of this version, hold a
     /// live file of, by key. A manifest whose manifest-list entry names its
-    /// one partition is not read. The others are read over the pool, a few at a time, and
-    /// decoded: of each, the files of the partitions `wants_files` accepts
-    /// are left in `ahead`, as far as its bound allows, and nothing else
-    /// is kept.
+    /// one partition is not read, and neither is one whose partitions the
+    /// cache holds, which a version of the table that listed it read: a
+    /// manifest never changes. The others are read over the pool, a few at
+    /// a time, and decoded: of each, the partitions are cached, and the
+    /// files of the partitions `wants_files` accepts are left in `ahead`,
+    /// as far as its bound allows.
     fn list_partitions_from_manifests(
         &self,
         manifests: &[&ListedManifest],
@@ -828,12 +839,44 @@ impl Table {
                 EntryPartitions::Unknown => unnamed.push(manifest),
             }
         }
-        for manifests in unnamed.chunks(MANIFESTS_PER_READ) {
+        let cache = FileMetadataCache::process_wide();
+        let held = cache.find_manifest_partitions::<ManifestPartitions>(
+            &self.cache_key,
+            unnamed.iter().map(|manifest| manifest.path().as_ref()),
+        );
+        let mut unread: Vec<&ListedManifest> = Vec::new();
+        for (manifest, held) in unnamed.into_iter().zip(held) {
+            let Some(held) = held else {
+                unread.push(manifest);
+                continue;
+            };
+            for (key, partition) in held.iter() {
+                partitions
+                    .entry(Arc::clone(key))
+                    .or_insert_with(|| Arc::clone(partition));
+            }
+        }
+        for manifests in unread.chunks(MANIFESTS_PER_READ) {
             let parsed = self.read_manifests(manifests.iter().map(|manifest| manifest.file()))?;
             for (listed, manifest) in manifests.iter().zip(parsed) {
                 let decoded = self.decode_manifest(listed, manifest, &mut |_, partition| {
                     wants_files(partition)
                 })?;
+                let heap_bytes: usize = decoded
+                    .partitions
+                    .iter()
+                    .map(|(key, partition)| {
+                        size_of::<(Arc<[u8]>, Arc<Partition>)>()
+                            + measure_shared_allocation(key.len())
+                            + partition.estimate_heap_bytes()
+                    })
+                    .sum();
+                cache.store_manifest_partitions(
+                    &self.cache_key,
+                    listed.path(),
+                    Arc::new(decoded.partitions.clone()),
+                    heap_bytes as u64,
+                );
                 for (key, partition) in decoded.partitions {
                     partitions.entry(key).or_insert(partition);
                 }

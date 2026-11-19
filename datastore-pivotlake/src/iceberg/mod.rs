@@ -11,8 +11,8 @@
 //! Its live files are indexed a partition at a time, when a scan, a commit
 //! or a maintenance pass first asks for the partition, from the manifests
 //! whose manifest-list entries do not rule the partition out; the indexes
-//! of every table are held in one cache, and nothing else is kept of a
-//! manifest. A version holds no footer: a scan, a merge or a layout
+//! of every table are held in one cache, with the partitions each
+//! manifest that spans several holds a file of. A version holds no footer: a scan, a merge or a layout
 //! measurement takes the row groups of the files it works on and lets go
 //! of them when it is done. The row groups of the footers it read stay in
 //! the same cache, within the same budget, where the next one takes them
@@ -282,7 +282,7 @@ impl Table for IcebergTable {
 
     /// The key of every partition a data manifest of the version holds a
     /// file of; the manifests whose manifest-list entries do not name their
-    /// one partition are read for it, and nothing of them is kept.
+    /// one partition are read for it, once each.
     fn list_partitions(&self) -> crate::Result<Vec<Vec<u8>>> {
         Ok(self
             .table
