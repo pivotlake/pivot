@@ -199,11 +199,23 @@ pub const DEFAULT_MERGE_TARGET_MULTIPLIER: f64 = 1.3;
 /// fills one.
 pub const DEFAULT_MIN_FILES_TO_MERGE: usize = MAX_SMALL_FILES_PER_MERGE;
 
-/// The most small files one merge takes. A merge holds rows of every input
-/// file in memory at once, so its memory grows with their number. A larger
-/// pile is merged in steps, each taking the next files in the partition's
-/// order.
+/// How many small files one merge takes, unless they hold less than one row
+/// group of a merged file between them: it then takes more, until they hold
+/// one. A merge holds rows of every input file in memory at once, so its
+/// memory grows with their number, and files past this count are taken only
+/// while all the rows together are one row group's. A larger pile is merged
+/// in steps, each taking the partition's next smallest files.
 pub const MAX_SMALL_FILES_PER_MERGE: usize = 10;
+
+/// A file below the target size, as a merge of small files weighs it.
+#[derive(Clone)]
+struct SmallFile {
+    file: FileRef,
+    /// The rows the file holds. A file whose rows the table's metadata does
+    /// not record counts as one full row group, so it is never the reason a
+    /// merge takes more files.
+    rows: u64,
+}
 
 /// Per-file fixed cost in the balance test. This prevents many similarly small
 /// files from being rejected merely because their byte total is low.
@@ -854,22 +866,30 @@ impl MergeSelection {
         let Some(files) = table.load_partition_files(partition)? else {
             return Ok(None);
         };
-        let mut small_files: Vec<FileRef> = Vec::new();
+        let mut small_files: Vec<SmallFile> = Vec::new();
         let _ = files.visit_files(&mut |file| {
             if is_small_file(file.file().size, self.target_bytes)
                 && !reserved.contains(&file.file().path)
             {
-                small_files.push(file.file().clone());
+                small_files.push(SmallFile {
+                    file: file.file().clone(),
+                    rows: file.row_count().unwrap_or(ROW_GROUP_ROWS as u64),
+                });
             }
             ControlFlow::Continue(())
         });
+        // A merge takes files of about one size, the smallest first, so a
+        // file merged before is not weighed against the ones just written.
+        // Files of one size keep the partition's order.
+        small_files.sort_by_key(|small| small.file.size);
         Ok(match pass {
             CompactionPass::Routine => {
                 small_file_batch(small_files, self.merge_target_bytes, self.min_files)
             }
             CompactionPass::Final => {
                 small_files.truncate(MAX_SMALL_FILES_PER_MERGE);
-                (small_files.len() >= 2).then_some(small_files)
+                (small_files.len() >= 2)
+                    .then(|| small_files.into_iter().map(|small| small.file).collect())
             }
         })
     }
@@ -1064,22 +1084,27 @@ pub fn is_small_file(size: u64, target_bytes: u64) -> bool {
 }
 
 fn small_file_batch(
-    files: Vec<FileRef>,
+    files: Vec<SmallFile>,
     merge_target_bytes: u64,
     min_files: usize,
 ) -> Option<Vec<FileRef>> {
-    // A merge takes neighbours in the partition's order, at most
-    // `MAX_SMALL_FILES_PER_MERGE` of them. The first such run of files that
-    // makes a merge is taken: when the files a partition starts with make
-    // none, the ones after them still do.
+    // A merge takes a run of the files as they are ordered: the next
+    // `MAX_SMALL_FILES_PER_MERGE` of them, and the ones after those for as
+    // long as the run holds less than one row group of a merged file. The
+    // first run that makes a merge is taken: when the files the order starts
+    // with make none, the ones after them still do.
     for first in 0..files.len() {
-        let window = &files[first..files.len().min(first + MAX_SMALL_FILES_PER_MERGE)];
         let mut total = 0u64;
-        let mut batch = Vec::with_capacity(window.len());
+        let mut rows = 0u64;
+        let mut batch = Vec::with_capacity(MAX_SMALL_FILES_PER_MERGE);
         let mut reaches_merge_target = false;
-        for file in window {
-            total += file.size;
-            batch.push(file.clone());
+        for small in &files[first..] {
+            if batch.len() >= MAX_SMALL_FILES_PER_MERGE && rows >= ROW_GROUP_ROWS as u64 {
+                break;
+            }
+            total += small.file.size;
+            rows += small.rows;
+            batch.push(small.file.clone());
             if batch.len() >= 2 && total >= merge_target_bytes {
                 reaches_merge_target = true;
                 break;
@@ -3103,6 +3128,16 @@ mod tests {
         dispatch.exit();
     }
 
+    fn weigh_as_full_row_groups(files: Vec<FileRef>) -> Vec<SmallFile> {
+        files
+            .into_iter()
+            .map(|file| SmallFile {
+                file,
+                rows: ROW_GROUP_ROWS as u64,
+            })
+            .collect()
+    }
+
     fn file_of_size(path: &str, size: u64) -> FileRef {
         FileRef {
             path: ObjectPath::new(path),
@@ -3254,7 +3289,7 @@ mod tests {
             file_of_size("c", 1),
         ];
 
-        let batch = small_file_batch(files.to_vec(), 130, 100).unwrap();
+        let batch = small_file_batch(weigh_as_full_row_groups(files.to_vec()), 130, 100).unwrap();
 
         assert_eq!(
             batch.iter().map(|file| file.size).collect::<Vec<_>>(),
@@ -3268,7 +3303,8 @@ mod tests {
         let mut files = vec![file_of_size("outlier", 500 * MIB)];
         files.extend((0..9).map(|index| file_of_size(&format!("small-{index}"), MIB)));
 
-        let batch = small_file_batch(files.to_vec(), 2 * 1024 * MIB, 10).unwrap();
+        let batch =
+            small_file_batch(weigh_as_full_row_groups(files.to_vec()), 2 * 1024 * MIB, 10).unwrap();
 
         assert_eq!(batch.len(), 9, "the check continues below 10 files");
         assert!(batch.iter().all(|file| file.path.as_str() != "outlier"));
@@ -3283,7 +3319,7 @@ mod tests {
             .collect();
         files.extend((0..15).map(|index| file_of_size(&format!("fresh-{index}"), 7 * MIB)));
 
-        let batch = small_file_batch(files, 1300 * MIB, 10).unwrap();
+        let batch = small_file_batch(weigh_as_full_row_groups(files), 1300 * MIB, 10).unwrap();
 
         assert!(batch.len() >= 2);
         assert!(batch.iter().all(|file| file.size == 7 * MIB));
@@ -3295,7 +3331,7 @@ mod tests {
             .map(|index| file_of_size(&format!("small-{index:02}"), 1))
             .collect();
 
-        let batch = small_file_batch(files, 1_000, 10).unwrap();
+        let batch = small_file_batch(weigh_as_full_row_groups(files), 1_000, 10).unwrap();
 
         let names: Vec<&str> = batch.iter().map(|file| file.path.as_str()).collect();
         let expected: Vec<String> = (0..10).map(|index| format!("small-{index:02}")).collect();
@@ -3308,8 +3344,8 @@ mod tests {
             .map(|index| file_of_size(&format!("small-{index}"), 1))
             .collect();
 
-        let allowed = small_file_batch(files.to_vec(), 100, 5);
-        let waiting = small_file_batch(files.to_vec(), 100, 6);
+        let allowed = small_file_batch(weigh_as_full_row_groups(files.to_vec()), 100, 5);
+        let waiting = small_file_batch(weigh_as_full_row_groups(files.to_vec()), 100, 6);
 
         assert_eq!(allowed.unwrap().len(), 5);
         assert!(waiting.is_none());
