@@ -187,8 +187,8 @@ impl Vacuumer {
         if !table.has_expired_history(now_ms)? {
             return Ok(None);
         }
-        let commit_lock = table.commit_lock();
-        let _committing = commit_lock.lock().unwrap();
+        let commit_queue = table.commit_queue();
+        let _committing = commit_queue.take_turn();
         let mut latest = self
             .datastore
             .table_handle_by_id(&table.id())

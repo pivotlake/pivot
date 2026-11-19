@@ -1,10 +1,11 @@
 //! Several INSERT statements committing to one managed table at once, each
-//! through a transaction of its own: every one commits, as its own version,
-//! and none is lost to another's commit.
+//! through a transaction of its own: every one commits, none is lost to
+//! another's commit, and those that wait for the table together share a
+//! version.
 
 mod iceberg_support;
 
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use catalog::datastore::DatastoreTransaction as _;
 use datastore_pivotlake::test_support::metadata_versions;
@@ -28,12 +29,46 @@ fn parallel_inserts_into_one_table_all_land() {
 
     let count = db.execute("SELECT count(*) FROM events");
     let rows = db.execute("SELECT value FROM events ORDER BY value");
+    let versions = metadata_versions(&db.root_uri(), &db.table_directory("events")).unwrap();
     assert_eq!(single_i64(&count), 8);
     assert_eq!(collect_i64s(&rows, 0), (1..=8).collect::<Vec<_>>());
     assert_eq!(
-        metadata_versions(&db.root_uri(), &db.table_directory("events")).unwrap(),
-        (1..=9).collect::<Vec<_>>(),
-        "the create and one version per insert"
+        versions,
+        (1..=versions.len() as u64).collect::<Vec<_>>(),
+        "the versions follow one another"
+    );
+    assert!(
+        (2..=9).contains(&versions.len()),
+        "the create and at most one version per insert, got {versions:?}"
+    );
+}
+
+#[test]
+fn inserts_that_wait_for_the_table_together_share_a_version() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE events (value BIGINT)");
+    let start = Arc::new(Barrier::new(64));
+
+    let inserts: Vec<_> = (1..=64i64)
+        .map(|value| {
+            let datastore = Arc::clone(&db.datastore);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                insert_rows(&datastore, "events", vec![int_batch(&[value])])
+            })
+        })
+        .collect();
+    for insert in inserts {
+        insert.join().unwrap();
+    }
+
+    let rows = db.execute("SELECT value FROM events ORDER BY value");
+    let versions = metadata_versions(&db.root_uri(), &db.table_directory("events")).unwrap();
+    assert_eq!(collect_i64s(&rows, 0), (1..=64).collect::<Vec<_>>());
+    assert!(
+        versions.len() < 65,
+        "64 inserts at once made a version each: {versions:?}"
     );
 }
 

@@ -179,6 +179,12 @@ pub enum Error {
     Merge(#[source] DataFlowError),
     #[error("table at `{location}` commit conflict: input file `{file}` is no longer active")]
     CommitConflict { location: String, file: String },
+    #[error("committing together with other writers of the table: {0}")]
+    SharedCommit(#[source] Arc<Error>),
+    #[error(
+        "the writer that was making this commit with its own panicked; whether the commit was made is unknown"
+    )]
+    CommitterPanicked,
     #[error(
         "compaction of table `{table}` stopped: a merge selected from version {version} found its input file `{file}` no longer active, and a refresh from storage left the table at that version"
     )]
@@ -210,7 +216,12 @@ impl Error {
     /// unknown. The table may then reference the files the commit wrote, so
     /// none may be deleted.
     pub fn may_have_committed(&self) -> bool {
-        matches!(self, Self::Iceberg(error) if error.may_have_committed())
+        match self {
+            Self::Iceberg(error) => error.may_have_committed(),
+            Self::SharedCommit(error) => error.may_have_committed(),
+            Self::CommitterPanicked => true,
+            _ => false,
+        }
     }
 }
 
@@ -707,14 +718,17 @@ impl PivotlakeDatastore {
         }
     }
 
-    /// In one Delta commit for table `id`, add every file in `added` and remove
+    /// In one version of table `id`, add every file in `added` and remove
     /// every path in `removed`. `data_change` is `true` for a logical change such
     /// as INSERT, or `false` for a compaction rearrangement that incremental log
     /// readers can skip.
     ///
-    /// This is the sole in-process write path and uses the
-    /// [commit-lock protocol](field@CatalogTable::commit_lock). A caller's
-    /// [`CatalogTable`] copy is a read view, never a commit base.
+    /// This is the sole in-process write path and goes through the table's
+    /// [commit queue](field@CatalogTable::commit_queue): the version that
+    /// holds this commit may hold the inserts of other writers waiting with
+    /// it, and a failure of such a version is every one's
+    /// ([`Error::SharedCommit`]). A caller's [`CatalogTable`] copy is a read
+    /// view, never a commit base.
     pub(crate) fn commit_to_table(
         &self,
         id: Uuid,
@@ -722,27 +736,43 @@ impl PivotlakeDatastore {
         added: Vec<TableFile>,
         data_change: bool,
     ) -> Result<()> {
-        // Look the table up twice on purpose: this first lookup takes nothing
-        // but the lock, because a copy read before the lock would be the version
-        // the previous holder is about to supersede. The index guard is a
-        // temporary in this statement, so it is released at the semicolon,
-        // before the blocking log write; that only type-checks because
-        // `commit_lock` hands back an owned `Arc` rather than a reference.
-        let commit_lock = self
+        // The table is looked up again for every version committed: this
+        // first lookup takes nothing but the queue, because a copy read before
+        // the lock would be the version the previous holder is about to
+        // supersede. The index guard is a temporary in this statement, so it
+        // is released at the semicolon, before the blocking log write; that
+        // only type-checks because `commit_queue` hands back an owned `Arc`
+        // rather than a reference.
+        let commit_queue = self
             .tables_index
             .read()
             .unwrap()
             .get_table_by_id(&id)
             .ok_or_else(|| Error::TableNotFound(id.to_string()))?
-            .commit_lock();
-        let _committing = commit_lock.lock().unwrap();
+            .commit_queue();
+        let outcome = commit_queue.enqueue(removed, added, data_change);
+        let turn = match commit_queue.wait_to_commit(&outcome) {
+            table::CommitWait::Committed(committed) => return committed,
+            table::CommitWait::Turn(turn) => turn,
+        };
 
-        let mut table = self
-            .table_handle_by_id(&id)
-            .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
-        table.commit_files(removed, added, data_change)?;
-        self.publish_table(table);
-        Ok(())
+        loop {
+            if let Some(committed) = outcome.take() {
+                return committed;
+            }
+            let mut group = turn
+                .take_next_group()
+                .expect("a commit with no outcome yet is still queued");
+            let committed = self
+                .table_handle_by_id(&id)
+                .ok_or_else(|| Error::TableNotFound(id.to_string()))
+                .and_then(|mut table| {
+                    group.commit_to(&mut table)?;
+                    self.publish_table(table);
+                    Ok(())
+                });
+            turn.report(group, committed);
+        }
     }
 
     /// Persist one table creation staged by a completed footer-fetch dataflow:
