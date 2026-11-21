@@ -8,51 +8,71 @@
 //!
 //! Durable state lives in two places, both in the store:
 //!
-//! - the `_pivot_manifest.json` manifest: which schemas exist, and which tables
-//!   exist in them (schema-qualified name and location);
-//! - each table's standard Delta `_delta_log`: its schema, partitioning,
-//!   version, and active Parquet files, interpreted by Delta Kernel.
+//! - the `_pivot_manifest.json` manifest: which schemas exist, which tables
+//!   exist in them (schema-qualified name and location), and the table
+//!   format the database keeps them in;
+//! - each table's own metadata in that format: its schema, partitioning,
+//!   version, and active Parquet files. A Delta Lake table keeps a standard
+//!   `_delta_log`, interpreted by Delta Kernel; an Iceberg table keeps
+//!   numbered metadata files, manifest lists and manifests.
 //!
-//! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
-//! per-file row groups at one log version. The in-memory set is kept current by
+//! The format is chosen once, when the first open of a location creates the
+//! database's manifest (`iceberg` unless the opener names `delta`), and read
+//! back from the manifest on every later open; a manifest written before the
+//! field existed is a Delta database.
+//! Everything below the `table_format` seam is one implementation per format;
+//! everything above it is written once.
+//!
+//! Each table's in-memory [`table::CatalogTable`] pairs its definition with
+//! one committed version of the table. The in-memory set is kept current by
 //! **push, not pull**: a periodic [`refresh_from_store`](PivotlakeDatastore::refresh_from_store)
 //! sweep (the server and the shell each run one on an interval) reloads every
-//! table to its latest committed version and fetches any new files' footers,
+//! table to its latest committed version,
+//! a vacuum round reloads the table it is about to work on the same way,
 //! and an in-process writer (INSERT, compaction)
 //! [`publish_table`](PivotlakeDatastore::publish_table)s its committed copy
-//! immediately. Queries never touch the store: a query opens
+//! immediately. A query never looks for a newer version: it opens
 //! a transaction ([`Datastore::begin_transaction`]) whose [`PivotlakeSnapshot`]
 //! freezes the table set as of that moment, and every binding, scan, and late
-//! materialize of that query reads the frozen snapshot with zero I/O.
+//! materialize of that query reads the frozen versions. What a version
+//! holds in memory is its format's. A Delta version holds every file with
+//! its row groups' metadata, which a refresh fetched, so a query over it
+//! reads no metadata from the store. An Iceberg version holds its manifest
+//! list, and a query reads the manifests and footers it needs through the
+//! file metadata cache, from the store when the cache does not hold them.
 //!
-//! Each resolve hands back a fresh [`TableBinding`], so per-query filter
+//! Each resolve hands back a fresh [`ParquetTableBinding`], so per-query filter
 //! pushdown accumulates on that binding alone.
 
 mod binding;
 mod compact;
+mod delta;
+mod iceberg;
 mod insert_sink;
 mod local_lock;
-mod log;
 mod manifest;
 mod table;
-/// A Docker-backed object-store test harness (MinIO) plus Delta test helpers.
+mod table_format;
+/// A Docker-backed object-store test harness (MinIO) plus table test helpers.
 /// Gated behind the `test-support` feature so it, and its heavy testcontainers
 /// deps, never enter a normal build.
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod vacuum;
 
-pub use binding::TableBinding;
+pub use binding::BoundCatalogTable;
 pub use compact::{
     CompacterHandle, CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM,
     DEFAULT_COMPACT_POLL, DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE,
-    DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, compact_table_files, default_merge_target_bytes,
+    DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, default_merge_target_bytes,
 };
-pub use manifest::{
-    ColumnStatFilter, DeltaFileEntry, PartitionEqFilter, PartitionValues, pivot_scalar,
+pub use file_entry::{
+    ColumnStatFilter, FileEntry, PartitionEqFilter, PartitionValues, pivot_scalar,
     scalar_values_equal, scalar_values_from_row,
 };
 pub use object_storage::FileRef;
+use parquet_engine::file_entry;
+pub use table_format::TableFormat;
 pub use vacuum::{DEFAULT_VACUUM_POLL, VacuumConfig, Vacuumer};
 
 use std::collections::HashMap;
@@ -67,36 +87,30 @@ use catalog::{CommitAction, CommitQueue, StagedCommit};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
 use manifest::CatalogManifest;
-use object_storage::{self, DataFile, ObjectPath, ObjectStore, open_store};
-use parquet_engine::ParquetTableError;
-use parquet_engine::writing::upload::{UploadedFiles, delete_uploaded_files};
+use object_storage::{self, DataFile, ObjectPath, ObjectStore};
+use parquet_engine::writing::upload::{UploadedFile, UploadedFiles};
+use parquet_engine::{ParquetTableBinding, ParquetTableError};
 use planner::catalog::{
     BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Error as CatalogError,
     Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop,
     TableRevision,
 };
 pub use table::CatalogTable;
-pub use table::TableFile;
+use table::TableFile;
+use table::TableStorage;
+use table_format::{CarriedFileGroups, RemovedFiles};
 use thiserror::Error as ThisError;
 
 /// `WITH (with_pre_existing_parquets = 'dir')`: a directory of Parquet files the new
 /// table adopts as its initial data, where they already sit.
 const PRE_EXISTING_PARQUETS_OPTION: &str = "with_pre_existing_parquets";
-/// `WITH (partition_by = 'a, b')` — ordered, comma-separated partition columns.
-const PARTITION_BY_OPTION: &str = "partition_by";
-/// `WITH (sort_by = 'a, b')` — ordered, comma-separated sort columns.
-const SORT_BY_OPTION: &str = "sort_by";
 
 /// Every option `CREATE TABLE` understands. An option outside this set is
 /// rejected rather than ignored: a statement that asks for something the
 /// datastore does not implement has not been carried out, and silently
 /// dropping it is how a retired option (or a typo) turns into a table that is
 /// quietly not what was asked for.
-const TABLE_OPTIONS: [&str; 3] = [
-    PRE_EXISTING_PARQUETS_OPTION,
-    PARTITION_BY_OPTION,
-    SORT_BY_OPTION,
-];
+const TABLE_OPTIONS: [&str; 1] = [PRE_EXISTING_PARQUETS_OPTION];
 
 #[derive(Debug, ThisError)]
 pub enum Error {
@@ -106,8 +120,22 @@ pub enum Error {
     OptionPathWithScheme { option: String, path: String },
     #[error("`{option}` is not a table option; this datastore takes {known}")]
     UnknownOption { option: String, known: String },
-    #[error("`{option}` column `{column}` is not a declared column of the table")]
-    UnknownSpecColumn { option: String, column: String },
+    #[error("PARTITIONED BY column `{column}` is not a declared column of the table")]
+    UnknownPartitionColumn { column: String },
+    #[error("SORTED BY column `{column}` is not a declared column of the table")]
+    UnknownSortColumn { column: String },
+    #[error(
+        "PARTITIONED BY term `{term}` is a transform of a column, which Delta Lake has none of: a database in the `delta` table format partitions its tables by columns"
+    )]
+    PartitionTransformInDelta { term: String },
+    #[error(
+        "PARTITIONED BY term `{term}` is a transform of a column, and a table that adopts files with `with_pre_existing_parquets` is partitioned by columns alone: no transform cut the files it adopts"
+    )]
+    AdoptingIntoPartitionTransform { term: String },
+    #[error(
+        "table at `{location}` cannot merge files whose partition records no value for the partition field `{field}`"
+    )]
+    PartitionValueMissing { location: String, field: String },
     #[error(transparent)]
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
@@ -118,8 +146,6 @@ pub enum Error {
     SchemaNotFound(String),
     #[error("schema `{0}` already exists")]
     SchemaExists(String),
-    #[error("datastore received a transaction created by a different backend")]
-    WrongTransactionType,
     #[error(
         "datastore directory `{path}` is already in use by another Pivot process{owner}; stop that process or choose another datastore directory"
     )]
@@ -137,13 +163,39 @@ pub enum Error {
     #[error(transparent)]
     Manifest(#[from] manifest::Error),
     #[error(transparent)]
-    Delta(#[from] crate::log::Error),
+    Delta(#[from] crate::delta::log::Error),
+    #[error(transparent)]
+    Iceberg(#[from] iceberg_tables::Error),
+    #[error(
+        "the database at `{location}` keeps its tables as {recorded} tables and cannot be opened as a {requested} database; its format was fixed when it was created"
+    )]
+    FormatMismatch {
+        location: String,
+        recorded: TableFormat,
+        requested: TableFormat,
+    },
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
     #[error("running a compaction merge: {0}")]
     Merge(#[source] DataFlowError),
     #[error("table at `{location}` commit conflict: input file `{file}` is no longer active")]
     CommitConflict { location: String, file: String },
+    #[error(
+        "compaction of table `{table}` stopped: a merge selected from version {version} found its input file `{file}` no longer active, and a refresh from storage left the table at that version"
+    )]
+    CompactionConflictWithoutProgress {
+        table: String,
+        version: u64,
+        file: String,
+    },
+    #[error(
+        "compaction of table `{table}` stopped: the compacter's lists of the table's files do not hold `{file}`, an input of a merge it committed; they are rebuilt from the table"
+    )]
+    CompactionListsOutOfStep { table: String, file: String },
+    #[error(
+        "table at `{location}` cannot merge the files of a partition whose files its format does not rewrite"
+    )]
+    PartitionNotRewritable { location: String },
     #[error(
         "table at `{location}` cannot delete `{file}`: the file sits outside the table's own storage, so it belongs to whoever the table adopted it from"
     )]
@@ -157,6 +209,15 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether the commit this error ended may have succeeded: its outcome is
+    /// unknown. The table may then reference the files the commit wrote, so
+    /// none may be deleted.
+    pub fn may_have_committed(&self) -> bool {
+        matches!(self, Self::Iceberg(error) if error.may_have_committed())
+    }
+}
 
 impl From<Error> for CatalogError {
     fn from(value: Error) -> Self {
@@ -260,6 +321,44 @@ impl DatastoreIndex {
     }
 }
 
+/// The most live data files a database may hold, over all its tables, for
+/// an open to preload it. It bounds the work an open may do. It does not
+/// bound the memory what it loaded takes below the budget of the cache a
+/// format keeps it in: at the widest footers measured, about 3.3 MB of
+/// index and footer per file, that many files take about 1.8 GB, and the
+/// cache then keeps the ones loaded last.
+pub const PRELOADED_DATABASE_MAX_FILES: u64 = 555;
+
+/// Load what the first scan of each of `tables`, every table of one
+/// database as an open just loaded it, would read of the table's metadata
+/// and of its files' footers, when the tables hold at most
+/// [`PRELOADED_DATABASE_MAX_FILES`] live data files between them. A
+/// database that holds more, or has a table whose metadata does not count
+/// its files, is left whole to its queries: no table of it is preloaded.
+///
+/// A preload only spares a table's first query the reads, so a table that
+/// fails to preload does not fail the open. The failure is logged, here and
+/// nowhere else in place of being returned; the other tables are still
+/// preloaded, and the table's first query meets the same failure and
+/// reports it.
+fn preload_small_database(tables: &[(SchemaQualifiedTableName, Arc<dyn table_format::Table>)]) {
+    let file_count = tables.iter().try_fold(0u64, |total, (_, table)| {
+        total.checked_add(table.count_files()?)
+    });
+    if file_count.is_none_or(|files| files > PRELOADED_DATABASE_MAX_FILES) {
+        return;
+    }
+    for (name, table) in tables {
+        if let Err(error) = table.preload_scan_metadata() {
+            tracing::warn!(
+                table = %name,
+                error = %error,
+                "preloading the table's file metadata failed; its first query loads it"
+            );
+        }
+    }
+}
+
 /// A pivotlake datastore's concurrent table index, keyed by name.
 ///
 /// `CREATE TABLE` compiles to a dataflow that reads every data file's footer
@@ -293,11 +392,9 @@ pub struct PivotlakeDatastore {
     /// The exclusive process lock for a local store. Remote stores have none.
     /// Shared by datastore clones so one clone cannot unlock active peers.
     _local_lock: Option<Arc<LocalDatastoreLock>>,
-    /// The Delta Kernel engine every table's log is read and written through.
-    /// Built once for the store, so a refresh, a commit, or a vacuum sweep reuses
-    /// the one object-store client and task executor instead of standing up its
-    /// own; each table holds a clone.
-    engine: crate::log::DeltaEngine,
+    /// What creates and loads this database's tables, in the format the
+    /// manifest records.
+    table_factory: Arc<dyn table_format::TableFactory>,
 
     /// The worker pool every footer fetch runs on. Held by the datastore because
     /// refreshes drive their own dataflows, with no dispatcher passed in.
@@ -314,7 +411,7 @@ pub struct PivotlakeDatastore {
     maintenance_tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     /// Handle to the one compaction actor serving both timer ticks and explicit
     /// commands. Created lazily by maintenance startup or the first command.
-    compacter: Arc<Mutex<Option<crate::compact::CompacterHandle>>>,
+    compacter: Arc<Mutex<Option<CompacterHandle>>>,
 }
 
 impl std::fmt::Debug for PivotlakeDatastore {
@@ -326,26 +423,22 @@ impl std::fmt::Debug for PivotlakeDatastore {
 }
 
 impl PivotlakeDatastore {
-    /// Open a persisted database rooted at `uri`, a local directory (or
-    /// `file://…`), or a remote `s3://…` object store, reloading every
-    /// table the manifest records at its latest version: read each table's
-    /// manifest (schema + file list) and fetch its files' footers, building the
-    /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.
-    /// No background maintenance runs (see [`from_store`](Self::from_store)).
-    pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Arc<Self>> {
-        let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
-        Self::from_store(store, dispatcher, None)
-    }
-
     /// Open a persisted database over an already-built object store. This is the
     /// seam a metastore uses: it constructs the
     /// store (local dir / S3, with whatever credentials it holds) and hands
     /// it in, rather than having the datastore re-derive one from a URI. Reloads
-    /// every table the manifest records, exactly as [`open`](Self::open) does.
+    /// every table the manifest records at its latest version, building the
+    /// in-memory [`CatalogTable`]s, and preloads a database of at most
+    /// `PRELOADED_DATABASE_MAX_FILES` files. Background maintenance runs
+    /// only when `maintenance` configures it.
+    /// `format` names the table format a database that does not exist yet is
+    /// created in (the default when `None`); an existing database keeps the
+    /// one its manifest records, and naming a different one is an error.
     pub fn from_store(
         store: Arc<dyn ObjectStore>,
         dispatcher: &DataFlowDispatcher,
         maintenance: Option<crate::MaintenanceConfig>,
+        format: Option<TableFormat>,
     ) -> Result<Arc<Self>> {
         // Only local pivotlake datastores take a process lock; remote stores have
         // no local root and skip this.
@@ -354,24 +447,42 @@ impl PivotlakeDatastore {
             .map(LocalDatastoreLock::acquire)
             .transpose()?
             .map(Arc::new);
-        let manifest = CatalogManifest::load(store.as_ref())?;
-        let engine = crate::log::DeltaEngine::new(store.as_ref())?;
+        let manifest = Self::load_or_create_manifest(store.as_ref(), format)?;
+        let table_factory: Arc<dyn table_format::TableFactory> = match manifest.table_format() {
+            TableFormat::Delta => Arc::new(delta::DeltaTableFactory::new(
+                store.clone(),
+                dispatcher.clone(),
+            )?),
+            TableFormat::Iceberg => Arc::new(iceberg::IcebergTableFactory::new(
+                store.clone(),
+                dispatcher.clone(),
+            )),
+        };
 
         let mut index = DatastoreIndex::default();
         for schema in &manifest.schemas {
             index.insert_schema(schema.name.clone());
         }
+        let mut loaded_tables = Vec::new();
         for entry in manifest.tables() {
             let (name, id, location) = entry?;
-            let table = Self::load_table(dispatcher, &store, &engine, id, location)?;
+            let loaded = table_factory.load_table(location, &name)?;
+            loaded_tables.push((name.clone(), Arc::clone(&loaded)));
+            let table = CatalogTable::new(
+                id,
+                TableStorage::new(store.clone(), location.clone()),
+                loaded,
+                dispatcher.clone(),
+            );
             index.insert_table(name, table);
         }
+        preload_small_database(&loaded_tables);
 
         Ok(Arc::new(Self {
             tables_index: Arc::new(RwLock::new(index)),
             store,
             _local_lock: local_lock,
-            engine,
+            table_factory,
             dispatcher: dispatcher.clone(),
             maintenance,
             maintenance_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -379,7 +490,7 @@ impl PivotlakeDatastore {
         }))
     }
 
-    fn compacter(self: &Arc<Self>) -> crate::compact::CompacterHandle {
+    fn compacter(self: &Arc<Self>) -> CompacterHandle {
         let mut compacter = self.compacter.lock().unwrap();
         if let Some(compacter) = compacter.as_ref() {
             return compacter.clone();
@@ -405,15 +516,15 @@ impl PivotlakeDatastore {
                 Some(config.poll_interval),
             ),
             None => (
-                crate::compact::DEFAULT_COMPACT_BYTES,
-                crate::compact::default_merge_target_bytes(crate::compact::DEFAULT_COMPACT_BYTES),
-                crate::compact::DEFAULT_MIN_FILES_TO_MERGE,
-                crate::compact::DEFAULT_COMPACT_PARALLELISM,
-                crate::compact::DEFAULT_LAYOUT_CLIQUE_SIZE,
+                DEFAULT_COMPACT_BYTES,
+                default_merge_target_bytes(DEFAULT_COMPACT_BYTES),
+                DEFAULT_MIN_FILES_TO_MERGE,
+                DEFAULT_COMPACT_PARALLELISM,
+                DEFAULT_LAYOUT_CLIQUE_SIZE,
                 None,
             ),
         };
-        let (handle, actor) = crate::compact::CompacterHandle::new(
+        let (handle, actor) = CompacterHandle::new(
             target_bytes,
             merge_target_bytes,
             min_files,
@@ -431,54 +542,38 @@ impl PivotlakeDatastore {
         handle
     }
 
-    /// Build the in-memory [`CatalogTable`] for one persisted table: read its
-    /// manifest (erroring if the catalog points at a table that has none), then
-    /// locate its committed files under the entry's location and fetch their
-    /// footers over the pool.
-    fn load_table(
-        dispatcher: &DataFlowDispatcher,
-        store: &Arc<dyn ObjectStore>,
-        engine: &crate::log::DeltaEngine,
-        id: Uuid,
-        location: &ObjectPath,
-    ) -> Result<CatalogTable> {
-        let delta_uri = crate::log::table_uri(&store.location_uri(), location)?;
-        let state = crate::log::load_table(&delta_uri, engine)?;
-        let data_files = state
-            .file_entries
-            .iter()
-            .map(|e| e.file.clone().into_data_file(store.as_ref(), location))
-            .collect::<object_storage::Result<Vec<DataFile>>>()?;
-        let declared_columns = parquet_engine::TableColumns::by_name(state.columns.clone());
-        // The footer fetch returns one result per file, in the order of the log
-        // entries (partition tuples) the files were built from.
-        let footers =
-            parquet_engine::load_file_row_groups(dispatcher, &data_files, declared_columns)?;
-        let files: Vec<TableFile> = state
-            .file_entries
-            .into_iter()
-            .zip(footers)
-            .map(|(entry, footer)| TableFile::new(entry, footer.row_groups))
-            .collect();
-        Ok(CatalogTable::new(
-            id,
-            location.clone(),
-            state.snapshot,
-            state.columns,
-            state.partition_by,
-            state.sort_by,
-            files,
-            state.tombstones,
-            store.clone(),
-            dispatcher.clone(),
-            engine.clone(),
-        ))
+    /// The manifest of the database in `store`: the existing one, or a new one
+    /// recording `requested` (the default format when `None`), written right
+    /// here under the store's own update protocol, so of two openers racing to
+    /// create the database the first settles its format. `requested`, when
+    /// given, must agree with the format the manifest records.
+    fn load_or_create_manifest(
+        store: &dyn ObjectStore,
+        requested: Option<TableFormat>,
+    ) -> Result<CatalogManifest> {
+        let manifest = match CatalogManifest::load_existing(store)? {
+            Some(manifest) => manifest,
+            None => CatalogManifest::create(
+                store,
+                requested.unwrap_or(TableFormat::DEFAULT_FOR_NEW_DATABASES),
+            )?,
+        };
+        if let Some(requested) = requested
+            && requested != manifest.table_format()
+        {
+            return Err(Error::FormatMismatch {
+                location: store.location_uri(),
+                recorded: manifest.table_format(),
+                requested,
+            });
+        }
+        Ok(manifest)
     }
 
     /// Open a transaction, typed: freeze the current table set into a
     /// [`PivotlakeSnapshot`] and create the queue its statements stage their
-    /// commit actions on. Cheap: clones the map (the row-group metadata
-    /// inside is `Arc`-shared), no I/O. The [`Datastore::begin_transaction`]
+    /// commit actions on. Cheap: clones the map (what the tables inside
+    /// hold is `Arc`-shared), no I/O. The [`Datastore::begin_transaction`]
     /// trait impl delegates here.
     pub fn begin_transaction(self: Arc<Self>) -> Arc<PivotlakeTransaction> {
         let snapshot = Arc::new(PivotlakeSnapshot {
@@ -493,12 +588,11 @@ impl PivotlakeDatastore {
 
     /// Bring the in-memory schema and table sets up to date with the store: pick
     /// up schemas and tables another process registered in a shared remote
-    /// database index, and advance every table to its latest committed Delta
-    /// version, fetching the footers of
-    /// files it doesn't hold yet. This is the **only** place the read path
-    /// pays store I/O; the server drives it on a background interval, so
-    /// queries always bind against an already-materialized set. Returns whether
-    /// anything changed.
+    /// database index, and advance every table to its latest committed
+    /// version, reading what its format holds of a version in memory: of a
+    /// Delta table, the footers of the files it doesn't hold yet. The server
+    /// drives it on a background interval, so queries bind against a set
+    /// that is already loaded. Returns whether anything changed.
     ///
     /// A table another process dropped (or dropped and recreated, changing its
     /// identity) is removed here. The removal never trusts the sweep's first
@@ -555,19 +649,19 @@ impl PivotlakeDatastore {
             if self.tables_index.read().unwrap().contains_table(&name) {
                 continue;
             }
-            let table = match Self::load_table(
-                &self.dispatcher,
-                &self.store,
-                &self.engine,
-                id,
-                location,
-            ) {
-                Ok(table) => table,
+            let loaded = match self.table_factory.load_table(location, &name) {
+                Ok(loaded) => loaded,
                 Err(e) => {
                     tracing::warn!(table = %name, error = %e, "catalog refresh: loading table failed");
                     continue;
                 }
             };
+            let table = CatalogTable::new(
+                id,
+                TableStorage::new(self.store.clone(), location.clone()),
+                loaded,
+                self.dispatcher.clone(),
+            );
             let mut index = self.tables_index.write().unwrap();
             // An in-process CREATE TABLE may have published it since the read.
             if !index.contains_table(&name) {
@@ -576,12 +670,9 @@ impl PivotlakeDatastore {
             }
         }
 
-        // Refresh each table on a clone outside the lock (footer fetches are
-        // I/O), then publish the advanced copy back.
-        for (name, mut table) in self.tables() {
-            match table.refresh() {
-                Ok(true) => changed |= self.publish_table(table),
-                Ok(false) => {}
+        for (name, table) in self.tables() {
+            match self.refresh_table_from_store(&table.id()) {
+                Ok(advanced) => changed |= advanced,
                 Err(e) => {
                     tracing::warn!(table = %name, error = %e, "catalog refresh: refreshing table failed");
                 }
@@ -589,6 +680,19 @@ impl PivotlakeDatastore {
         }
 
         Ok(changed)
+    }
+
+    /// Advance the datastore's copy of the table `id` to the latest version
+    /// its storage holds and publish it, so what another process committed
+    /// is in the copy every query, commit and maintenance round takes from
+    /// then on. Returns whether the published copy advanced. The copy is
+    /// refreshed on a clone outside the index lock (reading a table's
+    /// metadata is I/O), then published back.
+    pub(crate) fn refresh_table_from_store(&self, id: &Uuid) -> Result<bool> {
+        let mut table = self
+            .table_handle_by_id(id)
+            .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
+        Ok(table.refresh()? && self.publish_table(table))
     }
 
     /// Publish a committed [`CatalogTable`] copy into the shared map, so its
@@ -607,7 +711,7 @@ impl PivotlakeDatastore {
         }
     }
 
-    /// In one Delta commit for table `id`, add every file in `added` and remove
+    /// In one commit for table `id`, add every file in `added` and remove
     /// every path in `removed`. `data_change` is `true` for a logical change such
     /// as INSERT, or `false` for a compaction rearrangement that incremental log
     /// readers can skip.
@@ -615,13 +719,16 @@ impl PivotlakeDatastore {
     /// This is the sole in-process write path and uses the
     /// [commit-lock protocol](field@CatalogTable::commit_lock). A caller's
     /// [`CatalogTable`] copy is a read view, never a commit base.
+    ///
+    /// Hands back what the commit did to the groups of the version it was
+    /// made on, when the table's format says so.
     pub(crate) fn commit_to_table(
         &self,
         id: Uuid,
-        removed: &[ObjectPath],
+        removed: RemovedFiles<'_>,
         added: Vec<TableFile>,
         data_change: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<CarriedFileGroups>> {
         // Look the table up twice on purpose: this first lookup takes nothing
         // but the lock, because a copy read before the lock would be the version
         // the previous holder is about to supersede. The index guard is a
@@ -640,9 +747,9 @@ impl PivotlakeDatastore {
         let mut table = self
             .table_handle_by_id(&id)
             .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
-        table.commit_files(removed, added, data_change)?;
+        let carried_groups = table.commit_files(removed, added, data_change)?;
         self.publish_table(table);
-        Ok(())
+        Ok(carried_groups)
     }
 
     /// Persist one table creation staged by a completed footer-fetch dataflow:
@@ -674,17 +781,27 @@ impl PivotlakeDatastore {
             }
             return Err(Error::TableExists(name.to_string()));
         }
-        let table = CatalogTable::create_new(
+        // Pair each discovered file with a bare entry; `TableFile::new` derives
+        // its stats from the footers.
+        let adopted: Vec<TableFile> = loaded
+            .into_iter()
+            .map(|file| TableFile::new(FileEntry::new(file.file), file.row_groups))
+            .collect();
+        let created = self.table_factory.create_table(
+            &location,
+            &name,
             id,
-            location.clone(),
-            loaded,
             columns,
             partition_by,
             sort_by,
-            self.store.clone(),
-            self.dispatcher.clone(),
-            self.engine.clone(),
+            adopted,
         )?;
+        let table = CatalogTable::new(
+            id,
+            TableStorage::new(self.store.clone(), location.clone()),
+            created,
+            self.dispatcher.clone(),
+        );
         CatalogManifest::update(self.store.as_ref(), |manifest| {
             manifest.upsert_table(&name, id, location.clone())
         })?;
@@ -714,10 +831,16 @@ impl PivotlakeDatastore {
             }
             return Err(Error::TableNotFound(name.to_string()));
         };
-        let retention = index
+        let dropped = index
             .get_table_by_id(&id)
-            .expect("the name index resolved the id, so the table is held")
-            .deleted_file_retention();
+            .expect("the name index resolved the id, so the table is held");
+        let retention = dropped.deleted_file_retention()?;
+        // The table's files are deleted once its tombstone ages out, and a
+        // footer the cache holds keeps its file open. What a query that
+        // bound the table before the drop caches from here on is let go of
+        // when the storage is reclaimed.
+        self.table_factory
+            .forget_cached_table(&ObjectPath::new(dropped.location()))?;
         let dropped_at_ms = crate::vacuum::now_unix_ms();
         CatalogManifest::update(self.store.as_ref(), |manifest| {
             manifest.remove_table(&name, dropped_at_ms, retention.as_millis() as u64)
@@ -745,6 +868,10 @@ impl PivotlakeDatastore {
                 location = %entry.location,
                 "vacuum: deleting dropped table's storage"
             );
+            // A footer the cache holds keeps its file open, and a deleted
+            // file that is open keeps its blocks: a query that bound the
+            // table before its drop may have cached one since.
+            self.table_factory.forget_cached_table(&entry.location)?;
             self.delete_table_storage(&entry.location)?;
             tracing::info!(
                 table_id = %entry.id,
@@ -844,12 +971,6 @@ impl PivotlakeDatastore {
         Ok(())
     }
 
-    /// The worker pool this datastore fetches footers on, shared with callers
-    /// (the compacter) that drive their own dataflows over the same tables.
-    pub fn dispatcher(&self) -> &DataFlowDispatcher {
-        &self.dispatcher
-    }
-
     /// A clone of the named table's current state, for a caller that reads it
     /// (a compaction candidate scan, introspection) or refreshes it to the
     /// latest committed version. A copy drifts as soon as anything commits, and
@@ -871,8 +992,9 @@ impl PivotlakeDatastore {
         self.tables_index.read().unwrap().contains_table(name)
     }
 
-    /// A snapshot clone of every table the catalog currently holds — for a sweep
-    /// (e.g. the compacter) that refreshes and evolves each one independently.
+    /// A snapshot clone of every table the catalog currently holds, each
+    /// under its name: what a sweep over the tables (the refresh, the
+    /// compacter, the vacuumer) goes through.
     pub fn tables(&self) -> Vec<(SchemaQualifiedTableName, CatalogTable)> {
         self.tables_index
             .read()
@@ -892,15 +1014,6 @@ impl PivotlakeDatastore {
             .get_table_by_id(id)
             .cloned()
     }
-
-    /// BoundTable `name`'s current committed files — refreshing to the latest version
-    /// first, so a commit by INSERT/compaction (in this process or another) is
-    /// reflected. `None` if no such table exists.
-    pub fn table_files(&self, name: &SchemaQualifiedTableName) -> Option<Vec<FileRef>> {
-        let mut table = self.table_handle(name)?;
-        let _ = table.refresh();
-        Some(table.file_refs())
-    }
 }
 
 impl PivotlakeTransaction {
@@ -913,10 +1026,12 @@ impl PivotlakeTransaction {
     }
 
     /// Resolve a `CREATE TABLE` against this datastore: check the schema exists
-    /// and the name is still free, parse the layout options, and locate the
-    /// Parquet files the table adopts. Returns a [`PivotlakeTableCreation`] whose
-    /// `compile` builds the footer-fetch-and-stage dataflow. This part runs on
-    /// the coordinator; compiling needs the pool.
+    /// and the name is still free, refuse a partition term the database's
+    /// table format cannot partition by and a `SORTED BY` column the table
+    /// does not declare, and locate the Parquet files the table adopts.
+    /// Returns a [`PivotlakeTableCreation`] whose `compile` builds the
+    /// footer-fetch-and-stage dataflow. This part runs on the coordinator;
+    /// compiling needs the pool.
     ///
     /// The table's own storage is always a directory of its own under the
     /// database root, named after its identity. `WITH (with_pre_existing_parquets = '…')`
@@ -949,8 +1064,17 @@ impl PivotlakeTransaction {
         // log's `metaData.id` when version 0 is written.
         let id = Uuid::new_v4();
         let location = ObjectPath::new(id.to_string());
-        let partition_by = Self::parse_spec_columns(&request, PARTITION_BY_OPTION)?;
-        let sort_by = Self::parse_spec_columns(&request, SORT_BY_OPTION)?;
+        self.datastore.table_factory.check_partition_by(
+            &name,
+            &request.columns,
+            &request.partitioned_by,
+            request.options.contains_key(PRE_EXISTING_PARQUETS_OPTION),
+        )?;
+        if let Some(column) = request.find_undeclared_sort_column() {
+            return Err(Error::UnknownSortColumn {
+                column: column.to_string(),
+            });
+        }
         let files = self.adopted_data_files(&request)?;
 
         Ok(PivotlakeTableCreation {
@@ -960,8 +1084,8 @@ impl PivotlakeTransaction {
             id,
             columns: request.columns,
             location,
-            partition_by,
-            sort_by,
+            partition_by: request.partitioned_by,
+            sort_by: request.sorted_by,
             if_not_exists: request.if_not_exists,
         })
     }
@@ -1076,29 +1200,6 @@ impl PivotlakeTransaction {
             .map_err(Error::from)
     }
 
-    /// Parse a comma-separated column-list option (`partition_by` / `sort_by`)
-    /// into an ordered `Vec<String>`, validating each name is a declared column.
-    /// Absent or empty → no columns.
-    fn parse_spec_columns(request: &CreateTableRequest, option: &str) -> Result<Vec<String>> {
-        let Some(raw) = request.options.get(option) else {
-            return Ok(Vec::new());
-        };
-        raw.split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|name| {
-                if request.columns.iter().any(|c| c.name == name) {
-                    Ok(name.to_string())
-                } else {
-                    Err(Error::UnknownSpecColumn {
-                        option: option.to_string(),
-                        column: name.to_string(),
-                    })
-                }
-            })
-            .collect()
-    }
-
     /// List the Parquet data files directly under `directory` through the store,
     /// each named relative to it. A missing directory yields no files. Used where
     /// the *listing* is the source of truth: `CREATE TABLE`.
@@ -1153,8 +1254,9 @@ impl CommitAction<PivotlakeDatastore> for PendingInsert {
     /// through [`PivotlakeDatastore::commit_to_table`]. The transaction's frozen
     /// snapshot is not the commit base -- it is a read view, and a table it
     /// froze versions ago would lose the compare-and-swap against every INSERT
-    /// that committed since. A commit that fails removes the files it did not
-    /// land, as a discard does: nothing names them.
+    /// that committed since. A commit that did not succeed removes the files it
+    /// wrote, as a discard does: nothing names them. A commit whose outcome
+    /// is unknown may have succeeded, so its files stay.
     fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> CatalogResult<()> {
         let uploaded = self.uploaded_files.take();
         if uploaded.is_empty() {
@@ -1166,26 +1268,29 @@ impl CommitAction<PivotlakeDatastore> for PendingInsert {
                 let stats = Some(Arc::new(parquet_engine::aggregate_file_stats(
                     &uploaded.row_groups,
                 )));
-                let entry = DeltaFileEntry {
+                let entry = FileEntry {
                     file: uploaded.file.clone(),
                     partition: uploaded.partition.clone(),
                     stats,
+                    sorted_by: uploaded.sorted_by.clone(),
                 };
                 TableFile::new(entry, uploaded.row_groups.clone())
             })
             .collect();
-        let committed = datastore.commit_to_table(self.table_id, &[], files, true);
-        if committed.is_err() {
-            delete_uploaded_files(self.store.as_ref(), &self.location, &uploaded);
+        let committed = datastore.commit_to_table(self.table_id, RemovedFiles::NONE, files, true);
+        if let Err(error) = &committed
+            && !error.may_have_committed()
+        {
+            uploaded.iter().for_each(UploadedFile::delete);
         }
-        Ok(committed?)
+        committed?;
+        Ok(())
     }
 
     /// Delete every file the INSERT uploaded: none is in the log, so no reader
     /// can be holding one.
     fn discard(self: Box<Self>) {
-        self.uploaded_files
-            .delete_from(self.store.as_ref(), &self.location);
+        self.uploaded_files.delete_all();
     }
 }
 
@@ -1237,7 +1342,7 @@ impl Datastore for PivotlakeDatastore {
             tick.tick().await;
             loop {
                 tick.tick().await;
-                // The refresh drives footer-fetch dataflows and blocking store
+                // The refresh drives metadata-read dataflows and blocking store
                 // reads, so it runs off the reactor.
                 let datastore = Arc::clone(&refresh_datastore);
                 match tokio::task::spawn_blocking(move || datastore.refresh_from_store()).await {
@@ -1268,10 +1373,12 @@ impl Datastore for PivotlakeDatastore {
 }
 
 /// One transaction's frozen view of the catalog: every table at the version it
-/// held when the transaction began, with all row-group metadata already
-/// materialized (the background refresh keeps the master set fully fetched).
-/// Everything a query does against it (binding, scan-view construction, late
-/// materialize) is pure in-memory.
+/// held when the transaction began. Everything a query does against it
+/// (binding, scan selection, late materialize) reads those versions and no
+/// later one: from memory for a Delta table, whose version holds every
+/// file's row-group metadata, and through the file metadata cache for an
+/// Iceberg table, which reads from the store the manifests and footers the
+/// cache does not hold.
 pub struct PivotlakeSnapshot {
     /// The datastore's schemas and tables as they stood when the transaction
     /// began, so a query resolves both from one frozen view.
@@ -1288,7 +1395,7 @@ impl std::fmt::Debug for PivotlakeSnapshot {
 
 impl PivotlakeSnapshot {
     /// A clone of the table named `name`, or `None` if this snapshot has no such
-    /// table. The frozen copy a [`TableBinding`] captures at bind time, so its
+    /// table. The frozen copy a [`ParquetTableBinding`] captures at bind time, so its
     /// compile resolves the table's file set without any transaction handle.
     pub(crate) fn catalog_table_by_name(
         &self,
@@ -1315,7 +1422,7 @@ impl PivotlakeSnapshot {
 
     /// Every table in this frozen index, with its pivotlake manifest ID, the
     /// columns it declares and the files it holds at this version.
-    fn tables(&self) -> Vec<DatastoreTableMetadata> {
+    fn tables(&self) -> Result<Vec<DatastoreTableMetadata>> {
         self.index
             .named_tables()
             .map(|(name, table)| table.metadata(name))
@@ -1367,13 +1474,12 @@ pub(crate) struct PendingTableCreation {
 /// the table in one version. Staged by the statement's upload stage as the
 /// dataflow starts; the files arrive on `uploaded_files` as it runs, so a sink
 /// that wrote no rows appends nothing. Carries the table's durable id, not its
-/// name, so the commit resolves the live table regardless of a rename, and the
-/// store and location the files were written under, so a discard can remove
-/// them without the table.
+/// name, so the commit resolves the live table regardless of a rename. Each
+/// uploaded file knows the store and the directory it was written into (the
+/// table's own, so its path is the one the table names it by), so a discard
+/// removes them without the table.
 pub(crate) struct PendingInsert {
     pub(crate) table_id: Uuid,
-    pub(crate) store: Arc<dyn ObjectStore>,
-    pub(crate) location: ObjectPath,
     pub(crate) uploaded_files: UploadedFiles,
 }
 
@@ -1397,22 +1503,28 @@ impl std::fmt::Debug for PivotlakeTransaction {
 
 impl PivotlakeTransaction {
     /// [`DatastoreTransaction::bind_table`], typed: the concrete
-    /// [`TableBinding`] instead of the trait object. This is the single
+    /// [`ParquetTableBinding`] instead of the trait object. This is the single
     /// resolution path; the trait impl below only boxes its result (the planner
     /// needs a `Box<dyn BoundTable>`, while a concrete caller wants the
-    /// `TableBinding`, and one function cannot return both). The binding captures
+    /// `ParquetTableBinding`, and one function cannot return both). The binding captures
     /// the snapshot's copy of the table and shares this transaction's staging
     /// queue, so it is self-contained.
-    pub fn table(&self, datastore: &str, name: &SchemaQualifiedTableName) -> Option<TableBinding> {
-        Some(TableBinding::new(
+    pub fn table(
+        &self,
+        datastore: &str,
+        name: &SchemaQualifiedTableName,
+    ) -> CatalogResult<Option<ParquetTableBinding>> {
+        let Some(table) = self.snapshot.catalog_table_by_name(name) else {
+            return Ok(None);
+        };
+        Ok(Some(ParquetTableBinding::new(
             planner::catalog::TableReference {
                 datastore: datastore.to_string(),
                 schema: name.schema.clone(),
                 table: name.table.clone(),
             },
-            self.snapshot.catalog_table_by_name(name)?,
-            self.staged.queue(),
-        ))
+            BoundCatalogTable::new(table, self.staged.queue()),
+        )))
     }
 }
 
@@ -1427,7 +1539,7 @@ impl DatastoreTransaction for PivotlakeTransaction {
         datastore: &str,
         name: &SchemaQualifiedTableName,
     ) -> CatalogResult<Option<Box<dyn BoundTable>>> {
-        Ok(PivotlakeTransaction::table(self, datastore, name)
+        Ok(PivotlakeTransaction::table(self, datastore, name)?
             .map(|table| Box::new(table) as Box<dyn BoundTable>))
     }
 
@@ -1439,7 +1551,7 @@ impl DatastoreTransaction for PivotlakeTransaction {
     }
 
     fn tables(&self) -> CatalogResult<Vec<DatastoreTableMetadata>> {
-        Ok(self.snapshot.tables())
+        Ok(self.snapshot.tables()?)
     }
 
     fn bind_create_table(
@@ -1471,7 +1583,7 @@ impl DatastoreTransaction for PivotlakeTransaction {
         Ok(self
             .datastore
             .compacter()
-            .compact(name.clone(), table, final_sweep)
+            .compact(name.clone(), table.id(), final_sweep)
             .await?)
     }
 

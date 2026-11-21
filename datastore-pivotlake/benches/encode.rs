@@ -562,8 +562,12 @@ fn table_over(
     columns: Vec<Column>,
     sort_by: &[&str],
 ) -> (PivotCatalog, PathBuf) {
-    let datastore =
-        PivotlakeDatastore::open(&dir.to_string_lossy(), dispatch.dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &dir.to_string_lossy(),
+        dispatch.dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let catalog = PivotCatalog::new(
         HashMap::from([(
             DEFAULT_DATASTORE_NAME.to_string(),
@@ -574,10 +578,6 @@ fn table_over(
     )
     .unwrap();
 
-    let mut options = HashMap::new();
-    if !sort_by.is_empty() {
-        options.insert("sort_by".to_string(), sort_by.join(", "));
-    }
     let creation = catalog.begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {
@@ -585,7 +585,9 @@ fn table_over(
             schema_name: None,
             name: TABLE.to_string(),
             columns,
-            options,
+            partitioned_by: Vec::new(),
+            sorted_by: sort_by.iter().map(|column| column.to_string()).collect(),
+            options: HashMap::new(),
             if_not_exists: false,
         })
         .unwrap()

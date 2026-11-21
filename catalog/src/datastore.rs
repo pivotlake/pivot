@@ -34,8 +34,9 @@ pub struct DatastoreTableMetadata {
     pub columns: Vec<DatastoreColumnMetadata>,
     /// The table's sort columns, in order; empty when the table is unsorted.
     pub sort_by: Vec<String>,
-    /// The table's partition columns, in order; empty when the table is
-    /// unpartitioned.
+    /// The terms the table is partitioned by, in order, each a column or a
+    /// transform of one as `CREATE TABLE` spells it (`day(ts)`); empty when
+    /// the table is unpartitioned.
     pub partition_by: Vec<String>,
     /// How many rows the table's committed files hold.
     pub total_rows: u64,
@@ -61,6 +62,8 @@ pub struct DatastoreColumnMetadata {
     pub bytes: u64,
     /// What those bytes hold decoded, before the storage format compressed them.
     pub bytes_uncompressed: u64,
+    /// Whether the table is partitioned by the column or by a transform of
+    /// it.
     pub is_partition_key: bool,
     pub is_sort_key: bool,
 }

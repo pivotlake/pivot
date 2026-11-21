@@ -6,6 +6,7 @@ members = [
     "catalog",
     "datastore-iceberg",
     "datastore-pivotlake",
+    "iceberg-tables",
     "dispatch",
     "duckdb-planner",
     "metastore-disk",
@@ -29,6 +30,7 @@ publish = false
 catalog = { path = "catalog" }
 datastore-iceberg = { path = "datastore-iceberg" }
 datastore-pivotlake = { path = "datastore-pivotlake" }
+iceberg-tables = { path = "iceberg-tables" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore-disk = { path = "metastore-disk" }
@@ -63,6 +65,11 @@ core_affinity = "0.8.3"
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 crossbeam-deque = "0.8.6"
 crossbeam-queue = "0.3"
+# A hash map whose lookups take any key equivalent to a held one.
+hashbrown = "0.17.1"
+# A persistent ordered map: a partition's file index shares every node the
+# commit that made it did not touch.
+imbl = "7.0.2"
 insta = "1"
 libc = "0.2.184"
 lru = "0.18.1"

@@ -1593,7 +1593,6 @@ mod tests {
         std::fs::write(&path, &content).unwrap();
         let open_file =
             OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
-        memory_ctx().caches().invalidate_reopened_file(&open_file);
         let mut requester = IORequester::default();
         requester.force_fs_queue(HardwareQueue::with_capacity(capacity));
 
@@ -1786,7 +1785,6 @@ mod tests {
         std::fs::write(&path, [vec![1u8; 4096], vec![2u8; 4096]].concat()).unwrap();
         let open_file =
             OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
-        memory_ctx().caches().invalidate_reopened_file(&open_file);
         let shared_queue = HardwareQueue::with_capacity(1);
         let mut first = IORequester::default();
         let mut second = IORequester::default();
@@ -1852,7 +1850,6 @@ mod tests {
         std::fs::write(&path, vec![7; 4096]).unwrap();
         let open_file =
             OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
-        memory_ctx().caches().invalidate_reopened_file(&open_file);
         let mut owner = IORequester::default();
         let mut follower = IORequester::default();
 
@@ -1889,7 +1886,6 @@ mod tests {
         std::fs::write(&path, vec![0; 4096]).unwrap();
         let write_only = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         let open_file = OpenFile::Local(LocalFile::new(write_only).unwrap());
-        memory_ctx().caches().invalidate_reopened_file(&open_file);
         let mut owner = IORequester::default();
         let mut follower = IORequester::default();
         let mut retry = IORequester::default();
@@ -1937,7 +1933,6 @@ mod tests {
         std::fs::write(&path, vec![0; 4096]).unwrap();
         let readable = std::fs::File::open(path).unwrap();
         let open_file = OpenFile::Local(LocalFile::new(readable).unwrap());
-        memory_ctx().caches().invalidate_reopened_file(&open_file);
         let mut owner = IORequester::default();
         let mut retry = IORequester::default();
         owner.backend.reject_reads();
@@ -2455,7 +2450,6 @@ mod tests {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
         let loc = OpenFile::Remote(remote);
-        memory_ctx().caches().invalidate_reopened_file(&loc);
 
         let mut requester = IORequester::with_http_config(client_config());
 
@@ -2492,7 +2486,6 @@ mod tests {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
         let loc = OpenFile::Remote(remote);
-        memory_ctx().caches().invalidate_reopened_file(&loc);
 
         let mut requester = IORequester::with_http_config(client_config());
 
@@ -2713,7 +2706,6 @@ mod tests {
         ))
         .unwrap();
         let loc = OpenFile::Remote(Arc::new(RemoteFile::open(url, None, SIZE as u64).unwrap()));
-        memory_ctx().caches().invalidate_reopened_file(&loc);
         let mut requester = IORequester::with_http_config(client_config());
 
         fetch(&mut requester, &loc, 4096, SIZE - 4096);
@@ -2734,7 +2726,6 @@ mod tests {
         ))
         .unwrap();
         let loc = OpenFile::Remote(Arc::new(RemoteFile::open(url, None, SIZE as u64).unwrap()));
-        memory_ctx().caches().invalidate_reopened_file(&loc);
         let mut requester = IORequester::with_http_config(client_config());
 
         let results = fetch_results(&mut requester, &loc, 0, 2 * 4096);
@@ -2787,9 +2778,7 @@ mod tests {
         let path = dir.path().join("data");
         let body: Vec<u8> = (0..size).map(pattern).collect();
         std::fs::write(&path, body).unwrap();
-        let loc = OpenFile::Local(open_direct_read(&path).unwrap());
-        memory_ctx().caches().invalidate_reopened_file(&loc);
-        loc
+        OpenFile::Local(open_direct_read(&path).unwrap())
     }
 
     /// A block-aligned tail fill may stop at EOF inside its final block; because
@@ -2888,9 +2877,7 @@ mod tests {
     /// Register a remote object served by the loopback server on `port`.
     fn remote_loc(port: u16) -> OpenFile {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
-        let loc = OpenFile::Remote(Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap()));
-        memory_ctx().caches().invalidate_reopened_file(&loc);
-        loc
+        OpenFile::Remote(Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap()))
     }
 
     fn requester_with(cache: Arc<DiskCache>) -> IORequester {
@@ -3051,7 +3038,6 @@ mod tests {
         std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
         let open_file =
             OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
-        memory_ctx().caches().invalidate_reopened_file(&open_file);
         (open_file, dir)
     }
 

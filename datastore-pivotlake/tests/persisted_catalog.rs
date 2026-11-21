@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow_array::{Int64Array, RecordBatch, StringViewArray};
+use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -21,7 +23,7 @@ use dispatch::Projection;
 use parquet_engine::table_input;
 use planner::DEFAULT_DATASTORE_NAME;
 use planner::catalog::{
-    Column, CreateTableRequest, Result as CatalogResult, SchemaQualifiedTableName,
+    BoundTable, Column, CreateTableRequest, Result as CatalogResult, SchemaQualifiedTableName,
 };
 use planner::types::Type;
 
@@ -76,6 +78,8 @@ fn adopting_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTabl
         schema_name: None,
         name: name.to_string(),
         columns,
+        partitioned_by: Vec::new(),
+        sorted_by: Vec::new(),
         options,
         if_not_exists: false,
     }
@@ -89,6 +93,8 @@ fn rooted_request(name: &str, columns: Vec<Column>) -> CreateTableRequest {
         schema_name: None,
         name: name.to_string(),
         columns,
+        partitioned_by: Vec::new(),
+        sorted_by: Vec::new(),
         options: HashMap::new(),
         if_not_exists: false,
     }
@@ -121,7 +127,12 @@ fn create_table_over_adopted_parquet_scans_rows() {
         &strings_and_ints(&["a", "b", "c"], &[1, 2, 3]),
     );
 
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create(
         &dispatch,
         &datastore,
@@ -136,6 +147,7 @@ fn create_table_over_adopted_parquet_scans_rows() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("events"),
         )
+        .unwrap()
         .expect("table created");
     assert_eq!(table.columns.len(), 2);
     let parquet = current_parquet(&datastore, "events");
@@ -161,7 +173,12 @@ fn tables_persist_across_reopen() {
 
     // Create the table, then drop the datastore, only the on-disk manifest remains.
     {
-        let datastore = PivotlakeDatastore::open(db_uri, &dispatch).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db_uri,
+            &dispatch,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
         create(
             &dispatch,
             &datastore,
@@ -171,7 +188,12 @@ fn tables_persist_across_reopen() {
     }
 
     // Reopening (as a restart would) reloads the table and its data.
-    let reopened = PivotlakeDatastore::open(db_uri, &dispatch).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db_uri,
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let table = reopened
         .clone()
         .begin_transaction()
@@ -179,6 +201,7 @@ fn tables_persist_across_reopen() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("events"),
         )
+        .unwrap()
         .expect("table reloaded from the manifest");
     assert_eq!(table.columns.len(), 2);
     let parquet = current_parquet(&reopened, "events");
@@ -197,7 +220,12 @@ fn background_refresh_advances_to_latest_delta_snapshot() {
     let second = data.path().join("b.parquet");
     write_parquet(&first, &strings_and_ints(&["a"], &[1]));
 
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create(
         &dispatch,
         &datastore,
@@ -243,6 +271,67 @@ fn background_refresh_advances_to_latest_delta_snapshot() {
     assert_eq!(current_parquet(&datastore, "events").row_groups().len(), 1);
 }
 
+/// One row whose `name` is NULL.
+fn a_row_with_a_null_name(value: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8View, true),
+            Field::new("value", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringViewArray::from(vec![None::<&str>])),
+            Arc::new(Int64Array::from(vec![value])),
+        ],
+    )
+    .unwrap()
+}
+
+/// What the planner is told about each column of `name` holding NULLs.
+fn bound_nullability(
+    datastore: &Arc<PivotlakeDatastore>,
+    name: &SchemaQualifiedTableName,
+) -> Vec<bool> {
+    datastore
+        .clone()
+        .begin_transaction()
+        .table(DEFAULT_DATASTORE_NAME, name)
+        .unwrap()
+        .expect("the table exists")
+        .nullability()
+}
+
+#[test]
+fn a_column_binds_as_nullable_only_once_a_file_holds_a_null_in_it() {
+    let dispatch = dispatch(1);
+    let db = TempDir::new().unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
+    create(&dispatch, &datastore, rooted_request("t", columns())).unwrap();
+    let name = SchemaQualifiedTableName::in_default_schema("t");
+    insert_batches(
+        &dispatch,
+        datastore.clone().begin_transaction(),
+        "t",
+        vec![strings_and_ints(&["a", "b"], &[1, 2])],
+    );
+
+    let before_a_null = bound_nullability(&datastore, &name);
+    insert_batches(
+        &dispatch,
+        datastore.clone().begin_transaction(),
+        "t",
+        vec![a_row_with_a_null_name(3)],
+    );
+    let after_a_null = bound_nullability(&datastore, &name);
+
+    assert_eq!(before_a_null, [false, false]);
+    assert_eq!(after_a_null, [true, false]);
+}
+
 #[test]
 fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
     let dispatch = dispatch(1);
@@ -250,7 +339,12 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
     let db_uri = db.path().to_str().unwrap();
 
     {
-        let datastore = PivotlakeDatastore::open(db_uri, &dispatch).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db_uri,
+            &dispatch,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
         create(&dispatch, &datastore, rooted_request("t", columns())).unwrap();
 
         // A data-less table: registered, with no row groups (its data lives at
@@ -292,7 +386,12 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
     }
 
     // And it survives a reopen.
-    let reopened = PivotlakeDatastore::open(db_uri, &dispatch).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db_uri,
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     assert!(
         reopened
             .clone()
@@ -301,6 +400,7 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
 }
@@ -327,7 +427,12 @@ fn create_fetches_footers_across_workers_before_commit() {
         );
     }
 
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create(
         &dispatch,
         &datastore,
@@ -353,6 +458,7 @@ fn create_fetches_footers_across_workers_before_commit() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("empty"),
             )
+            .unwrap()
             .is_some()
     );
     assert!(current_parquet(&datastore, "empty").row_groups().is_empty());
@@ -362,7 +468,12 @@ fn create_fetches_footers_across_workers_before_commit() {
 fn rejects_an_object_store_scheme_in_the_adopt_path() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
 
     let err = create(
         &dispatch,

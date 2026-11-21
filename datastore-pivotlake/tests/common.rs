@@ -187,7 +187,7 @@ pub fn current_parquet(
         .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
         .expect("table exists");
     table.refresh().expect("manifest reload");
-    table.build_scan_view(&[], &[]).expect("build scan view")
+    table.select_scan(&[]).expect("select scan")
 }
 
 /// Where `name` keeps its own storage under a database rooted at
@@ -326,9 +326,12 @@ pub fn write_parquet_files(
         })
         .collect();
 
-    let datastore =
-        datastore_pivotlake::PivotlakeDatastore::open(&database_root.to_string_lossy(), dispatch)
-            .unwrap();
+    let datastore = datastore_pivotlake::PivotlakeDatastore::open_with_format(
+        &database_root.to_string_lossy(),
+        dispatch,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let creation = datastore.clone().begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {
@@ -336,6 +339,8 @@ pub fn write_parquet_files(
             schema_name: None,
             name: "written".to_string(),
             columns,
+            partitioned_by: Vec::new(),
+            sorted_by: Vec::new(),
             options: std::collections::HashMap::new(),
             if_not_exists: false,
         })
@@ -381,4 +386,37 @@ pub fn insert_batches(
         .collect()
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();
+}
+
+/// Run one final compaction round over the table `name` of `datastore`, the
+/// round a `COMPACT ... FINAL` statement runs: every two or more small files
+/// of a partition are merged. Hands back the passes the round made, or why
+/// it failed.
+pub fn run_final_round(
+    datastore: &Arc<datastore_pivotlake::PivotlakeDatastore>,
+    name: &SchemaQualifiedTableName,
+) -> Result<u64, datastore_pivotlake::Error> {
+    use datastore_pivotlake::{
+        CompacterHandle, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM,
+        DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE, default_merge_target_bytes,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (compacter, actor) = CompacterHandle::new(
+        DEFAULT_COMPACT_BYTES,
+        default_merge_target_bytes(DEFAULT_COMPACT_BYTES),
+        DEFAULT_MIN_FILES_TO_MERGE,
+        DEFAULT_COMPACT_PARALLELISM,
+        DEFAULT_LAYOUT_CLIQUE_SIZE,
+        None,
+        Arc::clone(datastore),
+    );
+    let id = datastore.table_handle(name).expect("the table exists").id();
+    let running = runtime.spawn(actor.run());
+    let passes = runtime.block_on(compacter.compact(name.clone(), id, true));
+    running.abort();
+    passes
 }
