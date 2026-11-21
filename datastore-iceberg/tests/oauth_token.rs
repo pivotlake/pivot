@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 use datastore_iceberg::{IcebergCatalogAuth, IcebergCatalogConfig, IcebergDatastore};
 use dispatch::Dispatch;
+use iceberg_tables::table_metadata_cache::{
+    DEFAULT_TABLE_METADATA_CACHE_BYTES, TableMetadataCache,
+};
 use object_storage::{ExternalStoreFactory, ObjectStore, StoreError};
 use testcontainers::core::{ContainerPort, IntoContainerPort};
 use testcontainers::runners::SyncRunner;
@@ -116,6 +119,7 @@ fn refresh_succeeds_after_the_first_token_expires_and_after_the_renewed_one_does
         Arc::new(NoStoreFactory),
         dispatch.dispatcher(),
         Duration::from_secs(3600),
+        TableMetadataCache::new(DEFAULT_TABLE_METADATA_CACHE_BYTES),
     )
     .expect("open the datastore");
 

@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    ArrayRef, BinaryViewArray, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryViewArray, Date32Array, Float64Array, Int64Array, RecordBatch,
+    StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
@@ -808,6 +808,7 @@ fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
         None,
         Arc::from([]),
         Arc::from(["key".to_string()]),
+        true,
         3,
         usize::MAX,
     )

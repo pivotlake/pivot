@@ -433,7 +433,7 @@ async fn system_datastores_lists_every_served_datastore(#[future] conn: Conn) {
 async fn system_tables_and_columns_describe_a_table(#[future] conn: Conn) {
     conn.simple_query(
         "CREATE TABLE system_described (id BIGINT, region VARCHAR) \
-         WITH (partition_by = 'region', sort_by = 'id')",
+         SORTED BY (id) PARTITIONED BY (region)",
     )
     .await
     .unwrap();
@@ -530,7 +530,7 @@ async fn system_columns_describes_the_system_relations_by_their_id(#[future] con
 async fn system_table_files_reports_a_file_partition(#[future] conn: Conn) {
     conn.simple_query(
         "CREATE TABLE system_partitioned (id BIGINT, region VARCHAR) \
-         WITH (partition_by = 'region')",
+         PARTITIONED BY (region)",
     )
     .await
     .unwrap();
@@ -1193,7 +1193,10 @@ async fn global_min_max_answers_from_metadata(#[future] conn: Conn) {
 /// The unfiltered global MIN/MAX short-circuits to parquet row-group stats and
 /// never reads a data page, so it leaves the compressed cache empty. Proven by
 /// clearing the cache (of any footer-load residue), running the aggregate, and
-/// finding nothing to evict afterwards.
+/// finding nothing to evict afterwards. This suite's database keeps its
+/// tables as Delta Lake, whose tables hold every footer in memory, so the
+/// aggregate reads nothing at all; an Iceberg table reads its files' footers
+/// through the cache for the same aggregate, which its own suite covers.
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]

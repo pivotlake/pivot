@@ -164,27 +164,29 @@ pub fn equality_predicates(predicates: &[PushedPredicate]) -> Vec<ScanEqualityPr
         .collect()
 }
 
-/// Clone a table and retain only the row groups which the recorded predicates
-/// do not eliminate. The clone preserves [`ParquetTable`]'s captured schema
-/// even when every row group is removed.
-pub fn prune_parquet(parquet: &ParquetTable, predicates: &[PushedPredicate]) -> ParquetTable {
-    let mut parquet = parquet.clone();
-    parquet.row_groups_mut().retain(|rg| {
-        !predicates.iter().any(|predicate| {
-            predicate
-                .leaf_for_row_group(rg.as_ref())
-                .is_some_and(|leaf| {
-                    row_group_eliminated(
-                        rg.as_ref(),
-                        leaf,
-                        predicate.compare_type,
-                        &predicate.value,
-                    )
-                    .unwrap_or(false)
-                })
-        })
-    });
-    parquet
+impl ParquetTable {
+    /// Clone this table and retain only the row groups which `predicates` do
+    /// not eliminate. The clone preserves the table's captured schema even
+    /// when every row group is removed.
+    pub fn prune_row_groups(&self, predicates: &[PushedPredicate]) -> ParquetTable {
+        let mut pruned = self.clone();
+        pruned.row_groups_mut().retain(|rg| {
+            !predicates.iter().any(|predicate| {
+                predicate
+                    .leaf_for_row_group(rg.as_ref())
+                    .is_some_and(|leaf| {
+                        row_group_eliminated(
+                            rg.as_ref(),
+                            leaf,
+                            predicate.compare_type,
+                            &predicate.value,
+                        )
+                        .unwrap_or(false)
+                    })
+            })
+        });
+        pruned
+    }
 }
 
 /// A top-level column and the optional variant path whose statistics can prune.

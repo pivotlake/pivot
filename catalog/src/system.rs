@@ -418,8 +418,9 @@ fn build_tables(
             string_array(tables.iter().map(|entry| entry.table.name.schema.clone())),
             string_array(tables.iter().map(|entry| entry.table.name.table.clone())),
             string_array(tables.iter().map(|entry| entry.table.id.clone())),
-            // A key list is reported as its column names in order, so an
-            // unsorted or unpartitioned table reports an empty string.
+            // A key list is reported as its sort columns or its partition
+            // terms in order, so an unsorted or unpartitioned table reports
+            // an empty string.
             string_array(tables.iter().map(|entry| entry.table.sort_by.join(","))),
             string_array(
                 tables

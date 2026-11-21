@@ -46,6 +46,7 @@ use planner::catalog::{
     TableCreation, TableDrop, TableReference, TableRevision, UserCreation,
 };
 use system::{DatastoreEntry, SystemTransaction};
+use tokio::task::JoinSet;
 
 /// One named data source served by pivotdb. Re-exported from [`datastore`],
 /// where the trait lives; concrete backends (e.g. `datastore_pivotlake::PivotlakeDatastore`)
@@ -177,11 +178,33 @@ impl PivotCatalog {
         }
     }
 
-    /// Stop every datastore's background maintenance. Called on shutdown before
-    /// the worker pool is torn down, so no maintenance sweep races the teardown.
-    pub fn abort(&self) {
+    /// Tell every datastore's background maintenance to stop, without waiting
+    /// for any of it. For a shutdown whose worker pool is already broken,
+    /// where a sweep in flight may never finish.
+    pub fn request_stop(&self) {
         for datastore in self.datastores.values() {
-            datastore.abort();
+            datastore.request_stop();
+        }
+    }
+
+    /// Tell every datastore's background maintenance to stop, and wait until
+    /// all of it has finished, the datastores stopping concurrently. Called on shutdown
+    /// before the worker pool is torn down: once this returns, no maintenance
+    /// sweep is running or will run, so none races the teardown.
+    pub async fn stop(&self) {
+        let mut stopping = JoinSet::new();
+        for datastore in self.datastores.values() {
+            let datastore = datastore.clone();
+            stopping.spawn(async move { datastore.stop().await });
+        }
+        while let Some(stopped) = stopping.join_next().await {
+            match stopped.map_err(tokio::task::JoinError::try_into_panic) {
+                Ok(()) => {}
+                Err(Ok(panic)) => std::panic::resume_unwind(panic),
+                Err(Err(error)) => {
+                    tracing::warn!(error = %error, "a datastore's stop was cancelled")
+                }
+            }
         }
     }
 

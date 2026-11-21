@@ -304,12 +304,6 @@ impl<V: Cached> RingCache for Cache<V> {
         });
     }
 
-    fn invalidate(&self, file: &OpenFile) {
-        if let Some(table) = self.files.remove(file) {
-            self.entries.fetch_sub(table.len(), Ordering::Relaxed);
-        }
-    }
-
     fn clear(&self) -> usize {
         // Release this worker's fill pin first so its own fill slot can be
         // recycled below rather than skipped as pinned.

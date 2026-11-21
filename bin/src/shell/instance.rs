@@ -8,7 +8,10 @@ use std::time::Duration;
 use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_iceberg::IcebergDatastore;
-use datastore_pivotlake::{DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, PivotlakeDatastore};
+use datastore_pivotlake::{
+    DEFAULT_REFRESH_INTERVAL, DEFAULT_TABLE_METADATA_CACHE_BYTES, MaintenanceConfig,
+    PivotlakeDatastore, TableMetadataCache,
+};
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, SpillDirectory};
 use object_storage::{AmbientExternalStoreFactory, ObjectStore, open_store};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
@@ -114,7 +117,10 @@ struct ShellState {
 }
 
 impl ShellState {
-    fn shutdown(self) {
+    /// Let go of the executor and the catalog, join the dispatch workers,
+    /// and then let go of the datastore. The catalog's maintenance was
+    /// stopped, or told to stop, before this.
+    fn tear_down(self) {
         let Self {
             executor,
             catalog,
@@ -122,7 +128,6 @@ impl ShellState {
             datastore,
         } = self;
 
-        catalog.abort();
         drop(executor);
         drop(catalog);
         dispatch.shutdown();
@@ -131,6 +136,10 @@ impl ShellState {
 }
 
 /// An embedded Pivot executor over one datastore.
+///
+/// [`shutdown`](Self::shutdown) ends it in order: it waits for a background
+/// refresh in flight before the dispatch workers go. An instance that is
+/// only dropped tells its maintenance to stop and waits for none of it.
 pub struct ShellInstance {
     state: Option<ShellState>,
     location: String,
@@ -205,8 +214,9 @@ impl ShellInstance {
     /// shared store, or a table committed to the catalog, becomes visible to
     /// later queries. Background compaction and vacuum stay off: those belong
     /// to one owning process per datastore, and a shell over a shared store is
-    /// not it. The sweep spawns onto the ambient tokio runtime, so call this
-    /// from within one.
+    /// not it. The sweep spawns onto the ambient tokio runtime, of either
+    /// flavor, so call this from within one, and keep that runtime for as
+    /// long as the instance is used.
     pub fn open_with_resources(
         target: &ShellTarget,
         workers: usize,
@@ -261,32 +271,57 @@ impl ShellInstance {
         &self.location
     }
 
-    fn shutdown(&mut self) {
+    /// Shut the instance down in order: stop its background maintenance and
+    /// wait for what it had in flight, a refresh that needs the dispatch
+    /// workers to finish, then join the workers and release the datastore.
+    /// Await it on the runtime the instance was opened on. When this
+    /// returns, a pivotlake datastore's lock is released.
+    pub async fn shutdown(mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let catalog = Arc::clone(&state.catalog);
+        catalog.stop().await;
+        drop(catalog);
         if let Some(state) = self.state.take() {
-            state.shutdown();
+            state.tear_down();
         }
     }
 }
 
 impl Drop for ShellInstance {
+    /// Tell the maintenance to stop, without waiting for it, and tear the
+    /// instance down: a refresh in flight is cut short by the workers going,
+    /// and a pivotlake datastore's lock is released only once the maintenance
+    /// tasks, which hold the datastore, have returned. An instance that was
+    /// [`shutdown`](Self::shutdown) has nothing left to do here.
     fn drop(&mut self) {
-        self.shutdown();
+        if let Some(state) = self.state.take() {
+            state.catalog.request_stop();
+            state.tear_down();
+        }
     }
 }
 
 /// Open the datastore `target` names, refreshing it every `refresh_interval`
-/// once the catalog starts it. A pivotlake datastore is opened without
-/// maintenance (see [`ShellInstance::open_with_resources`]); an Iceberg
-/// datastore reads its tables' files through the process's own credential
-/// policy, the same one the `AWS_*` and `GOOGLE_*` variables set for a pivotlake
-/// datastore in a bucket.
+/// once the catalog starts it, with a table metadata cache made for it: the
+/// instance serves this one datastore, so the cache is the instance's whole
+/// budget for what it keeps of Iceberg tables. A pivotlake datastore
+/// is opened without maintenance (see [`ShellInstance::open_with_resources`]);
+/// a REST-catalog Iceberg datastore reads its tables' files through the
+/// process's own credential policy, the same one the `AWS_*` and `GOOGLE_*`
+/// variables set for a datastore in a bucket.
 fn open_datastore(
     target: &ShellTarget,
     dispatcher: &DataFlowDispatcher,
     refresh_interval: Duration,
 ) -> Result<Arc<dyn Datastore>, Box<dyn std::error::Error>> {
+    let table_metadata_cache = TableMetadataCache::new(DEFAULT_TABLE_METADATA_CACHE_BYTES);
     match target {
-        ShellTarget::Pivotlake { location } => {
+        ShellTarget::Pivotlake {
+            location,
+            table_format,
+        } => {
             let store: Arc<dyn ObjectStore> = open_store(location)?.into();
             let maintenance = MaintenanceConfig {
                 refresh_interval,
@@ -297,6 +332,8 @@ fn open_datastore(
                 store,
                 dispatcher,
                 Some(maintenance),
+                *table_format,
+                table_metadata_cache,
             )?)
         }
         ShellTarget::Iceberg(config) => Ok(IcebergDatastore::open(
@@ -304,6 +341,7 @@ fn open_datastore(
             Arc::new(AmbientExternalStoreFactory),
             dispatcher,
             refresh_interval,
+            table_metadata_cache,
         )?),
     }
 }

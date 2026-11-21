@@ -84,7 +84,10 @@ pub fn pivot_scalar(array: &ArrayRef, row: usize) -> Scalar<ArrayRef> {
     Scalar::new(value)
 }
 
-/// A file's partition tuple: column name to the typed value carried by every row.
+/// A file's partition tuple: the name of each partition key to the typed
+/// value every row of the file shares. A key is a column of the file, or a
+/// value a table format computes from one (the day of a timestamp), named as
+/// the format names it.
 pub type PartitionValues = HashMap<String, Scalar<ArrayRef>>;
 
 /// Parquet statistics aggregated over every row group in one file.
@@ -94,4 +97,24 @@ pub struct FileStats {
     pub min_values: HashMap<String, ArrayRef>,
     pub max_values: HashMap<String, ArrayRef>,
     pub null_counts: HashMap<String, i64>,
+}
+
+impl FileStats {
+    /// Finds the partition the file belongs to: each partition column mapped to
+    /// the value it holds when that value is constant across the file (its min
+    /// equals its max). Returns `None` if any partition column is absent from
+    /// the stats or varies within the file, so a file that does not sit in a
+    /// single partition is left for the caller to refuse or leave unstamped.
+    pub fn find_constant_partition(&self, partition_by: &[String]) -> Option<PartitionValues> {
+        let mut values = PartitionValues::new();
+        for column in partition_by {
+            let min = Scalar::new(ArrayRef::clone(self.min_values.get(column)?));
+            let max = Scalar::new(ArrayRef::clone(self.max_values.get(column)?));
+            if scalar_equal(&min, &max) != Some(true) {
+                return None;
+            }
+            values.insert(column.clone(), min);
+        }
+        Some(values)
+    }
 }

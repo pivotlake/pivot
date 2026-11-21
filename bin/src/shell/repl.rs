@@ -76,14 +76,21 @@ pub(crate) async fn run_shell(
         .into());
     }
 
-    let session = Session::open(&target, limits)?;
-    if !interactive {
-        return match run_inputs(session, inputs).await {
+    let mut session = Session::open(&target, limits)?;
+    let result = if interactive {
+        run_prompt(&mut session).await
+    } else {
+        match run_inputs(&mut session, inputs).await {
             Err(Error::Quit) => Ok(()),
             result => result,
-        };
-    }
+        }
+    };
+    session.shutdown().await;
+    result
+}
 
+/// Greet the user and run the interactive prompt until it ends.
+async fn run_prompt(session: &mut Session) -> Result<(), Error> {
     let editor = DefaultEditor::new()?;
     println!("pivot shell ({})", env!("CARGO_PKG_VERSION"));
     println!("Type \"\\help\" for help.");
@@ -91,7 +98,7 @@ pub(crate) async fn run_shell(
 }
 
 /// Run each input in order, stopping at the first that fails or quits.
-async fn run_inputs(mut session: Session, inputs: Vec<ShellInput>) -> Result<(), Error> {
+async fn run_inputs(session: &mut Session, inputs: Vec<ShellInput>) -> Result<(), Error> {
     for input in inputs {
         session.run_input(&input).await?;
     }
@@ -120,7 +127,7 @@ fn describe_input(input: &ShellInput) -> String {
     }
 }
 
-async fn run_repl(mut session: Session, mut editor: DefaultEditor) -> Result<(), Error> {
+async fn run_repl(session: &mut Session, mut editor: DefaultEditor) -> Result<(), Error> {
     loop {
         let prompt = if session.buffer.is_empty() {
             "pivot=> "
@@ -194,6 +201,11 @@ impl Session {
 
     fn executor(&self) -> &crate::execution::Executor {
         self.instance.executor()
+    }
+
+    /// End the session, shutting its instance down in order.
+    async fn shutdown(self) {
+        self.instance.shutdown().await;
     }
 
     /// Handle one line of input: a meta-command, or SQL appended to the buffer

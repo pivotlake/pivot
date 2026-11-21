@@ -188,7 +188,7 @@ fn a_datastore_is_created_at_the_requested_path_and_persists() {
     assert!(error.to_string().contains("already in use"));
     assert!(error.to_string().contains(&std::process::id().to_string()));
 
-    drop(instance);
+    runtime.block_on(instance.shutdown());
 
     assert!(path.exists());
     assert!(path.join(".pivot.lock").is_file());
@@ -245,4 +245,38 @@ fn default_pool_budget_rejects_a_machine_the_reserve_swallows() {
             .to_string()
             .contains("too little for a buffer-pool budget")
     );
+}
+
+#[test]
+fn an_instance_opens_and_shuts_down_on_a_current_thread_runtime() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let created = runtime.block_on(async {
+        let instance = ShellInstance::open_with_resources(
+            &ShellTarget::pivot(directory.path().to_str().unwrap()),
+            1,
+            32,
+            None,
+            DEFAULT_REFRESH_INTERVAL,
+        )
+        .unwrap();
+        let created = instance
+            .executor()
+            .execute(
+                "CREATE TABLE people (id BIGINT)".to_string(),
+                ExecuteOptions::default(),
+            )
+            .await;
+        instance.shutdown().await;
+        created
+    });
+
+    assert!(matches!(
+        created.unwrap().output,
+        StatementOutput::Command(Command::CreateTable)
+    ));
 }

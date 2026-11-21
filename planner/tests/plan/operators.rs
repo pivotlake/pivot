@@ -257,6 +257,77 @@ fn create_table_propagates_with_options(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn create_table_carries_partitioned_by_terms_in_the_order_written(
+    mut testing_planner: TestingPlanner,
+) {
+    let plan = testing_planner
+        .plan(
+            "CREATE TABLE created_table (id BIGINT, ts TIMESTAMP, \"Region\" VARCHAR) \
+             PARTITIONED BY (day(ts), bucket(16, id), \"Region\")",
+        )
+        .unwrap();
+
+    assert_snapshot!(
+        plan.to_string(),
+        @"CreateTable(created_table, [id:Int64, ts:Timestamp, Region:Utf8], partitioned_by: [day(ts), bucket(16, id), Region], options: {})
+    "
+    );
+}
+
+#[rstest]
+fn create_table_carries_sorted_by_columns_in_the_order_written(
+    mut testing_planner: TestingPlanner,
+) {
+    let plan = testing_planner
+        .plan(
+            "CREATE TABLE created_table (id BIGINT, ts TIMESTAMP) \
+             SORTED BY (ts, id) PARTITIONED BY (days(ts))",
+        )
+        .unwrap();
+
+    assert_snapshot!(
+        plan.to_string(),
+        @"CreateTable(created_table, [id:Int64, ts:Timestamp], partitioned_by: [days(ts)], sorted_by: [ts, id], options: {})
+    "
+    );
+}
+
+#[rstest]
+fn create_table_refuses_a_sorted_by_key_that_is_not_a_column(mut testing_planner: TestingPlanner) {
+    let error = testing_planner
+        .plan("CREATE TABLE created_table (id BIGINT) SORTED BY (id + 1)")
+        .expect_err("the statement is refused");
+
+    assert!(
+        error
+            .to_string()
+            .contains("SORTED BY key `(id + 1)` is not a column"),
+        "{error}"
+    );
+}
+
+#[rstest]
+fn create_table_refuses_a_direction_or_a_null_ordering_in_sorted_by(
+    mut testing_planner: TestingPlanner,
+) {
+    let descending = testing_planner
+        .plan("CREATE TABLE created_table (id BIGINT) SORTED BY (id DESC)")
+        .expect_err("a descending key is refused");
+    let nulls_last = testing_planner
+        .plan("CREATE TABLE created_table (id BIGINT) SORTED BY (id NULLS LAST)")
+        .expect_err("a NULLS LAST key is refused");
+
+    assert!(
+        descending.to_string().contains("syntax error"),
+        "{descending}"
+    );
+    assert!(
+        nulls_last.to_string().contains("syntax error"),
+        "{nulls_last}"
+    );
+}
+
+#[rstest]
 fn drop_table_produces_drop_table_operator(mut testing_planner: TestingPlanner) {
     let plan = testing_planner.plan("DROP TABLE example_table").unwrap();
 

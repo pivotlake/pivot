@@ -8,114 +8,66 @@ use arrow_ord::ord::make_comparator;
 use arrow_schema::SortOptions;
 
 use super::CompactionPass;
-use crate::TableFile;
-use crate::manifest::DeltaFileEntry;
-use object_storage::ObjectPath;
+use super::sort_key::{compare_sort_bounds, has_sort_range};
+use crate::table_format::CompactionFile;
+use crate::{CatalogTable, Result};
+use object_storage::{FileRef, ObjectPath};
+use parquet_engine::BoundSide;
+use parquet_engine::RowGroupMetadata;
+use parquet_engine::file_entry::FileEntry;
 
-/// A layout-optimization candidate: a file's manifest entry beside its row
-/// groups' min/max on every sort column, in the table's sort order. A pair is
-/// measured on the column that tells the two files apart, which is not always
-/// the first: files holding one identical value on the leading keys are
-/// ordered by the next one, and that is where their row groups have to be
-/// compared. `None` marks a row group whose footer recorded no bounds for a
-/// column; its rows can lie anywhere in the file's range, so the
-/// contested-group count includes it.
-pub(super) struct LayoutCandidate<'a> {
-    pub(super) entry: &'a DeltaFileEntry,
-    pub(super) row_group_ranges: Vec<Vec<Option<(ArrayRef, ArrayRef)>>>,
+/// A file's row groups' min/max on every sort column, in the table's sort
+/// order, each column's in row-group order. `None` marks a row group whose
+/// footer recorded no bounds for a column; its rows can lie anywhere in the
+/// file's range, so the contested-group count includes it.
+type RowGroupRanges = Vec<Vec<Option<(ArrayRef, ArrayRef)>>>;
+
+/// Extract each of a file's row groups' min/max on each of `sort_by` from
+/// `row_groups`, its footer metadata.
+fn read_row_group_ranges(
+    row_groups: &[Arc<RowGroupMetadata>],
+    sort_by: &[String],
+) -> RowGroupRanges {
+    sort_by
+        .iter()
+        .map(|sort_column| {
+            row_groups
+                .iter()
+                .map(|row_group| {
+                    let column = row_group.schema.index_of(sort_column).ok()?;
+                    let statistics = row_group.column_statistics(column)?;
+                    let min = statistics.min()?.into_inner();
+                    let max = statistics.max()?.into_inner();
+                    Some((min, max))
+                })
+                .collect()
+        })
+        .collect()
 }
 
-impl<'a> LayoutCandidate<'a> {
-    /// Extract each of the file's row groups' min/max on each of `sort_by`
-    /// from its footer metadata.
-    pub(super) fn from_table_file(file: &'a TableFile, sort_by: &[String]) -> Self {
-        let row_group_ranges = sort_by
-            .iter()
-            .map(|sort_column| {
-                file.row_groups
-                    .iter()
-                    .map(|row_group| {
-                        let column = row_group.schema.index_of(sort_column).ok()?;
-                        let statistics = row_group.column_statistics(column)?;
-                        let min = statistics.min()?.into_inner();
-                        let max = statistics.max()?.into_inner();
-                        Some((min, max))
-                    })
-                    .collect()
-            })
-            .collect();
-        Self {
-            entry: &file.entry,
-            row_group_ranges,
-        }
-    }
+/// A layout-optimization candidate: a file's entry beside its row groups'
+/// min/max on every sort column. A pair is measured on the column
+/// that tells the two files apart, which is not always the first: files
+/// holding one identical value on the leading keys are ordered by the next
+/// one, and that is where their row groups have to be compared.
+struct LayoutCandidate<'a> {
+    entry: &'a FileEntry,
+    row_group_ranges: RowGroupRanges,
+}
 
+impl LayoutCandidate<'_> {
     /// The file's row group count, which every sort column's bounds share.
     fn row_group_count(&self) -> usize {
         self.row_group_ranges
             .first()
             .map_or(0, |per_column| per_column.len())
     }
-
-    /// The file's min/max on `column` from its manifest statistics.
-    fn column_bounds(&self, column: &str) -> Option<(&ArrayRef, &ArrayRef)> {
-        let stats = self.entry.stats.as_ref()?;
-        Some((stats.min_values.get(column)?, stats.max_values.get(column)?))
-    }
-
-    /// Whether this file's maximum lies strictly before `other`'s minimum
-    /// on the sort key, so the two share no stretch of it: the first column
-    /// that separates the bounds decides, a tie defers to the next column,
-    /// and a missing, null, or incomparable bound keeps the pair together.
-    fn ends_before(&self, other: &LayoutCandidate, sort_by: &[String]) -> bool {
-        for column in sort_by {
-            let (Some((_, self_max)), Some((other_min, _))) =
-                (self.column_bounds(column), other.column_bounds(column))
-            else {
-                return false;
-            };
-            match compare(self_max, other_min) {
-                Some(Ordering::Less) => return true,
-                Some(Ordering::Equal) => continue,
-                _ => return false,
-            }
-        }
-        false
-    }
 }
 
-/// Order two files by their minimums on the sort key, column after column
-/// the way rows order; a missing or null bound orders first. Ties break by
-/// path only to keep the sweep deterministic.
-fn compare_minimums(
-    left: &LayoutCandidate,
-    right: &LayoutCandidate,
-    sort_by: &[String],
-) -> Ordering {
-    for column in sort_by {
-        let order = match (known_minimum(left, column), known_minimum(right, column)) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Less,
-            (Some(_), None) => Ordering::Greater,
-            (Some(left_min), Some(right_min)) => {
-                compare(left_min, right_min).unwrap_or(Ordering::Equal)
-            }
-        };
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
-    left.entry
-        .file
-        .path
-        .as_str()
-        .cmp(right.entry.file.path.as_str())
-}
-
-/// The file's recorded, non-null minimum on `column`.
-fn known_minimum<'a>(candidate: &'a LayoutCandidate, column: &str) -> Option<&'a ArrayRef> {
-    let (min, _) = candidate.column_bounds(column)?;
-    (!min.is_null(0)).then_some(min)
+/// The file's min/max on `column` from its entry's statistics.
+fn column_bounds<'a>(entry: &'a FileEntry, column: &str) -> Option<(&'a ArrayRef, &'a ArrayRef)> {
+    let stats = entry.stats.as_ref()?;
+    Some((stats.min_values.get(column)?, stats.max_values.get(column)?))
 }
 
 fn compare(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
@@ -123,8 +75,8 @@ fn compare(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
         return None;
     }
     // One column's bounds reach selection from two places that need not decode
-    // them alike: a file's own statistics come from the table log, its row
-    // groups' from its footer, and the same logical type can arrive as `Utf8`
+    // them alike: a file's own statistics come from its table's metadata, its
+    // row groups' from its footer, and the same logical type can arrive as `Utf8`
     // from one and `Utf8View` from the other. Cast the pair together rather
     // than calling it incomparable, which would leave every comparison
     // undecided.
@@ -143,36 +95,32 @@ fn compare_same_type(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
     Some(comparator(0, 0))
 }
 
-/// A file without statistics, rows, or ordered leading bounds cannot
-/// participate in a layout pair.
-fn is_measurable(candidate: &LayoutCandidate, leading_column: &str) -> bool {
-    let Some(stats) = candidate.entry.stats.as_ref() else {
-        return false;
-    };
-    if !stats.num_records.is_some_and(|records| records > 0) {
-        return false;
-    }
-    let Some((min, max)) = candidate.column_bounds(leading_column) else {
-        return false;
-    };
-    compare(min, max).is_some_and(|order| order != Ordering::Greater)
+/// Whether `file` can be one of a layout pair: it holds a row, and the
+/// column its table's sort key leads with is bounded on both sides, no
+/// higher below than above.
+fn is_measurable(file: &dyn CompactionFile) -> bool {
+    let read_leading_bound = |side| file.read_sort_bound(0, side);
+    let has_rows = file.row_count().is_some_and(|rows| rows > 0);
+    has_rows
+        && has_sort_range(file)
+        && read_leading_bound(BoundSide::Lower) <= read_leading_bound(BoundSide::Upper)
 }
 
 /// How much two files' rows interleave, from their row-group bounds.
 #[derive(Clone, Copy)]
-pub(super) struct PairOverlap {
+struct PairOverlap {
     /// The smaller of the two files' contested row-group shares. Zero when
     /// the ranges overlap but no row group of either file nests in the
     /// other's range.
-    pub(super) contested_share: f64,
+    contested_share: f64,
     /// Whether the pair is worth a routine rewrite: both files have more
     /// than [`CONTESTED_ROW_GROUP_PERCENT_BAR`] percent of their row groups
     /// contested. A final sweep ignores this and takes any measured pair.
-    pub(super) clears_bar: bool,
+    clears_bar: bool,
 }
 
-/// Measure how `left` and `right` interleave, or `None` for a pair no pass
-/// may ever merge.
+/// The sort column a pair of measurable files is measured on, by position,
+/// or `None` for a pair no pass may ever merge.
 ///
 /// The pair is decided on the first sort column where the two files are not
 /// the same single value. Ranges that are disjoint or touch at one value
@@ -180,17 +128,9 @@ pub(super) struct PairOverlap {
 /// one identical key value throughout, which have nothing to sort. Both
 /// rules hold in every pass; they are what makes compaction terminate. A
 /// bound that cannot be compared keeps the pair rather than dropping it.
-pub(super) fn measure_pair(
-    left: &LayoutCandidate,
-    right: &LayoutCandidate,
-    sort_by: &[String],
-) -> Option<PairOverlap> {
-    let leading_column = sort_by.first()?;
-    if !is_measurable(left, leading_column) || !is_measurable(right, leading_column) {
-        return None;
-    }
-    let left_stats = left.entry.stats.as_ref()?;
-    let right_stats = right.entry.stats.as_ref()?;
+fn find_deciding_column(left: &FileEntry, right: &FileEntry, sort_by: &[String]) -> Option<usize> {
+    let left_stats = left.stats.as_ref()?;
+    let right_stats = right.stats.as_ref()?;
     for (column, name) in sort_by.iter().enumerate() {
         let (Some(left_min), Some(left_max), Some(right_min), Some(right_max)) = (
             left_stats.min_values.get(name),
@@ -217,7 +157,7 @@ pub(super) fn measure_pair(
         ) {
             return None;
         }
-        return overlap_from_row_groups(left, right, column, name);
+        return Some(column);
     }
     // One identical key value throughout both files: nothing to sort, and a
     // rewrite could only cut the value's run and hand the pair back.
@@ -234,8 +174,8 @@ fn overlap_from_row_groups(
     column: usize,
     name: &str,
 ) -> Option<PairOverlap> {
-    let left_range = left.column_bounds(name)?;
-    let right_range = right.column_bounds(name)?;
+    let left_range = column_bounds(left.entry, name)?;
+    let right_range = column_bounds(right.entry, name)?;
     let left_contested = count_contested_row_groups(left, column, right_range);
     let right_contested = count_contested_row_groups(right, column, left_range);
     let clears_bar = left_contested >= required_contested_row_groups(left.row_group_count())
@@ -264,95 +204,283 @@ impl CompactionPass {
     }
 }
 
-/// One table's pair overlaps, remembered between rounds.
+/// Two files an observation has to measure against each other.
+type CandidatePair<'f> = (&'f Arc<dyn CompactionFile>, &'f Arc<dyn CompactionFile>);
+
+/// Every pair of the measurable files of `large`, one partition's large
+/// files in the order they stand in, that holds a file `is_new` accepts and
+/// may share a stretch of the sort key.
 ///
-/// An overlap depends only on the two files' footers and manifest stats, so
-/// it is measured once: a round measures the files it has not seen before
-/// against the files of their partition they can interleave with, and
-/// forgets the files that are gone. Every pair sharing a stretch of the key
-/// is kept under both of its files, so a file's partners are one lookup
-/// away. Paths are shared, so each is stored once however many pairs
-/// contain it.
+/// The files come in order of their lowest key, and the sweep keeps in
+/// reach those whose highest key has not yet been passed; only those can
+/// share a stretch of the key with the current file. A new file is paired
+/// with every file in reach, a file measured before only with the new
+/// ones, so the first observation of a partition yields its overlapping
+/// pairs rather than all pairs.
+fn collect_pairs<'f>(
+    large: impl Iterator<Item = &'f Arc<dyn CompactionFile>>,
+    is_new: &dyn Fn(&Arc<dyn CompactionFile>) -> bool,
+) -> Vec<CandidatePair<'f>> {
+    let mut pairs = Vec::new();
+    // The files whose range the sweep has not passed: every one, and the
+    // new ones among them.
+    let mut in_reach: Vec<&'f Arc<dyn CompactionFile>> = Vec::new();
+    let mut new_in_reach: Vec<&'f Arc<dyn CompactionFile>> = Vec::new();
+    for candidate in large.filter(|file| is_measurable(file.as_ref())) {
+        let reaches_candidate = |partner: &&'f Arc<dyn CompactionFile>| {
+            let (partner, candidate) = (partner.as_ref(), candidate.as_ref());
+            compare_sort_bounds(partner, BoundSide::Upper, candidate, BoundSide::Lower).is_ge()
+        };
+        new_in_reach.retain(reaches_candidate);
+        let is_new_candidate = is_new(candidate);
+        let partners = if is_new_candidate {
+            in_reach.retain(reaches_candidate);
+            &in_reach
+        } else {
+            &new_in_reach
+        };
+        pairs.extend(partners.iter().map(|partner| (*partner, candidate)));
+        in_reach.push(candidate);
+        if is_new_candidate {
+            new_in_reach.push(candidate);
+        }
+    }
+    pairs
+}
+
+/// The large files of a partition no observation measured yet.
+#[derive(Default)]
+enum UnmeasuredFiles {
+    /// Every one: no observation of the partition succeeded yet.
+    #[default]
+    Every,
+    /// Those that joined since the last observation that succeeded, each
+    /// by its path.
+    Joined(HashSet<ObjectPath>),
+}
+
+/// A file that has a partner.
+struct PairedFile {
+    /// The file's record, as its partition's list holds it.
+    record: Arc<dyn CompactionFile>,
+    /// The file's partners, and how far each overlaps it.
+    partners: HashMap<Arc<ObjectPath>, PairOverlap>,
+}
+
+/// What the rounds know of the layout of one partition of a table.
+///
+/// An overlap depends only on the two files' footers and the bounds their
+/// table's metadata records, so it is measured once: an observation
+/// measures the files that joined the partition since the one before
+/// against the files of the partition they can interleave with. The
+/// partition's lists tell the cache of every large file that joins
+/// ([`OverlapCache::add_unmeasured_file`]) and of every file that leaves,
+/// which is forgotten there and then ([`OverlapCache::forget_file`]).
+///
+/// Between rounds it holds the pairs that clear the contested bar, each
+/// with its share, and nothing else: a pair below the bar is one no routine
+/// round merges, and nothing is held of a file of no pair. A final sweep, which
+/// merges those too, measures every pair again when it reaches the
+/// partition, holds them all while it works on it and lets go of the ones
+/// below the bar when it is done.
+///
+/// A pair is kept under both of its files, so a file's partners are one
+/// lookup away. The pairs name a file by one shared copy of its path, so
+/// each is stored once however many pairs contain it.
 #[derive(Default)]
 pub(super) struct OverlapCache {
-    /// One shared copy of each live file's path, the handle partner lists
-    /// are keyed by.
-    known_paths: HashSet<Arc<ObjectPath>>,
-    /// Each live file's remembered partners and how far they overlap it.
-    partners: HashMap<Arc<ObjectPath>, HashMap<Arc<ObjectPath>, PairOverlap>>,
+    /// The files that have a partner, each under the one copy of its path
+    /// the pairs name it by.
+    paired: HashMap<Arc<ObjectPath>, PairedFile>,
+    /// The large files no observation measured yet.
+    unmeasured: UnmeasuredFiles,
+    /// Whether the pairs below the contested bar are held too: while a
+    /// final sweep works on the partition.
+    holds_every_pair: bool,
 }
 
 impl OverlapCache {
-    /// Bring the cache up to date with `partitions`, each one partition's
-    /// candidates: measure the files no earlier round has seen against the
-    /// files of their partition they can interleave with, and forget the
-    /// files that are gone.
+    /// Bring the cache up to date with `large`, the large files of a
+    /// partition of `table` in the order they stand in, for a round
+    /// running `pass`: the
+    /// files that joined since the last observation that succeeded are
+    /// measured against the files they can interleave with, and count as
+    /// measured once that has succeeded. A routine round lets go of the
+    /// pairs only a final sweep holds. The first observation of a final
+    /// sweep measures every file again, and what it measured takes the
+    /// place of what was held once every pair is measured.
     ///
-    /// Each partition is swept in order of minimum on the whole sort key,
-    /// keeping the files whose maximum has not yet been passed; only those
-    /// can share a stretch of the key with the current file. A new file is
-    /// measured against every file in reach, a file seen before only
-    /// against the new ones, so a pass measures only pairs with a new file,
-    /// and the first observation of a table measures its overlapping pairs
-    /// rather than all pairs. Reach is trimmed only when a new file comes
-    /// up: a file dropped there ends before every later file too, and a
-    /// known file measures so few pairs that a stale one costs nothing.
-    pub(super) fn observe(&mut self, partitions: &[&[LayoutCandidate<'_>]], sort_by: &[String]) {
-        let Some(leading_column) = sort_by.first() else {
-            return;
-        };
-        let mut live = HashSet::new();
-        let mut new_paths = HashSet::new();
-        for candidate in partitions.iter().flat_map(|partition| partition.iter()) {
-            let path = &candidate.entry.file.path;
-            live.insert(path.as_str());
-            if !self.known_paths.contains(path) {
-                let shared = Arc::new(path.clone());
-                self.partners.entry(shared.clone()).or_default();
-                self.known_paths.insert(shared);
-                new_paths.insert(path.as_str());
+    /// No footer is read and no entry built to tell which pairs may share
+    /// a stretch of the key: that is decided by comparing the bounds on the
+    /// sort key where the records hold them ([`collect_pairs`]). Only the
+    /// files of those pairs have their entries built, off their records,
+    /// and only those of the pairs the entries' bounds do not rule out have
+    /// their footers read, off `table`.
+    pub(super) fn observe<'f>(
+        &mut self,
+        large: impl Iterator<Item = &'f Arc<dyn CompactionFile>>,
+        table: &CatalogTable,
+        pass: CompactionPass,
+    ) -> Result<()> {
+        match pass {
+            CompactionPass::Final if !self.holds_every_pair => {
+                let mut every_pair = Self {
+                    holds_every_pair: true,
+                    ..Self::default()
+                };
+                let pairs = collect_pairs(large, &|_| true);
+                every_pair.measure_pairs(pairs, table)?;
+                *self = every_pair;
+                return Ok(());
             }
+            CompactionPass::Final => {}
+            CompactionPass::Routine => self.forget_pairs_below_bar(),
         }
-        self.retain_live_files(&live);
-
-        for partition in partitions {
-            let mut ordered: Vec<&LayoutCandidate<'_>> = partition
-                .iter()
-                .filter(|candidate| is_measurable(candidate, leading_column))
-                .collect();
-            ordered.sort_unstable_by(|left, right| compare_minimums(left, right, sort_by));
-            // Files whose range the sweep has not passed, each flagged new.
-            let mut in_reach: Vec<(&LayoutCandidate<'_>, bool)> = Vec::new();
-            for candidate in ordered {
-                let candidate_is_new = new_paths.contains(candidate.entry.file.path.as_str());
-                let candidate_path = self.interned(&candidate.entry.file.path);
-                if candidate_is_new {
-                    in_reach.retain(|(partner, _)| !partner.ends_before(candidate, sort_by));
-                }
-                for (partner, partner_is_new) in &in_reach {
-                    if !candidate_is_new && !partner_is_new {
-                        continue;
-                    }
-                    let Some(overlap) = measure_pair(partner, candidate, sort_by) else {
-                        continue;
-                    };
-                    let partner_path = self.interned(&partner.entry.file.path);
-                    self.partners
-                        .entry(partner_path.clone())
-                        .or_default()
-                        .insert(candidate_path.clone(), overlap);
-                    self.partners
-                        .entry(candidate_path.clone())
-                        .or_default()
-                        .insert(partner_path, overlap);
-                }
-                in_reach.push((candidate, candidate_is_new));
+        let pairs = match &self.unmeasured {
+            UnmeasuredFiles::Joined(joined) if joined.is_empty() => return Ok(()),
+            UnmeasuredFiles::Joined(joined) => {
+                collect_pairs(large, &|file| joined.contains(&file.file().path))
             }
+            UnmeasuredFiles::Every => collect_pairs(large, &|_| true),
+        };
+        self.measure_pairs(pairs, table)
+    }
+
+    /// Count `file`, a large file that joined the partition, as one no
+    /// observation measured.
+    pub(super) fn add_unmeasured_file(&mut self, file: &Arc<dyn CompactionFile>) {
+        if let UnmeasuredFiles::Joined(joined) = &mut self.unmeasured {
+            joined.insert(file.file().path.clone());
         }
     }
 
-    /// Choose the files the next merge rewrites together, as paths, or
-    /// `None` when no merge should start.
+    /// Forget `file`, which left the partition: every pair that holds it,
+    /// and that it was yet to be measured.
+    pub(super) fn forget_file(&mut self, file: &Arc<dyn CompactionFile>) {
+        if let UnmeasuredFiles::Joined(joined) = &mut self.unmeasured {
+            joined.remove(&file.file().path);
+        }
+        if let Some((name, _)) = self.paired.get_key_value(&file.file().path) {
+            let name = Arc::clone(name);
+            self.forget_pairs_of(&name);
+        }
+    }
+
+    /// Hold `kept` as the record of its file, the one its partition's list
+    /// holds from here on. What was measured of the file, and whether it is
+    /// yet to be measured, goes by its path and stays as it was.
+    pub(super) fn replace_record(&mut self, kept: &Arc<dyn CompactionFile>) {
+        if let Some(paired) = self.paired.get_mut(&kept.file().path) {
+            paired.record = Arc::clone(kept);
+        }
+    }
+
+    /// Let go of the pairs below the contested bar, which only the final
+    /// sweep that measured them merges: what stays is what the rounds
+    /// remember between them.
+    pub(super) fn forget_pairs_below_bar(&mut self) {
+        if !self.holds_every_pair {
+            return;
+        }
+        for file in self.paired.values_mut() {
+            file.partners.retain(|_, overlap| overlap.clears_bar);
+        }
+        self.paired.retain(|_, file| !file.partners.is_empty());
+        self.holds_every_pair = false;
+    }
+
+    /// Measure each of `pairs`, files of `table`, and remember, under both
+    /// of their files, those that share a stretch of the sort key and that
+    /// the cache holds: every one during a final sweep, else those that
+    /// clear the contested bar. No file is left to measure once that has
+    /// succeeded.
+    fn measure_pairs(&mut self, pairs: Vec<CandidatePair<'_>>, table: &CatalogTable) -> Result<()> {
+        /// How many files' footers are held at a time.
+        const FILES_PER_READ: usize = 256;
+
+        let sort_by = table.sort_by();
+
+        // The entry of each file of a pair, by its path.
+        let mut entries: HashMap<&ObjectPath, FileEntry> = HashMap::new();
+        for file in pairs.iter().flat_map(|(left, right)| [*left, *right]) {
+            let entry = entries.entry(&file.file().path);
+            entry.or_insert_with(|| file.build_entry());
+        }
+        let decided: Vec<(CandidatePair<'_>, usize)> = pairs
+            .into_iter()
+            .filter_map(|(left, right)| {
+                let left_entry = &entries[&left.file().path];
+                let right_entry = &entries[&right.file().path];
+                let column = find_deciding_column(left_entry, right_entry, sort_by)?;
+                Some(((left, right), column))
+            })
+            .collect();
+
+        // The files of the pairs left, each once, in the order each first
+        // appears.
+        let mut listed: HashSet<&ObjectPath> = HashSet::new();
+        let measured: Vec<&Arc<dyn CompactionFile>> = decided
+            .iter()
+            .flat_map(|((left, right), _)| [*left, *right])
+            .filter(|file| listed.insert(&file.file().path))
+            .collect();
+        let mut candidates: HashMap<&ObjectPath, LayoutCandidate<'_>> = HashMap::new();
+        for files in measured.chunks(FILES_PER_READ) {
+            let named: Vec<FileRef> = files.iter().map(|file| file.file().clone()).collect();
+            // The footers are read for these files alone: only the bounds of
+            // their row groups on the sort columns are kept.
+            let footers = table.row_groups(&named)?;
+            for (file, row_groups) in files.iter().zip(&footers) {
+                let path = &file.file().path;
+                let candidate = LayoutCandidate {
+                    entry: &entries[path],
+                    row_group_ranges: read_row_group_ranges(row_groups, sort_by),
+                };
+                candidates.insert(path, candidate);
+            }
+        }
+
+        for ((left, right), column) in decided {
+            let Some(overlap) = overlap_from_row_groups(
+                &candidates[&left.file().path],
+                &candidates[&right.file().path],
+                column,
+                &sort_by[column],
+            ) else {
+                continue;
+            };
+            if !self.holds_every_pair && !overlap.clears_bar {
+                continue;
+            }
+            let (left_name, right_name) = (self.name_file(left), self.name_file(right));
+            for (name, partner) in [(&left_name, &right_name), (&right_name, &left_name)] {
+                let file = self.paired.get_mut(name).expect("a named file is held");
+                file.partners.insert(Arc::clone(partner), overlap);
+            }
+        }
+        self.unmeasured = UnmeasuredFiles::Joined(HashSet::new());
+        Ok(())
+    }
+
+    /// The one copy of the path of `file` the pairs name it by: the one
+    /// held, or a new one, held with the file's record from here on.
+    fn name_file(&mut self, file: &Arc<dyn CompactionFile>) -> Arc<ObjectPath> {
+        let path = &file.file().path;
+        if let Some((name, _)) = self.paired.get_key_value(path) {
+            return Arc::clone(name);
+        }
+        let name = Arc::new(path.clone());
+        let paired = PairedFile {
+            record: Arc::clone(file),
+            partners: HashMap::new(),
+        };
+        self.paired.insert(Arc::clone(&name), paired);
+        name
+    }
+
+    /// Choose the files the next merge rewrites together, each by its
+    /// record as its partition's list holds it, or `None` when no merge
+    /// should start.
     ///
     /// Files are tried as seeds from the one with the most partners the
     /// pass admits down, ties broken by the best of those shares and then
@@ -366,15 +494,16 @@ impl OverlapCache {
         reserved: &HashSet<ObjectPath>,
         pass: CompactionPass,
         clique_size: usize,
-    ) -> Option<Vec<Arc<ObjectPath>>> {
+    ) -> Option<Vec<Arc<dyn CompactionFile>>> {
         // Each file a group may be grown from, with how many admitted
         // partners it has and the best of their shares.
         let mut seeds: Vec<(&Arc<ObjectPath>, usize, f64)> = self
-            .partners
+            .paired
             .iter()
             .filter(|(path, _)| !reserved.contains(path.as_ref()))
-            .filter_map(|(path, partners)| {
-                let (count, best) = partners
+            .filter_map(|(path, file)| {
+                let (count, best) = file
+                    .partners
                     .iter()
                     .filter(|(partner, overlap)| {
                         pass.admits(**overlap) && !reserved.contains(partner.as_ref())
@@ -397,15 +526,23 @@ impl OverlapCache {
             match pass {
                 CompactionPass::Routine => {
                     if let Some(clique) = self.grow_clique(seed, reserved, clique_size) {
-                        return Some(clique);
+                        return Some(self.list_records(&clique));
                     }
                 }
                 CompactionPass::Final => {
-                    return Some(self.grow_connected_group(seed, reserved, clique_size));
+                    let group = self.grow_connected_group(seed, reserved, clique_size);
+                    return Some(self.list_records(&group));
                 }
             }
         }
         None
+    }
+
+    /// The record of each file of `group`, files that have a partner, in
+    /// the order given.
+    fn list_records(&self, group: &[Arc<ObjectPath>]) -> Vec<Arc<dyn CompactionFile>> {
+        let records = group.iter().map(|path| &self.paired[path].record);
+        records.cloned().collect()
     }
 
     /// Grow a clique from `seed`: up to `clique_size` files that pairwise
@@ -419,7 +556,8 @@ impl OverlapCache {
         reserved: &HashSet<ObjectPath>,
         clique_size: usize,
     ) -> Option<Vec<Arc<ObjectPath>>> {
-        let candidates: Vec<(&Arc<ObjectPath>, f64)> = self.partners[seed]
+        let candidates: Vec<(&Arc<ObjectPath>, f64)> = self.paired[seed]
+            .partners
             .iter()
             .filter(|(partner, overlap)| overlap.clears_bar && !reserved.contains(partner.as_ref()))
             .map(|(partner, overlap)| (partner, overlap.contested_share))
@@ -448,7 +586,7 @@ impl OverlapCache {
             };
             // Candidates that pair with the newest member, each keeping the
             // lowest share it has against the group so far.
-            let newest_partners = &self.partners[newest];
+            let newest_partners = &self.paired[newest].partners;
             let narrowed = candidates
                 .iter()
                 .filter_map(|(path, lowest)| {
@@ -481,7 +619,8 @@ impl OverlapCache {
         reserved: &HashSet<ObjectPath>,
         max_group_size: usize,
     ) -> Vec<Arc<ObjectPath>> {
-        let mut partners: Vec<(&Arc<ObjectPath>, f64)> = self.partners[seed]
+        let mut partners: Vec<(&Arc<ObjectPath>, f64)> = self.paired[seed]
+            .partners
             .iter()
             .filter(|(partner, _)| !reserved.contains(partner.as_ref()))
             .map(|(partner, overlap)| (partner, overlap.contested_share))
@@ -497,31 +636,19 @@ impl OverlapCache {
             .collect()
     }
 
-    /// The shared copy of a live file's path, the handle partner lists are
-    /// keyed by.
-    fn interned(&self, path: &ObjectPath) -> Arc<ObjectPath> {
-        self.known_paths
-            .get(path)
-            .expect("the path is a live file")
-            .clone()
-    }
-
-    /// Forget the files not in `live` and every pair containing one, at the
-    /// cost of the gone files' pairs rather than of every remembered pair.
-    fn retain_live_files(&mut self, live: &HashSet<&str>) {
-        let gone: Vec<Arc<ObjectPath>> = self
-            .known_paths
-            .iter()
-            .filter(|path| !live.contains(path.as_str()))
-            .cloned()
-            .collect();
-        for path in gone {
-            self.known_paths.remove(&path);
-            let partners = self.partners.remove(&path).unwrap_or_default();
-            for partner in partners.keys() {
-                if let Some(partner_pairs) = self.partners.get_mut(partner) {
-                    partner_pairs.remove(&path);
-                }
+    /// Forget every pair that holds the file at `path`, and with it each
+    /// file the pair was the last of.
+    fn forget_pairs_of(&mut self, path: &Arc<ObjectPath>) {
+        let Some(file) = self.paired.remove(path) else {
+            return;
+        };
+        for partner in file.partners.keys() {
+            let is_left_alone = self.paired.get_mut(partner).is_some_and(|partner| {
+                partner.partners.remove(path);
+                partner.partners.is_empty()
+            });
+            if is_left_alone {
+                self.paired.remove(partner);
             }
         }
     }
@@ -591,31 +718,138 @@ fn count_contested_row_groups(
 mod tests {
     use std::sync::Arc;
 
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
     use arrow_array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 
     use super::*;
-    use crate::manifest::FileStats;
+    use crate::compact::sort_key::compare_file_order;
+    use arrow_schema::DataType;
     use object_storage::{FileRef, ObjectPath};
+    use parquet_engine::FileStats;
+    use parquet_engine::SortValue;
 
-    /// The best remembered bar-clearing pair in `cache` among `partitions`,
-    /// measuring the files no earlier round has seen: the pair a routine
-    /// round seeds a clique from, so tests can probe the scoring directly.
+    /// A candidate as a partition's list holds it: its bounds on the sort
+    /// columns are read off its entry's statistics, integers and strings.
+    struct CandidateRecord {
+        rows: Option<u64>,
+        entry: FileEntry,
+        sort_by: Vec<String>,
+    }
+
+    impl CompactionFile for CandidateRecord {
+        fn file(&self) -> &FileRef {
+            &self.entry.file
+        }
+
+        fn row_count(&self) -> Option<u64> {
+            self.rows
+        }
+
+        fn commit_sequence(&self) -> u64 {
+            0
+        }
+
+        fn count_sort_columns(&self) -> usize {
+            self.sort_by.len()
+        }
+
+        fn read_sort_bound(&self, position: usize, side: BoundSide) -> SortValue<'_> {
+            let Some(stats) = self.entry.stats.as_deref() else {
+                return SortValue::Missing;
+            };
+            let bounds = match side {
+                BoundSide::Lower => &stats.min_values,
+                BoundSide::Upper => &stats.max_values,
+            };
+            let Some(bound) = bounds.get(&self.sort_by[position]) else {
+                return SortValue::Missing;
+            };
+            match bound.data_type() {
+                DataType::Int64 => {
+                    SortValue::Integer(bound.as_primitive::<Int64Type>().value(0).into())
+                }
+                DataType::Utf8 => SortValue::String(bound.as_string::<i32>().value(0)),
+                DataType::Utf8View => SortValue::String(bound.as_string_view().value(0)),
+                other => panic!("no candidate bounds a sort column by a {other}"),
+            }
+        }
+
+        fn build_entry(&self) -> FileEntry {
+            self.entry.clone()
+        }
+    }
+
+    /// The record of the file of `entry`, a file of a table sorted by
+    /// `sort_by`.
+    fn build_record(entry: &FileEntry, sort_by: &[String]) -> Arc<dyn CompactionFile> {
+        let stats = entry.stats.as_ref();
+        let rows = stats
+            .and_then(|stats| stats.num_records)
+            .and_then(|rows| u64::try_from(rows).ok());
+        Arc::new(CandidateRecord {
+            rows,
+            entry: entry.clone(),
+            sort_by: sort_by.to_vec(),
+        })
+    }
+
+    /// What a round running `pass` holds of a partition whose large files
+    /// are `files` once it has measured them: every pair of them that may
+    /// share a stretch of the key, measured on the row groups each
+    /// candidate gives.
+    fn measure_candidates(
+        files: &[LayoutCandidate<'_>],
+        sort_by: &[String],
+        pass: CompactionPass,
+    ) -> OverlapCache {
+        let mut large: Vec<Arc<dyn CompactionFile>> = files
+            .iter()
+            .map(|file| build_record(file.entry, sort_by))
+            .collect();
+        large.sort_by(|left, right| compare_file_order(left.as_ref(), right.as_ref()));
+        let find_candidate = |record: &Arc<dyn CompactionFile>| {
+            let mut candidates = files.iter();
+            candidates
+                .find(|candidate| candidate.entry.file.path == record.file().path)
+                .unwrap()
+        };
+        let mut cache = OverlapCache {
+            holds_every_pair: pass == CompactionPass::Final,
+            ..OverlapCache::default()
+        };
+        for (left, right) in collect_pairs(large.iter(), &|_| true) {
+            let (left_candidate, right_candidate) = (find_candidate(left), find_candidate(right));
+            let column = find_deciding_column(left_candidate.entry, right_candidate.entry, sort_by);
+            let overlap = column.and_then(|column| {
+                overlap_from_row_groups(left_candidate, right_candidate, column, &sort_by[column])
+            });
+            let Some(overlap) = overlap.filter(|overlap| pass.admits(*overlap)) else {
+                continue;
+            };
+            let (left_name, right_name) = (cache.name_file(left), cache.name_file(right));
+            for (name, partner) in [(&left_name, &right_name), (&right_name, &left_name)] {
+                let file = cache.paired.get_mut(name).unwrap();
+                file.partners.insert(Arc::clone(partner), overlap);
+            }
+        }
+        cache
+    }
+
+    /// The best bar-clearing pair `cache` holds: the pair a routine round
+    /// seeds a clique from, so tests can probe the scoring directly.
     /// Reserved files' pairs are passed over; ties go to the
     /// lexicographically first pair.
     fn select_best_pair(
-        cache: &mut OverlapCache,
-        partitions: &[&[LayoutCandidate<'_>]],
-        sort_by: &[String],
+        cache: &OverlapCache,
         reserved: &HashSet<ObjectPath>,
     ) -> Option<(f64, Arc<ObjectPath>, Arc<ObjectPath>)> {
-        cache.observe(partitions, sort_by);
         let (left, right, overlap) = cache
-            .partners
+            .paired
             .iter()
-            .flat_map(|(left, partners)| {
-                partners
-                    .iter()
-                    .map(move |(right, overlap)| (left, right, overlap))
+            .flat_map(|(left, file)| {
+                let partners = file.partners.iter();
+                partners.map(move |(right, overlap)| (left, right, overlap))
             })
             .filter(|(left, right, overlap)| {
                 left.as_str() < right.as_str()
@@ -637,51 +871,48 @@ mod tests {
         Some((overlap.contested_share, left.clone(), right.clone()))
     }
 
-    /// Every pair the cache remembers, bar or no bar.
+    /// Every pair the cache holds, bar or no bar.
     fn remembered_pairs(cache: &OverlapCache) -> usize {
-        cache.partners.values().map(HashMap::len).sum::<usize>() / 2
+        let partners = cache.paired.values().map(|file| file.partners.len());
+        partners.sum::<usize>() / 2
     }
 
     /// Remembered pairs that clear the contested bar, reserved or not: the
     /// pairs a routine round may merge.
     fn eligible_pairs(cache: &OverlapCache) -> usize {
         cache
-            .partners
+            .paired
             .values()
-            .flat_map(|partners| partners.values())
+            .flat_map(|file| file.partners.values())
             .filter(|overlap| overlap.clears_bar)
             .count()
             / 2
     }
 
-    /// Select over one partition with nothing remembered.
+    /// The best pair a routine round holds of a partition of `files`.
     fn select_pair(
         files: &[LayoutCandidate<'_>],
         sort_by: &[String],
     ) -> Option<(f64, Arc<ObjectPath>, Arc<ObjectPath>)> {
-        select_best_pair(
-            &mut OverlapCache::default(),
-            &[files],
-            sort_by,
-            &HashSet::new(),
-        )
+        let cache = measure_candidates(files, sort_by, CompactionPass::Routine);
+        select_best_pair(&cache, &HashSet::new())
     }
 
-    /// Select a group over one partition with nothing remembered and nothing
-    /// reserved.
+    /// Select a group over one partition of `files` with nothing reserved,
+    /// as a round running `pass` does.
     fn select_group(
         files: &[LayoutCandidate<'_>],
         sort_by: &[String],
         pass: CompactionPass,
         clique_size: usize,
-    ) -> Option<Vec<Arc<ObjectPath>>> {
-        let mut cache = OverlapCache::default();
-        cache.observe(&[files], sort_by);
+    ) -> Option<Vec<Arc<dyn CompactionFile>>> {
+        let cache = measure_candidates(files, sort_by, pass);
         cache.select_group(&HashSet::new(), pass, clique_size)
     }
 
-    fn group_paths(group: &[Arc<ObjectPath>]) -> Vec<&str> {
-        group.iter().map(|path| path.as_str()).collect()
+    fn group_paths(group: &[Arc<dyn CompactionFile>]) -> Vec<&str> {
+        let paths = group.iter().map(|record| record.file().path.as_str());
+        paths.collect()
     }
 
     fn int_stat(value: i64) -> ArrayRef {
@@ -692,8 +923,8 @@ mod tests {
         Arc::new(StringViewArray::from(vec![value]))
     }
 
-    fn stats_entry(path: &str, columns: &[(&str, ArrayRef, ArrayRef)]) -> DeltaFileEntry {
-        let mut entry = DeltaFileEntry::new(FileRef {
+    fn stats_entry(path: &str, columns: &[(&str, ArrayRef, ArrayRef)]) -> FileEntry {
+        let mut entry = FileEntry::new(FileRef {
             path: ObjectPath::new(path),
             size: 1,
         });
@@ -713,7 +944,7 @@ mod tests {
     }
 
     /// An entry sorted by one integer `id` column, `size` bytes large.
-    fn sized_entry(path: &str, min: i64, max: i64, size: u64) -> DeltaFileEntry {
+    fn sized_entry(path: &str, min: i64, max: i64, size: u64) -> FileEntry {
         let mut entry = stats_entry(path, &[("id", int_stat(min), int_stat(max))]);
         entry.file.size = size;
         entry
@@ -725,7 +956,7 @@ mod tests {
 
     /// A candidate whose file has one row group spanning its whole range on
     /// each of `sort_by`, the layout a small single-group parquet has.
-    fn candidate<'a>(entry: &'a DeltaFileEntry, sort_by: &[&str]) -> LayoutCandidate<'a> {
+    fn candidate<'a>(entry: &'a FileEntry, sort_by: &[&str]) -> LayoutCandidate<'a> {
         let stats = entry.stats.as_ref().unwrap();
         LayoutCandidate {
             entry,
@@ -744,7 +975,7 @@ mod tests {
     /// A candidate of a singly sorted table, whose row groups span `groups` on
     /// its one sort column.
     fn candidate_with_row_groups<'a>(
-        entry: &'a DeltaFileEntry,
+        entry: &'a FileEntry,
         groups: &[(i64, i64)],
     ) -> LayoutCandidate<'a> {
         LayoutCandidate {
@@ -762,7 +993,7 @@ mod tests {
     /// integer column last, `leading` giving each leading key's row-group
     /// bounds and `trailing` the last key's.
     fn keyed_candidate<'a>(
-        entry: &'a DeltaFileEntry,
+        entry: &'a FileEntry,
         leading_keys: usize,
         leading: &[(&str, &str)],
         trailing: &[(i64, i64)],
@@ -785,7 +1016,7 @@ mod tests {
     }
 
     fn candidate_with_string_row_groups<'a>(
-        entry: &'a DeltaFileEntry,
+        entry: &'a FileEntry,
         groups: &[(&str, &str)],
     ) -> LayoutCandidate<'a> {
         LayoutCandidate {
@@ -1060,10 +1291,10 @@ mod tests {
     /// Four files of five row groups each: a wide file, a file shifted half a
     /// range past it, a narrow file inside it, and one nowhere near the rest.
     fn layered_candidates() -> Vec<LayoutCandidate<'static>> {
-        static WIDE: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
-        static SHIFTED: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
-        static CONTAINED: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
-        static DISJOINT: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
+        static WIDE: std::sync::OnceLock<FileEntry> = std::sync::OnceLock::new();
+        static SHIFTED: std::sync::OnceLock<FileEntry> = std::sync::OnceLock::new();
+        static CONTAINED: std::sync::OnceLock<FileEntry> = std::sync::OnceLock::new();
+        static DISJOINT: std::sync::OnceLock<FileEntry> = std::sync::OnceLock::new();
         let wide = WIDE.get_or_init(|| stats_entry("wide", &[("id", int_stat(0), int_stat(100))]));
         let shifted =
             SHIFTED.get_or_init(|| stats_entry("shifted", &[("id", int_stat(50), int_stat(150))]));
@@ -1088,42 +1319,6 @@ mod tests {
         ]
     }
 
-    /// After a merge, the next round measures only the merge's output against
-    /// the survivors and no longer knows the pairs of the files it replaced.
-    #[test]
-    fn a_merge_output_is_measured_against_the_survivors() {
-        let shape = [(0, 50), (50, 100)];
-        let first = stats_entry("first", &[("id", int_stat(0), int_stat(100))]);
-        let second = stats_entry("second", &[("id", int_stat(0), int_stat(100))]);
-        let survivor = stats_entry("survivor", &[("id", int_stat(500), int_stat(600))]);
-        let survivor_shape = [(500, 550), (550, 600)];
-        let mut cache = OverlapCache::default();
-        let before = vec![
-            candidate_with_row_groups(&first, &shape),
-            candidate_with_row_groups(&second, &shape),
-            candidate_with_row_groups(&survivor, &survivor_shape),
-        ];
-        select_best_pair(&mut cache, &[&before], &["id".into()], &HashSet::new());
-        let merged = stats_entry("merged", &[("id", int_stat(500), int_stat(600))]);
-        let after = vec![
-            candidate_with_row_groups(&survivor, &survivor_shape),
-            candidate_with_row_groups(&merged, &survivor_shape),
-        ];
-
-        let (share, left, right) =
-            select_best_pair(&mut cache, &[&after], &["id".into()], &HashSet::new()).unwrap();
-
-        assert!((share - 1.0).abs() < 1e-12);
-        let mut pair = [left.as_str(), right.as_str()];
-        pair.sort();
-        assert_eq!(pair, ["merged", "survivor"]);
-        assert_eq!(
-            remembered_pairs(&cache),
-            1,
-            "the merged-away files' pairs are forgotten"
-        );
-    }
-
     /// A file some merge is already rewriting keeps its remembered overlaps but
     /// is passed over while it is reserved, so the round picks another pair.
     #[test]
@@ -1140,13 +1335,11 @@ mod tests {
             candidate_with_row_groups(&far_first, &far_shape),
             candidate_with_row_groups(&far_second, &far_shape),
         ];
-        let mut cache = OverlapCache::default();
-        let (_, left, right) =
-            select_best_pair(&mut cache, &[&files], &["id".into()], &HashSet::new()).unwrap();
+        let cache = measure_candidates(&files, &["id".into()], CompactionPass::Routine);
+        let (_, left, right) = select_best_pair(&cache, &HashSet::new()).unwrap();
         let reserved = HashSet::from([(*left).clone(), (*right).clone()]);
 
-        let (_, next_left, next_right) =
-            select_best_pair(&mut cache, &[&files], &["id".into()], &reserved).unwrap();
+        let (_, next_left, next_right) = select_best_pair(&cache, &reserved).unwrap();
 
         assert!(!reserved.contains(next_left.as_ref()));
         assert!(!reserved.contains(next_right.as_ref()));
@@ -1214,8 +1407,8 @@ mod tests {
         let (_, left, right) = select_pair(&files, &["id".into()]).unwrap();
 
         assert_eq!(group.len(), 2);
-        assert_eq!(group[0], left);
-        assert_eq!(group[1], right);
+        assert_eq!(group[0].file().path, *left);
+        assert_eq!(group[1].file().path, *right);
     }
 
     /// A file some merge is rewriting keeps its remembered overlaps but
@@ -1234,8 +1427,7 @@ mod tests {
             candidate_with_row_groups(&third, &shape),
         ];
         let reserved = HashSet::from([ObjectPath::new("c")]);
-        let mut cache = OverlapCache::default();
-        cache.observe(&[&files], &["id".into()]);
+        let cache = measure_candidates(&files, &["id".into()], CompactionPass::Routine);
 
         let clique = cache.select_group(&reserved, CompactionPass::Routine, 3);
         let settled = cache
@@ -1281,7 +1473,7 @@ mod tests {
     fn waits_for_a_full_clique_before_merging() {
         let shape = [(0, 50), (50, 100)];
         let range = [("id", int_stat(0), int_stat(100))];
-        let entries: Vec<DeltaFileEntry> = (0..6)
+        let entries: Vec<FileEntry> = (0..6)
             .map(|index| stats_entry(&format!("file-{index}"), &range))
             .collect();
         let five: Vec<LayoutCandidate> = entries[..5]
@@ -1309,7 +1501,7 @@ mod tests {
         let range = [("id", int_stat(500), int_stat(600))];
         let hot_first = stats_entry("hot-a", &range);
         let hot_second = stats_entry("hot-b", &range);
-        let steps: Vec<DeltaFileEntry> = (0..6i64)
+        let steps: Vec<FileEntry> = (0..6i64)
             .map(|step| {
                 stats_entry(
                     &format!("step-{step}"),
@@ -1347,7 +1539,7 @@ mod tests {
     fn final_sweep_takes_a_group_short_of_the_clique_size() {
         let shape = [(0, 50), (50, 100)];
         let range = [("id", int_stat(0), int_stat(100))];
-        let entries: Vec<DeltaFileEntry> = (0..5)
+        let entries: Vec<FileEntry> = (0..5)
             .map(|index| stats_entry(&format!("file-{index}"), &range))
             .collect();
         let files: Vec<LayoutCandidate> = entries
@@ -1360,25 +1552,91 @@ mod tests {
         assert_eq!(group.len(), 5);
     }
 
-    /// A pair below the contested bar is remembered for the final sweep but
-    /// never selected by a routine round, which counts no eligible pair.
+    /// A wide file and a narrow one inside its range: a pair below the
+    /// contested bar.
+    fn below_bar_entries() -> (FileEntry, FileEntry) {
+        (
+            stats_entry("wide", &[("id", int_stat(1), int_stat(100))]),
+            stats_entry("narrow", &[("id", int_stat(3), int_stat(4))]),
+        )
+    }
+
+    /// The candidates of [`below_bar_entries`], five row groups each.
+    fn below_bar_candidates<'a>(
+        wide: &'a FileEntry,
+        narrow: &'a FileEntry,
+    ) -> [LayoutCandidate<'a>; 2] {
+        [
+            candidate_with_row_groups(wide, &[(1, 20), (20, 40), (40, 60), (60, 80), (80, 100)]),
+            candidate_with_row_groups(narrow, &[(3, 3), (3, 4), (4, 4), (4, 4), (4, 4)]),
+        ]
+    }
+
+    /// Once a final sweep is done with a partition, the pairs below the bar
+    /// it held are gone.
     #[test]
-    fn remembers_a_below_bar_pair_for_the_final_sweep_only() {
-        let wide = stats_entry("wide", &[("id", int_stat(1), int_stat(100))]);
-        let narrow = stats_entry("narrow", &[("id", int_stat(3), int_stat(4))]);
-        let files = [
-            candidate_with_row_groups(&wide, &[(1, 20), (20, 40), (40, 60), (60, 80), (80, 100)]),
-            candidate_with_row_groups(&narrow, &[(3, 3), (3, 4), (4, 4), (4, 4), (4, 4)]),
+    fn a_final_sweep_leaves_no_pair_below_the_bar_behind() {
+        let (wide, narrow) = below_bar_entries();
+        let files = below_bar_candidates(&wide, &narrow);
+        let mut cache = measure_candidates(&files, &["id".into()], CompactionPass::Final);
+        let held_by_the_sweep = remembered_pairs(&cache);
+
+        cache.forget_pairs_below_bar();
+
+        assert_eq!(held_by_the_sweep, 1);
+        assert_eq!(remembered_pairs(&cache), 0);
+    }
+
+    /// A file that left the partition is forgotten, with its pairs.
+    #[test]
+    fn a_file_that_is_gone_is_forgotten() {
+        let shape = [(0, 50), (50, 100)];
+        let first = stats_entry("first", &[("id", int_stat(0), int_stat(100))]);
+        let second = stats_entry("second", &[("id", int_stat(0), int_stat(100))]);
+        let both = [
+            candidate_with_row_groups(&first, &shape),
+            candidate_with_row_groups(&second, &shape),
         ];
-        let mut cache = OverlapCache::default();
-        cache.observe(&[&files], &["id".into()]);
+        let mut cache = measure_candidates(&both, &["id".into()], CompactionPass::Routine);
+        let gone = Arc::clone(&cache.paired[&ObjectPath::new("second")].record);
 
-        let routine = cache.select_group(&HashSet::new(), CompactionPass::Routine, 6);
-        let settled = cache.select_group(&HashSet::new(), CompactionPass::Final, 6);
+        cache.forget_file(&gone);
 
-        assert!(routine.is_none());
-        assert_eq!(eligible_pairs(&cache), 0);
-        assert_eq!(group_paths(&settled.unwrap()), ["narrow", "wide"]);
+        assert!(cache.paired.is_empty());
+    }
+
+    /// A file in a pair is named, wherever a pair names it, by the one
+    /// copy of its path held for it as a paired file.
+    #[test]
+    fn a_paired_file_is_named_by_the_one_copy_of_its_path() {
+        let shape = [(0, 50), (50, 100)];
+        let range = [("id", int_stat(0), int_stat(100))];
+        let (first, second, third) = (
+            stats_entry("first", &range),
+            stats_entry("second", &range),
+            stats_entry("third", &range),
+        );
+        let files = [
+            candidate_with_row_groups(&first, &shape),
+            candidate_with_row_groups(&second, &shape),
+            candidate_with_row_groups(&third, &shape),
+        ];
+
+        let cache = measure_candidates(&files, &["id".into()], CompactionPass::Routine);
+
+        let is_the_one_copy = |path: &Arc<ObjectPath>| {
+            cache
+                .paired
+                .get_key_value(path)
+                .is_some_and(|(name, _)| Arc::ptr_eq(name, path))
+        };
+        assert_eq!(remembered_pairs(&cache), 3);
+        assert!(
+            cache
+                .paired
+                .values()
+                .all(|file| file.partners.keys().all(is_the_one_copy))
+        );
     }
 
     /// A hub's second satellite is below the bar, so no clique of three
@@ -1446,8 +1704,7 @@ mod tests {
             candidate_with_row_groups(&apart, &[(200, 300)]),
         ];
 
-        let mut cache = OverlapCache::default();
-        select_best_pair(&mut cache, &[&files], &["id".into()], &HashSet::new());
+        let cache = measure_candidates(&files, &["id".into()], CompactionPass::Routine);
 
         assert_eq!(eligible_pairs(&cache), 3);
     }
@@ -1603,8 +1860,8 @@ mod tests {
         assert!((share - 1.0).abs() < 1e-12);
     }
 
-    /// A file's statistics come from the table log and its row groups' from
-    /// its footer, which decode a string column to `Utf8` and `Utf8View`. The
+    /// A file's statistics come from its table's metadata and its row groups'
+    /// from its footer, which decode a string column to `Utf8` and `Utf8View`. The
     /// two still have to compare.
     #[test]
     fn row_groups_are_counted_against_differently_encoded_file_stats() {
@@ -1693,17 +1950,17 @@ mod tests {
         let mut cache = OverlapCache::default();
         for (left, right, contested_share) in pairs {
             for (path, partner) in [(left, right), (right, left)] {
-                let path = Arc::new(ObjectPath::new(*path));
-                let partner = Arc::new(ObjectPath::new(*partner));
-                cache.known_paths.insert(path.clone());
-                cache.known_paths.insert(partner.clone());
-                cache.partners.entry(path).or_default().insert(
-                    partner,
-                    PairOverlap {
-                        contested_share: *contested_share,
-                        clears_bar: true,
-                    },
-                );
+                let name = Arc::new(ObjectPath::new(*path));
+                let file = cache.paired.entry(name).or_insert_with(|| PairedFile {
+                    record: build_record(&stats_entry(path, &[]), &[]),
+                    partners: HashMap::new(),
+                });
+                let overlap = PairOverlap {
+                    contested_share: *contested_share,
+                    clears_bar: true,
+                };
+                file.partners
+                    .insert(Arc::new(ObjectPath::new(*partner)), overlap);
             }
         }
         cache

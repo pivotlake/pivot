@@ -129,10 +129,16 @@ pub(super) fn plan_file_shredding(chunks: &[RecordBatch]) -> WriteResult<FileShr
         };
         let no_rows = VariantArray::try_new(chunks[0].column(column).slice(0, 0).as_ref())?;
         let widened = shred_variant(&no_rows, &shredding_type)?;
-        // `VariantArray::field` re-applies the variant extension tag, so the
-        // widened column is still recognized as a variant by the footer's
-        // VARIANT annotation the assembler writes.
-        fields[column] = Arc::new(widened.field(fields[column].name()));
+        // Only the column's type widens. It stays the field it was declared
+        // as: nullable where the table lets a document be NULL, tagged as a
+        // variant for the footer's VARIANT annotation, and under the Parquet
+        // field id a reader resolving columns by id finds it by.
+        fields[column] = Arc::new(
+            fields[column]
+                .as_ref()
+                .clone()
+                .with_data_type(widened.data_type().clone()),
+        );
         column_shredding[column] = Some(Arc::new(shredding_type));
     }
     Ok(FileShredding {

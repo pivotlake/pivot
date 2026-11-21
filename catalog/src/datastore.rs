@@ -34,8 +34,9 @@ pub struct DatastoreTableMetadata {
     pub columns: Vec<DatastoreColumnMetadata>,
     /// The table's sort columns, in order; empty when the table is unsorted.
     pub sort_by: Vec<String>,
-    /// The table's partition columns, in order; empty when the table is
-    /// unpartitioned.
+    /// The terms the table is partitioned by, in order, each a column or a
+    /// transform of one as `CREATE TABLE` spells it (`day(ts)`); empty when
+    /// the table is unpartitioned.
     pub partition_by: Vec<String>,
     /// How many rows the table's committed files hold.
     pub total_rows: u64,
@@ -61,6 +62,8 @@ pub struct DatastoreColumnMetadata {
     pub bytes: u64,
     /// What those bytes hold decoded, before the storage format compressed them.
     pub bytes_uncompressed: u64,
+    /// Whether the table is partitioned by the column or by a transform of
+    /// it.
     pub is_partition_key: bool,
     pub is_sort_key: bool,
 }
@@ -236,13 +239,31 @@ pub trait Datastore: Debug + Send + Sync {
 
     /// Start this datastore's background maintenance (e.g. periodic refresh and
     /// compaction), spawning its tasks onto the ambient async runtime. Called
-    /// once, when the server begins serving. The `Arc<Self>` receiver lets the
-    /// spawned tasks hold the datastore alive. Default: no maintenance.
+    /// once, when the server begins serving. The `Arc<Self>` receiver lets a
+    /// task hold the datastore: each runs until [`stop`](Self::stop) or
+    /// [`request_stop`](Self::request_stop) ends it, so a started datastore
+    /// must be stopped to be released. A datastore that has been stopped, or
+    /// told to stop, runs no maintenance again. Default: no maintenance.
     fn start(self: Arc<Self>) {}
 
-    /// Stop the background maintenance [`start`](Self::start) spawned, aborting
-    /// its tasks. Called on shutdown *before* the worker pool is torn down, so a
-    /// maintenance sweep cannot race the pool's teardown. Default: nothing to
-    /// stop.
-    fn abort(&self) {}
+    /// Tell the background maintenance of this datastore to stop, and wait
+    /// until it has finished. Each task is told to stop and then awaited: a
+    /// sweep or a merge already in flight runs to its end, and no new one
+    /// begins. Once
+    /// this returns, none of the datastore's maintenance tasks exists, none
+    /// of their work is still running on the blocking pool, and none will
+    /// touch the worker pool again, so the caller may tear the pool down.
+    /// Called once, on shutdown, while the runtime the tasks were spawned on
+    /// and the worker pool both still run: a sweep in flight needs them to
+    /// finish, and this waits for as long as that sweep takes. Maintenance
+    /// stays stopped afterwards. Default: nothing to stop.
+    async fn stop(&self) {}
+
+    /// Tell the background maintenance of this datastore to stop, without
+    /// waiting for it: no new sweep or merge begins, and one in flight is
+    /// left to end by itself. For a caller whose worker pool is already
+    /// broken, where a sweep in flight may never finish and
+    /// [`stop`](Self::stop) could wait for it forever. Maintenance stays
+    /// stopped afterwards. Default: nothing to stop.
+    fn request_stop(&self) {}
 }

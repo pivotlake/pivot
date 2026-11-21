@@ -21,8 +21,9 @@ use tempfile::TempDir;
 use catalog::datastore::{Datastore, DatastoreTransaction};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{commit_datastore_transaction, current_parquet};
-use datastore_pivotlake::{ColumnStatFilter, PartitionEqFilter, PivotlakeDatastore, TableBinding};
+use datastore_pivotlake::PivotlakeDatastore;
 use object_storage::ObjectPath;
+use parquet_engine::ParquetTableBinding;
 use planner::PlanNode;
 use planner::Planner;
 use planner::catalog::{
@@ -50,18 +51,34 @@ fn dispatcher() -> DataFlowDispatcher {
 /// guard next to the datastore makes its storage lifetime explicit.
 fn empty_datastore() -> (TempDir, Arc<PivotlakeDatastore>) {
     let database = TempDir::new().unwrap();
-    let datastore =
-        PivotlakeDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &database.path().to_string_lossy(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     (database, datastore)
 }
 
-/// Entries written to a datastore other than its process-lifetime lock.
+/// Entries written to a datastore other than what opening it writes: its
+/// process-lifetime lock, and its manifest with the lock the manifest is
+/// updated under.
 fn durable_datastore_entries(database: &Path) -> Vec<std::ffi::OsString> {
+    const WRITTEN_AT_OPEN: [&str; 3] = [
+        ".pivot.lock",
+        "_pivot_manifest.json",
+        "_pivot_manifest.json.lock",
+    ];
     std::fs::read_dir(database)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
-        .filter(|name| name != ".pivot.lock")
+        .filter(|name| !WRITTEN_AT_OPEN.iter().any(|written| name == written))
         .collect()
+}
+
+/// The bytes of a datastore's manifest as storage holds them.
+fn read_manifest(database: &Path) -> Vec<u8> {
+    std::fs::read(database.join("_pivot_manifest.json")).unwrap()
 }
 
 /// Create a table, mirroring how the server runs `CREATE TABLE`: execute the
@@ -165,6 +182,8 @@ fn create_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableR
         schema_name: None,
         name: name.to_string(),
         columns,
+        partitioned_by: Vec::new(),
+        sorted_by: Vec::new(),
         options,
         if_not_exists: false,
     }
@@ -178,6 +197,8 @@ fn empty_request(name: &str, columns: Vec<Column>) -> CreateTableRequest {
         schema_name: None,
         name: name.to_string(),
         columns,
+        partitioned_by: Vec::new(),
+        sorted_by: Vec::new(),
         options: HashMap::new(),
         if_not_exists: false,
     }
@@ -223,7 +244,11 @@ fn constant_comparison(
 // Row groups that survive `table`'s pushed-down predicates over the table's
 // current files (what `compile` would scan). Pruning is a pure in-memory filter
 // — no dispatcher needed.
-fn row_group_count(datastore: &PivotlakeDatastore, name: &str, table: &TableBinding) -> usize {
+fn row_group_count(
+    datastore: &PivotlakeDatastore,
+    name: &str,
+    table: &ParquetTableBinding,
+) -> usize {
     table
         .pruned_parquet(&current_parquet(datastore, name))
         .row_groups()
@@ -250,6 +275,7 @@ fn create_table_succeeds_with_valid_path() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
 }
@@ -258,6 +284,7 @@ fn create_table_succeeds_with_valid_path() {
 fn create_table_is_durable_and_visible_only_after_commit() {
     let (dir, columns) = three_row_table();
     let (database, datastore) = empty_datastore();
+    let manifest_at_open = read_manifest(database.path());
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(create_request("t", dir.path(), columns))
@@ -275,9 +302,11 @@ fn create_table_is_durable_and_visible_only_after_commit() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_none()
     );
     assert!(durable_datastore_entries(database.path()).is_empty());
+    assert_eq!(read_manifest(database.path()), manifest_at_open);
 
     commit_datastore_transaction(transaction).unwrap();
 
@@ -289,6 +318,7 @@ fn create_table_is_durable_and_visible_only_after_commit() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
     assert!(
@@ -304,6 +334,7 @@ fn create_table_is_durable_and_visible_only_after_commit() {
 fn rolling_back_create_table_discards_the_staged_creation() {
     let (dir, columns) = three_row_table();
     let (database, datastore) = empty_datastore();
+    let manifest_at_open = read_manifest(database.path());
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(create_request("t", dir.path(), columns))
@@ -323,10 +354,12 @@ fn rolling_back_create_table_discards_the_staged_creation() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_none()
     );
     assert!(!dir.path().join("_delta_log").exists());
     assert!(durable_datastore_entries(database.path()).is_empty());
+    assert_eq!(read_manifest(database.path()), manifest_at_open);
 }
 
 #[test]
@@ -358,6 +391,8 @@ fn create_table_if_not_exists_keeps_the_existing_table() {
         schema_name: None,
         name: "t".to_string(),
         columns,
+        partitioned_by: Vec::new(),
+        sorted_by: Vec::new(),
         options: HashMap::new(),
         if_not_exists: true,
     };
@@ -375,6 +410,8 @@ fn create_table_without_a_path_makes_an_empty_table() {
         schema_name: None,
         name: "t".to_string(),
         columns,
+        partitioned_by: Vec::new(),
+        sorted_by: Vec::new(),
         options: HashMap::new(),
         if_not_exists: false,
     };
@@ -388,6 +425,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
                 DEFAULT_DATASTORE_NAME,
                 &SchemaQualifiedTableName::in_default_schema("t"),
             )
+            .unwrap()
             .is_some()
     );
     assert!(current_parquet(&datastore, "t").row_groups().is_empty());
@@ -398,9 +436,13 @@ fn opening_an_unwritable_database_fails() {
     // Opening takes and records the datastore lock before loading catalog state,
     // so an unwritable root is rejected immediately.
     let bogus = "/definitely/not/a/real/path/for/datastore/tests";
-    let err = PivotlakeDatastore::open(bogus, &dispatcher())
-        .unwrap_err()
-        .to_string();
+    let err = PivotlakeDatastore::open_with_format(
+        bogus,
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap_err()
+    .to_string();
 
     let err_lower = err.to_lowercase();
     assert!(
@@ -435,6 +477,8 @@ fn create_table_rejects_a_url_path() {
         schema_name: None,
         name: "t".to_string(),
         columns,
+        partitioned_by: Vec::new(),
+        sorted_by: Vec::new(),
         options: HashMap::from([(
             "with_pre_existing_parquets".to_string(),
             "s3://bucket/data".to_string(),
@@ -461,6 +505,8 @@ fn create_table_rejects_an_unknown_option() {
         schema_name: None,
         name: "t".to_string(),
         columns,
+        partitioned_by: Vec::new(),
+        sorted_by: Vec::new(),
         options: HashMap::from([(
             "path".to_string(),
             dir.path().to_string_lossy().into_owned(),
@@ -512,7 +558,8 @@ fn pushdown_filter_always_returns_false() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     let pushed = table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
@@ -532,7 +579,8 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
 
     table
@@ -722,7 +770,8 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     first
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
@@ -736,7 +785,8 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     assert_eq!(row_group_count(&datastore, "t", &second), 3);
 }
 
@@ -754,7 +804,8 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_eq_filter(0, int_constant(999)))
         .unwrap();
@@ -775,7 +826,8 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -794,7 +846,8 @@ fn pushdown_filter_eq_returns_false() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     let pushed = table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -814,7 +867,8 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_neq_filter(0, int_constant(999)))
         .unwrap();
@@ -1240,7 +1294,9 @@ fn unsigned_partition_column_round_trips() {
                     col_type: Type::Int32,
                 },
             ],
-            options: HashMap::from([("partition_by".to_string(), "bucket".to_string())]),
+            partitioned_by: vec!["bucket".to_string()],
+            sorted_by: Vec::new(),
+            options: HashMap::new(),
             if_not_exists: false,
         },
     )
@@ -1266,6 +1322,8 @@ fn insert_files_reach_the_log_only_when_the_transaction_commits() {
                 name: "id".to_string(),
                 col_type: Type::Int32,
             }],
+            partitioned_by: Vec::new(),
+            sorted_by: Vec::new(),
             options: HashMap::new(),
             if_not_exists: false,
         },
@@ -1334,6 +1392,8 @@ fn a_rolled_back_insert_removes_the_files_it_uploaded() {
                 name: "id".to_string(),
                 col_type: Type::Int32,
             }],
+            partitioned_by: Vec::new(),
+            sorted_by: Vec::new(),
             options: HashMap::new(),
             if_not_exists: false,
         },
@@ -1444,14 +1504,14 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
-    let added = vec![datastore_pivotlake::DeltaFileEntry::new(
+    let added = vec![datastore_pivotlake::FileEntry::new(
         datastore_pivotlake::FileRef {
             path: ObjectPath::new(merged.to_str().unwrap()),
             size: merged_size,
         },
     )];
     // A losing compacter clones the table out at the version where the inputs
-    // are present, before the winning swap lands.
+    // are present, before the winning swap is committed.
     let mut loser = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
@@ -1462,14 +1522,20 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     winner.refresh().unwrap();
     // The two inputs under the paths the table records them by: the adopted file
     // absolutely, the appended one relative to the table's own location.
-    let removed: Vec<ObjectPath> = winner.file_refs().into_iter().map(|f| f.path).collect();
+    let removed: Vec<ObjectPath> = winner
+        .file_refs()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
     winner.replace_data_files(&removed, &added).unwrap();
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh and returns a typed commit-conflict error.
-    let loser_added = vec![datastore_pivotlake::DeltaFileEntry::new(
+    let loser_merged = write_ids(dir.path(), "merged-loser.parquet", &[10, 20, 30, 40]);
+    let loser_added = vec![datastore_pivotlake::FileEntry::new(
         datastore_pivotlake::FileRef {
-            path: ObjectPath::new("merged-loser.parquet"),
-            size: merged_size,
+            path: ObjectPath::new(loser_merged.to_str().unwrap()),
+            size: std::fs::metadata(&loser_merged).unwrap().len(),
         },
     )];
     let loser_result = loser.replace_data_files(&removed, &loser_added);
@@ -1489,7 +1555,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 
 /// A writer's copy carries its own Delta snapshot forward across commits: each
 /// commit rides the snapshot the previous one produced, so the copy commits
-/// again and again with no reload in between and every commit lands exactly one
+/// again and again with no reload in between and every commit is exactly one
 /// version on.
 #[test]
 fn one_copy_commits_repeatedly_without_reloading_between_commits() {
@@ -1511,7 +1577,7 @@ fn one_copy_commits_repeatedly_without_reloading_between_commits() {
 
     assert_eq!(table.version(), start + 3);
     assert_eq!(
-        table.file_refs().len(),
+        table.file_refs().unwrap().len(),
         4,
         "the seed file plus three appends"
     );
@@ -1542,7 +1608,7 @@ fn a_refresh_advances_a_copy_onto_another_copys_commit() {
     );
     assert!(reader.refresh().unwrap(), "the refresh advances us onto it");
     assert_eq!(reader.version(), start + 1);
-    assert_eq!(reader.file_refs().len(), 2);
+    assert_eq!(reader.file_refs().unwrap().len(), 2);
     assert!(
         !reader.refresh().unwrap(),
         "a current copy does not advance"
@@ -1564,28 +1630,30 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
         .unwrap();
     let version = reader.version();
 
-    // Another writer commits an `Add` for a file that is not in the store, so
-    // any copy reloading onto that version fails to read its footer.
+    // Another writer commits an `Add` for a file that then leaves the store,
+    // so any copy reloading onto that version fails to read its footer.
     let mut writer = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
-    let absent = vec![datastore_pivotlake::DeltaFileEntry::new(
+    let removed_after_commit = write_ids(dir.path(), "removed-after-commit.parquet", &[40]);
+    let added = vec![datastore_pivotlake::FileEntry::new(
         datastore_pivotlake::FileRef {
-            path: ObjectPath::new("absent.parquet"),
-            size: 1,
+            path: ObjectPath::new(removed_after_commit.to_str().unwrap()),
+            size: std::fs::metadata(&removed_after_commit).unwrap().len(),
         },
     )];
-    assert!(writer.replace_data_files(&[], &absent).is_err());
+    writer.replace_data_files(&[], &added).unwrap();
+    std::fs::remove_file(&removed_after_commit).unwrap();
 
     assert!(reader.refresh().is_err());
     assert_eq!(reader.version(), version, "the copy stays at its version");
     assert_eq!(
-        reader.file_refs().len(),
+        reader.file_refs().unwrap().len(),
         1,
         "with the files of that version"
     );
     assert_eq!(
-        reader.build_scan_view(&[], &[]).unwrap().row_groups().len(),
+        reader.select_scan(&[]).unwrap().row_groups().len(),
         3,
         "and still scans them"
     );
@@ -1594,7 +1662,7 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
 /// Compaction merges a table's small files into one target-sized file over the
 /// async upload path and swaps them in, preserving every row in one commit.
 #[test]
-fn compact_table_files_merges_small_files_into_one() {
+fn a_final_round_merges_small_files_into_one() {
     let columns = vec![Column {
         name: "id".to_string(),
         col_type: Type::Int32,
@@ -1603,23 +1671,12 @@ fn compact_table_files_merges_small_files_into_one() {
     create_table(&datastore, empty_request("t", columns)).unwrap();
     run_sql(&datastore, "INSERT INTO t VALUES (10), (20), (30)");
     run_sql(&datastore, "INSERT INTO t VALUES (40), (50)");
+    let name = SchemaQualifiedTableName::in_default_schema("t");
 
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
-    table.refresh().unwrap();
-    let inputs = table.file_refs();
-    assert_eq!(inputs.len(), 2, "two inserts wrote two files");
-    let merged = datastore_pivotlake::compact_table_files(
-        &datastore,
-        table.id(),
-        &inputs,
-        128 * 1024,
-        128 * 1024,
-    )
-    .unwrap();
+    common::run_final_round(&datastore, &name).unwrap();
 
-    assert_eq!(merged.len(), 1, "the two inputs merge into one file");
+    let files = datastore.table_files(&name).unwrap().unwrap();
+    assert_eq!(files.len(), 1, "the two inputs merge into one file");
     let parquet = current_parquet(&datastore, "t");
     assert_eq!(parquet.row_groups().len(), 1);
     assert_eq!(parquet.row_groups()[0].num_rows, 5);
@@ -1629,17 +1686,15 @@ fn compact_table_files_merges_small_files_into_one() {
 /// output. The output is not referenced by any log version, so it must be
 /// deleted before the error escapes.
 #[test]
-fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
+fn a_final_round_deletes_uploaded_outputs_when_the_delta_commit_fails() {
     let (dir, columns) = three_row_table();
+    // A second file beside the first, so the round has two to merge.
+    let adopted = common::parquet_files_in(dir.path());
+    std::fs::copy(&adopted[0], dir.path().join("second.parquet")).unwrap();
     let (database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
     let table_dir = table_dir(&database, &datastore, "t");
-
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
-    table.refresh().unwrap();
-    let inputs = table.file_refs();
+    let name = SchemaQualifiedTableName::in_default_schema("t");
 
     // Replace the Delta log directory with a file so the data upload succeeds
     // but creating the next commit version fails.
@@ -1647,13 +1702,7 @@ fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     let saved_delta_log = table_dir.join("_delta_log.saved");
     std::fs::rename(&delta_log, &saved_delta_log).unwrap();
     File::create(&delta_log).unwrap();
-    let result = datastore_pivotlake::compact_table_files(
-        &datastore,
-        table.id(),
-        &inputs,
-        128 * 1024,
-        128 * 1024,
-    );
+    let result = common::run_final_round(&datastore, &name);
     std::fs::remove_file(&delta_log).unwrap();
     std::fs::rename(&saved_delta_log, &delta_log).unwrap();
 
@@ -1685,7 +1734,8 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -1705,14 +1755,128 @@ fn reopened_database_restores_appended_files_from_manifest() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            &dispatcher(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
         create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
         let new_file = write_ids(data_dir.path(), "later.parquet", &[40]);
         append(&datastore, "t", &new_file);
     }
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     assert_eq!(current_parquet(&reopened, "t").row_groups().len(), 4);
+}
+
+/// The names of the files of the table `name`, in the order maintenance
+/// holds them.
+fn list_file_names_in_maintenance_order(datastore: &PivotlakeDatastore, name: &str) -> Vec<String> {
+    let files = datastore
+        .table_files_in_maintenance_order(&SchemaQualifiedTableName::in_default_schema(name))
+        .unwrap()
+        .unwrap();
+    files
+        .iter()
+        .map(|file| file.path.name().to_string())
+        .collect()
+}
+
+#[test]
+fn a_delta_tables_files_are_listed_in_the_order_of_their_paths() {
+    let (data_dir, columns) = three_row_table();
+    let db = TempDir::new().unwrap();
+    let open = || {
+        PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            &dispatcher(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap()
+    };
+    let datastore = open();
+    create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
+    append(
+        &datastore,
+        "t",
+        &write_ids(data_dir.path(), "zebra.parquet", &[40]),
+    );
+
+    append(
+        &datastore,
+        "t",
+        &write_ids(data_dir.path(), "apple.parquet", &[50]),
+    );
+
+    let list_paths = |datastore: &PivotlakeDatastore| -> Vec<String> {
+        let name = SchemaQualifiedTableName::in_default_schema("t");
+        let files = datastore.table_files(&name).unwrap().unwrap();
+        files.iter().map(|file| file.path.to_string()).collect()
+    };
+    let listed = list_paths(&datastore);
+    let mut by_path = listed.clone();
+    by_path.sort_unstable();
+    assert_eq!(listed, by_path);
+    assert!(listed[1].ends_with("apple.parquet") && listed[2].ends_with("zebra.parquet"));
+    drop(datastore);
+    assert_eq!(list_paths(&open()), by_path);
+}
+
+#[test]
+fn an_unsorted_tables_files_stand_in_the_order_they_were_committed_in() {
+    let (data_dir, columns) = three_row_table();
+    let db = TempDir::new().unwrap();
+    let open = || {
+        PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            &dispatcher(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap()
+    };
+    let datastore = open();
+    create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
+    append(
+        &datastore,
+        "t",
+        &write_ids(data_dir.path(), "zebra.parquet", &[40]),
+    );
+
+    append(
+        &datastore,
+        "t",
+        &write_ids(data_dir.path(), "apple.parquet", &[50]),
+    );
+
+    let in_commit_order = ["data.parquet", "zebra.parquet", "apple.parquet"];
+    let listed = list_file_names_in_maintenance_order(&datastore, "t");
+    assert_eq!(listed, in_commit_order);
+    drop(datastore);
+    let listed_again = list_file_names_in_maintenance_order(&open(), "t");
+    assert_eq!(listed_again, in_commit_order);
+}
+
+#[test]
+fn a_sorted_tables_files_stand_by_where_they_start_on_the_sort_key() {
+    let (_, columns) = three_row_table();
+    let data_dir = TempDir::new().unwrap();
+    write_ids(data_dir.path(), "a_high.parquet", &[1000, 1001]);
+    write_ids(data_dir.path(), "b_low.parquet", &[1, 2]);
+    let (_database, datastore) = empty_datastore();
+    let mut request = create_request("t", data_dir.path(), columns);
+    request.sorted_by = vec!["id".to_string()];
+
+    create_table(&datastore, request).unwrap();
+
+    assert_eq!(
+        list_file_names_in_maintenance_order(&datastore, "t"),
+        ["b_low.parquet", "a_high.parquet"]
+    );
 }
 
 /// Delta has no native sort spec, so `sort_by` rides in the table metadata's
@@ -1722,16 +1886,23 @@ fn reopened_database_restores_sort_by() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore =
-            PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            db.path().to_str().unwrap(),
+            &dispatcher(),
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
         let mut request = create_request("t", data_dir.path(), columns);
-        request
-            .options
-            .insert("sort_by".to_string(), "id".to_string());
+        request.sorted_by = vec!["id".to_string()];
         create_table(&datastore, request).unwrap();
     }
 
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
 
     assert_eq!(
         reopened
@@ -1748,7 +1919,12 @@ fn reopened_database_restores_sort_by() {
 fn unlogged_leftover_file_is_invisible_after_swap() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
-    let datastore = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
 
     // "Compact" the adopted file into merged.parquet but crash before deleting
@@ -1756,9 +1932,14 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     let mut table = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
-    let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
+    let inputs: Vec<ObjectPath> = table
+        .file_refs()
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
-    let added = vec![datastore_pivotlake::DeltaFileEntry::new(
+    let added = vec![datastore_pivotlake::FileEntry::new(
         datastore_pivotlake::FileRef {
             path: ObjectPath::new(merged.to_str().unwrap()),
             size: std::fs::metadata(&merged).unwrap().len(),
@@ -1768,7 +1949,12 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
 
     drop(table);
     drop(datastore);
-    let reopened = PivotlakeDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotlakeDatastore::open_with_format(
+        db.path().to_str().unwrap(),
+        &dispatcher(),
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let parquet = current_parquet(&reopened, "t");
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the committed merged file is read");
@@ -1806,7 +1992,7 @@ fn write_ids_one_group_each(dir: &Path, file_name: &str, ids: &[i32]) {
 /// A file whose every row group shares one partition value is fully pruned by a
 /// filter on the partition column: each row group has min == max == that value,
 /// so the existing min/max stats prune drops the whole irrelevant file without
-/// any partition-specific read path. This is why partition_by needs no special
+/// any partition-specific read path. This is why partitioning needs no special
 /// pruning today — one-partition-per-file makes it fall out of stats pruning.
 #[test]
 fn filter_on_partition_column_prunes_whole_single_partition_file() {
@@ -1827,7 +2013,8 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("t"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     assert_eq!(row_group_count(&datastore, "t", &table), 6);
 
     table
@@ -1861,7 +2048,9 @@ fn table_partitioned_by_name() -> (TempDir, TempDir, Arc<PivotlakeDatastore>) {
                 col_type: Type::Utf8,
             },
         ],
-        options: HashMap::from([("partition_by".to_string(), "name".to_string())]),
+        partitioned_by: vec!["name".to_string()],
+        sorted_by: Vec::new(),
+        options: HashMap::new(),
         if_not_exists: false,
     };
     let (database, datastore) = empty_datastore();
@@ -1896,11 +2085,20 @@ fn string_values(name: &str, value: &str) -> HashMap<String, Scalar<ArrayRef>> {
     )])
 }
 
-fn name_eq(value: &str) -> PartitionEqFilter {
-    PartitionEqFilter {
-        column: "name".to_string(),
-        value: Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef),
-    }
+/// `name = value` over the `name` column of [`table_partitioned_by_name`].
+fn name_eq(value: &str) -> Expression {
+    Expression::Compare(Compare {
+        left: Box::new(Expression::Ref(Ref {
+            column_idx: 1,
+            return_type: Type::Utf8,
+            name: None,
+        })),
+        right: Box::new(Expression::Constant(Scalar::new(
+            Arc::new(StringViewArray::from(vec![value])) as ArrayRef,
+        ))),
+        compare_type: CompareType::Equal,
+        return_type: Type::Boolean,
+    })
 }
 
 #[test]
@@ -1911,7 +2109,7 @@ fn partition_filter_builds_only_the_matching_partitions_files() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
         .unwrap();
     table.refresh().unwrap();
-    let kept = table.build_scan_view(&[name_eq("keep")], &[]).unwrap();
+    let kept = table.select_scan(&[name_eq("keep")]).unwrap();
 
     // Only the one-group `keep` file enters the scan view; the three-group
     // `drop` file's partition tuple can't match.
@@ -1926,7 +2124,7 @@ fn no_partition_filter_builds_every_partitions_files() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
         .unwrap();
     table.refresh().unwrap();
-    let all = table.build_scan_view(&[], &[]).unwrap();
+    let all = table.select_scan(&[]).unwrap();
 
     // Without a filter both files are in view: keep's 1 group + drop's 3.
     assert_eq!(all.row_groups().len(), 4);
@@ -1981,20 +2179,15 @@ fn create_over_partitioned_files_stamps_each_file_with_its_partition() {
     ];
     let (_database, datastore) = empty_datastore();
     let mut request = create_request("t", dir.path(), columns);
-    request
-        .options
-        .insert("partition_by".to_string(), "part".to_string());
+    request.partitioned_by = vec!["part".to_string()];
     create_table(&datastore, request).unwrap();
 
     let mut table = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
     table.refresh().unwrap();
-    let part_is_one = PartitionEqFilter {
-        column: "part".to_string(),
-        value: int_constant(1),
-    };
-    let kept = table.build_scan_view(&[part_is_one], &[]).unwrap();
+    let part_is_one = col_eq_filter(0, int_constant(1));
+    let kept = table.select_scan(&[part_is_one]).unwrap();
 
     // Each discovered file's constant `part` was recorded as its partition, so the
     // part=1 filter drops the part=2 file's three row groups and keeps part=1's.
@@ -2020,6 +2213,8 @@ fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
             schema_name: None,
             name: "t".to_string(),
             columns,
+            partitioned_by: Vec::new(),
+            sorted_by: Vec::new(),
             options: HashMap::new(),
             if_not_exists: false,
         },
@@ -2039,12 +2234,8 @@ fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
     }
     table.refresh().unwrap();
 
-    let id_below_fifty = ColumnStatFilter {
-        column: "id".to_string(),
-        compare_type: CompareType::Less,
-        value: int_constant(50),
-    };
-    let kept = table.build_scan_view(&[], &[id_below_fifty]).unwrap();
+    let id_below_fifty = constant_comparison(0, CompareType::Less, int_constant(50));
+    let kept = table.select_scan(&[id_below_fifty]).unwrap();
 
     // The high file's aggregate min (100) proves no row is `< 50`, so all three
     // of its groups drop before row-group pruning; the low file's three survive.
@@ -2118,7 +2309,7 @@ fn variant_filter(path: &[&str], cmp: CompareType, value: i64) -> Expression {
     })
 }
 
-fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<PivotlakeDatastore>, TableBinding) {
+fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<PivotlakeDatastore>, ParquetTableBinding) {
     let (database, datastore) = empty_datastore();
     let columns = vec![Column {
         name: "doc".to_string(),
@@ -2132,7 +2323,8 @@ fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<PivotlakeDatastore>, Tab
             DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema("docs"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("the table exists");
     (database, datastore, binding)
 }
 

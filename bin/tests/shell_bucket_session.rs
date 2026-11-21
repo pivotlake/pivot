@@ -64,7 +64,7 @@ fn write_then_reopen(location: &str) -> Vec<i64> {
         )
         .await;
     });
-    drop(instance);
+    runtime.block_on(instance.shutdown());
 
     let reopened = runtime
         .block_on(async {

@@ -164,14 +164,18 @@ required, including when serving one local directory. Exactly one datastore must
 becomes the current database (the target of unqualified table names). Every
 datastore is attached as a database of its own name, so a query reads any other
 one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
-implementation (`pivotlake` or `iceberg`); the storage backend is inferred from `location` (a plain
+implementation (`pivotlake` or `iceberg`); a pivotlake datastore's `table_format` (`iceberg`, the default, or
+`delta`) is the table format a new database is created in; the storage backend is inferred from `location` (a plain
 path is local, an `s3://` URI is S3, a `gs://` URI is Google Cloud Storage).
-Compaction is configured per datastore with `compact`. `compact_bytes` targets
+Compaction is configured per pivotlake datastore with `compact`; an `iceberg`
+datastore takes no compaction keys, since Pivot does not compact the tables of
+a REST catalog. `compact_bytes` targets
 the compaction output size; files strictly below half that size are small-file
 candidates, while an individual row group may exceed the target.
-`compact_merge_bytes` sets the accumulated small-file bytes that immediately
-trigger a merge (by default 1.3 times `compact_bytes`), and
-`compact_min_files` sets when the balance fallback is allowed (100 by default).
+`compact_merge_bytes` caps the bytes the small files of one merge hold between
+them (by default 5 times `compact_bytes`; a merge writes as many files of
+`compact_bytes` as their rows fill), and
+`compact_min_files` sets the fewest small files one merge takes (2 by default).
 `compact_parallelism` limits concurrent, disjoint merge rewrites (1 by default);
 each merge in flight holds its decoded input rows in memory. Compaction is on by
 default and should run in only one process per datastore (set `compact: false`
@@ -188,8 +192,8 @@ datastores:
     location: s3://analytics/warm/            # S3 store
     compact: true                             # this datastore compacts itself
     compact_bytes: 128m
-    compact_merge_bytes: 192m
-    compact_min_files: 100
+    compact_merge_bytes: 640m
+    compact_min_files: 2
     compact_parallelism: 3
   cold:
     kind: pivotlake
@@ -207,7 +211,7 @@ Pivot holds `.pivot.lock` in that directory until shutdown and reports the
 owning PID if another process tries to open it.
 
 `datastore_refresh_interval` sets how often each datastore brings itself up
-to date with the store: new Delta versions, new files' footers, and, for shared
+to date with the store: new table versions, new files' footers, and, for shared
 remote stores, tables committed by other processes. It bounds how stale a query's view of externally committed data can
 be; this process's own INSERT and compaction publish their commits immediately.
 

@@ -925,6 +925,26 @@ impl<'plan> CreateTable<'plan> {
             .collect()
     }
 
+    /// The terms of the statement's `PARTITIONED BY (...)` clause, in the
+    /// order written, each a column by its name or a transform by its name
+    /// over its arguments (`day(ts)`, `bucket(16, id)`); none when the
+    /// statement has no such clause.
+    pub fn partitioned_by(self) -> Result<Vec<String>> {
+        (0..ffi::lo_create_partition_key_count(self.raw)?)
+            .map(|i| Ok(ffi::lo_create_partition_key(self.raw, i)?))
+            .collect()
+    }
+
+    /// The columns of the statement's `SORTED BY (...)` clause, by name, in
+    /// the order written; none when the statement has no such clause. A key
+    /// that is not a column is an error naming it. The clause's grammar takes
+    /// bare expressions, so a key carries no direction and no NULL ordering.
+    pub fn sorted_by(self) -> Result<Vec<String>> {
+        (0..ffi::lo_create_sort_key_count(self.raw)?)
+            .map(|i| Ok(ffi::lo_create_sort_key(self.raw, i)?))
+            .collect()
+    }
+
     pub fn if_not_exists(self) -> Result<bool> {
         Ok(ffi::lo_create_if_not_exists(self.raw)?)
     }

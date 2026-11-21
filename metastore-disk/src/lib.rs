@@ -20,18 +20,22 @@
 //! is the operator's, and the metastore file is the server's own to rewrite
 //! (which is exactly serialising its section back out).
 //!
-//! `kind` selects the datastore implementation: `pivot`, or `iceberg` for the
-//! read-only tables of an Iceberg REST catalog. A `pivot` datastore's storage
-//! backend is chosen from `location`: a plain path (or `file://`) opens a local
-//! store, an `s3://` URI opens an S3 store, a `gs://` URI opens a Google Cloud
-//! Storage store. An `iceberg` datastore names its catalog by `uri` (and
-//! `warehouse`, when the catalog serves several), names the `iceberg` secret it
-//! authenticates to the catalog with by `secret`, and reads the tables' files
-//! from wherever the catalog says they are; it asks the catalog what it holds
-//! on the same refresh interval a `pivot` datastore rereads its store on. A
-//! datastore carries no credentials
-//! of its own; they come from the `secrets` section below, storage secrets
-//! matched to the files' locations and catalog secrets named by the datastore.
+//! `kind` selects the datastore implementation: `pivotlake` (also accepted as
+//! `pivot`), or `iceberg` for the tables of an Iceberg REST catalog.
+//! A `pivotlake` datastore's storage backend is chosen from `location`: a
+//! plain path (or `file://`) opens a local store, an `s3://` URI opens an S3
+//! store, a `gs://` URI opens a Google Cloud Storage store. Its tables are
+//! kept in the table format the database records: `table_format` names the one a
+//! database that does not exist yet is created in (`iceberg` unless it says
+//! `delta`), and an existing database keeps the format it was created in. An
+//! `iceberg` datastore names its catalog by `uri` (and `warehouse`, when the
+//! catalog serves several), names the `iceberg` secret it authenticates to
+//! the catalog with by `secret`, and reads the tables' files from wherever
+//! the catalog says they are; it asks the catalog what it holds on the same
+//! refresh interval a `pivotlake` datastore rereads its store on. A datastore
+//! carries no credentials of its own; they come from the `secrets` section
+//! below, storage secrets matched to the files' locations and catalog secrets
+//! named by the datastore.
 //!
 //! Exactly one datastore must set `default = true`; it becomes the current
 //! database, so unqualified table names and DDL resolve against it. Its name is
@@ -150,8 +154,9 @@ use catalog::metastore::{
 use datastore_iceberg::{IcebergCatalogAuth, IcebergCatalogConfig, IcebergDatastore};
 use datastore_pivotlake::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
-    DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, MaintenanceConfig,
-    PivotlakeDatastore, VacuumConfig, default_merge_target_bytes,
+    DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_TABLE_METADATA_CACHE_BYTES,
+    DEFAULT_VACUUM_POLL, MaintenanceConfig, PivotlakeDatastore, TableFormat, TableMetadataCache,
+    VacuumConfig, default_max_merge_input_bytes,
 };
 use dispatch::DataFlowDispatcher;
 use object_storage::{
@@ -190,6 +195,10 @@ pub struct DiskMetastore {
     /// server takes from its own section); compaction, in contrast, is
     /// configured per datastore.
     refresh_interval: Duration,
+    /// The one cache the Iceberg tables of every datastore this metastore
+    /// opens keep their footers and the parts of their manifests in, so
+    /// all of them share one budget of memory.
+    table_metadata_cache: Arc<TableMetadataCache>,
 }
 
 /// Opens external read-only stores with the same scoped-secret policy as a
@@ -248,6 +257,7 @@ impl DiskMetastore {
             secrets,
             default_name,
             refresh_interval,
+            table_metadata_cache: TableMetadataCache::new(DEFAULT_TABLE_METADATA_CACHE_BYTES),
         })
     }
 
@@ -319,13 +329,20 @@ impl DiskMetastore {
                             compaction: config.compaction(),
                             vacuum: config.vacuum(),
                         };
-                        PivotlakeDatastore::from_store(store, dispatcher, Some(maintenance))?
+                        PivotlakeDatastore::from_store(
+                            store,
+                            dispatcher,
+                            Some(maintenance),
+                            config.table_format,
+                            Arc::clone(&self.table_metadata_cache),
+                        )?
                     }
                     DatastoreConfig::Iceberg(config) => IcebergDatastore::open(
                         &config.catalog_config(name, &self.secrets)?,
                         self.external_store_factory(),
                         dispatcher,
                         self.refresh_interval,
+                        Arc::clone(&self.table_metadata_cache),
                     )?,
                 };
                 Ok((name.clone(), datastore))
@@ -677,15 +694,16 @@ impl DatastoreConfig {
     }
 }
 
-/// The read-only tables of an Iceberg REST catalog. The catalog is named by
-/// `uri` and authenticated to with the `iceberg` secret `secret` names, when it
-/// requires one; the tables' files are read from the locations the catalog
-/// reports, with the credentials the catalog vends or those of the storage
-/// secret scoped to each location.
+/// An Iceberg datastore: the tables of a REST catalog, read and written
+/// through it. The catalog
+/// is authenticated to with the `iceberg` secret `secret` names, when it
+/// requires one, and the tables' files are read from and written to the locations the
+/// catalog reports, with the credentials the catalog vends or those of the
+/// storage secret scoped to each location.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IcebergDatastoreConfig {
-    /// The catalog's base URI, such as `https://catalog.example.com/api`.
+    /// The REST catalog's base URI, such as `https://catalog.example.com/api`.
     uri: String,
     /// The warehouse to serve, when the catalog serves several.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -717,6 +735,7 @@ impl IcebergDatastoreConfig {
             .transpose()
     }
 
+    /// The REST catalog configuration of this entry.
     fn catalog_config(&self, datastore: &str, secrets: &Secrets) -> Result<IcebergCatalogConfig> {
         Ok(IcebergCatalogConfig {
             uri: self.uri.clone(),
@@ -735,6 +754,12 @@ impl IcebergDatastoreConfig {
 #[serde(deny_unknown_fields)]
 pub struct PivotlakeDatastoreConfig {
     location: String,
+    /// The table format a database that does not exist yet at `location` is
+    /// created in: `iceberg` (the default) or `delta` (also spelled
+    /// `deltalake`). An existing database keeps the format it was created
+    /// in, recorded in its index; naming the other one fails at open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    table_format: Option<TableFormat>,
     /// Marks this datastore as the default: the current database, the target of
     /// unqualified table names and DDL. Exactly one datastore must set it.
     #[serde(rename = "default", default)]
@@ -751,12 +776,13 @@ pub struct PivotlakeDatastoreConfig {
     /// [`DEFAULT_COMPACT_BYTES`].
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_bytes: Option<ByteSize>,
-    /// Accumulated small-file bytes that immediately trigger a merge. Defaults
-    /// to 1.3 times `compact_bytes`.
+    /// The most bytes the small files one merge rewrites may hold between
+    /// them; a merge writes as many files of `compact_bytes` as their rows
+    /// fill. Defaults to 5 times `compact_bytes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_merge_bytes: Option<ByteSize>,
-    /// Count at which sub-target small files may use the balance fallback.
-    /// Defaults to [`DEFAULT_MIN_FILES_TO_MERGE`].
+    /// The fewest small files one merge takes. Defaults to
+    /// [`DEFAULT_MIN_FILES_TO_MERGE`], any two.
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_min_files: Option<usize>,
     /// How many merges this datastore rewrites at once (such as `3`). Which
@@ -792,10 +818,10 @@ impl PivotlakeDatastoreConfig {
             .unwrap_or(DEFAULT_COMPACT_BYTES);
         Some(CompactionConfig {
             target_bytes,
-            merge_target_bytes: self
+            max_merge_input_bytes: self
                 .compact_merge_bytes
                 .map(ByteSize::as_bytes)
-                .unwrap_or_else(|| default_merge_target_bytes(target_bytes)),
+                .unwrap_or_else(|| default_max_merge_input_bytes(target_bytes)),
             min_files: self.compact_min_files.unwrap_or(DEFAULT_MIN_FILES_TO_MERGE),
             max_concurrent_merges: self
                 .compact_parallelism
@@ -974,7 +1000,7 @@ datastores:
         // Compaction is on by default (hot omits `compact`), and off only where a
         // datastore turns it off explicitly (warm).
         assert_eq!(hot.target_bytes, 128 * 1024 * 1024);
-        assert_eq!(hot.merge_target_bytes, 160 * 1024 * 1024);
+        assert_eq!(hot.max_merge_input_bytes, 160 * 1024 * 1024);
         assert_eq!(hot.min_files, 42);
         assert_eq!(hot.max_concurrent_merges, 7);
         assert!(warm.is_none());
@@ -988,8 +1014,8 @@ datastores:
 
         assert_eq!(config.target_bytes, DEFAULT_COMPACT_BYTES);
         assert_eq!(
-            config.merge_target_bytes,
-            default_merge_target_bytes(DEFAULT_COMPACT_BYTES)
+            config.max_merge_input_bytes,
+            default_max_merge_input_bytes(DEFAULT_COMPACT_BYTES)
         );
         assert_eq!(config.min_files, DEFAULT_MIN_FILES_TO_MERGE);
         assert_eq!(config.max_concurrent_merges, DEFAULT_COMPACT_PARALLELISM);

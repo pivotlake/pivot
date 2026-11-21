@@ -17,7 +17,7 @@ use planner::expression::Expression;
 use planner::types::{Type, type_from_physical};
 
 use crate::{
-    ParquetTable, PushedPredicate, is_variant_field, materialize, prune_parquet,
+    ParquetTable, PushedPredicate, is_variant_field, materialize,
     table_input_with_filter_and_eq_predicates,
 };
 use object_storage::{
@@ -105,7 +105,7 @@ impl BoundTable for ExternalParquetTable {
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         let equality_predicates = crate::equality_predicates(&self.predicates);
-        let parquet = Arc::new(prune_parquet(&self.parquet, &self.predicates));
+        let parquet = Arc::new(self.parquet.prune_row_groups(&self.predicates));
         Ok(table_input_with_filter_and_eq_predicates(
             dispatcher,
             &parquet,
@@ -140,7 +140,7 @@ impl BoundTable for ExternalParquetTable {
         // renumber them.
         Ok(materialize(
             input,
-            Arc::new(prune_parquet(&self.parquet, &self.predicates)),
+            Arc::new(self.parquet.prune_row_groups(&self.predicates)),
             projection,
         ))
     }
@@ -286,7 +286,7 @@ impl ParquetLocationPattern {
             let mut matched = Vec::new();
             for directory in directories {
                 for prefix in store
-                    .list_with_name_prefix(&directory, literal_prefix(segment))?
+                    .list_filtered(&directory, literal_prefix(segment), None)?
                     .prefixes
                 {
                     if wildcard_segment_matches(segment, prefix.as_str()) {
@@ -300,7 +300,7 @@ impl ParquetLocationPattern {
         let mut files = Vec::new();
         for directory in directories {
             for object in store
-                .list_with_name_prefix(&directory, literal_prefix(filename_pattern))?
+                .list_filtered(&directory, literal_prefix(filename_pattern), None)?
                 .objects
             {
                 if !wildcard_segment_matches(filename_pattern, object.file.path.as_str()) {

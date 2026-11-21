@@ -116,8 +116,9 @@ pub struct Server {
     query_executor: Arc<crate::execution::Executor>,
     /// Every datastore, presented as one composite catalog. Query binding
     /// starts here. [`serve`](Self::serve) starts each datastore's
-    /// background maintenance when it begins serving and aborts it on shutdown,
-    /// before the worker pool is torn down.
+    /// background maintenance when it begins serving, and on shutdown stops it
+    /// and waits for it to finish, before the worker pool is torn down. When
+    /// a worker exits by itself it only tells the maintenance to stop.
     catalog: Arc<PivotCatalog>,
     /// The metastore consulted for every connection's current user and
     /// authentication method.
@@ -176,11 +177,16 @@ impl Server {
 
     /// Run the accept loop until `shutdown` resolves or a worker exits.
     ///
-    /// On `shutdown`, we flip the shared exit flag (the `Arc<AtomicBool>` we
-    /// took from `Dispatch::into_parts`) and then await the worker-watcher
-    /// tasks; they unblock once every worker observes the flag. The wait is
-    /// short (a few worker-loop iterations) and bounded by the longest-running
-    /// in-flight query.
+    /// On `shutdown`, we stop every datastore's background maintenance and
+    /// wait for the sweeps in flight to finish, flip the shared exit flag (the
+    /// `Arc<AtomicBool>` we took from `Dispatch::into_parts`) and then await
+    /// the worker-watcher tasks; they unblock once every worker observes the
+    /// flag. That last wait is short (a few worker-loop iterations) and
+    /// bounded by the longest-running in-flight query.
+    ///
+    /// A worker exits by itself only when the server has crashed. The
+    /// maintenance is then told to stop and not waited for, the exit flag is
+    /// flipped, and the worker's failure is returned.
     pub async fn serve(
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
@@ -205,10 +211,10 @@ impl Server {
                 biased;
                 _ = &mut shutdown => {
                     info!("shutdown signalled, stopping workers");
-                    // Stop each datastore's maintenance *before* tearing down the
-                    // pool, so no refresh/compaction sweep races the workers'
-                    // exit.
-                    self.catalog.abort();
+                    // Stop each datastore's maintenance and wait for it *before*
+                    // tearing down the pool: a refresh, vacuum or compaction
+                    // sweep in flight finishes on the workers it needs.
+                    self.catalog.stop().await;
                     // Flip the shared exit flag: every dispatch worker watches it
                     // and exits.
                     self.shutdown.shutdown();
@@ -218,7 +224,11 @@ impl Server {
                     return Ok(());
                 }
                 Some(joined) = self.worker_watchers.join_next() => {
-                    self.catalog.abort();
+                    // Reached only when the server has crashed: a worker
+                    // exits by itself when its own loop failed or panicked.
+                    // Maintenance is told to stop and not waited for, since
+                    // a sweep in flight may need the worker that is gone.
+                    self.catalog.request_stop();
                     self.shutdown.shutdown();
                     return Err(match joined {
                         Ok(Ok(())) => {

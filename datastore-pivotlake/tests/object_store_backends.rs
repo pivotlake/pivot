@@ -61,6 +61,8 @@ fn adopting_request(name: &str, path: &str) -> CreateTableRequest {
         schema_name: None,
         name: name.to_string(),
         columns: columns(),
+        partitioned_by: Vec::new(),
+        sorted_by: Vec::new(),
         options: HashMap::from([("with_pre_existing_parquets".to_string(), path.to_string())]),
         if_not_exists: false,
     }
@@ -91,7 +93,12 @@ fn create_events(
             .put(&ObjectPath::new(format!("events/{name}")), &pq(values))
             .unwrap();
     }
-    let datastore = PivotlakeDatastore::open(&b.root, d).unwrap();
+    let datastore = PivotlakeDatastore::open_with_format(
+        &b.root,
+        d,
+        Some(datastore_pivotlake::TableFormat::Delta),
+    )
+    .unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(adopting_request("events", "events"))
@@ -159,7 +166,12 @@ mod bodies {
         b.store
             .put(&ObjectPath::new("events/p1.parquet"), &pq(&[1, 2, 3]))
             .unwrap();
-        let datastore = PivotlakeDatastore::open(&b.root, &d).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            &b.root,
+            &d,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -185,7 +197,12 @@ mod bodies {
             .unwrap();
         let absolute = b.store.absolute_key(&ObjectPath::new("outside")).unwrap();
         assert!(absolute.is_absolute(), "the store yields an absolute key");
-        let datastore = PivotlakeDatastore::open(&b.root, &d).unwrap();
+        let datastore = PivotlakeDatastore::open_with_format(
+            &b.root,
+            &d,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -205,7 +222,12 @@ mod bodies {
         let d = dispatch_with_buffers(2, 32);
         drop(create_events(&d, b, &[("p1.parquet", &[1, 2, 3])]));
 
-        let reopened = PivotlakeDatastore::open(&b.root, &d).unwrap();
+        let reopened = PivotlakeDatastore::open_with_format(
+            &b.root,
+            &d,
+            Some(datastore_pivotlake::TableFormat::Delta),
+        )
+        .unwrap();
 
         assert_eq!(scan(&d, &reopened, "events"), vec![1, 2, 3]);
     }
@@ -235,7 +257,12 @@ mod bodies {
             .unwrap();
         // The adopted files are recorded by their store-absolute key; the merged
         // output is written into the table's own location.
-        let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
+        let inputs: Vec<ObjectPath> = table
+            .file_refs()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
         let merged_path = ObjectPath::new("merged.parquet");
         let merged_bytes = pq(&[1, 2, 3, 4]);
         b.store
@@ -250,7 +277,7 @@ mod bodies {
         };
 
         table
-            .replace_data_files(&inputs, &[datastore_pivotlake::DeltaFileEntry::new(merged)])
+            .replace_data_files(&inputs, &[datastore_pivotlake::FileEntry::new(merged)])
             .unwrap();
 
         assert_eq!(scan(&d, &datastore, "events"), vec![1, 2, 3, 4]);
@@ -354,7 +381,7 @@ mod bodies {
 
         let listing = b
             .store
-            .list_with_name_prefix(&ObjectPath::new("n"), "part-")
+            .list_filtered(&ObjectPath::new("n"), "part-", None)
             .unwrap();
 
         let names: Vec<String> = listing
