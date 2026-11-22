@@ -20,6 +20,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 mod backend;
+#[cfg(target_os = "linux")]
+mod dns;
 mod http1;
 mod proto;
 mod tls;
@@ -44,6 +46,12 @@ pub enum Error {
     Tls(#[from] rustls::Error),
     #[error("invalid dns name: {0}")]
     InvalidDnsName(#[from] rustls::pki_types::InvalidDnsNameError),
+    #[cfg(target_os = "linux")]
+    #[error("host lookups cannot start: {0}")]
+    HostResolverSetup(c_ares::Error),
+    #[cfg(target_os = "linux")]
+    #[error("{host} cannot be resolved: {reason}")]
+    HostLookup { host: String, reason: c_ares::Error },
 }
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;

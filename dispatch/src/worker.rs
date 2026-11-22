@@ -680,6 +680,9 @@ impl Worker {
 
             self.process_io_completions()?;
 
+            #[cfg(target_os = "linux")]
+            self.io.borrow_mut().refresh_dns_address_book()?;
+
             self.maybe_spill();
 
             self.saturate_available_io();

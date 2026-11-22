@@ -31,7 +31,6 @@ use crate::memory::{FileBytes, Slab};
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -194,7 +193,7 @@ impl Debug for OpenFile {
 /// token cell.
 pub type AuthHeader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
 
-/// A remote HTTP(S) object, resolved once and reused for every range request
+/// A remote HTTP(S) object, parsed once and reused for every range request
 /// against it.
 ///
 /// Two opens of one object are equal: `Hash`/`Eq` look only at its
@@ -205,11 +204,10 @@ pub type AuthHeader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
 /// The fields are pre-parsed from the URL at [`open`](Self::open) so the request
 /// hot path never re-parses it; the `Url` itself isn't kept.
 pub struct RemoteFile {
-    /// `IP:port`, resolved once at construction (the port lives here too).
-    addr: SocketAddr,
-    /// Bare hostname for TLS SNI — `addr` only carries the IP, and SNI must not
-    /// include a port.
+    /// Bare hostname, without a port. It is what TLS SNI carries and what is
+    /// resolved to an address when a connection to the store is opened.
     host: String,
+    port: u16,
     /// Value for the `Host:` request header: the bare host, plus the port when
     /// the URL carries a non-default one. A presigned URL's SigV4 signature
     /// covers this exact `host` header, so an S3-compatible endpoint on a custom
@@ -238,9 +236,9 @@ pub struct RemoteFile {
 }
 
 impl RemoteFile {
-    /// Parse `url`, resolve its host to a [`SocketAddr`], and intern it. The DNS
-    /// lookup happens here (once) so the per-request hot path never blocks on
-    /// resolution. `auth` supplies a fresh `Authorization` header per request, or
+    /// Parse `url`. The host is not resolved here: an object needs no address
+    /// of its own, only the connection a request for it travels on does.
+    /// `auth` supplies a fresh `Authorization` header per request, or
     /// `None` when the URL carries its own auth; `size` is the object's byte
     /// length (from the store listing), carried so the disk cache can size its
     /// bitmap exactly.
@@ -264,15 +262,6 @@ impl RemoteFile {
         let port = url.port_or_known_default().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "url has no port")
         })?;
-        let addr = (host.as_str(), port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "host resolved to no addresses",
-                )
-            })?;
 
         let path = url.path();
 
@@ -295,8 +284,8 @@ impl RemoteFile {
         let cache_identity = format!("{host_header}\0{path}");
 
         Ok(Self {
-            addr,
             host,
+            port,
             host_header,
             request_target,
             is_https,
@@ -333,10 +322,7 @@ impl RemoteFile {
         &self.host_header
     }
     pub fn port(&self) -> u16 {
-        self.addr.port()
-    }
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+        self.port
     }
     pub fn request_target(&self) -> &str {
         &self.request_target
@@ -350,7 +336,7 @@ impl RemoteFile {
     fn display_url(&self) -> String {
         let scheme = if self.is_https { "https" } else { "http" };
         let default_port = if self.is_https { 443 } else { 80 };
-        let port = self.addr.port();
+        let port = self.port;
         if port == default_port {
             format!("{scheme}://{}{}", self.host, self.request_target)
         } else {

@@ -17,6 +17,14 @@
 //! outlives its deadline is cancelled by the kernel and the read is issued
 //! again on another connection.
 //!
+//! An object carries its store's host name, not an address. A new connection
+//! takes its address from what the worker last learned for the host. A host
+//! the worker knows nothing about is looked up by c-ares, whose sockets are
+//! polled on the same ring, and the answer is kept for the next connections,
+//! so a worker never blocks on resolving a name. The worker's loop has each
+//! host in use looked up again once the time to live of its answer has
+//! passed, so a connection does not wait for that either.
+//!
 //! A peer that is gone is noticed by the kernel, for reads and uploads alike.
 //! Every socket has TCP keepalive on and a bound on how long sent bytes may
 //! stay unacknowledged, so a connection whose packets vanish fails with a
@@ -233,7 +241,15 @@ mod blocking_engine {
 
     fn connect(client_config: &Arc<rustls::ClientConfig>, request: &RemoteRequest) -> Result<Conn> {
         let remote = request.remote();
-        let tcp = TcpStream::connect_timeout(&remote.addr(), CONNECT_TIMEOUT)?;
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(remote.host(), remote.port()))?
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "host resolved to no addresses",
+                )
+            })?;
+        let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
         tcp.set_nodelay(true).ok();
         // These bound every read/write so a hung server can't pin a pool thread
         // (and stall Drop) forever, so a failure to set them must fail the
@@ -526,13 +542,14 @@ mod blocking_engine {
 mod uring_engine {
     use super::*;
     use crate::Identifier;
+    use crate::io::http::dns::{AddressBook, HostResolver, LOOKUP_TAG};
     use crate::io::http::http1;
     use crate::io::http::{Error, Result};
     use io_uring::{IoUring, opcode, squeue, types};
     use rustls::ClientConnection;
     use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -690,6 +707,8 @@ mod uring_engine {
         fd: OwnedFd,
         transport: Transport,
         host_key: String,
+        /// The address the connection goes to.
+        addr: SocketAddr,
         /// Connect target; boxed so the SQE can hold a stable pointer to it.
         sockaddr: Box<libc::sockaddr_storage>,
         sockaddr_len: libc::socklen_t,
@@ -745,6 +764,26 @@ mod uring_engine {
     /// store before it discards the rest of that host's pool unchecked. The
     /// ones left are older still, so they are very likely closed too.
     const MAX_CLOSED_POOLED_IN_A_ROW: usize = 64;
+
+    /// A request that has no connection yet, with what its earlier attempts
+    /// used up.
+    struct WaitingRequest {
+        id: Identifier,
+        request: RemoteRequest,
+        retries: u32,
+        deadline_reissues: u32,
+    }
+
+    /// A host being looked up, and the requests that cannot connect until
+    /// its addresses are known.
+    struct Lookup {
+        waiting: Vec<WaitingRequest>,
+        /// Whether the lookup itself is counted in the engine's `active`,
+        /// which it is when it started as a refresh, with no request waiting
+        /// for it. The worker then keeps serving the ring until the answer
+        /// is in.
+        counted_as_active: bool,
+    }
 
     /// One complete HTTP request/response exchange, owning a connection while it
     /// is active. Dropping this value releases all request-specific resources;
@@ -807,7 +846,15 @@ mod uring_engine {
     }
 
     impl HttpExchange {
-        fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Self {
+        /// The next attempt at `waiting` on `conn`, whose first step is
+        /// `state`.
+        fn new(conn: Conn, waiting: WaitingRequest, state: State) -> Self {
+            let WaitingRequest {
+                id,
+                request,
+                retries,
+                deadline_reissues,
+            } = waiting;
             let expected_body_len = match &request {
                 RemoteRequest::Read(read) => read.expected_body_len(),
                 RemoteRequest::Upload(_) => 0,
@@ -821,8 +868,8 @@ mod uring_engine {
                 request_bytes,
                 request_queued: false,
                 request,
-                retries: 0,
-                deadline_reissues: 0,
+                retries,
+                deadline_reissues,
                 started_at: Instant::now(),
                 step_deadline: Box::new(types::Timespec::new()),
                 armed_step_deadline: Duration::ZERO,
@@ -1133,7 +1180,15 @@ mod uring_engine {
         free_slots: Vec<usize>,
         /// host_key -> idle reusable connections, the longest idle first.
         pool: HashMap<String, Vec<IdleConn>>,
-        /// Requests in flight (not counting idle pooled connections).
+        /// Looks hosts up on the worker's ring.
+        host_resolver: HostResolver,
+        /// What each host last resolved to.
+        address_book: AddressBook,
+        /// The lookups in flight, by host.
+        lookups: HashMap<String, Lookup>,
+        /// Requests in flight, counting the ones waiting for a lookup and not
+        /// counting idle pooled connections. A lookup that started as a
+        /// refresh counts as one too.
         active: usize,
         /// Ids whose body fully landed during the last completion routing pass.
         completed: Vec<Identifier>,
@@ -1158,6 +1213,9 @@ mod uring_engine {
                 exchanges: Vec::new(),
                 free_slots: Vec::new(),
                 pool: HashMap::new(),
+                host_resolver: HostResolver::new().map_err(Error::HostResolverSetup)?,
+                address_book: AddressBook::new(),
+                lookups: HashMap::new(),
                 active: 0,
                 completed: Vec::new(),
                 failed: Vec::new(),
@@ -1175,6 +1233,40 @@ mod uring_engine {
         #[cfg(test)]
         pub fn force_step_deadline_bounds(&mut self, shortest: Duration, longest: Duration) {
             self.step_deadline_bounds = StepDeadlineBounds { shortest, longest };
+        }
+
+        /// Ask `servers` for host addresses instead of the machine's name
+        /// servers, so a test controls what a host resolves to.
+        #[cfg(test)]
+        pub fn force_name_servers(&mut self, servers: Vec<SocketAddr>) {
+            self.host_resolver.force_name_servers(servers);
+        }
+
+        /// Look a host up again between `shortest` and `longest` after its
+        /// answer, so a test controls how soon an answer is refreshed.
+        #[cfg(test)]
+        pub fn force_refresh_intervals(&mut self, shortest: Duration, longest: Duration) {
+            self.address_book.force_refresh_intervals(shortest, longest);
+        }
+
+        /// Go through the address book and start a lookup of each host whose
+        /// answer's time to live has passed. Called from the worker's loop,
+        /// so the addresses a new connection takes are current without the
+        /// connection waiting for a lookup.
+        pub fn refresh_dns_address_book(&mut self, ring: &mut IoUring) -> Result<()> {
+            // A worker that reads no remote store pays nothing here, not
+            // even for the time.
+            if self.address_book.is_empty() {
+                return Ok(());
+            }
+            for host in self.address_book.take_hosts_due_for_refresh(Instant::now()) {
+                // A request that found the host's addresses too old may have
+                // started the lookup already.
+                if !self.lookups.contains_key(&host) {
+                    self.start_lookup(ring, host, Vec::new())?;
+                }
+            }
+            Ok(())
         }
 
         /// Ids of the reads issued again for a missed step deadline since the
@@ -1221,36 +1313,56 @@ mod uring_engine {
             id: Identifier,
             request: RemoteRequest,
         ) -> Result<()> {
-            let (conn, state) = self.take_connection(&request)?;
-            let exchange = HttpExchange::new(conn, id, request, state);
-            self.launch(ring, exchange)
+            self.address_book
+                .record_use(request.remote().host(), Instant::now());
+            self.active += 1;
+            self.send_or_connect(
+                ring,
+                WaitingRequest {
+                    id,
+                    request,
+                    retries: 0,
+                    deadline_reissues: 0,
+                },
+            )
         }
 
-        /// A connection for `request` and the state its exchange starts in: an
-        /// idle keep-alive connection ready to send on, or a fresh socket still
-        /// to connect. The exchange owns it until the response completes or the
-        /// connection fails.
+        /// Send `waiting`, a request already counted in `active`, on an idle
+        /// keep-alive connection when the pool has one for its host, and on
+        /// a new connection otherwise. The exchange owns the connection
+        /// until the response completes or the connection fails.
+        fn send_or_connect(&mut self, ring: &mut IoUring, waiting: WaitingRequest) -> Result<()> {
+            match self.take_pooled_connection(&waiting.request) {
+                Some(conn) => {
+                    let exchange = HttpExchange::new(conn, waiting, State::Sending);
+                    let idx = self.alloc_slot(exchange);
+                    self.pump(ring, idx)
+                }
+                None => self.connect_or_await_address(ring, waiting),
+            }
+        }
+
+        /// An idle keep-alive connection `request` can be sent on, if the
+        /// pool has one for its host.
         ///
         /// The most recently used idle connection is tried first, and one the
         /// store has closed meanwhile is closed here for the next. Once the
         /// youngest left has idled too long, so have all the others, and the
         /// whole pool for that host is closed.
-        fn take_connection(&mut self, request: &RemoteRequest) -> Result<(Conn, State)> {
-            let key = host_key(request.remote());
-            if let Some(idle) = self.pool.get_mut(&key) {
-                let mut closed_in_a_row = 0;
-                while let Some(candidate) = idle.pop() {
-                    let idled_too_long = candidate.idle_since.elapsed() > MAX_POOLED_IDLE;
-                    if !idled_too_long && candidate.conn.is_open_and_quiet() {
-                        return Ok((candidate.conn, State::Sending));
-                    }
-                    closed_in_a_row += 1;
-                    if idled_too_long || closed_in_a_row == MAX_CLOSED_POOLED_IN_A_ROW {
-                        idle.clear();
-                    }
+        fn take_pooled_connection(&mut self, request: &RemoteRequest) -> Option<Conn> {
+            let idle = self.pool.get_mut(&host_key(request.remote()))?;
+            let mut closed_in_a_row = 0;
+            while let Some(candidate) = idle.pop() {
+                let idled_too_long = candidate.idle_since.elapsed() > MAX_POOLED_IDLE;
+                if !idled_too_long && candidate.conn.is_open_and_quiet() {
+                    return Some(candidate.conn);
+                }
+                closed_in_a_row += 1;
+                if idled_too_long || closed_in_a_row == MAX_CLOSED_POOLED_IN_A_ROW {
+                    idle.clear();
                 }
             }
-            Ok((self.new_conn(key, request)?, State::Connecting))
+            None
         }
 
         /// Keep `conn` for the next request to its host, and close the
@@ -1270,16 +1382,114 @@ mod uring_engine {
             });
         }
 
-        /// Put `exchange` in flight: give it a slot and submit its first SQE.
-        fn launch(&mut self, ring: &mut IoUring, exchange: HttpExchange) -> Result<()> {
-            let connecting = matches!(exchange.state, State::Connecting);
-            let idx = self.alloc_slot(exchange);
-            self.active += 1;
-            if connecting {
-                self.start_connect(ring, idx)
-            } else {
-                self.pump(ring, idx)
+        /// Open a new connection for `waiting`, a request already counted in
+        /// `active`, to the next address the book has for its host. A host
+        /// the book has no address for is looked up first, and the request
+        /// connects when the answer arrives.
+        fn connect_or_await_address(
+            &mut self,
+            ring: &mut IoUring,
+            waiting: WaitingRequest,
+        ) -> Result<()> {
+            let remote = waiting.request.remote();
+            let host = remote.host().to_string();
+            let port = remote.port();
+            // A host written as an address needs no lookup. An IPv6 one is
+            // in brackets in a URL.
+            let written_address = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>();
+            let address = match written_address {
+                Ok(address) => address,
+                Err(_) => match self.address_book.choose_address(&host, Instant::now()) {
+                    Some(address) => address,
+                    None => {
+                        return match self.lookups.get_mut(&host) {
+                            Some(lookup) => {
+                                lookup.waiting.push(waiting);
+                                Ok(())
+                            }
+                            None => self.start_lookup(ring, host, vec![waiting]),
+                        };
+                    }
+                },
+            };
+
+            let key = host_key(waiting.request.remote());
+            match self.new_conn(key, &waiting.request, SocketAddr::new(address, port)) {
+                Ok(conn) => {
+                    let exchange = HttpExchange::new(conn, waiting, State::Connecting);
+                    let idx = self.alloc_slot(exchange);
+                    self.start_connect(ring, idx)
+                }
+                // Couldn't even build the socket — treat as a terminal failure.
+                Err(error) => {
+                    self.active -= 1;
+                    self.failed.push((waiting.id, error));
+                    Ok(())
+                }
             }
+        }
+
+        /// Start looking `host` up, and have the requests in `waiting`
+        /// connect once its addresses are known.
+        fn start_lookup(
+            &mut self,
+            ring: &mut IoUring,
+            host: String,
+            waiting: Vec<WaitingRequest>,
+        ) -> Result<()> {
+            let counted_as_active = waiting.is_empty();
+            if counted_as_active {
+                self.active += 1;
+            }
+            self.lookups.insert(
+                host.clone(),
+                Lookup {
+                    waiting,
+                    counted_as_active,
+                },
+            );
+            self.host_resolver.start_lookup(ring, &host)?;
+            self.finish_lookups(ring)
+        }
+
+        /// Record the answers of the lookups that have finished, and connect
+        /// the requests that waited for them. A lookup that found no address
+        /// fails the requests that waited for it.
+        fn finish_lookups(&mut self, ring: &mut IoUring) -> Result<()> {
+            for (host, answer) in self.host_resolver.take_answers() {
+                let lookup = self
+                    .lookups
+                    .remove(&host)
+                    .expect("an answer for a lookup in flight");
+                if lookup.counted_as_active {
+                    self.active -= 1;
+                }
+                match answer {
+                    Ok(found) => {
+                        self.address_book
+                            .record_answer(&host, &found, Instant::now());
+                        for waiting in lookup.waiting {
+                            self.connect_or_await_address(ring, waiting)?;
+                        }
+                    }
+                    Err(reason) => {
+                        for waiting in lookup.waiting {
+                            self.active -= 1;
+                            self.failed.push((
+                                waiting.id,
+                                Error::HostLookup {
+                                    host: host.clone(),
+                                    reason,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
 
         /// Advance the connection identified by a tagged `user_data` after its SQE
@@ -1300,6 +1510,10 @@ mod uring_engine {
         pub fn on_cqe(&mut self, ring: &mut IoUring, user_data: u64, result: i32) -> Result<()> {
             if user_data & STEP_DEADLINE_TAG != 0 {
                 return Ok(());
+            }
+            if user_data & LOOKUP_TAG != 0 {
+                self.host_resolver.on_cqe(ring, user_data, result)?;
+                return self.finish_lookups(ring);
             }
             let idx = (user_data & !HTTP_TAG) as usize;
 
@@ -1408,7 +1622,6 @@ mod uring_engine {
                 .take()
                 .expect("cqe for an active HTTP exchange");
             self.free_slots.push(idx);
-            self.active -= 1;
             let HttpExchange {
                 conn,
                 id,
@@ -1417,22 +1630,23 @@ mod uring_engine {
                 request,
                 ..
             } = stalled;
+            self.address_book.record_failure(
+                request.remote().host(),
+                conn.addr.ip(),
+                Instant::now(),
+            );
             drop(conn); // close the stalled socket before issuing the read again
             self.reissued.push(id);
 
-            match self.take_connection(&request) {
-                Ok((conn, state)) => {
-                    let mut fresh = HttpExchange::new(conn, id, request, state);
-                    fresh.retries = retries;
-                    fresh.deadline_reissues = deadline_reissues + 1;
-                    self.launch(ring, fresh)
-                }
-                // Couldn't even build the socket — treat as a terminal failure.
-                Err(error) => {
-                    self.failed.push((id, error));
-                    Ok(())
-                }
-            }
+            self.send_or_connect(
+                ring,
+                WaitingRequest {
+                    id,
+                    request,
+                    retries,
+                    deadline_reissues: deadline_reissues + 1,
+                },
+            )
         }
 
         /// Handle a dead connection for the request at slot `idx`: tear it down
@@ -1453,27 +1667,30 @@ mod uring_engine {
                 retries,
                 deadline_reissues,
                 request,
+                state,
                 ..
             } = dead;
-            let key = conn.host_key.clone();
+            // An address that does not accept a connection is passed over
+            // for the next ones.
+            if let State::Connecting = state {
+                self.address_book.record_failure(
+                    request.remote().host(),
+                    conn.addr.ip(),
+                    Instant::now(),
+                );
+            }
             drop(conn); // close the failed socket before reconnecting
 
             if is_retryable(&err) && retries < MAX_HTTP_RETRIES {
-                match self.new_conn(key, &request) {
-                    Ok(conn) => {
-                        let mut fresh = HttpExchange::new(conn, id, request, State::Connecting);
-                        fresh.retries = retries + 1;
-                        fresh.deadline_reissues = deadline_reissues;
-                        let new_idx = self.alloc_slot(fresh);
-                        return self.start_connect(ring, new_idx);
-                    }
-                    // Couldn't even build the socket — treat as a terminal failure.
-                    Err(e) => {
-                        self.active -= 1;
-                        self.failed.push((id, e));
-                        return Ok(());
-                    }
-                }
+                return self.connect_or_await_address(
+                    ring,
+                    WaitingRequest {
+                        id,
+                        request,
+                        retries: retries + 1,
+                        deadline_reissues,
+                    },
+                );
             }
 
             self.active -= 1;
@@ -1481,9 +1698,8 @@ mod uring_engine {
             Ok(())
         }
 
-        fn new_conn(&self, key: String, request: &RemoteRequest) -> Result<Conn> {
+        fn new_conn(&self, key: String, request: &RemoteRequest, addr: SocketAddr) -> Result<Conn> {
             let remote = request.remote();
-            let addr = remote.addr();
             let domain = match addr {
                 SocketAddr::V4(_) => libc::AF_INET,
                 SocketAddr::V6(_) => libc::AF_INET6,
@@ -1546,6 +1762,7 @@ mod uring_engine {
                 fd,
                 transport,
                 host_key: key,
+                addr,
                 sockaddr,
                 sockaddr_len,
                 out_buf: Vec::new(),

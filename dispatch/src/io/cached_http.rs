@@ -46,7 +46,8 @@ use std::time::{Duration, Instant};
 
 /// The `user_data` of the timeout that wakes a worker's ring once the receive
 /// allowance covers its oldest held fetch. It carries [`HTTP_TAG`] so the
-/// requester routes it here, and a bit no exchange slot or step deadline uses.
+/// requester routes it here, and a bit no exchange slot, step deadline or host
+/// lookup uses.
 #[cfg(target_os = "linux")]
 const RECEIVE_ALLOWANCE_TIMER: u64 = HTTP_TAG | (1 << 61);
 
@@ -229,6 +230,24 @@ impl CachedHttpEngine {
         longest: std::time::Duration,
     ) {
         self.http.force_step_deadline_bounds(shortest, longest);
+    }
+
+    /// Ask `servers` for host addresses instead of the machine's name
+    /// servers, so a test controls what a host resolves to.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn force_name_servers(&mut self, servers: Vec<std::net::SocketAddr>) {
+        self.http.force_name_servers(servers);
+    }
+
+    /// Look a host up again between `shortest` and `longest` after its
+    /// answer, so a test controls how soon an answer is refreshed.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn force_refresh_intervals(
+        &mut self,
+        shortest: std::time::Duration,
+        longest: std::time::Duration,
+    ) {
+        self.http.force_refresh_intervals(shortest, longest);
     }
 
     /// Join ranges with up to `bytes` between them into one request, so a
@@ -578,6 +597,15 @@ impl CachedHttpEngine {
             return Ok(());
         }
         self.http.on_cqe(&mut backend.ring, user_data, result)?;
+        Ok(())
+    }
+
+    /// Start a lookup of each host in use whose answer's time to live has
+    /// passed. Linux only - elsewhere a connection resolves its host as it
+    /// opens, on a pool thread, and nothing is kept to refresh.
+    #[cfg(target_os = "linux")]
+    pub fn refresh_dns_address_book(&mut self, backend: &mut IOBackend) -> Result<()> {
+        self.http.refresh_dns_address_book(&mut backend.ring)?;
         Ok(())
     }
 
