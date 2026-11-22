@@ -1,0 +1,163 @@
+name: Deploy Web Dashboard
+
+# Builds the web dashboard's image (web/Dockerfile: the page's backend serving
+# the built page) from the commit the run is dispatched on, and pushes it to
+# Docker Hub as pivotlake/pivot-web for amd64 and arm64.
+#
+# Versions follow Deploy Binaries: the workspace version in Cargo.toml for a
+# real release, which also moves `latest`, and <version>-rc<sha> for a
+# candidate. Every published version gets a git tag web-v<version> at the
+# commit it was built from. The server's own tags are v<version>, so the two
+# are released independently and never move each other's tag.
+#
+# Not the docs or install.sh, which Deploy Web publishes.
+#
+# Required secrets:
+#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN  the org-level Docker Hub account,
+#                                         which must have push access to
+#                                         pivotlake/pivot-web.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: "Publish as release candidate"
+        type: boolean
+        default: true
+      override:
+        description: "Republish an existing version: overwrite its image, move its git tag"
+        type: boolean
+        default: false
+
+# Serializing releases keeps two runs from racing to move `latest`.
+concurrency:
+  group: pivot-web-release
+  cancel-in-progress: false
+
+jobs:
+  # Resolve the version once so the image tags and the git tag cannot
+  # disagree, and refuse a version that is already published before anything
+  # is built.
+  version:
+    name: Resolve the release version
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        run: |
+          set -euo pipefail
+          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          case "$workspace_version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Could not read the workspace version from Cargo.toml (got '$workspace_version')."; exit 1 ;;
+          esac
+          if [ "${{ inputs.release_candidate }}" = "true" ]; then
+            release=$workspace_version-rc$(git rev-parse --short=7 HEAD)
+          else
+            release=$workspace_version
+          fi
+          echo "Release version: $release"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+      # A published version is immutable: its image may only be rebuilt from
+      # another commit when the run explicitly overrides the previous one.
+      - name: Refuse a version published from another commit
+        env:
+          VERSION: ${{ steps.version.outputs.release }}
+        run: |
+          set -euo pipefail
+          tag=web-v$VERSION
+          # The tag is annotated, so the remote lists it twice: under its own
+          # name by the tag's object, and with ^{} after the name by the
+          # commit it points at, which is the line that comes last.
+          existing=$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" | tail -n 1 | cut -f1)
+          if [ -z "$existing" ] || [ "$existing" = "${{ github.sha }}" ]; then
+            exit 0
+          fi
+          if [ "${{ inputs.override }}" != "true" ]; then
+            echo "::error::$tag already exists at $existing. Bump the version in Cargo.toml, or re-run with override to republish it."
+            exit 1
+          fi
+          echo "::warning::$tag already exists at $existing; override is on, so it will be republished from ${{ github.sha }}."
+
+  # The image is compiled here, inside the Docker build. The arm64 leg is
+  # cross-compiled and its final stage only copies files in, so nothing runs
+  # under emulation and the job needs no QEMU.
+  docker:
+    name: Build & push the Docker image
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve Docker tags
+        id: docker_tags
+        env:
+          VERSION: ${{ needs.version.outputs.release }}
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "pivotlake/pivot-web:$VERSION"
+            if [ "${{ inputs.release_candidate }}" != "true" ]; then
+              echo "pivotlake/pivot-web:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.docker_tags.outputs.tags }}
+          cache-from: type=gha,scope=web
+          # ignore-error keeps a cache-service outage from failing a build
+          # whose image is already pushed; the next run is just colder.
+          cache-to: type=gha,scope=web,mode=max,ignore-error=true
+
+  # The git tag is pushed only once the image is, so a tag always names a
+  # version that can be pulled.
+  tag-release:
+    name: Tag the release
+    needs: [version, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create and push the release tag
+        env:
+          VERSION: ${{ needs.version.outputs.release }}
+        run: |
+          set -euo pipefail
+          tag=web-v$VERSION
+
+          # The commit the tag points at, as in the version job.
+          existing=$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" | tail -n 1 | cut -f1)
+          if [ "$existing" = "${{ github.sha }}" ]; then
+            echo "$tag already points at ${{ github.sha }}; nothing to do."
+            exit 0
+          fi
+          if [ -n "$existing" ] && [ "${{ inputs.override }}" != "true" ]; then
+            echo "::error::$tag already exists at $existing. Bump the version in Cargo.toml, or re-run with override to move it."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate --message "Pivot web dashboard $VERSION" "$tag" "${{ github.sha }}"
+          git push --force origin "$tag"
