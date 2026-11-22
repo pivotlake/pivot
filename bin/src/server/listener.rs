@@ -192,6 +192,7 @@ impl Server {
         let handlers = Arc::new(PivotHandlers::new(
             self.query_executor.clone(),
             self.metastore.clone(),
+            self.catalog.connections().clone(),
         ));
 
         // Start each datastore's background maintenance.

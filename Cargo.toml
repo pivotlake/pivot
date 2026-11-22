@@ -13,9 +13,9 @@ members = [
     "planner",
     "object-storage",
 ]
-# arrow-rs (vendored submodule) and perfy are workspaces of their own; they
-# resolve and lock independently.
-exclude = ["arrow-rs", "perfy"]
+# arrow-rs (vendored submodule), perfy and the web page's backend are
+# workspaces of their own; they resolve and lock independently.
+exclude = ["arrow-rs", "perfy", "web"]
 
 [workspace.package]
 version = "0.1.1"

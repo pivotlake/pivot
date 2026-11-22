@@ -1,11 +1,11 @@
 ---
 title: System tables
-description: Read-only tables that describe the server's datastores, tables, columns, files, and memory.
+description: Read-only tables that describe the server's datastores, tables, columns, files, memory, and connections.
 ---
 
 The `system` datastore holds read-only tables that describe the server
-itself: which datastores it serves, the tables and files in each, and how its
-memory is used. Query them like any other table:
+itself: which datastores it serves, the tables and files in each, how its
+memory is used, and who is connected to it. Query them like any other table:
 
 ```sql
 SELECT datastore, schema, name, total_rows
@@ -20,6 +20,7 @@ ORDER BY total_rows DESC;
 | [`system.columns`](#systemcolumns) | Column of any table |
 | [`system.table_files`](#systemtable_files) | Data file of any table |
 | [`system.memory_blocks`](#systemmemory_blocks) | Block of the buffer pool |
+| [`system.connections`](#systemconnections) | Client connection open to the server |
 
 System tables span every datastore, and describe the `system` datastore
 itself too. A query reads them from the same snapshot as the other tables it
@@ -152,8 +153,42 @@ GROUP BY state
 ORDER BY blocks DESC;
 ```
 
+## `system.connections`
+
+One row per client connection open to the server, including the connection
+running the query. A connection appears once it has logged in and disappears
+when it closes. The [shell](/docs/reference/cli/) accepts no connections, so
+there the table is empty.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `id` | `BIGINT` | The connection's number. Counts up from 1 as connections log in, and is never reused while the server runs. |
+| `user_name` | `VARCHAR` | The user the connection logged in as. |
+| `application_name` | `VARCHAR` | The `application_name` the client sent when it connected, such as `psql`, or an empty string if it sent none. |
+| `client_address` | `VARCHAR` | The client's address and port, such as `10.0.0.7:51234`. |
+| `connected_at` | `TIMESTAMP WITH TIME ZONE` | When the connection logged in. |
+| `state` | `VARCHAR` | What the connection is doing. See the table below. |
+| `state_changed_at` | `TIMESTAMP WITH TIME ZONE` | When the connection entered its current state. |
+| `statement` | `VARCHAR` | The statement the connection is running, or an empty string while it is idle. |
+| `copy_bytes` | `BIGINT` | Bytes of row data the client has sent to the running `COPY ... FROM STDIN`, or 0 in any other state. |
+
+| State | Meaning |
+| --- | --- |
+| `idle` | Waiting for the client to send a statement. |
+| `query` | Running a statement. |
+| `copy` | Receiving the rows of a [`COPY ... FROM STDIN`](/docs/reference/statements/copy/) from the client. |
+
+```sql
+-- What every busy connection is doing, the longest-busy first
+SELECT id, user_name, application_name, state, statement, copy_bytes
+FROM system.connections
+WHERE state <> 'idle'
+ORDER BY state_changed_at;
+```
+
 ## Related
 
 - [Datastores & storage credentials](/docs/reference/server/datastores/)
 - [`COMPACT`](/docs/reference/statements/compact/)
+- [`COPY`](/docs/reference/statements/copy/)
 - [`SELECT`](/docs/reference/statements/select/)
