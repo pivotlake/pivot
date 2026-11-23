@@ -10,7 +10,8 @@ use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadata, Type};
 use iceberg_tables::{Table, forget_cached_table};
 use parquet_engine::ScanSelection;
 use support::{
-    Fixture, append, create_partitioned_table, describe, load, publish_changed, v_equals,
+    Fixture, append, create_partitioned_table, describe, live_entry, load, publish_changed,
+    v_equals,
 };
 
 /// The rows of each row group `selection` scans, in scan order.
@@ -157,6 +158,57 @@ fn a_forgotten_footer_is_read_again_and_its_file_no_longer_held_open() {
 
     assert!(held_open.upgrade().is_none());
     assert!(read_without_its_footer.is_err());
+}
+
+/// `table` after a commit that replaces its live file `seven` with a file
+/// of the same partition.
+fn replace_seven(fixture: &Fixture, table: &Table) -> Table {
+    table
+        .commit(
+            &[live_entry(table, "seven.parquet")],
+            vec![fixture.write_file("nine", 7)],
+        )
+        .unwrap()
+        .expect("no other writer")
+}
+
+#[test]
+fn a_file_a_commit_removes_is_no_longer_held_open_once_the_version_before_is_dropped() {
+    let (fixture, created) = create_partitioned_table();
+    append(&created, vec![fixture.write_file("seven", 7)]);
+    let opened = load(&fixture);
+    let held_open = Arc::downgrade(&opened.select_scan(&[]).unwrap().row_groups.row_groups()[0]);
+    let _replaced = replace_seven(&fixture, &opened);
+
+    drop(opened);
+
+    assert!(held_open.upgrade().is_none());
+}
+
+#[test]
+fn a_file_a_commit_removes_stays_held_while_the_version_before_is() {
+    let (fixture, created) = create_partitioned_table();
+    append(&created, vec![fixture.write_file("seven", 7)]);
+    let opened = load(&fixture);
+    let held_open = Arc::downgrade(&opened.select_scan(&[]).unwrap().row_groups.row_groups()[0]);
+
+    let _replaced = replace_seven(&fixture, &opened);
+
+    assert!(held_open.upgrade().is_some());
+}
+
+#[test]
+fn a_file_a_commit_removes_stays_held_while_a_version_two_commits_before_is() {
+    let (fixture, created) = create_partitioned_table();
+    append(&created, vec![fixture.write_file("seven", 7)]);
+    let opened = load(&fixture);
+    let held_open = Arc::downgrade(&opened.select_scan(&[]).unwrap().row_groups.row_groups()[0]);
+    let appended = append(&opened, vec![fixture.write_file("eight", 8)]);
+
+    let _replaced = replace_seven(&fixture, &appended);
+    drop(appended);
+
+    assert!(held_open.upgrade().is_some());
 }
 
 #[test]

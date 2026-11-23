@@ -216,6 +216,10 @@ impl Table {
                 }
             }
         }
+        let removed_uris = removed
+            .iter()
+            .map(|entry| self.location().uri_for(&entry.file.path))
+            .collect::<Result<Vec<String>>>()?;
         let to_data_files = |entries: &[DataFileEntry]| -> Result<Vec<DataFile>> {
             entries
                 .iter()
@@ -227,7 +231,7 @@ impl Table {
             .zip(removed.iter().map(|entry| entry.manifest_path.clone()))
             .collect();
         let added = to_data_files(&added)?;
-        self.commit_transaction(Vec::new(), move |transaction| {
+        let committed = self.commit_transaction(Vec::new(), move |transaction| {
             // The files were just written under fresh names, so none is in
             // the table already; the check for one would read every manifest.
             // Small manifests are merged as they pile up, so the table's
@@ -259,7 +263,13 @@ impl Table {
                 rewrite = rewrite.add_file(file);
             }
             rewrite.apply(transaction)
-        })
+        })?;
+        // No later version lists a file this commit removed, so its footer
+        // is let go of once nothing holds this version or an earlier one.
+        if committed.is_some() {
+            self.record_files_removed_next(removed_uris);
+        }
+        Ok(committed)
     }
 
     /// Whether a snapshot or a previous metadata file of this version has
@@ -430,6 +440,7 @@ impl Table {
             manifest_list,
             manifest_list_size,
         )
+        .map(|next| next.derived_from(self))
     }
 }
 

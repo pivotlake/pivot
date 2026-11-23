@@ -362,14 +362,24 @@ impl FileMetadataCache {
     }
 
     /// Let go of the footers `table` holds for the files at `paths`, and
-    /// with each of the cache's hold on the open of its file.
-    pub fn remove_footers<'p>(&self, table: &TableKey, paths: impl Iterator<Item = &'p str>) {
+    /// with each of the cache's hold on the open of its file. Hands back
+    /// the row groups of each footer it held.
+    pub fn remove_footers<'p>(
+        &self,
+        table: &TableKey,
+        paths: impl Iterator<Item = &'p str>,
+    ) -> Vec<Vec<Arc<RowGroupMetadata>>> {
         let mut state = self.state.lock().unwrap();
-        for path in paths {
-            state
-                .items
-                .remove(table, &name_item(EntryKind::Footer, path.as_bytes()));
-        }
+        paths
+            .filter_map(|path| {
+                let key = name_item(EntryKind::Footer, path.as_bytes());
+                let (_, held) = state.items.remove(table, &key)?;
+                let row_groups = held
+                    .downcast::<HeldFooter>()
+                    .expect("a footer entry holds a file's row groups");
+                Some(*row_groups)
+            })
+            .collect()
     }
 
     /// Let go of every item of every table named `table`, whatever else

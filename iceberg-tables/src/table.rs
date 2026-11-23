@@ -71,7 +71,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use dispatch::DataFlowDispatcher;
@@ -201,6 +201,104 @@ pub struct Table {
     /// The key this version's partition indexes and the footers of its
     /// files are cached under ([`build_cache_key`]).
     cache_key: TableKey,
+    /// The files the commit on top of this version removed, once it has
+    /// committed, whose footers are let go of when nothing holds this
+    /// version or an earlier one any more.
+    files_removed_next: Arc<FilesRemovedNext>,
+}
+
+/// The files the commit on top of one version of a table removed. No later
+/// version lists them, so the cache lets go of their footers, but not while
+/// a transaction that began before the commit may still plan over them: a
+/// version holds its own of these, and each holds the one of the next
+/// version derived from its version, so the footers are let go of once the
+/// version and every earlier one of its line are dropped. The cache may
+/// still let go of them sooner to stay within its budget.
+struct FilesRemovedNext {
+    /// Where the version the commit was on top of stands.
+    version: VersionOrder,
+    /// The key that version's footers are cached under.
+    cache_key: TableKey,
+    /// The URIs of the files removed; unset until the commit succeeds, and
+    /// for a version another process committed on top of.
+    uris: OnceLock<Vec<String>>,
+    /// The same of the next version derived from this one's.
+    of_later_version: OnceLock<Arc<FilesRemovedNext>>,
+    /// The pool whose ring caches hold bytes of the files.
+    dispatcher: DataFlowDispatcher,
+}
+
+impl FilesRemovedNext {
+    fn new(
+        version: VersionOrder,
+        cache_key: TableKey,
+        dispatcher: &DataFlowDispatcher,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            version,
+            cache_key,
+            uris: OnceLock::new(),
+            of_later_version: OnceLock::new(),
+            dispatcher: dispatcher.clone(),
+        })
+    }
+
+    /// Let go of everything this process caches of the files at `uris`,
+    /// which `cache_key` holds the footers of: each footer, and with it
+    /// what the ring's caches hold of the file's bytes. A file whose footer
+    /// is not held keeps its bytes in the ring until their slots are
+    /// reclaimed.
+    fn forget_files<'u>(
+        dispatcher: &DataFlowDispatcher,
+        cache_key: &TableKey,
+        uris: impl Iterator<Item = &'u str>,
+    ) {
+        let footers = FileMetadataCache::process_wide().remove_footers(cache_key, uris);
+        dispatcher.forget_cached_files(
+            footers
+                .iter()
+                .filter_map(|row_groups| row_groups.first())
+                .map(|row_group| &row_group.open_file),
+        );
+    }
+
+    /// The one of the version standing at `version`, derived from this
+    /// one's: the one a version derived earlier started, so every object of
+    /// one version shares it, else a new one after the last of the line.
+    fn find_or_start_later(
+        self: &Arc<Self>,
+        version: VersionOrder,
+        cache_key: &TableKey,
+    ) -> Arc<Self> {
+        let mut held = Arc::clone(self);
+        while held.version < version {
+            let later = Arc::clone(
+                held.of_later_version
+                    .get_or_init(|| Self::new(version, cache_key.clone(), &self.dispatcher)),
+            );
+            held = later;
+        }
+        held
+    }
+}
+
+impl Drop for FilesRemovedNext {
+    /// Let go of the footers of the files removed, and of those of each
+    /// later version that nothing else holds, one after the other: a long
+    /// line let go of at once is not walked by nested drops.
+    fn drop(&mut self) {
+        if let Some(uris) = self.uris.get() {
+            Self::forget_files(
+                &self.dispatcher,
+                &self.cache_key,
+                uris.iter().map(String::as_str),
+            );
+        }
+        let mut later = self.of_later_version.take();
+        while let Some(mut unheld) = later.and_then(Arc::into_inner) {
+            later = unheld.of_later_version.take();
+        }
+    }
 }
 
 /// The key the version `metadata` describes of the table at `location`
@@ -434,6 +532,11 @@ impl Table {
         );
         let writer_sort_order_id = find_writer_sort_order_id(metadata, columns.columns());
         let cache_key = build_cache_key(&location, metadata);
+        let version = VersionOrder {
+            sequence: metadata.last_sequence_number(),
+            updated_ms: metadata.last_updated_ms(),
+        };
+        let files_removed_next = FilesRemovedNext::new(version, cache_key.clone(), dispatcher);
         Ok(Table {
             name: name.clone(),
             metadata_store,
@@ -447,7 +550,27 @@ impl Table {
             manifest_list,
             manifest_list_size,
             cache_key,
+            files_removed_next,
         })
+    }
+
+    /// This version as one derived from `earlier`, by a refresh or a commit:
+    /// the footers of the files a commit between the two removed are held
+    /// for as long as `earlier` is.
+    pub(crate) fn derived_from(mut self, earlier: &Table) -> Table {
+        self.files_removed_next = earlier
+            .files_removed_next
+            .find_or_start_later(self.version_order(), &self.cache_key);
+        self
+    }
+
+    /// Record the files, by their URIs, that the commit on top of this
+    /// version removed.
+    pub(crate) fn record_files_removed_next(&self, uris: Vec<String>) {
+        self.files_removed_next
+            .uris
+            .set(uris)
+            .expect("one commit succeeds on top of a version");
     }
 
     /// The latest committed version, derived from this one, or `None` when
@@ -465,7 +588,7 @@ impl Table {
             latest,
             None,
         )
-        .map(Some)
+        .map(|latest| Some(latest.derived_from(self)))
     }
 
     /// What a scan over `filters` reads: the row groups of the files
@@ -763,16 +886,20 @@ impl Table {
     }
 
     /// Let go of the footers the cache holds for `files`, each under the
-    /// path the table names it by: what the deleter of a table's files
-    /// calls for them, since a footer held holds its file open, and a
-    /// deleted local file keeps its blocks for as long as it is open.
+    /// path the table names it by, and of what the ring's caches hold of
+    /// their bytes: what the deleter of a table's files calls for them,
+    /// since a footer held holds its file open, and a deleted local file
+    /// keeps its blocks for as long as it is open.
     pub fn forget_footers(&self, files: &[ObjectPath]) -> Result<()> {
         let uris = files
             .iter()
             .map(|path| self.location.uri_for(path))
             .collect::<Result<Vec<String>>>()?;
-        FileMetadataCache::process_wide()
-            .remove_footers(&self.cache_key, uris.iter().map(String::as_str));
+        FilesRemovedNext::forget_files(
+            &self.dispatcher,
+            &self.cache_key,
+            uris.iter().map(String::as_str),
+        );
         Ok(())
     }
 

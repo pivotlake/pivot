@@ -103,6 +103,12 @@ impl<Table: Default> FileMap<Table> {
         }
     }
 
+    /// Take `file`'s table out, whatever it holds.
+    pub fn remove(&self, file: &OpenFile) -> Option<Table> {
+        let table = self.files.write().unwrap().remove(file)?;
+        Some(table.into_inner().unwrap())
+    }
+
     /// Take every table out, leaving the map empty.
     pub fn drain(&self) -> Vec<(OpenFile, Table)> {
         std::mem::take(&mut *self.files.write().unwrap())

@@ -54,6 +54,12 @@ pub trait RingCache: Send + Sync {
     /// than ordinary entries under the same pressure.
     fn reinforce_range(&self, range: &SourceRange);
 
+    /// Drop every entry of `file`, returning how many: what whoever knows
+    /// the file will not be read again calls. Touches no slot, so it runs on
+    /// any thread: the bytes stay where they are until the clock reclaims
+    /// their slots, and a read of the file after this misses.
+    fn forget_file(&self, file: &OpenFile) -> usize;
+
     /// Drop every entry and recycle every slot that can be taken exclusively,
     /// returning how many entries were dropped. Backs `drop_cache()`.
     fn clear(&self) -> usize;

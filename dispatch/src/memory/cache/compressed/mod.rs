@@ -392,6 +392,14 @@ impl RingCache for CompressedCache {
         });
     }
 
+    /// A fill of the file still in flight settles as it would have: its
+    /// owner holds the extent, and finds no table to take it out of.
+    fn forget_file(&self, file: &OpenFile) -> usize {
+        self.files
+            .remove(file)
+            .map_or(0, |mut table| table.drain().count())
+    }
+
     /// Sound only while no query is in flight: it recycles bound slots, which
     /// must not race a reader holding a pin (a slot another worker is still
     /// filling is left intact; its extents are already dropped, so it serves

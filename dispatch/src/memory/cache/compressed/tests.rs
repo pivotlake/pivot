@@ -116,6 +116,31 @@ fn a_committed_fill_survives_its_owner_being_dropped() {
 }
 
 #[test]
+fn a_forgotten_file_is_read_again() {
+    init_test_free_pool(8);
+    let file = new_file();
+    fill_pattern(&cache().get(&file, 0, 10));
+
+    let forgotten = cache().forget_file(&file);
+
+    assert_eq!(forgotten, 1);
+    assert!(has_misses(&cache().get(&file, 0, 10)));
+}
+
+#[test]
+fn forgetting_a_file_leaves_another_files_bytes_cached() {
+    init_test_free_pool(8);
+    let kept = new_file();
+    let forgotten = new_file();
+    fill_pattern(&cache().get(&kept, 0, 10));
+    fill_pattern(&cache().get(&forgotten, 0, 10));
+
+    cache().forget_file(&forgotten);
+
+    assert!(!has_misses(&cache().get(&kept, 0, 10)));
+}
+
+#[test]
 fn miss_then_fill_then_hit() {
     init_test_free_pool(8);
 

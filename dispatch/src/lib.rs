@@ -86,6 +86,8 @@ mod profiler;
 mod scan;
 mod stats;
 
+use crate::io::OpenFile;
+use crate::memory::cache::Caches;
 use crate::waker::{WakerSet, WorkerWaker};
 use crate::worker::Worker;
 pub use api::*;
@@ -199,6 +201,8 @@ pub struct DataFlowDispatcher {
     waker_set: WakerSet,
     /// Total ring slots across all nodes, used to size group-by working memory.
     buffers: usize,
+    /// The ring's caches, shared with every worker.
+    caches: Arc<Caches>,
     /// Shared by every clone so arbitrary single-worker stages rotate across
     /// this pool rather than accumulating on its first worker.
     next_worker: Arc<AtomicUsize>,
@@ -278,6 +282,15 @@ impl DataFlowDispatcher {
     /// single query poll this to know when to stop.
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown_flag.load(Ordering::Relaxed)
+    }
+
+    /// Drop what the ring's caches hold of each of `files`, which will not
+    /// be read again: a file a table no longer lists, or one being deleted.
+    /// Runs on the calling thread.
+    pub fn forget_cached_files<'f>(&self, files: impl Iterator<Item = &'f OpenFile>) {
+        for file in files {
+            self.caches.forget_file(file);
+        }
     }
 
     /// Ship a `FnOnce() -> T` to one worker and return its result.
@@ -428,7 +441,12 @@ impl Dispatch {
 
         let barrier = Arc::new(Barrier::new(total_workers + 1));
         let should_exit = Arc::new(AtomicBool::new(false));
-        let mut memory_factories = MemoryContextFactory::create_for_layout(layout).into_iter();
+        let memory_factories = MemoryContextFactory::create_for_layout(layout);
+        let caches = memory_factories
+            .first()
+            .expect("a pool has a worker")
+            .share_caches();
+        let mut memory_factories = memory_factories.into_iter();
         let node_wakers: Vec<Arc<WorkerWaker>> = (0..topology.node_count)
             .map(|_| Arc::new(WorkerWaker::new(topology.workers_per_node)))
             .collect();
@@ -465,6 +483,7 @@ impl Dispatch {
                 topology,
                 waker_set: waker_set.clone(),
                 buffers: layout.total_slots(),
+                caches,
                 next_worker: Arc::new(AtomicUsize::new(0)),
                 shutdown_flag: should_exit.clone(),
                 #[cfg(feature = "perf")]

@@ -15,6 +15,7 @@
 //! [`reclaim`](Caches::reclaim): reclaim from the owning cache, then reinforce
 //! its siblings over whatever it dropped.
 
+use crate::io::OpenFile;
 use crate::memory::WriteBuffer;
 use crate::memory::cache::cached::Cached;
 use crate::memory::cache::compressed::CompressedCache;
@@ -103,6 +104,15 @@ impl Caches {
             }
         }
         Some(reclaimed.buffer)
+    }
+
+    /// Drop every entry of `file` from every cache; the total entries
+    /// dropped.
+    pub fn forget_file(&self, file: &OpenFile) -> usize {
+        self.caches
+            .iter()
+            .map(|cache| cache.forget_file(file))
+            .sum()
     }
 
     /// Drop everything from every cache; the total entries dropped.

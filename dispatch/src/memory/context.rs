@@ -164,6 +164,11 @@ impl MemoryContextFactory {
         Self::create_for_layout(RingLayout::single_node(count, buffers))
     }
 
+    /// The caches every worker's memory context shares.
+    pub fn share_caches(&self) -> Arc<Caches> {
+        Arc::clone(&self.caches.caches)
+    }
+
     pub fn create_memory_ctx(self) -> MemoryContext {
         let fill_cursors = self
             .caches
