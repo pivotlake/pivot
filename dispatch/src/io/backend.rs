@@ -112,16 +112,36 @@ mod uring_backend {
     }
 
     impl IOBackend {
+        /// A ring of `ring_size` submission entries whose completion queue
+        /// is the kernel's default, twice as long.
+        #[cfg(test)]
         pub fn new(ring_size: u32) -> io::Result<Self> {
+            Self::with_queue_sizes(ring_size, 2 * ring_size)
+        }
+
+        /// A ring of `submission_queue_size` submission entries whose
+        /// completion queue holds `completion_queue_size` completions (the
+        /// kernel rounds both up to a power of two). Completions past that
+        /// are kept by the kernel in memory it allocates as they arrive,
+        /// which can fail when the machine is short of memory, so the queue
+        /// should hold everything its user can have outstanding.
+        pub fn with_queue_sizes(
+            submission_queue_size: u32,
+            completion_queue_size: u32,
+        ) -> io::Result<Self> {
             // `IORING_SETUP_COOP_TASKRUN` (kernel >= 5.19) lets the kernel skip an
             // IPI when completing work on the submitting task — a latency win. On
             // older kernels `io_uring_setup` rejects the unknown flag with EINVAL;
             // fall back to a plain ring rather than failing to start the engine.
-            let ring = match IoUring::builder().setup_coop_taskrun().build(ring_size) {
+            let ring = match IoUring::builder()
+                .setup_cqsize(completion_queue_size)
+                .setup_coop_taskrun()
+                .build(submission_queue_size)
+            {
                 Ok(ring) => ring,
-                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                    IoUring::builder().build(ring_size)?
-                }
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => IoUring::builder()
+                    .setup_cqsize(completion_queue_size)
+                    .build(submission_queue_size)?,
                 Err(e) => return Err(e),
             };
             let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -571,6 +591,15 @@ mod pread_pool_backend {
         /// constructor but ignored here: the pool's concurrency is set by
         /// `io_pool_thread_count()` and its backlog is an unbounded channel.
         pub fn new(_ring_size: u32) -> io::Result<Self> {
+            Self::with_queue_sizes(_ring_size, 0)
+        }
+
+        /// The pool takes any number of operations, so the queue sizes a
+        /// ring needs mean nothing here.
+        pub fn with_queue_sizes(
+            _submission_queue_size: u32,
+            _completion_queue_size: u32,
+        ) -> io::Result<Self> {
             let (sink, rx) = unbounded();
             Ok(Self {
                 pool: io_pool().jobs.clone(),

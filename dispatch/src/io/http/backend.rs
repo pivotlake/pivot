@@ -25,6 +25,11 @@
 //! host in use looked up again once the time to live of its answer has
 //! passed, so a connection does not wait for that either.
 //!
+//! The engine keeps a bounded number of requests in flight. A request past
+//! the cap waits in the engine and goes out as another finishes. A request
+//! the store was too busy for, which it says with a 5xx or a 429 answer,
+//! goes again only after a wait that doubles with each such answer.
+//!
 //! A peer that is gone is noticed by the kernel, for reads and uploads alike.
 //! Every socket has TCP keepalive on and a bound on how long sent bytes may
 //! stay unacknowledged, so a connection whose packets vanish fails with a
@@ -41,8 +46,10 @@ use super::{BodyCursor, BodyWindow, RemoteRead, RemoteRequest, RemoteUpload};
 
 const IO_CHUNK_SIZE: usize = 16 * 1024;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use uring_engine::SHORTEST_BUSY_STORE_WAIT;
 #[cfg(target_os = "linux")]
-pub(crate) use uring_engine::HttpEngine;
+pub(crate) use uring_engine::{HttpEngine, MAX_COMPLETIONS_PER_REQUEST, MAX_REQUESTS_IN_FLIGHT};
 
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) use blocking_engine::{HttpCompletion, HttpEngine};
@@ -536,13 +543,15 @@ mod blocking_engine {
 mod uring_engine {
     use super::*;
     use crate::Identifier;
-    use crate::io::http::completion_tags::{HTTP_TAG, LOOKUP_TAG, STEP_DEADLINE_TAG};
+    use crate::io::http::completion_tags::{
+        BUSY_STORE_WAIT_TAG, HTTP_TAG, LOOKUP_TAG, STEP_DEADLINE_TAG,
+    };
     use crate::io::http::dns::{AddressBook, HostResolver};
     use crate::io::http::http1;
     use crate::io::http::{Error, Result};
     use io_uring::{IoUring, opcode, squeue, types};
     use rustls::ClientConnection;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::io::{Read, Write};
     use std::net::{IpAddr, SocketAddr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -627,6 +636,37 @@ mod uring_engine {
         base * 2u32.pow(deadline_reissues.min(MAX_STEP_DEADLINE_DOUBLINGS))
     }
 
+    /// The most requests one engine has in flight at once. A request past it
+    /// waits in the engine until another finishes. Every request in flight
+    /// holds a socket, its buffers and a TLS session, and a store answers a
+    /// burst far past what it serves at once by refusing requests.
+    pub(crate) const MAX_REQUESTS_IN_FLIGHT: usize = 2048;
+
+    /// The most completions the ring can hold for one request in flight that
+    /// the engine has not taken yet: its connect, send or recv with the
+    /// timeout linked to it, and the cancelled timeout of the step before,
+    /// which the kernel may post after that step's own completion. A request
+    /// waiting for a host lookup has none of these in the ring, and the
+    /// lookup's polls and timers take their place. The ring's completion
+    /// queue is sized by this, so it holds whatever the engine can have
+    /// outstanding.
+    pub(crate) const MAX_COMPLETIONS_PER_REQUEST: usize = 4;
+
+    /// The shortest wait before a request the store was too busy for is sent
+    /// again. The wait doubles with each such answer to the same request, and
+    /// up to as much again is added at random so that the requests of one
+    /// burst do not all come back at the same moment. A waiting request
+    /// keeps its place among the requests in flight, so a store that
+    /// refuses many of them is sent fewer at once until they go again.
+    pub(crate) const SHORTEST_BUSY_STORE_WAIT: Duration = Duration::from_millis(50);
+
+    /// How many times a request is sent again after the store was too busy
+    /// for it before the request fails. Counted apart from
+    /// [`MAX_HTTP_RETRIES`]: a busy store asks for patience, and the waits
+    /// between these attempts add up to between one and a half and three
+    /// seconds.
+    const MAX_BUSY_STORE_RETRIES: u32 = 5;
+
     /// How many times a single range read is re-issued on a fresh connection
     /// before it's reported as failed. Covers the common case — a pooled
     /// keep-alive connection the server closed on its idle timeout — plus a few
@@ -651,18 +691,14 @@ mod uring_engine {
     /// How long the kernel waits between two keepalive probes.
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 
-    /// Whether a transport error is worth retrying on a fresh connection. Socket
-    /// teardown (a closed keep-alive, a reset, a refused reconnect) is transient,
-    /// and so is a 5xx answer: object stores return one while they are briefly
-    /// overloaded. A TLS/protocol/DNS error is not — retrying would just fail
-    /// the same way.
+    /// Whether a transport error is worth retrying at once on a fresh
+    /// connection. Socket teardown (a closed keep-alive, a reset, a refused
+    /// reconnect) is transient. A TLS/protocol/DNS error is not — retrying
+    /// would just fail the same way. A 5xx or a 429 answer is retried too,
+    /// after a wait (see [`Error::is_busy_store_answer`]).
     fn is_retryable(err: &Error) -> bool {
-        use crate::io::http::proto::ProtoError;
         use std::io::ErrorKind::*;
         match err {
-            Error::Proto(
-                ProtoError::UnexpectedUploadStatus(status) | ProtoError::UnexpectedStatus(status),
-            ) => (500..600).contains(status),
             Error::Io(e) => matches!(
                 e.kind(),
                 UnexpectedEof
@@ -762,6 +798,16 @@ mod uring_engine {
         request: RemoteRequest,
         retries: u32,
         deadline_reissues: u32,
+        busy_store_retries: u32,
+    }
+
+    /// A request waiting out the pause before it is sent again to a store
+    /// that was too busy for it.
+    struct BusyStoreWait {
+        waiting: WaitingRequest,
+        /// How long the timer waits. Boxed so the address its SQE carries
+        /// stays put while the slab of waits grows.
+        pause: Box<types::Timespec>,
     }
 
     /// A host being looked up, and the requests that cannot connect until
@@ -799,6 +845,9 @@ mod uring_engine {
         /// step is not an error until the deadline has stopped doubling, so up
         /// to [`MAX_STEP_DEADLINE_DOUBLINGS`] misses leave `retries` alone.
         deadline_reissues: u32,
+        /// How many times the store has been too busy for this request;
+        /// bounded by [`MAX_BUSY_STORE_RETRIES`].
+        busy_store_retries: u32,
         /// When this attempt started, to learn what a read typically takes.
         started_at: Instant,
         /// The deadline the timeout linked to the in-flight connect or recv
@@ -844,6 +893,7 @@ mod uring_engine {
                 request,
                 retries,
                 deadline_reissues,
+                busy_store_retries,
             } = waiting;
             let expected_body_len = match &request {
                 RemoteRequest::Read(read) => read.expected_body_len(),
@@ -860,6 +910,7 @@ mod uring_engine {
                 request,
                 retries,
                 deadline_reissues,
+                busy_store_retries,
                 started_at: Instant::now(),
                 step_deadline: Box::new(types::Timespec::new()),
                 armed_step_deadline: Duration::ZERO,
@@ -1176,10 +1227,21 @@ mod uring_engine {
         address_book: AddressBook,
         /// The lookups in flight, by host.
         lookups: HashMap<String, Lookup>,
-        /// Requests in flight, counting the ones waiting for a lookup and not
-        /// counting idle pooled connections. A lookup that started as a
-        /// refresh counts as one too.
+        /// Requests in flight, counting the ones waiting for a lookup or to
+        /// be sent again, and not counting idle pooled connections. A lookup
+        /// that started as a refresh counts as one too.
         active: usize,
+        /// How many requests may be in flight at once, which is
+        /// [`MAX_REQUESTS_IN_FLIGHT`] outside tests.
+        requests_in_flight_cap: usize,
+        /// Requests past the cap, in the order they were started. Each goes
+        /// out when a request in flight finishes.
+        queued: VecDeque<WaitingRequest>,
+        /// Stable-index slab of the requests waiting to be sent again to a
+        /// store that was too busy for them; the index (tagged with
+        /// [`BUSY_STORE_WAIT_TAG`]) is the SQE `user_data`.
+        busy_store_waits: Vec<Option<BusyStoreWait>>,
+        free_busy_store_wait_slots: Vec<usize>,
         /// Ids whose body fully landed during the last completion routing pass.
         completed: Vec<Identifier>,
         /// Ids whose transport failed terminally (retries exhausted or a
@@ -1207,6 +1269,10 @@ mod uring_engine {
                 address_book: AddressBook::new(),
                 lookups: HashMap::new(),
                 active: 0,
+                requests_in_flight_cap: MAX_REQUESTS_IN_FLIGHT,
+                queued: VecDeque::new(),
+                busy_store_waits: Vec::new(),
+                free_busy_store_wait_slots: Vec::new(),
                 completed: Vec::new(),
                 failed: Vec::new(),
                 reissued: Vec::new(),
@@ -1265,8 +1331,16 @@ mod uring_engine {
             std::mem::take(&mut self.reissued)
         }
 
+        /// Keep at most `cap` requests in flight, so a test reaches the cap
+        /// with a handful of requests.
+        #[cfg(test)]
+        pub fn force_requests_in_flight_cap(&mut self, cap: usize) {
+            self.requests_in_flight_cap = cap;
+        }
+
+        /// Whether any request is in flight or waiting for its turn.
         pub fn has_active(&self) -> bool {
-            self.active > 0
+            self.active > 0 || !self.queued.is_empty()
         }
 
         pub fn take_completed(&mut self) -> Vec<Identifier> {
@@ -1305,16 +1379,85 @@ mod uring_engine {
         ) -> Result<()> {
             self.address_book
                 .record_use(request.remote().host(), Instant::now());
+            let waiting = WaitingRequest {
+                id,
+                request,
+                retries: 0,
+                deadline_reissues: 0,
+                busy_store_retries: 0,
+            };
+            // A request never overtakes one already waiting for its turn.
+            if !self.queued.is_empty() || self.active >= self.requests_in_flight_cap {
+                self.queued.push_back(waiting);
+                return Ok(());
+            }
             self.active += 1;
-            self.send_or_connect(
-                ring,
-                WaitingRequest {
-                    id,
-                    request,
-                    retries: 0,
-                    deadline_reissues: 0,
-                },
-            )
+            self.send_or_connect(ring, waiting)
+        }
+
+        /// Send the requests that waited for their turn, oldest first, for as
+        /// long as the cap has room for them.
+        fn start_queued_requests(&mut self, ring: &mut IoUring) -> Result<()> {
+            while self.active < self.requests_in_flight_cap
+                && let Some(waiting) = self.queued.pop_front()
+            {
+                self.active += 1;
+                self.send_or_connect(ring, waiting)?;
+            }
+            Ok(())
+        }
+
+        /// Have the request `waiting`, which the store was too busy for,
+        /// wait before it is sent again. The pause doubles with each such
+        /// answer the request has had. A request whose timer the ring does
+        /// not take has nothing in flight to bring it back, so it fails.
+        fn wait_out_busy_store(
+            &mut self,
+            ring: &mut IoUring,
+            waiting: WaitingRequest,
+        ) -> Result<()> {
+            let shortest = SHORTEST_BUSY_STORE_WAIT * 2u32.pow(waiting.busy_store_retries - 1);
+            let pause = shortest + shortest.mul_f64(rand::random::<f64>());
+            let id = waiting.id;
+            let wait = BusyStoreWait {
+                waiting,
+                pause: Box::new(
+                    types::Timespec::new()
+                        .sec(pause.as_secs())
+                        .nsec(pause.subsec_nanos()),
+                ),
+            };
+            let timespec = &*wait.pause as *const types::Timespec;
+            let idx = match self.free_busy_store_wait_slots.pop() {
+                Some(idx) => {
+                    self.busy_store_waits[idx] = Some(wait);
+                    idx
+                }
+                None => {
+                    self.busy_store_waits.push(Some(wait));
+                    self.busy_store_waits.len() - 1
+                }
+            };
+            let timer = opcode::Timeout::new(timespec)
+                .build()
+                .user_data(HTTP_TAG | BUSY_STORE_WAIT_TAG | idx as u64);
+            if let Err(error) = push(ring, &timer) {
+                self.busy_store_waits[idx] = None;
+                self.free_busy_store_wait_slots.push(idx);
+                self.active -= 1;
+                self.failed.push((id, error));
+            }
+            Ok(())
+        }
+
+        /// Send the request at slot `idx` of the busy store waits again, now
+        /// that its pause is over.
+        fn on_busy_store_wait_cqe(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
+            let wait = self.busy_store_waits[idx]
+                .take()
+                .expect("cqe for a request waiting out a busy store");
+            self.free_busy_store_wait_slots.push(idx);
+            self.send_or_connect(ring, wait.waiting)
         }
 
         /// Send `waiting`, a request already counted in `active`, on an idle
@@ -1497,9 +1640,23 @@ mod uring_engine {
         /// still double, that is a stalled attempt rather than a failed one, and
         /// the read is issued again. A miss of the longest deadline is a
         /// transport error like the others.
+        ///
+        /// Whatever the completion ended leaves room under the cap, which
+        /// the requests waiting for their turn take.
         pub fn on_cqe(&mut self, ring: &mut IoUring, user_data: u64, result: i32) -> Result<()> {
+            self.route_cqe(ring, user_data, result)?;
+            self.start_queued_requests(ring)
+        }
+
+        /// Hand a completion to the lookups, the waiting request or the
+        /// exchange its `user_data` names.
+        fn route_cqe(&mut self, ring: &mut IoUring, user_data: u64, result: i32) -> Result<()> {
             if user_data & STEP_DEADLINE_TAG != 0 {
                 return Ok(());
+            }
+            if user_data & BUSY_STORE_WAIT_TAG != 0 {
+                let idx = (user_data & !(HTTP_TAG | BUSY_STORE_WAIT_TAG)) as usize;
+                return self.on_busy_store_wait_cqe(ring, idx);
             }
             if user_data & LOOKUP_TAG != 0 {
                 self.host_resolver.on_cqe(ring, user_data, result)?;
@@ -1617,6 +1774,7 @@ mod uring_engine {
                 id,
                 retries,
                 deadline_reissues,
+                busy_store_retries,
                 request,
                 ..
             } = stalled;
@@ -1635,6 +1793,7 @@ mod uring_engine {
                     request,
                     retries,
                     deadline_reissues: deadline_reissues + 1,
+                    busy_store_retries,
                 },
             )
         }
@@ -1656,6 +1815,7 @@ mod uring_engine {
                 id,
                 retries,
                 deadline_reissues,
+                busy_store_retries,
                 request,
                 state,
                 ..
@@ -1671,6 +1831,26 @@ mod uring_engine {
             }
             drop(conn); // close the failed socket before reconnecting
 
+            // A request the store was too busy for waits before it goes
+            // again.
+            if err.is_busy_store_answer() {
+                if busy_store_retries < MAX_BUSY_STORE_RETRIES {
+                    return self.wait_out_busy_store(
+                        ring,
+                        WaitingRequest {
+                            id,
+                            request,
+                            retries,
+                            deadline_reissues,
+                            busy_store_retries: busy_store_retries + 1,
+                        },
+                    );
+                }
+                self.active -= 1;
+                self.failed.push((id, err));
+                return Ok(());
+            }
+
             if is_retryable(&err) && retries < MAX_HTTP_RETRIES {
                 return self.connect_or_await_address(
                     ring,
@@ -1679,6 +1859,7 @@ mod uring_engine {
                         request,
                         retries: retries + 1,
                         deadline_reissues,
+                        busy_store_retries,
                     },
                 );
             }

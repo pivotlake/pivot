@@ -59,10 +59,19 @@ pub(crate) mod completion_tags {
     /// Marks the CQE of the cancellation of a socket's poll. Nothing is done
     /// on its arrival: the cancelled poll reports with a CQE of its own.
     pub(crate) const POLL_CANCEL_TAG: u64 = 1 << 58;
+
+    /// Marks the CQE of the timer a request waits out before it is sent
+    /// again to a store that was too busy for it. The bits below the tags
+    /// hold the wait's slot.
+    pub(crate) const BUSY_STORE_WAIT_TAG: u64 = 1 << 57;
 }
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) use backend::HttpCompletion;
 pub(crate) use backend::HttpEngine;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use backend::SHORTEST_BUSY_STORE_WAIT;
+#[cfg(target_os = "linux")]
+pub(crate) use backend::{MAX_COMPLETIONS_PER_REQUEST, MAX_REQUESTS_IN_FLIGHT};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -82,6 +91,22 @@ pub enum Error {
     #[cfg(target_os = "linux")]
     #[error("{host} cannot be resolved: {reason}")]
     HostLookup { host: String, reason: c_ares::Error },
+}
+
+#[cfg(target_os = "linux")]
+impl Error {
+    /// Whether this is a 5xx or a 429 answer: the store failing for the
+    /// moment, or saying it is sent more requests than it serves, which a
+    /// later attempt may not meet.
+    pub(crate) fn is_busy_store_answer(&self) -> bool {
+        matches!(
+            self,
+            Error::Proto(
+                proto::ProtoError::UnexpectedUploadStatus(status)
+                    | proto::ProtoError::UnexpectedStatus(status),
+            ) if *status == 429 || (500..600).contains(status)
+        )
+    }
 }
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
