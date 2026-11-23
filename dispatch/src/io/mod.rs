@@ -243,14 +243,23 @@ impl Debug for OpenFile {
     }
 }
 
-/// Produces the `Authorization` header value for a remote read — typically a
-/// GCS bearer token. Invoked once per request on a worker thread, so it must be
-/// cheap and non-blocking: it reads an already-minted, cached token, it never
-/// mints one. `None` means the URL is self-authenticating (an S3 presigned URL)
-/// or needs no auth at all. `Arc` so a [`crate::io::OpenFile`]/source can be
-/// cloned (the work-stealing fetch queue clones each file) while sharing one
-/// token cell.
-pub type AuthHeader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
+/// What authenticates a request to a remote object: the headers a store adds
+/// to it, minted per request on the issuing thread from state the store keeps
+/// current (a cached bearer token, signing keys read again before they expire).
+/// Cheap and non-blocking by contract: it reads a cell or computes a
+/// signature, never a network round trip. A file whose URL needs no header
+/// (anonymous S3, a public URL) carries none. Held in an `Arc` so an
+/// [`OpenFile`]/source can be cloned (the work-stealing fetch queue clones
+/// each file) while sharing one cell.
+pub trait RequestAuth: Send + Sync {
+    /// The headers that authenticate one `method` request for `request_target`
+    /// (origin form: path and query) against the file's host.
+    fn authenticate(
+        &self,
+        method: &str,
+        request_target: &str,
+    ) -> std::io::Result<Vec<(String, String)>>;
+}
 
 /// A remote HTTP(S) object, resolved once and reused for every range request
 /// against it.
@@ -268,24 +277,22 @@ pub struct RemoteFile {
     host: String,
     port: u16,
     /// Value for the `Host:` request header: the bare host, plus the port when
-    /// the URL carries a non-default one. A presigned URL's SigV4 signature
-    /// covers this exact `host` header, so an S3-compatible endpoint on a custom
-    /// port (e.g. MinIO at `localhost:9000`) rejects the request as a signature
+    /// the URL carries a non-default one. An S3 SigV4 signature covers this
+    /// exact `host` header, so an S3-compatible endpoint on a custom port
+    /// (e.g. MinIO at `localhost:9000`) rejects the request as a signature
     /// mismatch if the port is dropped.
     host_header: String,
     /// Origin-form request target (path + query) for the HTTP request line.
     request_target: String,
     is_https: bool,
-    /// Mints the `Authorization` header for each request (a bearer token whose
-    /// freshness is the store's concern), or `None` for a self-authenticating
-    /// URL. Read per request, never on the URL's `Hash`/`Eq` path.
-    auth: Option<AuthHeader>,
+    /// Mints the headers that authenticate each request (a bearer token, a
+    /// signature; their freshness is the store's concern), or `None` for a URL
+    /// that needs none. Read per request, never on the URL's `Hash`/`Eq` path.
+    auth: Option<Arc<dyn RequestAuth>>,
     /// Stable object identity for the on-disk cache: the authority (`host` plus
-    /// any non-default port) + path, *without* the query string. S3 presigns its
-    /// read URLs, so the query holds a SigV4 signature that changes every time the
-    /// catalog re-signs; excluding it keeps `https://host/bucket/key?sig=A` and
-    /// `...?sig=B` mapped to one cache file. (GCS reads use a stable URL with a
-    /// `Bearer` header, so their query is empty anyway.) Including the port keeps
+    /// any non-default port) + path, *without* the query string, so a URL whose
+    /// query varies between opens (a signature embedded by whoever handed the
+    /// URL out) still maps to one cache file. Including the port keeps
     /// two endpoints that share a host but differ by port (e.g. two MinIO
     /// instances) on separate cache files.
     cache_identity: String,
@@ -297,11 +304,10 @@ pub struct RemoteFile {
 impl RemoteFile {
     /// Parse `url`. The host is not resolved here: an object needs no address
     /// of its own, only the connection a request for it travels on does.
-    /// `auth` supplies a fresh `Authorization` header per request, or
-    /// `None` when the URL carries its own auth; `size` is the object's byte
-    /// length (from the store listing), carried so the disk cache can size its
-    /// bitmap exactly.
-    pub fn open(url: Url, auth: Option<AuthHeader>, size: u64) -> std::io::Result<Self> {
+    /// `auth` mints the headers that authenticate each request, or is `None`
+    /// when the URL needs none; `size` is the object's byte length (from the
+    /// store listing), carried so the disk cache can size its bitmap exactly.
+    pub fn open(url: Url, auth: Option<Arc<dyn RequestAuth>>, size: u64) -> std::io::Result<Self> {
         let host = url
             .host_str()
             .ok_or_else(|| {
@@ -331,7 +337,7 @@ impl RemoteFile {
         }
 
         // `Url::port()` is `Some` only for an explicit, non-default port — the
-        // same condition under which the catalog's presign signs `host:port`.
+        // same condition under which a store's signer signs `host:port`.
         let host_header = match url.port() {
             Some(port) => format!("{host}:{port}"),
             None => host.clone(),
@@ -354,10 +360,14 @@ impl RemoteFile {
         })
     }
 
-    /// The `Authorization` header value for the next request, or `None` when the
-    /// URL is self-authenticating. Cheap and non-blocking — reads a cached token.
-    pub fn auth_header(&self) -> Option<Arc<str>> {
-        self.auth.as_ref().and_then(|f| f())
+    /// The headers that authenticate one `method` request against this file,
+    /// none when its URL needs no header. Cheap and non-blocking: a cached
+    /// token read or a signature computed, never a network round trip.
+    pub fn authenticate(&self, method: &str) -> std::io::Result<Vec<(String, String)>> {
+        match &self.auth {
+            Some(auth) => auth.authenticate(method, &self.request_target),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Total object size in bytes.
@@ -506,6 +516,17 @@ pub enum UploadMethod {
     /// of its answer. Sending the same `POST` twice may do the thing twice,
     /// so it goes out once, on a connection of its own.
     Post,
+}
+
+impl UploadMethod {
+    /// The method as the request line spells it, which is also what a store's
+    /// signature of the request covers.
+    pub fn as_verb(self) -> &'static str {
+        match self {
+            UploadMethod::Put => "PUT",
+            UploadMethod::Post => "POST",
+        }
+    }
 }
 
 /// A request that sends a body to an object store, driven by the same

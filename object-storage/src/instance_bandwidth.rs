@@ -29,12 +29,12 @@ pub const INSTANCE_METADATA_ENDPOINT: &str = "http://169.254.169.254";
 /// How long the metadata service gets to answer. It is link-local, so a real
 /// one answers in a millisecond; off EC2 nothing does, and startup should not
 /// wait on that for long.
-const METADATA_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const METADATA_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long connecting to the metadata service may take. Where the address
 /// leads nowhere a connection attempt hangs, and every start of the process
 /// would wait this out.
-const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 const INSTANCE_BANDWIDTH_TABLE: &str = include_str!("instance_bandwidth.tsv");
 

@@ -46,14 +46,17 @@ enum PivotCommand {
     /// tables' files are read from wherever the catalog says they are, with the
     /// credentials the catalog vends or those of the environment below.
     ///
-    /// Object-store credentials are read from the environment. S3 takes
-    /// AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY when both are set, or uses
-    /// anonymous access when both are absent. Its region comes from AWS_REGION
-    /// or AWS_DEFAULT_REGION when set, and is discovered with HeadBucket
-    /// otherwise. An optional AWS_ENDPOINT_URL names a path-style S3-compatible
-    /// endpoint such as MinIO. GCS follows Application Default Credentials:
-    /// GOOGLE_APPLICATION_CREDENTIALS, then the gcloud login file, then the
-    /// instance metadata server.
+    /// Object-store credentials are those of the environment the shell runs
+    /// in. S3 signs with the first of these that has keys: AWS_ACCESS_KEY_ID
+    /// and AWS_SECRET_ACCESS_KEY (with AWS_SESSION_TOKEN for temporary keys),
+    /// a container's credentials endpoint, and the role of the EC2 instance.
+    /// Temporary keys are refreshed before they expire, and requests are sent
+    /// unsigned when none of them has keys. The region comes from
+    /// AWS_REGION or AWS_DEFAULT_REGION when set, and is discovered with
+    /// HeadBucket otherwise. An optional AWS_ENDPOINT_URL names a path-style
+    /// S3-compatible endpoint such as MinIO. GCS follows Application Default
+    /// Credentials: GOOGLE_APPLICATION_CREDENTIALS, then the gcloud login
+    /// file, then the instance metadata server.
     Open {
         /// Local directory or object-store URI holding the datastore, or an
         /// Iceberg REST catalog's http(s) URI with --kind iceberg.

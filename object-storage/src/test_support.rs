@@ -19,9 +19,10 @@
 //! happens-before to every later reader. Tests isolate themselves under a unique
 //! key prefix within the shared bucket rather than per-test containers.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::{DataFileLocation, ObjectPath, ObjectStore, open_store};
+use dispatch::io::RequestAuth;
 use testcontainers::core::ContainerPort;
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
@@ -71,16 +72,16 @@ pub fn gcs(prefix: &str) -> Option<Backend> {
 }
 
 /// Fetch an object through [`ObjectStore::source`] exactly as the engine would:
-/// a local path is read off disk; a remote URL (a presigned S3 URL, a GCS media
-/// URL) is fetched over HTTP. Exercises the same read source the io_uring reader
-/// is handed.
+/// a local path is read off disk; a remote URL (an S3 object URL, a GCS media
+/// URL) is fetched over HTTP with the headers the store mints for the request.
+/// Exercises the same read source the io_uring reader is handed.
 pub fn read_via_source(store: &dyn ObjectStore, key: &ObjectPath) -> Vec<u8> {
     match store.source(key).expect("source") {
         DataFileLocation::Local(path) => std::fs::read(path).expect("read local source"),
         DataFileLocation::Remote { url, auth } => {
             let mut req = ureq::get(url.as_str());
-            if let Some(header) = auth.and_then(|f| f()) {
-                req = req.set("Authorization", &header);
+            for (name, value) in authenticate(auth, "GET", &url) {
+                req = req.set(&name, &value);
             }
             let resp = req.call().expect("GET source url");
             let mut buf = Vec::new();
@@ -101,8 +102,8 @@ pub fn write_via_sink(store: &dyn ObjectStore, key: &ObjectPath, bytes: &[u8]) {
         DataFileLocation::Local(path) => std::fs::write(path, bytes).expect("write local sink"),
         DataFileLocation::Remote { url, auth } => {
             let mut request = ureq::put(url.as_str());
-            if let Some(header) = auth.and_then(|mint| mint()) {
-                request = request.set("Authorization", &header);
+            for (name, value) in authenticate(auth, "PUT", &url) {
+                request = request.set(&name, &value);
             }
             request.send_bytes(bytes).expect("PUT sink url");
         }
@@ -113,13 +114,14 @@ pub fn write_via_sink(store: &dyn ObjectStore, key: &ObjectPath, bytes: &[u8]) {
 /// of an object assembled from parts with `-<part count>`; an object uploaded
 /// in one request has no such suffix.
 pub fn count_s3_upload_parts(store: &dyn ObjectStore, key: &ObjectPath) -> usize {
-    let DataFileLocation::Remote { url, .. } = store.source(key).expect("source") else {
+    let DataFileLocation::Remote { url, auth } = store.source(key).expect("source") else {
         panic!("an S3 object is read through a URL");
     };
-    let response = ureq::get(url.as_str())
-        .set("Range", "bytes=0-0")
-        .call()
-        .expect("GET source url");
+    let mut request = ureq::get(url.as_str()).set("Range", "bytes=0-0");
+    for (name, value) in authenticate(auth, "GET", &url) {
+        request = request.set(&name, &value);
+    }
+    let response = request.call().expect("GET source url");
     let etag = response.header("etag").expect("S3 answers with an ETag");
     match etag.trim_matches('"').rsplit_once('-') {
         Some((_, part_count)) => part_count.parse().expect("a part count"),
@@ -165,6 +167,25 @@ pub fn list_s3_pending_uploads(key: &str) -> Vec<String> {
         .into_iter()
         .map(|upload| upload.key)
         .collect()
+}
+
+/// The headers `auth` mints for a `method` request to `url`, as the ring would
+/// ask for them: with the URL's origin-form target.
+fn authenticate(
+    auth: Option<Arc<dyn RequestAuth>>,
+    method: &str,
+    url: &url::Url,
+) -> Vec<(String, String)> {
+    let Some(auth) = auth else {
+        return Vec::new();
+    };
+    let mut target = url.path().to_string();
+    if let Some(query) = url.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    auth.authenticate(method, &target)
+        .expect("authenticate the request")
 }
 
 // ---------------------------------------------------------------------------

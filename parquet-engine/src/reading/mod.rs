@@ -1,7 +1,7 @@
 //! The **reading** pipeline — the per-query scan, as a dispatch dataflow:
 //!
 //! - [`fetching`] — the source: injects a table's row groups and reads each
-//!   projected column chunk over the io_uring ring (disk or presigned HTTP).
+//!   projected column chunk over the io_uring ring (disk or HTTP).
 //! - [`indexer`] — splits the fetched chunks into compressed pages.
 //! - [`decompressor`] — decompresses each page.
 //! - [`range_cutter`] — collects each row group's pages and cuts its rows
