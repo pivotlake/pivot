@@ -106,7 +106,7 @@ fn steal_order(table: &ParquetTable, order: &ScanOrder) -> Vec<usize> {
 ///    entire extra job to the tail). Cache-resident row groups jumping the LPT
 ///    queue can't set that critical path: their decode skips the expensive
 ///    decompression, so they are the cheap tail-filler jobs anyway.
-fn plain_scan_order(table: &ParquetTable, projection: &Projection) -> Vec<usize> {
+pub(crate) fn plain_scan_order(table: &ParquetTable, projection: &Projection) -> Vec<usize> {
     let mut order: Vec<usize> = (0..table.row_groups.len()).collect();
     let projected_size = |idx: usize| -> i64 {
         let row_group = &table.row_groups[idx];

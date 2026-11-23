@@ -6,6 +6,11 @@
 //! IO, no decode — chunked to [`RECORD_BATCH_SIZE`] so a downstream `LIMIT` can
 //! reject most of them after the first chunk.
 //!
+//! Row groups are emitted in the order a plain scan claims them, those with
+//! pages in the decompressed cache first (see [`plain_scan_order`]). The rows
+//! a `LIMIT` keeps are the first emitted, and the `Materialize` above it reads
+//! their columns, so rows from a row group that is in memory spare that read.
+//!
 //! Row-group/row-index metadata columns are appended only when requested: a
 //! late-materialized plain `LIMIT` (whose narrow scan has no sort/filter key)
 //! needs them for the downstream `Materialize`; any other zero-column scan (a
@@ -23,8 +28,10 @@ use dispatch::{
 };
 
 use crate::RowGroupFilter;
+use crate::reading::fetching::plain_scan_order;
 use crate::reading::record_batch_metadata::{with_row_group_metadata, with_row_group_positions};
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
+use crate::types::projection::Projection;
 use crate::types::table::ParquetTable;
 
 /// Build a scan that emits the rows of an empty (zero-data-column) projection.
@@ -36,7 +43,7 @@ pub(crate) fn empty_projection_scan(
 ) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
     let row_groups = Arc::new(Injector::new());
-    for idx in 0..table.row_groups.len() {
+    for idx in plain_scan_order(table, &Projection::columns([])) {
         row_groups.push(QueryRowGroupMetadata::new(table, idx, RowSelection::All));
     }
     let factories = (0..n).map(|_| EmptyProjectionScanFactory {
@@ -141,7 +148,7 @@ impl Nullary<RecordBatch> for EmptyProjectionScan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reading::record_batch_metadata::row_index;
+    use crate::reading::record_batch_metadata::{global_row_group, row_index};
     use crate::test_utils::{deleted_rows, dummy_row_group};
     use crate::types::metadata::RowGroupMetadata;
     use dispatch::Dispatch;
@@ -159,6 +166,7 @@ mod tests {
                     num_rows: *rows,
                     deleted_rows: deleted_rows(0, deleted),
                     file_row_group_idx: index,
+                    live_decompressed_pages: Arc::default(),
                     ..(*dummy).clone()
                 })
             })
@@ -177,6 +185,27 @@ mod tests {
 
         let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(rows, 7);
+    }
+
+    #[test]
+    fn a_row_group_with_cached_pages_is_emitted_first() {
+        let dispatch = Dispatch::spin_up(1, 32, None);
+        let table = table_of_row_groups(&[5, 4, 3], &[&[], &[], &[]]);
+        table.row_groups[2]
+            .live_decompressed_pages
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let batches = empty_projection_scan(dispatch.dispatcher(), &table, None, true)
+            .collect()
+            .unwrap();
+
+        let first_row_group = global_row_group(&batches[0])
+            .values()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(first_row_group, 2);
     }
 
     #[test]

@@ -85,3 +85,4 @@ use crate::types::metadata::QueryRowGroupMetadata;
 use dispatch::BuildContext;
 use dispatch::{Built, BuiltUnary};
 pub use table_source::RowGroupInjectorFactory;
+pub(crate) use table_source::plain_scan_order;
