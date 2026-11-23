@@ -100,18 +100,6 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
         }
     }
 
-    /// What `row_group` counts against a read-ahead budget: its whole
-    /// projected size.
-    fn compute_projected_bytes(&self, row_group: &QueryRowGroupMetadata) -> usize {
-        let projected_bytes: i64 = self
-            .projection
-            .indices()
-            .iter()
-            .map(|&column| row_group.row_group_metadata.columns[column].total_compressed_size)
-            .sum();
-        projected_bytes as usize
-    }
-
     /// Ask for the next read while the read-ahead budget has room: an
     /// uncached row group when there is one, otherwise one expected to need a
     /// read, this worker's own queue first, then a peer's.
@@ -128,8 +116,8 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
             return Ok(WorkStatus::Pending);
         };
 
-        let read_ahead_charge =
-            io.charge_read_ahead(self.read_medium, self.compute_projected_bytes(&row_group));
+        let projected_bytes = row_group.compute_projected_bytes(&self.projection);
+        let read_ahead_charge = io.charge_read_ahead(self.read_medium, projected_bytes);
         let request = RowGroupRequest::from(row_group, &self.projection);
         if request.reads_nothing() {
             // In memory after all. It still waits its turn behind the row

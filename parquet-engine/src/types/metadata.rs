@@ -9,9 +9,11 @@
 //! decompressor to locate pages on disk.
 
 use crate::thrift::general::CompressionCodec;
+use crate::types::leaves::projected_leaves;
 use crate::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
+use dispatch::Projection;
 use dispatch::io::OpenFile;
 use roaring::RoaringTreemap;
 use std::ops::Range;
@@ -367,11 +369,61 @@ impl QueryRowGroupMetadata {
     pub fn index(&self) -> usize {
         self.row_group_index
     }
+
+    /// The compressed bytes of the chunks a read of `projection` fetches. A
+    /// nested column counts every leaf chunk under it, and a pushed extract
+    /// counts the leaves it reads.
+    pub fn compute_projected_bytes(&self, projection: &Projection) -> usize {
+        let fields = self.row_group_metadata.schema.fields();
+        projected_leaves(fields, self, projection)
+            .iter()
+            .map(|&leaf| self.columns()[leaf].total_compressed_size as usize)
+            .sum()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field, Fields, Schema};
+
+    fn chunk_of(total_compressed_size: i64) -> ColumnChunkMeta {
+        ColumnChunkMeta {
+            codec: CompressionCodec::SNAPPY,
+            dictionary_page_offset: None,
+            data_page_offset: 0,
+            total_compressed_size,
+            total_uncompressed_size: total_compressed_size,
+            max_def_level: 0,
+            physical_type: 0,
+            fixed_len_byte_width: None,
+            data_pages_all_dictionary: false,
+            absent: false,
+        }
+    }
+
+    #[test]
+    fn projected_bytes_count_the_leaf_chunks_of_the_projected_columns() {
+        let point = Fields::from(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Int64, false),
+        ]);
+        let table = ParquetTable::new(vec![Arc::new(RowGroupMetadata {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("point", DataType::Struct(point), false),
+                Field::new("label", DataType::Int64, false),
+            ])),
+            columns: vec![chunk_of(10), chunk_of(20), chunk_of(300)],
+            ..(*crate::test_utils::dummy_row_group()).clone()
+        })]);
+        let row_group = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
+
+        let point_bytes = row_group.compute_projected_bytes(&Projection::columns([0]));
+        let label_bytes = row_group.compute_projected_bytes(&Projection::columns([1]));
+
+        assert_eq!(point_bytes, 30);
+        assert_eq!(label_bytes, 300);
+    }
 
     #[test]
     fn a_row_group_straddling_a_treemap_block_sees_its_rows_from_both_sides() {
