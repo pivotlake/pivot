@@ -2233,3 +2233,70 @@ async fn qualify_on_row_number_keeps_the_lowest_scores_of_each_team(#[future] co
         ]]
     );
 }
+
+/// Create `table (id BIGINT, shard BIGINT, seen BIGINT, j VARIANT)` with four
+/// events, the first two on shard 0 and the others on shard 1: 1 and
+/// 3 are of age 30, the others of age 25, and `seen` grows with `id`.
+async fn create_events_table(conn: &Conn, table: &str) {
+    conn.simple_query(&format!(
+        "CREATE TABLE {table} (id BIGINT, shard BIGINT, seen BIGINT, j VARIANT)"
+    ))
+    .await
+    .unwrap();
+    conn.simple_query(&format!(
+        "INSERT INTO {table} VALUES (1, 0, 10, '{{\"age\":30}}'), (2, 0, 20, '{{\"age\":25}}'), \
+         (3, 1, 30, '{{\"age\":30}}'), (4, 1, 40, '{{\"age\":25}}')"
+    ))
+    .await
+    .unwrap();
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn top_whole_rows_filtered_by_a_variant_path(#[future] conn: Conn) {
+    create_events_table(&conn, "events_by_path").await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT * FROM events_by_path WHERE j.age::BIGINT = 30 ORDER BY seen DESC LIMIT 1",
+    )
+    .await;
+
+    let ids: Vec<Option<String>> = rows.into_iter().map(|row| row[0].clone()).collect();
+    assert_eq!(ids, vec![Some("3".into())]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn top_whole_rows_filtered_by_a_variant_path_and_a_column(#[future] conn: Conn) {
+    create_events_table(&conn, "events_by_path_and_shard").await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT * FROM events_by_path_and_shard WHERE j.age::BIGINT = 30 AND shard = 0 \
+         ORDER BY seen DESC LIMIT 1",
+    )
+    .await;
+
+    let ids: Vec<Option<String>> = rows.into_iter().map(|row| row[0].clone()).collect();
+    assert_eq!(ids, vec![Some("1".into())]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn top_whole_rows_filtered_by_a_variant_path_keep_the_top_n_scan_filter(
+    #[future] conn: Conn,
+) {
+    create_events_table(&conn, "events_plan").await;
+
+    let plan = select_rows(
+        &conn,
+        "EXPLAIN SELECT * FROM events_plan WHERE j.age::BIGINT = 30 ORDER BY seen DESC LIMIT 1",
+    )
+    .await;
+
+    assert!(format!("{plan:?}").contains("DynamicFilter("), "{plan:?}");
+}
