@@ -3,10 +3,10 @@ use crate::WriteRequestId;
 use crate::io::{Completion, IORequester};
 use crate::memory::cache::{CacheId, CacheSetup, Caches, FillCursor, PageCaches};
 use crate::memory::clock::{Clock, Sweep};
-use crate::memory::evict::DataflowEvict;
+use crate::memory::evict::{DataflowEvict, Evicted};
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::status::{MemoryBlockStatus, read_block_status};
-use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
+use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer, WritesInFlight};
 use crate::worker::WORKER_IDX;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
 use std::collections::HashMap;
@@ -93,7 +93,7 @@ struct NodeSpillPressure {
 
 /// The in-flight write count of each spilled buffer that one spill write
 /// carries rows of.
-type BuffersWritesInFlight = Vec<Arc<AtomicUsize>>;
+type BuffersWritesInFlight = Vec<Arc<WritesInFlight>>;
 
 pub struct MemoryContextFactory {
     ring: Arc<Ring>,
@@ -182,7 +182,7 @@ impl MemoryContextFactory {
             layout: self.layout,
             evictors: RefCell::new(HashMap::new()),
             buffers_spilled: self.buffers_spilled,
-            own_buffers_spilled: Cell::new(0),
+            own_buffers_spilled: Arc::new(AtomicUsize::new(0)),
             spill_pressure: self.spill_pressure,
             io_requester: OnceCell::new(),
             spill_writes_in_flight: RefCell::new(HashMap::new()),
@@ -221,10 +221,12 @@ pub struct MemoryContext {
     /// node's workers, so a slot one worker is already spilling is not asked
     /// for again by another.
     buffers_spilled: Arc<[AtomicUsize]>,
-    /// The slots this worker itself has handed over for spilling and still
-    /// holds. Only this worker's eviction can take those back, so they are
-    /// what tells one worker's need to spill apart from its siblings'.
-    own_buffers_spilled: Cell<usize>,
+    /// The slots this worker itself has handed over for spilling and that are
+    /// still held. They are what tells one worker's need to spill apart from
+    /// its siblings'. Every one of those buffers carries a handle on the
+    /// count, because a sibling that takes the buffer back counts it off from
+    /// its own thread.
+    own_buffers_spilled: Arc<AtomicUsize>,
     /// Per node, whether the last worker to count the node's reclaimable
     /// slots found it short of them. A worker that took no buffer reads only
     /// this to learn that its siblings have run the node short.
@@ -554,12 +556,15 @@ impl MemoryContext {
             if !moved_a_hand {
                 // Whatever is cached in this region is held by readers, so the
                 // caches have nothing to give back and only the operators can.
-                if let Some(buffer) = self.evict_from_dataflow_operators() {
-                    return buffer;
-                }
-                if self.has_spill_writes_in_flight() {
-                    self.wait_for_a_spill_write_to_land();
-                    iterations = 0;
+                match self.evict_from_dataflow_operators() {
+                    Evicted::Buffer(buffer) => return buffer,
+                    Evicted::NothingUntilWoken => {
+                        if let Some(buffer) = self.wait_for_a_spilled_buffer() {
+                            return buffer;
+                        }
+                        iterations = 0;
+                    }
+                    Evicted::Nothing => {}
                 }
                 continue;
             }
@@ -571,12 +576,15 @@ impl MemoryContext {
                 if drained || nothing_left_to_drain {
                     sweeps_given_up += 1;
                     if sweeps_given_up >= members_to_try {
-                        if let Some(buffer) = self.evict_from_dataflow_operators() {
-                            return buffer;
-                        }
-                        if self.has_spill_writes_in_flight() {
-                            self.wait_for_a_spill_write_to_land();
-                            iterations = 0;
+                        match self.evict_from_dataflow_operators() {
+                            Evicted::Buffer(buffer) => return buffer,
+                            Evicted::NothingUntilWoken => {
+                                if let Some(buffer) = self.wait_for_a_spilled_buffer() {
+                                    return buffer;
+                                }
+                                iterations = 0;
+                            }
+                            Evicted::Nothing => {}
                         }
                     }
                 }
@@ -596,10 +604,10 @@ impl MemoryContext {
     /// because eviction can take them once their write lands, so the slots
     /// that are none of these are the ones operators still hold.
     ///
-    /// A spilled slot can be taken back only by the worker that spilled it, so
-    /// this worker's own spilled slots are added on top of the node's. A worker
+    /// This worker's own spilled slots are added on top of the node's. A worker
     /// that holds many sees no shortfall and one that holds few sees it first,
-    /// which sends each new spill to the worker with the fewest.
+    /// which sends each new spill to the worker with the fewest and keeps the
+    /// node's spilled slots spread evenly over its workers.
     ///
     /// Nothing is asked for until the reclaimable slots are below where
     /// spilling starts (see [`get_reclaimable_slots_start_percent`]), which may
@@ -610,7 +618,8 @@ impl MemoryContext {
     ///
     /// Whether the node as a whole is short is published to its other workers
     /// (see [`is_pressure_check_due`](Self::is_pressure_check_due)). That
-    /// leaves out this worker's own spilled slots, which only it can count.
+    /// leaves out this worker's own spilled slots, which tell only this worker
+    /// whether it is its turn to spill.
     pub fn slots_to_spill(&self) -> usize {
         let free = self.dirty_pool.free_slots() + self.zeroed_pool.free_slots();
         let cached = self.clock.count_cached_in_region(self.node);
@@ -620,31 +629,46 @@ impl MemoryContext {
         let target = slots * get_reclaimable_slots_target_percent() / 100;
         let node_reclaimable = free + cached + spilled;
         self.publish_spill_pressure(node_reclaimable < start);
-        let reclaimable = node_reclaimable + self.own_buffers_spilled.get();
+        let reclaimable = node_reclaimable + self.own_buffers_spilled.load(Ordering::Relaxed);
         if reclaimable >= start {
             return 0;
         }
         (target - reclaimable).div_ceil(self.layout.topology().workers_per_node)
     }
 
-    /// Count `count` more of this node's slots as spilled, so that
-    /// [`slots_to_spill`](Self::slots_to_spill) stops asking for them.
+    /// Count `count` more of this node's slots as spilled, by this worker, so
+    /// that [`slots_to_spill`](Self::slots_to_spill) stops asking for them.
     pub fn record_buffers_spilled(&self, count: usize) {
         self.buffers_spilled[self.node].fetch_add(count, Ordering::Relaxed);
-        self.own_buffers_spilled
-            .set(self.own_buffers_spilled.get() + count);
+        self.own_buffers_spilled.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// A handle on this worker's count of the slots it spilled, for each
+    /// spilled buffer to carry to whichever worker releases it (see
+    /// [`record_spilled_buffers_released`](Self::record_spilled_buffers_released)).
+    pub fn share_own_buffers_spilled(&self) -> Arc<AtomicUsize> {
+        self.own_buffers_spilled.clone()
     }
 
     /// Note that `count` spilled slots have been released, so they are no
     /// longer counted as spilled: once free, the pools count them instead.
-    pub fn record_spilled_buffers_released(&self, count: usize) {
+    /// `buffers_spilled_by_worker` is the count of the worker that spilled
+    /// them, which may be a sibling of the one releasing them.
+    pub fn record_spilled_buffers_released(
+        &self,
+        count: usize,
+        buffers_spilled_by_worker: &AtomicUsize,
+    ) {
         let before = self.buffers_spilled[self.node].fetch_sub(count, Ordering::Relaxed);
         assert!(
             before >= count,
             "released more spilled buffers than were spilled"
         );
-        self.own_buffers_spilled
-            .set(self.own_buffers_spilled.get() - count);
+        let before = buffers_spilled_by_worker.fetch_sub(count, Ordering::Relaxed);
+        assert!(
+            before >= count,
+            "released more spilled buffers than their worker spilled"
+        );
     }
 
     /// Make `evictors` reachable from this worker's eviction for as long as the
@@ -697,7 +721,7 @@ impl MemoryContext {
         &self,
         dataflow: Identifier,
         id: WriteRequestId,
-        buffers_writes_in_flight: Vec<Arc<AtomicUsize>>,
+        buffers_writes_in_flight: BuffersWritesInFlight,
     ) {
         let replaced = self
             .spill_writes_in_flight
@@ -732,29 +756,36 @@ impl MemoryContext {
                 spill_writes_in_flight.remove(&(write.data_flow_id, write.request.id))
             {
                 for writes_in_flight in buffers_writes_in_flight {
-                    writes_in_flight.fetch_sub(1, Ordering::Release);
+                    writes_in_flight.count_off_landed_write();
                 }
             }
         }
     }
 
-    /// Block until one of this worker's spill writes may have landed, and
-    /// count the ones that did off their buffers. Every slot this worker could
-    /// reclaim is held by a spilled buffer whose write has not landed yet, so
-    /// the only way forward is to let the writes finish. Runs inside an
-    /// operator's run, so it leaves every other completion for the worker's
-    /// next pass.
+    /// Block until a spilled buffer may have become evictable, and count this
+    /// worker's spill writes that landed meanwhile off their buffers. Every
+    /// slot this worker could reclaim is held by a spilled buffer whose write
+    /// has not landed yet, so the only way forward is to let the writes
+    /// finish. Returns a buffer if one turned up before the wait began. Runs
+    /// inside an operator's run, so it leaves every other completion for the
+    /// worker's next pass.
     ///
-    /// A write held back because its device's hardware queue is full is not on
-    /// the ring, and the worker is told through its waker when a slot in that
-    /// queue frees. The waker reaches only a wait that was published to it, so
-    /// the wait is published the way the worker loop publishes its own: a
-    /// worker whose writes are all held back would otherwise never wake.
-    fn wait_for_a_spill_write_to_land(&self) {
+    /// A write of this worker's shows up on its ring when it lands. Anything
+    /// else reaches the worker through its waker, which only reaches a wait
+    /// that was published to it, so the wait is published the way the worker
+    /// loop publishes its own. That covers a write held back because its
+    /// device's hardware queue is full, which is not on the ring until a slot
+    /// in that queue frees, and a buffer of another worker's, whose evictor
+    /// wakes the workers it told to wait.
+    ///
+    /// The operators are asked once more after the ring wake count is read: a
+    /// wake sent for an answer given before that would otherwise be missed,
+    /// and the wait would have nothing left to end it.
+    fn wait_for_a_spilled_buffer(&self) -> Option<WriteBuffer> {
         let requester = self
             .io_requester
             .get()
-            .expect("spill writes are in flight only on a worker with an attached IO requester");
+            .expect("a worker that waits for a spilled buffer has an attached IO requester");
         let mut requester = requester
             .try_borrow_mut()
             .expect("eviction does not run from inside the IO requester's own calls");
@@ -763,13 +794,16 @@ impl MemoryContext {
             .layout
             .topology()
             .local_index_of_worker(WORKER_IDX.get());
-        // Read before the hardware queues are tried, so a slot that frees
-        // after that makes the wait return at once instead of being missed.
         let last_seen = waker.ring_wake_count();
         // Take what the ring already holds, which also puts held-back writes
         // on the device as far as its queue allows.
         if self.count_off_landed_spill_writes(&mut requester) {
-            return;
+            return None;
+        }
+        match self.evict_from_dataflow_operators() {
+            Evicted::Buffer(buffer) => return Some(buffer),
+            Evicted::Nothing => return None,
+            Evicted::NothingUntilWoken => {}
         }
         if waker.begin_ring_wait(node_local_idx, last_seen) {
             let waited = requester.wait();
@@ -777,6 +811,7 @@ impl MemoryContext {
             waited.expect("waiting on the IO ring while evicting");
         }
         self.count_off_landed_spill_writes(&mut requester);
+        None
     }
 
     /// Collect the ring's completions and count the spill writes among them
@@ -791,15 +826,26 @@ impl MemoryContext {
     }
 
     /// Ask each registered dataflow's operators for a slot they can give up and
-    /// return the first one offered, or `None` when none has a slot to spare
-    /// right now. The borrow is held across the calls, which is fine because an
-    /// operator's `evict` only releases memory it already holds and never
-    /// reaches back into this registry.
-    fn evict_from_dataflow_operators(&self) -> Option<WriteBuffer> {
-        self.evictors
-            .borrow_mut()
-            .values_mut()
-            .find_map(DataflowEvict::evict)
+    /// return the first one offered. When none has a slot to spare right now,
+    /// the answer says whether one is on its way: an operator said this worker
+    /// will be woken for it, or a spill write of this worker's own is still in
+    /// flight, whose landing wakes the worker's ring. The borrow is held across
+    /// the calls, which is fine because an operator's `evict` only releases
+    /// memory it already holds and never reaches back into this registry.
+    fn evict_from_dataflow_operators(&self) -> Evicted {
+        let mut is_woken_later = self.has_spill_writes_in_flight();
+        for evictors in self.evictors.borrow_mut().values_mut() {
+            match evictors.evict() {
+                Evicted::Buffer(buffer) => return Evicted::Buffer(buffer),
+                Evicted::NothingUntilWoken => is_woken_later = true,
+                Evicted::Nothing => {}
+            }
+        }
+        if is_woken_later {
+            Evicted::NothingUntilWoken
+        } else {
+            Evicted::Nothing
+        }
     }
 }
 
@@ -1048,7 +1094,8 @@ mod tests {
         let shortfall = memory_ctx().slots_to_spill();
         memory_ctx().record_buffers_spilled(shortfall);
         let while_spilled = memory_ctx().slots_to_spill();
-        memory_ctx().record_spilled_buffers_released(shortfall);
+        memory_ctx()
+            .record_spilled_buffers_released(shortfall, &memory_ctx().share_own_buffers_spilled());
         let after_release = memory_ctx().slots_to_spill();
 
         assert_eq!(shortfall, 15);
@@ -1066,7 +1113,7 @@ mod tests {
         let shortfall = memory_ctx().slots_to_spill();
 
         assert_eq!(shortfall, 0);
-        memory_ctx().record_spilled_buffers_released(5);
+        memory_ctx().record_spilled_buffers_released(5, &memory_ctx().share_own_buffers_spilled());
     }
 
     #[test]

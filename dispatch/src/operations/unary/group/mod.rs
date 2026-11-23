@@ -535,13 +535,9 @@ mod tests {
         let topk_threshold = Arc::new(TopKThreshold::for_limit(output_limit));
         let shared_bin_totals = Arc::new(SharedBinTotals::new(1));
 
-        let evictors: Vec<SharedPartitionEvictor> = (0..worker_count)
-            .map(|_| {
-                std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::memory::PartitionEvictor::new(),
-                ))
-            })
-            .collect();
+        let evictors = SharedPartitionEvictor::create_for_workers(
+            crate::numa::Topology::single_node(worker_count),
+        );
         let groups: Vec<_> = evictors
             .iter()
             .map(|evictor| {
@@ -577,7 +573,7 @@ mod tests {
                 .spill(&mut io.spiller(&spill_directory), usize::MAX)
                 .unwrap();
             io.finish_spill_writes();
-            while let Some(freed) = evictors[worker].borrow_mut().evict() {
+            while let Some(freed) = evictors[worker].lock_own().evict() {
                 drop(freed);
                 evicted += 1;
             }
@@ -915,9 +911,7 @@ mod tests {
                     radix,
                     topk_threshold.clone(),
                     shared_bin_totals.clone(),
-                    std::rc::Rc::new(std::cell::RefCell::new(
-                        crate::memory::PartitionEvictor::new(),
-                    )),
+                    SharedPartitionEvictor::create_without_siblings(),
                 )
             })
             .collect();

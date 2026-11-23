@@ -21,12 +21,12 @@ use crate::memory::spill::partition_tree::{
     PARTITIONS, PartitionTree, group_of_partition, is_leaf,
 };
 use crate::memory::spill::{
-    SPILL_BLOCK_SIZE, SpillWrite, SpilledBuffer, SpilledSlab, Spiller, padded_to_spill_block,
+    SPILL_BLOCK_SIZE, SpillWrite, SpilledBuffer, SpilledSlab, Spiller, WritesInFlight,
+    padded_to_spill_block,
 };
 use crate::memory::{BUFFER_SIZE, FileBytes, FrozenSlab, Slab, WriteBuffer, memory_ctx};
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 thread_local! {
     /// Where a worker compresses the slabs of one write before it knows how
@@ -124,23 +124,6 @@ struct PackedSlab<'a> {
     start: usize,
     compressed_len: usize,
     slab: &'a FrozenSlab,
-}
-
-/// Have `write` count as in flight for `spilled_buffer`, which it carries
-/// rows of, unless it already does.
-fn count_write_against_buffer(write: &mut SpillWrite, spilled_buffer: &SpilledBuffer) {
-    let already_counted = write
-        .buffers_writes_in_flight
-        .iter()
-        .any(|counted| Arc::ptr_eq(counted, &spilled_buffer.writes_in_flight));
-    if !already_counted {
-        spilled_buffer
-            .writes_in_flight
-            .fetch_add(1, Ordering::Release);
-        write
-            .buffers_writes_in_flight
-            .push(spilled_buffer.writes_in_flight.clone());
-    }
 }
 
 /// The slab a partition is appending into, and where it came from, so that
@@ -644,7 +627,8 @@ impl<L: Layout> PartitionAllocator<L> {
                 ));
             }
             spilled_buffers.push(SpilledBuffer {
-                writes_in_flight: Arc::new(AtomicUsize::new(0)),
+                writes_in_flight: Arc::new(WritesInFlight::new()),
+                buffers_spilled_by_worker: memory_ctx().share_own_buffers_spilled(),
                 buffer,
                 slabs: Vec::new(),
                 partition_group_slot: partition_group_slot_idx,
@@ -755,7 +739,7 @@ impl<L: Layout> PartitionAllocator<L> {
         write.rows.push_slab(compressed_rows);
         for packed_slab in packed_slabs {
             let spilled_buffer = &mut spilled_buffers[packed_slab.spilled_buffer_idx];
-            count_write_against_buffer(&mut write, spilled_buffer);
+            write.count_against_buffer(spilled_buffer);
             spilled_buffer.slabs.push(SpilledSlab {
                 spill_partition_id: partition,
                 file_offset: write.offset + packed_slab.start as u64,
@@ -880,7 +864,6 @@ mod tests {
     use crate::stats::StatsCollector;
     use crate::worker::WORKER_IDX;
     use std::cell::RefCell;
-    use std::sync::atomic::Ordering;
 
     /// What a `Spiller` borrows, with a spill directory of the test's own so
     /// its spill files clash with no other test's.
@@ -1177,11 +1160,11 @@ mod tests {
             .pop()
             .unwrap();
         let again = allocator.spill(&mut parts.spiller(), 1).unwrap();
-        let writes_issued = spilled.writes_in_flight.load(Ordering::Acquire);
+        let writes_issued = spilled.writes_in_flight.load();
         parts.finish_writes();
 
         assert_eq!(writes_issued, 4);
-        assert_eq!(spilled.writes_in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(spilled.writes_in_flight.load(), 0);
         let partitions: Vec<usize> = spilled.slabs.iter().map(|s| s.spill_partition_id).collect();
         assert_eq!(partitions, [0, 64, 128, 192]);
         assert!(spilled.slabs.iter().all(|s| s.file_offset == 0));
@@ -1233,7 +1216,7 @@ mod tests {
             .unwrap();
         parts.finish_writes();
 
-        assert_eq!(second.writes_in_flight.load(Ordering::Acquire), 0);
+        assert_eq!(second.writes_in_flight.load(), 0);
         assert_eq!(
             allocator.partitions[0].spill_file.clone().unwrap(),
             file_after_first
@@ -1274,7 +1257,7 @@ mod tests {
         let writes_issued = parts.next_request_id;
         let writes_per_buffer: Vec<usize> = spilled
             .iter()
-            .map(|buffer| buffer.writes_in_flight.load(Ordering::Acquire))
+            .map(|buffer| buffer.writes_in_flight.load())
             .collect();
         parts.finish_writes();
 
@@ -1286,7 +1269,7 @@ mod tests {
         assert!(
             spilled
                 .iter()
-                .all(|buffer| buffer.writes_in_flight.load(Ordering::Acquire) == 0)
+                .all(|buffer| buffer.writes_in_flight.load() == 0)
         );
         assert_eq!(parts.file_len(0), SPILL_BLOCK_SIZE as u64);
     }

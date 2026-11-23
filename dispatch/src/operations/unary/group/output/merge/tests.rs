@@ -38,7 +38,7 @@ fn merge_partition(
     table
 }
 use crate::RECORD_BATCH_SIZE;
-use crate::memory::{PartitionEvictor, SharedPartitionEvictor, init_test_free_pool};
+use crate::memory::{SharedPartitionEvictor, init_test_free_pool};
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{
     AggregatedTable, AggregatedTableOutput, RadixConfig,
@@ -78,7 +78,7 @@ fn make_worker_tables(
         (),
         RadixConfig::DEFAULT,
         None,
-        fresh_evictor(),
+        SharedPartitionEvictor::create_without_siblings(),
     );
     let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
@@ -281,10 +281,6 @@ fn node_tables_merge_across_nodes() {
     assert_eq!(entries, vec![(1, 1), (2, 2), (3, 2), (4, 1)]);
 }
 
-fn fresh_evictor() -> SharedPartitionEvictor {
-    std::rc::Rc::new(std::cell::RefCell::new(PartitionEvictor::new()))
-}
-
 /// Feed `values` through a worker in batch-sized chunks and hand back its
 /// finalized output (in-place stack + scatter buffers if it switched).
 fn make_worker_output(
@@ -299,7 +295,7 @@ fn make_worker_output(
         (),
         RadixConfig::DEFAULT,
         None,
-        fresh_evictor(),
+        SharedPartitionEvictor::create_without_siblings(),
     );
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
     // Consume one batch at a time because hash scratch has a fixed size.
