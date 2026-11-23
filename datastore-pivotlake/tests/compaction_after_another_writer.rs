@@ -13,11 +13,11 @@ use iceberg_tables::test_support::FaultyStore;
 use object_storage::{LocalStore, ObjectStore};
 use planner::catalog::SchemaQualifiedTableName;
 
-/// Sizes under which any two small files are a merge.
+/// Sizes under which a final sweep merges any two small files.
 fn build_pair_merge_config() -> CompactionConfig {
     CompactionConfig {
         target_bytes: 64 * 1024 * 1024,
-        merge_target_bytes: 1,
+        merge_target_bytes: 5 * 64 * 1024 * 1024,
         min_files: 2,
         max_concurrent_merges: 1,
         layout_clique_size: 2,
@@ -45,7 +45,7 @@ fn check_a_round_merges_the_files_another_process_inserted(format: TableFormat) 
     insert_rows(&other_process, "t", vec![int_batch(&[1])]);
     insert_rows(&other_process, "t", vec![int_batch(&[2])]);
 
-    db.compact("t", false);
+    db.compact("t", true);
 
     let files = db
         .datastore

@@ -628,6 +628,12 @@ impl CatalogTable {
         self.table.select_rewritable_partitions(partitions)
     }
 
+    /// When each of the commits at `commit_sequences` was made; see
+    /// `Table::read_commit_times_ms`.
+    pub(crate) fn read_commit_times_ms(&self, commit_sequences: &[u64]) -> Vec<u64> {
+        self.table.read_commit_times_ms(commit_sequences)
+    }
+
     /// Index each of `partitions` together; see `Table::index_partitions`.
     pub(crate) fn index_partitions(&self, partitions: &[Vec<u8>]) -> crate::Result<()> {
         self.table.index_partitions(partitions)

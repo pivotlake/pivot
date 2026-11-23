@@ -196,6 +196,10 @@ pub(crate) trait Table: Send + Sync {
     /// each. A format whose version holds every partition's files has
     /// nothing to do.
     fn index_partitions(&self, partitions: &[Vec<u8>]) -> Result<()>;
+    /// When the commit standing at each of `commit_sequences` among the
+    /// table's commits was made, in Unix milliseconds, one for each in the
+    /// order given: how old the files that commit added are.
+    fn read_commit_times_ms(&self, commit_sequences: &[u64]) -> Vec<u64>;
     /// The live data files of `partition`, as the index the version keeps
     /// them in; `None` when this version has no file in the partition.
     fn load_partition_files(&self, partition: &[u8]) -> Result<Option<Arc<dyn PartitionFiles>>>;

@@ -26,8 +26,8 @@
 //! are read from the manifests written since, whoever wrote them: what a
 //! routine compaction round examines.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use catalog::datastore::DatastoreTableMetadata;
@@ -204,12 +204,27 @@ struct IcebergTable {
     /// The qualified name the table is indexed under, for messages.
     name: SchemaQualifiedTableName,
     table: iceberg_tables::Table,
+    /// When each snapshot this version lists was written, read from the
+    /// metadata the first time a commit's time is asked for.
+    snapshot_times: OnceLock<SnapshotTimes>,
+}
+
+/// When the snapshots one version of a table lists were written.
+struct SnapshotTimes {
+    /// The timestamp of each snapshot, by its sequence number.
+    by_sequence_number: HashMap<i64, i64>,
+    /// The timestamp of the oldest snapshot, 0 for a table with none.
+    oldest: i64,
 }
 
 impl IcebergTable {
     /// The table at the version `table` is at.
     fn new(name: SchemaQualifiedTableName, table: iceberg_tables::Table) -> Self {
-        Self { name, table }
+        Self {
+            name,
+            table,
+            snapshot_times: OnceLock::new(),
+        }
     }
 
     /// The entry a commit records for `file`, which a writer just uploaded:
@@ -347,6 +362,40 @@ impl Table for IcebergTable {
     /// several of them decoded once for them all.
     fn index_partitions(&self, partitions: &[Vec<u8>]) -> crate::Result<()> {
         Ok(self.table.index_partitions(partitions)?)
+    }
+
+    /// The timestamp of the snapshot each commit wrote. A commit whose
+    /// snapshot has been expired is given the timestamp of the oldest
+    /// snapshot the table still lists: it was made no later than that.
+    fn read_commit_times_ms(&self, commit_sequences: &[u64]) -> Vec<u64> {
+        let snapshot_times = self.snapshot_times.get_or_init(|| {
+            let by_sequence_number: HashMap<i64, i64> = self
+                .table
+                .metadata()
+                .snapshots()
+                .map(|snapshot| (snapshot.sequence_number(), snapshot.timestamp_ms()))
+                .collect();
+            let oldest = by_sequence_number.values().copied().min().unwrap_or(0);
+            SnapshotTimes {
+                by_sequence_number,
+                oldest,
+            }
+        });
+        commit_sequences
+            .iter()
+            .map(|commit_sequence| {
+                let committed_at = i64::try_from(*commit_sequence)
+                    .ok()
+                    .and_then(|sequence_number| {
+                        snapshot_times
+                            .by_sequence_number
+                            .get(&sequence_number)
+                            .copied()
+                    })
+                    .unwrap_or(snapshot_times.oldest);
+                u64::try_from(committed_at).unwrap_or(0)
+            })
+            .collect()
     }
 
     /// The partition's index; only that partition is indexed.

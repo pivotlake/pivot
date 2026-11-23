@@ -190,9 +190,11 @@ pub const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// enter layout optimization instead.
 pub const DEFAULT_COMPACT_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Default headroom for compression gains: a group whose input bytes only just
-/// reach the desired output size can encode to another undersized file.
-pub const DEFAULT_MERGE_TARGET_MULTIPLIER: f64 = 1.3;
+/// Default for how many times the desired output size the inputs of one
+/// small-file merge may hold. A merge writes as many output files as its
+/// rows fill, so several files that each nearly reach the desired size, and
+/// that no smaller group could merge, are rewritten together.
+pub const DEFAULT_MERGE_TARGET_MULTIPLIER: f64 = 5.0;
 
 /// Default for the fewest small files one merge takes: any two.
 pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 2;
@@ -200,7 +202,20 @@ pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 2;
 /// The most small files one merge takes. A merge holds rows of every input
 /// file in memory at once, so its memory grows with their number. A larger
 /// pile is merged in steps.
-pub const MAX_SMALL_FILES_PER_MERGE: usize = 50;
+pub const MAX_SMALL_FILES_PER_MERGE: usize = 10;
+
+/// A merge takes more than [`MAX_SMALL_FILES_PER_MERGE`] files while they
+/// hold no more than these bytes and are no more than this many: files this
+/// small take little memory each, and merging few of them at a time removes
+/// fewer files than a busy table gains.
+const MAX_BYTES_OF_A_MERGE_OF_MANY_FILES: u64 = 64 * 1024 * 1024;
+const MAX_FILES_OF_A_MERGE_OF_FEW_BYTES: usize = 100;
+
+/// The most merges of small files a round swaps into the table in one
+/// commit. A commit costs the same whatever it holds, so a table that gains
+/// small files quickly loses them faster when one commit swaps in several
+/// merges.
+pub const MAX_SMALL_FILE_MERGES_PER_COMMIT: usize = 5;
 
 /// What merging one more file costs whatever its size, added to each file's
 /// bytes wherever a merge of small files is weighed. Without it many
@@ -220,19 +235,35 @@ const MIN_BALANCE_RATIO_OF_A_CROWDED_PARTITION: f64 = 2.0;
 const SMALL_FILES_TO_START_LOWERING_BALANCE: f64 = 10.0;
 const SMALL_FILES_OF_A_CROWDED_PARTITION: f64 = 50.0;
 
-/// A file at the end of a run that is smaller than this share of the run's
-/// bytes is left out of the merge: it is better merged later with files of
-/// its own size.
-const MAX_SHARE_OF_A_TRAILING_FILE_LEFT_OUT: f64 = 0.01;
+/// A run whose files have all waited is asked for less balance too, down to
+/// [`MIN_BALANCE_RATIO_OF_A_CROWDED_PARTITION`], so the files left in a
+/// partition that gains no more are merged in the end. The balance starts to
+/// fall once the run's youngest file is this many seconds old.
+const AGE_SECONDS_TO_START_LOWERING_BALANCE: f64 = 10.0;
 
-/// A run about the size of the file before it is preferred, because merging
-/// it leaves two neighbours of one size for a later merge. The preference
-/// applies when the file before is larger than this share of the run, and
-/// within this many powers of two of it; a run exactly its size has its
-/// score multiplied by [`BEST_SCORE_FACTOR_OF_A_RUN_SIZED_AS_THE_FILE_BEFORE`].
+/// How old the youngest file of a run is when the run is asked for the least
+/// balance: this many seconds for a run of [`BYTES_OF_A_RUN_THAT_AGES_FASTEST`]
+/// or fewer, and for a run of the desired file size or more, with the
+/// logarithm of the run's bytes in between. Rewriting many bytes early costs
+/// more than rewriting few.
+const AGE_SECONDS_OF_AN_OLD_RUN_OF_FEW_BYTES: f64 = 10.0 * 60.0;
+const AGE_SECONDS_OF_AN_OLD_RUN_OF_A_WHOLE_FILE: f64 = 6.0 * 3600.0;
+const BYTES_OF_A_RUN_THAT_AGES_FASTEST: f64 = (1024 * 1024) as f64;
+
+/// A run whose merged file would be about the size of the file before it is
+/// preferred, because merging it leaves two neighbours of one size for a
+/// later merge. The preference applies when the file before is larger than
+/// this share of the merged file, and within this many powers of two of it;
+/// a run that merges to exactly its size has its score multiplied by
+/// [`BEST_SCORE_FACTOR_OF_A_RUN_MERGING_TO_THE_FILE_BEFORE`].
 const MIN_SHARE_OF_THE_FILE_BEFORE_A_RUN: f64 = 0.9;
 const MAX_POWERS_OF_TWO_FROM_THE_FILE_BEFORE: f64 = 0.5;
-const BEST_SCORE_FACTOR_OF_A_RUN_SIZED_AS_THE_FILE_BEFORE: f64 = 0.75;
+const BEST_SCORE_FACTOR_OF_A_RUN_MERGING_TO_THE_FILE_BEFORE: f64 = 0.75;
+
+/// How many input bytes a merge is taken to read for each byte it writes:
+/// a file carries metadata and dictionaries of its own that a merged file
+/// holds once, so a merged file is smaller than its inputs together.
+const INPUT_BYTES_PER_MERGED_BYTE: f64 = 1.3;
 
 /// Default cadence for re-checking the tables' metadata. Candidates only
 /// change when a commit produces a new version, so seconds-scale is plenty.
@@ -275,8 +306,8 @@ pub struct CompactionConfig {
     pub merge_target_bytes: u64,
     /// Count at which a sub-target pile may take the balance-check path.
     pub min_files: usize,
-    /// How many merges a round may have in flight at once. Selection stays
-    /// serial whatever this is; only the rewrites overlap.
+    /// How many groups of merges a round may have committing while it merges
+    /// the next one. One group is merged at a time whatever this is.
     pub max_concurrent_merges: usize,
     /// Files one layout merge rewrites together, at least two; see
     /// [`DEFAULT_LAYOUT_CLIQUE_SIZE`].
@@ -506,10 +537,14 @@ impl CompacterActor {
     /// Compact the table `id` until it has no candidate left: the round has
     /// the datastore refresh the table from storage and publish it once as
     /// it begins, then each pass starts a small-file group if one qualifies,
-    /// else the best overlapping large-file group. Up to
-    /// `max_concurrent_merges` of those rewrites run at once, each holding
-    /// its inputs reserved until it commits, so selection works around the
-    /// merges already in flight. A pass with nothing to start and nothing in
+    /// else the best overlapping large-file group. A small-file group is
+    /// followed by further merges of small files of the same partition, each
+    /// picked once the one before is written, and one commit swaps them all
+    /// in ([`MAX_SMALL_FILE_MERGES_PER_COMMIT`]). One group is merged at a
+    /// time. The next is selected as soon as the group before starts its
+    /// commit, while up to `max_concurrent_merges` groups are committing, and
+    /// a committing group holds its inputs reserved, so selection works
+    /// around them. A pass with nothing to start and nothing in
     /// flight ends the round, and the table is then remembered as examined
     /// up to the version the round listed its partitions from.
     ///
@@ -536,8 +571,14 @@ impl CompacterActor {
         id: Uuid,
         pass: CompactionPass,
     ) -> Result<RoundOutcome> {
-        let mut passes = 0;
+        let mut passes = 1;
         let mut in_flight = JoinSet::new();
+        // What the group being merged sends once its merges are written: the
+        // inputs its commit removes.
+        let mut merging: Option<oneshot::Receiver<Vec<ObjectPath>>> = None;
+        // Whether a group one of whose merges failed has yet to be joined:
+        // the run that failed is not reserved, and would be selected again.
+        let mut is_failed_group_in_flight = false;
         let mut reserved = HashSet::new();
         let examined_through_commit = self
             .table_states
@@ -552,23 +593,32 @@ impl CompacterActor {
             ..RoundProgress::default()
         };
         loop {
-            passes += 1;
-
-            while in_flight.len() < self.max_concurrent_merges {
+            if merging.is_none()
+                && !is_failed_group_in_flight
+                && in_flight.len() <= self.max_concurrent_merges
+            {
                 let (selected, batch) = self.select_next_batch(id, pass, &reserved, progress).await;
                 progress = selected;
-                let Some(batch) = batch? else {
-                    break;
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        drain_merges(&mut in_flight).await;
+                        return Err(error);
+                    }
                 };
-                reserved.extend(batch.inputs.iter().map(|file| file.path.clone()));
-                progress.merging.push(batch.partition.clone());
-                in_flight.spawn(compact_batch(
-                    Arc::clone(&self.datastore),
-                    name.clone(),
-                    id,
-                    batch,
-                    self.target_bytes,
-                ));
+                if let Some(batch) = batch {
+                    progress.merging.push(batch.partition.clone());
+                    let (merged_inputs, merges_written) = oneshot::channel();
+                    merging = Some(merges_written);
+                    in_flight.spawn(compact_batch(
+                        Arc::clone(&self.datastore),
+                        name.clone(),
+                        id,
+                        batch,
+                        self.build_merge_selection(),
+                        merged_inputs,
+                    ));
+                }
             }
 
             if in_flight.is_empty() {
@@ -584,7 +634,28 @@ impl CompacterActor {
 
             // Every exit from here on drains first: a merge body runs on the
             // blocking pool, which a dropped handle does not stop.
-            let merge = match in_flight.join_next().await {
+            let joined = tokio::select! {
+                // A group that has finished has sent its inputs or dropped
+                // its sender, so what it sent is read before it is joined.
+                biased;
+                merges_written = async {
+                    merging
+                        .as_mut()
+                        .expect("the branch is taken while a group is merging")
+                        .await
+                }, if merging.is_some() => {
+                    // A group one of whose merges failed sends nothing, and
+                    // hands its failure back when it is joined.
+                    merging = None;
+                    match merges_written {
+                        Ok(inputs) => reserved.extend(inputs),
+                        Err(_) => is_failed_group_in_flight = true,
+                    }
+                    continue;
+                }
+                joined = in_flight.join_next() => joined,
+            };
+            let merge = match joined {
                 Some(Ok(merge)) => merge,
                 Some(Err(error)) => {
                     drain_merges(&mut in_flight).await;
@@ -592,6 +663,10 @@ impl CompacterActor {
                 }
                 None => unreachable!("the set is not empty"),
             };
+            passes += 1;
+            if merge.has_failed_merge {
+                is_failed_group_in_flight = false;
+            }
             for path in &merge.reserved_paths {
                 reserved.remove(path);
             }
@@ -645,6 +720,16 @@ impl CompacterActor {
         }
     }
 
+    /// The sizes this compacter selects its merges by.
+    fn build_merge_selection(&self) -> MergeSelection {
+        MergeSelection {
+            target_bytes: self.target_bytes,
+            merge_target_bytes: self.merge_target_bytes,
+            min_files: self.min_files,
+            layout_clique_size: self.layout_clique_size,
+        }
+    }
+
     /// The copy of the table `id` the datastore has published.
     fn find_published_table(&self, id: Uuid) -> Result<CatalogTable> {
         self.datastore
@@ -693,12 +778,7 @@ impl CompacterActor {
             Ok(table) => table,
             Err(error) => return (progress, Err(error)),
         };
-        let selection = MergeSelection {
-            target_bytes: self.target_bytes,
-            merge_target_bytes: self.merge_target_bytes,
-            min_files: self.min_files,
-            layout_clique_size: self.layout_clique_size,
-        };
+        let selection = self.build_merge_selection();
         let mut overlaps = std::mem::take(&mut self.table_states.entry(id).or_default().overlaps);
         let reserved = reserved.clone();
         let selected = tokio::task::spawn_blocking(move || {
@@ -780,6 +860,14 @@ struct RoundProgress {
     merging: Vec<Vec<u8>>,
 }
 
+/// A file below the target size, as the selection of a merge weighs it.
+#[derive(Clone)]
+struct SmallFile {
+    file: FileRef,
+    /// When the commit that added the file was made, in Unix milliseconds.
+    committed_at_ms: u64,
+}
+
 /// The files one merge rewrites together, all of one partition.
 struct MergeBatch {
     /// The partition the inputs sit in, as a walk names it.
@@ -788,6 +876,133 @@ struct MergeBatch {
     kind: MergeKind,
     /// The version of the table the inputs were selected from.
     selected_at_version: u64,
+    /// The copy of the table the inputs were selected from.
+    table: CatalogTable,
+    /// The small files of the partition in its order, the inputs among them,
+    /// that the merges following this one in its commit are picked from.
+    /// Empty when no merge follows.
+    small_files: Vec<SmallFile>,
+}
+
+/// What the merges of one commit wrote, before the commit.
+struct WrittenMerges {
+    /// The copy of the table the merges read.
+    table: CatalogTable,
+    /// The inputs of every merge written.
+    removed_paths: Vec<ObjectPath>,
+    /// The outputs of every merge written.
+    outputs: Vec<TableFile>,
+    /// Why a merge failed, when one did. No merge follows a failed one.
+    failure: Option<Error>,
+}
+
+impl WrittenMerges {
+    /// Delete the outputs, which `error` keeps out of the table.
+    fn delete_outputs(&self, error: &Error) {
+        for file in &self.outputs {
+            if let Err(cleanup_error) = self.table.delete_data_file(&file.file_ref().path) {
+                warn!(
+                    error = %error,
+                    cleanup_error = %cleanup_error,
+                    file = %file.file_ref().path,
+                    "compaction: deleting an output that will not be committed failed (orphan left)"
+                );
+            }
+        }
+    }
+}
+
+impl MergeBatch {
+    /// Merge the inputs, then further runs of the partition's small files
+    /// while one may merge, up to [`MAX_SMALL_FILE_MERGES_PER_COMMIT`] merges
+    /// in all. Each run is picked once the merge before it is written, from
+    /// the files as that merge leaves them: its inputs gone and its output in
+    /// their place. An output is not yet in the table, so no later run takes
+    /// it. Nothing is committed.
+    ///
+    /// Blocking store I/O, so callers run it on the blocking pool.
+    fn write_merges(
+        self,
+        selection: &MergeSelection,
+        name: &SchemaQualifiedTableName,
+    ) -> WrittenMerges {
+        let MergeBatch {
+            partition,
+            mut inputs,
+            kind,
+            table,
+            mut small_files,
+            ..
+        } = self;
+        let mut written = WrittenMerges {
+            table,
+            removed_paths: Vec::new(),
+            outputs: Vec::new(),
+            failure: None,
+        };
+        let mut uncommitted = HashSet::new();
+        for merges_after_this in (0..MAX_SMALL_FILE_MERGES_PER_COMMIT).rev() {
+            let outputs = match written.table.merge_files(
+                &partition,
+                &inputs,
+                ROW_GROUP_ROWS,
+                selection.target_bytes,
+            ) {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    written.failure = Some(error);
+                    break;
+                }
+            };
+            let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
+            let output_files: Vec<FileRef> =
+                outputs.iter().map(|file| file.file_ref().clone()).collect();
+            let output_sizes: Vec<u64> = output_files.iter().map(|file| file.size).collect();
+            info!(
+                table = %name,
+                kind = kind.label(),
+                inputs = input_sizes.len(),
+                input_sizes = ?input_sizes,
+                input_bytes = input_sizes.iter().sum::<u64>(),
+                outputs = output_sizes.len(),
+                output_sizes = ?output_sizes,
+                output_bytes = output_sizes.iter().sum::<u64>(),
+                "compacted batch"
+            );
+            written
+                .removed_paths
+                .extend(inputs.iter().map(|file| file.path.clone()));
+            written.outputs.extend(outputs);
+
+            let first_input = small_files
+                .iter()
+                .position(|small| small.file.path == inputs[0].path);
+            let Some(first_input) = first_input.filter(|_| merges_after_this > 0) else {
+                break;
+            };
+            uncommitted.extend(output_files.iter().map(|file| file.path.clone()));
+            let now_ms = crate::vacuum::now_unix_ms();
+            small_files.splice(
+                first_input..first_input + inputs.len(),
+                output_files
+                    .into_iter()
+                    .filter(|file| is_small_file(file.size, selection.target_bytes))
+                    .map(|file| SmallFile {
+                        file,
+                        committed_at_ms: now_ms,
+                    }),
+            );
+            let Some(run) = selection.best_small_file_run(&small_files, &uncommitted, now_ms)
+            else {
+                break;
+            };
+            inputs = small_files[run]
+                .iter()
+                .map(|small| small.file.clone())
+                .collect();
+        }
+        written
+    }
 }
 
 /// The sizes a round selects its merges by.
@@ -830,12 +1045,16 @@ impl MergeSelection {
         for partitions in unfinished.chunks(PARTITIONS_PER_INDEXING) {
             table.index_partitions(partitions)?;
             for partition in partitions.iter().cloned() {
-                if let Some(inputs) = self.next_small_batch(table, &partition, pass, reserved)? {
+                if let Some((inputs, small_files)) =
+                    self.next_small_batch(table, &partition, pass, reserved)?
+                {
                     return Ok(Some(MergeBatch {
                         partition,
                         inputs,
                         kind: MergeKind::SmallFiles,
                         selected_at_version: table.version(),
+                        table: table.clone(),
+                        small_files,
                     }));
                 }
                 let group =
@@ -846,6 +1065,8 @@ impl MergeSelection {
                         inputs,
                         kind: MergeKind::LayoutOptimization,
                         selected_at_version: table.version(),
+                        table: table.clone(),
+                        small_files: Vec::new(),
                     }));
                 }
                 if progress.merging.contains(&partition) {
@@ -866,65 +1087,137 @@ impl MergeSelection {
     /// Pick one group of files of `partition` below the target size: in a
     /// routine round the best run of neighbours
     /// ([`best_small_file_run`](Self::best_small_file_run)), in a final sweep
-    /// the first files of the partition, as many as one merge takes.
+    /// the first files of the partition, as many as one merge takes. Beside
+    /// the group come the small files further merges of the same commit are
+    /// picked from: those of the partition in a routine round, none in a
+    /// final sweep.
     fn next_small_batch(
         &self,
         table: &CatalogTable,
         partition: &[u8],
         pass: CompactionPass,
         reserved: &HashSet<ObjectPath>,
-    ) -> Result<Option<Vec<FileRef>>> {
+    ) -> Result<Option<(Vec<FileRef>, Vec<SmallFile>)>> {
         let Some(files) = table.load_partition_files(partition)? else {
             return Ok(None);
         };
-        let mut small_files: Vec<FileRef> = Vec::new();
+        let mut small_file_refs: Vec<FileRef> = Vec::new();
+        let mut commit_sequences: Vec<u64> = Vec::new();
         let _ = files.visit_files(&mut |file| {
             if is_small_file(file.file().size, self.target_bytes)
                 && !reserved.contains(&file.file().path)
             {
-                small_files.push(file.file().clone());
+                small_file_refs.push(file.file().clone());
+                commit_sequences.push(file.commit_sequence());
             }
             ControlFlow::Continue(())
         });
+        if small_file_refs.len() < 2 {
+            return Ok(None);
+        }
+        let mut small_files: Vec<SmallFile> = small_file_refs
+            .into_iter()
+            .zip(table.read_commit_times_ms(&commit_sequences))
+            .map(|(file, committed_at_ms)| SmallFile {
+                file,
+                committed_at_ms,
+            })
+            .collect();
+        let best_run =
+            self.best_small_file_run(&small_files, &HashSet::new(), crate::vacuum::now_unix_ms());
         Ok(match pass {
-            CompactionPass::Routine => self
-                .best_small_file_run(&small_files)
-                .map(|run| small_files[run].to_vec()),
+            CompactionPass::Routine => best_run.map(|run| {
+                let inputs = small_files[run]
+                    .iter()
+                    .map(|small| small.file.clone())
+                    .collect();
+                (inputs, small_files)
+            }),
             CompactionPass::Final => {
                 small_files.truncate(MAX_SMALL_FILES_PER_MERGE);
-                (small_files.len() >= 2).then_some(small_files)
+                let inputs: Vec<FileRef> =
+                    small_files.into_iter().map(|small| small.file).collect();
+                (inputs.len() >= 2).then_some((inputs, Vec::new()))
             }
         })
+    }
+
+    /// How many times the size of its largest file a run of `total_bytes`
+    /// must be to merge, when its youngest file was committed `age_seconds`
+    /// ago in a partition `crowding` of the way from few small files to
+    /// many. The crowding and the run's age each take the balance asked
+    /// from [`MIN_BALANCE_RATIO`] toward
+    /// [`MIN_BALANCE_RATIO_OF_A_CROWDED_PARTITION`], and together no
+    /// further than that.
+    fn find_min_balance_ratio(&self, crowding: f64, total_bytes: u64, age_seconds: f64) -> f64 {
+        let fewest_bytes = (1.0 + BYTES_OF_A_RUN_THAT_AGES_FASTEST).ln();
+        let bytes_span = (1.0 + self.target_bytes as f64).ln() - fewest_bytes;
+        let size_position = if bytes_span > 0.0 {
+            (((1.0 + total_bytes as f64).ln() - fewest_bytes) / bytes_span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let age_of_an_old_run = AGE_SECONDS_OF_AN_OLD_RUN_OF_FEW_BYTES
+            + (AGE_SECONDS_OF_AN_OLD_RUN_OF_A_WHOLE_FILE - AGE_SECONDS_OF_AN_OLD_RUN_OF_FEW_BYTES)
+                * size_position;
+        let aging = ((age_seconds - AGE_SECONDS_TO_START_LOWERING_BALANCE)
+            / (age_of_an_old_run - AGE_SECONDS_TO_START_LOWERING_BALANCE))
+            .clamp(0.0, 1.0);
+        let lowering = (crowding + aging).min(1.0);
+        MIN_BALANCE_RATIO
+            + (MIN_BALANCE_RATIO_OF_A_CROWDED_PARTITION - MIN_BALANCE_RATIO) * lowering
     }
 
     /// The run of neighbours among `files`, the small files of one partition
     /// in its order, that is cheapest to merge for the files it removes, if
     /// any run may merge.
     ///
-    /// Every run of at least two and at most `MAX_SMALL_FILES_PER_MERGE`
-    /// neighbours whose bytes fit one merged file is weighed. A run may merge
+    /// Every run of at least two neighbours whose bytes fit one merged file
+    /// is weighed, of at most `MAX_SMALL_FILES_PER_MERGE` files, or of at most
+    /// `MAX_FILES_OF_A_MERGE_OF_FEW_BYTES` that hold no more than
+    /// `MAX_BYTES_OF_A_MERGE_OF_MANY_FILES` bytes. A run may merge
     /// when it has the configured number of files and is balanced: its bytes
     /// are enough times those of its largest file, so a large file is not
     /// rewritten to absorb a few small ones. A partition with many small
-    /// files asks for less balance, so it merges sooner. Of the runs that may
+    /// files asks for less balance, so it merges sooner, and so does a run
+    /// whose files have all waited ([`find_min_balance_ratio`](Self::find_min_balance_ratio)). Of the runs that may
     /// merge, the one with the fewest bytes rewritten per file removed is
-    /// taken, and of equals the last in the partition's order.
-    fn best_small_file_run(&self, files: &[FileRef]) -> Option<Range<usize>> {
+    /// taken, and of equals the last in the partition's order. A run that
+    /// would merge to about the size of the file before it counts as cheaper
+    /// than it is. No run holds
+    /// a file of `uncommitted`, files a merge wrote that the table does not
+    /// hold yet.
+    fn best_small_file_run(
+        &self,
+        files: &[SmallFile],
+        uncommitted: &HashSet<ObjectPath>,
+        now_ms: u64,
+    ) -> Option<Range<usize>> {
         let crowding = ((files.len() as f64 - SMALL_FILES_TO_START_LOWERING_BALANCE)
             / (SMALL_FILES_OF_A_CROWDED_PARTITION - SMALL_FILES_TO_START_LOWERING_BALANCE))
             .clamp(0.0, 1.0);
-        let min_balance_ratio = MIN_BALANCE_RATIO
-            + (MIN_BALANCE_RATIO_OF_A_CROWDED_PARTITION - MIN_BALANCE_RATIO) * crowding;
 
         let mut best: Option<(f64, Range<usize>)> = None;
         for first in 0..files.len() {
-            let mut total = files[first].size;
-            let mut largest = files[first].size;
+            if uncommitted.contains(&files[first].file.path) {
+                continue;
+            }
+            let mut total = files[first].file.size;
+            let mut largest = files[first].file.size;
+            let mut youngest_committed_at_ms = files[first].committed_at_ms;
             for end in first + 2..=files.len() {
-                total += files[end - 1].size;
-                largest = largest.max(files[end - 1].size);
+                if uncommitted.contains(&files[end - 1].file.path) {
+                    break;
+                }
+                total += files[end - 1].file.size;
+                largest = largest.max(files[end - 1].file.size);
+                youngest_committed_at_ms =
+                    youngest_committed_at_ms.max(files[end - 1].committed_at_ms);
                 let count = end - first;
-                if count > MAX_SMALL_FILES_PER_MERGE || total > self.merge_target_bytes {
+                let has_too_many_files = count > MAX_FILES_OF_A_MERGE_OF_FEW_BYTES
+                    || (count > MAX_SMALL_FILES_PER_MERGE
+                        && total > MAX_BYTES_OF_A_MERGE_OF_MANY_FILES);
+                if has_too_many_files || total > self.merge_target_bytes {
                     break;
                 }
                 if count < self.min_files {
@@ -932,37 +1225,25 @@ impl MergeSelection {
                 }
                 let balance_ratio = (total as f64 + FIXED_FILE_COST_BYTES * count as f64)
                     / (largest as f64 + FIXED_FILE_COST_BYTES);
-                if balance_ratio < min_balance_ratio {
+                let age_seconds = now_ms.saturating_sub(youngest_committed_at_ms) as f64 / 1000.0;
+                if balance_ratio < self.find_min_balance_ratio(crowding, total, age_seconds) {
                     continue;
                 }
 
-                let mut run_end = end;
-                let mut run_total = total;
-                while run_end >= first + 3
-                    && (files[run_end - 1].size as f64)
-                        < MAX_SHARE_OF_A_TRAILING_FILE_LEFT_OUT * total as f64
-                {
-                    run_total -= files[run_end - 1].size;
-                    run_end -= 1;
-                }
-                let run_count = run_end - first;
-                if run_count < self.min_files {
-                    continue;
-                }
-
-                let mut score = (run_total as f64 + FIXED_FILE_COST_BYTES * run_count as f64)
-                    / (run_count as f64 - 1.9);
+                let mut score =
+                    (total as f64 + FIXED_FILE_COST_BYTES * count as f64) / (count as f64 - 1.9);
+                let merged_size = total as f64 / INPUT_BYTES_PER_MERGED_BYTE;
                 let size_before = match first {
                     0 => 0.0,
-                    _ => files[first - 1].size as f64,
+                    _ => files[first - 1].file.size as f64,
                 };
-                if size_before > run_total as f64 * MIN_SHARE_OF_THE_FILE_BEFORE_A_RUN {
-                    let powers_of_two_apart = (run_total as f64 / size_before).log2().abs();
+                if size_before > merged_size * MIN_SHARE_OF_THE_FILE_BEFORE_A_RUN {
+                    let powers_of_two_apart = (merged_size / size_before).log2().abs();
                     if powers_of_two_apart < MAX_POWERS_OF_TWO_FROM_THE_FILE_BEFORE {
                         let closeness =
                             1.0 - powers_of_two_apart / MAX_POWERS_OF_TWO_FROM_THE_FILE_BEFORE;
                         score *= 1.0
-                            - (1.0 - BEST_SCORE_FACTOR_OF_A_RUN_SIZED_AS_THE_FILE_BEFORE)
+                            - (1.0 - BEST_SCORE_FACTOR_OF_A_RUN_MERGING_TO_THE_FILE_BEFORE)
                                 * closeness;
                     }
                 }
@@ -971,7 +1252,7 @@ impl MergeSelection {
                     .as_ref()
                     .is_none_or(|(best_score, _)| score <= *best_score)
                 {
-                    best = Some((score, first..run_end));
+                    best = Some((score, first..end));
                 }
             }
         }
@@ -1057,78 +1338,104 @@ impl overlap::LayoutSource for LayoutCandidates<'_> {
     }
 }
 
-/// What one merge hands back.
+/// What the merges of one commit hand back.
 struct MergeOutcome {
     /// The partition the inputs sit in, as a walk names it.
     partition: Vec<u8>,
-    /// The input paths the merge held reserved.
+    /// The input paths the round held reserved for the commit.
     reserved_paths: Vec<ObjectPath>,
     /// The version of the table the inputs were selected from.
     selected_at_version: u64,
-    /// Whether the merge committed its swap, or why it did not.
+    /// Whether a merge failed, so the round was sent no inputs.
+    has_failed_merge: bool,
+    /// Whether every merge was written and their swap committed, or why
+    /// not. The merges written before one that failed are committed all the
+    /// same.
     committed: Result<()>,
 }
 
-/// Rewrite the inputs of `batch` into target-sized outputs and swap them
-/// into the table in one commit. Returns the inputs' partition and paths
-/// beside the outcome so the round can release their reservations however
-/// the merge went, and the version they were selected from so the round
-/// can tell a conflict it cannot get past.
+/// Write the merges of `batch` ([`MergeBatch::write_merges`]) and swap their
+/// outputs into the table for their inputs in one commit labelled a
+/// rearrangement, which publishes the version it wrote. The inputs are sent
+/// through `merged_inputs` once the merges are written, before the commit, so
+/// the round can select the next merges around them while the commit runs.
+///
+/// The merges run off a read copy of the table with no commit lock held, so
+/// they never block a concurrent INSERT's commit; only the swap takes it.
+/// When a merge fails, the merges written before it are committed all the
+/// same and the failure is returned, with nothing sent through
+/// `merged_inputs`: a run that keeps failing does not keep the runs picked
+/// before it from merging. If the swap fails, the outputs are deleted
+/// before the error is returned; a swap whose outcome is unknown may have
+/// succeeded, so its outputs stay.
+///
+/// Returns the inputs' partition and paths beside the outcome so the round
+/// can release their reservations however the merges went, and the version
+/// they were selected from so the round can tell a conflict it cannot get
+/// past.
 async fn compact_batch(
     datastore: Arc<PivotlakeDatastore>,
     name: SchemaQualifiedTableName,
     id: Uuid,
     batch: MergeBatch,
-    target_bytes: u64,
+    selection: MergeSelection,
+    merged_inputs: oneshot::Sender<Vec<ObjectPath>>,
 ) -> MergeOutcome {
-    let MergeBatch {
-        partition,
-        inputs,
-        kind,
-        selected_at_version,
-    } = batch;
-    let reserved_paths: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
-    let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
-    let merged_partition = partition.clone();
-    let build_outcome = |committed| MergeOutcome {
+    let partition = batch.partition.clone();
+    let selected_at_version = batch.selected_at_version;
+    let written =
+        match tokio::task::spawn_blocking(move || batch.write_merges(&selection, &name)).await {
+            Ok(written) => written,
+            Err(error) => {
+                return MergeOutcome {
+                    partition,
+                    reserved_paths: Vec::new(),
+                    selected_at_version,
+                    has_failed_merge: true,
+                    committed: Err(Error::CompactionJobPanicked(error.to_string())),
+                };
+            }
+        };
+    let reserved_paths = written.removed_paths.clone();
+    let has_failed_merge = written.failure.is_some();
+    let commit_partition = partition.clone();
+    let committed = tokio::task::spawn_blocking(move || {
+        let mut written = written;
+        let failure = written.failure.take();
+        match &failure {
+            // The round only reads what is sent while it waits for this
+            // commit.
+            None => {
+                let _ = merged_inputs.send(written.removed_paths.clone());
+            }
+            Some(_) => drop(merged_inputs),
+        }
+        if written.removed_paths.is_empty() {
+            return failure.map_or(Ok(()), Err);
+        }
+        let removed = RemovedFiles {
+            partition: &commit_partition,
+            paths: &written.removed_paths,
+        };
+        // The swap goes through the datastore's one in-process write path,
+        // under the table's commit lock.
+        let committed = datastore.commit_to_table(id, removed, written.outputs.clone(), false);
+        if let Err(error) = &committed
+            && !error.may_have_committed()
+        {
+            written.delete_outputs(error);
+        }
+        committed.and(failure.map_or(Ok(()), Err))
+    })
+    .await
+    .unwrap_or_else(|error| Err(Error::CompactionJobPanicked(error.to_string())));
+    MergeOutcome {
         partition,
         reserved_paths,
         selected_at_version,
+        has_failed_merge,
         committed,
-    };
-    // `spawn_blocking` needs a `'static` closure, so the merge takes the
-    // datastore handle rather than a borrow of it.
-    let merged = match tokio::task::spawn_blocking(move || {
-        compact_partition_files(
-            datastore.as_ref(),
-            id,
-            &merged_partition,
-            &inputs,
-            ROW_GROUP_ROWS,
-            target_bytes,
-        )
-    })
-    .await
-    {
-        Ok(Ok(merged)) => merged,
-        Ok(Err(error)) => return build_outcome(Err(error)),
-        Err(error) => {
-            return build_outcome(Err(Error::CompactionJobPanicked(error.to_string())));
-        }
-    };
-    let output_sizes: Vec<u64> = merged.iter().map(|file| file.file_ref().size).collect();
-    info!(
-        table = %name,
-        kind = kind.label(),
-        inputs = input_sizes.len(),
-        input_sizes = ?input_sizes,
-        input_bytes = input_sizes.iter().sum::<u64>(),
-        outputs = output_sizes.len(),
-        output_sizes = ?output_sizes,
-        output_bytes = output_sizes.iter().sum::<u64>(),
-        "compacted batch"
-    );
-    build_outcome(Ok(()))
+    }
 }
 
 /// Await the merges still in flight, reporting rather than propagating what
@@ -1710,9 +2017,9 @@ mod tests {
         );
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let mut writer = datastore.table_handle(&name).unwrap();
-        // Each file is small (under half the target), two of them stay under
-        // the merge target (1.3 times it), three of them reach it: the merge
-        // only happens once the refresh brings `c.parquet` in.
+        // Each file is small (under half the target), so a final sweep
+        // merges all the table has: one file is left only if the refresh
+        // brings `c.parquet` in.
         let target = writer.file_refs().unwrap()[0].size * 22 / 10;
         write_parquet_file(&adopted, "c.parquet", vec![3]);
         writer
@@ -1727,7 +2034,7 @@ mod tests {
             CompacterSizes::defaults(target),
             datastore.clone(),
             name.clone(),
-            false,
+            true,
         );
 
         assert_eq!(sweeps, 2, "one merging pass and one that finds nothing");
@@ -2038,8 +2345,7 @@ mod tests {
             .iter()
             .map(|f| f.size)
             .sum();
-        let target = (total as f64 / DEFAULT_MERGE_TARGET_MULTIPLIER).floor() as u64;
-        run_one_sweep(target, datastore.clone());
+        run_one_sweep(total, datastore.clone());
 
         assert_eq!(
             datastore
@@ -2961,13 +3267,10 @@ mod tests {
             .saturating_mul(2)
             .saturating_add(1);
         run_command(
-            CompacterSizes {
-                merge_target_bytes: 0,
-                ..CompacterSizes::defaults(target)
-            },
+            CompacterSizes::defaults(target),
             datastore.clone(),
             name.clone(),
-            false,
+            true,
         );
 
         // One round merges each partition's small files in turn; a second round
@@ -2982,13 +3285,10 @@ mod tests {
             2
         );
         run_command(
-            CompacterSizes {
-                merge_target_bytes: 0,
-                ..CompacterSizes::defaults(target)
-            },
+            CompacterSizes::defaults(target),
             datastore.clone(),
             name.clone(),
-            false,
+            true,
         );
 
         // Reload from Delta rather than trusting the in-memory swap. Exactly one
@@ -3162,10 +3462,17 @@ mod tests {
         }
     }
 
-    fn file_of_size(path: &str, size: u64) -> FileRef {
-        FileRef {
-            path: ObjectPath::new(path),
-            size,
+    /// When the tests' small files were committed, and the time selection
+    /// is asked at unless a test says otherwise.
+    const COMMITTED_AT_MS: u64 = 1_000_000_000_000;
+
+    fn file_of_size(path: &str, size: u64) -> SmallFile {
+        SmallFile {
+            file: FileRef {
+                path: ObjectPath::new(path),
+                size,
+            },
+            committed_at_ms: COMMITTED_AT_MS,
         }
     }
 
@@ -3312,9 +3619,13 @@ mod tests {
             .map(|index| file_of_size(&format!("small-{index:03}"), MIB))
             .collect();
 
-        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(&files);
+        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(
+            &files,
+            &HashSet::new(),
+            COMMITTED_AT_MS,
+        );
 
-        assert_eq!(run, Some(70..120));
+        assert_eq!(run, Some(56..120));
     }
 
     #[test]
@@ -3323,7 +3634,11 @@ mod tests {
         let mut files = vec![file_of_size("outlier", 500 * MIB)];
         files.extend((0..9).map(|index| file_of_size(&format!("small-{index}"), MIB)));
 
-        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(&files);
+        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(
+            &files,
+            &HashSet::new(),
+            COMMITTED_AT_MS,
+        );
 
         assert_eq!(run, Some(1..10));
     }
@@ -3335,23 +3650,52 @@ mod tests {
             .map(|index| file_of_size(&format!("small-{index}"), MIB))
             .collect();
 
-        let run_of_four = small_file_selection(1300 * MIB, 2).best_small_file_run(&files[..4]);
-        let run_of_five = small_file_selection(1300 * MIB, 2).best_small_file_run(&files);
+        let run_of_four = small_file_selection(1300 * MIB, 2).best_small_file_run(
+            &files[..4],
+            &HashSet::new(),
+            COMMITTED_AT_MS,
+        );
+        let run_of_five = small_file_selection(1300 * MIB, 2).best_small_file_run(
+            &files,
+            &HashSet::new(),
+            COMMITTED_AT_MS,
+        );
 
         assert_eq!(run_of_four, None);
         assert_eq!(run_of_five, Some(0..5));
     }
 
     #[test]
+    fn a_run_merges_with_the_tiny_files_at_its_end() {
+        const MIB: u64 = 1024 * 1024;
+        let mut files: Vec<_> = (0..4)
+            .map(|index| file_of_size(&format!("small-{index}"), 10 * MIB))
+            .collect();
+        files.extend((0..3).map(|index| file_of_size(&format!("tiny-{index}"), MIB / 4)));
+
+        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(
+            &files,
+            &HashSet::new(),
+            COMMITTED_AT_MS,
+        );
+
+        assert_eq!(run, Some(0..7));
+    }
+
+    #[test]
     fn a_merge_takes_no_more_bytes_than_one_merged_file() {
         const MIB: u64 = 1024 * 1024;
         let files: Vec<_> = (0..60)
-            .map(|index| file_of_size(&format!("small-{index:02}"), 100 * MIB))
+            .map(|index| file_of_size(&format!("small-{index:02}"), 200 * MIB))
             .collect();
 
-        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(&files);
+        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(
+            &files,
+            &HashSet::new(),
+            COMMITTED_AT_MS,
+        );
 
-        assert_eq!(run.unwrap().len(), 13);
+        assert_eq!(run.unwrap().len(), 6);
     }
 
     #[test]
@@ -3361,23 +3705,38 @@ mod tests {
             .map(|index| file_of_size(&format!("small-{index}"), MIB))
             .collect();
 
-        let allowed = small_file_selection(1300 * MIB, 5).best_small_file_run(&files);
-        let waiting = small_file_selection(1300 * MIB, 6).best_small_file_run(&files);
+        let allowed = small_file_selection(1300 * MIB, 5).best_small_file_run(
+            &files,
+            &HashSet::new(),
+            COMMITTED_AT_MS,
+        );
+        let waiting = small_file_selection(1300 * MIB, 6).best_small_file_run(
+            &files,
+            &HashSet::new(),
+            COMMITTED_AT_MS,
+        );
 
         assert_eq!(allowed, Some(0..5));
         assert_eq!(waiting, None);
     }
 
     #[test]
-    fn a_tiny_file_at_the_end_of_a_run_is_left_for_a_later_merge() {
+    fn small_files_of_uneven_sizes_merge_once_they_have_waited() {
         const MIB: u64 = 1024 * 1024;
-        let mut files: Vec<_> = (0..6)
-            .map(|index| file_of_size(&format!("merged-{index}"), 100 * MIB))
+        const DAY_MS: u64 = 24 * 3600 * 1000;
+        let files: Vec<_> = [219, 205, 263, 205]
+            .into_iter()
+            .enumerate()
+            .map(|(index, mebibytes)| file_of_size(&format!("left-{index}"), mebibytes * MIB))
             .collect();
-        files.push(file_of_size("fresh", MIB));
+        let selection = small_file_selection(5120 * MIB, 2);
 
-        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(&files);
+        let run_when_committed =
+            selection.best_small_file_run(&files, &HashSet::new(), COMMITTED_AT_MS);
+        let run_a_day_later =
+            selection.best_small_file_run(&files, &HashSet::new(), COMMITTED_AT_MS + DAY_MS);
 
-        assert_eq!(run, Some(0..6));
+        assert_eq!(run_when_committed, None);
+        assert_eq!(run_a_day_later, Some(0..4));
     }
 }

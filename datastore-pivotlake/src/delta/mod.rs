@@ -570,6 +570,12 @@ impl Table for DeltaTable {
         Ok(())
     }
 
+    /// The sequences themselves: a commit's files are numbered from the
+    /// reading of the clock when it is made.
+    fn read_commit_times_ms(&self, commit_sequences: &[u64]) -> Vec<u64> {
+        commit_sequences.to_vec()
+    }
+
     fn load_partition_files(&self, partition: &[u8]) -> Result<Option<Arc<dyn PartitionFiles>>> {
         Ok(self
             .files

@@ -185,10 +185,10 @@ fn a_routine_round_rewrites_overlapping_sorted_files_into_disjoint_ranges() {
 
 #[test]
 fn a_routine_round_merges_the_small_files_a_reopened_database_holds() {
-    // Any two small files are a merge.
+    // Five small files of one size are a merge.
     let compaction = CompactionConfig {
         target_bytes: 64 * 1024 * 1024,
-        merge_target_bytes: 1,
+        merge_target_bytes: 5 * 64 * 1024 * 1024,
         min_files: 2,
         max_concurrent_merges: 1,
         layout_clique_size: 2,
@@ -199,6 +199,8 @@ fn a_routine_round_merges_the_small_files_a_reopened_database_holds() {
     db.execute("INSERT INTO t VALUES (1)");
     db.execute("INSERT INTO t VALUES (2)");
     db.execute("INSERT INTO t VALUES (3)");
+    db.execute("INSERT INTO t VALUES (4)");
+    db.execute("INSERT INTO t VALUES (5)");
     let directory = db.table_directory("t");
     let mut reopened = Database::reopen_with_compaction(db.close(), compaction);
 
@@ -207,7 +209,7 @@ fn a_routine_round_merges_the_small_files_a_reopened_database_holds() {
     let live = live_data_file_names(&reopened.root_uri(), &directory).unwrap();
     assert_eq!(live.len(), 1, "{live:?}");
     let rows = reopened.execute("SELECT v FROM t ORDER BY v");
-    assert_eq!(collect_i64s(&rows, 0), [1, 2, 3]);
+    assert_eq!(collect_i64s(&rows, 0), [1, 2, 3, 4, 5]);
 }
 
 #[test]
