@@ -47,12 +47,6 @@ pub(crate) use uring_engine::HttpEngine;
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) use blocking_engine::{HttpCompletion, HttpEngine};
 
-/// High bit of an SQE `user_data` marking a completion as belonging to the HTTP
-/// engine rather than a file read. File-read ids are small monotonic counters,
-/// so they never collide with this. (Only meaningful on the Linux shared ring.)
-#[cfg(target_os = "linux")]
-pub(crate) const HTTP_TAG: u64 = 1 << 63;
-
 /// Per-host pool key.
 fn host_key(remote: &crate::io::RemoteFile) -> String {
     format!("{}:{}", remote.host(), remote.port())
@@ -542,7 +536,8 @@ mod blocking_engine {
 mod uring_engine {
     use super::*;
     use crate::Identifier;
-    use crate::io::http::dns::{AddressBook, HostResolver, LOOKUP_TAG};
+    use crate::io::http::completion_tags::{HTTP_TAG, LOOKUP_TAG, STEP_DEADLINE_TAG};
+    use crate::io::http::dns::{AddressBook, HostResolver};
     use crate::io::http::http1;
     use crate::io::http::{Error, Result};
     use io_uring::{IoUring, opcode, squeue, types};
@@ -553,11 +548,6 @@ mod uring_engine {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-
-    /// Marks the CQE of the timeout linked to a read's connect or recv, as
-    /// opposed to the CQE of the operation itself. Only the operation's own CQE
-    /// drives an exchange, so a CQE carrying this bit is dropped on arrival.
-    const STEP_DEADLINE_TAG: u64 = 1 << 62;
 
     /// A read's connect or recv that completes nothing for this many typical
     /// read times is taken for stalled. One step is a fraction of a whole read,

@@ -28,8 +28,38 @@ mod tls;
 
 pub use tls::default_client_config;
 
+/// The bits of an SQE's `user_data` that say what its CQE belongs to. Disk
+/// reads, HTTP exchanges and host lookups share a worker's ring, and a CQE
+/// carries nothing but this number. The bits below the tags hold a slot index.
 #[cfg(target_os = "linux")]
-pub(crate) use backend::HTTP_TAG;
+pub(crate) mod completion_tags {
+    /// Marks a CQE as belonging to the HTTP engine and not to a file read.
+    /// File-read ids are small monotonic counters, so they never reach this
+    /// bit. Every tag below comes together with this one.
+    pub(crate) const HTTP_TAG: u64 = 1 << 63;
+
+    /// Marks the CQE of the timeout linked to a read's connect or recv, as
+    /// opposed to the CQE of the operation itself. Only the operation's own
+    /// CQE drives an exchange, so a CQE carrying this bit is dropped on
+    /// arrival.
+    pub(crate) const STEP_DEADLINE_TAG: u64 = 1 << 62;
+
+    /// Marks the CQE of the timeout that wakes a worker's ring once the
+    /// receive allowance covers its oldest held fetch.
+    pub(crate) const RECEIVE_ALLOWANCE_TIMER_TAG: u64 = 1 << 61;
+
+    /// Marks a CQE as belonging to the host lookups, as opposed to an
+    /// exchange. The two tags below come together with this one.
+    pub(crate) const LOOKUP_TAG: u64 = 1 << 60;
+
+    /// Marks the CQE of a timer that fires when c-ares has a question to
+    /// give up on or repeat.
+    pub(crate) const LOOKUP_TIMER_TAG: u64 = 1 << 59;
+
+    /// Marks the CQE of the cancellation of a socket's poll. Nothing is done
+    /// on its arrival: the cancelled poll reports with a CQE of its own.
+    pub(crate) const POLL_CANCEL_TAG: u64 = 1 << 58;
+}
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) use backend::HttpCompletion;
 pub(crate) use backend::HttpEngine;

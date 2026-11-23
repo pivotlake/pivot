@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use crate::io::http::HTTP_TAG;
+use crate::io::http::completion_tags::{HTTP_TAG, RECEIVE_ALLOWANCE_TIMER_TAG};
 #[cfg(target_os = "linux")]
 use crate::io::receive_rate::{ReceiveRateLimiter, process_receive_rate_limiter};
 #[cfg(target_os = "linux")]
@@ -46,10 +46,9 @@ use std::time::{Duration, Instant};
 
 /// The `user_data` of the timeout that wakes a worker's ring once the receive
 /// allowance covers its oldest held fetch. It carries [`HTTP_TAG`] so the
-/// requester routes it here, and a bit no exchange slot, step deadline or host
-/// lookup uses.
+/// requester routes it here.
 #[cfg(target_os = "linux")]
-const RECEIVE_ALLOWANCE_TIMER: u64 = HTTP_TAG | (1 << 61);
+const RECEIVE_ALLOWANCE_TIMER: u64 = HTTP_TAG | RECEIVE_ALLOWANCE_TIMER_TAG;
 
 /// The most bytes between two ranges of one object that are fetched and
 /// dropped so that one request serves both ranges. None by default, so only

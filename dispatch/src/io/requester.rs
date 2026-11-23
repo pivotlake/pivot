@@ -20,7 +20,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
-use crate::io::http::HTTP_TAG;
+use crate::io::http::completion_tags::HTTP_TAG;
 
 #[derive(Debug, Error)]
 pub enum Error {

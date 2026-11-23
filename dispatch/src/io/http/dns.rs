@@ -12,26 +12,13 @@
 //! resolved to, and has a host looked up again once the time to live of its
 //! answer has passed.
 
-use super::HTTP_TAG;
+use super::completion_tags::{HTTP_TAG, LOOKUP_TAG, LOOKUP_TIMER_TAG, POLL_CANCEL_TAG};
 use c_ares::{AddrInfoHints, Channel, FdEventFlags, FdEvents, Options, ProcessFlags, Socket};
 use io_uring::{IoUring, opcode, squeue, types};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-/// Marks a CQE as belonging to the host lookups, as opposed to an exchange.
-/// Bit 62 marks a step deadline and bit 61 the timer of the receive
-/// allowance.
-pub(crate) const LOOKUP_TAG: u64 = 1 << 60;
-
-/// Marks the CQE of a timer that fires when c-ares has a question to give up
-/// on or repeat.
-const LOOKUP_TIMER_TAG: u64 = 1 << 59;
-
-/// Marks the CQE of the cancellation of a socket's poll. Nothing is done on
-/// its arrival: the cancelled poll reports with a CQE of its own.
-const POLL_CANCEL_TAG: u64 = 1 << 58;
 
 /// How long a name server is given to answer the first time it is asked. A
 /// name server on the machine or its network answers in a few milliseconds.
