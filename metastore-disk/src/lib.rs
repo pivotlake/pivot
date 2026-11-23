@@ -44,7 +44,9 @@
 //! Each storage entry under `secrets` holds the credentials for the paths its
 //! `scope` covers, so a bucket's keys are written once however many datastores
 //! sit in it. `type` names the backend (`s3` or `gcs`) and carries that
-//! backend's fields. The most specific scope covering a location authenticates
+//! backend's fields. An `s3` secret carries access keys, or none to sign as the
+//! identity the server itself runs as, or `anonymous: true` to send requests
+//! unsigned. The most specific scope covering a location authenticates
 //! it; two secrets may not claim the same scope, so which one that is never
 //! depends on the order they were written in. A secret with no `scope` covers
 //! every location of its type. An `iceberg` secret has no scope: it carries a
@@ -86,10 +88,13 @@
 //!     credentials_file: /etc/pivot/gcs-key.json
 //! ```
 //!
-//! An `s3://` datastore without a covering secret uses anonymous, unsigned
-//! requests. This supports public S3 locations; define a secret when the
-//! location requires authentication. A `gs://` datastore without one falls
-//! back to the ambient Application Default Credentials chain
+//! A datastore in a bucket no secret covers is opened as the identity the
+//! server itself runs as. For `s3://` that is the first of the `AWS_*` key
+//! variables, a container's credentials endpoint and the role of the EC2
+//! instance to have keys, whose temporary keys are read again before they
+//! expire; when none has keys, requests are sent unsigned, which reads a
+//! public bucket.
+//! For `gs://` it is the Application Default Credentials chain
 //! (`GOOGLE_APPLICATION_CREDENTIALS`, the file
 //! `gcloud auth application-default login` writes, or the workload identity of
 //! the Google compute instance).
@@ -207,10 +212,10 @@ struct SecretExternalStoreFactory {
 impl ExternalStoreFactory for SecretExternalStoreFactory {
     fn open(&self, root_uri: &str) -> object_storage::Result<Arc<dyn ObjectStore>> {
         match StoreScheme::from_uri(root_uri)? {
-            StoreScheme::S3 => Ok(Arc::new(match self.secrets.resolve_s3(root_uri) {
-                Some(credentials) => S3Store::with_credentials(root_uri, credentials)?,
-                None => S3Store::anonymous(root_uri)?,
-            })),
+            StoreScheme::S3 => Ok(Arc::new(S3Store::with_credentials(
+                root_uri,
+                self.secrets.resolve_s3(root_uri),
+            )?)),
             StoreScheme::Gcs => Ok(Arc::new(match self.secrets.resolve_gcs(root_uri) {
                 Some(credentials_file) => {
                     GcsStore::with_credentials_file(root_uri, credentials_file)?
@@ -503,6 +508,14 @@ pub enum Error {
         scope: String,
         expected: &'static str,
     },
+    #[error(
+        "secret `{name}`: `access_key_id` and `secret_access_key` are written together, or both left out to sign as the server's own AWS identity"
+    )]
+    S3SecretLoneKey { name: String },
+    #[error(
+        "secret `{name}`: an `anonymous` secret sends requests unsigned, so it carries no keys"
+    )]
+    S3SecretAnonymousWithKeys { name: String },
     #[error("secret `{name}`: an iceberg secret carries exactly one of `token` and `credential`")]
     IcebergSecretCredential { name: String },
     #[error("datastore `{datastore}` names secret `{secret}`, which is not an iceberg secret")]
@@ -843,17 +856,17 @@ impl PivotlakeDatastoreConfig {
     /// names none of these is refused, so the server fails to start rather than
     /// serving an empty datastore out of a directory named after the URI.
     ///
-    /// A remote store is opened with the secret scoped to its location. An S3
-    /// location without one uses anonymous, unsigned requests, supporting
-    /// public buckets and no-auth S3 endpoints. A GCS location without one
-    /// falls back to the ambient Application Default Credentials chain, which
-    /// on Google compute is the whole configuration a store needs.
+    /// A remote store is opened with the secret scoped to its location. A
+    /// location without one is opened as the identity the server runs as: the
+    /// AWS credential chain for S3, the Application Default Credentials chain
+    /// for GCS. On an instance with a role attached, or on
+    /// Google compute, that is the whole configuration a store needs.
     fn open_store(&self, _name: &str, secrets: &Secrets) -> Result<Arc<dyn ObjectStore>> {
         match StoreScheme::from_uri(&self.location)? {
-            StoreScheme::S3 => Ok(Arc::new(match secrets.resolve_s3(&self.location) {
-                Some(credentials) => S3Store::with_credentials(&self.location, credentials)?,
-                None => S3Store::anonymous(&self.location)?,
-            })),
+            StoreScheme::S3 => Ok(Arc::new(S3Store::with_credentials(
+                &self.location,
+                secrets.resolve_s3(&self.location),
+            )?)),
             StoreScheme::Gcs => Ok(Arc::new(match secrets.resolve_gcs(&self.location) {
                 Some(credentials_file) => {
                     GcsStore::with_credentials_file(&self.location, credentials_file)?
@@ -870,6 +883,7 @@ mod tests {
     use super::*;
     use catalog::DEFAULT_DATASTORE_NAME;
     use datastore_pivotlake::DEFAULT_REFRESH_INTERVAL;
+    use object_storage::S3Auth;
     use std::io::Write;
     use std::time::Duration;
 
@@ -946,6 +960,21 @@ mod tests {
             DEFAULT_REFRESH_INTERVAL,
         )
         .unwrap()
+    }
+
+    /// Whether `location` is opened the way a location no secret covers is:
+    /// as the server's own identity, at AWS's endpoint, in whatever region the
+    /// bucket turns out to be.
+    fn is_opened_as_the_server_identity(store: &DiskMetastore, location: &str) -> bool {
+        let credentials = store.secrets.resolve_s3(location);
+        matches!(credentials.auth, S3Auth::Chain(_))
+            && credentials.region.is_none()
+            && credentials.endpoint.is_none()
+    }
+
+    /// The secrets a config section of `yaml` resolves to.
+    fn secrets_of(yaml: &str) -> Result<DiskMetastore> {
+        from_yaml(&format!("{WARM_SECTION}{yaml}"))
     }
 
     /// Minimal config-file entries: one default datastore.
@@ -1337,7 +1366,7 @@ datastores:
     }
 
     #[test]
-    fn an_s3_datastore_no_secret_covers_selects_anonymous_access() {
+    fn an_s3_datastore_no_secret_covers_is_opened_as_the_server_identity() {
         let yaml = format!(
             "{WARM_SECTION}{}",
             r#"
@@ -1352,19 +1381,94 @@ secrets:
         );
 
         let store = from_yaml(&yaml).unwrap();
-        assert!(
-            store
-                .secrets
-                .resolve_s3(&datastore(&store, "warm").location)
-                .is_none()
-        );
+
+        assert!(is_opened_as_the_server_identity(
+            &store,
+            &datastore(&store, "warm").location
+        ));
     }
 
     #[test]
-    fn an_external_s3_location_without_a_covering_secret_selects_anonymous_access() {
+    fn an_external_s3_location_no_secret_covers_is_opened_as_the_server_identity() {
         let store = from_yaml(HOT_SECTION).unwrap();
 
-        assert!(store.secrets.resolve_s3("s3://public/events").is_none());
+        assert!(is_opened_as_the_server_identity(
+            &store,
+            "s3://public/events"
+        ));
+    }
+
+    #[test]
+    fn an_s3_secret_without_keys_signs_as_the_server_identity_in_its_region() {
+        let store = secrets_of(
+            r#"
+secrets:
+  role:
+    type: s3
+    scope: s3://analytics/
+    region: eu-west-1
+"#,
+        )
+        .unwrap();
+
+        let credentials = store.secrets.resolve_s3("s3://analytics/warm/data");
+
+        assert!(matches!(credentials.auth, S3Auth::Chain(_)));
+        assert_eq!(credentials.region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn an_anonymous_s3_secret_sends_requests_unsigned() {
+        let store = secrets_of(
+            r#"
+secrets:
+  open-data:
+    type: s3
+    scope: s3://analytics/
+    anonymous: true
+"#,
+        )
+        .unwrap();
+
+        let credentials = store.secrets.resolve_s3("s3://analytics/warm/data");
+
+        assert!(matches!(credentials.auth, S3Auth::Anonymous));
+    }
+
+    #[test]
+    fn an_s3_secret_with_one_key_of_the_pair_is_rejected() {
+        let result = secrets_of(
+            r#"
+secrets:
+  half:
+    type: s3
+    access_key_id: AKIA
+"#,
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::S3SecretLoneKey { name }) if name == "half"
+        ));
+    }
+
+    #[test]
+    fn an_anonymous_s3_secret_carrying_keys_is_rejected() {
+        let result = secrets_of(
+            r#"
+secrets:
+  both:
+    type: s3
+    access_key_id: AKIA
+    secret_access_key: secret
+    anonymous: true
+"#,
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::S3SecretAnonymousWithKeys { name }) if name == "both"
+        ));
     }
 
     #[test]
@@ -1485,10 +1589,7 @@ secrets:
         );
 
         let store = from_yaml(&yaml).unwrap();
-        let credentials = store
-            .secrets
-            .resolve_s3("s3://analytics/warm/data")
-            .unwrap();
+        let credentials = store.secrets.resolve_s3("s3://analytics/warm/data");
 
         assert!(credentials.region.is_none());
     }
@@ -1526,12 +1627,10 @@ secrets:
                 .describe()
                 .contains("eu-west-1")
         );
-        assert!(
-            store
-                .secrets
-                .resolve_s3(&datastore(&store, "adjacent").location)
-                .is_none()
-        );
+        assert!(is_opened_as_the_server_identity(
+            &store,
+            &datastore(&store, "adjacent").location
+        ));
     }
 
     #[test]
@@ -1552,12 +1651,11 @@ secrets:
         );
 
         let store = from_yaml(&yaml).unwrap();
-        assert!(
-            store
-                .secrets
-                .resolve_s3(&datastore(&store, "warm").location)
-                .is_none()
-        );
+
+        assert!(is_opened_as_the_server_identity(
+            &store,
+            &datastore(&store, "warm").location
+        ));
     }
 
     #[test]
@@ -1726,6 +1824,23 @@ secrets:
     }
 
     #[test]
+    fn secrets_without_keys_survive_a_rewrite_as_they_were_written() {
+        let disk = "secrets:\n  role:\n    type: s3\n    scope: s3://analytics/\n    \
+                    region: eu-west-1\n  open-data:\n    type: s3\n    scope: s3://open-data/\n    \
+                    anonymous: true\n";
+        let (store, file) = open_with_file(WARM_SECTION, disk);
+
+        store.create_user("walt", None).unwrap();
+
+        let reopened = reopen(WARM_SECTION, &file);
+        let role = reopened.secrets.resolve_s3("s3://analytics/warm/data");
+        let open_data = reopened.secrets.resolve_s3("s3://open-data/trips");
+        assert!(matches!(role.auth, S3Auth::Chain(_)));
+        assert_eq!(role.region.as_deref(), Some("eu-west-1"));
+        assert!(matches!(open_data.auth, S3Auth::Anonymous));
+    }
+
+    #[test]
     fn a_secrets_keys_stay_out_of_its_debug_output() {
         let yaml = format!(
             "{WARM_SECTION}{}",
@@ -1758,23 +1873,6 @@ secrets:
     access_key_id: AKIA
     secret_access_key: secret
     credentials_file: /etc/pivot/gcs-key.json
-"#
-        );
-
-        let error = from_yaml(&yaml).err().unwrap();
-
-        assert!(matches!(&error, Error::Parse { .. }), "{error}");
-    }
-
-    #[test]
-    fn an_s3_secret_without_its_keys_is_rejected() {
-        let yaml = format!(
-            "{WARM_SECTION}{}",
-            r#"
-secrets:
-  analytics:
-    type: s3
-    region: eu-west-1
 "#
         );
 

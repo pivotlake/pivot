@@ -13,7 +13,7 @@ use std::sync::Arc;
 use dispatch::UnaryResult;
 use dispatch::io::{OpenFile, OperatorIO, RemoteFile};
 use dispatch::memory::{FileBytes, SlabAllocator};
-use object_storage::{ObjectPath, S3Store};
+use object_storage::{DataFileLocation, ObjectPath, S3Store};
 use parquet_engine::writing::MemoryReservation;
 
 use super::output_file::{FileWrites, InFlightWrite, WriteKind};
@@ -100,16 +100,14 @@ impl RowGroupWriter {
         file_number: usize,
         key: &ObjectPath,
     ) -> UnaryResult<()> {
-        let url = self
+        let location = self
             .output
             .store
             .as_s3()
             .expect("a multipart upload is only started in an S3 store")
-            .presign_create_multipart_upload(key)
+            .locate_multipart_upload_start(key)
             .map_err(parquet_engine::op_err)?;
-        let request = RemoteFile::open(url, None, 0)
-            .map(Arc::new)
-            .map_err(parquet_engine::op_err)?;
+        let request = open_request(location, 0)?;
         self.issue_post(
             io,
             request,
@@ -157,12 +155,10 @@ impl RowGroupWriter {
                 upload.parts_issued += 1;
                 upload.bytes_issued += bytes.len() as u64;
                 let part_number = upload.parts_issued;
-                let url = s3
-                    .presign_upload_part(&key, &upload_id, part_number)
+                let location = s3
+                    .locate_upload_part(&key, &upload_id, part_number)
                     .map_err(parquet_engine::op_err)?;
-                let part = RemoteFile::open(url, None, bytes.len() as u64)
-                    .map(Arc::new)
-                    .map_err(parquet_engine::op_err)?;
+                let part = open_request(location, bytes.len() as u64)?;
                 self.issue_write(
                     io,
                     OpenFile::Remote(part),
@@ -186,12 +182,10 @@ impl RowGroupWriter {
                     .map(|(_, etag)| etag.clone())
                     .collect();
                 let body = S3Store::build_completion_body(&part_etags);
-                let url = s3
-                    .presign_complete_multipart_upload(&key, &upload_id)
+                let location = s3
+                    .locate_multipart_upload_completion(&key, &upload_id)
                     .map_err(parquet_engine::op_err)?;
-                let request = RemoteFile::open(url, None, body.len() as u64)
-                    .map(Arc::new)
-                    .map_err(parquet_engine::op_err)?;
+                let request = open_request(location, body.len() as u64)?;
                 // A request's body is sent from ring memory.
                 let allocator = self
                     .allocator
@@ -241,4 +235,16 @@ impl RowGroupWriter {
         upload.upload_id = Some(upload_id);
         Ok(())
     }
+}
+
+/// Open the request an S3 store located, whose body is `body_len` bytes, for
+/// the ring to send. The store's signer rides along, so each attempt is
+/// signed as it goes out.
+fn open_request(location: DataFileLocation, body_len: u64) -> UnaryResult<Arc<RemoteFile>> {
+    let DataFileLocation::Remote { url, auth } = location else {
+        panic!("an S3 store addresses its requests by URL");
+    };
+    RemoteFile::open(url, auth, body_len)
+        .map(Arc::new)
+        .map_err(parquet_engine::op_err)
 }

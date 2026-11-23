@@ -56,6 +56,9 @@ Storage.
 
         pivot open s3://my-bucket/pivot-data
         ```
+
+        On an EC2 instance with an IAM role that can access the bucket, skip
+        the exports: Pivot uses the role's credentials.
       </TabItem>
 
       <TabItem label="pivotlake datastore - GCS">
@@ -131,6 +134,12 @@ Storage.
         `-e AWS_ENDPOINT_URL=http://minio:9000`. The image generates a
         metastore for the location on startup, and the datastore remains in
         your bucket after the container exits.
+
+        To use the IAM role of an ECS task, an EKS pod with Pod Identity, or
+        an EC2 instance instead, leave out the two key variables. On EC2, the
+        container can
+        reach the instance's role only if the instance's metadata hop limit is
+        at least 2, or the container runs with `--network host`.
       </TabItem>
 
       <TabItem label="pivotlake datastore - GCS">

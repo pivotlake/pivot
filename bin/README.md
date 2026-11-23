@@ -248,13 +248,18 @@ claim the same scope, so which secret that is never depends on the order they
 were written in. A secret with no `scope` covers every location of its type;
 there can be only one such secret per type.
 
-An `s3://` datastore without a covering secret uses anonymous, unsigned
-requests. This supports public S3 locations; define a secret when the location
-requires authentication. A `gs://` datastore without one falls back to the
-ambient Application Default Credentials chain instead:
-`GOOGLE_APPLICATION_CREDENTIALS`, the file
-`gcloud auth application-default login` writes, or the workload identity of the
-Google compute instance.
+An S3 secret written without keys signs as the identity the server itself
+runs as, and one that says `anonymous: true` sends its requests unsigned, for
+a public bucket.
+
+A datastore in a bucket no secret covers is opened as the server's own
+identity. For `s3://` that is the first of these that has keys: the `AWS_*`
+key variables, a container's credentials endpoint, or the role of the EC2
+instance, whose temporary keys are refreshed before they expire. When none
+has keys, requests are sent unsigned, which reads a public bucket. For `gs://`
+it is the Application Default Credentials chain:
+`GOOGLE_APPLICATION_CREDENTIALS`, the file `gcloud auth application-default
+login` writes, or the workload identity of the Google compute instance.
 
 An S3 secret's keys are written inline, so protect files containing one
 appropriately.

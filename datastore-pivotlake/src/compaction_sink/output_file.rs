@@ -25,7 +25,7 @@ pub(super) enum Destination {
     /// An object uploaded whole once the file is closed.
     Remote {
         url: url::Url,
-        auth: Option<dispatch::io::AuthHeader>,
+        auth: Option<Arc<dyn dispatch::io::RequestAuth>>,
         bytes: FileBytes,
     },
     /// An S3 object uploaded a part at a time. The upload is kept with the

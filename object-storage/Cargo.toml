@@ -32,3 +32,4 @@ test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfil
 [dev-dependencies]
 dispatch = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+chrono = "0.4"
