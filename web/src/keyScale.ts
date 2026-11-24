@@ -54,99 +54,118 @@ function writeNumberAsBound(number: number, bounds: Bound[]): Bound {
 
 export type KeyScale = {
   // Where a value's own stretch of the line starts, the line running from 0
-  // to 1 and each value's stretch being `valueShare` long.
+  // to 1.
   locate(bound: Bound): number;
+  // How much of the line a value's stretch takes: the room there is inside
+  // the value for whatever sorts the rows that share it.
+  measure(bound: Bound): number;
   // What stands at `position` of the line, 0 to 1.
   readAt(position: number): Standing;
-  // How much of the line one value of the column takes: the room there is
-  // inside a value for whatever sorts the rows that share it. The same for
-  // every value. Close to nothing for a column whose values are all
-  // different, such as a precise timestamp, and a good part of the line for
-  // one with few values, such as a timestamp rounded to the minute over an
-  // hour.
-  valueShare: number;
 };
 
-// The scale over `bounds`, of which there is at least one.
-//
-// When every bound has a number, values are placed by it, so distances along
-// the line are distances between keys, and one value takes as much of the
-// line as the smallest gap between two different bounds. Otherwise values
-// are placed by their rank among the different bounds as text, evenly.
-export function buildKeyScale(bounds: Bound[]): KeyScale {
-  const numbers = bounds.map(readAsNumber);
-  if (numbers.every((number) => number !== undefined)) {
-    // The bounds in order with one of each number, and their numbers.
-    const numbered = bounds
-      .map((bound, index) => ({ bound, number: numbers[index] as number }))
-      .sort((left, right) => left.number - right.number)
-      .filter((entry, index, sorted) => index === 0 || sorted[index - 1].number !== entry.number);
-    if (numbered.length === 1) return buildOneValueScale(numbered[0].bound);
+// Whether a bound has a number to be placed by.
+export function isNumbered(bound: Bound): boolean {
+  return readAsNumber(bound) !== undefined;
+}
 
-    const distinct = numbered.map((entry) => entry.bound);
-    const values = numbered.map((entry) => entry.number);
-    const low = values[0];
-    const lastIndex = values.length - 1;
-    const smallestGap = Math.min(...values.slice(1).map((value, index) => value - values[index]));
-    const length = values[lastIndex] - low + smallestGap;
-    return {
-      locate: (bound) => ((readAsNumber(bound) as number) - low) / length,
-      readAt: (position) => {
-        const number = low + position * length;
-        // The last bound at or before the place, whose stretch is the only
-        // one that can hold it.
-        let index = 0;
-        while (index < lastIndex && values[index + 1] <= number) index += 1;
-        const pastBound = number - values[index];
-        // The line ends where the largest bound's stretch does, so whatever
-        // is past that bound is in its stretch, however the sums round.
-        if (index === lastIndex || pastBound <= smallestGap) {
-          return { value: distinct[index], within: Math.min(pastBound / smallestGap, 1) };
-        }
-        // No bound's stretch holds the place. Every value has a stretch as
-        // long as a bound's, so the place is in the stretch of the value a
-        // whole number of stretches past the smallest bound.
-        const stretchesPast = Math.floor((number - low) / smallestGap);
-        return {
-          value: writeNumberAsBound(low + stretchesPast * smallestGap, distinct),
-          within: (number - low) / smallestGap - stretchesPast,
-        };
-      },
-      valueShare: smallestGap / length,
-    };
-  }
-
-  // The bounds as text, in order, one of each. Text is what tells these
-  // bounds apart: two of them can be written differently and still have the
-  // same number.
-  const distinct = [...new Map(bounds.map((bound) => [String(bound), bound])).entries()]
-    .sort(([leftText], [rightText]) => (leftText < rightText ? -1 : leftText > rightText ? 1 : 0))
-    .map(([, bound]) => bound);
-  if (distinct.length === 1) return buildOneValueScale(distinct[0]);
-
-  const rankByText = new Map(distinct.map((bound, rank) => [String(bound), rank]));
+// The scale that places `bounds` by their numbers, so distances along the
+// line are distances between keys. Every bound has a number, and at least
+// two of the numbers differ. One value takes as much of the line as the
+// smallest gap between two different bounds, which is close to nothing for
+// a column whose values are all different, such as a precise timestamp.
+export function buildNumberScale(bounds: Bound[]): KeyScale {
+  // The bounds in order with one of each number, and their numbers.
+  const numbered = bounds
+    .map((bound) => ({ bound, number: readAsNumber(bound) as number }))
+    .sort((left, right) => left.number - right.number)
+    .filter((entry, index, sorted) => index === 0 || sorted[index - 1].number !== entry.number);
+  const distinct = numbered.map((entry) => entry.bound);
+  const values = numbered.map((entry) => entry.number);
+  const low = values[0];
+  const lastIndex = values.length - 1;
+  const smallestGap = Math.min(...values.slice(1).map((value, index) => value - values[index]));
+  const length = values[lastIndex] - low + smallestGap;
   return {
-    locate: (bound) => {
-      const rank = rankByText.get(String(bound));
-      if (rank === undefined) {
-        throw new Error(`${String(bound)} is not one of the bounds the scale was built over`);
-      }
-      return rank / distinct.length;
-    },
+    locate: (bound) => ((readAsNumber(bound) as number) - low) / length,
+    measure: () => smallestGap / length,
     readAt: (position) => {
-      const rank = Math.min(Math.floor(position * distinct.length), distinct.length - 1);
-      return { value: distinct[rank], within: position * distinct.length - rank };
+      const number = low + position * length;
+      // The last bound at or before the place, whose stretch is the only
+      // one that can hold it.
+      let index = 0;
+      while (index < lastIndex && values[index + 1] <= number) index += 1;
+      const pastBound = number - values[index];
+      // The line ends where the largest bound's stretch does, so whatever
+      // is past that bound is in its stretch, however the sums round.
+      if (index === lastIndex || pastBound <= smallestGap) {
+        return { value: distinct[index], within: Math.min(pastBound / smallestGap, 1) };
+      }
+      // No bound's stretch holds the place. Every value has a stretch as
+      // long as a bound's, so the place is in the stretch of the value a
+      // whole number of stretches past the smallest bound.
+      const stretchesPast = Math.floor((number - low) / smallestGap);
+      return {
+        value: writeNumberAsBound(low + stretchesPast * smallestGap, distinct),
+        within: (number - low) / smallestGap - stretchesPast,
+      };
     },
-    valueShare: 1 / distinct.length,
   };
 }
 
-// The scale of a column that holds `value` and nothing else, which has the
-// whole line.
-function buildOneValueScale(value: Bound): KeyScale {
+// The scale that gives every different value among `bounds` a stretch of its
+// own, the values in order and the stretches side by side filling the line.
+// Distances along it say nothing of how far apart two keys are.
+//
+// `held` are the values files hold alone, one for each such file, all of
+// them among `bounds`. A value's stretch is as long as the number of files
+// that hold it, and one more: the files of a value many files hold are drawn
+// inside its stretch, and need the room.
+export function buildSectionScale(bounds: Bound[], held: Bound[]): KeyScale {
+  // Bounds that all have numbers are told apart and ordered by them, and
+  // any others by their text: two bounds can be written differently and
+  // still have the same number.
+  const areNumbered = bounds.every(isNumbered);
+  const readKey = (bound: Bound) => (areNumbered ? String(readAsNumber(bound)) : String(bound));
+  const distinct = [...new Map(bounds.map((bound) => [readKey(bound), bound])).values()].sort((left, right) => {
+    if (areNumbered) return (readAsNumber(left) as number) - (readAsNumber(right) as number);
+    const leftText = String(left);
+    const rightText = String(right);
+    return leftText < rightText ? -1 : leftText > rightText ? 1 : 0;
+  });
+
+  const holderCounts = new Map<string, number>();
+  for (const bound of held) {
+    const key = readKey(bound);
+    holderCounts.set(key, (holderCounts.get(key) ?? 0) + 1);
+  }
+  const weights = distinct.map((bound) => 1 + (holderCounts.get(readKey(bound)) ?? 0));
+  const totalWeight = weights.reduce((total, weight) => total + weight, 0);
+
+  // Each value's stretch, in the values' order.
+  const stretches: { value: Bound; start: number; length: number }[] = [];
+  let weightBefore = 0;
+  for (const [index, value] of distinct.entries()) {
+    stretches.push({ value, start: weightBefore / totalWeight, length: weights[index] / totalWeight });
+    weightBefore += weights[index];
+  }
+  const stretchByKey = new Map(stretches.map((stretch) => [readKey(stretch.value), stretch]));
+  const findStretch = (bound: Bound) => {
+    const stretch = stretchByKey.get(readKey(bound));
+    if (!stretch) {
+      throw new Error(`${String(bound)} is not one of the bounds the scale was built over`);
+    }
+    return stretch;
+  };
+
   return {
-    locate: () => 0,
-    readAt: (position) => ({ value, within: position }),
-    valueShare: 1,
+    locate: (bound) => findStretch(bound).start,
+    measure: (bound) => findStretch(bound).length,
+    readAt: (position) => {
+      // The last stretch that starts at or before the place.
+      let index = 0;
+      while (index + 1 < stretches.length && stretches[index + 1].start <= position) index += 1;
+      const { value, start, length } = stretches[index];
+      return { value, within: Math.min((position - start) / length, 1) };
+    },
   };
 }

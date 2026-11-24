@@ -58,21 +58,36 @@ files of a sorted table whose keys all interleave is rewritten in key order
 into files that do not overlap.
 
 The pane draws the files in the table's sort order: each file a bar from
-where its first row falls to where its last does. The widest files are placed
-first, each in the highest row where it overlaps nothing already there, so
-files that span everything pile up at the top and narrow ones settle beneath
-them. Two bars one above the other are two files holding keys from the same
-stretch of the sort order, which a layout merge rewrites into files side by
-side; large files that are fully sorted make a single row.
+where its first row falls to where its last does. Two bars one above the
+other are two files holding keys from the same stretch of the sort order,
+which a layout merge rewrites into files side by side; large files that are
+fully sorted make a single row.
 
-For a table sorted by two columns the line is the first column's range, with
-each of its values given a stretch along which the second column runs. So a
-file holding every deployment for ten minutes spans the whole line, and a
-file holding one deployment for a day is a short bar inside that
-deployment's stretch. A file holding several values of the first column is
-drawn between the middles of its two end values' stretches, since its bounds
-do not say how much of either it holds; two files that share only an end
-value then meet without overlapping, which is how the compacter treats them.
+A value of a sort column that files hold alone is a section of the line: a
+deployment, for a table sorted by deployment, service and time. Its files
+are drawn inside it, placed by the next sort column, whose values are
+sections in turn. A section is as wide as its files are many, so the
+deployment with the most files has the most room. Sort columns but the last
+have sections.
+
+A section is marked by a ruled line across it with its value in small grey
+text, in the row where the separation happens: below the files that span
+the section and above the files inside it. So a column whose one value every
+file holds is marked once across the top, the column that divides those
+files is marked beneath, within it, and the last column is written on the
+files. A file's bar is labelled with its keys below the sections it lies
+under. Double-click a section's mark to zoom to the section.
+
+A file holding several values of a column is drawn between the middles of
+its two end values' stretches, since its bounds do not say how much of
+either it holds; two files that share only an end value then meet without
+overlapping, which is how the compacter treats them. Where no file holds one
+value of a column alone, as with a timestamp, the files are ranges along it
+and are placed by its values, so widths there are spans of time.
+
+Files and marks are placed in rows from the files that span sections down
+to those inside the innermost ones, each in the highest row where it
+overlaps nothing, and never above a file that spans its section.
 
 The page does not predict layout merges. The server decides them from the
 bounds of each file's row groups, read from the files' footers, which
@@ -99,7 +114,9 @@ A file's block that is wide enough has the file's keys written on it: its
 bounds on every sort column. With less room the column names go, then the
 sort columns from the last, down to the ones that place the file: its one
 value of each column down to the first it holds several values of, and its
-range there. The narrowest label is that range alone.
+range there. With still less room long values are shortened to their start
+(`8ba5dcf7… → f3ed8e3c…`), a range of times within one day loses the day,
+and last the label is cut to what fits, with an ellipsis.
 
 ## What is live and what is not
 
@@ -193,6 +210,8 @@ published version gets a `web-v<version>` git tag.
   page's side of those requests.
 - `src/compaction.ts`: which small files a compaction round would merge.
 - `src/keyScale.ts`: placing a column's bounds along a line.
+- `src/sortOrderLine.ts`: the table's sort order as one line, its sections,
+  and where a file lies on it.
 - `src/fileKeys.ts`: a file's keys in words, and what of them fits on its
   block.
 - `src/zoom.tsx`: zooming into a part of a drawing's width.
