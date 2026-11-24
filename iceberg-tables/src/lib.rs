@@ -60,7 +60,7 @@ pub use files::manifests::ManifestList;
 pub use io::runtime::block_on;
 pub use metadata::layout::{TableLocation, split_location};
 pub use metadata::metadata_store::{MetadataFile, MetadataStore, build_table_ident};
-pub use table::{Table, forget_cached_table};
+pub use table::{Table, forget_cached_table, forget_held_manifests};
 pub use types::columns::LOGICAL_TYPES_PROPERTY;
 pub use types::partitioning::{PartitionKeys, check_partition_terms};
 

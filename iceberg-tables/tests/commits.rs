@@ -19,7 +19,7 @@ use iceberg::table::Table as SpecTable;
 use iceberg::{NamespaceIdent, TableIdent};
 use iceberg_tables::test_support::Faults;
 use iceberg_tables::types::schema::build_schema;
-use iceberg_tables::{Error, MetadataFile, Table, block_on};
+use iceberg_tables::{Error, MetadataFile, Table, block_on, forget_held_manifests};
 use parquet_engine::{PartitionValues, scalar_equal};
 use planner::catalog::Column;
 use planner::types::Type;
@@ -334,7 +334,7 @@ fn a_scan_reports_a_column_nullable_only_while_a_live_file_records_a_null_in_it(
 }
 
 #[test]
-fn commits_merging_manifests_read_the_carried_ones_from_the_store() {
+fn commits_merging_manifests_read_none_the_process_wrote() {
     let (fixture, _created) = create_table(&[]);
     let faults = Arc::new(Faults::default());
     let mut table = load_over_faulty_store(&fixture, &faults);
@@ -354,9 +354,35 @@ fn commits_merging_manifests_read_the_carried_ones_from_the_store() {
     assert_eq!(paths(&table).len(), appends as usize);
     // Each commit reads the manifest list it wrote and, but for the first,
     // the one it is built on; the one that merged every manifest into one
-    // reads them all, the 99 it carried and the one it wrote for its own
-    // file.
-    assert_eq!(requests.object_reads, 3 * appends as usize - 1);
+    // has them all at hand, the 99 it carried and the one it wrote for its
+    // own file.
+    assert_eq!(requests.object_reads, 2 * appends as usize - 1);
+    assert_eq!(requests.listings, 0);
+}
+
+#[test]
+fn a_commit_merging_manifests_reads_the_carried_ones_the_process_does_not_hold() {
+    let (fixture, _created) = create_table(&[]);
+    let faults = Arc::new(Faults::default());
+    let mut table = load_over_faulty_store(&fixture, &faults);
+    let appends = 100;
+    for number in 0..appends - 1 {
+        let low = number * 10;
+        table = append(
+            &table,
+            vec![entry(&format!("f{number:03}"), 10, low, low + 9)],
+        );
+    }
+    forget_held_manifests(&fixture.location.table_uri());
+    faults.take_requests();
+
+    table = append(&table, vec![entry("f099", 10, 990, 999)]);
+    let requests = faults.take_requests();
+
+    assert_eq!(count_manifests(&table), 1);
+    // The manifest list the commit is built on and the one it wrote, and
+    // the 99 manifests it carried.
+    assert_eq!(requests.object_reads, 2 + appends as usize - 1);
     assert_eq!(requests.listings, 0);
 }
 
@@ -373,6 +399,7 @@ fn a_rewrite_reads_only_the_manifest_that_lists_the_file_it_replaces() {
         );
     }
     let replaced = live_entry(&table, "f00.parquet");
+    forget_held_manifests(&fixture.location.table_uri());
     faults.take_requests();
 
     let rewritten = table.commit(&[replaced], vec![entry("merged", 10, 0, 0)]);
@@ -386,6 +413,30 @@ fn a_rewrite_reads_only_the_manifest_that_lists_the_file_it_replaces() {
     // wrote.
     assert_eq!(requests.object_reads, 4);
     assert_eq!(requests.listings, 0);
+}
+
+#[test]
+fn a_rewrite_reads_no_manifest_the_process_wrote() {
+    let (fixture, _created) = create_table(&[]);
+    let faults = Arc::new(Faults::default());
+    let mut table = load_over_faulty_store(&fixture, &faults);
+    for number in 0..20 {
+        table = append(
+            &table,
+            vec![entry(&format!("f{number:02}"), 10, number, number)],
+        );
+    }
+    let replaced = live_entry(&table, "f00.parquet");
+    faults.take_requests();
+
+    let rewritten = table.commit(&[replaced], vec![entry("merged", 10, 0, 0)]);
+    let requests = faults.take_requests();
+
+    assert!(rewritten.unwrap().is_some());
+    // The manifest list the rewrite is built on, once to look for deletes
+    // committed since and once for the manifests it lists, and the
+    // manifest list it wrote.
+    assert_eq!(requests.object_reads, 3);
 }
 
 #[test]

@@ -75,7 +75,9 @@ use std::sync::{Arc, OnceLock};
 
 use arrow_schema::{Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use dispatch::DataFlowDispatcher;
-use iceberg::spec::{FormatVersion, Manifest, ManifestFile, TableMetadata, TableMetadataRef};
+use iceberg::spec::{
+    EncodedManifest, FormatVersion, Manifest, ManifestFile, TableMetadata, TableMetadataRef,
+};
 use object_storage::{DataFile, FileRef, ObjectPath, load_objects};
 use parquet_engine::file_entry::FileEntry;
 use parquet_engine::{
@@ -332,6 +334,15 @@ fn build_cache_key(location: &TableLocation, metadata: &TableMetadata) -> TableK
 /// local file keeps its blocks for as long as it is open.
 pub fn forget_cached_table(location: &TableLocation) {
     FileMetadataCache::process_wide().remove_tables(&location.table_uri());
+    forget_held_manifests(&location.table_uri());
+}
+
+/// Let go of the manifests the format's crate holds, as the commits of this
+/// process wrote them, of the tables under the directory at
+/// `directory_uri`. They are then read from the store, as they are by a
+/// process that has just started, which holds none.
+pub fn forget_held_manifests(directory_uri: &str) {
+    EncodedManifest::forget_under(directory_uri);
 }
 
 /// What a scan over some filters selected of a table version.
