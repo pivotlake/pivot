@@ -26,6 +26,24 @@
 //!   bytes diverge early) plus one `i64` payload; byte-wise key comparisons
 //!   dominate.
 //!
+//! The remaining scenarios sort by several columns, the way a window sorts
+//! its rows: an `i64` with 100,000 distinct values comes first, as a
+//! partition key does, so most comparisons are between rows that agree on it
+//! and the columns after it decide them. The rows hold the key columns only.
+//!
+//! * `i64_date_i64_i32` - then a date, an `i64` and an `i32`: four
+//!   fixed-width columns, 192 bits together.
+//! * `i64_then_i64_descending` - then a second `i64`, descending.
+//! * `i64_short_string_date` - then a string with seven values of 3 to 7
+//!   bytes, then a date. Rows often tie on the string, and the date decides.
+//! * `i64_nullable_i32_date` - then an `i32` of which about one in seven is
+//!   NULL, then a date.
+//! * `i64_long_string_date` - then a string of 10 to 43 bytes made of words
+//!   from a small vocabulary, then a date. Many strings start alike, so a
+//!   comparison often has to read past their first bytes.
+//! * `i64_mixed_string_date` - then a string with four values, two of them
+//!   shorter than 12 bytes and two longer, then a date.
+//!
 //! Scenario sizes count logical row bytes (fixed widths; views plus payload
 //! bytes for strings) independent of dictionary sharing, and generation stops
 //! at the first batch to cross the target, so reported bytes/s throughput is
@@ -62,7 +80,9 @@
 use std::sync::Arc;
 
 use arrow_array::builder::StringViewBuilder;
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringViewArray};
+use arrow_array::{
+    Array, ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, StringViewArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::measurement::WallTime;
 use criterion::{BatchSize, BenchmarkGroup, Criterion, SamplingMode, Throughput};
@@ -165,6 +185,74 @@ fn generate_i64_ascending(next: &mut i64, n: usize) -> ArrayRef {
     Arc::new(values)
 }
 
+/// How many distinct values the leading key column of a several-column
+/// scenario has. Every value then repeats a few hundred times at the default
+/// scenario size.
+const LEADING_KEY_VALUES: usize = 100_000;
+
+/// `i64` column of values drawn uniformly from `[0, distinct_values)`.
+fn generate_i64_repeating(rng: &mut Rng, row_count: usize, distinct_values: usize) -> ArrayRef {
+    let values: Int64Array = (0..row_count)
+        .map(|_| Some(rng.below(distinct_values) as i64))
+        .collect();
+    Arc::new(values)
+}
+
+/// `Date32` column of days drawn uniformly from a span of about seven years.
+fn generate_date_col(rng: &mut Rng, row_count: usize) -> ArrayRef {
+    let days = (0..row_count).map(|_| 8_000 + rng.below(2_500) as i32);
+    Arc::new(Date32Array::from_iter_values(days))
+}
+
+/// `Int32` column of values drawn uniformly from 1 to 7. With
+/// `lowest_is_null`, every 1 is a NULL instead.
+fn generate_small_i32_col(rng: &mut Rng, row_count: usize, lowest_is_null: bool) -> ArrayRef {
+    let values: Int32Array = (0..row_count)
+        .map(|_| {
+            let value = 1 + rng.below(7) as i32;
+            (value != 1 || !lowest_is_null).then_some(value)
+        })
+        .collect();
+    Arc::new(values)
+}
+
+/// Build `count` strings of 10 to 43 bytes, each a run of words drawn from a
+/// small vocabulary and cut at its length. Many of them start with the same
+/// word, so comparing two often means reading past their first 12 bytes.
+fn build_sentence_dict(count: usize) -> Vec<String> {
+    const WORDS: [&str; 16] = [
+        "carefully",
+        "furiously",
+        "quickly",
+        "blithely",
+        "final",
+        "ironic",
+        "regular",
+        "pending",
+        "express",
+        "special",
+        "deposits",
+        "accounts",
+        "packages",
+        "requests",
+        "instructions",
+        "platelets",
+    ];
+    let mut rng = Rng::new(7);
+    (0..count)
+        .map(|_| {
+            let length = 10 + rng.below(34);
+            let mut sentence = String::new();
+            while sentence.len() < length {
+                sentence.push_str(WORDS[rng.below(WORDS.len())]);
+                sentence.push(' ');
+            }
+            sentence.truncate(length);
+            sentence
+        })
+        .collect()
+}
+
 /// Build `n_distinct` distinct strings averaging ~`avg_len` bytes whose bytes
 /// diverge within the first few characters (a short shared lead, then a
 /// per-entry token), so key comparisons short-circuit early like real ids and
@@ -232,6 +320,7 @@ fn count_logical_bytes(batch: &RecordBatch) -> usize {
         .iter()
         .map(|column| match column.data_type() {
             DataType::Int64 => 8 * column.len(),
+            DataType::Int32 | DataType::Date32 => 4 * column.len(),
             DataType::Utf8View => {
                 let strings = column.as_any().downcast_ref::<StringViewArray>().unwrap();
                 16 * strings.len()
@@ -321,7 +410,7 @@ fn register<D>(
 fn bench_order_by_large(c: &mut Criterion, d: &DataFlowDispatcher) {
     let target = target_sort_bytes();
 
-    // One group for all four scenarios, so criterion's group summary compares
+    // One group for every scenario, so criterion's group summary compares
     // them and the throughput/sampling config is stated once.
     let mut group = c.benchmark_group("order_by");
     group.throughput(Throughput::Bytes(target as u64));
@@ -419,6 +508,131 @@ fn bench_order_by_large(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         vec![OrderBy::new(0, false, false)],
     );
+
+    register(
+        &mut group,
+        d,
+        "i64_date_i64_i32",
+        move || {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("leading_key", DataType::Int64, false),
+                Field::new("day", DataType::Date32, false),
+                Field::new("number", DataType::Int64, false),
+                Field::new("small_number", DataType::Int32, false),
+            ]));
+            let mut rng = Rng::new(5);
+            generate_until(target, &schema, |row_count| {
+                vec![
+                    generate_i64_repeating(&mut rng, row_count, LEADING_KEY_VALUES),
+                    generate_date_col(&mut rng, row_count),
+                    generate_i64_random(&mut rng, row_count),
+                    generate_small_i32_col(&mut rng, row_count, false),
+                ]
+            })
+        },
+        vec![
+            OrderBy::new(0, false, false),
+            OrderBy::new(1, false, false),
+            OrderBy::new(2, false, false),
+            OrderBy::new(3, false, false),
+        ],
+    );
+
+    register(
+        &mut group,
+        d,
+        "i64_then_i64_descending",
+        move || {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("leading_key", DataType::Int64, false),
+                Field::new("number", DataType::Int64, false),
+            ]));
+            let mut rng = Rng::new(6);
+            generate_until(target, &schema, |row_count| {
+                vec![
+                    generate_i64_repeating(&mut rng, row_count, LEADING_KEY_VALUES),
+                    generate_i64_random(&mut rng, row_count),
+                ]
+            })
+        },
+        vec![OrderBy::new(0, false, false), OrderBy::new(1, true, false)],
+    );
+
+    register(
+        &mut group,
+        d,
+        "i64_nullable_i32_date",
+        move || {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("leading_key", DataType::Int64, false),
+                Field::new("small_number", DataType::Int32, true),
+                Field::new("day", DataType::Date32, false),
+            ]));
+            let mut rng = Rng::new(8);
+            generate_until(target, &schema, |row_count| {
+                vec![
+                    generate_i64_repeating(&mut rng, row_count, LEADING_KEY_VALUES),
+                    generate_small_i32_col(&mut rng, row_count, true),
+                    generate_date_col(&mut rng, row_count),
+                ]
+            })
+        },
+        vec![
+            OrderBy::new(0, false, false),
+            OrderBy::new(1, false, false),
+            OrderBy::new(2, false, false),
+        ],
+    );
+
+    // The three scenarios with a string between the leading key and a date
+    // differ only in the strings the column draws from.
+    let mut register_string_scenario =
+        |name: &str, seed: u64, build_strings: fn() -> Vec<String>| {
+            register(
+                &mut group,
+                d,
+                name,
+                move || {
+                    let schema = Arc::new(Schema::new(vec![
+                        Field::new("leading_key", DataType::Int64, false),
+                        Field::new("text", DataType::Utf8View, false),
+                        Field::new("day", DataType::Date32, false),
+                    ]));
+                    let block = build_dict_block(&build_strings());
+                    let mut rng = Rng::new(seed);
+                    generate_until(target, &schema, |row_count| {
+                        vec![
+                            generate_i64_repeating(&mut rng, row_count, LEADING_KEY_VALUES),
+                            generate_string_col(&mut rng, row_count, &block),
+                            generate_date_col(&mut rng, row_count),
+                        ]
+                    })
+                },
+                vec![
+                    OrderBy::new(0, false, false),
+                    OrderBy::new(1, false, false),
+                    OrderBy::new(2, false, false),
+                ],
+            );
+        };
+    register_string_scenario("i64_short_string_date", 9, || {
+        ["AIR", "FOB", "MAIL", "RAIL", "REG AIR", "SHIP", "TRUCK"]
+            .map(String::from)
+            .to_vec()
+    });
+    register_string_scenario("i64_long_string_date", 10, || {
+        build_sentence_dict(1_000_000)
+    });
+    register_string_scenario("i64_mixed_string_date", 11, || {
+        [
+            "NONE",
+            "COLLECT COD",
+            "TAKE BACK RETURN",
+            "DELIVER IN PERSON",
+        ]
+        .map(String::from)
+        .to_vec()
+    });
 
     group.finish();
 }

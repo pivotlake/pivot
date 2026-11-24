@@ -106,6 +106,13 @@ harness = false
 name = "order_by"
 harness = false
 
+# The window operator at scale (`benches/window.rs`): one window per scenario
+# over 60 million generated rows. Same custom-`main` Criterion setup as
+# `operators`.
+[[bench]]
+name = "window"
+harness = false
+
 # HTTP(S) range-read throughput (`benches/http_range.rs`): stands up a loopback
 # backend and drives the HTTP engine via a standalone `IORequester`. Needs
 # `test-util` for `init_test_free_pool` (the out-of-crate single-worker context).

@@ -10,13 +10,13 @@ set -euo pipefail
 source_directory="$1"
 database="$2"
 shift 2
-queries=("${@:-q01 q02 q03 q04 q05 q06}")
+queries=("${@:-q01 q02 q03 q04 q05 q06 q07 q08}")
 suite_directory="$(cd "$(dirname "$0")" && pwd)"
 
 if [ ! -f "$database" ]; then
     {
         echo "CREATE TABLE lineitem AS SELECT l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity,"
-        echo "    l_extendedprice, l_discount, l_shipdate, l_shipmode"
+        echo "    l_extendedprice, l_discount, l_shipdate, l_shipinstruct, l_shipmode, l_comment"
         echo "FROM read_parquet('$source_directory/lineitem/*.parquet');"
     } | duckdb "$database"
 fi

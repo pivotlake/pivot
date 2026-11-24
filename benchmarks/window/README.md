@@ -1,6 +1,6 @@
 # Window function suite
 
-Six queries over the TPC-H `lineitem` table, each a window function inside a
+Eight queries over the TPC-H `lineitem` table, each a window function inside a
 subquery with an aggregate on top, so the result is one row and the time is
 the window operator's.
 
@@ -12,10 +12,40 @@ the window operator's.
 | q04 | `rank() OVER (PARTITION BY l_suppkey ORDER BY l_extendedprice * (1 - l_discount) DESC)` | An expression as the order key. |
 | q05 | `row_number() OVER (PARTITION BY l_suppkey ORDER BY l_shipmode, l_shipdate)` | A string in the middle of the sort key. |
 | q06 | `row_number() OVER (PARTITION BY l_suppkey ORDER BY NULLIF(l_linenumber, 1), l_shipdate)` | A key column with nulls. |
+| q07 | `row_number() OVER (PARTITION BY l_suppkey ORDER BY l_comment, l_shipdate)` | A long string, 10 to 43 bytes, in the middle of the sort key. |
+| q08 | `row_number() OVER (PARTITION BY l_suppkey ORDER BY l_shipinstruct, l_shipdate)` | A string with four values, two of them longer than 12 bytes, so most rows tie on it. |
 
-q04 to q06 partition by supplier on purpose. A supplier has several hundred
+q04 to q08 partition by supplier on purpose. A supplier has several hundred
 lines, so most comparisons in the sort are between rows of one partition, and
 those are decided by the order key.
+
+## Microbenchmark
+
+`dispatch/benches/window.rs` has one scenario per query. A scenario runs the
+query's window, with the same input columns, types and keys as the query's
+plan, over generated rows held in memory. It leaves out the scan, the
+expressions around the window and the aggregate on top.
+
+| Query | Scenario |
+|---|---|
+| q01 | `sum_per_order` |
+| q02 | `top_3_prices_per_part` |
+| q03 | `running_sum_and_lag_per_supplier` |
+| q04 | `rank_by_revenue_per_supplier` |
+| q05 | `row_number_by_ship_mode_then_date` |
+| q06 | `row_number_by_nullable_line_then_date` |
+| q07 | `row_number_by_comment_then_date` |
+| q08 | `row_number_by_instructions_then_date` |
+
+```sh
+cargo bench -p dispatch --bench window
+```
+
+At its default of 60M rows a scenario takes within 8% of its query's hot time
+at scale factor 10, and a profile of it splits between sorting, comparing,
+gathering and evaluating as the query's does. q01 is the exception: about a
+quarter of the query's time is the scan, the expressions and the aggregate
+around the window, which the scenario does not run.
 
 ## Data
 
