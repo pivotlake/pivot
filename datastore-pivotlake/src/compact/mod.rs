@@ -163,7 +163,8 @@
 //! in one process. The actor stops before the datastore's dispatch pool
 //! shuts down.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 use std::time::Duration;
@@ -885,21 +886,51 @@ struct SmallFile {
     committed_at_ms: u64,
 }
 
-/// The files one merge rewrites together, all of one partition.
+/// The files the merges of one commit rewrite, all of one partition.
 struct MergeBatch {
     /// The partition the inputs sit in, as a walk names it.
     partition: Vec<u8>,
-    inputs: Vec<FileRef>,
+    /// The inputs of each merge. No file is among those of two.
+    merges: Vec<Vec<FileRef>>,
     kind: MergeKind,
     /// The version of the table the inputs were selected from.
     selected_at_version: u64,
     /// The copy of the table the inputs were selected from.
     table: CatalogTable,
-    /// The small files of the partition in its order, the inputs among them,
-    /// that the merges following this one in its commit are picked from.
-    /// Empty when no merge follows.
-    small_files: Vec<SmallFile>,
 }
+
+/// A run of small files one merge may take, as the picking of a commit's
+/// runs orders it: the cheaper to merge is the greater, and of two as cheap
+/// the one that starts later in the partition's order.
+struct RunCandidate {
+    /// The bytes the merge rewrites for each file it removes.
+    score: f64,
+    first: usize,
+    end: usize,
+}
+
+impl Ord for RunCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then(self.first.cmp(&other.first))
+    }
+}
+
+impl PartialOrd for RunCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RunCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RunCandidate {}
 
 /// What the merges of one commit wrote, before the commit.
 struct WrittenMerges {
@@ -930,14 +961,24 @@ impl WrittenMerges {
 }
 
 impl MergeBatch {
-    /// Merge the inputs and, at the same time, further runs of the
-    /// partition's small files, each run a merge of its own: up to
-    /// [`MAX_SMALL_FILE_MERGES_PER_COMMIT`] merges in all, of no more than
-    /// [`MAX_INPUT_BYTES_OF_MERGES_WRITTEN_TOGETHER`] of inputs between
-    /// them, the first merge whatever it holds. The runs are picked before
-    /// anything is written, each from the files the runs before it left, so
-    /// no file is in two. Nothing is committed. A merge that fails leaves
-    /// the others to be committed.
+    /// The merges of one commit, selected from `table`.
+    fn new(
+        table: &CatalogTable,
+        partition: Vec<u8>,
+        merges: Vec<Vec<FileRef>>,
+        kind: MergeKind,
+    ) -> Self {
+        Self {
+            partition,
+            merges,
+            kind,
+            selected_at_version: table.version(),
+            table: table.clone(),
+        }
+    }
+
+    /// Write the merges at the same time, each a merge of its own. Nothing
+    /// is committed. A merge that fails leaves the others to be committed.
     ///
     /// Blocking store I/O, so callers run it on the blocking pool.
     fn write_merges(
@@ -947,36 +988,11 @@ impl MergeBatch {
     ) -> WrittenMerges {
         let MergeBatch {
             partition,
-            inputs,
+            merges,
             kind,
             table,
-            small_files,
             ..
         } = self;
-        let count_bytes = |files: &[FileRef]| files.iter().map(|file| file.size).sum::<u64>();
-        let mut merges: Vec<Vec<FileRef>> = Vec::new();
-        let mut taken = HashSet::new();
-        let mut input_bytes = 0;
-        let mut next_inputs = Some(inputs);
-        while let Some(inputs) = next_inputs.take() {
-            input_bytes += count_bytes(&inputs);
-            taken.extend(inputs.iter().map(|file| file.path.clone()));
-            merges.push(inputs);
-            if merges.len() == MAX_SMALL_FILE_MERGES_PER_COMMIT {
-                break;
-            }
-            next_inputs = selection
-                .best_small_file_run(&small_files, &taken, crate::vacuum::now_unix_ms())
-                .map(|run| {
-                    small_files[run]
-                        .iter()
-                        .map(|small| small.file.clone())
-                        .collect::<Vec<FileRef>>()
-                })
-                .filter(|run| {
-                    input_bytes + count_bytes(run) <= MAX_INPUT_BYTES_OF_MERGES_WRITTEN_TOGETHER
-                });
-        }
 
         // Each merge blocks its thread on the dataflow that writes it, and
         // reads the table's store through the runtime of the thread that
@@ -1083,29 +1099,15 @@ impl MergeSelection {
         for partitions in unfinished.chunks(PARTITIONS_PER_INDEXING) {
             table.index_partitions(partitions)?;
             for partition in partitions.iter().cloned() {
-                if let Some((inputs, small_files)) =
-                    self.next_small_batch(table, &partition, pass, reserved)?
-                {
-                    return Ok(Some(MergeBatch {
-                        partition,
-                        inputs,
-                        kind: MergeKind::SmallFiles,
-                        selected_at_version: table.version(),
-                        table: table.clone(),
-                        small_files,
-                    }));
+                if let Some(merges) = self.next_small_merges(table, &partition, pass, reserved)? {
+                    let batch = MergeBatch::new(table, partition, merges, MergeKind::SmallFiles);
+                    return Ok(Some(batch));
                 }
                 let group =
                     self.next_layout_optimization(overlaps, table, &partition, reserved, pass)?;
                 if let Some(inputs) = group {
-                    return Ok(Some(MergeBatch {
-                        partition,
-                        inputs,
-                        kind: MergeKind::LayoutOptimization,
-                        selected_at_version: table.version(),
-                        table: table.clone(),
-                        small_files: Vec::new(),
-                    }));
+                    let kind = MergeKind::LayoutOptimization;
+                    return Ok(Some(MergeBatch::new(table, partition, vec![inputs], kind)));
                 }
                 if progress.merging.contains(&partition) {
                     continue;
@@ -1122,20 +1124,19 @@ impl MergeSelection {
         Ok(None)
     }
 
-    /// Pick one group of files of `partition` below the target size: in a
-    /// routine round the best run of neighbours
-    /// ([`best_small_file_run`](Self::best_small_file_run)), in a final sweep
-    /// the first files of the partition, as many as one merge takes. Beside
-    /// the group come the small files further merges of the same commit are
-    /// picked from: those of the partition in a routine round, none in a
-    /// final sweep.
-    fn next_small_batch(
+    /// Pick the merges one commit makes of the files of `partition` below
+    /// the target size, the inputs of each: in a routine round the runs of
+    /// neighbours cheapest to merge
+    /// ([`pick_small_file_runs`](Self::pick_small_file_runs)), in a final
+    /// sweep one merge of the first files of the partition, as many as a
+    /// merge takes.
+    fn next_small_merges(
         &self,
         table: &CatalogTable,
         partition: &[u8],
         pass: CompactionPass,
         reserved: &HashSet<ObjectPath>,
-    ) -> Result<Option<(Vec<FileRef>, Vec<SmallFile>)>> {
+    ) -> Result<Option<Vec<Vec<FileRef>>>> {
         let Some(files) = table.load_partition_files(partition)? else {
             return Ok(None);
         };
@@ -1153,31 +1154,36 @@ impl MergeSelection {
         if small_file_refs.len() < 2 {
             return Ok(None);
         }
-        let mut small_files: Vec<SmallFile> = small_file_refs
-            .into_iter()
-            .zip(table.read_commit_times_ms(&commit_sequences))
-            .map(|(file, committed_at_ms)| SmallFile {
-                file,
-                committed_at_ms,
-            })
-            .collect();
-        let best_run =
-            self.best_small_file_run(&small_files, &HashSet::new(), crate::vacuum::now_unix_ms());
-        Ok(match pass {
-            CompactionPass::Routine => best_run.map(|run| {
-                let inputs = small_files[run]
-                    .iter()
-                    .map(|small| small.file.clone())
+        let merges: Vec<Vec<FileRef>> = match pass {
+            CompactionPass::Routine => {
+                let small_files: Vec<SmallFile> = small_file_refs
+                    .into_iter()
+                    .zip(table.read_commit_times_ms(&commit_sequences))
+                    .map(|(file, committed_at_ms)| SmallFile {
+                        file,
+                        committed_at_ms,
+                    })
                     .collect();
-                (inputs, small_files)
-            }),
-            CompactionPass::Final => {
-                small_files.truncate(MAX_SMALL_FILES_PER_MERGE);
-                let inputs: Vec<FileRef> =
-                    small_files.into_iter().map(|small| small.file).collect();
-                (inputs.len() >= 2).then_some((inputs, Vec::new()))
+                self.pick_small_file_runs(
+                    &small_files,
+                    crate::vacuum::now_unix_ms(),
+                    MAX_SMALL_FILE_MERGES_PER_COMMIT,
+                )
+                .into_iter()
+                .map(|run| {
+                    small_files[run]
+                        .iter()
+                        .map(|small| small.file.clone())
+                        .collect()
+                })
+                .collect()
             }
-        })
+            CompactionPass::Final => {
+                small_file_refs.truncate(MAX_SMALL_FILES_PER_MERGE);
+                vec![small_file_refs]
+            }
+        };
+        Ok((!merges.is_empty()).then_some(merges))
     }
 
     /// How many times the size of its largest file a run of `total_bytes`
@@ -1206,95 +1212,144 @@ impl MergeSelection {
             + (MIN_BALANCE_RATIO_OF_A_CROWDED_PARTITION - MIN_BALANCE_RATIO) * lowering
     }
 
-    /// The run of neighbours among `files`, the small files of one partition
-    /// in its order, that is cheapest to merge for the files it removes, if
-    /// any run may merge.
+    /// The runs of neighbours among `files`, the small files of one partition
+    /// in its order, that the merges of one commit take, a run each, in the
+    /// order they are picked: at most `max_runs` of them, of no more than
+    /// [`MAX_INPUT_BYTES_OF_MERGES_WRITTEN_TOGETHER`] between them, the
+    /// first whatever it holds. None when no run may merge.
     ///
-    /// Every run of at least two neighbours whose bytes fit one merged file
-    /// is weighed, of at most `MAX_SMALL_FILES_PER_MERGE` files, or of at most
+    /// Each run is the one cheapest to merge for the files it removes, of
+    /// the runs that hold no file of a run picked before it. Every run of at
+    /// least two neighbours whose bytes fit one merged file is weighed, of
+    /// at most `MAX_SMALL_FILES_PER_MERGE` files, or of at most
     /// `MAX_FILES_OF_A_MERGE_OF_FEW_BYTES` that hold no more than
-    /// `MAX_BYTES_OF_A_MERGE_OF_MANY_FILES` bytes. A run may merge
-    /// when it has the configured number of files and is balanced: its bytes
-    /// are enough times those of its largest file, so a large file is not
+    /// `MAX_BYTES_OF_A_MERGE_OF_MANY_FILES` bytes. A run may merge when it
+    /// has the configured number of files and is balanced: its bytes are
+    /// enough times those of its largest file, so a large file is not
     /// rewritten to absorb a few small ones. A partition with many small
     /// files asks for less balance, so it merges sooner, and so does a run
-    /// whose files have all waited ([`find_min_balance_ratio`](Self::find_min_balance_ratio)). Of the runs that may
-    /// merge, the one with the fewest bytes rewritten per file removed is
-    /// taken, and of equals the last in the partition's order. A run that
-    /// would merge to about the size of the file before it counts as cheaper
-    /// than it is. No run holds
-    /// a file of `uncommitted`, files a merge wrote that the table does not
-    /// hold yet.
-    fn best_small_file_run(
+    /// whose files have all waited
+    /// ([`find_min_balance_ratio`](Self::find_min_balance_ratio)). Of the
+    /// runs that may merge, the one with the fewest bytes rewritten per file
+    /// removed is taken, and of equals the last in the partition's order. A
+    /// run that would merge to about the size of the file before it counts
+    /// as cheaper than it is.
+    ///
+    /// The files are gone through once, for the best run that starts at
+    /// each. The best of those is picked, and the runs that start at a file
+    /// are weighed again only when the best of them holds a file a picked
+    /// run took.
+    fn pick_small_file_runs(
         &self,
         files: &[SmallFile],
-        uncommitted: &HashSet<ObjectPath>,
         now_ms: u64,
-    ) -> Option<Range<usize>> {
+        max_runs: usize,
+    ) -> Vec<Range<usize>> {
         let crowding = ((files.len() as f64 - SMALL_FILES_TO_START_LOWERING_BALANCE)
             / (SMALL_FILES_OF_A_CROWDED_PARTITION - SMALL_FILES_TO_START_LOWERING_BALANCE))
             .clamp(0.0, 1.0);
 
-        let mut best: Option<(f64, Range<usize>)> = None;
-        for first in 0..files.len() {
-            if uncommitted.contains(&files[first].file.path) {
+        let mut is_taken = vec![false; files.len()];
+        let mut candidates: BinaryHeap<RunCandidate> = (0..files.len())
+            .filter_map(|first| self.find_best_run_from(files, first, &is_taken, crowding, now_ms))
+            .collect();
+        let mut runs: Vec<Range<usize>> = Vec::new();
+        let mut input_bytes = 0;
+        while runs.len() < max_runs {
+            let Some(candidate) = candidates.pop() else {
+                break;
+            };
+            let run = candidate.first..candidate.end;
+            if is_taken[run.clone()].contains(&true) {
+                // What is left of the runs that start at the file, none when
+                // the file itself was taken.
+                candidates.extend(self.find_best_run_from(
+                    files,
+                    candidate.first,
+                    &is_taken,
+                    crowding,
+                    now_ms,
+                ));
                 continue;
             }
-            let mut total = files[first].file.size;
-            let mut largest = files[first].file.size;
-            let mut youngest_committed_at_ms = files[first].committed_at_ms;
-            for end in first + 2..=files.len() {
-                if uncommitted.contains(&files[end - 1].file.path) {
-                    break;
-                }
-                total += files[end - 1].file.size;
-                largest = largest.max(files[end - 1].file.size);
-                youngest_committed_at_ms =
-                    youngest_committed_at_ms.max(files[end - 1].committed_at_ms);
-                let count = end - first;
-                let has_too_many_files = count > MAX_FILES_OF_A_MERGE_OF_FEW_BYTES
-                    || (count > MAX_SMALL_FILES_PER_MERGE
-                        && total > MAX_BYTES_OF_A_MERGE_OF_MANY_FILES);
-                if has_too_many_files || total > self.merge_target_bytes {
-                    break;
-                }
-                if count < self.min_files {
-                    continue;
-                }
-                let balance_ratio = (total as f64 + FIXED_FILE_COST_BYTES * count as f64)
-                    / (largest as f64 + FIXED_FILE_COST_BYTES);
-                let age_seconds = now_ms.saturating_sub(youngest_committed_at_ms) as f64 / 1000.0;
-                if balance_ratio < self.find_min_balance_ratio(crowding, total, age_seconds) {
-                    continue;
-                }
+            let run_bytes: u64 = files[run.clone()].iter().map(|small| small.file.size).sum();
+            let is_first_run = runs.is_empty();
+            if !is_first_run && input_bytes + run_bytes > MAX_INPUT_BYTES_OF_MERGES_WRITTEN_TOGETHER
+            {
+                break;
+            }
+            input_bytes += run_bytes;
+            is_taken[run.clone()].fill(true);
+            runs.push(run);
+        }
+        runs
+    }
 
-                let mut score =
-                    (total as f64 + FIXED_FILE_COST_BYTES * count as f64) / (count as f64 - 1.9);
-                let merged_size = total as f64 / INPUT_BYTES_PER_MERGED_BYTE;
-                let size_before = match first {
-                    0 => 0.0,
-                    _ => files[first - 1].file.size as f64,
-                };
-                if size_before > merged_size * MIN_SHARE_OF_THE_FILE_BEFORE_A_RUN {
-                    let powers_of_two_apart = (merged_size / size_before).log2().abs();
-                    if powers_of_two_apart < MAX_POWERS_OF_TWO_FROM_THE_FILE_BEFORE {
-                        let closeness =
-                            1.0 - powers_of_two_apart / MAX_POWERS_OF_TWO_FROM_THE_FILE_BEFORE;
-                        score *= 1.0
-                            - (1.0 - BEST_SCORE_FACTOR_OF_A_RUN_MERGING_TO_THE_FILE_BEFORE)
-                                * closeness;
-                    }
-                }
+    /// The run cheapest to merge of those that start at `files[first]` and
+    /// hold no taken file, if any may merge, weighed as
+    /// [`pick_small_file_runs`](Self::pick_small_file_runs) says: of runs as
+    /// cheap, the longest.
+    fn find_best_run_from(
+        &self,
+        files: &[SmallFile],
+        first: usize,
+        is_taken: &[bool],
+        crowding: f64,
+        now_ms: u64,
+    ) -> Option<RunCandidate> {
+        if is_taken[first] {
+            return None;
+        }
+        let mut best: Option<RunCandidate> = None;
+        let mut total = files[first].file.size;
+        let mut largest = files[first].file.size;
+        let mut youngest_committed_at_ms = files[first].committed_at_ms;
+        for end in first + 2..=files.len() {
+            if is_taken[end - 1] {
+                break;
+            }
+            total += files[end - 1].file.size;
+            largest = largest.max(files[end - 1].file.size);
+            youngest_committed_at_ms = youngest_committed_at_ms.max(files[end - 1].committed_at_ms);
+            let count = end - first;
+            let has_too_many_files = count > MAX_FILES_OF_A_MERGE_OF_FEW_BYTES
+                || (count > MAX_SMALL_FILES_PER_MERGE
+                    && total > MAX_BYTES_OF_A_MERGE_OF_MANY_FILES);
+            if has_too_many_files || total > self.merge_target_bytes {
+                break;
+            }
+            if count < self.min_files {
+                continue;
+            }
+            let balance_ratio = (total as f64 + FIXED_FILE_COST_BYTES * count as f64)
+                / (largest as f64 + FIXED_FILE_COST_BYTES);
+            let age_seconds = now_ms.saturating_sub(youngest_committed_at_ms) as f64 / 1000.0;
+            if balance_ratio < self.find_min_balance_ratio(crowding, total, age_seconds) {
+                continue;
+            }
 
-                if best
-                    .as_ref()
-                    .is_none_or(|(best_score, _)| score <= *best_score)
-                {
-                    best = Some((score, first..end));
+            let mut score =
+                (total as f64 + FIXED_FILE_COST_BYTES * count as f64) / (count as f64 - 1.9);
+            let merged_size = total as f64 / INPUT_BYTES_PER_MERGED_BYTE;
+            let size_before = match first {
+                0 => 0.0,
+                _ => files[first - 1].file.size as f64,
+            };
+            if size_before > merged_size * MIN_SHARE_OF_THE_FILE_BEFORE_A_RUN {
+                let powers_of_two_apart = (merged_size / size_before).log2().abs();
+                if powers_of_two_apart < MAX_POWERS_OF_TWO_FROM_THE_FILE_BEFORE {
+                    let closeness =
+                        1.0 - powers_of_two_apart / MAX_POWERS_OF_TWO_FROM_THE_FILE_BEFORE;
+                    score *= 1.0
+                        - (1.0 - BEST_SCORE_FACTOR_OF_A_RUN_MERGING_TO_THE_FILE_BEFORE) * closeness;
                 }
             }
+
+            if best.as_ref().is_none_or(|best| score <= best.score) {
+                best = Some(RunCandidate { score, first, end });
+            }
         }
-        best.map(|(_, run)| run)
+        best
     }
 
     /// The next group of at-least-half-full files of `partition` one merge
@@ -3657,11 +3712,10 @@ mod tests {
             .map(|index| file_of_size(&format!("small-{index:03}"), MIB))
             .collect();
 
-        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(
-            &files,
-            &HashSet::new(),
-            COMMITTED_AT_MS,
-        );
+        let run = small_file_selection(1300 * MIB, 2)
+            .pick_small_file_runs(&files, COMMITTED_AT_MS, 1)
+            .into_iter()
+            .next();
 
         assert_eq!(run, Some(56..120));
     }
@@ -3672,11 +3726,10 @@ mod tests {
         let mut files = vec![file_of_size("outlier", 500 * MIB)];
         files.extend((0..9).map(|index| file_of_size(&format!("small-{index}"), MIB)));
 
-        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(
-            &files,
-            &HashSet::new(),
-            COMMITTED_AT_MS,
-        );
+        let run = small_file_selection(1300 * MIB, 2)
+            .pick_small_file_runs(&files, COMMITTED_AT_MS, 1)
+            .into_iter()
+            .next();
 
         assert_eq!(run, Some(1..10));
     }
@@ -3688,16 +3741,14 @@ mod tests {
             .map(|index| file_of_size(&format!("small-{index}"), MIB))
             .collect();
 
-        let run_of_four = small_file_selection(1300 * MIB, 2).best_small_file_run(
-            &files[..4],
-            &HashSet::new(),
-            COMMITTED_AT_MS,
-        );
-        let run_of_five = small_file_selection(1300 * MIB, 2).best_small_file_run(
-            &files,
-            &HashSet::new(),
-            COMMITTED_AT_MS,
-        );
+        let run_of_four = small_file_selection(1300 * MIB, 2)
+            .pick_small_file_runs(&files[..4], COMMITTED_AT_MS, 1)
+            .into_iter()
+            .next();
+        let run_of_five = small_file_selection(1300 * MIB, 2)
+            .pick_small_file_runs(&files, COMMITTED_AT_MS, 1)
+            .into_iter()
+            .next();
 
         assert_eq!(run_of_four, None);
         assert_eq!(run_of_five, Some(0..5));
@@ -3711,11 +3762,10 @@ mod tests {
             .collect();
         files.extend((0..3).map(|index| file_of_size(&format!("tiny-{index}"), MIB / 4)));
 
-        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(
-            &files,
-            &HashSet::new(),
-            COMMITTED_AT_MS,
-        );
+        let run = small_file_selection(1300 * MIB, 2)
+            .pick_small_file_runs(&files, COMMITTED_AT_MS, 1)
+            .into_iter()
+            .next();
 
         assert_eq!(run, Some(0..7));
     }
@@ -3727,11 +3777,10 @@ mod tests {
             .map(|index| file_of_size(&format!("small-{index:02}"), 200 * MIB))
             .collect();
 
-        let run = small_file_selection(1300 * MIB, 2).best_small_file_run(
-            &files,
-            &HashSet::new(),
-            COMMITTED_AT_MS,
-        );
+        let run = small_file_selection(1300 * MIB, 2)
+            .pick_small_file_runs(&files, COMMITTED_AT_MS, 1)
+            .into_iter()
+            .next();
 
         assert_eq!(run.unwrap().len(), 6);
     }
@@ -3743,16 +3792,14 @@ mod tests {
             .map(|index| file_of_size(&format!("small-{index}"), MIB))
             .collect();
 
-        let allowed = small_file_selection(1300 * MIB, 5).best_small_file_run(
-            &files,
-            &HashSet::new(),
-            COMMITTED_AT_MS,
-        );
-        let waiting = small_file_selection(1300 * MIB, 6).best_small_file_run(
-            &files,
-            &HashSet::new(),
-            COMMITTED_AT_MS,
-        );
+        let allowed = small_file_selection(1300 * MIB, 5)
+            .pick_small_file_runs(&files, COMMITTED_AT_MS, 1)
+            .into_iter()
+            .next();
+        let waiting = small_file_selection(1300 * MIB, 6)
+            .pick_small_file_runs(&files, COMMITTED_AT_MS, 1)
+            .into_iter()
+            .next();
 
         assert_eq!(allowed, Some(0..5));
         assert_eq!(waiting, None);
@@ -3769,12 +3816,82 @@ mod tests {
             .collect();
         let selection = small_file_selection(5120 * MIB, 2);
 
-        let run_when_committed =
-            selection.best_small_file_run(&files, &HashSet::new(), COMMITTED_AT_MS);
-        let run_a_day_later =
-            selection.best_small_file_run(&files, &HashSet::new(), COMMITTED_AT_MS + DAY_MS);
+        let run_when_committed = selection
+            .pick_small_file_runs(&files, COMMITTED_AT_MS, 1)
+            .into_iter()
+            .next();
+        let run_a_day_later = selection
+            .pick_small_file_runs(&files, COMMITTED_AT_MS + DAY_MS, 1)
+            .into_iter()
+            .next();
 
         assert_eq!(run_when_committed, None);
         assert_eq!(run_a_day_later, Some(0..4));
+    }
+
+    #[test]
+    fn the_runs_of_one_commit_are_each_the_best_of_what_the_runs_before_left() {
+        const KIB: u64 = 1024;
+        let files: Vec<_> = (0..250)
+            .map(|index| file_of_size(&format!("small-{index:03}"), 256 * KIB))
+            .collect();
+
+        let runs = small_file_selection(1300 * 1024 * KIB, 2).pick_small_file_runs(
+            &files,
+            COMMITTED_AT_MS,
+            MAX_SMALL_FILE_MERGES_PER_COMMIT,
+        );
+
+        assert_eq!(runs, [150..250, 50..150, 0..50]);
+    }
+
+    #[test]
+    fn a_commit_takes_no_more_runs_than_it_is_asked_for() {
+        const KIB: u64 = 1024;
+        let files: Vec<_> = (0..250)
+            .map(|index| file_of_size(&format!("small-{index:03}"), 256 * KIB))
+            .collect();
+
+        let runs = small_file_selection(1300 * 1024 * KIB, 2).pick_small_file_runs(
+            &files,
+            COMMITTED_AT_MS,
+            2,
+        );
+
+        assert_eq!(runs, [150..250, 50..150]);
+    }
+
+    #[test]
+    fn a_run_that_would_take_a_commits_inputs_past_what_is_written_together_ends_the_picking() {
+        const MIB: u64 = 1024 * 1024;
+        let files: Vec<_> = (0..120)
+            .map(|index| file_of_size(&format!("small-{index:03}"), MIB))
+            .collect();
+
+        let runs = small_file_selection(1300 * MIB, 2).pick_small_file_runs(
+            &files,
+            COMMITTED_AT_MS,
+            MAX_SMALL_FILE_MERGES_PER_COMMIT,
+        );
+
+        assert_eq!(runs, [56..120]);
+    }
+
+    #[test]
+    fn a_run_picked_around_a_large_file_leaves_the_runs_on_either_side_of_it() {
+        const MIB: u64 = 1024 * 1024;
+        let mut files: Vec<_> = (0..8)
+            .map(|index| file_of_size(&format!("before-{index}"), MIB))
+            .collect();
+        files.push(file_of_size("outlier", 400 * MIB));
+        files.extend((0..9).map(|index| file_of_size(&format!("after-{index}"), MIB)));
+
+        let runs = small_file_selection(1300 * MIB, 2).pick_small_file_runs(
+            &files,
+            COMMITTED_AT_MS,
+            MAX_SMALL_FILE_MERGES_PER_COMMIT,
+        );
+
+        assert_eq!(runs, [9..18, 0..8]);
     }
 }
