@@ -523,11 +523,17 @@ impl CompacterActor {
 
     async fn compact_all(&mut self) {
         self.forget_dropped_tables();
-        for (name, table) in self.datastore.tables() {
-            match self
-                .compact_table(&name, table.id(), CompactionPass::Routine)
-                .await
-            {
+        // Only the names and identities are kept: a copy of a table held
+        // across its round keeps every file the round's commits remove in the
+        // caches.
+        let tables: Vec<(SchemaQualifiedTableName, Uuid)> = self
+            .datastore
+            .tables()
+            .into_iter()
+            .map(|(name, table)| (name, table.id()))
+            .collect();
+        for (name, id) in tables {
+            match self.compact_table(&name, id, CompactionPass::Routine).await {
                 Ok(round) => debug!(
                     table = %name,
                     partitions = round.examined.len(),
@@ -590,8 +596,13 @@ impl CompacterActor {
             .table_states
             .get(&id)
             .and_then(|state| state.examined_through_commit);
-        let table = self.refresh_published_table(id)?;
-        let listed = list_round_partitions(&table, pass, examined_through_commit).await?;
+        let listed = {
+            // The copy is let go of once the partitions are listed: a version
+            // held for the round's length keeps every file the round's commits
+            // remove in the caches.
+            let table = self.refresh_published_table(id)?;
+            list_round_partitions(&table, pass, examined_through_commit).await?
+        };
         self.forget_partitions_not_among(id, &listed);
         let mut listed_at = listed.commit_position;
         let mut progress = RoundProgress {
