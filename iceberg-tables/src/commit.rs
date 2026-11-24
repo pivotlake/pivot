@@ -24,7 +24,7 @@ use iceberg::ErrorKind;
 use iceberg::Runtime;
 use iceberg::spec::{DataFile, FormatVersion, TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table as SpecTable;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::transaction::{ApplyTransactionAction, RewriteFilesAction, Transaction};
 use planner::catalog::{Column, SchemaQualifiedTableName};
 use uuid::Uuid;
 
@@ -110,6 +110,44 @@ impl TableCreation<'_> {
     }
 }
 
+/// The manifests of a replace, written ahead of its commit
+/// ([`Table::prepare_rewrite`]).
+pub struct PreparedRewrite(iceberg::transaction::PreparedRewrite);
+
+/// The files one commit removes and adds, as the spec crate names them.
+struct CommitFiles {
+    /// Each file to remove, with the manifest that lists it when the entry
+    /// says which.
+    removed: Vec<(DataFile, Option<Arc<str>>)>,
+    added: Vec<DataFile>,
+    /// The URIs of the files to remove.
+    removed_uris: Vec<String>,
+}
+
+impl CommitFiles {
+    /// The replace of the removed files by the added ones, as an action of
+    /// `transaction`.
+    fn build_rewrite(self, transaction: &Transaction) -> RewriteFilesAction {
+        let mut rewrite = transaction
+            .rewrite_files()
+            .with_check_duplicate(false)
+            .with_manifest_merge(true);
+        // A file's entry is read from the manifest that lists it, so the
+        // rewrite reads as many manifests as its files are listed in, not
+        // every manifest of the table.
+        for (file, manifest_path) in self.removed {
+            rewrite = match manifest_path {
+                Some(manifest_path) => rewrite.delete_file_listed_in(file, manifest_path.as_ref()),
+                None => rewrite.delete_file(file),
+            };
+        }
+        for file in self.added {
+            rewrite = rewrite.add_file(file);
+        }
+        rewrite
+    }
+}
+
 impl Table {
     /// Create the table at `location`: make its first version current
     /// through `metadata_store`, holding the adopted files as the first
@@ -175,6 +213,53 @@ impl Table {
         removed: &[DataFileEntry],
         added: Vec<DataFileEntry>,
     ) -> Result<Option<Table>> {
+        self.commit_files(self.name_commit_files(removed, &added)?, None)
+    }
+
+    /// [`commit`](Self::commit) a replace whose manifests `prepared` holds,
+    /// written ahead on top of an earlier version of the table
+    /// ([`prepare_rewrite`](Self::prepare_rewrite)) for the same `removed`
+    /// and `added`. The commit lists them as they are when this version
+    /// still lists every manifest they took the place of, and then reads and
+    /// writes the manifest list alone; otherwise it writes the version's
+    /// manifests itself, as [`commit`](Self::commit) does.
+    pub fn commit_prepared(
+        &self,
+        removed: &[DataFileEntry],
+        added: Vec<DataFileEntry>,
+        prepared: PreparedRewrite,
+    ) -> Result<Option<Table>> {
+        self.commit_files(self.name_commit_files(removed, &added)?, Some(prepared))
+    }
+
+    /// Write, on top of this version, the manifests of the version that
+    /// replaces `removed` (entries of this version) with `added`, ahead of
+    /// its commit. Reading the manifests that list the removed files and
+    /// writing them again without those files is most of what a replace
+    /// does, and what it does here it does not do in
+    /// [`commit_prepared`](Self::commit_prepared), which a writer makes in
+    /// its turn while the table's other writers wait.
+    pub fn prepare_rewrite(
+        &self,
+        removed: &[DataFileEntry],
+        added: &[DataFileEntry],
+    ) -> Result<PreparedRewrite> {
+        let files = self.name_commit_files(removed, added)?;
+        block_on(async {
+            let base = self.build_spec_table()?;
+            let rewrite = files.build_rewrite(&Transaction::new(&base));
+            let prepared = rewrite.prepare(&base).await.map_err(Error::spec)?;
+            Ok(PreparedRewrite(prepared))
+        })
+    }
+
+    /// The files a commit on top of this version removes and adds, as the
+    /// spec crate names them. A commit this version cannot take is refused.
+    fn name_commit_files(
+        &self,
+        removed: &[DataFileEntry],
+        added: &[DataFileEntry],
+    ) -> Result<CommitFiles> {
         // An append lists the delete manifests as they are. A replace is
         // refused: compacting a table that carries deletion vectors is not
         // supported yet (https://github.com/pivotlake/pivot/issues/95).
@@ -226,43 +311,44 @@ impl Table {
                 .map(|entry| entry.create_data_file(self.metadata(), self.location()))
                 .collect()
         };
-        let removed: Vec<(DataFile, Option<Arc<str>>)> = to_data_files(removed)?
-            .into_iter()
-            .zip(removed.iter().map(|entry| entry.manifest_path.clone()))
-            .collect();
-        let added = to_data_files(&added)?;
+        Ok(CommitFiles {
+            removed: to_data_files(removed)?
+                .into_iter()
+                .zip(removed.iter().map(|entry| entry.manifest_path.clone()))
+                .collect(),
+            added: to_data_files(added)?,
+            removed_uris,
+        })
+    }
+
+    /// Commit the removal and the addition of `files` on top of this
+    /// version, a replace with the manifests `prepared` holds when it holds
+    /// them.
+    fn commit_files(
+        &self,
+        files: CommitFiles,
+        prepared: Option<PreparedRewrite>,
+    ) -> Result<Option<Table>> {
+        let removed_uris = files.removed_uris.clone();
         let committed = self.commit_transaction(Vec::new(), move |transaction| {
             // The files were just written under fresh names, so none is in
             // the table already; the check for one would read every manifest.
             // Small manifests are merged as they pile up, so the table's
             // manifests grow with its files and not with its commits.
-            if removed.is_empty() {
+            if files.removed.is_empty() {
                 return transaction
                     .fast_append()
                     .with_check_duplicate(false)
                     .with_manifest_merge(true)
-                    .add_data_files(added)
+                    .add_data_files(files.added)
                     .apply(transaction);
             }
-            let mut rewrite = transaction
-                .rewrite_files()
-                .with_check_duplicate(false)
-                .with_manifest_merge(true);
-            // A file's entry is read from the manifest that lists it, so
-            // the rewrite reads as many manifests as its files are listed
-            // in, not every manifest of the table.
-            for (file, manifest_path) in removed {
-                rewrite = match manifest_path {
-                    Some(manifest_path) => {
-                        rewrite.delete_file_listed_in(file, manifest_path.as_ref())
-                    }
-                    None => rewrite.delete_file(file),
-                };
+            let rewrite = files.build_rewrite(&transaction);
+            match prepared {
+                Some(PreparedRewrite(prepared)) => rewrite.with_prepared(prepared),
+                None => rewrite,
             }
-            for file in added {
-                rewrite = rewrite.add_file(file);
-            }
-            rewrite.apply(transaction)
+            .apply(transaction)
         })?;
         // No later version lists a file this commit removed, so its footer
         // is let go of once nothing holds this version or an earlier one.
@@ -272,12 +358,6 @@ impl Table {
         Ok(committed)
     }
 
-    /// Whether a snapshot or a previous metadata file of this version has
-    /// outlived the table's retention window as of `now_ms`: whether
-    /// [`expire_snapshots`](Self::expire_snapshots) has anything to commit.
-    /// Read from the metadata held, with nothing read from the store. A
-    /// table whose history is not linear is refused
-    /// ([`Error::NonLinearHistory`]).
     pub fn has_expired_history(&self, now_ms: i64) -> Result<bool> {
         Ok(!self.expired_snapshot_ids(now_ms)?.is_empty()
             || !self.expired_metadata_files(now_ms)?.is_empty())
@@ -324,6 +404,25 @@ impl Table {
         Ok(Some(SnapshotExpiry { table, expired }))
     }
 
+    /// This version as the spec crate's table, for a transaction to commit
+    /// on top of. Built inside the runtime its reads and writes run on.
+    fn build_spec_table(&self) -> Result<SpecTable> {
+        let base = SpecTable::builder()
+            .metadata(Arc::clone(self.metadata()))
+            .identifier(build_table_ident(self.name()))
+            .file_io(self.location().build_file_io())
+            // A commit reads the manifests it rewrites once.
+            .disable_cache();
+        // A table being created has no published document to succeed.
+        let base = match self.metadata_location() {
+            "" => base,
+            location => base.metadata_location(location),
+        };
+        base.runtime(Runtime::try_current().map_err(Error::spec)?)
+            .build()
+            .map_err(Error::spec)
+    }
+
     /// Commit the transaction `build_transaction` builds on this version
     /// through the table's metadata store, the new version's metadata log
     /// dropping `expired_metadata_files`. `Ok(None)` when another writer
@@ -354,23 +453,8 @@ impl Table {
         expired_metadata_files: Vec<String>,
         build_transaction: impl FnOnce(Transaction) -> iceberg::Result<Transaction>,
     ) -> Result<Option<Table>> {
-        let file_io = self.location().build_file_io();
-        let base = SpecTable::builder()
-            .metadata(Arc::clone(self.metadata()))
-            .identifier(build_table_ident(self.name()))
-            .file_io(file_io)
-            // A commit reads the manifests it rewrites once.
-            .disable_cache();
-        // A table being created has no published document to succeed.
-        let base = match self.metadata_location() {
-            "" => base,
-            location => base.metadata_location(location),
-        };
         let committed = block_on(async {
-            let base = base
-                .runtime(Runtime::try_current().map_err(Error::spec)?)
-                .build()
-                .map_err(Error::spec)?;
+            let base = self.build_spec_table()?;
             let transaction = build_transaction(Transaction::new(&base)).map_err(Error::spec)?;
             let catalog = CommitCatalog {
                 metadata_store: Arc::clone(self.metadata_store()),

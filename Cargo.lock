@@ -2897,7 +2897,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#9a6a05af7519609519b6d9487fd42742377bc519"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2Fsingle-pass-rewrite-prepared-outside-commit#0fd80a115c5580c6ce35572448e1d276c6f440de"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2956,7 +2956,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#9a6a05af7519609519b6d9487fd42742377bc519"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2Fsingle-pass-rewrite-prepared-outside-commit#0fd80a115c5580c6ce35572448e1d276c6f440de"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2976,7 +2976,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#9a6a05af7519609519b6d9487fd42742377bc519"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2Fsingle-pass-rewrite-prepared-outside-commit#0fd80a115c5580c6ce35572448e1d276c6f440de"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2986,7 +2986,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2F0.11.x-delete-vector#9a6a05af7519609519b6d9487fd42742377bc519"
+source = "git+https://github.com/pivotlake/iceberg-rust?branch=pivot%2Fsingle-pass-rewrite-prepared-outside-commit#0fd80a115c5580c6ce35572448e1d276c6f440de"
 dependencies = [
  "anyhow",
  "async-trait",

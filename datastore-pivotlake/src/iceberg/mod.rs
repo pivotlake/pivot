@@ -47,7 +47,9 @@ use uuid::Uuid;
 use crate::file_entry::{FileEntry, constant_partition};
 use crate::iceberg::directory_metadata_store::{DirectoryMetadataStore, metadata_location_version};
 use crate::table::{TableFile, TableStorage};
-use crate::table_format::{RemovedFiles, SnapshotExpiry, Table, TableFactory, VisitPartition};
+use crate::table_format::{
+    PreparedCommit, RemovedFiles, SnapshotExpiry, Table, TableFactory, VisitPartition,
+};
 
 pub(crate) use iceberg_tables::{Error, Result};
 
@@ -225,6 +227,28 @@ impl IcebergTable {
             table,
             snapshot_times: OnceLock::new(),
         }
+    }
+
+    /// The entries of the files `removed` names, which are live in this
+    /// version.
+    fn find_removed_entries(&self, removed: RemovedFiles<'_>) -> Result<Vec<DataFileEntry>> {
+        removed
+            .paths
+            .iter()
+            .map(|path| {
+                Ok(self
+                    .table
+                    .find_entry(removed.partition, path)?
+                    .expect("a file to remove is live in the version it is removed from"))
+            })
+            .collect()
+    }
+
+    fn build_uncommitted_entries(&self, files: &[TableFile]) -> Vec<DataFileEntry> {
+        files
+            .iter()
+            .map(|file| self.build_uncommitted_entry(file))
+            .collect()
     }
 
     /// The entry a commit records for `file`, which a writer just uploaded:
@@ -527,27 +551,41 @@ impl Table for IcebergTable {
         removed: RemovedFiles<'_>,
         added: &[TableFile],
         _data_change: bool,
+        prepared: Option<PreparedCommit>,
     ) -> crate::Result<Option<Arc<dyn Table>>> {
         // An Iceberg snapshot says what a commit did by its shape: an append
         // when it removes nothing, else a replace, which changes no row.
-        let removed_entries = removed
-            .paths
-            .iter()
-            .map(|path| {
-                Ok(self
-                    .table
-                    .find_entry(removed.partition, path)?
-                    .expect("a file to remove is live in the version it is removed from"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let added_entries: Vec<DataFileEntry> = added
-            .iter()
-            .map(|file| self.build_uncommitted_entry(file))
-            .collect();
-        let Some(next) = self.table.commit(&removed_entries, added_entries)? else {
+        let removed_entries = self.find_removed_entries(removed)?;
+        let added_entries = self.build_uncommitted_entries(added);
+        let committed = match prepared {
+            Some(PreparedCommit(prepared)) => {
+                self.table
+                    .commit_prepared(&removed_entries, added_entries, prepared)?
+            }
+            None => self.table.commit(&removed_entries, added_entries)?,
+        };
+        let Some(next) = committed else {
             return Ok(None);
         };
         Ok(Some(Arc::new(self.advanced_to(next))))
+    }
+
+    /// A replace has the manifests of its version written ahead: reading the
+    /// manifests that list the files it removes and writing them again is
+    /// most of its commit. An append has nothing written ahead.
+    fn prepare_commit(
+        &self,
+        removed: RemovedFiles<'_>,
+        added: &[TableFile],
+    ) -> crate::Result<Option<PreparedCommit>> {
+        if removed.paths.is_empty() {
+            return Ok(None);
+        }
+        let prepared = self.table.prepare_rewrite(
+            &self.find_removed_entries(removed)?,
+            &self.build_uncommitted_entries(added),
+        )?;
+        Ok(Some(PreparedCommit(prepared)))
     }
 
     /// The table's own retention property, or the default.

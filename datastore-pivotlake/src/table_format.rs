@@ -148,6 +148,10 @@ pub(crate) trait TableFactory: Send + Sync {
     fn forget_cached_table(&self, directory: &ObjectPath) -> Result<()>;
 }
 
+/// What a version of a table wrote ahead of a commit
+/// ([`Table::prepare_commit`]).
+pub(crate) struct PreparedCommit(pub(crate) iceberg_tables::PreparedRewrite);
+
 /// One table at one committed version, as its format holds it. Immutable: a
 /// refresh or a commit hands back the next version as a new value, so a
 /// copy handed to a query never changes under it.
@@ -263,6 +267,9 @@ pub(crate) trait Table: Send + Sync {
     /// footers the writer holds, as one new version. `data_change` is
     /// `false` for a rearrangement (compaction) that leaves the table's rows
     /// as they were.
+    /// `prepared` is what an earlier version of the table wrote ahead for
+    /// this commit ([`prepare_commit`](Self::prepare_commit)); a version it
+    /// no longer stands on commits without it.
     /// `None` means another writer committed a version first: the caller
     /// refreshes and retries.
     fn commit(
@@ -270,7 +277,18 @@ pub(crate) trait Table: Send + Sync {
         removed: RemovedFiles<'_>,
         added: &[TableFile],
         data_change: bool,
+        prepared: Option<PreparedCommit>,
     ) -> Result<Option<Arc<dyn Table>>>;
+    /// Do now, on top of this version, what the commit that removes
+    /// `removed` and adds `added` can have done ahead of it, so that the
+    /// commit itself, which a writer makes while the table's other writers
+    /// wait, is left with less. `None` for a commit this format does
+    /// nothing ahead of.
+    fn prepare_commit(
+        &self,
+        removed: RemovedFiles<'_>,
+        added: &[TableFile],
+    ) -> Result<Option<PreparedCommit>>;
     /// How long a file this table no longer references is kept before it may
     /// be deleted.
     fn deleted_file_retention(&self) -> Result<Duration>;

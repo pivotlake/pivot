@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::Error;
 use crate::file_entry::FileEntry;
-use crate::table_format::{RemovedFiles, Table, VisitPartition};
+use crate::table_format::{PreparedCommit, RemovedFiles, Table, VisitPartition};
 use catalog::datastore::DatastoreTableMetadata;
 use crossbeam_deque::{Injector, Steal};
 use dispatch::DataFlowDispatcher;
@@ -138,12 +138,22 @@ impl TableStorage {
 /// writes nothing itself. So the store is asked for one version per group of
 /// waiting inserts, however many writers wait, and a rewrite waits behind at
 /// most the commits queued before it.
+///
+/// A rewrite does what it can of its commit before it queues
+/// ([`CatalogTable::prepare_commit`]), on the version the table has then, so
+/// the writers behind it in the queue wait for less. What it prepared stands
+/// only while the table keeps what it replaced, which another rewrite
+/// committing in between would take away, so rewrites prepare and commit one
+/// after the other ([`take_rewrite_turn`](Self::take_rewrite_turn)), and
+/// inserts commit in between as they come.
 #[derive(Default)]
 pub(super) struct CommitQueue {
     state: Mutex<CommitQueueState>,
     /// Signalled when a version has been written and when the turn is given
     /// up: what a waiting writer waits for.
     changed: Condvar,
+    /// Held by the one rewrite that is preparing or committing.
+    rewrite_turn: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -160,6 +170,8 @@ struct QueuedCommit {
     removed_paths: Vec<ObjectPath>,
     added: Vec<TableFile>,
     data_change: bool,
+    /// What the writer had the table write ahead of the commit.
+    prepared: Option<PreparedCommit>,
     outcome: Arc<CommitOutcome>,
 }
 
@@ -204,6 +216,7 @@ impl CommitTurn<'_> {
             removed_paths: first.removed_paths,
             added: first.added,
             data_change: first.data_change,
+            prepared: first.prepared,
             outcomes: vec![first.outcome],
         };
         if !group.removed_paths.is_empty() || !group.data_change {
@@ -249,6 +262,9 @@ pub(super) struct CommitGroup {
     removed_paths: Vec<ObjectPath>,
     added: Vec<TableFile>,
     data_change: bool,
+    /// What the writer of a group of one commit had the table write ahead
+    /// of it.
+    prepared: Option<PreparedCommit>,
     /// The outcome of each commit of the group, until it is recorded.
     outcomes: Vec<Arc<CommitOutcome>>,
 }
@@ -260,7 +276,12 @@ impl CommitGroup {
             partition: &self.removed_partition,
             paths: &self.removed_paths,
         };
-        table.commit_files(removed, std::mem::take(&mut self.added), self.data_change)
+        table.commit_files(
+            removed,
+            std::mem::take(&mut self.added),
+            self.data_change,
+            self.prepared.take(),
+        )
     }
 
     /// Record how the group's commit went for every writer of it. The only
@@ -301,6 +322,7 @@ impl CommitQueue {
         removed: RemovedFiles<'_>,
         added: Vec<TableFile>,
         data_change: bool,
+        prepared: Option<PreparedCommit>,
     ) -> Arc<CommitOutcome> {
         let outcome = Arc::new(CommitOutcome::default());
         self.state.lock().unwrap().waiting.push_back(QueuedCommit {
@@ -308,9 +330,16 @@ impl CommitQueue {
             removed_paths: removed.paths.to_vec(),
             added,
             data_change,
+            prepared,
             outcome: Arc::clone(&outcome),
         });
         outcome
+    }
+
+    /// Wait for the turn to prepare and commit a rewrite and take it, until
+    /// the guard is dropped.
+    pub(super) fn take_rewrite_turn(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.rewrite_turn.lock().unwrap()
     }
 
     /// Wait until the queued commit with `outcome` has been made, or until
@@ -424,10 +453,16 @@ impl CatalogTable {
         removed: RemovedFiles<'_>,
         added: Vec<TableFile>,
         data_change: bool,
+        mut prepared: Option<PreparedCommit>,
     ) -> crate::Result<()> {
         loop {
             self.check_files_are_live(removed)?;
-            match self.table.commit(removed, &added, data_change) {
+            // What was prepared goes to the first attempt, which deletes
+            // what it wrote of it when it does not commit.
+            match self
+                .table
+                .commit(removed, &added, data_change, prepared.take())
+            {
                 Ok(Some(table)) => {
                     self.table = table;
                     return Ok(());
@@ -450,6 +485,20 @@ impl CatalogTable {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Have this version do ahead of the commit that removes `removed` and
+    /// adds `added` what its format can, for
+    /// [`commit_files`](Self::commit_files) to be handed: `None` when that
+    /// is nothing. Refused like the commit when this version no longer
+    /// holds a file to remove.
+    pub(crate) fn prepare_commit(
+        &self,
+        removed: RemovedFiles<'_>,
+        added: &[TableFile],
+    ) -> crate::Result<Option<PreparedCommit>> {
+        self.check_files_are_live(removed)?;
+        self.table.prepare_commit(removed, added)
     }
 
     /// [`Error::CommitConflict`] naming the first of `files` this version no
@@ -505,7 +554,7 @@ impl CatalogTable {
             partition: &removed_partition,
             paths: removed,
         };
-        self.commit_files(removed, added, data_change)
+        self.commit_files(removed, added, data_change, None)
     }
 
     /// Read the footers of `entries`, files under this table's location that

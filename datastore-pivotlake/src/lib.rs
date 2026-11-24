@@ -750,7 +750,20 @@ impl PivotlakeDatastore {
             .get_table_by_id(&id)
             .ok_or_else(|| Error::TableNotFound(id.to_string()))?
             .commit_queue();
-        let outcome = commit_queue.enqueue(removed, added, data_change);
+        // A rewrite has the table write ahead what it can of the commit, on
+        // the version published now, before it queues: the writers queued
+        // behind it then wait for less. It keeps the rewrite turn until its
+        // commit is made, so no other rewrite takes away what it prepared
+        // on.
+        let _rewrite_turn = (!removed.paths.is_empty()).then(|| commit_queue.take_rewrite_turn());
+        let prepared = match removed.paths.is_empty() {
+            true => None,
+            false => self
+                .table_handle_by_id(&id)
+                .ok_or_else(|| Error::TableNotFound(id.to_string()))?
+                .prepare_commit(removed, &added)?,
+        };
+        let outcome = commit_queue.enqueue(removed, added, data_change, prepared);
         let turn = match commit_queue.wait_to_commit(&outcome) {
             table::CommitWait::Committed(committed) => return committed,
             table::CommitWait::Turn(turn) => turn,

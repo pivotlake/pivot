@@ -53,6 +53,7 @@ pub mod table;
 pub mod test_support;
 pub mod types;
 
+pub use commit::PreparedRewrite;
 pub use error::{Error, Result};
 pub use files::file_index::{IndexedFile, Partition, PartitionIndex};
 pub use files::manifests::ManifestList;

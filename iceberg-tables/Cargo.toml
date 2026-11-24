@@ -47,7 +47,7 @@ uuid = { version = "1", features = ["v4"] }
 # asked, keeping a branch's retention and a snapshot's place in time across
 # commits, and letting a catalog name the metadata log entries a commit
 # drops, until a release carries them.
-iceberg = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
+iceberg = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/single-pass-rewrite-prepared-outside-commit" }
 # A partition's files with the manifests that list them are persistent maps:
 # the next version's share every node a commit did not touch.
 imbl = { workspace = true }

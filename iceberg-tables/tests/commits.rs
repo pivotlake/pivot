@@ -26,7 +26,7 @@ use planner::types::Type;
 use support::{
     append, avro_objects, columns, count_manifests, create_table, create_table_laid_out_by, entry,
     int_scalar, live_entry, load, load_over_faulty_store, partition_entry, paths, paths_in_order,
-    repartition, version,
+    repartition, replace, version,
 };
 
 /// What a version's manifests record of one live file, with what a
@@ -461,4 +461,57 @@ fn a_table_without_a_metadata_location_is_refused_under_its_identifier() {
         refused,
         Err(Error::TableMetadataMissing { table }) if table == "db.t"
     ));
+}
+
+#[test]
+fn a_replace_prepared_ahead_writes_only_a_manifest_list_when_it_commits() {
+    let (fixture, created) = create_table(&[]);
+    let table = append(
+        &created,
+        vec![entry("a", 10, 1, 10), entry("b", 10, 11, 20)],
+    );
+    let prepared = table
+        .prepare_rewrite(&[live_entry(&table, "a.parquet")], &[entry("d", 10, 1, 10)])
+        .unwrap();
+    let table = append(&table, vec![entry("c", 10, 21, 30)]);
+    let objects_before = avro_objects(&fixture.location);
+
+    table
+        .commit_prepared(
+            &[live_entry(&table, "a.parquet")],
+            vec![entry("d", 10, 1, 10)],
+            prepared,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        paths(&load(&fixture)),
+        ["b.parquet", "c.parquet", "d.parquet"]
+    );
+    assert_eq!(avro_objects(&fixture.location), objects_before + 1);
+}
+
+#[test]
+fn a_replace_prepared_ahead_commits_after_another_replace_rewrote_its_manifest() {
+    let (fixture, created) = create_table(&[]);
+    let table = append(
+        &created,
+        vec![entry("a", 10, 1, 10), entry("b", 10, 11, 20)],
+    );
+    let prepared = table
+        .prepare_rewrite(&[live_entry(&table, "a.parquet")], &[entry("d", 10, 1, 10)])
+        .unwrap();
+    let table = replace(&table, &["b.parquet"], "c");
+
+    table
+        .commit_prepared(
+            &[live_entry(&table, "a.parquet")],
+            vec![entry("d", 10, 1, 10)],
+            prepared,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(paths(&load(&fixture)), ["c.parquet", "d.parquet"]);
 }

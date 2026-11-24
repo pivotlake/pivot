@@ -37,8 +37,8 @@ serde = { workspace = true }
 # asked, keeping a branch's retention and a snapshot's place in time across
 # commits, and letting a catalog name the metadata log entries a commit
 # drops, until a release carries them.
-iceberg = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
-iceberg-catalog-rest = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
+iceberg = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/single-pass-rewrite-prepared-outside-commit" }
+iceberg-catalog-rest = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/single-pass-rewrite-prepared-outside-commit" }
 # The Iceberg table model, store and column plumbing shared with the pivotlake
 # datastore.
 iceberg-tables = { workspace = true }
@@ -66,7 +66,7 @@ datastore-iceberg = { path = ".", features = ["test-support"] }
 # in Docker, backed by the MinIO the object-storage harness starts, and write
 # tables into it through the iceberg crate's own writer and S3 storage.
 object-storage = { workspace = true, features = ["test-support"] }
-iceberg-storage-opendal = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector", default-features = false, features = ["opendal-s3"] }
+iceberg-storage-opendal = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/single-pass-rewrite-prepared-outside-commit", default-features = false, features = ["opendal-s3"] }
 tracing-subscriber = { workspace = true }
 testcontainers = { version = "0.24", features = ["blocking"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }

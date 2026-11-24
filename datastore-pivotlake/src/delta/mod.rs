@@ -65,7 +65,9 @@ use self::file_record::{DeltaFile, DeltaFilesByPath, DeltaIndex, RecordBuilder};
 use self::log::TableShape;
 use crate::file_entry::{ColumnStatFilter, FileEntry, PartitionEqFilter, constant_partition};
 use crate::table::{TableFile, TableStorage};
-use crate::table_format::{RemovedFiles, SnapshotExpiry, Table, TableFactory, VisitPartition};
+use crate::table_format::{
+    PreparedCommit, RemovedFiles, SnapshotExpiry, Table, TableFactory, VisitPartition,
+};
 use crate::{Error, Result};
 
 /// What creates and loads the Delta tables of one database, which every
@@ -693,6 +695,15 @@ impl Table for DeltaTable {
         Ok(Some(Arc::new(refreshed)))
     }
 
+    /// A commit writes one log entry, and nothing ahead of it.
+    fn prepare_commit(
+        &self,
+        _removed: RemovedFiles<'_>,
+        _added: &[TableFile],
+    ) -> Result<Option<PreparedCommit>> {
+        Ok(None)
+    }
+
     /// The next version is this one's files less those removed, with those
     /// added standing after every file of this version, in the order given:
     /// the log is written and not read.
@@ -701,6 +712,7 @@ impl Table for DeltaTable {
         removed: RemovedFiles<'_>,
         added: &[TableFile],
         data_change: bool,
+        _prepared: Option<PreparedCommit>,
     ) -> Result<Option<Arc<dyn Table>>> {
         let now_ms = crate::vacuum::now_unix_ms();
         let removed_index = self.files.find_partition(removed.partition);
