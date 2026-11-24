@@ -170,6 +170,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_storage::{FileRef, ObjectPath};
+use parquet_engine::PartitionValues;
 use parquet_engine::file_entry::FileEntry;
 use planner::catalog::SchemaQualifiedTableName;
 use tokio::sync::{mpsc, oneshot};
@@ -897,6 +898,9 @@ struct MergeBatch {
     selected_at_version: u64,
     /// The copy of the table the inputs were selected from.
     table: CatalogTable,
+    /// The partition tuple the table records for the inputs, which the
+    /// outputs take.
+    output_partition: Option<PartitionValues>,
 }
 
 /// A run of small files one merge may take, as the picking of a commit's
@@ -961,20 +965,25 @@ impl WrittenMerges {
 }
 
 impl MergeBatch {
-    /// The merges of one commit, selected from `table`.
+    /// The merges of one commit, selected from `table`: the inputs of each
+    /// are looked up once here, in the version they were selected from, for
+    /// the tuple their outputs take.
     fn new(
         table: &CatalogTable,
         partition: Vec<u8>,
         merges: Vec<Vec<FileRef>>,
         kind: MergeKind,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let inputs: Vec<FileRef> = merges.iter().flatten().cloned().collect();
+        let output_partition = table.find_merged_partition(&partition, &inputs)?;
+        Ok(Self {
             partition,
             merges,
             kind,
             selected_at_version: table.version(),
             table: table.clone(),
-        }
+            output_partition,
+        })
     }
 
     /// Write the merges at the same time, each a merge of its own. Nothing
@@ -987,10 +996,10 @@ impl MergeBatch {
         name: &SchemaQualifiedTableName,
     ) -> WrittenMerges {
         let MergeBatch {
-            partition,
             merges,
             kind,
             table,
+            output_partition,
             ..
         } = self;
 
@@ -1004,8 +1013,8 @@ impl MergeBatch {
                 .map(|inputs| {
                     scope.spawn(|| {
                         let _in_runtime = runtime.as_ref().map(|runtime| runtime.enter());
-                        table.merge_files(
-                            &partition,
+                        table.write_merged_files(
+                            output_partition.clone(),
                             inputs,
                             ROW_GROUP_ROWS,
                             selection.target_bytes,
@@ -1100,14 +1109,14 @@ impl MergeSelection {
             table.index_partitions(partitions)?;
             for partition in partitions.iter().cloned() {
                 if let Some(merges) = self.next_small_merges(table, &partition, pass, reserved)? {
-                    let batch = MergeBatch::new(table, partition, merges, MergeKind::SmallFiles);
+                    let batch = MergeBatch::new(table, partition, merges, MergeKind::SmallFiles)?;
                     return Ok(Some(batch));
                 }
                 let group =
                     self.next_layout_optimization(overlaps, table, &partition, reserved, pass)?;
                 if let Some(inputs) = group {
                     let kind = MergeKind::LayoutOptimization;
-                    return Ok(Some(MergeBatch::new(table, partition, vec![inputs], kind)));
+                    return Ok(Some(MergeBatch::new(table, partition, vec![inputs], kind)?));
                 }
                 if progress.merging.contains(&partition) {
                     continue;

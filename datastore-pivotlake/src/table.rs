@@ -16,7 +16,7 @@ use dispatch::DataFlowDispatcher;
 use iceberg_tables::maintenance::expired_objects::ExpiredSnapshots;
 use object_storage::{FileRef, ObjectPath, ObjectStore};
 use parquet_engine::writing::upload::UploadedFiles;
-use parquet_engine::{ParquetTable, RowGroupMetadata, ScanSelection};
+use parquet_engine::{ParquetTable, PartitionValues, RowGroupMetadata, ScanSelection};
 use planner::catalog::{Column, SchemaQualifiedTableName};
 use planner::expression::Expression;
 use table_file_index::PartitionFiles;
@@ -894,6 +894,27 @@ impl CatalogTable {
         target_rows_per_group: usize,
         max_output_file_size: u64,
     ) -> crate::Result<Vec<TableFile>> {
+        let output_partition = self.find_merged_partition(partition, inputs)?;
+        self.write_merged_files(
+            output_partition,
+            inputs,
+            target_rows_per_group,
+            max_output_file_size,
+        )
+    }
+
+    /// The partition tuple the table records for `inputs`, files of
+    /// `partition` (as a walk names it) that one merge or several rewrite:
+    /// the tuple the outputs take, which hold the inputs' rows and no
+    /// other. The inputs are looked up here, once for every merge that
+    /// rewrites some of them: one this copy no longer lists is a commit
+    /// conflict, and a partition whose files the table's format does not
+    /// rewrite is refused.
+    pub(crate) fn find_merged_partition(
+        &self,
+        partition: &[u8],
+        inputs: &[FileRef],
+    ) -> crate::Result<Option<PartitionValues>> {
         let rewritable = self.select_rewritable_partitions(vec![partition.to_vec()])?;
         if rewritable.is_empty() {
             return Err(Error::PartitionNotRewritable {
@@ -906,6 +927,25 @@ impl CatalogTable {
             .zip(self.table.find_file_entries(partition, &input_paths)?)
             .map(|(path, entry)| entry.ok_or_else(|| self.conflict_at(path)))
             .collect::<crate::Result<Vec<FileEntry>>>()?;
+        // The selector guarantees that all inputs share one partition, whose
+        // tuple the table records for each of them.
+        Ok(input_entries
+            .first()
+            .and_then(|first| first.partition.clone()))
+    }
+
+    /// Re-encode the rows of `inputs` into fresh target-sized files, as
+    /// [`merge_files`](Self::merge_files) does, with nothing looked up: the
+    /// inputs are files this copy lists in the partition whose tuple is
+    /// `output_partition`
+    /// ([`find_merged_partition`](Self::find_merged_partition)).
+    pub(crate) fn write_merged_files(
+        &self,
+        output_partition: Option<PartitionValues>,
+        inputs: &[FileRef],
+        target_rows_per_group: usize,
+        max_output_file_size: u64,
+    ) -> crate::Result<Vec<TableFile>> {
         let row_groups = self
             .table
             .row_groups(inputs)?
@@ -916,12 +956,6 @@ impl CatalogTable {
         if parquet.total_rows() == 0 {
             return Ok(Vec::new());
         }
-        // The selector guarantees that all inputs share one partition, whose
-        // tuple the table records for each of them. The outputs hold the
-        // inputs' rows and no other, so the tuple is theirs too.
-        let output_partition = input_entries
-            .first()
-            .and_then(|first| first.partition.clone());
         // The merge checks that each input's rows are in the order of the
         // table's sort columns and fails otherwise, so its outputs are in
         // that order whatever the inputs were recorded as: a file adopted as
