@@ -57,7 +57,8 @@ use std::sync::Arc;
 /// read: a table scan's injector, or the queue a late materialization sends
 /// them to.
 pub struct RowGroupFetcher<IoRowGroupsReceiver: Receiver<QueryRowGroupMetadata>> {
-    /// The columns the scan reads from every row group.
+    /// The columns the scan reads from every row group that names no
+    /// column of its own.
     projection: Arc<Projection>,
     /// The medium the table is read from, whose read-ahead budget the
     /// fetcher's reads count against.
@@ -103,8 +104,8 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
     /// What `row_group` counts against a read-ahead budget: its whole
     /// projected size.
     fn compute_projected_bytes(&self, row_group: &QueryRowGroupMetadata) -> usize {
-        let projected_bytes: i64 = self
-            .projection
+        let projected_bytes: i64 = row_group
+            .resolve_projection(&self.projection)
             .indices()
             .iter()
             .map(|&column| row_group.row_group_metadata.columns[column].total_compressed_size)

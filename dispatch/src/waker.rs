@@ -483,6 +483,85 @@ pub(crate) fn install_test_worker_waker() {
     init_waker_set(WakerSet::new(vec![waker], workers));
 }
 
+/// The workers that asked to be woken when what they wait for changes, one
+/// bit per global worker index.
+///
+/// A worker that finds what it waits for missing registers, and then
+/// looks once more: a change between its first look and the registration
+/// would otherwise go unseen forever. Whoever makes the change makes it
+/// first and wakes the registered workers after. So a second look that
+/// still finds nothing ran before the change, and the wake that follows
+/// the change will see the registration.
+pub struct WaitingWorkers {
+    workers: Box<[AtomicUsize]>,
+    /// Which registered worker the next wake notifies first: its place
+    /// among the workers registered then, wrapped round their number. Moves
+    /// one place on with every wake that finds any.
+    first_to_wake: AtomicUsize,
+}
+
+impl WaitingWorkers {
+    const WORD_BITS: usize = usize::BITS as usize;
+
+    /// No worker of a pool of `worker_count` is registered.
+    pub fn new(worker_count: usize) -> Self {
+        Self {
+            workers: (0..worker_count.div_ceil(Self::WORD_BITS))
+                .map(|_| AtomicUsize::new(0))
+                .collect(),
+            first_to_wake: AtomicUsize::new(0),
+        }
+    }
+
+    /// Ask for `worker` to be woken by the next [`wake_all`](Self::wake_all).
+    pub fn register(&self, worker: usize) {
+        let word = worker / Self::WORD_BITS;
+        assert!(
+            word < self.workers.len(),
+            "worker {worker} is outside the pool the waiting workers were sized for"
+        );
+        self.workers[word].fetch_or(1usize << (worker % Self::WORD_BITS), Ordering::SeqCst);
+    }
+
+    /// Drop the registration of `worker`, which found what it waited for
+    /// when it looked again, so that the next wake leaves it alone.
+    pub fn deregister(&self, worker: usize) {
+        self.workers[worker / Self::WORD_BITS]
+            .fetch_and(!(1usize << (worker % Self::WORD_BITS)), Ordering::SeqCst);
+    }
+
+    /// Whether `worker` registered and no wake has taken its registration
+    /// since.
+    pub fn is_registered(&self, worker: usize) -> bool {
+        let word = self.workers[worker / Self::WORD_BITS].load(Ordering::SeqCst);
+        word & (1usize << (worker % Self::WORD_BITS)) != 0
+    }
+
+    /// Wake every registered worker through `wakers` and take their
+    /// registrations away. The workers are woken in the same cycle each
+    /// time, entered one worker further on, so that when they race for
+    /// what changed no worker is always the first to be woken.
+    pub fn wake_all(&self, wakers: &WakerSet) {
+        let mut waiting_workers = Vec::new();
+        for (word_idx, word) in self.workers.iter().enumerate() {
+            let mut waiting = word.swap(0, Ordering::SeqCst);
+            while waiting != 0 {
+                let bit = waiting.trailing_zeros() as usize;
+                waiting_workers.push(word_idx * Self::WORD_BITS + bit);
+                waiting &= waiting - 1;
+            }
+        }
+        if waiting_workers.is_empty() {
+            return;
+        }
+        let first = self.first_to_wake.fetch_add(1, Ordering::Relaxed) % waiting_workers.len();
+        waiting_workers.rotate_left(first);
+        for worker in waiting_workers {
+            wakers.notify_worker(worker);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

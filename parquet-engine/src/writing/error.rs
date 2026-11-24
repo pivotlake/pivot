@@ -39,6 +39,17 @@ pub(crate) enum WriteError {
     /// An array did not have the Arrow type its column's schema declared.
     #[error("array downcast to {expected} failed")]
     Downcast { expected: &'static str },
+    /// A stage of a compaction's read counted a different number of rows
+    /// than another, or than the input's footers declare.
+    #[error("the stages of a compaction disagree on its row count")]
+    CompactionRowCountMismatch,
+    /// A compaction was asked to read a file that has deleted rows.
+    #[error("a compaction input file has deleted rows, which a compaction does not read")]
+    CompactionOfDeletedRows,
+    /// A compaction was asked to read a column of a type the reader does
+    /// not decode.
+    #[error("a compaction input column has type {0:?}, which the reader does not decode")]
+    CompactionOfUndecodedType(DataType),
 }
 
 pub(crate) type WriteResult<T> = Result<T, WriteError>;

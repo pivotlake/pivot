@@ -69,14 +69,17 @@ impl RowGroupRequest {
     /// Build a request for all projected columns in the given row group: each
     /// chunk is looked up in the decompressed cache, the pages it holds are
     /// taken, pinned, and the stretches between them become ranges to read.
-    pub fn from(metadata_handle: QueryRowGroupMetadata, projection: &Projection) -> Self {
+    /// The projected columns are the column the read names, or those of
+    /// `scan_projection` when it names none.
+    pub fn from(metadata_handle: QueryRowGroupMetadata, scan_projection: &Projection) -> Self {
         let open_file = metadata_handle.get_metadata().open_file.clone();
         let columns = metadata_handle.columns();
+        let projection = metadata_handle.resolve_projection(scan_projection);
         // The projection names top-level columns; fetch each one's run of leaf
         // chunks in this file's layout. The decoder resolves leaves the same
         // way, so a fetched chunk's position lines up with its decoder.
         let fields = metadata_handle.get_metadata().schema.fields();
-        let leaves = projected_leaves(fields, &metadata_handle, projection);
+        let leaves = projected_leaves(fields, &metadata_handle, &projection);
 
         let planned = leaves
             .iter()

@@ -9,11 +9,13 @@
 //! decompressor to locate pages on disk.
 
 use crate::thrift::general::CompressionCodec;
+use crate::types::projection::Projection;
 use crate::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use dispatch::io::OpenFile;
 use roaring::RoaringTreemap;
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -303,6 +305,19 @@ pub enum RowSelection {
     Indices(Arc<[u32]>),
 }
 
+/// Which read of a row group a page, a range of rows or a decoder belongs
+/// to. A scan reads each row group once. A reader that reads a row group a
+/// column at a time reads it once per column, and several of those reads
+/// can be on their way at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ReadKey {
+    /// The row group's index in the table's list of row groups.
+    pub row_group_index: usize,
+    /// The one table column the read takes, `None` for a read of the scan's
+    /// projection.
+    pub column: Option<usize>,
+}
+
 /// Row-group metadata augmented with per-query filtering state.
 ///
 /// Wraps a shared [`RowGroupMetadata`] and the [`RowSelection`] describing
@@ -321,6 +336,9 @@ pub struct QueryRowGroupMetadata {
     /// the decompressor skips the remaining, not-yet-touched pages instead of
     /// decompressing them only to be discarded.
     pruned: Arc<AtomicBool>,
+    /// The one table column this read takes, when it names it itself.
+    /// `None` for a read of the scan's projection.
+    column: Option<usize>,
 }
 
 impl QueryRowGroupMetadata {
@@ -331,6 +349,33 @@ impl QueryRowGroupMetadata {
             selection,
             row_group_index: index,
             pruned: Arc::new(AtomicBool::new(false)),
+            column: None,
+        }
+    }
+
+    /// Metadata for reading every row of row group `index`, in the table
+    /// column `column` alone rather than the scan's projection.
+    pub fn new_of_column(table: &ParquetTable, index: usize, column: usize) -> Self {
+        Self {
+            column: Some(column),
+            ..Self::new(table, index, RowSelection::All)
+        }
+    }
+
+    /// Which read of its row group this is.
+    pub fn read_key(&self) -> ReadKey {
+        ReadKey {
+            row_group_index: self.row_group_index,
+            column: self.column,
+        }
+    }
+
+    /// The columns this read takes: its own column when it names one,
+    /// otherwise `scan_projection`.
+    pub fn resolve_projection<'a>(&self, scan_projection: &'a Projection) -> Cow<'a, Projection> {
+        match self.column {
+            Some(column) => Cow::Owned(Projection::columns([column])),
+            None => Cow::Borrowed(scan_projection),
         }
     }
 

@@ -828,6 +828,25 @@ impl CatalogTable {
         // The selector guarantees that all inputs share one partition, so its
         // recorded tuple can key every decoded batch without repartitioning it.
         let parquet = self.parquet_table_for(inputs);
+        // With PIVOT_COMPACTION_MERGE_SORT set, the merge only reads its
+        // inputs, in the order of their merge and within a memory budget.
+        // The rows are dropped as they come out, and the merge fails, so
+        // nothing is committed.
+        if std::env::var_os("PIVOT_COMPACTION_MERGE_SORT").is_some() {
+            use parquet_engine::writing::{MergeSortSettings, MergedBatchColumn};
+            parquet_engine::writing::read_in_merge_order_spec(
+                &self.dispatcher,
+                parquet,
+                self.sort_by(),
+                target_rows_per_group,
+                MergeSortSettings::from_env(),
+            )
+            .map_err(crate::Error::Merge)?
+            .map_each(|_merged_batch: MergedBatchColumn| Ok(()))
+            .collect()
+            .map_err(crate::Error::Merge)?;
+            return Err(crate::Error::MergeOutputDiscarded);
+        }
         let columns = parquet.schema().fields().len();
         let scan = parquet_engine::table_input(
             &self.dispatcher,

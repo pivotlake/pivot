@@ -134,10 +134,11 @@ pub use operations::channels::{
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use operations::unary::test_utils;
-pub use operations::unary::{Error as UnaryError, Result as UnaryResult, copy_out};
 pub use operations::unary::{
-    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, batch_sort_indices,
+    ChunkedRowSorter, KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput,
+    RowComparer, batch_sort_indices,
 };
+pub use operations::unary::{Error as UnaryError, Result as UnaryResult, copy_out};
 pub use operations::unary::{WindowFunction, WindowRowLimit, WindowSpec};
 pub use operations::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot,
@@ -232,6 +233,12 @@ impl DataFlowDispatcher {
 }
 
 impl DataFlowDispatcher {
+    /// The wakers of the pool's workers, for waking one of them from
+    /// outside its own operators.
+    pub fn waker_set(&self) -> WakerSet {
+        self.waker_set.clone()
+    }
+
     /// Dispatch one pre-built `DataFlow` bundle across the node groups.
     /// Builder `i` goes to global worker `i` (node `i / workers_per_node`). A
     /// full bundle has one builder per worker; a shorter one reaches only the

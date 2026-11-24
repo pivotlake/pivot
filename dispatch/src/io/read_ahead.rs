@@ -51,6 +51,27 @@ pub enum ReadMedium {
     Network,
 }
 
+impl ReadMedium {
+    /// What `worker_count` workers together may have asked for from this
+    /// medium and not yet started on: the sum of their budgets. For the
+    /// network that is what the card receives in the time a remote read
+    /// takes, at the rate the process requests remote reads at.
+    pub fn count_read_ahead_bytes(self, worker_count: usize) -> usize {
+        match self {
+            ReadMedium::Disk => DISK_READ_AHEAD_BYTES * worker_count,
+            ReadMedium::Network => {
+                let read_time_millis = crate::env::get_env_var_with_default(
+                    "PIVOT_REMOTE_READ_TIME_MS",
+                    DEFAULT_REMOTE_READ_TIME_MILLIS,
+                );
+                let bytes_per_second =
+                    super::receive_rate::process_receive_rate_limiter().bytes_per_second();
+                (bytes_per_second as u128 * read_time_millis as u128 / 1000) as usize
+            }
+        }
+    }
+}
+
 /// One worker's budget of bytes asked for from one medium and not yet started
 /// on.
 pub struct ReadAheadBudget {
@@ -82,15 +103,8 @@ impl ReadAheadBudget {
         match medium {
             ReadMedium::Disk => Self::of_bytes(DISK_READ_AHEAD_BYTES),
             ReadMedium::Network => {
-                let read_time_millis = crate::env::get_env_var_with_default(
-                    "PIVOT_REMOTE_READ_TIME_MS",
-                    DEFAULT_REMOTE_READ_TIME_MILLIS,
-                );
-                Self::for_receive_rate(
-                    super::receive_rate::process_receive_rate_limiter().bytes_per_second(),
-                    Duration::from_millis(read_time_millis),
-                    crate::worker::NUM_WORKERS.get(),
-                )
+                let worker_count = crate::worker::NUM_WORKERS.get();
+                Self::of_bytes(medium.count_read_ahead_bytes(worker_count) / worker_count)
             }
         }
     }

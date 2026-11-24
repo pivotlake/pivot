@@ -102,9 +102,9 @@ impl UnaryFactory<DecodeRange, RecordBatch> for DecoderFactory {
 ///
 /// Works one range at a time, and takes the next only once the current one
 /// is emitted, so the ranges it has not started stay in the channel for
-/// idle peers to take. A row group's decoder is kept between ranges: the
-/// next range of the same row group usually continues it, and it is dropped
-/// once every range of the row group is decoded, on any worker.
+/// idle peers to take. A read's decoder is kept between ranges: the next
+/// range of the same read of a row group usually continues it, and it is
+/// dropped once every range of the read is decoded, on any worker.
 ///
 /// A batch the table format deleted rows of does not leave as the runt the
 /// drop would make of it: its live rows are gathered, as a filter's survivors
@@ -283,11 +283,11 @@ impl Unary<DecodeRange, RecordBatch> for Decoder {
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         assert!(self.active.is_none(), "a decoder takes one range at a time");
-        let row_group_index = range.metadata().row_group_index;
+        let read_key = range.metadata().read_key();
         let mut decoder = match self
             .idle
             .iter()
-            .position(|idle| idle.row_group_index() == row_group_index)
+            .position(|idle| idle.read_key() == read_key)
         {
             Some(pos) => self.idle.swap_remove(pos),
             None => RowGroupDecoder::new(&range, self.batch_size, self.add_row_group_metadata)

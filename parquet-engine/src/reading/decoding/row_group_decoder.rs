@@ -14,7 +14,7 @@ use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, St
 use crate::reading::record_batch_metadata::with_row_index;
 use crate::types::filter_mask::FilterMask;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
-use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
+use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, ReadKey, RowSelection};
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
@@ -212,6 +212,11 @@ impl RowGroupDecoder {
 
     pub fn row_group_index(&self) -> usize {
         self.metadata.row_group_index
+    }
+
+    /// Which read of its row group the decoder decodes the ranges of.
+    pub fn read_key(&self) -> ReadKey {
+        self.metadata.read_key()
     }
 
     /// Whether every range of the row group is decoded, on any worker, so

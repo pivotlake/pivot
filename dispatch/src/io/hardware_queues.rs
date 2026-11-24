@@ -31,6 +31,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use crate::waker::WaitingWorkers;
+
 /// In-flight cap for a device whose hardware-queue topology cannot be read
 /// (non-Linux, or a device without blk-mq sysfs entries, e.g. tmpfs). Private
 /// to one worker: without the topology there is no sharing structure to
@@ -57,15 +59,10 @@ pub(crate) struct HardwareQueue {
     most_runs_per_request: usize,
     /// Slots held by the operations in flight.
     in_flight: AtomicUsize,
-    /// Workers that found no room in this queue, one bit per global worker
-    /// index.
-    /// Sized on first use from the worker pool; after that registration and
-    /// release are atomic bitmap operations only.
-    waiters: OnceLock<Box<[AtomicUsize]>>,
-    /// Which waiting worker the next release wakes first: its place among the
-    /// workers waiting then, wrapped round their number. Moves one place on
-    /// with every release that wakes any.
-    first_waiter_to_wake: AtomicUsize,
+    /// Workers that found no room in this queue. Sized on first use from
+    /// the worker pool; after that registration and release are atomic
+    /// bitmap operations only.
+    waiters: OnceLock<WaitingWorkers>,
 }
 
 impl HardwareQueue {
@@ -86,7 +83,6 @@ impl HardwareQueue {
             most_runs_per_request,
             in_flight: AtomicUsize::new(0),
             waiters: OnceLock::new(),
-            first_waiter_to_wake: AtomicUsize::new(0),
         })
     }
 
@@ -122,61 +118,26 @@ impl HardwareQueue {
     /// ran before that decrement, so the sweep is still to come and will see
     /// this registration.
     pub(crate) fn register_waiter(&self, worker_idx: usize) {
-        const WORD_BITS: usize = usize::BITS as usize;
-
-        let waiters = self.waiters.get_or_init(|| {
-            let word_count = crate::waker::waker_set().worker_count().div_ceil(WORD_BITS);
-            (0..word_count).map(|_| AtomicUsize::new(0)).collect()
-        });
-        let word = worker_idx / WORD_BITS;
-        assert!(
-            word < waiters.len(),
-            "worker {worker_idx} is outside the hardware queue's worker pool"
-        );
-        waiters[word].fetch_or(1usize << (worker_idx % WORD_BITS), Ordering::SeqCst);
+        self.waiters
+            .get_or_init(|| WaitingWorkers::new(crate::waker::waker_set().worker_count()))
+            .register(worker_idx);
     }
 
     /// Drop a registration whose retry acquired a slot after all, so releases
     /// stop waking a worker that is no longer waiting.
     pub(crate) fn deregister_waiter(&self, worker_idx: usize) {
-        const WORD_BITS: usize = usize::BITS as usize;
-
-        let waiters = self
-            .waiters
+        self.waiters
             .get()
-            .expect("a waiter cannot deregister before registering");
-        waiters[worker_idx / WORD_BITS]
-            .fetch_and(!(1usize << (worker_idx % WORD_BITS)), Ordering::SeqCst);
+            .expect("a waiter cannot deregister before registering")
+            .deregister(worker_idx);
     }
 
     /// Return `slots` slots and wake every waiting worker to race for them,
     /// starting from a different worker each time.
     fn release(&self, slots: usize) {
         self.in_flight.fetch_sub(slots, Ordering::SeqCst);
-        let Some(waiters) = self.waiters.get() else {
-            return;
-        };
-        const WORD_BITS: usize = usize::BITS as usize;
-        let mut waiting_workers = Vec::new();
-        for (word_idx, word) in waiters.iter().enumerate() {
-            let mut waiting = word.swap(0, Ordering::SeqCst);
-            while waiting != 0 {
-                let bit = waiting.trailing_zeros() as usize;
-                waiting_workers.push(word_idx * WORD_BITS + bit);
-                waiting &= waiting - 1;
-            }
-        }
-        if waiting_workers.is_empty() {
-            return;
-        }
-        // The same cycle each time, entered one worker further on, so that no
-        // worker is always the first to be woken and to find the slots free.
-        let first =
-            self.first_waiter_to_wake.fetch_add(1, Ordering::Relaxed) % waiting_workers.len();
-        waiting_workers.rotate_left(first);
-        let wakers = crate::waker::waker_set();
-        for worker in waiting_workers {
-            wakers.notify_worker(worker);
+        if let Some(waiters) = self.waiters.get() {
+            waiters.wake_all(crate::waker::waker_set());
         }
     }
 }
@@ -500,14 +461,8 @@ mod tests {
         drop(permit);
 
         assert_eq!(waker.ring_wake_count(), 2);
-        assert!(
-            queue
-                .waiters
-                .get()
-                .unwrap()
-                .iter()
-                .all(|word| word.load(Ordering::SeqCst) == 0)
-        );
+        let waiters = queue.waiters.get().unwrap();
+        assert!((0..worker_count).all(|worker| !waiters.is_registered(worker)));
     }
 
     #[cfg(target_os = "linux")]

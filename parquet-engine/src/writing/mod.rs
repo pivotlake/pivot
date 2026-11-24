@@ -51,6 +51,7 @@
 //! memory.
 
 mod assembler;
+pub(crate) mod compacting;
 mod compression;
 pub(crate) mod encoder;
 pub(crate) mod error;
@@ -66,6 +67,10 @@ mod stats;
 pub use stats::aggregate_file_stats;
 mod types;
 
+pub use compacting::{
+    InputValues, MemoryReservation, MergeSortSettings, MergedBatchColumn, MergedRows,
+    read_in_merge_order_spec,
+};
 pub use types::AssembledFile;
 
 use std::sync::Arc;
