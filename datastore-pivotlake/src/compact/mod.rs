@@ -215,7 +215,12 @@ const MAX_FILES_OF_A_MERGE_OF_FEW_BYTES: usize = 100;
 /// commit. A commit costs the same whatever it holds, so a table that gains
 /// small files quickly loses them faster when one commit swaps in several
 /// merges.
-pub const MAX_SMALL_FILE_MERGES_PER_COMMIT: usize = 5;
+pub const MAX_SMALL_FILE_MERGES_PER_COMMIT: usize = 15;
+
+/// The most bytes of inputs the merges of one commit hold between them when
+/// there are several: they are written at the same time, each holding rows
+/// of its inputs in memory. A merge alone may hold more.
+pub const MAX_INPUT_BYTES_OF_MERGES_WRITTEN_TOGETHER: u64 = 100 * 1024 * 1024;
 
 /// What merging one more file costs whatever its size, added to each file's
 /// bytes wherever a merge of small files is weighed. Without it many
@@ -538,10 +543,11 @@ impl CompacterActor {
     /// the datastore refresh the table from storage and publish it once as
     /// it begins, then each pass starts a small-file group if one qualifies,
     /// else the best overlapping large-file group. A small-file group is
-    /// followed by further merges of small files of the same partition, each
-    /// picked once the one before is written, and one commit swaps them all
-    /// in ([`MAX_SMALL_FILE_MERGES_PER_COMMIT`]). One group is merged at a
-    /// time. The next is selected as soon as the group before starts its
+    /// joined by further merges of small files of the same partition, written
+    /// at the same time as it, and one commit swaps them all in
+    /// ([`MAX_SMALL_FILE_MERGES_PER_COMMIT`],
+    /// [`MAX_INPUT_BYTES_OF_MERGES_WRITTEN_TOGETHER`]). One group is merged
+    /// at a time. The next is selected as soon as the group before starts its
     /// commit, while up to `max_concurrent_merges` groups are committing, and
     /// a committing group holds its inputs reserved, so selection works
     /// around them. A pass with nothing to start and nothing in
@@ -892,7 +898,7 @@ struct WrittenMerges {
     removed_paths: Vec<ObjectPath>,
     /// The outputs of every merge written.
     outputs: Vec<TableFile>,
-    /// Why a merge failed, when one did. No merge follows a failed one.
+    /// Why a merge failed, the first one when several did.
     failure: Option<Error>,
 }
 
@@ -913,12 +919,14 @@ impl WrittenMerges {
 }
 
 impl MergeBatch {
-    /// Merge the inputs, then further runs of the partition's small files
-    /// while one may merge, up to [`MAX_SMALL_FILE_MERGES_PER_COMMIT`] merges
-    /// in all. Each run is picked once the merge before it is written, from
-    /// the files as that merge leaves them: its inputs gone and its output in
-    /// their place. An output is not yet in the table, so no later run takes
-    /// it. Nothing is committed.
+    /// Merge the inputs and, at the same time, further runs of the
+    /// partition's small files, each run a merge of its own: up to
+    /// [`MAX_SMALL_FILE_MERGES_PER_COMMIT`] merges in all, of no more than
+    /// [`MAX_INPUT_BYTES_OF_MERGES_WRITTEN_TOGETHER`] of inputs between
+    /// them, the first merge whatever it holds. The runs are picked before
+    /// anything is written, each from the files the runs before it left, so
+    /// no file is in two. Nothing is committed. A merge that fails leaves
+    /// the others to be committed.
     ///
     /// Blocking store I/O, so callers run it on the blocking pool.
     fn write_merges(
@@ -928,36 +936,82 @@ impl MergeBatch {
     ) -> WrittenMerges {
         let MergeBatch {
             partition,
-            mut inputs,
+            inputs,
             kind,
             table,
-            mut small_files,
+            small_files,
             ..
         } = self;
+        let count_bytes = |files: &[FileRef]| files.iter().map(|file| file.size).sum::<u64>();
+        let mut merges: Vec<Vec<FileRef>> = Vec::new();
+        let mut taken = HashSet::new();
+        let mut input_bytes = 0;
+        let mut next_inputs = Some(inputs);
+        while let Some(inputs) = next_inputs.take() {
+            input_bytes += count_bytes(&inputs);
+            taken.extend(inputs.iter().map(|file| file.path.clone()));
+            merges.push(inputs);
+            if merges.len() == MAX_SMALL_FILE_MERGES_PER_COMMIT {
+                break;
+            }
+            next_inputs = selection
+                .best_small_file_run(&small_files, &taken, crate::vacuum::now_unix_ms())
+                .map(|run| {
+                    small_files[run]
+                        .iter()
+                        .map(|small| small.file.clone())
+                        .collect::<Vec<FileRef>>()
+                })
+                .filter(|run| {
+                    input_bytes + count_bytes(run) <= MAX_INPUT_BYTES_OF_MERGES_WRITTEN_TOGETHER
+                });
+        }
+
+        // Each merge blocks its thread on the dataflow that writes it, and
+        // reads the table's store through the runtime of the thread that
+        // called.
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let merged: Vec<Result<Vec<TableFile>>> = std::thread::scope(|scope| {
+            let writers: Vec<_> = merges
+                .iter()
+                .map(|inputs| {
+                    scope.spawn(|| {
+                        let _in_runtime = runtime.as_ref().map(|runtime| runtime.enter());
+                        table.merge_files(
+                            &partition,
+                            inputs,
+                            ROW_GROUP_ROWS,
+                            selection.target_bytes,
+                        )
+                    })
+                })
+                .collect();
+            writers
+                .into_iter()
+                .map(|writer| {
+                    writer.join().unwrap_or_else(|_| {
+                        Err(Error::CompactionJobPanicked("a merge panicked".to_string()))
+                    })
+                })
+                .collect()
+        });
+
         let mut written = WrittenMerges {
             table,
             removed_paths: Vec::new(),
             outputs: Vec::new(),
             failure: None,
         };
-        let mut uncommitted = HashSet::new();
-        for merges_after_this in (0..MAX_SMALL_FILE_MERGES_PER_COMMIT).rev() {
-            let outputs = match written.table.merge_files(
-                &partition,
-                &inputs,
-                ROW_GROUP_ROWS,
-                selection.target_bytes,
-            ) {
+        for (inputs, outputs) in merges.into_iter().zip(merged) {
+            let outputs = match outputs {
                 Ok(outputs) => outputs,
                 Err(error) => {
-                    written.failure = Some(error);
-                    break;
+                    written.failure.get_or_insert(error);
+                    continue;
                 }
             };
             let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
-            let output_files: Vec<FileRef> =
-                outputs.iter().map(|file| file.file_ref().clone()).collect();
-            let output_sizes: Vec<u64> = output_files.iter().map(|file| file.size).collect();
+            let output_sizes: Vec<u64> = outputs.iter().map(|file| file.file_ref().size).collect();
             info!(
                 table = %name,
                 kind = kind.label(),
@@ -971,35 +1025,8 @@ impl MergeBatch {
             );
             written
                 .removed_paths
-                .extend(inputs.iter().map(|file| file.path.clone()));
+                .extend(inputs.into_iter().map(|file| file.path));
             written.outputs.extend(outputs);
-
-            let first_input = small_files
-                .iter()
-                .position(|small| small.file.path == inputs[0].path);
-            let Some(first_input) = first_input.filter(|_| merges_after_this > 0) else {
-                break;
-            };
-            uncommitted.extend(output_files.iter().map(|file| file.path.clone()));
-            let now_ms = crate::vacuum::now_unix_ms();
-            small_files.splice(
-                first_input..first_input + inputs.len(),
-                output_files
-                    .into_iter()
-                    .filter(|file| is_small_file(file.size, selection.target_bytes))
-                    .map(|file| SmallFile {
-                        file,
-                        committed_at_ms: now_ms,
-                    }),
-            );
-            let Some(run) = selection.best_small_file_run(&small_files, &uncommitted, now_ms)
-            else {
-                break;
-            };
-            inputs = small_files[run]
-                .iter()
-                .map(|small| small.file.clone())
-                .collect();
         }
         written
     }
