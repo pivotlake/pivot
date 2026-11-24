@@ -352,10 +352,11 @@ fn read_manifest_lists(metadata_dir: &std::path::Path) -> Vec<Vec<String>> {
 }
 
 #[test]
-fn inserts_whose_commits_merge_manifests_leave_no_manifest_that_no_snapshot_names() {
+fn inserts_merge_manifests_that_piled_up_and_leave_none_that_no_snapshot_names() {
     let mut db = Database::new();
     db.execute("CREATE TABLE events (value BIGINT)");
-    let inserts = 120;
+    // More than an insert leaves unmerged on a table nothing compacts.
+    let inserts = 520;
 
     for value in 0..inserts {
         db.execute(&format!("INSERT INTO events VALUES ({value})"));

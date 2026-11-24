@@ -6,10 +6,11 @@
 mod iceberg_support;
 
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 use catalog::datastore::DatastoreTransaction as _;
 use datastore_pivotlake::test_support::metadata_versions;
-use iceberg_support::{Database, collect_i64s, insert_rows, int_batch, single_i64};
+use iceberg_support::{Database, collect_i64s, insert_rows, int_batch, single_i64, stage_insert};
 use planner::catalog::SchemaQualifiedTableName;
 
 #[test]
@@ -70,6 +71,37 @@ fn inserts_that_wait_for_the_table_together_share_a_version() {
         versions.len() < 65,
         "64 inserts at once made a version each: {versions:?}"
     );
+}
+
+#[test]
+fn more_inserts_than_the_runtime_has_blocking_threads_all_commit() {
+    let mut db = Database::new();
+    db.execute("CREATE TABLE events (value BIGINT)");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(2)
+        .enable_time()
+        .build()
+        .unwrap();
+    let transactions: Vec<_> = (1..=16i64)
+        .map(|value| stage_insert(&db.datastore, "events", vec![int_batch(&[value])]))
+        .collect();
+
+    let commits: Vec<_> = transactions
+        .into_iter()
+        .map(|transaction| runtime.spawn(async move { transaction.commit().await }))
+        .collect();
+    for commit in commits {
+        let committed =
+            runtime.block_on(async { tokio::time::timeout(Duration::from_secs(60), commit).await });
+        committed
+            .expect("the commit is made")
+            .expect("the commit does not panic")
+            .unwrap();
+    }
+
+    let rows = db.execute("SELECT value FROM events ORDER BY value");
+    assert_eq!(collect_i64s(&rows, 0), (1..=16).collect::<Vec<_>>());
 }
 
 #[test]

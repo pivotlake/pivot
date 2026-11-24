@@ -10,6 +10,8 @@
 //! what the ones before it did; a failure stops the commit, the effects
 //! applied before it stay, and the actions after it are discarded.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,9 +21,11 @@ use planner::catalog::{Error as CatalogError, Result as CatalogResult};
 /// One durable effect a statement staged on its transaction against a
 /// datastore of type `D`.
 pub trait CommitAction<D>: Send {
-    /// Make the effect durable and visible. Blocking I/O: the commit runs
-    /// every action on the blocking pool.
-    fn apply(self: Box<Self>, datastore: &D) -> CatalogResult<()>;
+    /// Make the effect durable and visible. The commit awaits it on the
+    /// runtime, so an action does its blocking I/O on the blocking pool
+    /// ([`StagedCommit::apply_on_blocking_pool`]), and one that waits its
+    /// turn behind other writers holds no thread while it waits.
+    fn apply(self: Box<Self>, datastore: Arc<D>) -> ApplyFuture;
 
     /// Undo what the action put outside the catalog before its commit: a
     /// rolled-back or never-committed INSERT removes the files it uploaded.
@@ -29,6 +33,9 @@ pub trait CommitAction<D>: Send {
     /// unreferenced.
     fn discard(self: Box<Self>);
 }
+
+/// An action being applied ([`CommitAction::apply`]).
+pub type ApplyFuture = Pin<Box<dyn Future<Output = CatalogResult<()>> + Send>>;
 
 /// The queue a transaction's statements stage their actions on, shared
 /// between the transaction and the bindings and dataflows it hands out.
@@ -63,10 +70,26 @@ impl<D: Send + Sync + 'static> StagedCommit<D> {
         Arc::clone(&self.actions)
     }
 
-    /// Apply every staged action in order on the blocking pool. A read-only
-    /// transaction staged nothing and finishes inline. A failure stops the
-    /// commit, keeps the effects applied before it, and discards the actions
-    /// after it.
+    /// Apply `apply` to `datastore` on the blocking pool: how an action whose
+    /// effect is blocking I/O from start to end is applied.
+    pub fn apply_on_blocking_pool(
+        datastore: Arc<D>,
+        apply: impl FnOnce(&D) -> CatalogResult<()> + Send + 'static,
+    ) -> ApplyFuture {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || apply(&datastore))
+                .await
+                .map_err(|error| {
+                    CatalogError::Other(format!("commit thread panicked: {error}").into())
+                })?
+        })
+    }
+
+    /// Apply every staged action in order. A read-only transaction staged
+    /// nothing and finishes inline. A failure stops the commit, keeps the
+    /// effects applied before it, and discards the actions after it. The
+    /// actions are applied by a task of their own, so a caller that stops
+    /// waiting leaves none of them half applied or undiscarded.
     pub async fn commit(&self) -> CatalogResult<()> {
         // Marked at entry, not on success: the swap refuses a second commit,
         // and a failed commit has already drained the staged state, so the
@@ -79,12 +102,18 @@ impl<D: Send + Sync + 'static> StagedCommit<D> {
         }
         let datastore = Arc::clone(&self.datastore);
         let actions = drain_injector(&self.actions);
-        tokio::task::spawn_blocking(move || -> CatalogResult<()> {
+        tokio::spawn(async move {
             let mut actions = actions.into_iter();
             while let Some(action) = actions.next() {
-                if let Err(error) = action.apply(&datastore) {
-                    for unapplied in actions {
-                        unapplied.discard();
+                if let Err(error) = action.apply(Arc::clone(&datastore)).await {
+                    // A discard removes what the action wrote: store I/O.
+                    let discarded = tokio::task::spawn_blocking(move || {
+                        for unapplied in actions {
+                            unapplied.discard();
+                        }
+                    });
+                    if let Err(panicked) = discarded.await {
+                        tracing::warn!(error = %panicked, "discarding the actions after a failed one panicked");
                     }
                     return Err(error);
                 }
@@ -92,7 +121,7 @@ impl<D: Send + Sync + 'static> StagedCommit<D> {
             Ok(())
         })
         .await
-        .map_err(|error| CatalogError::Other(format!("commit thread panicked: {error}").into()))?
+        .map_err(|error| CatalogError::Other(format!("commit task panicked: {error}").into()))?
     }
 
     /// Discard every staged action, removing what it already wrote. Blocking
@@ -166,16 +195,18 @@ mod tests {
     }
 
     impl CommitAction<Journal> for Step {
-        fn apply(self: Box<Self>, journal: &Journal) -> CatalogResult<()> {
-            if self.fails {
-                return Err(CatalogError::Other(format!("{} failed", self.name).into()));
-            }
-            journal
-                .0
-                .lock()
-                .unwrap()
-                .push(format!("applied {}", self.name));
-            Ok(())
+        fn apply(self: Box<Self>, journal: Arc<Journal>) -> ApplyFuture {
+            StagedCommit::apply_on_blocking_pool(journal, move |journal| {
+                if self.fails {
+                    return Err(CatalogError::Other(format!("{} failed", self.name).into()));
+                }
+                journal
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push(format!("applied {}", self.name));
+                Ok(())
+            })
         }
 
         fn discard(self: Box<Self>) {

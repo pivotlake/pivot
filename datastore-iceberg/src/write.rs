@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use catalog::{CommitAction, CommitQueue};
+use catalog::{ApplyFuture, CommitAction, CommitQueue, StagedCommit};
 use dispatch::RecordBatchOperatorSpec;
 use iceberg::spec::{FormatVersion, Schema};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -30,7 +30,7 @@ use iceberg_tables::{LOGICAL_TYPES_PROPERTY, Table as LoadedTable, block_on, bui
 use object_storage::FileRef;
 use parquet_engine::FileStats;
 use parquet_engine::writing::upload::{UploadedFile, UploadedFiles};
-use planner::catalog::{Column, Result as CatalogResult, SchemaQualifiedTableName};
+use planner::catalog::{Column, SchemaQualifiedTableName};
 
 use crate::{Error, IcebergDatastore, Result, TableEntry};
 
@@ -114,30 +114,34 @@ impl CommitAction<IcebergDatastore> for PendingInsert {
     /// commit whose outcome is unknown may have succeeded, so its files stay.
     /// Once the commit has succeeded so has the statement: a version
     /// that cannot be entered now is seen at the next refresh.
-    fn apply(self: Box<Self>, datastore: &IcebergDatastore) -> CatalogResult<()> {
-        let uploads = self.uploaded_files.take();
-        if uploads.is_empty() {
-            return Ok(());
-        }
-        match self.commit_append(&uploads) {
-            Ok(committed) => {
-                datastore.publish_entry(self.table.name(), TableEntry::of_version(&committed))
+    fn apply(self: Box<Self>, datastore: Arc<IcebergDatastore>) -> ApplyFuture {
+        StagedCommit::apply_on_blocking_pool(datastore, move |datastore| {
+            let uploads = self.uploaded_files.take();
+            if uploads.is_empty() {
+                return Ok(());
             }
-            Err(Error::Tables(error @ iceberg_tables::Error::CommittedTableUnloaded { .. })) => {
-                tracing::warn!(
-                    table = %self.table.name(),
-                    error = %error,
-                    "the insert was committed, but its version could not be entered; the next refresh enters it"
-                )
-            }
-            Err(error) => {
-                if !error.may_have_committed() {
-                    uploads.iter().for_each(UploadedFile::delete);
+            match self.commit_append(&uploads) {
+                Ok(committed) => {
+                    datastore.publish_entry(self.table.name(), TableEntry::of_version(&committed))
                 }
-                return Err(error.into());
+                Err(Error::Tables(
+                    error @ iceberg_tables::Error::CommittedTableUnloaded { .. },
+                )) => {
+                    tracing::warn!(
+                        table = %self.table.name(),
+                        error = %error,
+                        "the insert was committed, but its version could not be entered; the next refresh enters it"
+                    )
+                }
+                Err(error) => {
+                    if !error.may_have_committed() {
+                        uploads.iter().for_each(UploadedFile::delete);
+                    }
+                    return Err(error.into());
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Delete every file the INSERT uploaded: none is in a snapshot, so no

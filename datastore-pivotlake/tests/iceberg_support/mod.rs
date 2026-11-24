@@ -13,7 +13,7 @@ use std::time::Duration;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, RecordBatch};
-use catalog::datastore::DatastoreTransaction as _;
+use catalog::datastore::DatastoreTransaction;
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{Datastore, PivotCatalog};
 use datastore_pivotlake::test_support::commit_external_append;
@@ -361,6 +361,21 @@ impl Database {
 /// runs: what a test uses to run several inserts at once from several
 /// threads, which one planner cannot.
 pub fn insert_rows(datastore: &Arc<PivotlakeDatastore>, name: &str, batches: Vec<RecordBatch>) {
+    let transaction = stage_insert(datastore, name, batches);
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(transaction.commit())
+        .unwrap();
+}
+
+/// A transaction that has written `batches` for the table `name` and has
+/// yet to commit them.
+pub fn stage_insert(
+    datastore: &Arc<PivotlakeDatastore>,
+    name: &str,
+    batches: Vec<RecordBatch>,
+) -> Arc<dyn DatastoreTransaction> {
     let transaction = Arc::clone(datastore).begin_transaction();
     let table = transaction
         .bind_table(
@@ -376,11 +391,7 @@ pub fn insert_rows(datastore: &Arc<PivotlakeDatastore>, name: &str, batches: Vec
         .unwrap()
         .collect()
         .unwrap();
-    tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(transaction.commit())
-        .unwrap();
+    transaction
 }
 
 /// Every value of the `Int64` column `column` across `batches`, in order.

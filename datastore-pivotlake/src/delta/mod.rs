@@ -704,6 +704,11 @@ impl Table for DeltaTable {
         Ok(None)
     }
 
+    /// Nothing is prepared for a commit to this format.
+    fn does_prepared_commit_stand(&self, _prepared: &PreparedCommit) -> bool {
+        false
+    }
+
     /// The next version is this one's files less those removed, with those
     /// added standing after every file of this version, in the order given:
     /// the log is written and not read.

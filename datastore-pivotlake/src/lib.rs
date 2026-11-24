@@ -79,7 +79,7 @@ use uuid::Uuid;
 
 use async_trait::async_trait;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
-use catalog::{CommitAction, CommitQueue, StagedCommit};
+use catalog::{ApplyFuture, CommitAction, CommitQueue, StagedCommit};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
 use manifest::CatalogManifest;
@@ -764,11 +764,55 @@ impl PivotlakeDatastore {
                 .prepare_commit(removed, &added)?,
         };
         let outcome = commit_queue.enqueue(removed, added, data_change, prepared);
-        let turn = match commit_queue.wait_to_commit(&outcome) {
-            table::CommitWait::Committed(committed) => return committed,
-            table::CommitWait::Turn(turn) => turn,
-        };
+        match commit_queue.wait_to_commit(&outcome) {
+            table::CommitWait::Committed(committed) => committed,
+            table::CommitWait::Turn(turn) => self.commit_queued_until_made(id, &turn, &outcome),
+        }
+    }
 
+    /// Append `added` to table `id` as an INSERT, in a version it may share
+    /// with the inserts of other writers waiting with it
+    /// ([`commit_to_table`](Self::commit_to_table)). Waiting for another
+    /// writer to make the commit holds no thread: only the writer whose turn
+    /// it is to commit takes one of the blocking pool, for as long as it
+    /// commits. So the commit in progress, which does its store I/O on that
+    /// pool, is never left without a thread by the writers waiting for it,
+    /// however many they are.
+    pub(crate) async fn commit_insert(
+        self: &Arc<Self>,
+        id: Uuid,
+        added: Vec<TableFile>,
+    ) -> Result<()> {
+        let commit_queue = self
+            .tables_index
+            .read()
+            .unwrap()
+            .get_table_by_id(&id)
+            .ok_or_else(|| Error::TableNotFound(id.to_string()))?
+            .commit_queue();
+        let outcome = commit_queue.enqueue(RemovedFiles::NONE, added, true, None);
+        match commit_queue.wait_to_commit_without_a_thread(&outcome).await {
+            table::CommitWait::Committed(committed) => committed,
+            table::CommitWait::Turn(turn) => {
+                let datastore = Arc::clone(self);
+                tokio::task::spawn_blocking(move || {
+                    datastore.commit_queued_until_made(id, &turn, &outcome)
+                })
+                .await
+                .unwrap_or(Err(Error::CommitterPanicked))
+            }
+        }
+    }
+
+    /// With the turn to commit to table `id`, make the commits at the front
+    /// of its queue, a version each group, until the one with `outcome` is
+    /// made, and hand back how that one went.
+    fn commit_queued_until_made(
+        &self,
+        id: Uuid,
+        turn: &table::CommitTurn,
+        outcome: &table::CommitOutcome,
+    ) -> Result<()> {
         loop {
             if let Some(committed) = outcome.take() {
                 return committed;
@@ -1281,8 +1325,10 @@ impl PivotlakeTransaction {
 impl CommitAction<PivotlakeDatastore> for PendingSchemaCreation {
     /// Record the schema in the database manifest and publish it into the live
     /// schema set.
-    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> CatalogResult<()> {
-        Ok(datastore.finalize_schema_creation(*self)?)
+    fn apply(self: Box<Self>, datastore: Arc<PivotlakeDatastore>) -> ApplyFuture {
+        StagedCommit::apply_on_blocking_pool(datastore, move |datastore| {
+            Ok(datastore.finalize_schema_creation(*self)?)
+        })
     }
 
     /// A schema creation writes nothing before its commit.
@@ -1292,8 +1338,10 @@ impl CommitAction<PivotlakeDatastore> for PendingSchemaCreation {
 impl CommitAction<PivotlakeDatastore> for PendingTableCreation {
     /// Initialize the table's Delta log, register it in the database manifest
     /// and publish it into the live table set.
-    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> CatalogResult<()> {
-        Ok(datastore.finalize_table_creation(*self)?)
+    fn apply(self: Box<Self>, datastore: Arc<PivotlakeDatastore>) -> ApplyFuture {
+        StagedCommit::apply_on_blocking_pool(datastore, move |datastore| {
+            Ok(datastore.finalize_table_creation(*self)?)
+        })
     }
 
     /// A table creation writes nothing before its commit: the log is
@@ -1303,8 +1351,10 @@ impl CommitAction<PivotlakeDatastore> for PendingTableCreation {
 
 impl CommitAction<PivotlakeDatastore> for PendingTableDrop {
     /// Unregister the table from the database manifest and the live table set.
-    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> CatalogResult<()> {
-        Ok(datastore.finalize_table_drop(*self)?)
+    fn apply(self: Box<Self>, datastore: Arc<PivotlakeDatastore>) -> ApplyFuture {
+        StagedCommit::apply_on_blocking_pool(datastore, move |datastore| {
+            Ok(datastore.finalize_table_drop(*self)?)
+        })
     }
 
     /// A table drop writes nothing before its commit.
@@ -1313,39 +1363,49 @@ impl CommitAction<PivotlakeDatastore> for PendingTableDrop {
 
 impl CommitAction<PivotlakeDatastore> for PendingInsert {
     /// Append every file the INSERT uploaded to its table as one version,
-    /// through [`PivotlakeDatastore::commit_to_table`]. The transaction's frozen
-    /// snapshot is not the commit base -- it is a read view, and a table it
-    /// froze versions ago would lose the compare-and-swap against every INSERT
-    /// that committed since. A commit that did not succeed removes the files it
-    /// wrote, as a discard does: nothing names them. A commit whose outcome
-    /// is unknown may have succeeded, so its files stay.
-    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> CatalogResult<()> {
-        let uploaded = self.uploaded_files.take();
-        if uploaded.is_empty() {
-            return Ok(());
-        }
-        let files: Vec<TableFile> = uploaded
-            .iter()
-            .map(|uploaded| {
-                let stats = Some(Arc::new(parquet_engine::aggregate_file_stats(
-                    &uploaded.row_groups,
-                )));
-                let entry = FileEntry {
-                    file: uploaded.file.clone(),
-                    partition: uploaded.partition.clone(),
-                    stats,
-                    sorted_by: uploaded.sorted_by.clone(),
-                };
-                TableFile::new(entry, uploaded.row_groups.clone())
-            })
-            .collect();
-        let committed = datastore.commit_to_table(self.table_id, RemovedFiles::NONE, files, true);
-        if let Err(error) = &committed
-            && !error.may_have_committed()
-        {
-            uploaded.iter().for_each(UploadedFile::delete);
-        }
-        Ok(committed?)
+    /// through [`PivotlakeDatastore::commit_insert`], which holds no thread
+    /// while the insert waits behind the table's other writers. The
+    /// transaction's frozen snapshot is not the commit base -- it is a read
+    /// view, and a table it froze versions ago would lose the
+    /// compare-and-swap against every INSERT that committed since. A commit
+    /// that did not succeed removes the files it wrote, as a discard does:
+    /// nothing names them. A commit whose outcome is unknown may have
+    /// succeeded, so its files stay.
+    fn apply(self: Box<Self>, datastore: Arc<PivotlakeDatastore>) -> ApplyFuture {
+        Box::pin(async move {
+            let uploaded = self.uploaded_files.take();
+            if uploaded.is_empty() {
+                return Ok(());
+            }
+            let files: Vec<TableFile> = uploaded
+                .iter()
+                .map(|uploaded| {
+                    let stats = Some(Arc::new(parquet_engine::aggregate_file_stats(
+                        &uploaded.row_groups,
+                    )));
+                    let entry = FileEntry {
+                        file: uploaded.file.clone(),
+                        partition: uploaded.partition.clone(),
+                        stats,
+                        sorted_by: uploaded.sorted_by.clone(),
+                    };
+                    TableFile::new(entry, uploaded.row_groups.clone())
+                })
+                .collect();
+            let committed = datastore.commit_insert(self.table_id, files).await;
+            if let Err(error) = &committed
+                && !error.may_have_committed()
+            {
+                // Deleting is store I/O.
+                let deleted = tokio::task::spawn_blocking(move || {
+                    uploaded.iter().for_each(UploadedFile::delete)
+                });
+                if let Err(panicked) = deleted.await {
+                    tracing::warn!(error = %panicked, "deleting the files of an insert that was not committed panicked");
+                }
+            }
+            Ok(committed?)
+        })
     }
 
     /// Delete every file the INSERT uploaded: none is in the log, so no reader

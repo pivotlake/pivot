@@ -143,7 +143,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
-use catalog::{CommitAction, CommitQueue, StagedCommit};
+use catalog::{ApplyFuture, CommitAction, CommitQueue, StagedCommit};
 use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use iceberg::table::Table;
 use iceberg::{Catalog, ErrorKind};
@@ -727,20 +727,22 @@ struct PendingTableCreation {
 impl CommitAction<IcebergDatastore> for PendingTableCreation {
     /// Register the table through the catalog, then refresh the index, which
     /// is shaped by what the catalog lists.
-    fn apply(self: Box<Self>, datastore: &IcebergDatastore) -> CatalogResult<()> {
-        match write::create_table(
-            &datastore.catalog,
-            &self.name,
-            &self.columns,
-            &self.partition_by,
-            &self.sort_by,
-        ) {
-            Ok(()) => {}
-            Err(Error::Catalog(error))
-                if self.if_not_exists && error.kind() == ErrorKind::TableAlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(datastore.refresh()?)
+    fn apply(self: Box<Self>, datastore: Arc<IcebergDatastore>) -> ApplyFuture {
+        StagedCommit::apply_on_blocking_pool(datastore, move |datastore| {
+            match write::create_table(
+                &datastore.catalog,
+                &self.name,
+                &self.columns,
+                &self.partition_by,
+                &self.sort_by,
+            ) {
+                Ok(()) => {}
+                Err(Error::Catalog(error))
+                    if self.if_not_exists && error.kind() == ErrorKind::TableAlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            Ok(datastore.refresh()?)
+        })
     }
 
     /// A table creation writes nothing before its commit.
@@ -759,9 +761,11 @@ struct PendingTableDrop {
 impl CommitAction<IcebergDatastore> for PendingTableDrop {
     /// Unregister the table through the catalog, leaving its files, then
     /// refresh the index, which is shaped by what the catalog lists.
-    fn apply(self: Box<Self>, datastore: &IcebergDatastore) -> CatalogResult<()> {
-        write::drop_table(&datastore.catalog, &self.name, self.if_exists)?;
-        Ok(datastore.refresh()?)
+    fn apply(self: Box<Self>, datastore: Arc<IcebergDatastore>) -> ApplyFuture {
+        StagedCommit::apply_on_blocking_pool(datastore, move |datastore| {
+            write::drop_table(&datastore.catalog, &self.name, self.if_exists)?;
+            Ok(datastore.refresh()?)
+        })
     }
 
     /// A table drop writes nothing before its commit.

@@ -51,7 +51,7 @@ use system::{DatastoreEntry, SystemTransaction};
 /// where the trait lives; concrete backends (e.g. `datastore_pivotlake::PivotlakeDatastore`)
 /// implement it and are held here behind `Arc<dyn Datastore>`.
 pub use datastore::Datastore;
-pub use staged_commit::{CommitAction, CommitQueue, StagedCommit, drain_injector};
+pub use staged_commit::{ApplyFuture, CommitAction, CommitQueue, StagedCommit, drain_injector};
 
 /// The conventional name for a single-datastore configuration's datastore; see
 /// [`planner::DEFAULT_DATASTORE_NAME`].

@@ -229,6 +229,21 @@ impl IcebergTable {
         }
     }
 
+    /// Whether this version lists more data manifests than a table whose
+    /// small files are being merged ever does: a merge's commit merges the
+    /// small manifests as well, so they pile up only on a table that gains
+    /// files and has none merged. An insert merges manifests itself then,
+    /// and otherwise leaves them, since merging them would take from under
+    /// a merge being committed the manifests it was prepared on.
+    fn has_manifests_piled_up(&self) -> bool {
+        /// A commit merges the newest manifests once there are a hundred of
+        /// them, so a table kept merged lists few more than that.
+        const MOST_DATA_MANIFESTS_OF_A_TABLE_KEPT_MERGED: usize = 500;
+
+        self.table.manifest_list().data_manifests().count()
+            > MOST_DATA_MANIFESTS_OF_A_TABLE_KEPT_MERGED
+    }
+
     /// The entries of the files `removed` names, which are live in this
     /// version.
     fn find_removed_entries(&self, removed: RemovedFiles<'_>) -> Result<Vec<DataFileEntry>> {
@@ -555,14 +570,25 @@ impl Table for IcebergTable {
     ) -> crate::Result<Option<Arc<dyn Table>>> {
         // An Iceberg snapshot says what a commit did by its shape: an append
         // when it removes nothing, else a replace, which changes no row.
-        let removed_entries = self.find_removed_entries(removed)?;
         let added_entries = self.build_uncommitted_entries(added);
         let committed = match prepared {
-            Some(PreparedCommit(prepared)) => {
-                self.table
-                    .commit_prepared(&removed_entries, added_entries, prepared)?
+            // The entries found when the commit was prepared are this
+            // version's too while it lists the manifests they were read
+            // from.
+            Some(prepared) if prepared.rewrite.stands_on(&self.table) => self
+                .table
+                .commit_prepared(&prepared.removed_entries, added_entries, prepared.rewrite)?,
+            Some(prepared) => self.table.commit_prepared(
+                &self.find_removed_entries(removed)?,
+                added_entries,
+                prepared.rewrite,
+            )?,
+            None if removed.paths.is_empty() && !self.has_manifests_piled_up() => {
+                self.table.append_without_merging_manifests(added_entries)?
             }
-            None => self.table.commit(&removed_entries, added_entries)?,
+            None => self
+                .table
+                .commit(&self.find_removed_entries(removed)?, added_entries)?,
         };
         let Some(next) = committed else {
             return Ok(None);
@@ -581,11 +607,18 @@ impl Table for IcebergTable {
         if removed.paths.is_empty() {
             return Ok(None);
         }
-        let prepared = self.table.prepare_rewrite(
-            &self.find_removed_entries(removed)?,
-            &self.build_uncommitted_entries(added),
-        )?;
-        Ok(Some(PreparedCommit(prepared)))
+        let removed_entries = self.find_removed_entries(removed)?;
+        let rewrite = self
+            .table
+            .prepare_rewrite(&removed_entries, &self.build_uncommitted_entries(added))?;
+        Ok(Some(PreparedCommit {
+            rewrite,
+            removed_entries,
+        }))
+    }
+
+    fn does_prepared_commit_stand(&self, prepared: &PreparedCommit) -> bool {
+        prepared.rewrite.stands_on(&self.table)
     }
 
     /// The table's own retention property, or the default.

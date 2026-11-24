@@ -149,8 +149,13 @@ pub(crate) trait TableFactory: Send + Sync {
 }
 
 /// What a version of a table wrote ahead of a commit
-/// ([`Table::prepare_commit`]).
-pub(crate) struct PreparedCommit(pub(crate) iceberg_tables::PreparedRewrite);
+/// ([`Table::prepare_commit`]): the manifests of the version the commit
+/// makes, and the entries, in the version that wrote them, of the files the
+/// commit removes.
+pub(crate) struct PreparedCommit {
+    pub(crate) rewrite: iceberg_tables::PreparedRewrite,
+    pub(crate) removed_entries: Vec<iceberg_tables::files::data_files::DataFileEntry>,
+}
 
 /// One table at one committed version, as its format holds it. Immutable: a
 /// refresh or a commit hands back the next version as a new value, so a
@@ -289,6 +294,10 @@ pub(crate) trait Table: Send + Sync {
         removed: RemovedFiles<'_>,
         added: &[TableFile],
     ) -> Result<Option<PreparedCommit>>;
+    /// Whether what `prepared` holds still stands on this version: the
+    /// commit it was prepared for then removes files this version holds, as
+    /// the version that prepared it did, with nothing looked up again.
+    fn does_prepared_commit_stand(&self, prepared: &PreparedCommit) -> bool;
     /// How long a file this table no longer references is kept before it may
     /// be deleted.
     fn deleted_file_retention(&self) -> Result<Duration>;

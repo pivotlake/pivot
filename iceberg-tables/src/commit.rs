@@ -114,6 +114,23 @@ impl TableCreation<'_> {
 /// ([`Table::prepare_rewrite`]).
 pub struct PreparedRewrite(iceberg::transaction::PreparedRewrite);
 
+impl PreparedRewrite {
+    /// Whether `table` still lists every manifest these take the place of.
+    /// It then lists the files the replace removes exactly where the
+    /// version the replace was prepared on did, so they are live in it and
+    /// their entries are the ones found then.
+    pub fn stands_on(&self, table: &Table) -> bool {
+        let listed: std::collections::HashSet<&str> = table
+            .manifest_list()
+            .data_manifests()
+            .map(|manifest| manifest.manifest_path.as_str())
+            .collect();
+        self.0
+            .replaced_manifest_paths()
+            .all(|path| listed.contains(path))
+    }
+}
+
 /// The files one commit removes and adds, as the spec crate names them.
 struct CommitFiles {
     /// Each file to remove, with the manifest that lists it when the entry
@@ -213,7 +230,20 @@ impl Table {
         removed: &[DataFileEntry],
         added: Vec<DataFileEntry>,
     ) -> Result<Option<Table>> {
-        self.commit_files(self.name_commit_files(removed, &added)?, None)
+        self.commit_files(self.name_commit_files(removed, &added)?, None, true)
+    }
+
+    /// [`commit`](Self::commit) an append that lists the manifest of the
+    /// added files beside the table's manifests and merges none of them. A
+    /// table whose manifests a replace merges as it is prepared
+    /// ([`prepare_rewrite`](Self::prepare_rewrite)) is appended to this way:
+    /// an append that merged manifests would take from under the replace the
+    /// ones it was prepared on.
+    pub fn append_without_merging_manifests(
+        &self,
+        added: Vec<DataFileEntry>,
+    ) -> Result<Option<Table>> {
+        self.commit_files(self.name_commit_files(&[], &added)?, None, false)
     }
 
     /// [`commit`](Self::commit) a replace whose manifests `prepared` holds,
@@ -229,7 +259,11 @@ impl Table {
         added: Vec<DataFileEntry>,
         prepared: PreparedRewrite,
     ) -> Result<Option<Table>> {
-        self.commit_files(self.name_commit_files(removed, &added)?, Some(prepared))
+        self.commit_files(
+            self.name_commit_files(removed, &added)?,
+            Some(prepared),
+            true,
+        )
     }
 
     /// Write, on top of this version, the manifests of the version that
@@ -323,11 +357,13 @@ impl Table {
 
     /// Commit the removal and the addition of `files` on top of this
     /// version, a replace with the manifests `prepared` holds when it holds
-    /// them.
+    /// them. `merges_manifests` says whether an append merges the small
+    /// manifests that have piled up.
     fn commit_files(
         &self,
         files: CommitFiles,
         prepared: Option<PreparedRewrite>,
+        merges_manifests: bool,
     ) -> Result<Option<Table>> {
         let removed_uris = files.removed_uris.clone();
         let committed = self.commit_transaction(Vec::new(), move |transaction| {
@@ -339,7 +375,7 @@ impl Table {
                 return transaction
                     .fast_append()
                     .with_check_duplicate(false)
-                    .with_manifest_merge(true)
+                    .with_manifest_merge(merges_manifests)
                     .add_data_files(files.added)
                     .apply(transaction);
             }

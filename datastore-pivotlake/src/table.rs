@@ -139,6 +139,12 @@ impl TableStorage {
 /// waiting inserts, however many writers wait, and a rewrite waits behind at
 /// most the commits queued before it.
 ///
+/// A writer waits either on its thread or, as an insert does, as a future
+/// that holds none ([`wait_to_commit_without_a_thread`](Self::wait_to_commit_without_a_thread)):
+/// the commit in progress does its store I/O on the runtime's blocking pool,
+/// which hundreds of inserts each waiting on a thread of it would leave
+/// with none.
+///
 /// A rewrite does what it can of its commit before it queues
 /// ([`CatalogTable::prepare_commit`]), on the version the table has then, so
 /// the writers behind it in the queue wait for less. What it prepared stands
@@ -150,8 +156,11 @@ impl TableStorage {
 pub(super) struct CommitQueue {
     state: Mutex<CommitQueueState>,
     /// Signalled when a version has been written and when the turn is given
-    /// up: what a waiting writer waits for.
+    /// up: what a writer waiting on its thread waits for.
     changed: Condvar,
+    /// Notified at the same moments: what a writer waiting as a future
+    /// waits for.
+    changed_for_futures: tokio::sync::Notify,
     /// Held by the one rewrite that is preparing or committing.
     rewrite_turn: Mutex<()>,
 }
@@ -190,20 +199,20 @@ impl CommitOutcome {
 }
 
 /// What a writer that queued a commit waited for.
-pub(super) enum CommitWait<'q> {
+pub(super) enum CommitWait {
     /// Another writer made the commit, and this is how it went.
     Committed(crate::Result<()>),
     /// The turn to commit, with the commit still in the queue.
-    Turn(CommitTurn<'q>),
+    Turn(CommitTurn),
 }
 
 /// The turn to commit to a table, held by one writer at a time and given up
 /// when dropped, which wakes the writers waiting for it.
-pub(super) struct CommitTurn<'q> {
-    queue: &'q CommitQueue,
+pub(super) struct CommitTurn {
+    queue: Arc<CommitQueue>,
 }
 
-impl CommitTurn<'_> {
+impl CommitTurn {
     /// Take the commits at the front of the queue that make the next
     /// version: every insert waiting before the next commit of another
     /// kind, else that one commit alone. An insert removes nothing and
@@ -246,13 +255,15 @@ impl CommitTurn<'_> {
     fn wake_waiting_writers(&self) {
         let _state = self.queue.state.lock().unwrap();
         self.queue.changed.notify_all();
+        self.queue.changed_for_futures.notify_waiters();
     }
 }
 
-impl Drop for CommitTurn<'_> {
+impl Drop for CommitTurn {
     fn drop(&mut self) {
         self.queue.state.lock().unwrap().is_turn_taken = false;
         self.queue.changed.notify_all();
+        self.queue.changed_for_futures.notify_waiters();
     }
 }
 
@@ -344,7 +355,7 @@ impl CommitQueue {
 
     /// Wait until the queued commit with `outcome` has been made, or until
     /// the turn to commit is free and take it, whichever comes first.
-    pub(super) fn wait_to_commit(&self, outcome: &CommitOutcome) -> CommitWait<'_> {
+    pub(super) fn wait_to_commit(self: &Arc<Self>, outcome: &CommitOutcome) -> CommitWait {
         let mut state = self.state.lock().unwrap();
         loop {
             if let Some(committed) = outcome.take() {
@@ -352,21 +363,53 @@ impl CommitQueue {
             }
             if !state.is_turn_taken {
                 state.is_turn_taken = true;
-                return CommitWait::Turn(CommitTurn { queue: self });
+                return CommitWait::Turn(CommitTurn {
+                    queue: Arc::clone(self),
+                });
             }
             state = self.changed.wait(state).unwrap();
         }
     }
 
+    /// [`wait_to_commit`](Self::wait_to_commit) as a future, which holds no
+    /// thread while it waits.
+    pub(super) async fn wait_to_commit_without_a_thread(
+        self: &Arc<Self>,
+        outcome: &CommitOutcome,
+    ) -> CommitWait {
+        loop {
+            // The wait is registered before the outcome and the turn are
+            // looked at, so a change between the look and the wait wakes it.
+            let changed = self.changed_for_futures.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(committed) = outcome.take() {
+                    return CommitWait::Committed(committed);
+                }
+                if !state.is_turn_taken {
+                    state.is_turn_taken = true;
+                    return CommitWait::Turn(CommitTurn {
+                        queue: Arc::clone(self),
+                    });
+                }
+            }
+            changed.await;
+        }
+    }
+
     /// Wait for the turn to commit and take it, for a writer that changes
     /// the table without queueing a commit.
-    pub(super) fn take_turn(&self) -> CommitTurn<'_> {
+    pub(super) fn take_turn(self: &Arc<Self>) -> CommitTurn {
         let mut state = self.state.lock().unwrap();
         while state.is_turn_taken {
             state = self.changed.wait(state).unwrap();
         }
         state.is_turn_taken = true;
-        CommitTurn { queue: self }
+        CommitTurn {
+            queue: Arc::clone(self),
+        }
     }
 }
 
@@ -456,7 +499,14 @@ impl CatalogTable {
         mut prepared: Option<PreparedCommit>,
     ) -> crate::Result<()> {
         loop {
-            self.check_files_are_live(removed)?;
+            // A version what was prepared still stands on holds the files
+            // to remove, as the version that prepared it did.
+            let is_prepared_standing = prepared
+                .as_ref()
+                .is_some_and(|prepared| self.table.does_prepared_commit_stand(prepared));
+            if !is_prepared_standing {
+                self.check_files_are_live(removed)?;
+            }
             // What was prepared goes to the first attempt, which deletes
             // what it wrote of it when it does not commit.
             match self
