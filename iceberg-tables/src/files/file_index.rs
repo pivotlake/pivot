@@ -40,9 +40,9 @@ use std::sync::Arc;
 
 use iceberg::expr::BoundPredicate;
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, Datum, Literal, Manifest, ManifestEntry,
-    ManifestFile, ManifestStatus, PrimitiveLiteral, PrimitiveType, Schema, SchemaRef, Struct,
-    TableMetadata,
+    DataContentType, DataFile, DataFileFormat, Datum, EncodedManifest, FormatVersion, Literal,
+    Manifest, ManifestEntry, ManifestFile, ManifestStatus, PrimitiveLiteral, PrimitiveType, Schema,
+    SchemaRef, Struct, TableMetadata,
 };
 use imbl::HashMap as SharedMap;
 use object_storage::{FileRef, ObjectPath};
@@ -158,6 +158,65 @@ pub(crate) struct DecodedManifest {
 
 /// Files by the key of the partition they sit in.
 pub(crate) type FilesByPartition = HashMap<Arc<[u8]>, Vec<Arc<IndexedFile>>>;
+
+/// The partitions a decode of one manifest, written under the partition
+/// spec `spec_id`, has met, each with whether its files are wanted. A
+/// manifest's entries mostly come in runs of one partition, so the one met
+/// last is looked at first, and a partition's key is encoded once for each
+/// run.
+struct MetPartitions<'w> {
+    spec_id: i32,
+    wants: &'w mut dyn FnMut(&[u8], &Partition) -> Result<bool>,
+    by_key: BTreeMap<Arc<[u8]>, (Arc<Partition>, bool)>,
+    latest: Option<(Arc<[u8]>, Arc<Partition>, bool)>,
+}
+
+impl<'w> MetPartitions<'w> {
+    fn new(spec_id: i32, wants: &'w mut dyn FnMut(&[u8], &Partition) -> Result<bool>) -> Self {
+        Self {
+            spec_id,
+            wants,
+            by_key: BTreeMap::new(),
+            latest: None,
+        }
+    }
+
+    /// Meet the partition of an entry with the tuple `tuple`: its key, the
+    /// partition, and whether its files are wanted, which is asked the
+    /// first time the partition is met.
+    fn meet(&mut self, tuple: &Struct) -> Result<(Arc<[u8]>, Arc<Partition>, bool)> {
+        let is_of_latest = self
+            .latest
+            .as_ref()
+            .is_some_and(|(_, partition, _)| &partition.tuple == tuple);
+        if !is_of_latest {
+            let key = encode_partition(self.spec_id, tuple);
+            let (partition, is_wanted) = match self.by_key.get(&key) {
+                Some(met) => met.clone(),
+                None => {
+                    let partition = Arc::new(Partition::new(self.spec_id, tuple.clone()));
+                    let is_wanted = (self.wants)(&key, &partition)?;
+                    self.by_key
+                        .insert(Arc::clone(&key), (Arc::clone(&partition), is_wanted));
+                    (partition, is_wanted)
+                }
+            };
+            self.latest = Some((key, partition, is_wanted));
+        }
+        Ok(self
+            .latest
+            .clone()
+            .expect("the partition just met is the latest"))
+    }
+
+    /// Every partition met, under its key, in key order.
+    fn into_partitions(self) -> Vec<(Arc<[u8]>, Arc<Partition>)> {
+        self.by_key
+            .into_iter()
+            .map(|(key, (partition, _))| (key, partition))
+            .collect()
+    }
+}
 
 /// What reading a manifest entry into a record needs of its table.
 pub(crate) struct DecodeContext<'t> {
@@ -388,13 +447,8 @@ impl IndexedFile {
         let schema_id = manifest.metadata().schema_id();
         let partition_spec_id = manifest.metadata().partition_spec().spec_id();
         let mut next_row_id = file.first_row_id.map(|first| first as i64);
-        // The partitions met, each with whether it is wanted.
-        let mut partitions: BTreeMap<Arc<[u8]>, (Arc<Partition>, bool)> = BTreeMap::new();
+        let mut partitions = MetPartitions::new(partition_spec_id, wants);
         let mut files = FilesByPartition::new();
-        // The partition of the entry before, with its key and whether it
-        // is wanted: a manifest's entries mostly come in runs of one
-        // partition.
-        let mut latest: Option<(Arc<[u8]>, Arc<Partition>, bool)> = None;
         let (entries, _) = manifest.into_parts();
         for entry in entries {
             let data = entry.data_file();
@@ -424,26 +478,7 @@ impl IndexedFile {
                     format: data.file_format().to_string(),
                 });
             }
-            let is_of_latest = latest.as_ref().is_some_and(|(_, partition, _)| {
-                partition.spec_id == partition_spec_id && &partition.tuple == data.partition()
-            });
-            if !is_of_latest {
-                let key = encode_partition(partition_spec_id, data.partition());
-                let (partition, is_wanted) = match partitions.get(&key) {
-                    Some(met) => met.clone(),
-                    None => {
-                        let partition =
-                            Arc::new(Partition::new(partition_spec_id, data.partition().clone()));
-                        let is_wanted = wants(&key, &partition)?;
-                        partitions.insert(Arc::clone(&key), (Arc::clone(&partition), is_wanted));
-                        (partition, is_wanted)
-                    }
-                };
-                latest = Some((key, partition, is_wanted));
-            }
-            let (key, partition, is_wanted) = latest
-                .as_ref()
-                .expect("the partition of the entry in hand is the latest");
+            let (key, partition, is_wanted) = partitions.meet(data.partition())?;
             if !is_wanted {
                 continue;
             }
@@ -451,24 +486,117 @@ impl IndexedFile {
             // The manifest was parsed for this decode alone, so its entries
             // are its own to give away.
             let entry = Arc::unwrap_or_clone(entry);
-            files
-                .entry(Arc::clone(key))
-                .or_default()
-                .push(Arc::new(Self::new(
-                    entry.data_file,
-                    schema_id,
-                    Arc::clone(partition),
-                    first_row_id,
-                    sequence_number,
-                    context.sort_columns,
-                    context.location,
-                )?));
+            files.entry(key).or_default().push(Arc::new(Self::new(
+                entry.data_file,
+                schema_id,
+                partition,
+                first_row_id,
+                sequence_number,
+                context.sort_columns,
+                context.location,
+            )?));
         }
         Ok(DecodedManifest {
-            partitions: partitions
-                .into_iter()
-                .map(|(key, (partition, _))| (key, partition))
-                .collect(),
+            partitions: partitions.into_partitions(),
+            files,
+        })
+    }
+
+    /// Decode the data manifest `file` from `held`, its entries as the
+    /// format's crate holds them, into what
+    /// [`decode_manifest`](Self::decode_manifest) makes of the manifest
+    /// parsed. A live file `find_record` has a record of, by its
+    /// partition's key and its path, keeps that record when it was made
+    /// under the same schema, commit and row id; only the entries of the
+    /// other files are decoded. A manifest that takes the place of others
+    /// lists mostly files there is a record of.
+    pub(crate) fn decode_held_manifest(
+        file: &ManifestFile,
+        held: &EncodedManifest,
+        context: &DecodeContext<'_>,
+        wants: &mut dyn FnMut(&[u8], &Partition) -> Result<bool>,
+        find_record: &dyn Fn(&[u8], &ObjectPath) -> Option<Arc<IndexedFile>>,
+    ) -> Result<DecodedManifest> {
+        let schema_id = held.metadata().schema_id;
+        let partition_spec_id = held.metadata().partition_spec.spec_id();
+        let is_numbering_no_commit = held.metadata().format_version == FormatVersion::V1;
+        let mut next_row_id = file.first_row_id.map(|first| first as i64);
+        let mut partitions = MetPartitions::new(partition_spec_id, wants);
+        let mut files = FilesByPartition::new();
+        let mut codec = None;
+        for entry in held.entries() {
+            let first_row_id = match entry.first_row_id() {
+                Some(assigned) => Some(assigned),
+                None if entry.is_alive() => {
+                    let assigned = next_row_id;
+                    if let Some(next) = next_row_id.as_mut() {
+                        *next += entry.record_count() as i64;
+                    }
+                    assigned
+                }
+                None => None,
+            };
+            if !entry.is_alive() {
+                continue;
+            }
+            if entry.content_type() != DataContentType::Data {
+                return Err(Error::DeleteFile {
+                    file: entry.file_path().to_string(),
+                });
+            }
+            let (key, partition, is_wanted) = partitions.meet(entry.partition())?;
+            if !is_wanted {
+                continue;
+            }
+            let sequence_number = match entry.sequence_number() {
+                // A version 1 table has no sequence numbers: every entry
+                // reads as the spec's inherited 0.
+                _ if is_numbering_no_commit => 0,
+                Some(number) => number,
+                None if entry.status() == ManifestStatus::Added => file.sequence_number,
+                None => {
+                    return Err(Error::InvalidDataFile {
+                        file: entry.file_path().to_string(),
+                        message: "an existing entry carries no sequence number".to_string(),
+                    });
+                }
+            };
+            let path = context.location.file_path_for_uri(entry.file_path())?;
+            let kept = find_record(&key, &path).filter(|record| {
+                record.schema_id == schema_id
+                    && record.first_row_id == first_row_id
+                    && record.facts.commit_sequence() == u64::try_from(sequence_number).unwrap_or(0)
+            });
+            let record = match kept {
+                Some(record) => record,
+                None => {
+                    let codec = match &codec {
+                        Some(codec) => codec,
+                        None => codec.insert(held.build_codec().map_err(Error::spec)?),
+                    };
+                    let data = codec.decode(entry).map_err(Error::spec)?.data_file;
+                    if data.file_format() != DataFileFormat::Parquet {
+                        return Err(Error::NonParquetFile {
+                            table: context.table.to_string(),
+                            file: data.file_path().to_string(),
+                            format: data.file_format().to_string(),
+                        });
+                    }
+                    Arc::new(Self::new(
+                        data,
+                        schema_id,
+                        partition,
+                        first_row_id,
+                        sequence_number,
+                        context.sort_columns,
+                        context.location,
+                    )?)
+                }
+            };
+            files.entry(key).or_default().push(record);
+        }
+        Ok(DecodedManifest {
+            partitions: partitions.into_partitions(),
             files,
         })
     }

@@ -210,6 +210,9 @@ impl Database {
         maintenance: Option<MaintenanceConfig>,
         format: TableFormat,
     ) -> Self {
+        // A server that has just started holds none of the manifests an
+        // earlier one wrote in the directory.
+        iceberg_tables::forget_held_manifests(&format!("file://{}", dir.path().display()));
         let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::new(dir.path()).unwrap());
         let root = dir.path().to_string_lossy().into_owned();
         Self::open_over(Some(dir), root, store, maintenance, format)

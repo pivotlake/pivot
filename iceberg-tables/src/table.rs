@@ -1148,7 +1148,48 @@ impl Table {
                 .iter()
                 .filter(|manifest| undecoded.contains(manifest.path().as_ref()))
                 .collect();
-            for manifests in undecoded.chunks(MANIFESTS_PER_READ) {
+            // A manifest the format's crate holds, as one this process
+            // wrote is, is neither fetched nor parsed, and a file of it
+            // that the index being advanced has a record of keeps the
+            // record.
+            let held_indexes: HashMap<&[u8], &PartitionIndex> = unbuilt
+                .iter()
+                .filter_map(|partition| {
+                    let key = partitions[partition.position].key.as_ref();
+                    Some((key, partition.held.as_deref()?))
+                })
+                .collect();
+            let find_record = |key: &[u8], path: &ObjectPath| {
+                held_indexes
+                    .get(key)
+                    .and_then(|index| index.find(path))
+                    .cloned()
+            };
+            let mut unheld: Vec<&ListedManifest> = Vec::new();
+            for listed in undecoded {
+                let Some(held) = EncodedManifest::find(&listed.file().manifest_path) else {
+                    unheld.push(listed);
+                    continue;
+                };
+                let table_name = self.name.to_string();
+                let sort_columns = self.resolve_sort_columns();
+                let context = DecodeContext {
+                    table: &table_name,
+                    sort_columns: &sort_columns,
+                    metadata: self.metadata(),
+                    location: &self.location,
+                };
+                let files = IndexedFile::decode_held_manifest(
+                    listed.file(),
+                    &held,
+                    &context,
+                    &mut is_unbuilt,
+                    &find_record,
+                )?
+                .files;
+                decoded.keep(listed.path(), files, false);
+            }
+            for manifests in unheld.chunks(MANIFESTS_PER_READ) {
                 let parsed =
                     self.read_manifests(manifests.iter().map(|manifest| manifest.file()))?;
                 for (listed, manifest) in manifests.iter().zip(parsed) {

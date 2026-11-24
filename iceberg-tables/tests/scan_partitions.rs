@@ -13,7 +13,7 @@ use arrow_array::{ArrayRef, Int64Array, Scalar, TimestampMicrosecondArray};
 use iceberg::spec::{Datum, Literal, PrimitiveLiteral, Transform};
 use iceberg::transform::create_transform_function;
 use iceberg_tables::files::data_files::DataFileEntry;
-use iceberg_tables::{Partition, Table};
+use iceberg_tables::{Partition, Table, forget_held_manifests};
 use object_storage::{FileRef, ObjectPath};
 use parquet_engine::{FileStats, PartitionValues};
 use planner::expression::{Compare, CompareType, Expression, InList, Ref};
@@ -298,16 +298,30 @@ fn a_partition_indexed_before_a_commit_is_read_after_it_from_the_manifest_it_wro
 }
 
 #[test]
-fn the_first_scan_of_a_partition_after_a_commit_reads_the_manifest_the_commit_wrote() {
+fn the_first_scan_of_a_partition_after_a_commit_reads_the_manifest_the_process_does_not_hold() {
+    let (fixture, created) = create_partitioned_table();
+    let first = append(&created, vec![fixture.write_file("early", 7)]);
+    selected(&first, &v_equals(7));
+
+    let second = append(&first, vec![fixture.write_file("late", 7)]);
+    forget_held_manifests(&fixture.location.table_uri());
+    fixture.delete_manifest(&find_joined_manifest(&first, &second));
+    let scan = second.select_scan(&v_equals(7));
+
+    assert!(scan.is_err());
+}
+
+#[test]
+fn the_first_scan_of_a_partition_after_a_commit_reads_no_manifest_the_process_wrote() {
     let (fixture, created) = create_partitioned_table();
     let first = append(&created, vec![fixture.write_file("early", 7)]);
     selected(&first, &v_equals(7));
 
     let second = append(&first, vec![fixture.write_file("late", 7)]);
     fixture.delete_manifest(&find_joined_manifest(&first, &second));
-    let scan = second.select_scan(&v_equals(7));
+    let files = selected(&second, &v_equals(7));
 
-    assert!(scan.is_err());
+    assert_eq!(files, ["early.parquet", "late.parquet"]);
 }
 
 #[test]
@@ -343,6 +357,7 @@ fn a_version_under_another_partition_spec_indexes_a_partition_from_its_manifests
     let written = append(&created, vec![fixture.write_file("seven", 7)]);
     written.select_scan(&[]).unwrap();
     let repartitioned = repartition(&fixture, &[("v", "v_bucket", Transform::Bucket(4))]);
+    forget_held_manifests(&fixture.location.table_uri());
     fixture.delete_data_manifests(&repartitioned);
 
     let scan = repartitioned.select_scan(&[]);
