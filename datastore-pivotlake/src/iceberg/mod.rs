@@ -244,17 +244,20 @@ impl IcebergTable {
             > MOST_DATA_MANIFESTS_OF_A_TABLE_KEPT_MERGED
     }
 
-    /// The entries of the files `removed` names, which are live in this
-    /// version.
-    fn find_removed_entries(&self, removed: RemovedFiles<'_>) -> Result<Vec<DataFileEntry>> {
+    /// The entries of the files `removed` names, looked up together:
+    /// [`Error::CommitConflict`] naming the first this version no longer
+    /// holds.
+    fn find_removed_entries(&self, removed: RemovedFiles<'_>) -> crate::Result<Vec<DataFileEntry>> {
+        let found = self.table.find_entries(removed.partition, removed.paths)?;
         removed
             .paths
             .iter()
-            .map(|path| {
-                Ok(self
-                    .table
-                    .find_entry(removed.partition, path)?
-                    .expect("a file to remove is live in the version it is removed from"))
+            .zip(found)
+            .map(|(path, entry)| {
+                entry.ok_or_else(|| crate::Error::CommitConflict {
+                    location: self.table.location().directory().as_str().to_string(),
+                    file: path.to_string(),
+                })
             })
             .collect()
     }

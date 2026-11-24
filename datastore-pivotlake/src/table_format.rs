@@ -288,7 +288,10 @@ pub(crate) trait Table: Send + Sync {
     /// `removed` and adds `added` can have done ahead of it, so that the
     /// commit itself, which a writer makes while the table's other writers
     /// wait, is left with less. `None` for a commit this format does
-    /// nothing ahead of.
+    /// nothing ahead of. A format that does something ahead looks the
+    /// files to remove up as it does, and returns
+    /// [`Error::CommitConflict`](crate::Error::CommitConflict) naming the
+    /// first this version no longer holds.
     fn prepare_commit(
         &self,
         removed: RemovedFiles<'_>,

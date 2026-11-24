@@ -540,14 +540,14 @@ impl CatalogTable {
     /// Have this version do ahead of the commit that removes `removed` and
     /// adds `added` what its format can, for
     /// [`commit_files`](Self::commit_files) to be handed: `None` when that
-    /// is nothing. Refused like the commit when this version no longer
-    /// holds a file to remove.
+    /// is nothing. A format that prepares a commit looks the files to
+    /// remove up as it does, and refuses like the commit when this version
+    /// no longer holds one; the commit itself checks for the others.
     pub(crate) fn prepare_commit(
         &self,
         removed: RemovedFiles<'_>,
         added: &[TableFile],
     ) -> crate::Result<Option<PreparedCommit>> {
-        self.check_files_are_live(removed)?;
         self.table.prepare_commit(removed, added)
     }
 

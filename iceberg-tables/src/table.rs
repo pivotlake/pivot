@@ -1275,19 +1275,37 @@ impl Table {
         ))
     }
 
-    /// The live file at `path` in the partition with the key `partition`
-    /// as a commit records it, or `None` when this version has no such
-    /// file.
-    pub fn find_entry(&self, partition: &[u8], path: &ObjectPath) -> Result<Option<DataFileEntry>> {
+    /// The live file at each of `paths` in the partition with the key
+    /// `partition` as a commit records it, in the order given: `None` for
+    /// a path this version has no file at.
+    pub fn find_entries(
+        &self,
+        partition: &[u8],
+        paths: &[ObjectPath],
+    ) -> Result<Vec<Option<DataFileEntry>>> {
+        // A commit that only adds files looks for none, and names no
+        // partition.
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
         let partition = self.find_keyed_partition(partition)?;
         let index = self.load_partition(partition)?;
-        index
-            .find(path)
+        let found: Vec<Option<&Arc<IndexedFile>>> =
+            paths.iter().map(|path| index.find(path)).collect();
+        let live: Vec<&Arc<IndexedFile>> = found.iter().flatten().copied().collect();
+        let mut manifest_paths = index.find_manifests_of(&live).into_iter();
+        found
+            .into_iter()
             .map(|file| {
-                let manifest_path = index.find_manifest_of(file).cloned();
-                file.to_entry(self.metadata(), self.columns(), manifest_path)
+                file.map(|file| {
+                    let manifest_path = manifest_paths
+                        .next()
+                        .expect("a manifest is looked for of every live file");
+                    file.to_entry(self.metadata(), self.columns(), manifest_path)
+                })
+                .transpose()
             })
-            .transpose()
+            .collect()
     }
 
     /// `file`, a live file of this version, as the datastore's planners

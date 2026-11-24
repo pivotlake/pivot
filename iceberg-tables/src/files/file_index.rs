@@ -35,7 +35,7 @@
 //! partition and those found to have none, so it tells whether it is a
 //! version's own.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use iceberg::expr::BoundPredicate;
@@ -1123,6 +1123,31 @@ impl PartitionIndex {
             && listed
                 .into_iter()
                 .all(|manifest| self.manifests.contains_key(manifest))
+    }
+
+    /// The path of the manifest the index has each of `files` from, in the
+    /// order given: the manifests' files are gone through once for all of
+    /// them.
+    pub fn find_manifests_of(&self, files: &[&Arc<IndexedFile>]) -> Vec<Option<Arc<str>>> {
+        let wanted: HashSet<*const IndexedFile> =
+            files.iter().map(|file| Arc::as_ptr(file)).collect();
+        let mut manifests: HashMap<*const IndexedFile, &Arc<str>> =
+            HashMap::with_capacity(wanted.len());
+        for (path, listed) in self.manifests.iter() {
+            for file in listed.iter() {
+                if wanted.contains(&Arc::as_ptr(file)) {
+                    manifests.insert(Arc::as_ptr(file), path);
+                }
+            }
+        }
+        files
+            .iter()
+            .map(|file| {
+                manifests
+                    .get(&Arc::as_ptr(file))
+                    .map(|path| Arc::clone(path))
+            })
+            .collect()
     }
 
     /// The path of the manifest the index has `file` from.
