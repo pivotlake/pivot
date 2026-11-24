@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
 import { chooseBlockLabel, readFileKeys } from "../fileKeys";
 import { formatMemory } from "../format";
-import { buildKeyScale, compareBounds, type KeyScale } from "../keyScale";
+import { compareBounds } from "../keyScale";
+import { buildSortOrderLine, type Section } from "../sortOrderLine";
 import type { TableFile } from "../tables";
 import { placeInView, useZoom, WIDTH_ONLY, ZoomControls, ZoomSurface, type Span } from "../zoom";
 
@@ -31,95 +32,46 @@ const NAMED_SORT_COLUMNS = 3;
 type Bar = Span & {
   file: TableFile;
   row: number;
-  // Where the next file of its row starts, which is as far as the bar can be
-  // widened to be seen. Past the line's end for the last file of a row.
+  // How many of the leading sort columns the file holds one value of that
+  // is a section, marked above the bar and not written on it.
+  sectionDepth: number;
+  // Where the next thing in its row starts, which is as far as the bar can
+  // be widened to be seen. Past the line's end for the last in a row.
   roomEnd: number;
+};
+
+// A section as it is drawn: a mark across its stretch of the line, in the
+// row above its files.
+type SectionMark = Section & { row: number };
+
+// A file or a section's mark, while the rows are packed. A file's depth is
+// the number of sections it lies under. A mark's is half a step past the
+// files that span its section, and half a step short of the files inside it.
+type Packed = Span & {
+  depth: number;
+  drawn: { file: TableFile; sectionDepth: number } | { section: Section };
 };
 
 function readFileName(path: string): string {
   return path.slice(path.lastIndexOf("/") + 1);
 }
 
-// The table's sort order as a line from 0 to 1, over the bounds `files` have
-// on `columns`, the table's sort columns in order.
-//
-// Rows are sorted by the first column, within one value of it by the second,
-// and so on. So the line is the first column's range, each value of the
-// first column has a stretch of the line to itself along which the second
-// column runs, each value of the second has a stretch of that, and so on
-// down.
-type SortOrderLine = {
-  // Where a file lies on the line.
-  //
-  // A file is followed down the columns for as long as it holds one value of
-  // each, into that value's stretch. At the first column it holds several
-  // values of, it is drawn from the middle of its first value's stretch to
-  // the middle of its last's: its bounds do not say how much of either end
-  // value it holds. Two files that share only an end value, as the outputs
-  // of one merge side by side do, then meet without overlapping, which is
-  // how the server's compacter treats ranges that touch at one value too. A
-  // file with one value of every column takes that value's whole stretch.
-  placeFile(file: TableFile): Span;
-  // The keys at the two ends of a part of the line: the values of the
-  // columns there, from the first column down to the first the two ends
-  // differ on.
-  nameEnds(part: Span): [string, string];
-};
-
-function buildSortOrderLine(files: TableFile[], columns: string[]): SortOrderLine {
-  const scales: KeyScale[] = columns.map((column) =>
-    buildKeyScale(files.flatMap((file) => [file.bounds[column].min, file.bounds[column].max])),
-  );
-  return {
-    placeFile: (file) => {
-      // The stretch of the line the file has been followed into so far.
-      let stretchStart = 0;
-      let stretchLength = 1;
-      for (const [level, column] of columns.entries()) {
-        const { min, max } = file.bounds[column];
-        const scale = scales[level];
-        if (compareBounds(min, max) !== 0) {
-          const middle = scale.valueShare / 2;
-          return {
-            start: stretchStart + (scale.locate(min) + middle) * stretchLength,
-            end: stretchStart + (scale.locate(max) + middle) * stretchLength,
-          };
-        }
-        stretchStart += scale.locate(min) * stretchLength;
-        stretchLength *= scale.valueShare;
-      }
-      return { start: stretchStart, end: stretchStart + stretchLength };
-    },
-    nameEnds: (part) => {
-      const startValues: string[] = [];
-      const endValues: string[] = [];
-      // Where the two ends are in the stretch both have been followed into.
-      let { start, end } = part;
-      for (const scale of scales) {
-        const atStart = scale.readAt(start);
-        const atEnd = scale.readAt(end);
-        startValues.push(String(atStart.value));
-        endValues.push(String(atEnd.value));
-        if (compareBounds(atStart.value, atEnd.value) !== 0) break;
-        start = atStart.within;
-        end = atEnd.within;
-      }
-      return [startValues.join(" · "), endValues.join(" · ")];
-    },
-  };
-}
-
 // A partition's large files drawn in the table's sort order: each file a bar
-// from its first row to its last. The widest files are placed first, each in
-// the highest row where it overlaps nothing already there, so files that
-// span everything pile up at the top and narrow ones settle beneath them. A
-// file too narrow to be seen is drawn wider where its row has the room, and
-// files side by side that are narrower still run together into a strip.
+// from its first row to its last. A file too narrow to be seen is drawn
+// wider where its row has the room, and files side by side that are narrower
+// still run together into a strip.
 //
 // Two bars one above the other are two files holding keys from the same
 // stretch of the sort order, which a query for a key there has to open both
 // of, and which a layout merge rewrites into files side by side. A partition
 // whose large files are fully sorted is a single row.
+//
+// A value of a sort column that files hold alone is a section, as wide as
+// those files are many. It is marked by a ruled line with the value on it,
+// in the row where the separation happens: below the files that span the
+// section, and above the files inside it, whose own sections are marked
+// further down in turn. A bar's keys start below the sections it lies under.
+// A double click on a section's mark zooms to the section.
 //
 // The map zooms into a part of the sort order. Files keep their rows as it
 // does, and a bar wide enough for it has the file's keys written on it. A
@@ -129,10 +81,10 @@ function buildSortOrderLine(files: TableFile[], columns: string[]): SortOrderLin
 export function KeyRangeMap({ files, sortBy }: { files: TableFile[]; sortBy: string[] }) {
   const [hoveredPath, setHoveredPath] = useState<string>();
 
-  const { bars, rowCount, columns, line } = useMemo(() => {
+  const { bars, marks, rowCount, columns, line } = useMemo(() => {
     const drawable = files.filter((file) => file.bounds[sortBy[0]]);
     if (drawable.length === 0) {
-      return { bars: [], rowCount: 0, columns: [], line: undefined };
+      return { bars: [], marks: [], rowCount: 0, columns: [], line: undefined };
     }
     // The sort columns files are placed by: from the first, for as long as
     // every file drawn has bounds on them.
@@ -140,37 +92,59 @@ export function KeyRangeMap({ files, sortBy }: { files: TableFile[]; sortBy: str
     const columns = firstUnbounded === -1 ? sortBy : sortBy.slice(0, firstUnbounded);
     const line = buildSortOrderLine(drawable, columns);
 
-    // Rows are packed by where the files lie, so two files share a row
-    // exactly when they do not overlap, however narrow they are.
-    const spans = drawable
-      .map((file) => ({ file, ...line.placeFile(file) }))
-      .sort(
-        (left, right) => right.end - right.start - (left.end - left.start) || left.start - right.start,
-      );
-
-    // What each row holds so far, for finding the highest row a span fits in.
-    const rows: (Span & { file: TableFile })[][] = [];
-    for (const span of spans) {
-      const row = rows.find((placed) =>
-        placed.every((other) => span.end <= other.start || other.end <= span.start),
-      );
-      if (row) {
-        row.push(span);
-      } else {
-        rows.push([span]);
-      }
-    }
-    const bars: Bar[] = rows.flatMap((placed, row) =>
-      placed
-        .sort((left, right) => left.start - right.start)
-        .map((span, index) => ({
-          ...span,
-          row,
-          roomEnd: index + 1 < placed.length ? placed[index + 1].start : Number.POSITIVE_INFINITY,
-        })),
+    // Rows are packed by where things lie, so two files share a row exactly
+    // when they do not overlap, however narrow they are. The shallowest go
+    // first, and among those the widest.
+    const packed: Packed[] = [
+      ...drawable.map((file) => {
+        const { start, end, sectionDepth } = line.placeFile(file);
+        return { start, end, depth: sectionDepth, drawn: { file, sectionDepth } };
+      }),
+      ...line.sections.map((section) => ({
+        start: section.start,
+        end: section.end,
+        depth: section.level + 0.5,
+        drawn: { section },
+      })),
+    ].sort(
+      (left, right) =>
+        left.depth - right.depth ||
+        right.end - right.start - (left.end - left.start) ||
+        left.start - right.start,
     );
 
-    return { bars, rowCount: rows.length, columns, line };
+    // What each row holds so far. Each thing goes in the highest row it fits
+    // in that is below everything shallower it overlaps: a section's mark
+    // below the files that span the section, and its files below the mark.
+    const rows: Packed[][] = [];
+    for (const next of packed) {
+      const isClearOf = (other: Span) => next.end <= other.start || other.end <= next.start;
+      let row = 0;
+      for (const [above, placed] of rows.entries()) {
+        if (placed.some((other) => other.depth < next.depth && !isClearOf(other))) {
+          row = above + 1;
+        }
+      }
+      while (row < rows.length && !rows[row].every(isClearOf)) row += 1;
+      if (row === rows.length) rows.push([]);
+      rows[row].push(next);
+    }
+
+    const bars: Bar[] = [];
+    const marks: SectionMark[] = [];
+    for (const [row, placed] of rows.entries()) {
+      placed.sort((left, right) => left.start - right.start);
+      for (const [index, { start, end, drawn }] of placed.entries()) {
+        if ("section" in drawn) {
+          marks.push({ ...drawn.section, row });
+        } else {
+          const roomEnd = index + 1 < placed.length ? placed[index + 1].start : Number.POSITIVE_INFINITY;
+          bars.push({ ...drawn, start, end, row, roomEnd });
+        }
+      }
+    }
+
+    return { bars, marks, rowCount: rows.length, columns, line };
   }, [files, sortBy]);
 
   const plotHeightPx = Math.min(rowCount * ROW_HEIGHT_PX, TALLEST_PLOT_PX);
@@ -203,6 +177,13 @@ export function KeyRangeMap({ files, sortBy }: { files: TableFile[]; sortBy: str
       topPx: (bar.row - firstRowShown) * rowHeightPx,
     }))
     .filter(({ place, topPx }) => place.width > 0 && topPx + rowHeightPx > 0 && topPx < plotHeightPx);
+  const visibleMarks = marks
+    .map((mark) => ({
+      mark,
+      place: placeInView(zoom.shown, mark),
+      topPx: (mark.row - firstRowShown) * rowHeightPx,
+    }))
+    .filter(({ place, topPx }) => place.width > 0 && topPx + rowHeightPx > 0 && topPx < plotHeightPx);
   const hovered = visibleBars.find(({ bar }) => bar.file.path === hoveredPath);
   const [firstKeys, lastKeys] = line.nameEnds(zoom.shown);
 
@@ -218,12 +199,42 @@ export function KeyRangeMap({ files, sortBy }: { files: TableFile[]; sortBy: str
         {(widthPx) => (
           <>
             <div className="key-map-files">
+              {visibleMarks.map(({ mark, place, topPx }) => (
+                <div
+                  key={`${mark.level} ${mark.start}`}
+                  className={[
+                    "key-map-section",
+                    place.isCutLeft && "is-cut-left",
+                    place.isCutRight && "is-cut-right",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  style={{
+                    left: `${place.left * 100}%`,
+                    width: `${place.width * 100}%`,
+                    top: topPx,
+                    height: rowHeightPx,
+                  }}
+                  title={`${mark.column} ${String(mark.value)}: ${mark.fileCount} ${mark.fileCount === 1 ? "file" : "files"}`}
+                  onDoubleClick={(event) => {
+                    event.stopPropagation();
+                    zoom.showStretch(mark, (mark.row + 0.5) / rowCount);
+                  }}
+                >
+                  {rowHeightPx >= LEAST_LABELLED_ROW_PX && (
+                    <span className="key-map-section-name">{String(mark.value)}</span>
+                  )}
+                </div>
+              ))}
               {visibleBars.map(({ bar, place, topPx }) => {
                 const isTooSmallForOutline =
                   rowHeightPx < LEAST_OUTLINED_ROW_PX || place.width * widthPx < LEAST_OUTLINED_BAR_PX;
                 const label =
                   rowHeightPx >= LEAST_LABELLED_ROW_PX
-                    ? chooseBlockLabel(readFileKeys(bar.file, sortBy), place.width * widthPx)
+                    ? chooseBlockLabel(
+                        readFileKeys(bar.file, sortBy).slice(bar.sectionDepth),
+                        place.width * widthPx,
+                      )
                     : undefined;
                 return (
                   <div
@@ -299,8 +310,8 @@ export function KeyRangeMap({ files, sortBy }: { files: TableFile[]; sortBy: str
       </div>
       {isSqueezed && (
         <p className="page-note">
-          {rowCount} rows of overlapping files, drawn thinner than usual to fit. Zooming in opens them up, and
-          dragging then moves up and down the rows as well.
+          {rowCount} rows, drawn thinner than usual to fit. Zooming in opens them up, and dragging then moves
+          up and down the rows as well.
         </p>
       )}
       {bars.length < files.length && (

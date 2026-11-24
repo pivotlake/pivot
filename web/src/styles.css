@@ -1001,6 +1001,56 @@ body {
   color: var(--text);
 }
 
+/* A section's mark, in the row above the section's files: a ruled line
+   across the section with a tick at each end, and the value in the middle
+   of it in small grey text. */
+.key-map-section {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.key-map-section::before,
+.key-map-section::after {
+  content: "";
+  flex: 1 1 0;
+  min-width: 3px;
+  height: 7px;
+  background: linear-gradient(var(--hairline-strong), var(--hairline-strong)) center / 100% 1px no-repeat;
+}
+
+.key-map-section::before {
+  border-left: 1px solid var(--hairline-strong);
+}
+
+.key-map-section::after {
+  border-right: 1px solid var(--hairline-strong);
+}
+
+.key-map-section:hover {
+  color: var(--text);
+}
+
+.key-map-section-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A section that goes on past an edge of what is shown has no end there. */
+.key-map-section.is-cut-left::before {
+  border-left: 0;
+}
+
+.key-map-section.is-cut-right::after {
+  border-right: 0;
+}
+
 /* A file that goes on past an edge of what is shown has no end there. */
 .key-map-file.is-cut-left {
   border-left: 0;
