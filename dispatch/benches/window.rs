@@ -46,6 +46,9 @@
 //! * `row_number_by_instructions_then_date` - `row_number()` per supplier by
 //!   shipping instructions, then ship date: a string that is short in half
 //!   the rows and long in the other half, with many ties.
+//! * `row_number_by_price_without_partitions` - `row_number()` over all the
+//!   rows by price. Without a partition key the window has one bucket, so
+//!   every row goes through one merge.
 //!
 //! # Running
 //!
@@ -626,6 +629,20 @@ fn bench_windows(criterion: &mut Criterion, dispatcher: &DataFlowDispatcher) {
         WindowSpec {
             partition_by: vec![0],
             order_by: vec![OrderBy::new(3, false, false), OrderBy::new(2, false, false)],
+            functions: vec![WindowFunction::RowNumber],
+            row_limit: None,
+        },
+    );
+
+    register_scenario(
+        &mut group,
+        dispatcher,
+        "row_number_by_price_without_partitions",
+        vec![decimal("price", 15, 2)],
+        |lines, _| vec![lines.build_price_col()],
+        WindowSpec {
+            partition_by: Vec::new(),
+            order_by: vec![OrderBy::new(0, false, false)],
             functions: vec![WindowFunction::RowNumber],
             row_limit: None,
         },

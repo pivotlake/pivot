@@ -64,9 +64,10 @@
 //! ```
 //!
 //! Tunables (env): `PIVOT_BENCH_SORT_MB` (MiB of data per scenario, default
-//! 1024), `PIVOT_BENCH_WORKERS` (default: all cores), `PIVOT_BENCH_BUFFERS`
-//! (ring slots of 2 MiB each; defaults to 16x the scenario size, i.e. 8192
-//! slots at the 1 GiB default).
+//! 1024), `PIVOT_BENCH_BATCH_ROWS` (rows per input batch, default 65536; a
+//! table scan delivers 8192), `PIVOT_BENCH_WORKERS` (default: all cores),
+//! `PIVOT_BENCH_BUFFERS` (ring slots of 2 MiB each; defaults to 16x the
+//! scenario size, i.e. 8192 slots at the 1 GiB default).
 //!
 //! Sizing the ring: the sorted output and the intermediate merge runs live on
 //! ring buffers, so the ring must hold several multiples of the input size.
@@ -93,9 +94,14 @@ use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, OrderBy, memory_ctx, v
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Rows per `RecordBatch`. Mirrors a scan morsel: many independent batches fan
-/// out across workers through the work-stealing injector.
-const BATCH_ROWS: usize = 64 * 1024;
+/// Rows per input `RecordBatch`. Many independent batches fan out across
+/// workers through the work-stealing injector. The sort makes its runs from
+/// whole batches, so the batch size decides how many runs it merges.
+fn read_batch_rows() -> usize {
+    let batch_rows = read_env_usize("PIVOT_BENCH_BATCH_ROWS", 64 * 1024);
+    assert!(batch_rows > 0, "PIVOT_BENCH_BATCH_ROWS must be at least 1");
+    batch_rows
+}
 
 /// Ring slots per byte of scenario data: the sorted output and the
 /// intermediate merge runs both live on ring buffers, and 8x the input has
@@ -335,16 +341,18 @@ fn count_logical_bytes(batch: &RecordBatch) -> usize {
         .sum()
 }
 
-/// Build `BATCH_ROWS`-sized batches until their logical bytes reach `target`.
+/// Build batches of [`read_batch_rows`] rows until their logical bytes reach
+/// `target`.
 fn generate_until(
     target: usize,
     schema: &Arc<Schema>,
     mut make_cols: impl FnMut(usize) -> Vec<ArrayRef>,
 ) -> Vec<RecordBatch> {
+    let batch_rows = read_batch_rows();
     let mut total = 0;
     let mut batches = Vec::new();
     while total < target {
-        let batch = RecordBatch::try_new(schema.clone(), make_cols(BATCH_ROWS)).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), make_cols(batch_rows)).unwrap();
         total += count_logical_bytes(&batch);
         batches.push(batch);
     }
