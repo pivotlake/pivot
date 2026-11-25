@@ -7,14 +7,16 @@
 //! The merged output is divided into pieces, and each piece is one task. A
 //! boundary between two pieces is a place in every run: the rows before it
 //! go to the earlier piece. Every boundary therefore takes a binary search
-//! in every run.
+//! in every run, and how the boundaries are found depends on the size of the
+//! merge.
 //!
-//! Making those searches while the plan is built would keep the one thread
-//! that builds it busy for longer than a large merge itself takes. So the
-//! plan only picks the boundaries: it reads a sample of the rows, every so
-//! many rows of each run, sorts it, and takes rows at even steps through the
-//! sorted sample. The task that merges a piece then finds its two boundaries
-//! in the runs.
+//! A merge small enough for its pieces to be single record batches finds its
+//! boundaries while the plan is built. A larger merge would keep the one
+//! thread that builds the plan busy for longer than the merge itself takes,
+//! so its plan only picks the boundaries: it reads a sample of the rows,
+//! every so many rows of each run, sorts it, and takes rows at even steps
+//! through the sorted sample. The task that merges a piece then finds its
+//! two boundaries in the runs.
 //!
 //! The worker that runs a task cuts its piece into parts, and orders each
 //! part's row positions and gathers each output column once. The number of
@@ -25,12 +27,13 @@
 //! the number of searches below the number of rows however large the merge
 //! is.
 //!
-//! A part is cut out of its piece by repeatedly bisecting the largest
-//! remaining run. Its midpoint is the pivot, and binary searches locate the
-//! corresponding boundary in every other run. A part therefore gets no larger
-//! than asked even when many runs contain the same key. Equal keys use run
-//! position only to make the independently found boundaries agree with each
-//! other; callers must not rely on that internal order.
+//! Boundaries found while planning and parts are cut the same way: by
+//! repeatedly bisecting the largest remaining run. Its midpoint is the
+//! pivot, and binary searches locate the corresponding boundary in every
+//! other run. A part therefore gets no larger than asked even when many runs
+//! contain the same key. Equal keys use run position only to make the
+//! independently found boundaries agree with each other; callers must not
+//! rely on that internal order.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -83,8 +86,16 @@ struct KWayMergePiece {
     target_node: usize,
 }
 
-/// Where each piece of the merged output ends and the next begins: at rows
-/// of a sorted sample of the runs, which the tasks find in the runs.
+/// Where each piece of the merged output ends and the next begins.
+enum PieceBoundaries {
+    /// Found while the plan was built: for each boundary, how many rows of
+    /// each run sort before it.
+    Planned(Vec<Vec<usize>>),
+    /// Picked from a sample, for the tasks to find in the runs.
+    Sampled(SampledBoundaries),
+}
+
+/// Boundaries between pieces that are rows of a sorted sample of the runs.
 struct SampledBoundaries {
     /// How many rows lie between two neighbouring sampled rows of a run.
     sample_gap: usize,
@@ -124,7 +135,7 @@ struct ParallelKWayMerge {
     pieces: Vec<KWayMergePiece>,
     /// The boundary between each piece and the next, so one fewer than
     /// there are pieces.
-    boundaries: SampledBoundaries,
+    boundaries: PieceBoundaries,
     /// The most rows that are ordered and gathered in one go.
     part_rows: usize,
     row_count: usize,
@@ -162,14 +173,24 @@ impl ParallelKWayMerge {
         let longest_piece_rows = MAX_PIECE_ROWS.max(shortest_piece_rows);
         let piece_rows =
             (row_count / TARGET_PIECE_COUNT).clamp(shortest_piece_rows, longest_piece_rows);
-        let (pieces, boundaries) = Self::sample_boundaries(
-            &order_by,
-            &batches,
-            &run_indexes,
-            &run_nodes,
-            node_count,
-            piece_rows,
-        )?;
+        // Pieces of one record batch mean a merge of at most
+        // `TARGET_PIECE_COUNT` record batches in a few dozen runs. Finding
+        // its boundaries here takes less than a sample does: a sampled
+        // boundary costs `SAMPLES_PER_PIECE` rows read and sorted, and still
+        // a search in every run afterwards. It also fills the pieces, where
+        // sampled ones are aimed under a record batch.
+        let (pieces, boundaries) = if piece_rows == MERGE_SLICE_ROWS {
+            Self::plan_boundaries(&ordering, &run_indexes, &run_nodes, node_count, piece_rows)
+        } else {
+            Self::sample_boundaries(
+                &order_by,
+                &batches,
+                &run_indexes,
+                &run_nodes,
+                node_count,
+                piece_rows,
+            )?
+        };
 
         // SAFETY: the ordering points into the buffers of the batches'
         // arrays. Those are reference counted and stay where they are when
@@ -189,6 +210,48 @@ impl ParallelKWayMerge {
         })
     }
 
+    /// Cuts the merge of the runs into pieces of at most `piece_rows` rows,
+    /// and returns the pieces with the boundaries between them.
+    fn plan_boundaries(
+        ordering: &KeyOrdering,
+        run_indexes: &[RunIndex],
+        run_nodes: &[usize],
+        node_count: usize,
+        piece_rows: usize,
+    ) -> (Vec<KWayMergePiece>, PieceBoundaries) {
+        let all_run_rows = run_indexes
+            .iter()
+            .map(|index| 0..index.row_count)
+            .collect::<Vec<_>>();
+        let mut run_rows_by_piece = Vec::new();
+        split_into_parts(
+            ordering,
+            run_indexes,
+            all_run_rows,
+            piece_rows,
+            &mut run_rows_by_piece,
+        );
+        let pieces = run_rows_by_piece
+            .iter()
+            .map(|run_rows| {
+                let mut rows_by_node = vec![0usize; node_count];
+                for (rows, &node) in run_rows.iter().zip(run_nodes) {
+                    rows_by_node[node] += rows.len();
+                }
+                KWayMergePiece {
+                    target_node: dominant_node(&rows_by_node),
+                }
+            })
+            .collect();
+        // A piece starts in every run where the piece before it ends.
+        let run_rows_before_boundaries = run_rows_by_piece
+            .iter()
+            .skip(1)
+            .map(|run_rows| run_rows.iter().map(|rows| rows.start).collect())
+            .collect();
+        (pieces, PieceBoundaries::Planned(run_rows_before_boundaries))
+    }
+
     /// Picks the boundaries between pieces of about `piece_rows` rows from a
     /// sample of the runs' rows, and returns the pieces with the boundaries.
     fn sample_boundaries(
@@ -198,7 +261,7 @@ impl ParallelKWayMerge {
         run_nodes: &[usize],
         node_count: usize,
         piece_rows: usize,
-    ) -> Result<(Vec<KWayMergePiece>, SampledBoundaries), ArrowError> {
+    ) -> Result<(Vec<KWayMergePiece>, PieceBoundaries), ArrowError> {
         let row_count: usize = run_indexes.iter().map(|index| index.row_count).sum();
         // The sample only estimates how many rows a piece gets. Pieces are
         // aimed an eighth under `piece_rows`, so that few come out over it.
@@ -277,12 +340,12 @@ impl ParallelKWayMerge {
                 }
             })
             .collect();
-        let boundaries = SampledBoundaries {
+        let boundaries = PieceBoundaries::Sampled(SampledBoundaries {
             sample_gap,
             first_sample_row_by_run,
             sample_ranks_by_run,
             boundaries,
-        };
+        });
         Ok((pieces, boundaries))
     }
 
@@ -294,12 +357,17 @@ impl ParallelKWayMerge {
     /// How many rows of each run sort before the boundary between piece
     /// `boundary_index` and the piece after it.
     ///
-    /// The sorted sample says where to look. A run's
+    /// For a sampled boundary, the sorted sample says where to look. A run's
     /// sampled rows that rank below the boundary sort before it, and the rest
     /// sort after it, so the boundary falls between two neighbouring sampled
     /// rows of the run, and only the rows between those are searched.
     fn find_run_rows_before(&self, boundary_index: usize) -> &[usize] {
-        let sampled = &self.boundaries;
+        let sampled = match &self.boundaries {
+            PieceBoundaries::Planned(run_rows_before_boundaries) => {
+                return &run_rows_before_boundaries[boundary_index];
+            }
+            PieceBoundaries::Sampled(sampled) => sampled,
+        };
         let boundary = &sampled.boundaries[boundary_index];
         boundary.run_rows_before.get_or_init(|| {
             self.run_indexes
