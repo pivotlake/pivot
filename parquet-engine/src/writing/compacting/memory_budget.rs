@@ -125,10 +125,9 @@ impl MemoryBudget {
 
     /// Whether `bytes` more can be held without passing half the limit.
     ///
-    /// This is the test for work that is done ahead of the rows whose order
-    /// is decided: sort keys decoded further ahead, and column chunks
-    /// fetched before their rows are ordered. The other half of the limit
-    /// is left for the columns of the rows whose order is decided.
+    /// This is the test for ordering rows further ahead than the workers
+    /// need to stay busy. The other half of the limit is left for the
+    /// columns of the rows whose order is decided.
     pub(super) fn has_room_ahead_for(&self, bytes: usize) -> bool {
         self.held_bytes.load(Ordering::Relaxed) + bytes <= self.limit_bytes / 2
     }

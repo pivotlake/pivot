@@ -328,6 +328,7 @@ impl ViewColumn {
                     &mut self.buffers,
                     &mut self.open_block_idx,
                     value,
+                    &mut { usize::MAX },
                     allocator,
                 )
             };
@@ -488,12 +489,20 @@ fn source_parts(source: &ArrayRef) -> (&[u128], &[Buffer], Option<&NullBuffer>) 
 /// Copy `value` into the block being filled, the one at `open_block_idx`,
 /// opening one (or a larger one for an outsized value) as needed, and return
 /// the view naming where it landed.
+///
+/// `bytes_left_to_copy` is how many bytes of values the caller still has to
+/// copy into these blocks, this value included, or `usize::MAX` when it does
+/// not know. A block that is opened is no larger than that, so that a column
+/// of few bytes does not take a whole standard block for them.
 pub fn copy_value(
     blocks: &mut Vec<DataBlock>,
     open_block_idx: &mut Option<usize>,
     value: &[u8],
+    bytes_left_to_copy: &mut usize,
     allocator: &mut SlabAllocator,
 ) -> u128 {
+    let bytes_left = *bytes_left_to_copy;
+    *bytes_left_to_copy = bytes_left.saturating_sub(value.len());
     if value.len() > BUFFER_SIZE {
         blocks.push(DataBlock::OversizedValue(value.to_vec()));
         return make_view(value, blocks.len() as u32 - 1, 0);
@@ -506,7 +515,7 @@ pub fn copy_value(
     if free < value.len() {
         // A value too large for a standard block takes a block sized to it,
         // which still fits one slab (anything larger took the branch above).
-        let size = DATA_BLOCK_SIZE.max(value.len());
+        let size = DATA_BLOCK_SIZE.min(bytes_left).max(value.len());
         blocks.push(DataBlock::Slab {
             slab: allocator.create_slab_buffer(size, false),
             size,

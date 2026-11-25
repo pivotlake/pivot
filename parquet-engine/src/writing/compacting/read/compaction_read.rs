@@ -39,11 +39,16 @@
 //! is being encoded or stored: one that is gives its memory back when it
 //! is stored, and the read waits for that instead.
 //!
-//! Nothing but memory limits how far ahead the read works. Rows are
-//! ordered and sort keys decoded ahead while what is held is within half
-//! the budget, which leaves the other half to the columns of the rows whose
-//! order is decided. Chunks are fetched ahead within a quarter of the
-//! budget.
+//! Nothing but memory limits how far ahead the read works. The next rows
+//! are ordered as soon as the decoding of every ordered row was started,
+//! and the sort keys of the next two ranges of rows of each file past the
+//! merge are decoded, while the budget has room: the workers that decode and
+//! encode would otherwise run out of rows. Rows are ordered further ahead
+//! than that while what is held is within half the budget, which leaves
+//! the other half to the columns of the rows whose order is decided. Chunks
+//! are fetched ahead within a sixteenth of the budget: the chunks of the next
+//! few output row groups, which is as far as fetching ahead was measured to
+//! help.
 
 use std::collections::VecDeque;
 
@@ -52,6 +57,7 @@ use dispatch::{Sender, UnaryResult};
 
 use super::output::MergedBatchColumn;
 use crate::ParquetTable;
+use crate::reading::DECODE_RANGE_ROWS;
 use crate::writing::compacting::read::input::decoded_values::DecodedValues;
 use crate::writing::compacting::read::input::input_file::InputFile;
 use crate::writing::compacting::read::input::read_requests::ReadRequests;
@@ -59,6 +65,14 @@ use crate::writing::compacting::read::row_order::key_merge::{KeyMerge, NextRun, 
 use crate::writing::compacting::read::row_order::output_row_group::OutputRowGroup;
 use crate::writing::compacting::settings::MergeSortSettings;
 use crate::writing::error::WriteResult;
+
+/// How many rows of sort keys past the last merged row of a file are
+/// decoded ahead of the merge: two of the ranges that rows are decoded
+/// in. The merge takes at most half a range of a file's rows at a time,
+/// so this keeps it from waiting for keys. Keys decoded further ahead
+/// stay in memory for longer, and each of their arrays keeps the whole
+/// block it was built in.
+const KEY_ROWS_DECODED_AHEAD: u64 = 2 * DECODE_RANGE_ROWS as u64;
 
 /// A compaction's read of its input files in merge order.
 pub(crate) struct CompactionRead {
@@ -313,20 +327,32 @@ impl CompactionRead {
     /// back to its gates in between. Returns whether the order of any row
     /// was decided or the decoding of any key was started.
     ///
-    /// While no ordered output row group waits to be sent on and none is
-    /// being encoded or stored, the output cannot go on without this: the
-    /// keys the merge needs are released to be decoded whatever the memory
-    /// budget says. Ordering more than that
-    /// is work ahead. It goes on only while the budget has room for work
-    /// ahead, and a key it needs is released only if the budget has that
-    /// room for it.
+    /// How much room the budget must have for this depends on how much
+    /// the rows are needed:
+    ///
+    /// - While no ordered output row group waits to be sent on and none is
+    ///   being encoded or stored, the output cannot go on without them:
+    ///   the keys the merge needs are released to be decoded whatever the
+    ///   memory budget says.
+    /// - While the decoding of every ordered row was started, the workers
+    ///   that decode and encode are about to run out of rows: the next
+    ///   rows are ordered, and the keys that takes released, as long as
+    ///   the budget has room at all.
+    /// - Ordering more than that is work ahead. It goes on only while the
+    ///   budget has room for work ahead, and a key it needs is released
+    ///   only if the budget has that room for it.
     fn decide_row_order_of_output_row_groups(&mut self) -> WriteResult<bool> {
         let is_every_row_ordered = self.merge.row_groups_to_merge().is_empty();
         let memory_budget = &self.requests.memory_budget;
         let is_required =
             self.ordered_row_groups.is_empty() && !memory_budget.has_output_row_group_in_flight();
-        let has_room_ahead = memory_budget.has_room_ahead_for(0);
-        if is_every_row_ordered || !(is_required || has_room_ahead) {
+        let mut ordered_row_groups = self.ordered_row_groups.iter();
+        let is_every_ordered_row_decoding =
+            ordered_row_groups.all(|row_group| row_group.find_next_to_decode().is_none());
+        let is_wanted = is_required
+            || (is_every_ordered_row_decoding && memory_budget.has_room_for(0))
+            || memory_budget.has_room_ahead_for(0);
+        if is_every_row_ordered || !is_wanted {
             return Ok(false);
         }
         let mut has_ordered_rows = false;
@@ -352,7 +378,11 @@ impl CompactionRead {
                         let rows_end = needed_key.row + 1;
                         let estimated_bytes = file.estimate_bytes_to_decode(column, rows_end);
                         let memory_budget = &self.requests.memory_budget;
-                        if is_required || memory_budget.has_room_ahead_for(estimated_bytes) {
+                        let has_room = match is_every_ordered_row_decoding {
+                            true => memory_budget.has_room_for(estimated_bytes),
+                            false => memory_budget.has_room_ahead_for(estimated_bytes),
+                        };
+                        if is_required || has_room {
                             has_started_decoding_keys |=
                                 file.start_decoding_rows(column, rows_end, &mut self.requests);
                         }
@@ -442,13 +472,13 @@ impl CompactionRead {
     /// Returns whether the decoding of any key was started.
     ///
     /// The keys of the row groups to merge are decoded a range of rows at a
-    /// time, each row group in turn, while the memory budget has room for
-    /// work ahead, and no further than one output row group's worth of rows
-    /// past the last merged row of their file: the merge cannot use more
-    /// before the next output row group is ordered.
+    /// time, each row group in turn, while the memory budget has room, and
+    /// no further than [`KEY_ROWS_DECODED_AHEAD`] rows past the last merged
+    /// row of their file. The merge needs these keys for certain,
+    /// and every worker waits with it when it has to wait for them, so they
+    /// are not held to the room for work ahead.
     fn start_decoding_sort_keys_ahead(&mut self) -> bool {
         let mut has_started = false;
-        let output_row_group_rows = self.row_group_being_ordered.row_limit as u64;
         loop {
             let mut has_started_range = false;
             for &row_group in self.merge.row_groups_to_merge() {
@@ -456,7 +486,7 @@ impl CompactionRead {
                 let row_group_rows = file.row_groups[row_group.row_group].rows.clone();
                 let rows_end = row_group_rows
                     .end
-                    .min(self.merge.count_merged_rows(row_group.file) + output_row_group_rows);
+                    .min(self.merge.count_merged_rows(row_group.file) + KEY_ROWS_DECODED_AHEAD);
                 for &column in &self.sort_columns {
                     let released_rows_end = file.find_released_rows_end(column);
                     // The file's rows are released in file order, so a row
@@ -467,7 +497,7 @@ impl CompactionRead {
                     let estimated_bytes =
                         file.estimate_bytes_to_decode(column, released_rows_end + 1);
                     let memory_budget = &self.requests.memory_budget;
-                    if !memory_budget.has_room_ahead_for(estimated_bytes) {
+                    if !memory_budget.has_room_for(estimated_bytes) {
                         return has_started;
                     }
                     file.start_decoding_rows(column, released_rows_end + 1, &mut self.requests);

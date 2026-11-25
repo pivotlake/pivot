@@ -74,8 +74,7 @@ impl DecompressGate {
             .collect()
     }
 
-    /// Count `page` as held decompressed rather than compressed, and tell
-    /// the compacter that it no longer waits compressed. The
+    /// Count `page` as held decompressed rather than compressed. The
     /// [`PageMemoryCounter`](super::page_memory_counter::PageMemoryCounter)
     /// takes the decompressed count over once the page is decompressed, and
     /// keeps it for as long as the page's bytes are held.
@@ -83,12 +82,17 @@ impl DecompressGate {
         self.memory_budget
             .add(page.header.uncompressed_page_size as usize);
         self.memory_budget.subtract(page.span);
-        self.gated_reads.record_page_let_through(page.span);
     }
 
-    /// Send `page` on to be decompressed. It is counted as decompressed
-    /// from here on, unless it arrived decompressed and was counted so
-    /// then.
+    /// Send `page` on to be decompressed, and tell the compacter that it no
+    /// longer waits at the gate, which makes room for another chunk to be
+    /// fetched ahead. It is counted as decompressed from here on, unless
+    /// it arrived decompressed and was counted so then.
+    ///
+    /// A page that arrived decompressed is told to the compacter only
+    /// here too. It waits at the gate like any other, and if it made room
+    /// when it arrived, chunks the decompressed cache holds would be
+    /// fetched ahead one after the other until they filled the budget.
     fn pass_page_on(
         &self,
         page: CompressedPage,
@@ -97,6 +101,7 @@ impl DecompressGate {
         if page.decompressed.is_none() {
             self.count_page_as_decompressed(&page);
         }
+        self.gated_reads.record_page_let_through(page.span);
         sender.send(page)?;
         Ok(())
     }

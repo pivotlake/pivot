@@ -39,6 +39,16 @@ pub use memory_budget::MemoryReservation;
 pub use settings::MergeSortSettings;
 pub use write::column_chunk_batcher::EncodedColumnChunks;
 
+/// Out of how many eighths of the configured memory the compaction's count
+/// of what it holds may reach: five.
+///
+/// The count is of the bytes of the pieces the compaction holds. They lie in
+/// blocks of memory, and a block is held whole while any piece in it is
+/// alive, so the blocks held take more than the count: about one and a half
+/// to twice as much, as measured while a compaction runs. Counting up to
+/// this share keeps the blocks held near the configured memory.
+const COUNTED_EIGHTHS_OF_MEMORY: usize = 5;
+
 /// How many input row groups a compaction's shredding plan reads.
 const SHREDDING_SAMPLE_ROW_GROUPS: usize = 8;
 
@@ -126,7 +136,7 @@ pub fn compact_files_spec(
     let write_worker = (compaction_worker + 1) % dispatcher.worker_count();
     let memory_budget = MemoryBudget::new(
         dispatcher.waker_set(),
-        settings.memory_bytes,
+        settings.memory_bytes / 8 * COUNTED_EIGHTHS_OF_MEMORY,
         compaction_worker,
     );
     let row_count = table.total_rows() as usize;

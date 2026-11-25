@@ -182,11 +182,11 @@ pub(super) fn read_in_merge_order_spec(
         Box::new(|| {}),
     );
     let read_medium = table.get_read_medium();
-    // Chunks are fetched ahead within a quarter of the budget, and within
+    // Chunks are fetched ahead within a sixteenth of the budget, and within
     // what the workers may have asked of the files' medium at a time:
     // more than is delivered in the time one read takes would only wait.
     let fetch_ahead_bytes =
-        (settings.memory_bytes / 4).min(read_medium.count_read_ahead_bytes(worker_count));
+        (settings.memory_bytes / 16).min(read_medium.count_read_ahead_bytes(worker_count));
     let read_requests = ReadRequests::new(
         table.clone(),
         gated_reads.clone(),

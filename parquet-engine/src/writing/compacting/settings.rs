@@ -10,9 +10,11 @@ pub struct MergeSortSettings {
     /// How many rows of the output one merged batch holds. The rows of an
     /// output row group are sent on one merged batch at a time.
     pub pull_rows: usize,
-    /// How many bytes the compaction may hold at a time: fetched chunks,
+    /// How much memory the compaction may hold at a time: fetched chunks,
     /// decompressed pages, decoded rows, and rows and pages being encoded
-    /// or waiting to be stored.
+    /// or waiting to be stored. The compaction counts the bytes of these
+    /// up to a share of this, since the blocks they lie in are held whole
+    /// (see `COUNTED_EIGHTHS_OF_MEMORY`).
     pub memory_bytes: usize,
     /// How many bytes of encoded column chunks are passed to the writer
     /// together. A row group's last column chunks are passed on however

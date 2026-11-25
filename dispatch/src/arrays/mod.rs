@@ -340,6 +340,22 @@ fn concat_view_chunks(
     let mut blocks: Vec<DataBlock> = Vec::new();
     let mut open_block_idx = None;
     let mut out_row = 0;
+    // How many bytes of values are copied in all, so that the blocks they
+    // are copied into take no more than that.
+    let mut bytes_left_to_copy: usize = chunks
+        .iter()
+        .map(|chunk| {
+            // SAFETY: as for the views read below.
+            let views = unsafe { (chunk.buffers()[0].as_ptr() as *const u128).add(chunk.offset()) };
+            let validity = chunk.nulls();
+            (0..chunk.len())
+                .filter(|&row| validity.is_none_or(|validity| validity.is_valid(row)))
+                .map(|row| unsafe { views.add(row).read_unaligned() } as u32)
+                .filter(|&length| length > INLINE_VIEW_LEN)
+                .map(|length| length as usize)
+                .sum::<usize>()
+        })
+        .sum();
     for chunk in chunks {
         // SAFETY (of the `add`): buffer 0 of a view array holds `offset + len`
         // views, so the offset stays within its allocation.
@@ -363,7 +379,13 @@ fn concat_view_chunks(
                 let buffer = (view >> 64) as u32 as usize;
                 let offset = (view >> 96) as u32 as usize;
                 let value = &data_buffers[buffer][offset..offset + length as usize];
-                copy_value(&mut blocks, &mut open_block_idx, value, allocator)
+                copy_value(
+                    &mut blocks,
+                    &mut open_block_idx,
+                    value,
+                    &mut bytes_left_to_copy,
+                    allocator,
+                )
             };
             // SAFETY: the slab holds `rows` slots.
             unsafe { slab.ptr_at_index(out_row).write(copied) };
@@ -500,6 +522,22 @@ fn gather_chunked_views(
             }
         })
         .collect();
+    // How many bytes of values are copied in all, so that the blocks they
+    // are copied into take no more than that.
+    let mut bytes_left_to_copy: usize = mapping
+        .iter()
+        .filter(|&&(chunk, row)| {
+            let validity = sources[chunk as usize].2;
+            validity.is_none_or(|validity| validity.is_valid(row as usize))
+        })
+        // SAFETY: as for the views read below.
+        .map(
+            |&(chunk, row)| unsafe { sources[chunk as usize].0.add(row as usize).read_unaligned() }
+                as u32,
+        )
+        .filter(|&length| length > INLINE_VIEW_LEN)
+        .map(|length| length as usize)
+        .sum();
     for (out_idx, &(chunk, row)) in mapping.iter().enumerate() {
         let (views, data_buffers, validity) = sources[chunk as usize];
         let valid = validity.is_none_or(|validity| validity.is_valid(row as usize));
@@ -518,7 +556,13 @@ fn gather_chunked_views(
             let buffer = (view >> 64) as u32 as usize;
             let offset = (view >> 96) as u32 as usize;
             let value = &data_buffers[buffer][offset..offset + length as usize];
-            copy_value(&mut blocks, &mut open_block_idx, value, allocator)
+            copy_value(
+                &mut blocks,
+                &mut open_block_idx,
+                value,
+                &mut bytes_left_to_copy,
+                allocator,
+            )
         };
         // SAFETY: the slab holds `mapping.len()` slots.
         unsafe { slab.ptr_at_index(out_idx).write(copied) };
