@@ -1,19 +1,16 @@
-//! [`Length`] — SQL `length(string)`, the byte length of the string.
+//! [`Length`] — SQL `length(string)`, the number of characters in the string.
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::Type;
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
-/// SQL `length(string)` — the number of *bytes* in the string, as `BIGINT`.
-/// Arrives as a `BOUND_FUNCTION` named `length` (also `strlen`/`len`).
-///
-/// This is ClickHouse's `length()` semantics (byte count). It differs from
-/// DuckDB's `length`/`strlen`, which count Unicode characters; we don't use
-/// DuckDB as the result oracle, so byte count is the intended answer here.
+/// SQL `length(string)`, also spelled `len`: the number of Unicode code points
+/// in the string, as `BIGINT`. This is how DuckDB counts when it folds a
+/// constant argument, so a column and a constant agree.
 #[derive(Debug, Clone)]
 pub struct Length {
     pub input: Box<Expression>,
@@ -26,6 +23,17 @@ impl Display for Length {
     }
 }
 
+/// The number of characters in `string`. Every character of an ASCII string
+/// is one byte, and checking for that is cheaper than counting.
+fn count_characters(string: &str) -> i64 {
+    let character_count = if string.is_ascii() {
+        string.len()
+    } else {
+        string.chars().count()
+    };
+    character_count as i64
+}
+
 impl Length {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         let input_builder = self.input.compile()?;
@@ -34,19 +42,11 @@ impl Length {
             Box::new(move |batch: &RecordBatch| {
                 let input = input_expr(batch);
                 let (arr, _) = input.as_datum().get();
-                let strings = arr.as_string_view();
-                // Byte length: each view keeps its string's length in its low
-                // 32 bits, so this reads the views alone and never touches the
-                // string payload buffers. That makes it O(rows), not O(bytes)
-                // — no per-byte scan like a Unicode character count would
-                // need. A null row keeps the input's null bit; whatever its
-                // view holds is never looked at.
-                let lengths: Vec<i64> = strings
-                    .views()
+                let lengths: Int64Array = arr
+                    .as_string_view()
                     .iter()
-                    .map(|view| i64::from(*view as u32))
+                    .map(|string| string.map(count_characters))
                     .collect();
-                let lengths = Int64Array::new(lengths.into(), strings.nulls().cloned());
                 ExprResult::Array(Arc::new(lengths) as ArrayRef)
             }) as ExprEvalFn
         }))
@@ -78,20 +78,36 @@ mod tests {
     }
 
     #[rstest]
-    fn counts_bytes(mut testing_planner: TestingPlanner) {
+    #[case::length("length")]
+    #[case::len("len")]
+    fn counts_characters(mut testing_planner: TestingPlanner, #[case] function: &str) {
         strs_table(&mut testing_planner);
 
-        let mut rows = run(&mut testing_planner, "SELECT length(s) FROM strs");
+        let mut rows = run(
+            &mut testing_planner,
+            &format!("SELECT {function}(s) FROM strs"),
+        );
 
         rows.sort_by_key(|r| only_column(r).as_i64().unwrap());
-        // Byte counts, not characters: "héllo" is 6 bytes (é is 2),
-        // "日本語abc" is 12 (three 3-byte CJK chars + "abc").
         assert_eq!(
             rows.iter()
                 .map(|r| only_column(r).as_i64().unwrap())
                 .collect::<Vec<_>>(),
-            vec![0, 5, 6, 12]
+            vec![0, 5, 5, 6]
         );
+    }
+
+    #[rstest]
+    fn a_column_and_a_constant_have_the_same_length(mut testing_planner: TestingPlanner) {
+        strs_table(&mut testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT s FROM strs WHERE length(s) = length('日本語abc')",
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(only_column(&rows[0]), "日本語abc");
     }
 
     #[rstest]
@@ -121,20 +137,5 @@ mod tests {
             .collect();
         lengths.sort();
         assert_eq!(lengths, vec![None, Some(2), Some(33)]);
-    }
-
-    #[rstest]
-    fn strlen_is_an_alias(mut testing_planner: TestingPlanner) {
-        strs_table(&mut testing_planner);
-
-        let mut rows = run(&mut testing_planner, "SELECT strlen(s) FROM strs");
-
-        rows.sort_by_key(|r| only_column(r).as_i64().unwrap());
-        assert_eq!(
-            rows.iter()
-                .map(|r| only_column(r).as_i64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![0, 5, 6, 12]
-        );
     }
 }

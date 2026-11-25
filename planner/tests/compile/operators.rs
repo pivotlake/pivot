@@ -719,10 +719,9 @@ fn select_star_filtered_top_n_late_materializes(mut testing_planner: TestingPlan
 #[rstest]
 fn grouped_avg_length_filtered_having_ordered(mut testing_planner: TestingPlanner) {
     // AVG(length(url)) per group, an empty-string WHERE filter, a HAVING on
-    // COUNT(*), then ORDER BY the avg DESC. length() is byte count, so g=1
-    // averages (5+2)/2 = 3.5 and g=2 averages (4+2)/2 = 3.0; the "" rows are
-    // filtered before aggregation and g=3 (one row) is dropped by
-    // HAVING COUNT(*) > 1.
+    // COUNT(*), then ORDER BY the avg DESC. g=1 averages (5+2)/2 = 3.5 and
+    // g=2 averages (4+2)/2 = 3.0; the "" rows are filtered before aggregation
+    // and g=3 (one row) is dropped by HAVING COUNT(*) > 1.
     testing_planner.add_table(
         "pages",
         &[

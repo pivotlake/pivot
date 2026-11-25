@@ -21,12 +21,12 @@ use duckdb_planner::handle::{
 use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 
 use crate::expression::{
-    AggregateFunc, Arithmetic, ArithmeticOp, Between, BucketGrid, Case, CaseCheck, Cast, Compare,
-    Concat, Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc,
-    Divide, Error, Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length,
-    Like, MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch,
-    RegexpJitReplace, RegexpReplace, Round, Rounding, StructExtract, StructPack, Substring, Suffix,
-    TemporalConvert, TimeBucket, VariantGet, count_epoch_months,
+    AggregateFunc, Arithmetic, ArithmeticOp, Between, BucketGrid, ByteLength, Case, CaseCheck,
+    Cast, Compare, Concat, Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind,
+    DateTrunc, Divide, Error, Expression, FormatBytes, Function, InList, IntervalArithmetic,
+    IsNull, Length, Like, MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, Round, Rounding, StructExtract, StructPack,
+    Substring, Suffix, TemporalConvert, TimeBucket, VariantGet, count_epoch_months,
 };
 use crate::types::{
     MICROS_PER_DAY, StructField, Type, build_scalar_value, physical_arrow_type, type_from_logical,
@@ -388,7 +388,8 @@ impl Function {
             },
             "*" => Ok(Function::Arithmetic(Arithmetic::from_handle(func)?)),
             "||" => Ok(Function::Concat(Concat::from_handle(func)?)),
-            "length" | "strlen" | "len" => Ok(Function::Length(Length::from_handle(func)?)),
+            "length" | "len" => Ok(Function::Length(Length::from_handle(func)?)),
+            "strlen" => Ok(Function::ByteLength(ByteLength::from_handle(func)?)),
             "format_bytes" => Ok(Function::FormatBytes(FormatBytes::from_handle(func)?)),
             // The `substring(x FROM a FOR b)` syntax binds to the same call.
             "substring" | "substr" => Ok(Function::Substring(Substring::from_handle(func)?)),
@@ -705,6 +706,16 @@ impl Length {
     pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<Length, Error> {
         let params = function_args(func, 1)?;
         Ok(Length {
+            return_type: type_from_logical(func.return_type()?)?,
+            input: Box::new(Expression::from_handle(params[0])?),
+        })
+    }
+}
+
+impl ByteLength {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<ByteLength, Error> {
+        let params = function_args(func, 1)?;
+        Ok(ByteLength {
             return_type: type_from_logical(func.return_type()?)?,
             input: Box::new(Expression::from_handle(params[0])?),
         })

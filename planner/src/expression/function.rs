@@ -2,9 +2,10 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic,
-    Length, Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
-    Round, StructExtract, StructPack, Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
+    Arithmetic, ByteLength, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes,
+    IntervalArithmetic, Length, Like, NormalizedInterval, Prefix, RegexpFullMatch,
+    RegexpJitReplace, RegexpReplace, Round, StructExtract, StructPack, Substring, Suffix,
+    TemporalConvert, TimeBucket, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -64,7 +65,10 @@ pub enum Function {
     /// optimizer leaves alone (several wildcards, or a `_`).
     Like(Like),
     Arithmetic(Arithmetic),
+    /// `length(string)` — the number of characters in a string.
     Length(Length),
+    /// `strlen(string)` — the number of bytes in a string.
+    ByteLength(ByteLength),
     /// `format_bytes(bytes)` — a byte count rendered in binary units.
     FormatBytes(FormatBytes),
     RegexpReplace(RegexpReplace),
@@ -132,6 +136,7 @@ impl Function {
                 visit(&a.right);
             }
             Function::Length(l) => visit(&l.input),
+            Function::ByteLength(b) => visit(&b.input),
             Function::FormatBytes(b) => visit(&b.input),
             Function::RegexpReplace(r) => visit(&r.input),
             // The pattern is a plan-time constant, not a child expression.
@@ -182,6 +187,7 @@ impl Function {
                 visit(&mut a.right);
             }
             Function::Length(l) => visit(&mut l.input),
+            Function::ByteLength(b) => visit(&mut b.input),
             Function::FormatBytes(b) => visit(&mut b.input),
             Function::RegexpReplace(r) => visit(&mut r.input),
             // The pattern is a plan-time constant, not a child expression.
@@ -220,6 +226,7 @@ impl Display for Function {
             Function::Like(l) => write!(f, "{l}"),
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
+            Function::ByteLength(b) => write!(f, "{b}"),
             Function::FormatBytes(b) => write!(f, "{b}"),
             Function::RegexpReplace(r) => write!(f, "{r}"),
             Function::RegexpFullMatch(r) => write!(f, "{r}"),
@@ -281,6 +288,7 @@ impl Function {
             // Arithmetic and the extractors carry DuckDB's bound result type.
             Function::Arithmetic(a) => a.return_type.clone(),
             Function::Length(l) => l.return_type.clone(),
+            Function::ByteLength(b) => b.return_type.clone(),
             Function::DatePart(d) => d.return_type.clone(),
             // The regex replacers, substring and concatenation rewrite
             // strings, and a formatted byte count is one.
@@ -324,6 +332,7 @@ impl Function {
             Function::Like(l) => l.compile(),
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),
+            Function::ByteLength(b) => b.compile(),
             Function::FormatBytes(b) => b.compile(),
             Function::RegexpReplace(r) => r.compile(),
             Function::RegexpFullMatch(r) => r.compile(),

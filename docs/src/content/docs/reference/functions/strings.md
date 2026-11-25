@@ -12,6 +12,7 @@ case-insensitive.
 | --- | --- |
 | [contains](#contains) | Whether text contains a substring. |
 | [length](#length) | Character count. |
+| [strlen](#strlen) | Byte count. |
 | [substring](#substring) | A character slice. |
 | [regexp_full_match](#regexp_full_match) | Whether the entire string matches a pattern. |
 | [regexp_replace](#regexp_replace) | Text with the first match replaced. |
@@ -38,12 +39,27 @@ FROM (VALUES ('Pivot'), ('Lake')) AS input(text);
 length(string)
 ```
 
-Returns the number of characters in the string. `len` and `strlen` are aliases.
+Returns the number of characters in the string. `len` is an alias.
 
 ```sql
 SELECT length(text) AS characters
-FROM (VALUES ('Pivot')) AS input(text);
--- characters: 5
+FROM (VALUES ('Pivot'), ('日本語')) AS input(text);
+-- characters: 5, 3
+```
+
+## strlen
+
+```sql
+strlen(string)
+```
+
+Returns the number of bytes in the string, which is UTF-8 encoded. It is the
+same as [`length`](#length) for ASCII text.
+
+```sql
+SELECT strlen(text) AS bytes
+FROM (VALUES ('Pivot'), ('日本語')) AS input(text);
+-- bytes: 5, 9
 ```
 
 ## substring

@@ -12,6 +12,7 @@
 mod aggregate;
 mod arithmetic;
 mod between;
+mod byte_length;
 mod case;
 mod cast;
 mod compare;
@@ -47,6 +48,7 @@ mod variant_get;
 pub use aggregate::{AggregateFunc, CountStar, NumericAggregate};
 pub use arithmetic::{Arithmetic, ArithmeticOp};
 pub use between::Between;
+pub use byte_length::ByteLength;
 pub use case::{Case, CaseCheck};
 pub use cast::Cast;
 pub use cast::cast_variant_array;
