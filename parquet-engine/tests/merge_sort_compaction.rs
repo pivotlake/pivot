@@ -1,4 +1,5 @@
-//! A compaction's read of its sorted input files in the order of their merge.
+//! A compaction of sorted input files into one output file, in the order of
+//! their merge.
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -6,16 +7,25 @@ use std::sync::{Arc, OnceLock};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
-use dispatch::{DataFlowDispatcher, Dispatch};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use bytes::Bytes;
+use dispatch::memory::SlabAllocator;
+use dispatch::{
+    BuildContext, Built, BuiltUnary, DataFlowDispatcher, Dispatch, OperatorIO, Sender, Unary,
+    UnaryFactory, UnaryResult, to_single_worker_mpsc, values_input,
+};
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use parquet_engine::ParquetTable;
 use parquet_engine::writing::{
-    MergeSortSettings, MergedBatchColumn, MergedRows, read_in_merge_order_spec,
+    AssembledFile, EncodedColumnChunks, MergeSortSettings, ParquetFileBuilder, compact_files_spec,
+    encode_record_batches_spec, plan_compaction_shredding,
 };
+use parquet_variant_compute::{VariantArray, json_to_variant, unshred_variant};
+use parquet_variant_json::VariantToJson;
 use tempfile::TempDir;
 
 /// A two-worker dispatch pool shared by this file's tests.
@@ -80,96 +90,137 @@ fn write_files(keys_per_file: &[Vec<i64>], rows_per_group: usize) -> (TempDir, A
     (dir, Arc::new(table))
 }
 
-/// What a read in merge order gave: the rows' keys, labels and texts, each
-/// in the order the read gave the rows.
+/// Appends the column chunks of a compaction to one file held in memory, as
+/// a writer would to a file in storage, and emits the file's bytes when the
+/// compaction is done.
+struct InMemoryFileWriter {
+    schema: SchemaRef,
+    builder: Option<ParquetFileBuilder>,
+    file: Vec<u8>,
+}
+
+impl UnaryFactory<EncodedColumnChunks, Vec<u8>> for InMemoryFileWriter {
+    type Unary = Self;
+
+    fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self> {
+        Built::new(self)
+    }
+}
+
+impl Unary<EncodedColumnChunks, Vec<u8>> for InMemoryFileWriter {
+    /// The column chunks' bytes are copied into the file at once, so their
+    /// memory is given back to the compaction here.
+    fn consume(
+        &mut self,
+        column_chunks: EncodedColumnChunks,
+        _sender: &mut dyn Sender<Vec<u8>>,
+        _io: &mut OperatorIO,
+    ) -> UnaryResult<()> {
+        let builder = self
+            .builder
+            .get_or_insert_with(|| ParquetFileBuilder::new(self.schema.clone()));
+        let bytes =
+            builder.append_column_chunks(column_chunks.chunks, &mut SlabAllocator::new(false));
+        self.file.extend(bytes.runs().flatten());
+        if column_chunks.ends_row_group {
+            builder.end_row_group();
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, sender: &mut dyn Sender<Vec<u8>>) -> UnaryResult<bool> {
+        if let Some(builder) = self.builder.take() {
+            let (footer, _) = builder.finish(&mut SlabAllocator::new(false))?;
+            self.file.extend(footer.runs().flatten());
+            sender.send(std::mem::take(&mut self.file))?;
+        }
+        Ok(true)
+    }
+}
+
+/// The rows of a compaction's output file: their keys, labels and texts,
+/// each in the order of the file, and how many rows each of the file's row
+/// groups holds.
 #[derive(Default)]
 struct OutputRows {
     keys: Vec<i64>,
     labels: Vec<String>,
     texts: Vec<String>,
+    row_group_rows: Vec<usize>,
+}
+
+/// Compact `table`, sorted by `sort_columns`, into one file of row groups
+/// of [`OUTPUT_ROW_GROUP_ROWS`] rows. Returns the file's bytes.
+fn compact_into_one_file(
+    table: Arc<ParquetTable>,
+    sort_columns: &[&str],
+    settings: MergeSortSettings,
+) -> Bytes {
+    let sort_columns: Vec<String> = sort_columns.iter().map(|name| name.to_string()).collect();
+    let dispatcher = test_dispatcher();
+    let shredding = plan_compaction_shredding(dispatcher, &table).unwrap();
+    let schema = shredding.schema.clone();
+    let compaction = compact_files_spec(
+        dispatcher,
+        table,
+        shredding,
+        &sort_columns,
+        OUTPUT_ROW_GROUP_ROWS,
+        settings,
+    )
+    .unwrap();
+    let worker_count = dispatcher.worker_count();
+    let files = compaction
+        .column_chunks
+        .chain(
+            to_single_worker_mpsc::<EncodedColumnChunks>(worker_count, compaction.write_worker)
+                .into_iter()
+                .collect(),
+            (0..worker_count)
+                .map(|_| InMemoryFileWriter {
+                    schema: schema.clone(),
+                    builder: None,
+                    file: Vec::new(),
+                })
+                .collect(),
+        )
+        .collect()
+        .unwrap();
+    let [file] = files.try_into().expect("the compaction wrote one file");
+    Bytes::from(file)
 }
 
 impl OutputRows {
-    /// Read `table`, sorted by `sort_columns`, in merge order, for output
-    /// row groups of [`OUTPUT_ROW_GROUP_ROWS`] rows. The rows are copied out
-    /// of each merged batch inside the dataflow, on a worker, whose memory
-    /// the decoded arrays are in. The merged batches leave the dataflow in
-    /// any order, and are put in output order by their sequence numbers.
-    fn read(table: Arc<ParquetTable>, sort_columns: &[&str], settings: MergeSortSettings) -> Self {
-        let sort_columns: Vec<String> = sort_columns.iter().map(|name| name.to_string()).collect();
-        let mut parts = read_in_merge_order_spec(
-            test_dispatcher(),
-            table,
-            &sort_columns,
-            OUTPUT_ROW_GROUP_ROWS,
-            settings,
-        )
-        .unwrap()
-        .map_each(|merged_batch: MergedBatchColumn| {
-            let mut part = OutputRows::default();
-            part.append_merged_batch(&merged_batch);
-            Ok((merged_batch.sequence, part))
-        })
-        .collect()
-        .unwrap();
-        parts.sort_by_key(|(sequence, _)| *sequence);
-        let mut merged = OutputRows::default();
-        for (_, part) in parts {
-            merged.keys.extend(part.keys);
-            merged.labels.extend(part.labels);
-            merged.texts.extend(part.texts);
-        }
-        merged
-    }
-
-    /// Append the rows of `merged_batch`, in the order its row list gives,
-    /// to the column it holds.
-    fn append_merged_batch(&mut self, merged_batch: &MergedBatchColumn) {
-        // A text column is not decoded as the same arrow type in every
-        // batch, so every source is cast to one type first.
-        let column_type = match merged_batch.column {
-            0 => DataType::Int64,
-            _ => DataType::Utf8,
+    /// Compact `table`, sorted by `sort_columns`, into one file, and read
+    /// the file back.
+    fn compact(
+        table: Arc<ParquetTable>,
+        sort_columns: &[&str],
+        settings: MergeSortSettings,
+    ) -> Self {
+        let file = compact_into_one_file(table, sort_columns, settings);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let row_groups = reader.metadata().row_groups().iter();
+        let mut output = OutputRows {
+            row_group_rows: row_groups
+                .map(|row_group| row_group.num_rows() as usize)
+                .collect(),
+            ..OutputRows::default()
         };
-        let sources: Vec<ArrayRef> = merged_batch
-            .sources
-            .iter()
-            .map(|source| arrow_cast::cast(&source.values, &column_type).unwrap())
-            .collect();
-        let rows: ArrayRef = match &merged_batch.rows {
-            MergedRows::Consecutive {
-                source,
-                first_row,
-                row_count,
-            } => sources[*source as usize].slice(*first_row as usize, *row_count),
-            MergedRows::Listed {
-                sources: source_of_each_row,
-                rows: row_in_source,
-            } => {
-                let sources: Vec<&dyn Array> =
-                    sources.iter().map(|source| source.as_ref()).collect();
-                let source_and_row_of_each_row: Vec<(usize, usize)> = source_of_each_row
-                    .values()
-                    .iter()
-                    .zip(row_in_source.values().iter())
-                    .map(|(&source, &row)| (source as usize, row as usize))
-                    .collect();
-                arrow_select::interleave::interleave(&sources, &source_and_row_of_each_row).unwrap()
-            }
-        };
-        match merged_batch.column {
-            0 => self
+        for batch in reader.build().unwrap() {
+            let batch = batch.unwrap();
+            let texts_of = |column: usize| -> Vec<String> {
+                let texts = arrow_cast::cast(batch.column(column), &DataType::Utf8).unwrap();
+                let texts = texts.as_string::<i32>().iter();
+                texts.map(|text| text.unwrap().to_string()).collect()
+            };
+            output
                 .keys
-                .extend(rows.as_primitive::<Int64Type>().values().iter()),
-            1 | 2 => {
-                let texts = rows.as_string::<i32>().iter().map(|text| text.unwrap());
-                match merged_batch.column {
-                    1 => self.labels.extend(texts.map(str::to_string)),
-                    _ => self.texts.extend(texts.map(str::to_string)),
-                }
-            }
-            _ => unreachable!("the table has three columns"),
+                .extend(batch.column(0).as_primitive::<Int64Type>().values().iter());
+            output.labels.extend(texts_of(1));
+            output.texts.extend(texts_of(2));
         }
+        output
     }
 }
 
@@ -184,30 +235,44 @@ fn merge_keys(keys_per_file: &[Vec<i64>]) -> Vec<i64> {
 const SETTINGS: MergeSortSettings = MergeSortSettings {
     pull_rows: 1000,
     memory_bytes: 1 << 30,
+    write_batch_bytes: 8 << 20,
 };
 
 /// Small enough that every test's output is several row groups.
 const OUTPUT_ROW_GROUP_ROWS: usize = 3000;
 
 #[test]
-fn files_that_do_not_overlap_are_read_one_after_the_other() {
+fn files_that_do_not_overlap_are_written_one_after_the_other() {
     let keys_per_file = [(5000..10000).collect(), (0..5000).collect()];
     let (_dir, table) = write_files(&keys_per_file, 10_000);
 
-    let merged = OutputRows::read(table, &["key"], SETTINGS);
+    let merged = OutputRows::compact(table, &["key"], SETTINGS);
 
     assert_eq!(merged.keys, merge_keys(&keys_per_file));
 }
 
 #[test]
-fn files_that_overlap_are_read_in_the_order_of_their_merge() {
+fn the_output_is_cut_into_row_groups_of_the_rows_asked_for() {
+    let keys_per_file = [
+        (0..5000).map(|row| row * 2).collect(),
+        (0..5000).map(|row| row * 2 + 1).collect(),
+    ];
+    let (_dir, table) = write_files(&keys_per_file, 10_000);
+
+    let merged = OutputRows::compact(table, &["key"], SETTINGS);
+
+    assert_eq!(merged.row_group_rows, [3000, 3000, 3000, 1000]);
+}
+
+#[test]
+fn files_that_overlap_are_written_in_the_order_of_their_merge() {
     let keys_per_file = [
         (0..5000).map(|row| row * 2).collect(),
         (0..5000).map(|row| row * 3).collect(),
     ];
     let (_dir, table) = write_files(&keys_per_file, 10_000);
 
-    let merged = OutputRows::read(table, &["key"], SETTINGS);
+    let merged = OutputRows::compact(table, &["key"], SETTINGS);
 
     let expected_keys = merge_keys(&keys_per_file);
     assert_eq!(merged.keys, expected_keys);
@@ -228,12 +293,12 @@ fn files_that_overlap_are_read_in_the_order_of_their_merge() {
 }
 
 #[test]
-fn a_file_of_several_row_groups_is_read_through_all_of_them() {
+fn a_file_of_several_row_groups_is_compacted_through_all_of_them() {
     let keys: Vec<i64> = (0..10_000).map(|row| row / 3).collect();
     let keys_per_file = [keys.clone(), keys];
     let (_dir, table) = write_files(&keys_per_file, 1_500);
 
-    let merged = OutputRows::read(table, &["key"], SETTINGS);
+    let merged = OutputRows::compact(table, &["key"], SETTINGS);
 
     let expected_keys = merge_keys(&keys_per_file);
     assert_eq!(merged.keys, expected_keys);
@@ -249,7 +314,7 @@ fn a_file_of_several_row_groups_is_read_through_all_of_them() {
 /// The budget has room for nothing, so the columns are decoded one after
 /// the other, a merged batch at a time.
 #[test]
-fn files_of_several_row_groups_are_read_within_a_memory_budget_with_no_room() {
+fn files_of_several_row_groups_are_compacted_within_a_memory_budget_with_no_room() {
     let keys_per_file = [
         (0..5000).map(|row| row * 2).collect(),
         (0..5000).map(|row| row * 2 + 1).collect(),
@@ -260,7 +325,7 @@ fn files_of_several_row_groups_are_read_within_a_memory_budget_with_no_room() {
         ..SETTINGS
     };
 
-    let merged = OutputRows::read(table, &["key"], settings);
+    let merged = OutputRows::compact(table, &["key"], settings);
 
     let expected_keys = merge_keys(&keys_per_file);
     assert_eq!(merged.keys, expected_keys);
@@ -285,10 +350,10 @@ fn write_long_row_groups() -> ([Vec<i64>; 2], TempDir, Arc<ParquetTable>) {
 }
 
 #[test]
-fn a_row_group_longer_than_the_rows_decoded_in_one_go_is_read_in_merge_order() {
+fn a_row_group_longer_than_the_rows_decoded_in_one_go_is_written_in_merge_order() {
     let (keys_per_file, _dir, table) = write_long_row_groups();
 
-    let merged = OutputRows::read(table, &["key"], SETTINGS);
+    let merged = OutputRows::compact(table, &["key"], SETTINGS);
 
     let expected_keys = merge_keys(&keys_per_file);
     assert_eq!(merged.keys, expected_keys);
@@ -304,14 +369,14 @@ fn a_row_group_longer_than_the_rows_decoded_in_one_go_is_read_in_merge_order() {
 /// The budget has room for nothing, so only the rows the output cannot go
 /// on without are decoded, a merged batch of a column group at a time.
 #[test]
-fn a_long_row_group_is_read_within_a_memory_budget_with_no_room() {
+fn a_long_row_group_is_compacted_within_a_memory_budget_with_no_room() {
     let (keys_per_file, _dir, table) = write_long_row_groups();
     let settings = MergeSortSettings {
         memory_bytes: 1,
         ..SETTINGS
     };
 
-    let merged = OutputRows::read(table, &["key"], settings);
+    let merged = OutputRows::compact(table, &["key"], settings);
 
     let expected_keys = merge_keys(&keys_per_file);
     assert_eq!(merged.keys, expected_keys);
@@ -324,12 +389,40 @@ fn a_long_row_group_is_read_within_a_memory_budget_with_no_room() {
     );
 }
 
+/// Every column chunk is a batch of its own, so each row group is written
+/// in three pieces.
 #[test]
-fn a_table_without_sort_columns_is_read_file_by_file() {
+fn a_row_group_written_a_column_chunk_at_a_time_is_whole() {
+    let keys_per_file = [
+        (0..5000).map(|row| row * 2).collect(),
+        (0..5000).map(|row| row * 2 + 1).collect(),
+    ];
+    let (_dir, table) = write_files(&keys_per_file, 2_000);
+    let settings = MergeSortSettings {
+        write_batch_bytes: 1,
+        ..SETTINGS
+    };
+
+    let merged = OutputRows::compact(table, &["key"], settings);
+
+    let expected_keys = merge_keys(&keys_per_file);
+    assert_eq!(merged.keys, expected_keys);
+    assert_eq!(
+        merged.texts,
+        expected_keys
+            .iter()
+            .map(|&key| text_of(key))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(merged.row_group_rows, [3000, 3000, 3000, 1000]);
+}
+
+#[test]
+fn a_table_without_sort_columns_is_written_file_by_file() {
     let keys_per_file = [(0..3000).rev().collect(), (0..2000).collect()];
     let (_dir, table) = write_files(&keys_per_file, 10_000);
 
-    let merged = OutputRows::read(table, &[], SETTINGS);
+    let merged = OutputRows::compact(table, &[], SETTINGS);
 
     assert_eq!(merged.keys, keys_per_file.concat());
 }
@@ -344,7 +437,7 @@ fn rows_with_equal_keys_are_ordered_by_the_next_sort_column() {
     let keys_per_file = [sort_by_label(0..6000), sort_by_label(3000..9000)];
     let (_dir, table) = write_files(&keys_per_file, 10_000);
 
-    let merged = OutputRows::read(table, &["label", "key"], SETTINGS);
+    let merged = OutputRows::compact(table, &["label", "key"], SETTINGS);
 
     let mut expected: Vec<(String, i64)> = keys_per_file
         .iter()
@@ -354,4 +447,81 @@ fn rows_with_equal_keys_are_ordered_by_the_next_sort_column() {
     expected.sort();
     let read: Vec<(String, i64)> = merged.labels.into_iter().zip(merged.keys).collect();
     assert_eq!(read, expected);
+}
+
+/// Write one file per item of `documents_per_file`, with this crate's own
+/// writer: a row per document, with its key, sorted by key. The writer
+/// shreds each file's documents the way that file's rows suggest.
+fn write_document_files(documents_per_file: &[Vec<(i64, String)>]) -> (TempDir, Arc<ParquetTable>) {
+    let dir = TempDir::new().unwrap();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for (file, documents) in documents_per_file.iter().enumerate() {
+        let json: ArrayRef = Arc::new(StringArray::from_iter_values(
+            documents.iter().map(|(_, document)| document.as_str()),
+        ));
+        let variants = json_to_variant(&json).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            variants.field("attrs"),
+        ]));
+        let keys: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            documents.iter().map(|(key, _)| *key),
+        ));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![keys, Arc::new(variants.into_inner())])
+                .unwrap();
+        let rows = values_input(test_dispatcher(), vec![batch]).record_batches();
+        let files = encode_record_batches_spec(
+            rows,
+            schema,
+            Arc::from(Vec::new()),
+            Arc::from(vec!["key".to_string()]),
+            128 * 1024,
+            usize::MAX,
+        )
+        .map_each(|file: AssembledFile| {
+            Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+        })
+        .collect()
+        .unwrap();
+        let [bytes] = files.try_into().expect("the rows were written as one file");
+        let path = dir.path().join(format!("documents{file}.parquet"));
+        std::fs::write(&path, bytes).unwrap();
+        paths.push(path);
+    }
+    let table = ParquetTable::from_files(test_dispatcher(), &paths, &[]).unwrap();
+    (dir, Arc::new(table))
+}
+
+#[test]
+fn documents_each_file_shredded_its_own_way_are_written_whole() {
+    let named = |key: i64| (key, format!(r#"{{"id":{key},"name":"n{key}"}}"#));
+    let flagged = |key: i64| (key, format!(r#"{{"flag":true,"id":{key}}}"#));
+    let documents_per_file = [
+        (0..4000).map(|row| named(row * 2)).collect(),
+        (0..4000).map(|row| flagged(row * 2 + 1)).collect(),
+    ];
+    let (_dir, table) = write_document_files(&documents_per_file);
+
+    let file = compact_into_one_file(table, &["key"], SETTINGS);
+
+    let mut written: Vec<(i64, String)> = Vec::new();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let leaves = reader.metadata().file_metadata().schema_descr().columns();
+    let leaf_paths: Vec<String> = leaves.iter().map(|leaf| leaf.path().string()).collect();
+    for batch in reader.build().unwrap() {
+        let batch = batch.unwrap();
+        let keys = batch.column(0).as_primitive::<Int64Type>().values().iter();
+        let documents = VariantArray::try_new(batch.column(1).as_ref()).unwrap();
+        let documents = unshred_variant(&documents).unwrap();
+        for (row, &key) in keys.enumerate() {
+            let mut document = Vec::new();
+            documents.value(row).to_json(&mut document).unwrap();
+            written.push((key, String::from_utf8(document).unwrap()));
+        }
+    }
+    let mut expected: Vec<(i64, String)> = documents_per_file.concat();
+    expected.sort();
+    assert_eq!(written, expected);
+    assert!(leaf_paths.contains(&"attrs.typed_value.id.typed_value".to_string()));
 }

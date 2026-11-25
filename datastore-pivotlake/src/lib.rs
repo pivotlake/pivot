@@ -30,6 +30,7 @@
 
 mod binding;
 mod compact;
+mod compaction_sink;
 mod insert_sink;
 mod local_lock;
 mod log;
@@ -141,10 +142,6 @@ pub enum Error {
     Load(#[from] DataFlowError),
     #[error("running a compaction merge: {0}")]
     Merge(#[source] DataFlowError),
-    #[error(
-        "PIVOT_COMPACTION_MERGE_SORT is set: the merge read its input files in merge order and wrote nothing, so the table is as it was"
-    )]
-    MergeOutputDiscarded,
     #[error("table at `{location}` commit conflict: input file `{file}` is no longer active")]
     CommitConflict { location: String, file: String },
     #[error(

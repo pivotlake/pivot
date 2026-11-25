@@ -469,6 +469,10 @@ impl ObjectStore for S3Store {
             auth: None,
         })
     }
+
+    fn as_s3(&self) -> Option<&S3Store> {
+        Some(self)
+    }
 }
 
 impl S3Store {
@@ -548,9 +552,14 @@ impl S3Store {
 
     fn presign(&self, method: &str, key: &ObjectPath) -> Result<url::Url> {
         let object = object_key(&self.prefix, key);
-        let url = self.url_for(&object);
+        self.presign_url(method, &self.url_for(&object))
+    }
+
+    /// Sign `url`, which may carry query parameters of its own, in its query
+    /// string.
+    fn presign_url(&self, method: &str, url: &str) -> Result<url::Url> {
         let Some(keys) = &self.keys else {
-            return url::Url::parse(&url)
+            return url::Url::parse(url)
                 .map_err(|e| StoreError::Http(format!("parsing anonymous S3 url: {e}")));
         };
         let identity = keys.credentials().into();
@@ -573,7 +582,7 @@ impl S3Store {
         let host_header = [("host", self.host.as_str())];
         let signable = SignableRequest::new(
             method,
-            &url,
+            url,
             host_header.iter().copied(),
             SignableBody::UnsignedPayload,
         )
@@ -583,13 +592,153 @@ impl S3Store {
             .map_err(|e| StoreError::Http(format!("sigv4 presign: {e}")))?
             .into_parts();
 
-        let mut signed = url::Url::parse(&url)
+        let mut signed = url::Url::parse(url)
             .map_err(|e| StoreError::Http(format!("parsing presign url: {e}")))?;
         for (name, value) in instructions.params() {
             signed.query_pairs_mut().append_pair(name, value);
         }
         Ok(signed)
     }
+}
+
+/// Multipart uploads: an object is sent as numbered parts, each a request of
+/// its own, and exists once the upload is completed with every part's `ETag`.
+/// S3 takes no part but the last under 5 MiB and at most 10,000 parts. The
+/// parts of an upload that is neither completed nor aborted stay stored, and
+/// billed, without the object ever appearing.
+impl S3Store {
+    /// Start a multipart upload of `key` and return its upload id.
+    pub fn create_multipart_upload(&self, key: &ObjectPath) -> Result<String> {
+        let object = object_key(&self.prefix, key);
+        let url = format!("{}?uploads=", self.url_for(&object));
+        let signed = self.sign("POST", &url, &[], &[])?;
+        let request = Self::apply(self.agent.post(&url), &signed);
+        let body = match request.send_bytes(&[]) {
+            Ok(response) if is_redirect(&response) => {
+                return Err(self.explain_redirect("CreateMultipartUpload", &response));
+            }
+            Ok(response) => response.into_string().map_err(|error| {
+                StoreError::Http(format!("CreateMultipartUpload {object} body: {error}"))
+            })?,
+            Err(error) => {
+                return Err(StoreError::Http(format!(
+                    "CreateMultipartUpload {object}: {error}"
+                )));
+            }
+        };
+        Self::parse_created_upload_id(body.as_bytes())
+    }
+
+    /// A URL a worker `POST`s, with no body, to start a multipart upload of
+    /// `key`. The answer's body names the upload
+    /// (see [`parse_created_upload_id`](Self::parse_created_upload_id)).
+    pub fn presign_create_multipart_upload(&self, key: &ObjectPath) -> Result<url::Url> {
+        let object = object_key(&self.prefix, key);
+        self.presign_url("POST", &format!("{}?uploads=", self.url_for(&object)))
+    }
+
+    /// The upload id in `answer`, the body the store answered the start of a
+    /// multipart upload with.
+    pub fn parse_created_upload_id(answer: &[u8]) -> Result<String> {
+        let created: InitiateMultipartUploadResult = quick_xml::de::from_reader(answer)
+            .map_err(|error| StoreError::Http(format!("CreateMultipartUpload parse: {error}")))?;
+        Ok(created.upload_id)
+    }
+
+    /// A URL a worker `PUT`s part `part_number` (counted from 1) of upload
+    /// `upload_id` to. The response's `ETag` header names the stored part.
+    pub fn presign_upload_part(
+        &self,
+        key: &ObjectPath,
+        upload_id: &str,
+        part_number: usize,
+    ) -> Result<url::Url> {
+        let object = object_key(&self.prefix, key);
+        let url = format!(
+            "{}?partNumber={part_number}&uploadId={}",
+            self.url_for(&object),
+            percent_encode(upload_id)
+        );
+        self.presign_url("PUT", &url)
+    }
+
+    /// A URL a worker `POST`s the
+    /// [completion body](Self::build_completion_body) to, to assemble the
+    /// object at `key` from the parts of upload `upload_id`. The answer's
+    /// body says whether that worked
+    /// (see [`check_completion_answer`](Self::check_completion_answer)).
+    pub fn presign_complete_multipart_upload(
+        &self,
+        key: &ObjectPath,
+        upload_id: &str,
+    ) -> Result<url::Url> {
+        let object = object_key(&self.prefix, key);
+        let url = format!(
+            "{}?uploadId={}",
+            self.url_for(&object),
+            percent_encode(upload_id)
+        );
+        self.presign_url("POST", &url)
+    }
+
+    /// The body of the request that completes a multipart upload.
+    /// `part_etags` holds the `ETag` each part's upload was answered with, in
+    /// part order.
+    pub fn build_completion_body(part_etags: &[String]) -> String {
+        let mut parts = String::from("<CompleteMultipartUpload>");
+        for (index, etag) in part_etags.iter().enumerate() {
+            parts.push_str(&format!(
+                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                index + 1,
+                quick_xml::escape::escape(etag.as_str())
+            ));
+        }
+        parts.push_str("</CompleteMultipartUpload>");
+        parts
+    }
+
+    /// Fail if `answer`, the body the store answered the completion of a
+    /// multipart upload with, reports an error. S3 can answer 200 and then
+    /// report in the body that assembling the object failed.
+    pub fn check_completion_answer(answer: &[u8]) -> Result<()> {
+        let answer = String::from_utf8_lossy(answer);
+        if answer.contains("<Error>") {
+            return Err(StoreError::Http(format!(
+                "CompleteMultipartUpload: {answer}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Drop upload `upload_id` of `key` and the parts stored for it. An upload
+    /// the store no longer knows, because it was completed or already aborted,
+    /// is not an error.
+    pub fn abort_multipart_upload(&self, key: &ObjectPath, upload_id: &str) -> Result<()> {
+        let object = object_key(&self.prefix, key);
+        let url = format!(
+            "{}?uploadId={}",
+            self.url_for(&object),
+            percent_encode(upload_id)
+        );
+        let signed = self.sign("DELETE", &url, &[], &[])?;
+        let request = Self::apply(self.agent.delete(&url), &signed);
+        match request.call() {
+            Ok(response) if is_redirect(&response) => {
+                Err(self.explain_redirect("AbortMultipartUpload", &response))
+            }
+            Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+            Err(error) => Err(StoreError::Http(format!(
+                "AbortMultipartUpload {object}: {error}"
+            ))),
+        }
+    }
+}
+
+/// The answer to CreateMultipartUpload.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InitiateMultipartUploadResult {
+    upload_id: String,
 }
 
 /// The object keys and immediate child prefixes from ListObjectsV2.
@@ -750,6 +899,66 @@ mod tests {
                 .join()
                 .unwrap()
                 .starts_with("GET /moved-bucket/?list-type=2")
+        );
+    }
+
+    #[test]
+    fn a_completion_answered_with_an_error_body_fails() {
+        let answer = b"<Error><Code>InternalError</Code></Error>";
+
+        let outcome = S3Store::check_completion_answer(answer);
+
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("InternalError"), "{error}");
+    }
+
+    #[test]
+    fn a_completion_body_lists_the_parts_in_order() {
+        let part_etags = ["\"first\"".to_string(), "\"second\"".to_string()];
+
+        let body = S3Store::build_completion_body(&part_etags);
+
+        assert_eq!(
+            body,
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>&quot;first&quot;</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>&quot;second&quot;</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+    }
+
+    #[test]
+    fn the_upload_id_is_read_from_the_answer_that_starts_an_upload() {
+        let answer = b"<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key>\
+                       <UploadId>upload-7</UploadId></InitiateMultipartUploadResult>";
+
+        let upload_id = S3Store::parse_created_upload_id(answer).unwrap();
+
+        assert_eq!(upload_id, "upload-7");
+    }
+
+    #[test]
+    fn the_requests_that_start_and_complete_an_upload_are_addressed_by_their_query() {
+        let store = S3Store::anonymous_with_options(
+            "s3://bucket/root",
+            "us-east-1",
+            Some("http://objects.example".to_string()),
+        )
+        .unwrap();
+        let key = ObjectPath::new("o.parquet");
+
+        let create = store.presign_create_multipart_upload(&key).unwrap();
+        let complete = store
+            .presign_complete_multipart_upload(&key, "upload-1")
+            .unwrap();
+
+        assert_eq!(
+            create.as_str(),
+            "http://objects.example/bucket/root/o.parquet?uploads="
+        );
+        assert_eq!(
+            complete.as_str(),
+            "http://objects.example/bucket/root/o.parquet?uploadId=upload-1"
         );
     }
 

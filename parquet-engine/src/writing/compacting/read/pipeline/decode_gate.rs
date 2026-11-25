@@ -20,7 +20,7 @@ use crate::DecodeRange;
 ///
 /// Every worker has one, which holds the ranges that reached that worker
 /// and passes them on to that worker's queue of ranges to decode.
-pub(super) struct DecodeGate {
+pub(crate) struct DecodeGate {
     gated_reads: Arc<GatedReads>,
     /// The worker the gate runs on.
     worker: usize,
@@ -30,7 +30,7 @@ pub(super) struct DecodeGate {
 
 impl DecodeGate {
     /// One gate per worker.
-    pub(super) fn create_for_workers(
+    pub(crate) fn create_for_workers(
         gated_reads: &Arc<GatedReads>,
         worker_count: usize,
     ) -> Vec<Self> {

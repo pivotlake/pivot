@@ -67,10 +67,12 @@ mod stats;
 pub use stats::aggregate_file_stats;
 mod types;
 
+pub use assembler::{ColumnChunkRun, ParquetFileBuilder};
 pub use compacting::{
-    InputValues, MemoryReservation, MergeSortSettings, MergedBatchColumn, MergedRows,
-    read_in_merge_order_spec,
+    EncodedColumnChunks, FileCompaction, MemoryReservation, MergeSortSettings, compact_files_spec,
+    plan_compaction_shredding,
 };
+pub use shredding::FileShredding;
 pub use types::AssembledFile;
 
 use std::sync::Arc;

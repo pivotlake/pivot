@@ -10,18 +10,18 @@ use std::sync::Arc;
 
 use dispatch::ChannelInputSender;
 
-use super::gated_reads::GatedReads;
-use super::memory_budget::MemoryBudget;
 use crate::ParquetTable;
 use crate::types::metadata::QueryRowGroupMetadata;
+use crate::writing::compacting::memory_budget::MemoryBudget;
+use crate::writing::compacting::read::pipeline::gated_reads::GatedReads;
 
 /// The requests and releases of every input file.
-pub(super) struct ReadRequests {
+pub(crate) struct ReadRequests {
     table: Arc<ParquetTable>,
     /// The queue the requests for column chunks go into.
     request_sender: ChannelInputSender<QueryRowGroupMetadata>,
     gated_reads: Arc<GatedReads>,
-    pub(super) memory_budget: Arc<MemoryBudget>,
+    pub(crate) memory_budget: Arc<MemoryBudget>,
     /// The compressed size of every chunk requested so far.
     requested_compressed_bytes: usize,
     /// The most compressed bytes that may be requested and not yet let
@@ -39,7 +39,7 @@ impl ReadRequests {
     /// request per column of every row group of the table. Chunks are
     /// fetched ahead within `fetch_ahead_bytes` (see
     /// [`has_room_to_fetch_ahead`](Self::has_room_to_fetch_ahead)).
-    pub(super) fn new(
+    pub(crate) fn new(
         table: Arc<ParquetTable>,
         gated_reads: Arc<GatedReads>,
         memory_budget: Arc<MemoryBudget>,
@@ -61,7 +61,7 @@ impl ReadRequests {
     /// `row_group` in the table's list of row groups, which is
     /// `compressed_bytes` in the file. The pipeline fetches it whole, and
     /// its size is counted as held from here on.
-    pub(super) fn request_column(
+    pub(crate) fn request_column(
         &mut self,
         row_group: usize,
         column: usize,
@@ -82,7 +82,7 @@ impl ReadRequests {
     /// compressed bytes that were requested and not yet let through to be
     /// decompressed stay within the limit on fetching ahead. Those bytes
     /// are on their way from disk or wait at the `DecompressGate`.
-    pub(super) fn has_room_to_fetch_ahead(&self, compressed_bytes: usize) -> bool {
+    pub(crate) fn has_room_to_fetch_ahead(&self, compressed_bytes: usize) -> bool {
         let waiting_bytes =
             self.requested_compressed_bytes - self.gated_reads.count_compressed_bytes_let_through();
         waiting_bytes + compressed_bytes <= self.fetch_ahead_bytes
@@ -96,7 +96,7 @@ impl ReadRequests {
     /// that hold some of those rows learn of it when
     /// [`wake_gates_after_releases`](Self::wake_gates_after_releases) is
     /// called.
-    pub(super) fn release_rows_before(
+    pub(crate) fn release_rows_before(
         &mut self,
         row_group: usize,
         column: usize,
@@ -112,7 +112,7 @@ impl ReadRequests {
     /// If rows were released since the last call, wake the workers whose
     /// gates hold pages or ranges, so that they look again at what is
     /// released.
-    pub(super) fn wake_gates_after_releases(&mut self) {
+    pub(crate) fn wake_gates_after_releases(&mut self) {
         if std::mem::take(&mut self.has_releases_to_wake_gates_for) {
             let waker_set = dispatch::waker::waker_set();
             self.gated_reads
@@ -124,7 +124,7 @@ impl ReadRequests {
 
     /// Tell the pipeline that no request follows, which lets the dataflow
     /// end.
-    pub(super) fn close(&self) {
+    pub(crate) fn close(&self) {
         self.request_sender.close();
     }
 }

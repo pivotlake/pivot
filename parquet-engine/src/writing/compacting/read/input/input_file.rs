@@ -26,13 +26,13 @@ use arrow_schema::{DataType, Field};
 use dispatch::Projection;
 
 use super::decoded_values::DecodedValues;
-use super::key_merge::{RowGroupKeyBounds, SortKeyBounds};
-use super::output::InputValues;
 use super::read_requests::ReadRequests;
 use crate::ParquetTable;
 use crate::reading::DECODE_RANGE_ROWS;
 use crate::types::leaves::projected_leaves;
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
+use crate::writing::compacting::read::output::InputValues;
+use crate::writing::compacting::read::row_order::key_merge::{RowGroupKeyBounds, SortKeyBounds};
 use crate::writing::error::{WriteError, WriteResult};
 
 /// What the decoded values of a column own, as its type says.
@@ -97,10 +97,10 @@ impl DecodedSize {
 }
 
 /// The read of one column of one input row group.
-pub(super) struct ColumnRead {
+pub(crate) struct ColumnRead {
     /// The size of the column's chunk in the file, from the footer. A
     /// request for the column fetches exactly this many bytes.
-    pub(super) compressed_bytes: usize,
+    pub(crate) compressed_bytes: usize,
     /// The size of the chunk's pages once decompressed, per row, from the
     /// footer.
     decompressed_bytes_per_row: usize,
@@ -109,7 +109,7 @@ pub(super) struct ColumnRead {
     /// How many rows the row group holds.
     row_count: u32,
     /// Whether the column's chunk was requested from the pipeline.
-    pub(super) is_requested: bool,
+    pub(crate) is_requested: bool,
     /// Every row before this one was released to be decompressed and
     /// decoded. It is the end of a range of rows the decoder decodes in
     /// one go, or the end of the row group.
@@ -169,9 +169,10 @@ impl ColumnRead {
             .max(self.released_rows_end)
     }
 
-    /// Keep `values`, decoded values of the column that arrived.
-    fn store_values(&mut self, values: InputValues) {
-        self.unsent_values.insert(values.first_row, values);
+    /// Keep `values`, decoded values of the column that arrived, whose
+    /// first row is row `first_row` of the row group.
+    fn store_values(&mut self, first_row: u32, values: InputValues) {
+        self.unsent_values.insert(first_row, values);
         while let Some(next) = self.unsent_values.get(&self.decoded_rows_end) {
             self.decoded_rows_end += next.values.len() as u32;
         }
@@ -199,8 +200,6 @@ impl ColumnRead {
                     (first_row - values_first_row) as usize,
                     (taken_rows_end - first_row) as usize,
                 ),
-                row_group: unsent.row_group,
-                first_row,
                 memory: unsent.memory.clone(),
             });
             if taken_rows_end == values_rows_end {
@@ -212,13 +211,13 @@ impl ColumnRead {
 }
 
 /// One row group of an input file, with the reads of its columns.
-pub(super) struct FileRowGroup {
+pub(crate) struct FileRowGroup {
     /// The row group's index in the table's list of row groups.
-    pub(super) table_index: usize,
+    pub(crate) table_index: usize,
     /// The file rows the row group holds.
-    pub(super) rows: Range<u64>,
+    pub(crate) rows: Range<u64>,
     /// The read of each column of the table.
-    pub(super) columns: Vec<ColumnRead>,
+    pub(crate) columns: Vec<ColumnRead>,
 }
 
 impl FileRowGroup {
@@ -231,7 +230,7 @@ impl FileRowGroup {
     /// Request the chunk of table column `column` from the pipeline. Does
     /// nothing if it was requested before. Returns whether the request was
     /// made now.
-    pub(super) fn request_column(&mut self, column: usize, requests: &mut ReadRequests) -> bool {
+    pub(crate) fn request_column(&mut self, column: usize, requests: &mut ReadRequests) -> bool {
         let read = &mut self.columns[column];
         if read.is_requested {
             return false;
@@ -286,7 +285,7 @@ impl FileRowGroup {
     /// budget counts the bytes they own from here on, in place of what it
     /// counted for their rows when they were released. The two differ only
     /// by the validity that values without a null do not hold.
-    pub(super) fn store_decoded_values(
+    pub(crate) fn store_decoded_values(
         &mut self,
         decoded: DecodedValues,
         requests: &mut ReadRequests,
@@ -307,20 +306,19 @@ impl FileRowGroup {
         read.awaited_rows_counted_bytes -= counted_bytes;
         let memory = Arc::new(requests.memory_budget.reserve(decoded.count_owned_bytes()));
         requests.memory_budget.subtract(counted_bytes);
-        read.store_values(InputValues {
+        let values = InputValues {
             values: decoded.values,
-            row_group: self.table_index as u32,
-            first_row: decoded.first_row,
             memory,
-        });
+        };
+        read.store_values(decoded.first_row, values);
         Ok(())
     }
 }
 
 /// One input file of a compaction.
-pub(super) struct InputFile {
+pub(crate) struct InputFile {
     /// The file's row groups that hold rows, in file order.
-    pub(super) row_groups: Vec<FileRowGroup>,
+    pub(crate) row_groups: Vec<FileRowGroup>,
 }
 
 impl InputFile {
@@ -331,7 +329,7 @@ impl InputFile {
     /// file's row groups together and in file order. A row group whose index
     /// within its file is not higher than the previous row group's therefore
     /// starts a new file.
-    pub(super) fn list_files_of(table: &ParquetTable) -> WriteResult<Vec<InputFile>> {
+    pub(crate) fn list_files_of(table: &ParquetTable) -> WriteResult<Vec<InputFile>> {
         let column_count = table.schema().fields().len();
         let mut files: Vec<InputFile> = Vec::new();
         let mut previous_index_in_file = None;
@@ -373,7 +371,7 @@ impl InputFile {
     /// file order: its row count and the bounds of the first sort column.
     /// `sort_columns` are the table columns the file is sorted by, and
     /// `key_types` their types.
-    pub(super) fn read_key_bounds(
+    pub(crate) fn read_key_bounds(
         &self,
         table: &ParquetTable,
         sort_columns: &[usize],
@@ -415,7 +413,7 @@ impl InputFile {
     /// A file's rows are released in file order, so this is where the
     /// released rows end in the file's first row group that is not released
     /// whole.
-    pub(super) fn find_released_rows_end(&self, column: usize) -> u64 {
+    pub(crate) fn find_released_rows_end(&self, column: usize) -> u64 {
         let first_partly_released = self.row_groups.partition_point(|row_group| {
             let read = &row_group.columns[column];
             read.released_rows_end == read.row_count
@@ -431,7 +429,7 @@ impl InputFile {
     /// Estimate how many more bytes will be held if every file row of
     /// table column `column` before `rows_end` is decoded (see
     /// [`FileRowGroup::estimate_bytes_to_decode`]).
-    pub(super) fn estimate_bytes_to_decode(&self, column: usize, rows_end: u64) -> usize {
+    pub(crate) fn estimate_bytes_to_decode(&self, column: usize, rows_end: u64) -> usize {
         let released_rows_end = self.find_released_rows_end(column);
         if rows_end <= released_rows_end {
             return 0;
@@ -449,7 +447,7 @@ impl InputFile {
     /// decompressed and decoded, requesting the chunks that hold them first
     /// if they were not requested. Does nothing for rows that were released
     /// before. Returns whether any row was released.
-    pub(super) fn start_decoding_rows(
+    pub(crate) fn start_decoding_rows(
         &mut self,
         column: usize,
         rows_end: u64,
@@ -469,7 +467,7 @@ impl InputFile {
 
     /// Whether the file rows `rows` of table column `column`, which must
     /// not be empty, have all arrived decoded.
-    pub(super) fn is_decoded(&self, column: usize, rows: &Range<u64>) -> bool {
+    pub(crate) fn is_decoded(&self, column: usize, rows: &Range<u64>) -> bool {
         self.row_groups[self.find_row_groups_of_rows(rows)]
             .iter()
             .all(|row_group| {
@@ -481,7 +479,7 @@ impl InputFile {
     /// Append the decoded file rows `rows` of table column `column`, which
     /// must not be empty, to `sources`, in file order, as slices of the
     /// values they arrived in.
-    pub(super) fn take_input_values(
+    pub(crate) fn take_input_values(
         &mut self,
         column: usize,
         rows: Range<u64>,

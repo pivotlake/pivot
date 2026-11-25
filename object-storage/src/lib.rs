@@ -273,6 +273,13 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// How a worker should asynchronously create a data object at `key`.
     fn sink(&self, key: &ObjectPath) -> Result<DataFileLocation>;
 
+    /// This store as an [`S3Store`] when it is one, for a writer that uploads
+    /// an object in parts, which only S3 does here. `None` for every other
+    /// store.
+    fn as_s3(&self) -> Option<&S3Store> {
+        None
+    }
+
     /// Prime any credentials workers will need for writes. Called on the
     /// coordinator before launching an INSERT dataflow.
     fn prepare_write(&self) -> Result<()> {

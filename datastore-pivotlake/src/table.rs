@@ -828,32 +828,6 @@ impl CatalogTable {
         // The selector guarantees that all inputs share one partition, so its
         // recorded tuple can key every decoded batch without repartitioning it.
         let parquet = self.parquet_table_for(inputs);
-        // With PIVOT_COMPACTION_MERGE_SORT set, the merge only reads its
-        // inputs, in the order of their merge and within a memory budget.
-        // The rows are dropped as they come out, and the merge fails, so
-        // nothing is committed.
-        if std::env::var_os("PIVOT_COMPACTION_MERGE_SORT").is_some() {
-            use parquet_engine::writing::{MergeSortSettings, MergedBatchColumn};
-            parquet_engine::writing::read_in_merge_order_spec(
-                &self.dispatcher,
-                parquet,
-                self.sort_by(),
-                target_rows_per_group,
-                MergeSortSettings::from_env(),
-            )
-            .map_err(crate::Error::Merge)?
-            .map_each(|_merged_batch: MergedBatchColumn| Ok(()))
-            .collect()
-            .map_err(crate::Error::Merge)?;
-            return Err(crate::Error::MergeOutputDiscarded);
-        }
-        let columns = parquet.schema().fields().len();
-        let scan = parquet_engine::table_input(
-            &self.dispatcher,
-            &parquet,
-            Projection::all(columns),
-            false,
-        );
         let partition = inputs.first().and_then(|input| {
             self.files
                 .iter()
@@ -864,6 +838,21 @@ impl CatalogTable {
                 .clone()
         });
         let max_output_file_size = usize::try_from(max_output_file_size).unwrap_or(usize::MAX);
+        if std::env::var_os("PIVOT_COMPACTION_MERGE_SORT").is_some() {
+            return self.merge_files_in_merge_order(
+                parquet,
+                partition,
+                target_rows_per_group,
+                max_output_file_size,
+            );
+        }
+        let columns = parquet.schema().fields().len();
+        let scan = parquet_engine::table_input(
+            &self.dispatcher,
+            &parquet,
+            Projection::all(columns),
+            false,
+        );
         let uploaded_files = Arc::new(Injector::new());
         let encoded = parquet_engine::writing::encode_compaction_batches_spec(
             scan,
@@ -885,30 +874,7 @@ impl CatalogTable {
         // Drive encode → upload to completion; the emitted row-count batch is
         // ignored, and the uploaded files arrive on `uploaded_files`.
         let outcome = spec.collect().map(|_| ()).map_err(crate::Error::Merge);
-
-        let mut added: Vec<TableFile> = Vec::new();
-        loop {
-            match uploaded_files.steal() {
-                Steal::Success(uploaded) => {
-                    let super::insert_sink::UploadedFile {
-                        file,
-                        partition,
-                        row_groups,
-                    } = uploaded;
-                    let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
-                        &row_groups,
-                    )));
-                    let entry = DeltaFileEntry {
-                        file,
-                        partition,
-                        stats,
-                    };
-                    added.push(TableFile::new(entry, row_groups));
-                }
-                Steal::Retry => continue,
-                Steal::Empty => break,
-            }
-        }
+        let added = Self::take_uploaded_table_files(&uploaded_files);
 
         // A merge that failed part way has uploaded some of its outputs. They
         // will never be committed, so delete them rather than leave orphans.
@@ -926,6 +892,126 @@ impl CatalogTable {
             return Err(error);
         }
         Ok(added)
+    }
+
+    /// [`merge_files`](Self::merge_files) of the files of `parquet`, which
+    /// share the partition values `partition`, by the compaction that reads
+    /// its inputs in the order of their merge, within a memory budget, and
+    /// writes the output's column chunks as soon as they are encoded. It runs in
+    /// place of the default merge when `PIVOT_COMPACTION_MERGE_SORT` is set.
+    fn merge_files_in_merge_order(
+        &self,
+        parquet: Arc<parquet_engine::ParquetTable>,
+        partition: Option<PartitionValues>,
+        target_rows_per_group: usize,
+        max_output_file_size: usize,
+    ) -> crate::Result<Vec<TableFile>> {
+        use parquet_engine::writing::{
+            MergeSortSettings, compact_files_spec, plan_compaction_shredding,
+        };
+        let shredding =
+            plan_compaction_shredding(&self.dispatcher, &parquet).map_err(crate::Error::Merge)?;
+        let stored_files = Arc::new(Injector::new());
+        let started_uploads = Arc::new(Injector::new());
+        let uploaded_files = Arc::new(Injector::new());
+        let output = super::compaction_sink::CompactionOutput {
+            store: self.store(),
+            location: self.location.clone(),
+            declared_columns: self.declared_columns(),
+            schema: shredding.schema.clone(),
+            partition,
+            max_file_size: max_output_file_size,
+            stored_files: stored_files.clone(),
+            started_uploads: started_uploads.clone(),
+            uploaded_files: uploaded_files.clone(),
+        };
+        let outcome = compact_files_spec(
+            &self.dispatcher,
+            parquet,
+            shredding,
+            self.sort_by(),
+            target_rows_per_group,
+            MergeSortSettings::from_env(),
+        )
+        .and_then(|compaction| {
+            super::compaction_sink::write_output_files_spec(output, compaction).collect()
+        });
+
+        // A merge that failed part way has started to store some of its
+        // outputs. They will never be committed, so delete them rather than
+        // leave orphans.
+        if let Err(error) = outcome {
+            // The parts of an upload that was never completed stay stored
+            // until it is aborted. Aborting one that was completed changes
+            // nothing, and its object is deleted below.
+            loop {
+                let upload: super::compaction_sink::StartedUpload = match started_uploads.steal() {
+                    Steal::Success(upload) => upload,
+                    Steal::Retry => continue,
+                    Steal::Empty => break,
+                };
+                let s3 = self.store.as_s3();
+                let aborted = s3
+                    .expect("a multipart upload is only started in an S3 store")
+                    .abort_multipart_upload(&upload.key, &upload.upload_id);
+                if let Err(cleanup_error) = aborted {
+                    tracing::warn!(
+                        merge_error = %error,
+                        cleanup_error = %cleanup_error,
+                        file = %upload.key,
+                        "compaction: aborting a multipart upload of a merge that will not commit failed (its parts are left)"
+                    );
+                }
+            }
+            loop {
+                let path: ObjectPath = match stored_files.steal() {
+                    Steal::Success(path) => path,
+                    Steal::Retry => continue,
+                    Steal::Empty => break,
+                };
+                if let Err(cleanup_error) = self.delete_data_file(&path) {
+                    tracing::warn!(
+                        merge_error = %error,
+                        cleanup_error = %cleanup_error,
+                        file = %path,
+                        "compaction: deleting an output of a merge that will not commit failed (orphan left)"
+                    );
+                }
+            }
+            return Err(crate::Error::Merge(error));
+        }
+        Ok(Self::take_uploaded_table_files(&uploaded_files))
+    }
+
+    /// Take every file a merge's writer has finished off `uploaded_files`,
+    /// each as a table file with the statistics of its row groups.
+    fn take_uploaded_table_files(
+        uploaded_files: &Injector<super::insert_sink::UploadedFile>,
+    ) -> Vec<TableFile> {
+        let mut table_files: Vec<TableFile> = Vec::new();
+        loop {
+            match uploaded_files.steal() {
+                Steal::Success(uploaded) => {
+                    let super::insert_sink::UploadedFile {
+                        file,
+                        partition,
+                        row_groups,
+                    } = uploaded;
+                    let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
+                        &row_groups,
+                    )));
+                    let entry = DeltaFileEntry {
+                        file,
+                        partition,
+                        stats,
+                    };
+                    table_files.push(TableFile::new(entry, row_groups));
+                }
+                Steal::Retry => continue,
+                Steal::Empty => break,
+            }
+        }
+        table_files
     }
 }
 

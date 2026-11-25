@@ -9,11 +9,13 @@
 //! is missing or of another type keeps it in `value`, so the pair is always a
 //! complete document. [`infer`] picks the paths.
 //!
-//! The decision is made **per file**, from that file's own rows. Files are free
-//! to disagree — the read path resolves a path against each file's schema and
-//! falls back to `value` where a file didn't shred it — and that is what keeps
-//! the choice cheap: no cross-file agreement to reach, no table-wide schema to
-//! migrate when the data drifts.
+//! An INSERT makes the decision **per file**, from that file's own rows. Files
+//! are free to disagree — the read path resolves a path against each file's
+//! schema and falls back to `value` where a file didn't shred it — and that is
+//! what keeps the choice cheap: no cross-file agreement to reach, no table-wide
+//! schema to migrate when the data drifts. A compaction that writes row groups
+//! as it reads makes it once for all its output files, before it starts, from
+//! a sample of its input.
 //!
 //! The entry points:
 //!
@@ -25,6 +27,8 @@
 //! - [`plan_file_shredding`] runs in the
 //!   [`row_group_planner`](super::row_group_planner) once a file's rows are
 //!   known. It picks the file's layout without rewriting the rows.
+//!   [`plan_shredding_from_sample`] picks a layout from some of the rows
+//!   that will be written.
 //! - [`shred_column`] applies the plan in the [`shredder`](super::shredder)
 //!   stage, one slice of a row group's variant column at a time. The rewrite
 //!   is the heavy half: it parallelizes across workers there, and slicing it
@@ -53,15 +57,35 @@ pub(crate) fn unshred_batch(
     batch: RecordBatch,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<RecordBatch> {
-    map_variant_columns(batch, |array| {
-        // Already the plain pair: nothing to fold, and rebuilding it would copy
-        // every document for nothing. This is the ingest path.
-        if array.typed_value_field().is_none() {
-            return Ok(None);
-        }
-        let unshredded = unshred_variant(array)?;
-        Ok(Some(copy_value_field_to_slabs(unshredded, allocator)?))
+    map_variant_columns(batch, |array| unshred_variant_array(array, allocator))
+}
+
+/// Fold `values`, rows of a variant column, back to the plain
+/// `{metadata, value}` pair. Rows that are already plain are returned as they
+/// are.
+pub(super) fn unshred_column(
+    values: &ArrayRef,
+    allocator: &mut SlabAllocator,
+) -> WriteResult<ArrayRef> {
+    let array = VariantArray::try_new(values.as_ref())?;
+    Ok(match unshred_variant_array(&array, allocator)? {
+        Some(unshredded) => Arc::new(unshredded.into_inner()),
+        None => values.clone(),
     })
+}
+
+/// `array` folded back to the plain `{metadata, value}` pair, or `None` when
+/// it is that already: there is nothing to fold then, and rebuilding it would
+/// copy every document for nothing. This is the ingest path.
+fn unshred_variant_array(
+    array: &VariantArray,
+    allocator: &mut SlabAllocator,
+) -> WriteResult<Option<VariantArray>> {
+    if array.typed_value_field().is_none() {
+        return Ok(None);
+    }
+    let unshredded = unshred_variant(array)?;
+    Ok(Some(copy_value_field_to_slabs(unshredded, allocator)?))
 }
 
 /// Rebuilds an unshredded column's `value` field over slab memory.
@@ -95,12 +119,12 @@ fn copy_value_field_to_slabs(
     Ok(VariantArray::try_new(&rebuilt)?)
 }
 
-/// One file's shredding decision: the widened schema its footer will
-/// describe, and each variant column's inferred layout for the encode workers
-/// to apply. Plain columns, and variants with nothing worth shredding, carry
-/// `None`.
-pub(super) struct FileShredding {
-    pub(super) schema: arrow_schema::SchemaRef,
+/// One shredding decision, for a file or for every output file of a
+/// compaction: the widened schema the footer will describe, and each variant
+/// column's inferred layout for the encode workers to apply. Plain columns,
+/// and variants with nothing worth shredding, carry `None`.
+pub struct FileShredding {
+    pub schema: arrow_schema::SchemaRef,
     pub(super) column_shredding: Vec<Option<Arc<arrow_schema::DataType>>>,
 }
 
@@ -114,20 +138,36 @@ pub(super) struct FileShredding {
 /// shredder stage ([`shred_column`]).
 pub(super) fn plan_file_shredding(chunks: &[RecordBatch]) -> WriteResult<FileShredding> {
     let schema = chunks[0].schema();
+    let columns: Vec<usize> = (0..schema.fields().len()).collect();
+    plan_shredding_from_sample(&schema, &columns, chunks)
+}
+
+/// Decide the shredding of rows that will be written under `schema`, the
+/// schema before any shredding, from a sample of them.
+///
+/// `sample` holds the sampled rows, unshredded, of the table columns
+/// `sampled_columns`: column `i` of every batch of it is table column
+/// `sampled_columns[i]`. A variant column that is not sampled, or of which no
+/// row is, is left unshredded.
+pub(super) fn plan_shredding_from_sample(
+    schema: &arrow_schema::SchemaRef,
+    sampled_columns: &[usize],
+    sample: &[RecordBatch],
+) -> WriteResult<FileShredding> {
     let mut fields: Vec<FieldRef> = schema.fields().to_vec();
     let mut column_shredding = vec![None; fields.len()];
-    for column in 0..fields.len() {
-        if !crate::is_variant_field(schema.field(column)) {
+    for (sample_column, &column) in sampled_columns.iter().enumerate() {
+        if !crate::is_variant_field(schema.field(column)) || sample.is_empty() {
             continue;
         }
-        let arrays = chunks
+        let arrays = sample
             .iter()
-            .map(|chunk| VariantArray::try_new(chunk.column(column).as_ref()))
+            .map(|batch| VariantArray::try_new(batch.column(sample_column).as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         let Some(shredding_type) = infer::infer_shredding_type(&arrays) else {
             continue;
         };
-        let no_rows = VariantArray::try_new(chunks[0].column(column).slice(0, 0).as_ref())?;
+        let no_rows = VariantArray::try_new(sample[0].column(sample_column).slice(0, 0).as_ref())?;
         let widened = shred_variant(&no_rows, &shredding_type)?;
         // `VariantArray::field` re-applies the variant extension tag, so the
         // widened column is still recognized as a variant by the footer's

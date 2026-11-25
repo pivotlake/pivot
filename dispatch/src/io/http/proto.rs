@@ -8,6 +8,7 @@
 //! share identical, socket-free, unit-testable logic.
 
 use super::http1;
+use crate::io::UploadMethod;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -24,17 +25,29 @@ pub enum ProtoError {
     UnexpectedUploadStatus(u16),
 }
 
-/// Build a whole-object upload request. Always a `PUT` (the only upload method
-/// pivot uses).
-pub fn build_upload(host: &str, target: &str, len: usize, auth: Option<&str>) -> Vec<u8> {
+/// Build the head of a request that sends a body of `len` bytes: a `PUT` of a
+/// whole object or of one part of it, or a `POST`. A `POST` asks the store to
+/// close the connection after its answer, since the connection is not used
+/// again.
+pub fn build_upload(
+    method: UploadMethod,
+    host: &str,
+    target: &str,
+    len: usize,
+    auth: Option<&str>,
+) -> Vec<u8> {
     let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
+    let (verb, connection) = match method {
+        UploadMethod::Put => ("PUT", "keep-alive"),
+        UploadMethod::Post => ("POST", "close"),
+    };
     format!(
-        "PUT {target} HTTP/1.1\r\n\
+        "{verb} {target} HTTP/1.1\r\n\
          Host: {host}\r\n\
          {auth}\
          Content-Type: application/octet-stream\r\n\
          Content-Length: {len}\r\n\
-         Connection: keep-alive\r\n\
+         Connection: {connection}\r\n\
          User-Agent: pivotdb-dispatch/0.1\r\n\
          \r\n"
     )
@@ -71,7 +84,7 @@ pub fn build_range_get(
 }
 
 /// A parsed (and validated `206`) response head.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ResponseHead {
     /// Length of the header section, including the terminating `\r\n\r\n`. The
     /// body begins at this offset in the buffer that was parsed.
@@ -84,6 +97,10 @@ pub struct ResponseHead {
     /// close-delimited): pooling it would leave unread bytes that corrupt the
     /// next response read on that connection.
     pub reuse_connection: bool,
+    /// The response's `ETag` header, if it carries one.
+    pub etag: Option<String>,
+    /// How the response says where its body ends, for a body that is kept.
+    pub framing: http1::BodyFraming,
 }
 
 /// Outcome of trying to parse a (possibly incomplete) response head.
@@ -129,6 +146,8 @@ pub fn parse_get_response_head(buf: &[u8], expected_len: usize) -> Result<HeadPa
         head_len: head.head_len,
         content_length,
         reuse_connection: true,
+        etag: head.etag,
+        framing: http1::BodyFraming::Length(content_length),
     }))
 }
 
@@ -150,6 +169,8 @@ pub fn parse_upload_response_head(buf: &[u8]) -> Result<HeadParse, ProtoError> {
         head_len: head.head_len,
         content_length: head.content_length.unwrap_or(0),
         reuse_connection: head.content_length.is_some(),
+        framing: http1::BodyFraming::of(&head),
+        etag: head.etag,
     }))
 }
 
@@ -205,6 +226,24 @@ mod tests {
             parse_get_response_head(raw, 4096),
             Err(ProtoError::UnexpectedStatus(200))
         ));
+    }
+
+    #[test]
+    fn a_post_asks_for_the_connection_to_be_closed() {
+        let head = build_upload(
+            crate::io::UploadMethod::Post,
+            "host",
+            "/object?uploads=",
+            0,
+            None,
+        );
+
+        let text = String::from_utf8(head).unwrap();
+        assert!(
+            text.starts_with("POST /object?uploads= HTTP/1.1\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("Connection: close\r\n"), "{text}");
     }
 
     #[test]

@@ -79,9 +79,9 @@ const STRETCH_ROWS: u64 = RECORD_BATCH_SIZE as u64;
 /// at or after `lower` and at or before `upper`. Each bound is an array of
 /// one value. `None` means the bound is not known. A NULL `lower` means the
 /// row group may contain NULLs, which sort first.
-pub(super) struct SortKeyBounds {
-    pub(super) lower: Option<ArrayRef>,
-    pub(super) upper: Option<ArrayRef>,
+pub(crate) struct SortKeyBounds {
+    pub(crate) lower: Option<ArrayRef>,
+    pub(crate) upper: Option<ArrayRef>,
 }
 
 impl SortKeyBounds {
@@ -93,7 +93,7 @@ impl SortKeyBounds {
     /// - Some rows may be NULL (or the NULL count is unknown): the lower
     ///   bound is NULL.
     /// - Otherwise: the recorded minimum and maximum.
-    pub(super) fn from_statistics(
+    pub(crate) fn from_statistics(
         row_group: &RowGroupMetadata,
         column: usize,
         key_type: &DataType,
@@ -126,16 +126,16 @@ impl SortKeyBounds {
 }
 
 /// What the merge is told about one row group of an input file.
-pub(super) struct RowGroupKeyBounds {
-    pub(super) row_count: u64,
+pub(crate) struct RowGroupKeyBounds {
+    pub(crate) row_count: u64,
     /// The bounds of the first sort column. `None` for a table without
     /// sort columns.
-    pub(super) first_key_bounds: Option<SortKeyBounds>,
+    pub(crate) first_key_bounds: Option<SortKeyBounds>,
 }
 
 /// The result of [`KeyMerge::plan_next_run`].
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum NextRun {
+pub(crate) enum NextRun {
     /// The next `rows` rows of the output are the next `rows` unmerged rows
     /// of input file `file`. They are now recorded as merged.
     Found { file: usize, rows: u64 },
@@ -148,18 +148,18 @@ pub(super) enum NextRun {
 /// One row group of an input file: `row_group` is its place among the
 /// file's row groups that hold rows, in file order.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(super) struct RowGroupOfFile {
-    pub(super) file: usize,
-    pub(super) row_group: usize,
+pub(crate) struct RowGroupOfFile {
+    pub(crate) file: usize,
+    pub(crate) row_group: usize,
 }
 
 /// One key the merge needs decoded: the value of sort column `sort_column`
 /// (its index in the sort order) in row `row` of input file `file`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(super) struct NeededKey {
-    pub(super) file: usize,
-    pub(super) sort_column: usize,
-    pub(super) row: u64,
+pub(crate) struct NeededKey {
+    pub(crate) file: usize,
+    pub(crate) sort_column: usize,
+    pub(crate) row: u64,
 }
 
 /// One row group of an input file as the merge tracks it.
@@ -337,7 +337,7 @@ struct RowGroupsToMerge {
 }
 
 /// Decides the merge order of the input files by their sort columns.
-pub(super) struct KeyMerge {
+pub(crate) struct KeyMerge {
     /// The order the files are sorted in: one key per sort column, in sort
     /// order, ascending with NULL first.
     order_by: Vec<OrderBy>,
@@ -355,7 +355,7 @@ impl KeyMerge {
     /// in sort order. `files` gives, for each file, what the statistics say
     /// about each of its row groups, in file order. The files are numbered
     /// in the order given. No key is decoded yet.
-    pub(super) fn new(
+    pub(crate) fn new(
         key_types: &[DataType],
         files: Vec<Vec<RowGroupKeyBounds>>,
     ) -> WriteResult<Self> {
@@ -388,7 +388,7 @@ impl KeyMerge {
     /// rows must be added as arrays of the same rows in every sort column.
     /// Keys of rows that are all merged already are not kept. The others
     /// are held until their rows are merged.
-    pub(super) fn add_decoded_keys(
+    pub(crate) fn add_decoded_keys(
         &mut self,
         file: usize,
         sort_column: usize,
@@ -417,7 +417,7 @@ impl KeyMerge {
 
     /// How many rows of `file` are merged. This is also the file row of its
     /// next unmerged row.
-    pub(super) fn count_merged_rows(&self, file: usize) -> u64 {
+    pub(crate) fn count_merged_rows(&self, file: usize) -> u64 {
         self.files[file].next_unmerged_row
     }
 
@@ -428,7 +428,7 @@ impl KeyMerge {
     ///
     /// The list changes only when a run takes a file's last unmerged row
     /// of a row group.
-    pub(super) fn row_groups_to_merge(&self) -> &[RowGroupOfFile] {
+    pub(crate) fn row_groups_to_merge(&self) -> &[RowGroupOfFile] {
         &self.to_merge.row_groups
     }
 
@@ -438,7 +438,7 @@ impl KeyMerge {
     /// start at the same key, and all of them in a table without sort
     /// columns, keep the order of their files and of their place in
     /// the file.
-    pub(super) fn list_row_groups_in_merge_order(&self) -> Vec<RowGroupOfFile> {
+    pub(crate) fn list_row_groups_in_merge_order(&self) -> Vec<RowGroupOfFile> {
         let mut row_groups: Vec<RowGroupOfFile> = self
             .files
             .iter()
@@ -516,7 +516,7 @@ impl KeyMerge {
     /// Give the next run of the output, of at most `row_limit` rows, and
     /// record its rows as merged. A longer run is cut at `row_limit` rows,
     /// and the next call gives its remaining rows.
-    pub(super) fn plan_next_run(&mut self, row_limit: u64) -> WriteResult<NextRun> {
+    pub(crate) fn plan_next_run(&mut self, row_limit: u64) -> WriteResult<NextRun> {
         if self.ordered_runs.is_empty() {
             match self.to_merge.files[..] {
                 [] => return Ok(NextRun::NoRowsLeft),

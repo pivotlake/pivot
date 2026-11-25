@@ -444,6 +444,19 @@ impl Worker {
                         data_flow.stats().record_http_get_time(time);
                     }
                 }
+                Ok(Completion::HttpGetDirect(r)) => {
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow
+                            .stats()
+                            .record_http_get_time(crate::io::RemoteReadTime {
+                                http: r
+                                    .submitted_at
+                                    .map(|submitted_at| submitted_at.elapsed())
+                                    .unwrap_or_default(),
+                                ..Default::default()
+                            });
+                    }
+                }
                 Ok(Completion::HttpUpload(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_http_upload_time(r.submitted_at);

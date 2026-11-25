@@ -29,7 +29,7 @@ use dispatch::waker::WaitingWorkers;
 use crate::types::metadata::QueryRowGroupMetadata;
 
 /// The reads of a compaction, as the compacter and the gates share them.
-pub(super) struct GatedReads {
+pub(crate) struct GatedReads {
     /// How many columns the table has.
     column_count: usize,
     /// For each read, the row of its row group before which every row is
@@ -37,9 +37,9 @@ pub(super) struct GatedReads {
     released_rows_end: Vec<AtomicU32>,
     /// The workers whose `DecompressGate` holds a page that is not
     /// released.
-    pub(super) waiting_decompress_gates: WaitingWorkers,
+    pub(crate) waiting_decompress_gates: WaitingWorkers,
     /// The workers whose `DecodeGate` holds a range that is not released.
-    pub(super) waiting_decode_gates: WaitingWorkers,
+    pub(crate) waiting_decode_gates: WaitingWorkers,
     /// The compressed size of every page that no longer waits compressed
     /// at a `DecompressGate`.
     let_through_compressed_bytes: AtomicUsize,
@@ -49,7 +49,7 @@ impl GatedReads {
     /// The reads of each of `column_count` columns of each of
     /// `row_group_count` row groups, none released yet, for gates on each of
     /// `worker_count` workers.
-    pub(super) fn new(
+    pub(crate) fn new(
         row_group_count: usize,
         column_count: usize,
         worker_count: usize,
@@ -67,12 +67,12 @@ impl GatedReads {
 
     /// The number of the read of table column `column` of the row group
     /// at `row_group` in the table's list of row groups.
-    pub(super) fn index_read(&self, row_group: usize, column: usize) -> usize {
+    pub(crate) fn index_read(&self, row_group: usize, column: usize) -> usize {
         row_group * self.column_count + column
     }
 
     /// The number of the read that `metadata` is carried by.
-    pub(super) fn find_read_index(&self, metadata: &QueryRowGroupMetadata) -> usize {
+    pub(crate) fn find_read_index(&self, metadata: &QueryRowGroupMetadata) -> usize {
         let read_key = metadata.read_key();
         let column = read_key
             .column
@@ -84,26 +84,26 @@ impl GatedReads {
     /// decoded, now or once its pages have been fetched. The gates that
     /// hold some of those rows only look again once their workers are
     /// woken.
-    pub(super) fn release_rows_before(&self, read: usize, rows_end: u32) {
+    pub(crate) fn release_rows_before(&self, read: usize, rows_end: u32) {
         self.released_rows_end[read].store(rows_end, Ordering::SeqCst);
     }
 
     /// Whether row `row` of `read` is released.
-    pub(super) fn is_row_released(&self, read: usize, row: u32) -> bool {
+    pub(crate) fn is_row_released(&self, read: usize, row: u32) -> bool {
         row < self.released_rows_end[read].load(Ordering::SeqCst)
     }
 
     /// Record that a page of `compressed_bytes` no longer waits
     /// compressed at a `DecompressGate`: the gate let it through, or it
     /// arrived decompressed.
-    pub(super) fn record_page_let_through(&self, compressed_bytes: usize) {
+    pub(crate) fn record_page_let_through(&self, compressed_bytes: usize) {
         self.let_through_compressed_bytes
             .fetch_add(compressed_bytes, Ordering::Relaxed);
     }
 
     /// The compressed size of every page that no longer waits compressed
     /// at a `DecompressGate`.
-    pub(super) fn count_compressed_bytes_let_through(&self) -> usize {
+    pub(crate) fn count_compressed_bytes_let_through(&self) -> usize {
         self.let_through_compressed_bytes.load(Ordering::Relaxed)
     }
 }

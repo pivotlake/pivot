@@ -11,14 +11,14 @@ use crate::writing::error::{WriteError, WriteResult};
 
 /// The decoded values of one column in consecutive rows of one input row
 /// group.
-pub(super) struct DecodedValues {
+pub(crate) struct DecodedValues {
     /// The index of the row group in the table's list of row groups.
-    pub(super) row_group: usize,
+    pub(crate) row_group: usize,
     /// The table column the values are of.
-    pub(super) column: usize,
+    pub(crate) column: usize,
     /// The row number, in that row group, of the first value.
-    pub(super) first_row: u32,
-    pub(super) values: ArrayRef,
+    pub(crate) first_row: u32,
+    pub(crate) values: ArrayRef,
 }
 
 impl DecodedValues {
@@ -29,7 +29,7 @@ impl DecodedValues {
     /// columns that say which row group the rows are in and which rows of
     /// it they are. The decoder does not say which column it decoded: that
     /// is found from the column's name.
-    pub(super) fn read_decoder_output(
+    pub(crate) fn read_decoder_output(
         batch: RecordBatch,
         table: &ParquetTable,
     ) -> WriteResult<Self> {
@@ -65,7 +65,7 @@ impl DecodedValues {
     /// decompressed pages and the dictionary. Those bytes are not the
     /// values' own: they are counted with the pages. Only the views and the
     /// validity are counted here.
-    pub(super) fn count_owned_bytes(&self) -> usize {
+    pub(crate) fn count_owned_bytes(&self) -> usize {
         Self::count_owned_bytes_of(&self.values.to_data())
     }
 

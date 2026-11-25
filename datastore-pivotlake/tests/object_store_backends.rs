@@ -80,6 +80,36 @@ fn pq(values: &[i64]) -> Vec<u8> {
     buf
 }
 
+/// Snappy Parquet bytes for rows carrying the given `value`s in row groups of
+/// 2,000 rows, each row with a name of a kilobyte that does not compress.
+fn wide_pq(values: &[i64]) -> Vec<u8> {
+    let names: Vec<String> = values
+        .iter()
+        .map(|value| {
+            let mut state = *value as u64 ^ 0x9e37_79b9_7f4a_7c15;
+            (0..1024)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    char::from(b'!' + (state % 94) as u8)
+                })
+                .collect()
+        })
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let batch = strings_and_ints(&names, values);
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_row_count(Some(2_000))
+        .build();
+    let mut buf = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    buf
+}
+
 /// Put `files` (name → values) under `events/` and `CREATE TABLE events` over them.
 fn create_events(
     d: &DispatchGuard,
@@ -91,10 +121,19 @@ fn create_events(
             .put(&ObjectPath::new(format!("events/{name}")), &pq(values))
             .unwrap();
     }
+    create_table(d, b, adopting_request("events", "events"))
+}
+
+/// Run the `CREATE TABLE` that `request` describes.
+fn create_table(
+    d: &DispatchGuard,
+    b: &Backend,
+    request: CreateTableRequest,
+) -> Arc<PivotlakeDatastore> {
     let datastore = PivotlakeDatastore::open(&b.root, d).unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
-        .bind_create_table(adopting_request("events", "events"))
+        .bind_create_table(request)
         .unwrap()
         .compile(d)
         .unwrap()
@@ -442,3 +481,124 @@ backend_tests!(update_never_loses_a_write);
 backend_tests!(list_returns_objects_and_child_prefixes);
 backend_tests!(list_narrows_to_a_name_prefix);
 backend_tests!(reclaim_deletes_a_dropped_tables_nested_objects);
+
+// --- S3 multipart uploads ----------------------------------------------------
+
+/// A compaction's output on S3 goes up as a multipart upload of several parts
+/// and holds every row. Each row group is smaller than a part, so the parts
+/// only fill if the merge keeps sending rows while earlier ones are collected.
+#[test]
+fn compaction_uploads_an_s3_file_in_parts() {
+    let Some(b) = harness::s3("compaction-parts-s3") else {
+        return;
+    };
+    if std::env::var_os("PIVOT_COMPACTION_MERGE_SORT").is_none() {
+        eprintln!(
+            "skipping: only the compaction that PIVOT_COMPACTION_MERGE_SORT selects uploads in parts"
+        );
+        return;
+    }
+    let d = dispatch_with_buffers(2, 256);
+    let values: Vec<i64> = (0..60_000).collect();
+    for (name, file_values) in [
+        ("a.parquet", &values[..30_000]),
+        ("b.parquet", &values[30_000..]),
+    ] {
+        b.store
+            .put(
+                &ObjectPath::new(format!("events/{name}")),
+                &wide_pq(file_values),
+            )
+            .unwrap();
+    }
+    let datastore = create_table(&d, &b, adopting_request("events", "events"));
+    let name = SchemaQualifiedTableName::in_default_schema("events");
+    let table = datastore.table_handle(&name).unwrap();
+
+    datastore_pivotlake::compact_table_files(
+        &datastore,
+        table.id(),
+        &table.file_refs(),
+        5_000,
+        u64::MAX,
+    )
+    .unwrap();
+
+    assert_eq!(scan(&d, &datastore, "events"), values);
+    let merged = datastore.table_files(&name).unwrap();
+    let key = table_location(&datastore, "events").resolve(&merged[0].path);
+    assert!(harness::count_s3_upload_parts(b.store.as_ref(), &key) > 1);
+}
+
+/// A merge that fails after it has uploaded output files leaves none of them
+/// behind.
+#[test]
+fn failed_compaction_leaves_no_s3_object() {
+    let Some(b) = harness::s3("compaction-failure-s3") else {
+        return;
+    };
+    if std::env::var_os("PIVOT_COMPACTION_MERGE_SORT").is_none() {
+        eprintln!(
+            "skipping: only the compaction that PIVOT_COMPACTION_MERGE_SORT selects uploads in parts"
+        );
+        return;
+    }
+    let d = dispatch_with_buffers(2, 256);
+    // The last two rows of the second file are out of sort order, which the
+    // merge only finds after it has written the rows of the first file, and
+    // those fill more than one output file.
+    let mut values: Vec<i64> = (0..60_000).collect();
+    values.swap(59_998, 59_999);
+    for (name, file_values) in [
+        ("a.parquet", &values[..30_000]),
+        ("b.parquet", &values[30_000..]),
+    ] {
+        b.store
+            .put(
+                &ObjectPath::new(format!("events/{name}")),
+                &wide_pq(file_values),
+            )
+            .unwrap();
+    }
+    let mut request = adopting_request("events", "events");
+    request
+        .options
+        .insert("sort_by".to_string(), "value".to_string());
+    let datastore = create_table(&d, &b, request);
+    let table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+        .unwrap();
+
+    let outcome = datastore_pivotlake::compact_table_files(
+        &datastore,
+        table.id(),
+        &table.file_refs(),
+        5_000,
+        16 * 1024 * 1024,
+    );
+
+    assert!(outcome.is_err(), "the merge fails");
+    let location = table_location(&datastore, "events");
+    let outputs: Vec<_> = b
+        .store
+        .list_with_name_prefix(&location, "pivot-")
+        .unwrap()
+        .objects;
+    assert!(outputs.is_empty(), "{outputs:?}");
+}
+
+/// Aborting a multipart upload leaves nothing of it in the store.
+#[test]
+fn aborted_s3_multipart_upload_is_no_longer_pending() {
+    let Some(b) = harness::s3("abort-upload-s3") else {
+        return;
+    };
+    let s3 = b.store.as_s3().unwrap();
+    let key = ObjectPath::new("o.bin");
+    let upload_id = s3.create_multipart_upload(&key).unwrap();
+
+    s3.abort_multipart_upload(&key, &upload_id).unwrap();
+
+    let pending = harness::list_s3_pending_uploads("abort-upload-s3/o.bin");
+    assert!(pending.is_empty(), "{pending:?}");
+}

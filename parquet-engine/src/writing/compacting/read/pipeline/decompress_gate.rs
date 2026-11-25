@@ -15,8 +15,8 @@ use dispatch::{BuildContext, Built, BuiltUnary, Sender, Unary, UnaryFactory, Una
 use dispatch::{OperatorIO, WorkStatus};
 
 use super::gated_reads::GatedReads;
-use super::memory_budget::MemoryBudget;
 use crate::CompressedPage;
+use crate::writing::compacting::memory_budget::MemoryBudget;
 
 /// A page that waits at the gate. Pages are ordered so that the one whose
 /// first row comes first in its row group is the greatest: it is the next
@@ -48,7 +48,7 @@ impl Ord for HeldPage {
 ///
 /// Every worker has one, which holds the pages that reached that worker and
 /// passes them on to that worker's queue of pages to decompress.
-pub(super) struct DecompressGate {
+pub(crate) struct DecompressGate {
     gated_reads: Arc<GatedReads>,
     memory_budget: Arc<MemoryBudget>,
     /// The worker the gate runs on.
@@ -59,7 +59,7 @@ pub(super) struct DecompressGate {
 
 impl DecompressGate {
     /// One gate per worker.
-    pub(super) fn create_for_workers(
+    pub(crate) fn create_for_workers(
         gated_reads: &Arc<GatedReads>,
         memory_budget: &Arc<MemoryBudget>,
         worker_count: usize,

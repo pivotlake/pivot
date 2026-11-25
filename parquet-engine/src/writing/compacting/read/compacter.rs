@@ -6,8 +6,8 @@ use dispatch::{
 };
 
 use super::compaction_read::CompactionRead;
-use super::decoded_values::DecodedValues;
 use super::output::MergedBatchColumn;
+use crate::writing::compacting::read::input::decoded_values::DecodedValues;
 
 /// Reads a compaction's input files in merge order (see the
 /// [module](super) for the whole design).
@@ -15,7 +15,7 @@ use super::output::MergedBatchColumn;
 /// The dataflow has one compacter per worker, but only the one on the
 /// compaction worker holds a [`CompactionRead`]. All decoded values are
 /// routed to that worker, so the other compacters receive nothing.
-pub(super) struct MergeSortCompacter {
+pub(crate) struct MergeSortCompacter {
     /// The read's state. `None` on every worker except the compaction
     /// worker.
     compaction_read: Option<CompactionRead>,
@@ -24,7 +24,7 @@ pub(super) struct MergeSortCompacter {
 impl MergeSortCompacter {
     /// One compacter per worker. The compacter of `compaction_worker` holds
     /// `compaction_read`.
-    pub(super) fn create_for_workers(
+    pub(crate) fn create_for_workers(
         compaction_read: CompactionRead,
         worker_count: usize,
         compaction_worker: usize,

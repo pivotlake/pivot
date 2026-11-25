@@ -1,6 +1,6 @@
 //! Decides which rows of a compaction's input files are fetched and decoded
 //! next, and sends them on in merge order. It lives in the
-//! [`MergeSortCompacter`](super::MergeSortCompacter) of the compaction
+//! [`MergeSortCompacter`](super::compacter::MergeSortCompacter) of the compaction
 //! worker.
 //!
 //! The read orders the rows of one output row group at a time, from the
@@ -28,13 +28,16 @@
 //!    order the merge will take rows from their row groups, while there
 //!    is room to fetch ahead.
 //!
-//! The read holds to a [`MemoryBudget`], which counts the bytes actually
+//! The read holds to a
+//! [`MemoryBudget`](crate::writing::compacting::memory_budget::MemoryBudget), which counts the bytes actually
 //! held. How many columns are decoded at once is not decided up front: a
 //! column's rows are started when the budget has room for them. What the
 //! output cannot go on without is done whatever the budget says, since
 //! nothing else would give memory back: the keys the merge is waiting for
 //! when no ordered rows are left to send, and the next merged batch of the
-//! first column still to send.
+//! first column still to send. That holds only while no output row group
+//! is being encoded or stored: one that is gives its memory back when it
+//! is stored, and the read waits for that instead.
 //!
 //! Nothing but memory limits how far ahead the read works. Rows are
 //! ordered and sort keys decoded ahead while what is held is within half
@@ -47,18 +50,18 @@ use std::collections::VecDeque;
 use arrow_schema::DataType;
 use dispatch::{Sender, UnaryResult};
 
-use super::decoded_values::DecodedValues;
-use super::input_file::InputFile;
-use super::key_merge::{KeyMerge, NextRun, RowGroupOfFile};
-use super::output::{MergedBatchColumn, MergedRows};
-use super::output_row_group::OutputRowGroup;
-use super::read_requests::ReadRequests;
-use super::settings::MergeSortSettings;
+use super::output::MergedBatchColumn;
 use crate::ParquetTable;
+use crate::writing::compacting::read::input::decoded_values::DecodedValues;
+use crate::writing::compacting::read::input::input_file::InputFile;
+use crate::writing::compacting::read::input::read_requests::ReadRequests;
+use crate::writing::compacting::read::row_order::key_merge::{KeyMerge, NextRun, RowGroupOfFile};
+use crate::writing::compacting::read::row_order::output_row_group::OutputRowGroup;
+use crate::writing::compacting::settings::MergeSortSettings;
 use crate::writing::error::WriteResult;
 
 /// A compaction's read of its input files in merge order.
-pub(super) struct CompactionRead {
+pub(crate) struct CompactionRead {
     /// The table columns the files are sorted by, in sort order.
     sort_columns: Vec<usize>,
     /// The input files, in the table's order, with what was read of each.
@@ -89,7 +92,7 @@ impl CompactionRead {
     /// columns `sort_columns`, into output row groups of
     /// `output_row_group_rows` rows. Nothing is requested yet. The files
     /// ask through `requests`, and the read holds to its memory budget.
-    pub(super) fn new(
+    pub(crate) fn new(
         table: &ParquetTable,
         sort_columns: Vec<usize>,
         settings: MergeSortSettings,
@@ -129,7 +132,7 @@ impl CompactionRead {
     /// row group left to merge, and no ordered output row group is left to
     /// send. The last rows the merge orders are moved to the ordered output
     /// row groups at once, so none is left in the one being ordered.
-    pub(super) fn has_sent_every_row(&self) -> bool {
+    pub(crate) fn has_sent_every_row(&self) -> bool {
         self.merge.row_groups_to_merge().is_empty() && self.ordered_row_groups.is_empty()
     }
 
@@ -139,7 +142,7 @@ impl CompactionRead {
     /// The steps run in this order so that memory is given back first, and
     /// so that the columns of rows whose order is decided take the room in
     /// the budget before sort keys and chunks further ahead do.
-    pub(super) fn run_ready_steps(
+    pub(crate) fn run_ready_steps(
         &mut self,
         sender: &mut dyn Sender<MergedBatchColumn>,
     ) -> UnaryResult<bool> {
@@ -160,7 +163,7 @@ impl CompactionRead {
     /// Keep the decoded values that came back from the pipeline, with the
     /// file they are of. Values of a sort column are also given to the
     /// merge as keys.
-    pub(super) fn store_decoded_values(&mut self, decoded: DecodedValues) -> UnaryResult<()> {
+    pub(crate) fn store_decoded_values(&mut self, decoded: DecodedValues) -> UnaryResult<()> {
         let row_group = self.find_row_group_at(decoded.row_group);
         let file_row_group = &mut self.files[row_group.file].row_groups[row_group.row_group];
         let sort_column = self
@@ -237,7 +240,7 @@ impl CompactionRead {
 
     /// Send on the next merged batch of the ordered output row group at
     /// `position` in `column`: the values its rows were decoded as, with
-    /// the list of which row of which of them each of its rows is.
+    /// the runs that say in which order they go out.
     fn send_next_merged_batch(
         &mut self,
         position: usize,
@@ -258,26 +261,30 @@ impl CompactionRead {
             self.files[file].take_input_values(column, rows.clone(), &mut sources);
         }
         sender.send(MergedBatchColumn {
-            sequence: row_group.first_sequence + batch_index,
+            row_group: row_group.number,
+            batch: batch_index,
+            row_group_batch_count: row_group.merged_batches.len(),
             column,
-            rows: MergedRows::from_file_runs(&batch.runs, &sources, &first_source_per_file),
-            sources: sources.into(),
+            sources,
+            first_source_per_file,
+            runs: batch.runs.clone(),
         })?;
         row_group.record_sent(column);
         Ok(())
     }
 
     /// Drop the oldest ordered output row groups that were sent on in every
-    /// column. Returns whether any was dropped.
+    /// column. From then on they are in flight: being encoded or stored.
+    /// Returns whether any was dropped.
     fn drop_sent_row_groups(&mut self) -> bool {
         let mut has_dropped = false;
         while let Some(row_group) = self
             .ordered_row_groups
             .pop_front_if(|row_group| row_group.find_first_unsent().is_none())
         {
-            self.requests
-                .memory_budget
-                .subtract(row_group.count_held_bytes());
+            let memory_budget = &self.requests.memory_budget;
+            memory_budget.subtract(row_group.count_held_bytes());
+            memory_budget.record_output_row_group_sent();
             has_dropped = true;
         }
         has_dropped
@@ -306,16 +313,19 @@ impl CompactionRead {
     /// back to its gates in between. Returns whether the order of any row
     /// was decided or the decoding of any key was started.
     ///
-    /// While no ordered output row group waits to be sent on, the output
-    /// cannot go on without this: the keys the merge needs are released to
-    /// be decoded whatever the memory budget says. Ordering more than that
+    /// While no ordered output row group waits to be sent on and none is
+    /// being encoded or stored, the output cannot go on without this: the
+    /// keys the merge needs are released to be decoded whatever the memory
+    /// budget says. Ordering more than that
     /// is work ahead. It goes on only while the budget has room for work
     /// ahead, and a key it needs is released only if the budget has that
     /// room for it.
     fn decide_row_order_of_output_row_groups(&mut self) -> WriteResult<bool> {
         let is_every_row_ordered = self.merge.row_groups_to_merge().is_empty();
-        let is_required = self.ordered_row_groups.is_empty();
-        let has_room_ahead = self.requests.memory_budget.has_room_ahead_for(0);
+        let memory_budget = &self.requests.memory_budget;
+        let is_required =
+            self.ordered_row_groups.is_empty() && !memory_budget.has_output_row_group_in_flight();
+        let has_room_ahead = memory_budget.has_room_ahead_for(0);
         if is_every_row_ordered || !(is_required || has_room_ahead) {
             return Ok(false);
         }
@@ -383,7 +393,8 @@ impl CompactionRead {
     /// order, and a column a merged batch at a time. Each merged batch of a
     /// column is started only while the memory budget has room for what it
     /// is estimated to hold, so the budget decides how many columns are
-    /// being decoded at once. The one exception always goes ahead: the next
+    /// being decoded at once. The one exception goes ahead without room,
+    /// while no output row group is being encoded or stored: the next
     /// merged batch to send of the first unsent column of the oldest output
     /// row group.
     ///
@@ -408,7 +419,9 @@ impl CompactionRead {
                         self.files[file].estimate_bytes_to_decode(next.column, rows_end)
                     })
                     .sum();
-                let is_required = position == 0 && row_group.find_first_unsent() == Some(next);
+                let is_required = position == 0
+                    && row_group.find_first_unsent() == Some(next)
+                    && !self.requests.memory_budget.has_output_row_group_in_flight();
                 let has_room = estimated_bytes == 0
                     || self.requests.memory_budget.has_room_for(estimated_bytes);
                 if !is_required && !has_room {

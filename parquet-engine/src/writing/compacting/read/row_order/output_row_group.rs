@@ -1,18 +1,20 @@
 //! The row order of one output row group, as the merge decided it.
 
 use std::ops::Range;
+use std::sync::Arc;
 
-use super::output::FileRun;
+use crate::writing::compacting::read::output::FileRun;
 
 /// Consecutive rows of the output: at most
-/// [`pull_rows`](super::MergeSortSettings::pull_rows) of them. The rows of
+/// [`pull_rows`](crate::writing::compacting::MergeSortSettings::pull_rows) of them. The rows of
 /// an output row group are sent on one merged batch at a time.
-pub(super) struct MergedBatch {
-    /// The runs the batch consists of, in output order.
-    pub(super) runs: Vec<FileRun>,
+pub(crate) struct MergedBatch {
+    /// The runs the batch consists of, in output order. They are shared
+    /// with the columns of the batch that were sent on.
+    pub(crate) runs: Arc<Vec<FileRun>>,
     /// For each input file, the file rows the batch takes from it. Empty
     /// for a file the batch takes no row from.
-    pub(super) rows_per_file: Vec<Range<u64>>,
+    pub(crate) rows_per_file: Vec<Range<u64>>,
 }
 
 impl MergedBatch {
@@ -33,26 +35,25 @@ impl MergedBatch {
 
 /// One merged batch of one column of an output row group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ColumnBatch {
-    pub(super) column: usize,
+pub(crate) struct ColumnBatch {
+    pub(crate) column: usize,
     /// The merged batch's place among the row group's merged batches.
-    pub(super) batch: usize,
+    pub(crate) batch: usize,
 }
 
 /// The rows of one output row group, in output order, and how far each
 /// column of them has got.
-pub(super) struct OutputRowGroup {
+pub(crate) struct OutputRowGroup {
     /// How many rows the row group holds when it is full.
-    pub(super) row_limit: usize,
+    pub(crate) row_limit: usize,
     /// How many rows a merged batch holds when it is full.
     merged_batch_rows: usize,
     /// How many input files the merge is of.
     file_count: usize,
-    /// The place of the row group's first merged batch among the merged
-    /// batches of the whole output, which are numbered from 0 in output
-    /// order.
-    pub(super) first_sequence: usize,
-    pub(super) merged_batches: Vec<MergedBatch>,
+    /// The row group's place among the output row groups, which are
+    /// numbered from 0 in output order.
+    pub(crate) number: usize,
+    pub(crate) merged_batches: Vec<MergedBatch>,
     /// The first merged batch of a column whose rows' decoding was not
     /// started yet. The columns are started in order, and each column's
     /// merged batches in order, so the decoding of everything before this
@@ -69,7 +70,7 @@ impl OutputRowGroup {
     /// The first output row group, with no rows yet, of a merge of
     /// `file_count` files of a table of `column_count` columns. It is full
     /// at `row_limit` rows, and its merged batches at `merged_batch_rows`.
-    pub(super) fn new(
+    pub(crate) fn new(
         column_count: usize,
         file_count: usize,
         row_limit: usize,
@@ -79,7 +80,7 @@ impl OutputRowGroup {
             row_limit,
             merged_batch_rows,
             file_count,
-            first_sequence: 0,
+            number: 0,
             merged_batches: Vec::new(),
             next_to_decode: ColumnBatch {
                 column: 0,
@@ -90,11 +91,10 @@ impl OutputRowGroup {
         }
     }
 
-    /// The output row group after this one, with no rows yet. Its merged
-    /// batches are numbered on from this one's.
-    pub(super) fn start_next(&self) -> Self {
+    /// The output row group after this one, with no rows yet.
+    pub(crate) fn start_next(&self) -> Self {
         Self {
-            first_sequence: self.first_sequence + self.merged_batches.len(),
+            number: self.number + 1,
             ..Self::new(
                 self.sent_batches.len(),
                 self.file_count,
@@ -116,14 +116,14 @@ impl OutputRowGroup {
     }
 
     /// Whether the row group holds as many rows as it can.
-    pub(super) fn is_full(&self) -> bool {
+    pub(crate) fn is_full(&self) -> bool {
         self.count_rows() == self.row_limit
     }
 
     /// How many rows the next run may hold: the room left in the last
     /// merged batch, or in a new one if that is full, and no more than the
     /// room left in the row group.
-    pub(super) fn count_room_for_next_run(&self) -> usize {
+    pub(crate) fn count_room_for_next_run(&self) -> usize {
         let rows_in_last_batch = self.merged_batches.last().map(MergedBatch::count_rows);
         let room_in_batch = match rows_in_last_batch {
             Some(rows) if rows < self.merged_batch_rows => self.merged_batch_rows - rows,
@@ -135,14 +135,14 @@ impl OutputRowGroup {
     /// Record that the row group's next `rows` rows are the rows of `file`
     /// from file row `first_row` on. They go to the last merged batch, or
     /// to a new one if the last is full.
-    pub(super) fn append_run(&mut self, file: usize, first_row: u64, rows: u32) {
+    pub(crate) fn append_run(&mut self, file: usize, first_row: u64, rows: u32) {
         let is_last_batch_full = self
             .merged_batches
             .last()
             .is_none_or(|batch| batch.count_rows() == self.merged_batch_rows);
         if is_last_batch_full {
             self.merged_batches.push(MergedBatch {
-                runs: Vec::new(),
+                runs: Arc::new(Vec::new()),
                 rows_per_file: vec![0..0; self.file_count],
             });
         }
@@ -152,14 +152,16 @@ impl OutputRowGroup {
             *rows_of_file = first_row..first_row;
         }
         rows_of_file.end += rows as u64;
-        match batch.runs.last_mut() {
+        let runs = Arc::get_mut(&mut batch.runs)
+            .expect("no column of a merged batch is sent on before its row group is ordered");
+        match runs.last_mut() {
             Some(last_run) if last_run.file == file => last_run.rows += rows,
-            _ => batch.runs.push(FileRun { file, rows }),
+            _ => runs.push(FileRun { file, rows }),
         }
     }
 
     /// How many bytes the row group's row order takes.
-    pub(super) fn count_held_bytes(&self) -> usize {
+    pub(crate) fn count_held_bytes(&self) -> usize {
         self.merged_batches
             .iter()
             .map(MergedBatch::count_held_bytes)
@@ -169,13 +171,13 @@ impl OutputRowGroup {
     /// The first merged batch of a column whose rows' decoding was not
     /// started yet, or `None` when the decoding of every merged batch of
     /// every column was started.
-    pub(super) fn find_next_to_decode(&self) -> Option<ColumnBatch> {
+    pub(crate) fn find_next_to_decode(&self) -> Option<ColumnBatch> {
         (self.next_to_decode.column < self.sent_batches.len()).then_some(self.next_to_decode)
     }
 
     /// Record that the decoding of the rows of the merged batch that
     /// [`find_next_to_decode`](Self::find_next_to_decode) gave was started.
-    pub(super) fn record_decoding_started(&mut self) {
+    pub(crate) fn record_decoding_started(&mut self) {
         self.next_to_decode.batch += 1;
         if self.next_to_decode.batch == self.merged_batches.len() {
             self.next_to_decode = ColumnBatch {
@@ -188,7 +190,7 @@ impl OutputRowGroup {
     /// The next merged batch to send on in `column`, with its place among
     /// the row group's merged batches, or `None` when the column was sent
     /// on in every merged batch.
-    pub(super) fn find_next_to_send(&self, column: usize) -> Option<(usize, &MergedBatch)> {
+    pub(crate) fn find_next_to_send(&self, column: usize) -> Option<(usize, &MergedBatch)> {
         let batch = self.sent_batches[column];
         self.merged_batches
             .get(batch)
@@ -198,7 +200,7 @@ impl OutputRowGroup {
     /// Record that the merged batch that
     /// [`find_next_to_send`](Self::find_next_to_send) gave for `column` was
     /// sent on.
-    pub(super) fn record_sent(&mut self, column: usize) {
+    pub(crate) fn record_sent(&mut self, column: usize) {
         self.sent_batches[column] += 1;
         while self.first_unsent_column < self.sent_batches.len()
             && self.sent_batches[self.first_unsent_column] == self.merged_batches.len()
@@ -209,7 +211,7 @@ impl OutputRowGroup {
 
     /// The first merged batch, of the first column, that is still to send
     /// on, or `None` when every column was sent on in every merged batch.
-    pub(super) fn find_first_unsent(&self) -> Option<ColumnBatch> {
+    pub(crate) fn find_first_unsent(&self) -> Option<ColumnBatch> {
         let column = self.first_unsent_column;
         (column < self.sent_batches.len()).then(|| ColumnBatch {
             column,

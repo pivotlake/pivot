@@ -18,9 +18,9 @@ use bytes::Bytes;
 use dispatch::UnaryResult;
 use dispatch::{BuildContext, Built, BuiltUnary, OperatorIO, Sender, Unary, UnaryFactory};
 
-use super::memory_budget::{MemoryBudget, MemoryReservation};
 use crate::DecompressedPage;
 use crate::types::page::{DataPage, DecompressedPageType};
+use crate::writing::compacting::memory_budget::{MemoryBudget, MemoryReservation};
 
 /// One buffer of a decompressed page, with the reservation that counts it.
 struct CountedPageBytes {
@@ -37,13 +37,13 @@ impl AsRef<[u8]> for CountedPageBytes {
 /// Wraps the bytes of every decompressed page it passes on so that the
 /// memory budget counts them until nothing holds them. It neither reads
 /// nor changes the bytes.
-pub(super) struct PageMemoryCounter {
+pub(crate) struct PageMemoryCounter {
     memory_budget: Arc<MemoryBudget>,
 }
 
 impl PageMemoryCounter {
     /// One counter per worker.
-    pub(super) fn create_for_workers(
+    pub(crate) fn create_for_workers(
         memory_budget: &Arc<MemoryBudget>,
         worker_count: usize,
     ) -> Vec<Self> {

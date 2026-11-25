@@ -5,9 +5,9 @@ use crate::io::disk_cache::DiskCache;
 use crate::io::hardware_queues::{InFlightPermit, WorkerHardwareQueues};
 use crate::io::{
     Completion, DataFlowRequest, FailedIO, FileRange, FsDirectReadRequest, FsReadRequest,
-    FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest, OpenFile,
-    PendingDirectReadRequest, PendingReadRequest, PendingWriteRequest, ReadData, ReadRequestId,
-    ReadResponse, RemoteSplit, SlabRead,
+    FsRequest, FsWriteRequest, HttpDirectGetRequest, HttpGetRequest, HttpRequest,
+    HttpUploadRequest, OpenFile, PendingDirectReadRequest, PendingReadRequest, PendingWriteRequest,
+    ReadData, ReadRequestId, ReadResponse, RemoteSplit, SlabRead,
 };
 use crate::memory::cache::MissingExtent;
 use crate::memory::{CacheLookup, FrozenSlab, memory_ctx};
@@ -176,6 +176,9 @@ impl IORead {
             },
             Self::Http(request) => match &request.request {
                 HttpRequest::Get(read) => &read.block,
+                HttpRequest::GetDirect(_) => {
+                    unreachable!("direct reads are never registered with the cache")
+                }
                 HttpRequest::Upload(_) => {
                     unreachable!("registered reads never contain uploads")
                 }
@@ -515,6 +518,7 @@ impl IORequester {
             open_file,
             offset,
             data,
+            method,
         } = request;
         match open_file {
             OpenFile::Local(file) => {
@@ -535,7 +539,13 @@ impl IORequester {
                 let mut request = DataFlowRequest::new(
                     data_flow_id,
                     operator_idx,
-                    HttpRequest::Upload(HttpUploadRequest { remote, data }),
+                    HttpRequest::Upload(HttpUploadRequest {
+                        remote,
+                        data,
+                        method,
+                        etag: None,
+                        response_body: Vec::new(),
+                    }),
                 );
                 stats.stamp_issued(std::slice::from_mut(&mut request));
                 let split = self.submit_http_request_to_backend(request)?;
@@ -666,9 +676,11 @@ impl IORequester {
         }
     }
 
-    /// Read ranges of a local file around the compressed cache, into the
-    /// slabs the caller supplied, and track the read until every range has
-    /// landed. Each range is one physical read.
+    /// Read ranges of a file around the compressed cache, into the slabs the
+    /// caller supplied, and track the read until every range has landed.
+    /// Each range is one physical read: a read of a local file, or a range
+    /// GET of a remote object. Remote ranges that follow each other in the
+    /// object share a request, as a cached read's do.
     pub fn request_read_direct(
         &mut self,
         data_flow_id: Identifier,
@@ -681,10 +693,12 @@ impl IORequester {
             operator_idx,
         };
         let PendingDirectReadRequest { id, file, reads } = request;
-        let mut fs_requests = Vec::with_capacity(reads.len());
+        let mut fs_requests = Vec::new();
+        let mut http_requests = Vec::new();
         let mut physical_read_ids = Vec::with_capacity(reads.len());
         let mut tracked = Vec::with_capacity(reads.len());
-        for SlabRead { offset, slab } in reads {
+        for SlabRead { offset, slab, len } in reads {
+            assert!(len <= slab.size(), "a direct read fits its slab");
             let physical_read_id = self.next_physical_read_id;
             self.next_physical_read_id += 1;
             physical_read_ids.push(physical_read_id);
@@ -695,35 +709,64 @@ impl IORequester {
                     filled: None,
                 },
             });
-            fs_requests.push(
-                DataFlowRequest::new(
-                    data_flow_id,
-                    operator_idx,
-                    FsRequest::ReadDirect(FsDirectReadRequest {
-                        file: file.clone(),
-                        offset: offset as u64,
-                        slab,
-                    }),
-                )
-                .with_pending_read_id(physical_read_id),
-            );
+            match &file {
+                OpenFile::Local(file) => fs_requests.push(
+                    DataFlowRequest::new(
+                        data_flow_id,
+                        operator_idx,
+                        FsRequest::ReadDirect(FsDirectReadRequest {
+                            file: file.clone(),
+                            offset: offset as u64,
+                            slab,
+                            len,
+                        }),
+                    )
+                    .with_pending_read_id(physical_read_id),
+                ),
+                OpenFile::Remote(remote) => http_requests.push(
+                    DataFlowRequest::new(
+                        data_flow_id,
+                        operator_idx,
+                        HttpRequest::GetDirect(HttpDirectGetRequest {
+                            remote: remote.clone(),
+                            offset: offset as u64,
+                            slab,
+                            len,
+                        }),
+                    )
+                    .with_pending_read_id(physical_read_id),
+                ),
+            }
         }
-        self.track_pending_read(
-            route,
-            id,
-            OpenFile::Local(file),
-            tracked,
-            &physical_read_ids,
-        );
+        self.track_pending_read(route, id, file, tracked, &physical_read_ids);
 
         stats.record_issued_disk(&mut fs_requests);
         let mut fs_queue = fs_requests.into_iter();
         while let Some(request) = fs_queue.next() {
             if let Err(error) = self.submit_fs_request_to_backend(request) {
-                self.withdraw_unsubmitted_reads(fs_queue, []);
+                self.withdraw_unsubmitted_reads(fs_queue, http_requests);
                 return Err(error);
             }
         }
+
+        stats.stamp_issued(&mut http_requests);
+        let mut http_queue = http_requests.into_iter();
+        while let Some(request) = http_queue.next() {
+            match self.submit_http_request_to_backend(request) {
+                Ok(split) => stats.record_issued_remote(split),
+                Err(error) => {
+                    self.withdraw_unsubmitted_reads(std::iter::empty(), http_queue);
+                    return Err(error);
+                }
+            }
+        }
+        // Issued once every range is registered, so the ranges that follow
+        // each other in the object share a request.
+        let http_requests = self.http.issue_registered_fetches(&mut self.backend)?;
+        stats.record_issued_remote(RemoteSplit {
+            http_requests,
+            ..RemoteSplit::default()
+        });
         Ok(())
     }
 
@@ -1020,6 +1063,13 @@ impl IORequester {
                     submitted_at,
                 },
             ),
+            HttpRequest::GetDirect(request) => Ok(self.http.get_direct(DataFlowRequest {
+                data_flow_id,
+                operator_idx,
+                request,
+                pending_read_id,
+                submitted_at,
+            })),
             HttpRequest::Upload(request) => {
                 let bytes = request.data.len() as u64;
                 self.http
@@ -1250,7 +1300,7 @@ impl IORequester {
                 // Zero progress means the file ends before the range does.
                 if let FsRequest::ReadDirect(read) = &request.request {
                     let done = done + result.max(0) as usize;
-                    if result > 0 && done < read.slab.size() {
+                    if result > 0 && done < read.len {
                         self.submit_rest_of_direct_read(read, done)?;
                         self.pending_io_requests.insert(
                             self.next_id,
@@ -1272,7 +1322,7 @@ impl IORequester {
                     }
                     // A direct read asks for bytes its caller knows are in
                     // the file, so a file that ends short of them is an error.
-                    FsRequest::ReadDirect(read) if done + (result as usize) < read.slab.size() => {
+                    FsRequest::ReadDirect(read) if done + (result as usize) < read.len => {
                         Some(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             "direct read stopped short of the requested range",
@@ -1356,7 +1406,7 @@ impl IORequester {
                             })
                         }
                         FsRequest::ReadDirect(read) => {
-                            let range = FileRange::new(read.offset as usize, read.slab.size());
+                            let range = FileRange::new(read.offset as usize, read.len);
                             if let Some(id) = pending_read_id {
                                 self.land_direct_read(id, read.slab.freeze());
                             }
@@ -1393,6 +1443,9 @@ impl IORequester {
         // HTTP reads the engine finished this pass (and any write-backs they queue).
         self.http
             .drain(&mut self.backend, &mut self.next_id, &mut out)?;
+        for (physical_read_id, filled_slab) in self.http.take_landed_direct_reads() {
+            self.land_direct_read(physical_read_id, filled_slab);
+        }
 
         // Reads waiting on fills the ring did not carry for this requester.
         self.resolve_piggybacked(&mut out);
@@ -1413,7 +1466,7 @@ impl IORequester {
                         self.complete_pending_read(id);
                     }
                 }
-                Ok(Completion::FsReadDirect(request)) => {
+                Ok(Completion::FsReadDirect(request) | Completion::HttpGetDirect(request)) => {
                     if let Some(id) = request.pending_read_id {
                         self.complete_pending_read(id);
                     }
@@ -1505,7 +1558,7 @@ fn fs_cache_extent(request: &DataFlowRequest<FsRequest>) -> Option<(OpenFile, Mi
 fn http_cache_extent(request: &DataFlowRequest<HttpRequest>) -> Option<(OpenFile, MissingExtent)> {
     match &request.request {
         HttpRequest::Get(read) => Some((OpenFile::Remote(read.remote.clone()), read.block.clone())),
-        HttpRequest::Upload(_) => None,
+        HttpRequest::GetDirect(_) | HttpRequest::Upload(_) => None,
     }
 }
 
@@ -1532,6 +1585,7 @@ mod tests {
     //! issuing a second read for a different region of the same object.
 
     use super::*;
+    use crate::io::UploadMethod;
     use crate::io::hardware_queues::HardwareQueue;
     use crate::io::{
         FileRange, HttpGetRequest, HttpUploadRequest, LocalFile, OpenFile, PendingReadRequest,
@@ -1680,12 +1734,13 @@ mod tests {
         let mut allocator = crate::memory::SlabAllocator::new(false);
         PendingDirectReadRequest {
             id: ReadRequestId(0),
-            file: file.clone(),
+            file: OpenFile::Local(file.clone()),
             reads: ranges
                 .iter()
                 .map(|range| SlabRead {
                     offset: range.offset,
                     slab: allocator.get_slab_of_size(range.len, false),
+                    len: range.len,
                 })
                 .collect(),
         }
@@ -2096,6 +2151,9 @@ mod tests {
             HttpRequest::Upload(HttpUploadRequest {
                 remote,
                 data: data.clone(),
+                method: UploadMethod::Put,
+                etag: None,
+                response_body: Vec::new(),
             }),
         );
         upload.submitted_at = Some(submitted_at);
@@ -2132,6 +2190,103 @@ mod tests {
         assert_eq!(Arc::strong_count(&data), 1);
     }
 
+    /// A `POST` whose body is the test payload, to the listener at `addr`.
+    fn build_post(addr: std::net::SocketAddr) -> DataFlowRequest<HttpRequest> {
+        let data = build_upload_payload();
+        let remote = Arc::new(
+            RemoteFile::open(
+                Url::parse(&format!("http://{addr}/object.parquet?uploads=")).unwrap(),
+                None,
+                data.len() as u64,
+            )
+            .unwrap(),
+        );
+        DataFlowRequest::new(
+            7,
+            11,
+            HttpRequest::Upload(HttpUploadRequest {
+                remote,
+                data,
+                method: UploadMethod::Post,
+                etag: None,
+                response_body: Vec::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_post_is_sent_as_a_post_and_its_chunked_answer_comes_back() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_line = [0u8; 5];
+            stream.read_exact(&mut request_line).unwrap();
+            read_upload_body(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                      6\r\n<Uploa\r\n7\r\ndId>7</\r\n0\r\n\r\n",
+                )
+                .unwrap();
+            request_line
+        });
+        let mut requester = IORequester::default();
+
+        requester
+            .submit_http_request_to_backend(build_post(addr))
+            .unwrap();
+        let completion = loop {
+            if let Some(completion) = requester.completions().unwrap().into_iter().next() {
+                break completion;
+            }
+            requester.wait().unwrap();
+        };
+
+        let Ok(Completion::HttpUpload(request)) = completion else {
+            panic!("expected a completed POST");
+        };
+        assert_eq!(request.request.response_body, b"<UploadId>7</");
+        assert_eq!(&server.join().unwrap(), b"POST ");
+    }
+
+    /// Only the io_uring engine re-issues a failed request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_post_is_sent_again_after_a_server_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut overloaded, _) = listener.accept().unwrap();
+            read_upload_body(&mut overloaded);
+            overloaded
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            let (mut recovered, _) = listener.accept().unwrap();
+            read_upload_body(&mut recovered);
+            recovered
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        });
+        let mut requester = IORequester::default();
+
+        requester
+            .submit_http_request_to_backend(build_post(addr))
+            .unwrap();
+        let completion = loop {
+            if let Some(completion) = requester.completions().unwrap().into_iter().next() {
+                break completion;
+            }
+            requester.wait().unwrap();
+        };
+
+        let Ok(Completion::HttpUpload(request)) = completion else {
+            panic!("expected a completed POST");
+        };
+        assert_eq!(request.request.response_body, b"ok");
+        server.join().unwrap();
+    }
+
     /// Only the io_uring engine re-issues a failed request.
     #[cfg(target_os = "linux")]
     #[test]
@@ -2157,6 +2312,9 @@ mod tests {
         let upload = HttpRequest::Upload(HttpUploadRequest {
             remote,
             data: data.clone(),
+            method: UploadMethod::Put,
+            etag: None,
+            response_body: Vec::new(),
         });
         let mut requester = IORequester::default();
 
@@ -2217,6 +2375,9 @@ mod tests {
             let upload = HttpRequest::Upload(HttpUploadRequest {
                 remote: remote.clone(),
                 data: data.clone(),
+                method: UploadMethod::Put,
+                etag: None,
+                response_body: Vec::new(),
             });
             requester
                 .submit_http_request_to_backend(DataFlowRequest::new(7, 11, upload))
@@ -2238,6 +2399,46 @@ mod tests {
         assert!(matches!(completion, Ok(Completion::HttpUpload(_))));
         let sent: Vec<u8> = data.runs().flatten().copied().collect();
         assert_eq!(server.join().unwrap().1, sent);
+    }
+
+    #[test]
+    fn upload_completion_carries_the_response_etag() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_upload_body(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nETag: \"part-1\"\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let data = build_upload_payload();
+        let url = Url::parse(&format!("http://{addr}/object.parquet")).unwrap();
+        let remote = Arc::new(RemoteFile::open(url, None, data.len() as u64).unwrap());
+        let upload = HttpRequest::Upload(HttpUploadRequest {
+            remote,
+            data,
+            method: UploadMethod::Put,
+            etag: None,
+            response_body: Vec::new(),
+        });
+        let mut requester = IORequester::default();
+
+        requester
+            .submit_http_request_to_backend(DataFlowRequest::new(7, 11, upload))
+            .unwrap();
+        let completion = loop {
+            if let Some(completion) = requester.completions().unwrap().into_iter().next() {
+                break completion;
+            }
+            requester.wait().unwrap();
+        };
+
+        let Ok(Completion::HttpUpload(request)) = completion else {
+            panic!("expected an HTTP upload completion");
+        };
+        assert_eq!(request.request.etag.as_deref(), Some("\"part-1\""));
+        server.join().unwrap();
     }
 
     /// Read one range request and write back its `206` response body.
