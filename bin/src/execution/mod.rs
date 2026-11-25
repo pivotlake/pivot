@@ -26,8 +26,8 @@ use planning::{PlanCache, PlannerPool, plan_query};
 
 pub use copy::CopyIngest;
 pub use types::{
-    Command, Error, ExecuteOptions, Execution, ExecutionStats, Result, ResultColumn,
-    STATS_VARIABLE, StatementOutput, is_truthy,
+    Command, Error, ExecuteOptions, Execution, ExecutionStats, LIVE_STATS_INTERVAL_VARIABLE,
+    Result, ResultColumn, STATS_VARIABLE, StatementOutput, is_truthy,
 };
 
 /// Shared SQL execution state for every frontend of one Pivot instance.
@@ -237,12 +237,17 @@ impl Executor {
         let dispatcher = self.dispatcher.clone();
         #[cfg(feature = "perf")]
         let dispatcher = dispatcher.with_profiling(options.profile);
+        let dispatcher = match options.live_stats {
+            Some(subscription) => dispatcher.with_live_stats(subscription),
+            None => dispatcher,
+        };
+        let collect_stats = options.collect_stats;
 
         let started = Instant::now();
         let compile_transaction = transaction;
         let handle = tokio::task::spawn_blocking(move || -> Result<StatementHandle<T>> {
             let spec = plan.compile(&dispatcher, compile_transaction.as_ref())?;
-            Ok(match (statement_kind, options.collect_stats) {
+            Ok(match (statement_kind, collect_stats) {
                 (StatementKind::Insert, true) => {
                     let output = spec.map(|| affected_rows_from_record_batch);
                     StatementHandle::Insert(output.execute_with_stats())

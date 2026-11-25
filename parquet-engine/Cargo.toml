@@ -26,6 +26,8 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 crossbeam-deque = { workspace = true }
 ahash = { workspace = true }
+# The custom stats a scan reports about its row groups for live stats.
+serde_json = { workspace = true }
 roaring = { workspace = true }
 snap = { workspace = true }
 # LZ4_RAW page decompression (the fork with scattered decode).

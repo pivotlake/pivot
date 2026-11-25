@@ -115,11 +115,15 @@ pub fn file_row_groups_from_metadata(
     let open_file = source
         .open_read(file.size)
         .map_err(crate::ParquetTableError::IO)?;
-    let row_groups =
-        crate::types::table::row_groups_from_metadata(metadata, open_file, table_columns)?
-            .into_iter()
-            .map(Arc::new)
-            .collect();
+    let row_groups = crate::types::table::row_groups_from_metadata(
+        metadata,
+        open_file,
+        &file.path,
+        table_columns,
+    )?
+    .into_iter()
+    .map(Arc::new)
+    .collect();
     Ok(FileRowGroups { file, row_groups })
 }
 

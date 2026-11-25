@@ -441,7 +441,7 @@ impl IORequester {
         let mut http_queue = http_requests.into_iter();
         while let Some(request) = http_queue.next() {
             match self.submit_http_request_to_backend(request) {
-                Ok(split) => stats.record_issued_remote(split),
+                Ok(split) => stats.record_issued_remote(operator_idx, split),
                 Err(error) => {
                     self.withdraw_unsubmitted_reads(std::iter::empty(), http_queue);
                     return Err(error);
@@ -451,10 +451,13 @@ impl IORequester {
         // Issued once the whole logical read is registered, so its ranges that
         // lie close together in the object share a request.
         let http_requests = self.http.issue_registered_fetches(&mut self.backend)?;
-        stats.record_issued_remote(RemoteSplit {
-            http_requests,
-            ..RemoteSplit::default()
-        });
+        stats.record_issued_remote(
+            operator_idx,
+            RemoteSplit {
+                http_requests,
+                ..RemoteSplit::default()
+            },
+        );
 
         Ok(())
     }
@@ -539,7 +542,7 @@ impl IORequester {
                 );
                 stats.stamp_issued(std::slice::from_mut(&mut request));
                 let split = self.submit_http_request_to_backend(request)?;
-                stats.record_issued_remote(split);
+                stats.record_issued_remote(operator_idx, split);
                 Ok(())
             }
         }
@@ -1621,8 +1624,7 @@ mod tests {
     }
 
     fn disabled_stats() -> StatsCollector {
-        let (tx, _rx) = mpsc::channel();
-        StatsCollector::new(tx, false)
+        StatsCollector::disabled()
     }
 
     #[test]

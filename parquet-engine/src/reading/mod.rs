@@ -9,6 +9,7 @@
 //! - [`decoding`] — decodes ranges into Arrow arrays.
 //! - [`materializer`] — late materialization: re-reads surviving rows by row id.
 //! - [`scan`] — the builders that chain the stages into one spec.
+//! - [`scan_live_stats`] — what the scan reports to a query's live stats.
 //!
 //! It scans the row groups the [`metadata`](super::metadata) (table-load)
 //! pipeline produced at `CREATE`/`ATTACH` time.
@@ -32,6 +33,8 @@ mod materializer;
 pub use materializer::MaterializerFactory;
 
 mod record_batch_metadata;
+
+pub mod scan_live_stats;
 
 mod empty_projection_scan;
 

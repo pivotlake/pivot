@@ -36,6 +36,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::reading::scan_live_stats::ROW_GROUP_PRUNED_BY_DYNAMIC_FILTER;
 use crate::{RowGroupFilter, ScanOrder};
 
 /// The NUMA node a row group is assigned to, by a hash of its stable identity
@@ -145,6 +146,9 @@ pub struct RowGroupInjectorFactory {
     queues_claimed_first: Option<RowGroupQueues>,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
+    /// Where the receivers this factory builds report each row group
+    /// `filter` eliminates: the custom stats of the fetcher they feed.
+    fetcher_custom_stats: dispatch::CustomStats,
 }
 
 /// The allowance on outstanding claims while the boundary has not yet proven
@@ -224,7 +228,10 @@ impl RowGroupInjectorFactory {
     /// groups are pushed in that key's order so the most-promising are claimed
     /// first and the boundary prunes the rest; otherwise decompressed-cache-covered
     /// row groups go first, largest-first within a tie (see
-    /// [`plain_scan_order`]).
+    /// [`plain_scan_order`]). The row groups the filter eliminates are
+    /// reported nowhere until each worker's copy of a factory is told which
+    /// fetcher it feeds (see
+    /// [`reporting_pruned_row_groups_to`](Self::reporting_pruned_row_groups_to)).
     pub fn create_by_expected_need(
         table: &Arc<ParquetTable>,
         projection: Projection,
@@ -273,14 +280,27 @@ impl RowGroupInjectorFactory {
             queues_claimed_first: None,
             filter: filter.clone(),
             speculation: speculation.clone(),
+            fetcher_custom_stats: dispatch::CustomStats::disabled(),
         };
         let io_row_groups = Self {
             row_group_queues: io_row_group_queues,
             queues_claimed_first,
             filter,
             speculation,
+            fetcher_custom_stats: dispatch::CustomStats::disabled(),
         };
         (in_memory_row_groups, io_row_groups)
+    }
+
+    /// Have the receiver this factory builds report each row group the
+    /// dynamic filter eliminates to `fetcher_custom_stats`, the custom stats
+    /// of the fetcher that receiver feeds.
+    pub fn reporting_pruned_row_groups_to(
+        mut self,
+        fetcher_custom_stats: dispatch::CustomStats,
+    ) -> Self {
+        self.fetcher_custom_stats = fetcher_custom_stats;
+        self
     }
 }
 
@@ -296,6 +316,7 @@ impl RootChannelFactory<QueryRowGroupMetadata> for RowGroupInjectorFactory {
             queues_claimed_first: self.queues_claimed_first,
             filter: self.filter,
             speculation: self.speculation,
+            fetcher_custom_stats: self.fetcher_custom_stats,
         }
     }
 }
@@ -314,6 +335,9 @@ pub struct RowGroupInjector {
     numa_node_idx: usize,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
+    /// Where each row group `filter` eliminates is reported: the custom
+    /// stats of the fetcher this injector feeds.
+    fetcher_custom_stats: dispatch::CustomStats,
 }
 
 impl Receiver<QueryRowGroupMetadata> for RowGroupInjector {
@@ -437,6 +461,10 @@ impl RowGroupInjector {
         if let Some(filter) = &self.filter
             && !filter(row_group.get_metadata())
         {
+            self.fetcher_custom_stats
+                .report(ROW_GROUP_PRUNED_BY_DYNAMIC_FILTER, || {
+                    row_group.row_group_metadata.describe_for_live_stats()
+                });
             return None;
         }
         if let SpeculationTicket::Reserved(gate) = &ticket {
@@ -552,6 +580,7 @@ mod tests {
             deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            file_path: Arc::from("data.parquet"),
         })
     }
 

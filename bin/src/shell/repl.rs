@@ -1,4 +1,6 @@
-use crate::execution::{ExecuteOptions, STATS_VARIABLE, StatementOutput, is_truthy};
+use crate::execution::{
+    ExecuteOptions, LIVE_STATS_INTERVAL_VARIABLE, STATS_VARIABLE, StatementOutput, is_truthy,
+};
 use crate::shell::copy::{CopyCommand, copy_from_file, parse_copy_command};
 use crate::shell::parser::split_complete;
 use crate::shell::progress::show_opening_progress;
@@ -307,6 +309,7 @@ impl Session {
         let options = ExecuteOptions {
             collect_stats,
             profile: false,
+            live_stats: None,
         };
         let executor = self.instance.executor();
         let stats = &mut self.stats;
@@ -315,6 +318,19 @@ impl Session {
                 .execute_with_output(sql, options, TextBatch::from_record_batch)
                 .await
                 .map_err(|error| Error::Statement(error.into()))?;
+            if let StatementOutput::Set { name, .. } = &execution.output
+                && name.eq_ignore_ascii_case(LIVE_STATS_INTERVAL_VARIABLE)
+            {
+                // Live stats travel as notices on a server connection, which
+                // the shell does not have: refuse rather than accept a
+                // setting that would do nothing here.
+                return Err(Error::Statement(
+                    format!(
+                        "{LIVE_STATS_INTERVAL_VARIABLE} is only available on a server connection"
+                    )
+                    .into(),
+                ));
+            }
             if let StatementOutput::Set { name, value } = &execution.output
                 && let Some(enabled) = parse_stats_toggle(name, value.as_deref())
             {
@@ -335,6 +351,7 @@ impl Session {
         let options = ExecuteOptions {
             collect_stats,
             profile: false,
+            live_stats: None,
         };
         let work = async {
             let outcome = copy_from_file(self.executor(), copy, options)

@@ -425,28 +425,36 @@ impl Worker {
                 // just means drop the completion (the slot pin releases with it).
                 Ok(Completion::FsRead(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.stats().record_disk_read_time(r.submitted_at);
+                        data_flow
+                            .stats()
+                            .record_disk_read_time(r.operator_idx, r.submitted_at);
                     }
                 }
                 Ok(Completion::FsReadDirect(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.stats().record_disk_read_time(r.submitted_at);
+                        data_flow
+                            .stats()
+                            .record_disk_read_time(r.operator_idx, r.submitted_at);
                     }
                 }
                 Ok(Completion::FsWrite(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.stats().record_disk_write_time(r.submitted_at);
+                        data_flow
+                            .stats()
+                            .record_disk_write_time(r.operator_idx, r.submitted_at);
                         data_flow.process_fs_write(r.operator_idx, r.request);
                     }
                 }
                 Ok(Completion::HttpGet(r, time)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.stats().record_http_get_time(time);
+                        data_flow.stats().record_http_get_time(r.operator_idx, time);
                     }
                 }
                 Ok(Completion::HttpUpload(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.stats().record_http_upload_time(r.submitted_at);
+                        data_flow
+                            .stats()
+                            .record_http_upload_time(r.operator_idx, r.submitted_at);
                         data_flow.process_http_upload_response(r.operator_idx, r.request);
                     }
                 }
@@ -699,6 +707,13 @@ impl Worker {
                 self.try_steal_work();
                 if self.did_work_last_iteration {
                     continue;
+                }
+
+                // About to wait for IO or park: send the dataflows' live
+                // stats that are due, as no dataflow step will until this
+                // worker next has work.
+                for flow in self.data_flows.values_mut() {
+                    flow.stats().publish_due_live_stats();
                 }
 
                 // One ring serves both disk and HTTP, so a single wait wakes on

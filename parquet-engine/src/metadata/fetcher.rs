@@ -181,6 +181,7 @@ impl FooterRead {
         Ok(FooterProgress::Done(row_groups_from_footer(
             footer,
             self.open_file.clone(),
+            &self.file.path,
             table_columns,
         )?))
     }

@@ -298,6 +298,12 @@ impl<'a> OperatorIO<'a> {
         Ok(id)
     }
 
+    /// Bill the time since the dataflow step started, or since its last
+    /// billing, to the operator this handle points at.
+    pub(crate) fn bill_cpu_lap(&mut self) {
+        self.stats.bill_cpu_lap_to_operator(self.operator_idx);
+    }
+
     pub(crate) fn data_flow_id(&self) -> crate::Identifier {
         self.data_flow_id
     }

@@ -256,6 +256,13 @@ pub trait Unary<I, O> {
         None
     }
 
+    /// See [`Operator::custom_stats`]. Wired through the wrapping
+    /// [`UnaryOperator`] so a transform can name where it reports its custom
+    /// stats.
+    fn custom_stats(&self) -> Option<crate::CustomStats> {
+        None
+    }
+
     /// Hand up to `count` of this transform's sealed buffers to `spiller`, so
     /// their memory can be given up once the writes land. See
     /// [`Operator::spill`]. The default
@@ -298,6 +305,10 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
 }
 
 impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<U>()
+    }
+
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         // A transform that is not taking input may still have work of its own
         // to advance, e.g. a job it steps through one batch per turn.
@@ -419,6 +430,10 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
 
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         self.unary.upstream_cancel_flag()
+    }
+
+    fn custom_stats(&self) -> Option<crate::CustomStats> {
+        self.unary.custom_stats()
     }
 
     fn spill(&mut self, spiller: &mut Spiller, count: usize) -> super::Result<()> {

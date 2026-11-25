@@ -26,14 +26,16 @@
 /// whether it asks for reads ahead of its worker's CPU work, the factory of
 /// the receiver the row groups expected to need a read wait in (a table
 /// scan's [`RowGroupInjectorFactory`] over them, or the queue a late
-/// materialization's materializer sends them to), and the queue every
-/// worker's fetcher pushes the uncached row groups to and takes them from.
+/// materialization's materializer sends them to), the queue every
+/// worker's fetcher pushes the uncached row groups to and takes them from,
+/// and where the fetcher reports its custom stats.
 pub struct RowGroupFetcherFactory<IoRowGroupsReceiverFactory> {
     projection: std::sync::Arc<crate::types::projection::Projection>,
     read_medium: dispatch::io::ReadMedium,
     reads_ahead_of_cpu_work: bool,
     io_row_groups_receiver_factory: IoRowGroupsReceiverFactory,
     uncached_row_groups_channel: dispatch::SharedWorkQueueChannelFactory<QueryRowGroupMetadata>,
+    custom_stats: dispatch::CustomStats,
 }
 
 impl<IoRowGroupsReceiverFactory> RowGroupFetcherFactory<IoRowGroupsReceiverFactory> {
@@ -43,6 +45,7 @@ impl<IoRowGroupsReceiverFactory> RowGroupFetcherFactory<IoRowGroupsReceiverFacto
         reads_ahead_of_cpu_work: bool,
         io_row_groups_receiver_factory: IoRowGroupsReceiverFactory,
         uncached_row_groups_channel: dispatch::SharedWorkQueueChannelFactory<QueryRowGroupMetadata>,
+        custom_stats: dispatch::CustomStats,
     ) -> Self {
         Self {
             projection,
@@ -50,6 +53,7 @@ impl<IoRowGroupsReceiverFactory> RowGroupFetcherFactory<IoRowGroupsReceiverFacto
             reads_ahead_of_cpu_work,
             io_row_groups_receiver_factory,
             uncached_row_groups_channel,
+            custom_stats,
         }
     }
 }
@@ -74,6 +78,7 @@ where
             dispatch::RootChannelFactory::build(self.io_row_groups_receiver_factory),
             uncached_row_groups_sender,
             uncached_row_groups_receiver,
+            self.custom_stats,
         ))
     }
 }

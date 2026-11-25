@@ -910,7 +910,7 @@ fn run_sql_err(datastore: &Arc<PivotlakeDatastore>, sql: &str) -> String {
 fn run_sql_with_stats(
     datastore: &Arc<PivotlakeDatastore>,
     sql: &str,
-) -> (Vec<RecordBatch>, dispatch::DataFlowStats) {
+) -> (Vec<RecordBatch>, dispatch::CpuAndIoCounters) {
     let (transaction, compiled) = compile_sql(datastore, sql);
     let result = compiled.collect_with_stats().unwrap();
     commit_transaction_blocking(transaction);

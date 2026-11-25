@@ -3,11 +3,11 @@ use crate::api::BuildContext;
 use crate::data_flow::DataFlow;
 use crate::memory::Evict;
 use crate::operations::Operator;
-use crate::stats::DataFlowStats;
+use crate::stats::{CpuAndIoCounters, LiveStatsSubscription};
 use ahash::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, mpsc};
+use std::sync::{Arc, LazyLock, Once, mpsc};
 use thiserror::Error;
 
 static ID: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
@@ -144,7 +144,7 @@ impl OperatorGraphBuilder {
         id: Identifier,
         cancelled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<crate::data_flow::Error>,
-        stats_tx: mpsc::Sender<DataFlowStats>,
+        stats_tx: mpsc::Sender<CpuAndIoCounters>,
         collect_stats: bool,
     ) -> DataFlow {
         DataFlow::new(
@@ -172,7 +172,7 @@ pub struct DataFlowBuilder {
     /// A sender for errors that may occur during running
     err_tx: mpsc::Sender<crate::data_flow::Error>,
     /// Where this worker's stats tally is shipped (used only when `collect_stats`)
-    stats_tx: mpsc::Sender<DataFlowStats>,
+    stats_tx: mpsc::Sender<CpuAndIoCounters>,
     /// Whether the query opted into per-dataflow stats collection
     collect_stats: bool,
     /// Whether this dataflow is profiled: it runs exclusively (the worker pauses
@@ -180,6 +180,10 @@ pub struct DataFlowBuilder {
     /// launching dispatcher was marked (see [`with_profiling`](Self::with_profiling)).
     #[cfg(feature = "perf")]
     profiled: bool,
+    /// Who receives this dataflow's live stats, and the flag every worker's
+    /// builder of this dataflow shares so that exactly one of them sends the
+    /// description of its operators. `None` when the query did not subscribe.
+    live_stats: Option<(LiveStatsSubscription, Arc<Once>)>,
     /// Builds the per-worker operator graph.
     build: Box<dyn FnOnce(&mut BuildContext) -> OperatorGraphBuilder + Send>,
 }
@@ -189,7 +193,7 @@ impl DataFlowBuilder {
         build: Box<dyn FnOnce(&mut BuildContext) -> OperatorGraphBuilder + Send>,
         cancelled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<crate::data_flow::Error>,
-        stats_tx: mpsc::Sender<DataFlowStats>,
+        stats_tx: mpsc::Sender<CpuAndIoCounters>,
         collect_stats: bool,
     ) -> Self {
         Self {
@@ -199,8 +203,22 @@ impl DataFlowBuilder {
             collect_stats,
             #[cfg(feature = "perf")]
             profiled: false,
+            live_stats: None,
             build,
         }
+    }
+
+    /// Have the dataflow this builds send its live stats to `subscription`.
+    /// Every worker's builder of one launched dataflow is given the same
+    /// `operators_sent`, so the first of them to build sends the description
+    /// of the dataflow's operators and the others send only their stats.
+    pub fn with_live_stats(
+        mut self,
+        subscription: LiveStatsSubscription,
+        operators_sent: Arc<Once>,
+    ) -> Self {
+        self.live_stats = Some((subscription, operators_sent));
+        self
     }
 
     /// Mark this builder's dataflow profiled, so it runs exclusively while a
@@ -253,7 +271,12 @@ impl DataFlowBuilder {
         );
         #[cfg(feature = "perf")]
         let data_flow = data_flow.with_profiling(self.profiled);
-        Ok(data_flow)
+        Ok(match self.live_stats {
+            Some((subscription, operators_sent)) => {
+                data_flow.with_live_stats(subscription, &operators_sent)
+            }
+            None => data_flow,
+        })
     }
 }
 

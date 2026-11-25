@@ -9,8 +9,8 @@ use crate::operations::{
 use crate::{DataFlowBuilder, DataFlowDispatcher, DataFlowHandle, OperatorGraphBuilder};
 use arrow_array::RecordBatch;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Arc, Once};
 
 /// Generic, strongly-typed spec for building multi-stage pipelines.
 ///
@@ -75,6 +75,12 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let cancelled = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "perf")]
         let profiled = self.dispatcher.profiled();
+        // One flag for the whole launch, so exactly one of the workers that
+        // run this dataflow sends the description of its operators.
+        let live_stats = self
+            .dispatcher
+            .live_stats()
+            .map(|subscription| (subscription.clone(), Arc::new(Once::new())));
         let wakers = self
             .dispatcher
             .push_data_flow(self.factories.into_iter().map(|f| {
@@ -91,7 +97,12 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
                 );
                 #[cfg(feature = "perf")]
                 let builder = builder.with_profiling(profiled);
-                builder
+                match &live_stats {
+                    Some((subscription, operators_sent)) => {
+                        builder.with_live_stats(subscription.clone(), operators_sent.clone())
+                    }
+                    None => builder,
+                }
             }));
         // Close our local copies of the senders so the channels close once
         // every worker drops theirs.

@@ -22,7 +22,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
-use object_storage::DataFile;
+use object_storage::{DataFile, ObjectPath};
 use planner::catalog::Column;
 use planner::types::Type;
 use std::collections::HashMap;
@@ -68,6 +68,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone)]
 pub struct ParquetTable {
     pub(crate) row_groups: Vec<Arc<RowGroupMetadata>>,
+    /// The row groups that pushed-down predicates removed from `row_groups`
+    /// because their statistics prove no row can match (see
+    /// [`prune_parquet`](crate::prune_parquet)). A scan does not read them;
+    /// it only reports them to a query's live stats.
+    pub(crate) row_groups_pruned_by_statistics: Vec<Arc<RowGroupMetadata>>,
     /// The table's Arrow schema, captured at construction so it survives even
     /// when every row group is pruned away (e.g. predicate-stats pruning removes
     /// all of them). Deriving it from `row_groups[0]` instead would yield an
@@ -91,7 +96,11 @@ impl ParquetTable {
             .first()
             .map(|rg| rg.schema.clone())
             .unwrap_or_else(|| EMPTY_SCHEMA.clone());
-        Self { row_groups, schema }
+        Self {
+            row_groups,
+            row_groups_pruned_by_statistics: Vec::new(),
+            schema,
+        }
     }
 
     /// A table of `schema` without row groups: a scan whose files were all
@@ -99,6 +108,7 @@ impl ParquetTable {
     pub fn empty(schema: SchemaRef) -> Self {
         Self {
             row_groups: Vec::new(),
+            row_groups_pruned_by_statistics: Vec::new(),
             schema,
         }
     }
@@ -243,15 +253,17 @@ pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 
 /// Parse raw thrift footer bytes into this file's row groups (file-local
 /// indices), tying each to `open_file` for the column-chunk reads that follow.
-/// `table_columns` is the table's declared schema and how the file's columns
-/// match it (see [`resolve_column_layout`]).
+/// `file_path` is the file's path in its object store. `table_columns` is the
+/// table's declared schema and how the file's columns match it (see
+/// [`resolve_column_layout`]).
 pub(crate) fn row_groups_from_footer(
     footer: &[u8],
     open_file: dispatch::io::OpenFile,
+    file_path: &ObjectPath,
     table_columns: &TableColumns,
 ) -> Result<Vec<RowGroupMetadata>> {
     let file_meta = parse_footer_thrift(footer)?;
-    row_groups_from_metadata(file_meta, open_file, table_columns)
+    row_groups_from_metadata(file_meta, open_file, file_path, table_columns)
 }
 
 /// Build the per-row-group metadata from a parsed footer and the (local or
@@ -267,8 +279,10 @@ pub(crate) fn row_groups_from_footer(
 pub(crate) fn row_groups_from_metadata(
     file_meta: FileMetaData,
     open_file: dispatch::io::OpenFile,
+    file_path: &ObjectPath,
     table_columns: &TableColumns,
 ) -> Result<Vec<RowGroupMetadata>> {
+    let file_path: Arc<str> = Arc::from(file_path.as_str());
     let (file_schema, file_field_ids, leaf_infos) = schema_elements_to_arrow(&file_meta.schema)?;
     let file_leaf_count = leaf_infos.len();
     let ColumnLayout {
@@ -375,6 +389,7 @@ pub(crate) fn row_groups_from_metadata(
         .map(|(i, (num_rows, columns))| {
             let row_group = RowGroupMetadata {
                 open_file: open_file.clone(),
+                file_path: file_path.clone(),
                 schema: schema.clone(),
                 columns,
                 statistics: statistics.clone(),

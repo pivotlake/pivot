@@ -102,6 +102,10 @@ impl<O, N: Nullary<O>> NullaryOperator<O, N> {
 }
 
 impl<O, N: Nullary<O>> Operator for NullaryOperator<O, N> {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<N>()
+    }
+
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         Ok(self.nullary.run(&mut *self.sender, io)?)
     }

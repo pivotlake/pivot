@@ -19,6 +19,7 @@ pub use row_group_pages::DecodeRange;
 
 use crate::reading::decoding::leaf_decoders::{BuiltDictionary, LeafDecoder};
 use crate::reading::decoding::{DecodePlan, ScanEqualityPredicate, WorkerAllocator};
+use crate::reading::scan_live_stats::ROW_GROUP_PRUNED_BY_DICTIONARY;
 use crate::types::page::{DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
 use ahash::{HashMap, HashSet};
@@ -43,6 +44,8 @@ pub struct RangeCutterFactory {
     pub outstanding_row_groups: Arc<AtomicUsize>,
     /// The worker's allocator for the dictionaries it builds.
     pub allocator: Arc<WorkerAllocator>,
+    /// Where the cutter reports each row group a dictionary prunes.
+    pub custom_stats: dispatch::CustomStats,
 }
 
 impl UnaryFactory<DecompressedPage, DecodeRange> for RangeCutterFactory {
@@ -54,6 +57,7 @@ impl UnaryFactory<DecompressedPage, DecodeRange> for RangeCutterFactory {
             self.eq_predicates,
             self.outstanding_row_groups,
             self.allocator,
+            self.custom_stats,
         ))
     }
 }
@@ -75,6 +79,8 @@ pub struct RangeCutter {
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
     /// Slab allocator for the dictionaries built here, the worker's own.
     allocator: Arc<WorkerAllocator>,
+    /// Where this cutter reports each row group a dictionary prunes.
+    custom_stats: dispatch::CustomStats,
     open: HashMap<usize, OpenRowGroup>,
     /// Row groups whose ranges are all emitted or that were pruned; a page
     /// arriving late for one is dropped.
@@ -88,11 +94,13 @@ impl RangeCutter {
         eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
         outstanding_row_groups: Arc<AtomicUsize>,
         allocator: Arc<WorkerAllocator>,
+        custom_stats: dispatch::CustomStats,
     ) -> Self {
         Self {
             projection,
             eq_predicates,
             allocator,
+            custom_stats,
             open: HashMap::default(),
             closed: HashSet::default(),
             outstanding_row_groups,
@@ -184,6 +192,10 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
                         // flight: the decompressor drops its remaining data
                         // pages.
                         metadata.mark_pruned();
+                        self.custom_stats
+                            .report(ROW_GROUP_PRUNED_BY_DICTIONARY, || {
+                                metadata.row_group_metadata.describe_for_live_stats()
+                            });
                         self.close(row_group_index);
                         return Ok(());
                     }
@@ -214,6 +226,10 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
             }
         }
         self.emit_ready_ranges(row_group_index, output)
+    }
+
+    fn custom_stats(&self) -> Option<dispatch::CustomStats> {
+        Some(self.custom_stats.clone())
     }
 
     fn finish(&mut self, _output: &mut dyn Sender<DecodeRange>) -> dispatch::UnaryResult<bool> {
@@ -262,6 +278,7 @@ mod tests {
             deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            file_path: Arc::from("data.parquet"),
         })]))
     }
 
@@ -365,6 +382,7 @@ mod tests {
             Arc::new(Vec::new()),
             outstanding.clone(),
             Arc::new(WorkerAllocator::new()),
+            dispatch::CustomStats::disabled(),
         );
 
         let mut ranges = run_unary_to_completion(cutter, vec![page]);
@@ -387,6 +405,7 @@ mod tests {
             Arc::new(vec![i32_eq_predicate(5)]),
             Arc::new(AtomicUsize::new(1)),
             Arc::new(WorkerAllocator::new()),
+            dispatch::CustomStats::disabled(),
         );
 
         let ranges = run_unary_to_completion(cutter, vec![dict]);

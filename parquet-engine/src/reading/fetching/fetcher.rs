@@ -40,6 +40,7 @@
 //! the fetcher, still counted against the budget, and is sent on once no
 //! in-memory row group is left, so what is in memory is worked on first.
 
+use crate::reading::scan_live_stats::{ROW_GROUP_FROM_MEMORY, ROW_GROUP_READ};
 use crate::types::metadata::QueryRowGroupMetadata;
 use crate::types::projection::Projection;
 use crate::types::requests::{RowGroupBuffer, RowGroupRequest};
@@ -77,6 +78,10 @@ pub struct RowGroupFetcher<IoRowGroupsReceiver: Receiver<QueryRowGroupMetadata>>
     /// The row groups whose reads are back, oldest first, waiting to be sent
     /// on until no in-memory row group is left.
     fetched_row_groups: VecDeque<RowGroupBuffer>,
+    /// Where this fetcher reports each row group it reads or finds in
+    /// memory. The scan's builder and the injectors feeding this fetcher
+    /// report the row groups they skip to the same place.
+    custom_stats: dispatch::CustomStats,
 }
 
 impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
@@ -87,6 +92,7 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
         io_row_groups_receiver: I,
         uncached_row_groups_sender: SharedWorkQueueSender<QueryRowGroupMetadata>,
         uncached_row_groups_receiver: SharedWorkQueueReceiver<QueryRowGroupMetadata>,
+        custom_stats: dispatch::CustomStats,
     ) -> Self {
         Self {
             projection,
@@ -97,6 +103,7 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
             uncached_row_groups_receiver,
             in_flight: HashMap::new(),
             fetched_row_groups: VecDeque::new(),
+            custom_stats,
         }
     }
 
@@ -120,11 +127,26 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
         let read_ahead_charge = io.charge_read_ahead(self.read_medium, projected_bytes);
         let request = RowGroupRequest::from(row_group, &self.projection);
         if request.reads_nothing() {
+            self.custom_stats.report(ROW_GROUP_FROM_MEMORY, || {
+                request
+                    .metadata
+                    .row_group_metadata
+                    .describe_for_live_stats()
+            });
             // In memory after all. It still waits its turn behind the row
             // groups that were expected to be.
             self.fetched_row_groups
                 .push_back(request.into_row_group_buffer(None, Some(read_ahead_charge)));
         } else {
+            self.custom_stats.report(ROW_GROUP_READ, || {
+                let mut row_group = request
+                    .metadata
+                    .row_group_metadata
+                    .describe_for_live_stats();
+                let bytes: usize = request.file_ranges().map(|range| range.len).sum();
+                row_group["bytes"] = bytes.into();
+                row_group
+            });
             let id = io.read(
                 &memory_ctx().page_caches().compressed,
                 request.open_file().clone(),
@@ -151,6 +173,12 @@ impl<I: Receiver<QueryRowGroupMetadata>> Unary<QueryRowGroupMetadata, RowGroupBu
     ) -> dispatch::UnaryResult<()> {
         let request = RowGroupRequest::from(row_group, &self.projection);
         if request.reads_nothing() {
+            self.custom_stats.report(ROW_GROUP_FROM_MEMORY, || {
+                request
+                    .metadata
+                    .row_group_metadata
+                    .describe_for_live_stats()
+            });
             sender.send(request.into_row_group_buffer(None, None))?;
             return Ok(());
         }
@@ -161,6 +189,10 @@ impl<I: Receiver<QueryRowGroupMetadata>> Unary<QueryRowGroupMetadata, RowGroupBu
 
     fn saturates_available_io(&self) -> bool {
         true
+    }
+
+    fn custom_stats(&self) -> Option<dispatch::CustomStats> {
+        Some(self.custom_stats.clone())
     }
 
     /// Ask for the next read ahead of the worker's CPU work, unless this is a

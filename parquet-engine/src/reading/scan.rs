@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::RowGroupFilter;
 use crate::reading::empty_projection_scan::empty_projection_scan;
+use crate::reading::scan_live_stats::ROW_GROUP_PRUNED_BY_STATISTICS;
 use crate::types::metadata::QueryRowGroupMetadata;
 use arrow_array::RecordBatch;
 use dispatch::{
@@ -50,6 +51,9 @@ where
         (0..n).map(|_| Arc::new(WorkerAllocator::new())).collect();
     let batch_allocators: Vec<Arc<WorkerAllocator>> =
         (0..n).map(|_| Arc::new(WorkerAllocator::new())).collect();
+    let range_cutter_custom_stats: Vec<dispatch::CustomStats> = (0..n)
+        .map(|_| input.dispatcher().create_custom_stats())
+        .collect();
     let decoded = input
         .chain(
             stealable::<RowGroupBuffer>(topology).into_iter().collect(),
@@ -65,11 +69,13 @@ where
                 .collect(),
             dictionary_allocators
                 .into_iter()
-                .map(|allocator| RangeCutterFactory {
+                .zip(range_cutter_custom_stats)
+                .map(|(allocator, custom_stats)| RangeCutterFactory {
                     projection: projection.clone(),
                     eq_predicates: eq_predicates.clone(),
                     outstanding_row_groups: outstanding_row_groups.clone(),
                     allocator,
+                    custom_stats,
                 })
                 .collect(),
         )
@@ -169,21 +175,39 @@ pub fn table_input_with_filter_and_eq_predicates(
             outstanding_row_groups.clone(),
             dispatcher.topology().node_count,
         );
+    // Each worker's fetcher has its own custom stats, which the injectors
+    // feeding that fetcher report to as well.
+    let fetcher_custom_stats: Vec<dispatch::CustomStats> =
+        (0..n).map(|_| dispatcher.create_custom_stats()).collect();
+    // The row groups the statistics eliminated when the scan was planned
+    // reach no worker, so they are reported here, as the first worker's
+    // fetcher's.
+    for row_group in &table.row_groups_pruned_by_statistics {
+        fetcher_custom_stats[0].report(ROW_GROUP_PRUNED_BY_STATISTICS, || {
+            row_group.describe_for_live_stats()
+        });
+    }
     let siblings = Arc::new(AtomicUsize::new(n));
     let shared_projection = Arc::new(projection.clone());
     let read_medium = table.get_read_medium();
     let factories: Vec<_> = shared_work_queue::<QueryRowGroupMetadata>(n)
         .into_iter()
-        .map(|uncached_row_groups_channel| {
+        .zip(fetcher_custom_stats)
+        .map(|(uncached_row_groups_channel, custom_stats)| {
             RootUnaryOperatorFactory::new(
                 RowGroupFetcherFactory::new(
                     shared_projection.clone(),
                     read_medium,
                     reads_ahead_of_cpu_work,
-                    io_row_groups_injector.clone(),
+                    io_row_groups_injector
+                        .clone()
+                        .reporting_pruned_row_groups_to(custom_stats.clone()),
                     uncached_row_groups_channel,
+                    custom_stats.clone(),
                 ),
-                in_memory_injector.clone(),
+                in_memory_injector
+                    .clone()
+                    .reporting_pruned_row_groups_to(custom_stats),
                 siblings.clone(),
             )
         })
@@ -249,6 +273,7 @@ pub fn materialize(
                         true,
                         io_row_groups_channel,
                         uncached_row_groups_channel,
+                        dispatcher.create_custom_stats(),
                     ),
                     rq_ch,
                     siblings_fetcher.clone(),

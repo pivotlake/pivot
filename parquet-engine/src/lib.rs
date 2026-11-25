@@ -37,6 +37,7 @@ mod external;
 pub use external::bind_read_parquet;
 
 pub(crate) mod reading;
+pub use reading::scan_live_stats;
 pub use reading::{
     ColumnDecoderError, DecodeRange, DecoderFactory, DecompressorError, DecompressorFactory,
     IndexerFactory, MaterializerFactory, RangeCutterFactory, RowGroupFetcherFactory,
@@ -107,6 +108,7 @@ pub(crate) mod test_utils {
             deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            file_path: Arc::from("data.parquet"),
         })
     }
 

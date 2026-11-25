@@ -1,4 +1,4 @@
-use crate::stats::DataFlowStats;
+use crate::stats::CpuAndIoCounters;
 use crate::waker::WakerSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -14,7 +14,7 @@ pub struct DataFlowHandle<T> {
     /// Receives errors that a worker queues before dropping its err-sender.
     err_rx: mpsc::Receiver<crate::data_flow::Error>,
     /// Receives each worker's stats tally (empty unless the query opted in).
-    stats_rx: mpsc::Receiver<DataFlowStats>,
+    stats_rx: mpsc::Receiver<CpuAndIoCounters>,
     /// Process-wide cancel flag, checked by every worker on each iteration.
     cancelled: Arc<AtomicBool>,
     /// Wakers of every node the dataflow runs on, so that cancel callers (which
@@ -26,7 +26,7 @@ impl<T> DataFlowHandle<T> {
     pub fn new(
         rx: mpsc::Receiver<T>,
         err_rx: mpsc::Receiver<crate::data_flow::Error>,
-        stats_rx: mpsc::Receiver<DataFlowStats>,
+        stats_rx: mpsc::Receiver<CpuAndIoCounters>,
         cancelled: Arc<AtomicBool>,
         wakers: WakerSet,
     ) -> Self {
@@ -70,7 +70,7 @@ impl<T> DataFlowHandle<T> {
     /// and ships its tally just afterwards, when the worker drops the dataflow.
     /// So the fold waits on the stats channel itself, which closes only once
     /// every worker has dropped its dataflow, and therefore reported.
-    pub fn collect_with_stats(mut self) -> crate::data_flow::Result<(Vec<T>, DataFlowStats)> {
+    pub fn collect_with_stats(mut self) -> crate::data_flow::Result<(Vec<T>, CpuAndIoCounters)> {
         let mut items = Vec::new();
         let mut error = None;
         // Drain to channel close (every worker has dropped its sender, finished
@@ -93,7 +93,7 @@ impl<T> DataFlowHandle<T> {
         {
             error = Some(e);
         }
-        let mut stats = DataFlowStats::default();
+        let mut stats = CpuAndIoCounters::default();
         while let Ok(worker_stats) = self.stats_rx.recv() {
             stats.merge(&worker_stats);
         }

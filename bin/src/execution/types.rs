@@ -4,7 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 use arrow_schema::DataType;
-use dispatch::DataFlowStats;
+use dispatch::{CpuAndIoCounters, LiveStatsSubscription};
 use thiserror::Error;
 use tokio::task::JoinError;
 
@@ -16,6 +16,14 @@ use super::CopyIngest;
 /// parses the statement; each frontend applies the toggle to its own session.
 pub const STATS_VARIABLE: &str = "pivot_stats";
 
+/// The session variable that turns on live stats: after
+/// `SET live_stats_interval_ms = 100`, every worker running one of the
+/// session's statements sends its per-operator stats at most once per 100 ms
+/// while the statement runs. `0`, or `RESET live_stats_interval_ms`, turns
+/// them off. The executor only parses the statement; a frontend that can
+/// deliver the stats applies it to its own session.
+pub const LIVE_STATS_INTERVAL_VARIABLE: &str = "live_stats_interval_ms";
+
 /// Whether a `SET` value spells a true boolean, the way PostgreSQL reads one.
 pub fn is_truthy(value: &str) -> bool {
     matches!(
@@ -25,13 +33,17 @@ pub fn is_truthy(value: &str) -> bool {
 }
 
 /// Options that affect execution but not the statement's result.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ExecuteOptions {
     /// Collect the dispatch IO and CPU breakdown.
     pub collect_stats: bool,
     /// Mark the statement's dataflows for exclusive perf profiling. This is a
     /// no-op unless the crate is built with its `perf` feature.
     pub profile: bool,
+    /// Who receives the statement's live stats while it runs, and how often
+    /// each worker sends them. `None` sends none. Every message has been sent
+    /// by the time the statement's execution returns.
+    pub live_stats: Option<LiveStatsSubscription>,
 }
 
 /// One result column resolved during planning. This remains available for an
@@ -116,7 +128,7 @@ pub struct ExecutionStats {
     pub plan: Duration,
     pub compile: Duration,
     pub execute: Duration,
-    pub flow: DataFlowStats,
+    pub flow: CpuAndIoCounters,
 }
 
 impl ExecutionStats {

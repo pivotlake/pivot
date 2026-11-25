@@ -160,6 +160,9 @@ pub struct RowGroupMetadata {
     /// The open file holding this row group's bytes (local file or remote
     /// object) — what the fetcher reads from and the compressed cache keys on.
     pub open_file: OpenFile,
+    /// The file's path in its object store, as the table's file list names
+    /// it. Shared by every row group of the file.
+    pub file_path: Arc<str>,
     /// Arrow schema describing the columns in this row group.
     pub schema: SchemaRef,
     /// Per-column-chunk byte layout (offsets and sizes).
@@ -193,6 +196,15 @@ pub struct RowGroupMetadata {
 }
 
 impl RowGroupMetadata {
+    /// How a scan's custom stats name this row group in a query's live
+    /// stats: the path of its file and its index within that file.
+    pub fn describe_for_live_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "file": &*self.file_path,
+            "row_group": self.file_row_group_idx,
+        })
+    }
+
     /// How many of this row group's rows a scan returns: those not deleted.
     pub fn live_rows(&self) -> i64 {
         self.num_rows - self.count_deleted_in(0..self.num_rows as u32) as i64

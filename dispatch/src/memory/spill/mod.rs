@@ -137,6 +137,12 @@ impl<'a> Spiller<'a> {
         self.io.set_operator_idx(operator_idx);
     }
 
+    /// Bill the time since the dataflow step's last billing to the operator
+    /// that was just asked to spill.
+    pub(crate) fn bill_cpu_lap(&mut self) {
+        self.io.bill_cpu_lap();
+    }
+
     /// Issue the writes of `buffers` sealed buffers spilled together, one
     /// write per partition with rows in them. Each write counts off the
     /// buffers it carries rows of as it lands.

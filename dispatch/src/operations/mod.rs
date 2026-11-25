@@ -133,6 +133,13 @@ pub enum FinishStatus {
 /// CPU work and IO are intentionally separate: the worker can saturate the IO queue
 /// while running CPU work from a different operator, hiding disk latency.
 pub trait Operator {
+    /// The full type name of what this operator runs, which live stats
+    /// shorten and send in the description of the dataflow's operators. An
+    /// operator that wraps the type doing the work names that type instead.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     /// Try to consume one item from the input and produce output.
     /// Returns [`WorkStatus::Ran`] if work was done, [`Pending`](WorkStatus::Pending) otherwise.
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> Result<WorkStatus>;
@@ -180,6 +187,17 @@ pub trait Operator {
     /// Try to steal work from a peer worker's channel. Default: no stealing.
     fn try_steal_work(&mut self, _io: &mut OperatorIO) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)
+    }
+
+    /// Where this operator's custom stats are reported (see
+    /// [`CustomStats`](crate::CustomStats)).
+    ///
+    /// Returning `Some` is a *capability* declaration, made once at build
+    /// time: a `DataFlow` that sends live stats records it and puts what was
+    /// reported there into every message, so the operators that report none
+    /// (the default `None`) cost nothing.
+    fn custom_stats(&self) -> Option<crate::CustomStats> {
+        None
     }
 
     /// A flag this operator raises to ask the `DataFlow` to abandon everything

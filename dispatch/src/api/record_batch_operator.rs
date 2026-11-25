@@ -72,7 +72,7 @@ use crate::operations::{
     create_normalizing_join_factories, create_normalizing_order_by_factories,
     create_range_join_factories,
 };
-use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
+use crate::{CpuAndIoCounters, DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
 
 /// RecordBatchOperatorSpec represents a parallel operator running over Arrow [`RecordBatch`]es.
@@ -1409,7 +1409,9 @@ impl RecordBatchOperatorSpec {
 
     /// Like [`collect`](Self::collect), but also returns the dataflow's IO/CPU
     /// stats folded across workers.
-    pub fn collect_with_stats(self) -> crate::data_flow::Result<(Vec<RecordBatch>, DataFlowStats)> {
+    pub fn collect_with_stats(
+        self,
+    ) -> crate::data_flow::Result<(Vec<RecordBatch>, CpuAndIoCounters)> {
         self.execute_with_stats(copy_out).collect_with_stats()
     }
 }

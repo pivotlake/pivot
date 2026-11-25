@@ -24,7 +24,7 @@ use crate::graph::Graph;
 use crate::io::{FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse};
 use crate::memory::{DataflowEvict, Evict, SpillDirectory, Spiller, memory_ctx};
 use crate::operations::{FinishStatus, Operator};
-use crate::stats::{DataFlowStats, StatsCollector};
+use crate::stats::{CpuAndIoCounters, LiveStatsSubscription, OperatorDescription, StatsCollector};
 use crate::waker::waker_set;
 use crate::worker::WORKER_IDX;
 use ahash::HashMap;
@@ -33,8 +33,7 @@ use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::time::Instant;
+use std::sync::{Arc, Once, mpsc};
 use std::{panic, result};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -227,7 +226,10 @@ impl OperatorGraph {
 
     /// Advance finishing from every root. A pending node blocks only what is
     /// downstream of it, not sibling roots.
-    fn try_finish(&mut self) -> Result<FinishStatus> {
+    ///
+    /// An operator that finished, or is still emitting its final output, did
+    /// work in this pass, so the time it took is billed to it in `stats`.
+    fn try_finish(&mut self, stats: &mut StatsCollector) -> Result<FinishStatus> {
         let mut working = false;
 
         let mut stack: Vec<usize> = self.graph.roots().to_vec();
@@ -251,8 +253,14 @@ impl OperatorGraph {
                     // Retiring the node drops the operator, and with it the
                     // sender it holds, so a stage that watches the other end
                     // of that channel learns the stage is over.
-                    FinishStatus::Done => self.drop_operator(idx),
-                    FinishStatus::Working => working = true,
+                    FinishStatus::Done => {
+                        stats.bill_cpu_lap_to_operator(idx);
+                        self.drop_operator(idx);
+                    }
+                    FinishStatus::Working => {
+                        stats.bill_cpu_lap_to_operator(idx);
+                        working = true;
+                    }
                     FinishStatus::Pending => {}
                 }
             }
@@ -400,7 +408,7 @@ impl DataFlow {
         evictors: Vec<Option<Box<dyn Evict>>>,
         publisher_to_subscriber: Vec<(Identifier, Identifier)>,
         gates: HashMap<Identifier, Vec<Arc<AtomicBool>>>,
-        stats_tx: mpsc::Sender<DataFlowStats>,
+        stats_tx: mpsc::Sender<CpuAndIoCounters>,
         collect_stats: bool,
     ) -> Self {
         assert_eq!(
@@ -408,6 +416,7 @@ impl DataFlow {
             operators.len(),
             "one evictor entry per operator"
         );
+        let operator_count = operators.len();
         // Operators that can give ring slots back are laid out for the memory
         // context in the operator graph's shape, so it asks them in graph order.
         let evictors = DataflowEvict::new(evictors, &publisher_to_subscriber);
@@ -454,7 +463,7 @@ impl DataFlow {
             io_saturators,
             cancelled: canceled,
             err_tx,
-            stats: StatsCollector::new(stats_tx, collect_stats),
+            stats: StatsCollector::new(stats_tx, collect_stats, operator_count),
             next_request_id: 0,
             #[cfg(feature = "perf")]
             profiled: false,
@@ -483,6 +492,51 @@ impl DataFlow {
     #[cfg(feature = "perf")]
     pub fn is_profiled(&self) -> bool {
         self.profiled
+    }
+
+    /// Have this worker send the dataflow's live stats to `subscription`.
+    /// The first of the dataflow's workers to get here also sends the
+    /// description of its operators; `operators_sent` is shared by those
+    /// workers to see to that. Called once, right after the dataflow is
+    /// built, while every operator is still in the graph to be described.
+    pub(crate) fn with_live_stats(
+        mut self,
+        subscription: LiveStatsSubscription,
+        operators_sent: &Once,
+    ) -> Self {
+        let operators = self
+            .graph
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(idx, node)| OperatorDescription {
+                name: node
+                    .operator
+                    .as_ref()
+                    .expect("no operator has retired before the dataflow first runs")
+                    .name(),
+                inputs: self.graph.graph.back_edges(idx).to_vec(),
+            })
+            .collect();
+        let custom_stats_of_operators = self
+            .graph
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, node)| {
+                node.operator
+                    .as_ref()?
+                    .custom_stats()
+                    .map(|custom_stats| (idx, custom_stats))
+            })
+            .collect();
+        self.stats.enable_live_stats(
+            subscription,
+            operators_sent,
+            operators,
+            custom_stats_of_operators,
+        );
+        self
     }
 
     /// This dataflow's stats collector. The worker records IO/CPU work against it
@@ -537,12 +591,12 @@ impl DataFlow {
     fn try_run_or<R>(&mut self, default: R, f: impl FnOnce(&mut Self) -> Result<R>) -> R {
         // Every operator step funnels through here, so it's the one place that
         // can see the dataflow's CPU work (the worker only sees opaque method
-        // calls). `then` skips the clock reads when stats are off.
-        let started = self.stats.enabled().then(Instant::now);
+        // calls). The step is timed as one lap: `f` bills the part an operator
+        // worked for to that operator, and what is left when the step ends
+        // goes to the dataflow. No clock is read when stats are off.
+        self.stats.start_cpu_lap();
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| f(self)));
-        if let Some(started) = started {
-            self.stats.record_cpu(started.elapsed());
-        }
+        self.stats.finish_cpu_lap();
         match outcome {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
@@ -572,7 +626,7 @@ impl DataFlow {
     /// An operator that reports [`FinishStatus::Done`] is dropped there and then,
     /// so subsequent passes step over its node.
     pub fn maybe_finish(&mut self) -> FinishStatus {
-        self.try_run_or(FinishStatus::Pending, |d| d.graph.try_finish())
+        self.try_run_or(FinishStatus::Pending, |d| d.graph.try_finish(&mut d.stats))
     }
 
     /// Honour any pending upstream-cancellation request: for each operator that
@@ -616,6 +670,7 @@ impl DataFlow {
                 let mut io =
                     OperatorIO::new(requester, data_flow_id, node.id, stats, next_request_id);
                 operator.process_read_response(&mut io, response)?;
+                io.bill_cpu_lap();
             }
             Ok(())
         });
@@ -629,6 +684,7 @@ impl DataFlow {
             let node = d.graph.node_mut(node_id);
             if let Some(operator) = node.operator.as_deref_mut() {
                 operator.process_fs_write_response(request)?;
+                d.stats.bill_cpu_lap_to_operator(node_id);
             }
             Ok(())
         });
@@ -645,6 +701,7 @@ impl DataFlow {
             let node = d.graph.node_mut(node_id);
             if let Some(operator) = node.operator.as_deref_mut() {
                 operator.process_http_upload_response(request)?;
+                d.stats.bill_cpu_lap_to_operator(node_id);
             }
             Ok(())
         });
@@ -661,7 +718,10 @@ impl DataFlow {
                     let status = operator.run_cpu_work(&mut io)?;
                     match status {
                         WorkStatus::Pending => Ok(ControlFlow::Continue(())),
-                        WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                        WorkStatus::Ran => {
+                            io.bill_cpu_lap();
+                            Ok(ControlFlow::Break(()))
+                        }
                     }
                 })
                 .map(|c| match c {
@@ -692,6 +752,7 @@ impl DataFlow {
                 spiller.set_operator_idx(node_id);
                 let remaining = count - spiller.buffers_spilled();
                 operator.spill(&mut spiller, remaining)?;
+                spiller.bill_cpu_lap();
                 Ok(if spiller.buffers_spilled() >= count {
                     ControlFlow::Break(())
                 } else {
@@ -730,6 +791,7 @@ impl DataFlow {
                     })?;
                     match node_status {
                         Some(ControlFlow::Break(WorkStatus::Ran)) => {
+                            io.bill_cpu_lap();
                             dataflow_status = WorkStatus::Ran;
                         }
                         _ => break,
@@ -751,7 +813,10 @@ impl DataFlow {
                     let status = operator.try_steal_work(&mut io)?;
                     match status {
                         WorkStatus::Pending => Ok(ControlFlow::Continue(())),
-                        WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                        WorkStatus::Ran => {
+                            io.bill_cpu_lap();
+                            Ok(ControlFlow::Break(()))
+                        }
                     }
                 })
                 .map(|c| match c {
@@ -1129,7 +1194,10 @@ mod tests {
         let mut graph =
             OperatorGraph::from_edges(0, false, operators, Vec::new(), HashMap::default());
 
-        assert_eq!(graph.try_finish().unwrap(), FinishStatus::Done);
+        assert_eq!(
+            graph.try_finish(&mut StatsCollector::disabled()).unwrap(),
+            FinishStatus::Done
+        );
 
         assert!(dropped.load(Ordering::Acquire));
     }
@@ -1143,7 +1211,10 @@ mod tests {
         let mut graph =
             OperatorGraph::from_edges(0, false, operators, Vec::new(), HashMap::default());
 
-        assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
+        assert_eq!(
+            graph.try_finish(&mut StatsCollector::disabled()).unwrap(),
+            FinishStatus::Pending
+        );
         assert!(!graph.graph.node(0).is_finished());
         assert!(graph.graph.node(1).is_finished());
     }
@@ -1194,11 +1265,20 @@ mod tests {
             vec![Box::new(FinishOperator::new(FinishStatus::Done))];
         let mut graph = OperatorGraph::from_edges(0, false, operators, Vec::new(), gates);
 
-        assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
+        assert_eq!(
+            graph.try_finish(&mut StatsCollector::disabled()).unwrap(),
+            FinishStatus::Pending
+        );
         first.store(true, Ordering::Release);
-        assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
+        assert_eq!(
+            graph.try_finish(&mut StatsCollector::disabled()).unwrap(),
+            FinishStatus::Pending
+        );
         second.store(true, Ordering::Release);
-        assert_eq!(graph.try_finish().unwrap(), FinishStatus::Done);
+        assert_eq!(
+            graph.try_finish(&mut StatsCollector::disabled()).unwrap(),
+            FinishStatus::Done
+        );
     }
 
     #[test]

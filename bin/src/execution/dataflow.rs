@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::{Array, Int64Array, RecordBatch};
-use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
+use dispatch::{CancelToken, CpuAndIoCounters, DataFlowHandle};
 
 use super::{Error, Result, ResultColumn};
 
@@ -23,7 +23,7 @@ impl<T> StatementHandle<T> {
 
     fn collect_with_stats(
         self,
-    ) -> std::result::Result<(StatementResults<T>, DataFlowStats), dispatch::DataFlowError> {
+    ) -> std::result::Result<(StatementResults<T>, CpuAndIoCounters), dispatch::DataFlowError> {
         match self {
             Self::Batches(handle) => handle
                 .collect_with_stats()
@@ -123,7 +123,7 @@ pub(super) fn affected_rows_from_record_batch(batch: RecordBatch) -> dispatch::U
 
 pub(super) async fn collect_handle<T>(
     handle: StatementHandle<T>,
-) -> Result<(StatementResults<T>, DataFlowStats, Duration)>
+) -> Result<(StatementResults<T>, CpuAndIoCounters, Duration)>
 where
     T: Send + 'static,
 {

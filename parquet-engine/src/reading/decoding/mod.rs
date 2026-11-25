@@ -375,6 +375,7 @@ pub(crate) mod tests {
             deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            file_path: Arc::from("data.parquet"),
         })]))
     }
 
@@ -470,6 +471,7 @@ pub(crate) mod tests {
             deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            file_path: Arc::from("data.parquet"),
         })]))
     }
 
@@ -555,6 +557,7 @@ pub(crate) mod tests {
             Arc::new(eq_predicates),
             Arc::new(AtomicUsize::new(usize::MAX / 2)),
             Arc::new(WorkerAllocator::new()),
+            dispatch::CustomStats::disabled(),
         )
     }
 

@@ -121,9 +121,12 @@ pub use profiler::worker_tids;
 pub use scan::{
     Projection, ROW_GROUP_IDX_FIELD, ROW_IDX_FIELD, VariantExtract, trailing_metadata_columns,
 };
-pub use stats::DataFlowStats;
 #[cfg(feature = "test-util")]
 pub use stats::StatsCollector;
+pub use stats::{
+    CpuAndIoCounters, CustomStat, CustomStats, LiveStatsMessage, LiveStatsSubscription,
+    OperatorDescription, OperatorLiveStats, WorkerLiveStats,
+};
 
 pub use operations::channels::{
     ChannelFactory, FanInChannelFactory, MpscReceiver, NodeIdOutput, NodeWorkQueueChannelFactory,
@@ -211,6 +214,11 @@ pub struct DataFlowDispatcher {
     /// query's dataflows; `false` on the shared handle.
     #[cfg(feature = "perf")]
     profiled: bool,
+    /// Who receives the live stats of every dataflow launched through this
+    /// handle. Set only on a per-query clone (see
+    /// [`with_live_stats`](Self::with_live_stats)); `None` on the shared
+    /// handle, whose dataflows send none.
+    live_stats: Option<LiveStatsSubscription>,
 }
 
 #[cfg(feature = "perf")]
@@ -231,6 +239,28 @@ impl DataFlowDispatcher {
 }
 
 impl DataFlowDispatcher {
+    /// Return this dispatcher with `subscription` set: every dataflow it
+    /// launches sends its live stats there. Clone the shared handle, call
+    /// this, and compile and execute one query through the result, so only
+    /// that query's dataflows report.
+    pub fn with_live_stats(mut self, subscription: LiveStatsSubscription) -> Self {
+        self.live_stats = Some(subscription);
+        self
+    }
+
+    /// Who receives the live stats of the dataflows launched through this
+    /// handle, when the query subscribed.
+    pub(crate) fn live_stats(&self) -> Option<&LiveStatsSubscription> {
+        self.live_stats.as_ref()
+    }
+
+    /// Create the [`CustomStats`] for one operator, on one worker, of a
+    /// dataflow launched through this handle. It keeps what is reported to
+    /// it only when this handle's dataflows send live stats.
+    pub fn create_custom_stats(&self) -> CustomStats {
+        CustomStats::new(self.live_stats.is_some())
+    }
+
     /// Dispatch one pre-built `DataFlow` bundle across the node groups.
     /// Builder `i` goes to global worker `i` (node `i / workers_per_node`). A
     /// full bundle has one builder per worker; a shorter one reaches only the
@@ -461,6 +491,7 @@ impl Dispatch {
                 shutdown_flag: should_exit.clone(),
                 #[cfg(feature = "perf")]
                 profiled: false,
+                live_stats: None,
             },
             handles: threads,
             shutdown: Shutdown {

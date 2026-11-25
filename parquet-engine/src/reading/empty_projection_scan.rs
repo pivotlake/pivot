@@ -167,6 +167,7 @@ mod tests {
                     deleted_rows: deleted_rows(0, deleted),
                     file_row_group_idx: index,
                     live_decompressed_pages: Arc::default(),
+                    file_path: Arc::from("data.parquet"),
                     ..(*dummy).clone()
                 })
             })

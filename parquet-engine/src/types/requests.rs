@@ -15,7 +15,7 @@ use dispatch::memory::{MultiBufferReader, ReaderPosition, Segment, memory_ctx};
 /// while the read is in flight. Compressed-cache lookup, extent allocation and
 /// physical reads happen in dispatch's worker-local requester.
 pub struct RowGroupRequest {
-    metadata: QueryRowGroupMetadata,
+    pub(crate) metadata: QueryRowGroupMetadata,
     open_file: OpenFile,
     /// Each projected leaf's chunk, in leaf order.
     columns: Vec<ColumnReference>,

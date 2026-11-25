@@ -12,6 +12,7 @@ use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use catalog::connections::{ConnectionRegistry, RegisteredConnection};
 use catalog::metastore::Metastore;
+use dispatch::{LiveStatsMessage, LiveStatsSubscription};
 use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
@@ -32,10 +33,19 @@ use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::response::NoticeResponse;
 use planner::CopyFormat;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Per-connection flag toggled with `SET pivot_stats = true`.
 const STATS_FLAG: &str = crate::execution::STATS_VARIABLE;
+
+/// Per-connection setting written by `SET live_stats_interval_ms = <ms>`:
+/// the interval in milliseconds, present only while live stats are on.
+const LIVE_STATS_INTERVAL_SETTING: &str = crate::execution::LIVE_STATS_INTERVAL_VARIABLE;
+
+/// What every live-stats notice starts with, followed by one message as JSON
+/// (see [`dispatch::LiveStatsMessage::to_json`]).
+const LIVE_STATS_NOTICE_PREFIX: &str = "live_stats: ";
 
 /// Per-connection flag toggled with `SET perf = 1`.
 #[cfg(feature = "perf")]
@@ -126,6 +136,7 @@ impl PivotQueryHandler {
         format: FieldFormat,
         collect_stats: bool,
         with_perf: bool,
+        live_stats: Option<LiveStatsSubscription>,
     ) -> crate::execution::Result<Execution<PGRowBatch>> {
         #[cfg(feature = "perf")]
         let mut perf_guard = if with_perf {
@@ -151,6 +162,7 @@ impl PivotQueryHandler {
                 ExecuteOptions {
                     collect_stats,
                     profile,
+                    live_stats,
                 },
                 move |batch| {
                     encode_batch(batch, format)
@@ -194,6 +206,24 @@ fn apply_set<C: ClientInfo>(
             client.metadata_mut().remove(STATS_FLAG);
         }
     }
+    if name.eq_ignore_ascii_case(LIVE_STATS_INTERVAL_SETTING) {
+        let interval_ms = match value {
+            Some(value) => value.trim_matches('\'').parse::<u64>().map_err(|_| {
+                user_error(format!(
+                    "{LIVE_STATS_INTERVAL_SETTING} takes a whole number of milliseconds, got {value:?}"
+                ))
+            })?,
+            None => 0,
+        };
+        if interval_ms == 0 {
+            client.metadata_mut().remove(LIVE_STATS_INTERVAL_SETTING);
+        } else {
+            client.metadata_mut().insert(
+                LIVE_STATS_INTERVAL_SETTING.to_string(),
+                interval_ms.to_string(),
+            );
+        }
+    }
     #[cfg(feature = "perf")]
     if name.eq_ignore_ascii_case(PERF_FLAG) {
         if value.is_some_and(is_truthy) {
@@ -226,6 +256,41 @@ fn stats_on<C: ClientInfo>(client: &C) -> bool {
         .metadata()
         .get(STATS_FLAG)
         .is_some_and(|value| value == "on")
+}
+
+/// How often the connection asked for live stats, or `None` when it did not.
+fn read_live_stats_interval<C: ClientInfo>(client: &C) -> Option<Duration> {
+    client
+        .metadata()
+        .get(LIVE_STATS_INTERVAL_SETTING)
+        .map(|interval_ms| {
+            Duration::from_millis(
+                interval_ms
+                    .parse()
+                    .expect("apply_set stores the interval as a number"),
+            )
+        })
+}
+
+/// Send the client each of `messages` as a notice: the
+/// [`LIVE_STATS_NOTICE_PREFIX`] and then the message as JSON.
+async fn send_live_stats<C>(client: &mut C, messages: Vec<LiveStatsMessage>) -> PgWireResult<()>
+where
+    C: Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    for message in messages {
+        let notice = NoticeResponse::from(ErrorInfo::new(
+            "INFO".to_string(),
+            "00000".to_string(),
+            format!("{LIVE_STATS_NOTICE_PREFIX}{}", message.to_json()),
+        ));
+        client
+            .send(PgWireBackendMessage::NoticeResponse(notice))
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "perf")]
@@ -316,16 +381,44 @@ impl PivotQueryHandler {
             .run_statement(query);
 
         info!(sql = %query, "query received");
+        // The workers running the statement send their live stats to this
+        // channel, and the loop below forwards them to the client once per
+        // interval while the statement is still running.
+        let live_stats_interval = read_live_stats_interval(client);
+        let (live_stats_sender, live_stats_receiver) = std::sync::mpsc::channel();
+        let live_stats = live_stats_interval.map(|interval| LiveStatsSubscription {
+            interval,
+            sender: live_stats_sender,
+        });
+        let run_query = self.run_query(query, format, with_stats, with_perf, live_stats);
+        tokio::pin!(run_query);
+        let peer_hang_up = self.peer_hang_up.wait();
+        tokio::pin!(peer_hang_up);
         // A statement nobody is waiting for is dropped, which cancels it.
-        let execution = tokio::select! {
-            execution = self.run_query(query, format, with_stats, with_perf) => execution,
-            hung_up = self.peer_hang_up.wait() => {
-                hung_up?;
-                info!(sql = %query, "client disconnected, query cancelled");
-                return Err(client_lost_error());
+        let execution = loop {
+            tokio::select! {
+                execution = &mut run_query => break execution,
+                hung_up = &mut peer_hang_up => {
+                    hung_up?;
+                    info!(sql = %query, "client disconnected, query cancelled");
+                    return Err(client_lost_error());
+                }
+                _ = async {
+                    match live_stats_interval {
+                        Some(interval) => tokio::time::sleep(interval).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let messages: Vec<LiveStatsMessage> = live_stats_receiver.try_iter().collect();
+                    send_live_stats(client, messages).await?;
+                }
             }
-        }
-        .map_err(|error| {
+        };
+        // Every worker has sent its last message by the time the statement's
+        // execution returns, whether it succeeded or failed.
+        let last_messages: Vec<LiveStatsMessage> = live_stats_receiver.try_iter().collect();
+        send_live_stats(client, last_messages).await?;
+        let execution = execution.map_err(|error| {
             warn!(%error, sql = %query, "query failed");
             into_pgwire_error(error)
         })?;
