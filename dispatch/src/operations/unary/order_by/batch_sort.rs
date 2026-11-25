@@ -5,24 +5,11 @@
 
 use std::cmp::Ordering;
 
-use super::keys::{KeyOrdering, KeyedRow, PackedKeyPrefix, RunRow, SortKey};
+use super::keys::{KeyOrdering, KeyedRow, PackedKeyPrefix, SortKey};
 use crate::RECORD_BATCH_SIZE;
 
 /// A merge output slice is capped at one normal record batch.
 pub(super) const MERGE_SLICE_ROWS: usize = RECORD_BATCH_SIZE;
-
-/// Whether one batch already arrives in key order. The ordering must have the
-/// batch as both its left and right input.
-pub(super) fn batch_arrives_sorted(ordering: &KeyOrdering, rows: usize) -> bool {
-    (1..rows).all(|row| {
-        let previous = RunRow {
-            chunk: 0,
-            row: row - 1,
-        };
-        let current = RunRow { chunk: 0, row };
-        ordering.compare(previous, current) != Ordering::Greater
-    })
-}
 
 /// Sorts `rows`, each a `(chunk, row)` position into the ordering's chunks,
 /// from lowest key to highest. The ordering must have those chunks as both its

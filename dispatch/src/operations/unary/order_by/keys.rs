@@ -792,6 +792,12 @@ pub(super) struct KeyOrdering<'chunks> {
     columns: Vec<KeyColumn<'chunks>>,
 }
 
+// SAFETY: an ordering only reads the buffers of the chunks it borrows, and
+// nothing writes to those while they are borrowed. The pointers it holds
+// into them are what keeps the compiler from seeing that by itself.
+unsafe impl Send for KeyOrdering<'_> {}
+unsafe impl Sync for KeyOrdering<'_> {}
+
 /// One key column of a [`KeyOrdering`], bound to every chunk of both runs.
 struct KeyColumn<'chunks> {
     values: KeyColumnValues<'chunks>,
@@ -959,6 +965,59 @@ impl<'chunks> KeyOrdering<'chunks> {
             })
             .collect::<Result<Vec<_>, ArrowError>>()?;
         Ok(Self { columns })
+    }
+
+    /// Whether the first `row_count` rows of chunk 0 are in key order as
+    /// they stand. The ordering must have that chunk as both its left and
+    /// its right input.
+    ///
+    /// A key of one fixed-width column without nulls is checked by a loop of
+    /// its own, which reads every value once and keeps it for the next row.
+    /// Input that arrives sorted goes through this check for every row and
+    /// through little else, so a call to [`compare`](Self::compare) per row
+    /// would be most of what sorting such input costs.
+    pub(super) fn chunk_arrives_sorted(&self, row_count: usize) -> bool {
+        if let [
+            KeyColumn {
+                values:
+                    KeyColumnValues::FixedWidth {
+                        left: chunks,
+                        read_key,
+                        ..
+                    },
+                has_nulls: false,
+                descending,
+                ..
+            },
+        ] = self.columns.as_slice()
+        {
+            if row_count == 0 {
+                return true;
+            }
+            let first_value = chunks[0].first_value;
+            let mut previous_key = read_key(first_value, 0);
+            for row in 1..row_count {
+                let key = read_key(first_value, row);
+                let is_before_previous = if *descending {
+                    key > previous_key
+                } else {
+                    key < previous_key
+                };
+                if is_before_previous {
+                    return false;
+                }
+                previous_key = key;
+            }
+            return true;
+        }
+        (1..row_count).all(|row| {
+            let previous = RunRow {
+                chunk: 0,
+                row: row - 1,
+            };
+            let current = RunRow { chunk: 0, row };
+            self.compare(previous, current) != Ordering::Greater
+        })
     }
 
     /// How the left run's row at `left` orders against the right run's row

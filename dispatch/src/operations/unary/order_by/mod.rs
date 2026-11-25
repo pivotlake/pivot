@@ -1,7 +1,8 @@
 //! Parallel ORDER BY over a complete input stream.
 //!
-//! This operator is a pipeline breaker. Each worker sorts incoming record
-//! batches and joins adjacent batches that already form one ordered run. Once
+//! This operator is a pipeline breaker. Each worker sorts the record batches
+//! it receives into runs, several batches to a run, and passes batches that
+//! already arrive in key order on as they are. Once
 //! input ends, workers on each NUMA node merge their runs locally. A second
 //! k-way merge combines the node results. On a single-node machine that second
 //! level is an identity operation and copies no rows.
@@ -24,8 +25,9 @@ use std::sync::{Arc, OnceLock};
 use arrow_array::{ArrayRef, RecordBatch};
 use crossbeam_deque::{Injector, Steal};
 
+use crate::RECORD_BATCH_SIZE;
 use crate::Topology;
-use crate::arrays::take;
+use crate::arrays::take_chunked;
 use crate::gather_barrier::GatherBarrier;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::{NodeIdOutput, Sender};
@@ -40,7 +42,7 @@ use crate::operations::unary::{
 };
 use crate::waker::waker_set;
 
-use batch_sort::{batch_arrives_sorted, sort_chunked_row_positions};
+use batch_sort::sort_chunked_row_positions;
 use keys::{KeyOrdering, KeyedRow, Packed, PackedKeyPrefix, RunRow};
 
 /// Returns a valid row order for one batch. The identity order is returned
@@ -49,27 +51,13 @@ pub fn batch_sort_indices(
     order_by: &[OrderBy],
     batch: &RecordBatch,
 ) -> Result<Vec<u32>, arrow_schema::ArrowError> {
-    Ok(find_sorted_row_order(order_by, batch)?
-        .unwrap_or_else(|| (0..batch.num_rows() as u32).collect()))
-}
-
-/// The order the rows of `batch` sort into by `order_by`, as row indices
-/// from lowest key to highest. Equal keys may appear in any order allowed by
-/// SQL.
-///
-/// `None` when the batch already arrives in key order, so that a caller can
-/// pass the batch on without copying it.
-fn find_sorted_row_order(
-    order_by: &[OrderBy],
-    batch: &RecordBatch,
-) -> Result<Option<Vec<u32>>, arrow_schema::ArrowError> {
     let mut sorter = ChunkedRowSorter::try_new(order_by, std::slice::from_ref(batch))?;
-    if batch_arrives_sorted(&sorter.ordering, batch.num_rows()) {
-        return Ok(None);
+    if sorter.ordering.chunk_arrives_sorted(batch.num_rows()) {
+        return Ok((0..batch.num_rows() as u32).collect());
     }
     let mut positions: Vec<(u32, u32)> = (0..batch.num_rows() as u32).map(|row| (0, row)).collect();
     sorter.sort(&mut positions);
-    Ok(Some(positions.into_iter().map(|(_, row)| row).collect()))
+    Ok(positions.into_iter().map(|(_, row)| row).collect())
 }
 
 /// Sorts row positions that are spread over several batches.
@@ -202,18 +190,6 @@ pub(crate) struct SortedRun {
 }
 
 impl SortedRun {
-    fn from_chunks(chunks: Vec<RecordBatch>) -> Self {
-        Self { chunks }
-    }
-
-    fn starting_with(chunk: RecordBatch) -> Self {
-        Self::from_chunks(vec![chunk])
-    }
-
-    fn extend_with(&mut self, chunk: RecordBatch) {
-        self.chunks.push(chunk);
-    }
-
     fn into_chunks(self) -> Vec<RecordBatch> {
         self.chunks
     }
@@ -458,6 +434,8 @@ where
             order_by: self.order_by,
             node_id: self.node_id,
             local_worker_id: self.local_worker_id,
+            pending_batches: Vec::new(),
+            pending_row_count: 0,
             open_run: None,
             completed_runs: Vec::new(),
             allocator: None,
@@ -466,13 +444,27 @@ where
     }
 }
 
-/// Sorts batches received by one worker and combines adjacent ordered batches
-/// into runs.
+/// How many rows a worker gathers before it sorts them into one run.
+///
+/// The merge cuts its output into record batches, and every cut takes a
+/// search in every run. So the cost of planning the merge grows with the
+/// number of runs, and a run per incoming batch makes planning take longer
+/// than everything else in the sort. Sixteen batches to a run keep the rows
+/// of one sort within a worker's cache.
+const PENDING_RUN_ROWS: usize = 16 * RECORD_BATCH_SIZE;
+
+/// Sorts the batches received by one worker into runs.
 pub struct OrderBySorter<O = RunMerger> {
     order_by: Arc<[OrderBy]>,
     node_id: usize,
     local_worker_id: usize,
-    /// Most recent run, retained separately so the next batch can extend it.
+    /// Batches that did not arrive in key order and are not sorted yet. They
+    /// are sorted together into one run when they hold [`PENDING_RUN_ROWS`]
+    /// rows, or when the input ends. All of them have the same schema.
+    pending_batches: Vec<RecordBatch>,
+    /// How many rows `pending_batches` hold.
+    pending_row_count: usize,
+    /// Most recent run, retained separately so the next batches can extend it.
     open_run: Option<SortedRun>,
     completed_runs: Vec<SortedRun>,
     /// Ring memory the sorted copies of unsorted batches land in. Taken on
@@ -482,22 +474,73 @@ pub struct OrderBySorter<O = RunMerger> {
 }
 
 impl<O> OrderBySorter<O> {
-    /// Returns the input unchanged when it is already ordered; otherwise
-    /// returns a reordered batch backed by ring memory.
-    fn sort_batch(&mut self, batch: RecordBatch) -> unary::Result<RecordBatch> {
-        let Some(sorted_indices) = find_sorted_row_order(&self.order_by, &batch)? else {
-            return Ok(batch);
-        };
+    /// Sorts the rows of the pending batches into one run, written to ring
+    /// memory in batches of [`RECORD_BATCH_SIZE`] rows, and adds it to the
+    /// worker's runs.
+    fn sort_pending_into_run(&mut self) -> unary::Result<()> {
+        if self.pending_batches.is_empty() {
+            return Ok(());
+        }
+        let pending_batches = std::mem::take(&mut self.pending_batches);
+        self.pending_row_count = 0;
+        let mut positions: Vec<(u32, u32)> = pending_batches
+            .iter()
+            .enumerate()
+            .flat_map(|(batch_index, batch)| {
+                (0..batch.num_rows() as u32).map(move |row| (batch_index as u32, row))
+            })
+            .collect();
+        ChunkedRowSorter::try_new(&self.order_by, &pending_batches)?.sort(&mut positions);
 
         let allocator = self
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
-        let columns = batch
-            .columns()
-            .iter()
-            .map(|column| take(allocator, column, &sorted_indices))
-            .collect::<Result<Vec<ArrayRef>, _>>()?;
-        RecordBatch::try_new(batch.schema(), columns).map_err(unary::Error::from)
+        let schema = pending_batches[0].schema();
+        // The batches' columns regrouped per column, which is how a gather
+        // across batches reads them.
+        let batches_of_column: Vec<Vec<&ArrayRef>> = (0..schema.fields().len())
+            .map(|column| {
+                pending_batches
+                    .iter()
+                    .map(|batch| batch.column(column))
+                    .collect()
+            })
+            .collect();
+        let sorted_chunks = positions
+            .chunks(RECORD_BATCH_SIZE)
+            .map(|chunk_positions| {
+                let columns = batches_of_column
+                    .iter()
+                    .map(|column_batches| take_chunked(allocator, column_batches, chunk_positions))
+                    .collect::<Result<Vec<ArrayRef>, _>>()?;
+                RecordBatch::try_new(schema.clone(), columns)
+            })
+            .collect::<Result<Vec<RecordBatch>, _>>()?;
+        self.append_sorted_chunks(sorted_chunks)
+    }
+
+    /// Adds `chunks`, whose rows are in key order from the first chunk's
+    /// first row to the last chunk's last, to the worker's runs: to the open
+    /// run when they continue it, and as a new open run when they do not.
+    fn append_sorted_chunks(&mut self, chunks: Vec<RecordBatch>) -> unary::Result<()> {
+        if self.extends_open_run(&chunks[0])? {
+            self.open_run
+                .as_mut()
+                .expect("extends_open_run saw a run")
+                .chunks
+                .extend(chunks);
+        } else {
+            self.completed_runs.extend(self.open_run.take());
+            self.open_run = Some(SortedRun { chunks });
+        }
+        Ok(())
+    }
+
+    /// Whether the rows of `batch` are in key order as they arrive.
+    fn arrives_in_key_order(&self, batch: &RecordBatch) -> unary::Result<bool> {
+        let batches = std::slice::from_ref(batch);
+        let ordering = KeyOrdering::try_new(&self.order_by, batches, batches)?;
+        Ok(ordering.chunk_arrives_sorted(batch.num_rows()))
     }
 
     /// Whether appending `batch` preserves the ordering of the open run.
@@ -526,22 +569,31 @@ where
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let sorted = self.sort_batch(batch)?;
-        if self.extends_open_run(&sorted)? {
-            self.open_run
-                .as_mut()
-                .expect("extends_open_run saw a run")
-                .extend_with(sorted);
-        } else {
-            if let Some(finished) = self.open_run.take() {
-                self.completed_runs.push(finished);
-            }
-            self.open_run = Some(SortedRun::starting_with(sorted));
+        // A batch that is already in key order joins the runs as it is,
+        // uncopied. It can only do that while nothing is pending, because
+        // the pending rows arrived before it.
+        if self.pending_batches.is_empty() && self.arrives_in_key_order(&batch)? {
+            return self.append_sorted_chunks(vec![batch]);
+        }
+        // Rows are gathered across the pending batches column by column,
+        // which needs the batches to have the same columns.
+        let schema_differs = self
+            .pending_batches
+            .first()
+            .is_some_and(|pending_batch| pending_batch.schema() != batch.schema());
+        if schema_differs {
+            self.sort_pending_into_run()?;
+        }
+        self.pending_row_count += batch.num_rows();
+        self.pending_batches.push(batch);
+        if self.pending_row_count >= PENDING_RUN_ROWS {
+            self.sort_pending_into_run()?;
         }
         Ok(())
     }
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
+        self.sort_pending_into_run()?;
         self.completed_runs.extend(self.open_run.take());
         let group = WorkerRuns {
             runs: std::mem::take(&mut self.completed_runs),
@@ -760,6 +812,28 @@ mod tests {
         assert_eq!(output.items.len(), 2);
         assert!(Arc::ptr_eq(output.items[0].column(0), first.column(0)));
         assert!(Arc::ptr_eq(output.items[1].column(0), second.column(0)));
+    }
+
+    #[test]
+    fn a_batch_already_in_descending_order_passes_through_as_the_same_array() {
+        init_test_free_pool(16);
+        let batch = int_batch(&[9, 5, 5, 1]);
+        let descending_by_key = vec![OrderBy::new(0, true, false)];
+
+        let output = run_consumers(consumers(descending_by_key, 1), vec![vec![batch.clone()]]);
+
+        assert_eq!(output.items.len(), 1);
+        assert!(Arc::ptr_eq(output.items[0].column(0), batch.column(0)));
+    }
+
+    #[test]
+    fn a_sorted_batch_that_follows_an_unsorted_one_is_sorted_with_it() {
+        init_test_free_pool(16);
+        let worker_batches = vec![vec![int_batch(&[9, 1, 5]), int_batch(&[2, 3, 4])]];
+
+        let output = run_consumers(consumers(ascending_by_key(), 1), worker_batches);
+
+        assert_eq!(output.i64_column(0), vec![1, 2, 3, 4, 5, 9]);
     }
 
     #[test]
