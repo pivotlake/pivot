@@ -308,6 +308,7 @@ impl PlanNode {
             crate::Operator::Input(o) => o.compile(dispatcher, slots),
             crate::Operator::Values(o) => o.compile(dispatcher),
             crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, slots),
+            crate::Operator::LateralCall(o) => o.compile(inputs.remove(0)),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => {

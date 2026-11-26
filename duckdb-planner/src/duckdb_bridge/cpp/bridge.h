@@ -182,6 +182,10 @@ size_t lo_get_param_count(const LogicalOperator &op);
 const Value &lo_get_param(const LogicalOperator &op, size_t index);
 bool lo_get_has_bound_table_function(const LogicalOperator &op);
 rust::Box<OptionalTableWrapper> lo_get_clone_bound_table_function(const LogicalOperator &op);
+size_t lo_get_argument_count(const LogicalOperator &op);
+const LogicalType &lo_get_argument_type(const LogicalOperator &op, size_t index);
+size_t lo_get_passthrough_count(const LogicalOperator &op);
+size_t lo_get_passthrough_column(const LogicalOperator &op, size_t index);
 
 // ---- CreateTable ----
 rust::String lo_create_table_name(const LogicalOperator &op);

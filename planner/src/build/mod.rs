@@ -33,8 +33,8 @@ use crate::expression::{
 use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
     Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
-    JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
-    TopN, TransactionStatement, Unnest, Values,
+    JoinKind, LateralCall, Limit, Materialize, Operator, OrderBy, Projection, SetVariable,
+    TableFunctionScan, TopN, TransactionStatement, Unnest, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -195,6 +195,12 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::TableFunctionScan(view) => {
             pushed_conditions = build_pushed_conditions(view.pushed_conditions()?)?;
             Operator::TableFunctionScan(TableFunctionScan::from_handle(view, ctx)?)
+        }
+        DuckOperator::LateralTableFunction(view) => {
+            let input = inputs
+                .first()
+                .expect("a lateral call has the rows it is called for");
+            Operator::LateralCall(LateralCall::from_handle(view, &input.output_types()?)?)
         }
         DuckOperator::CreateTable(c) => Operator::CreateTable(CreateTable::from_handle(c)?),
         DuckOperator::CreateSchema(c) => Operator::CreateSchema(CreateSchema::from_handle(c)?),
@@ -1201,6 +1207,11 @@ fn build_delim_get_scan(
 /// exactly as its probe-side twin treats probe rows. No reorder is needed:
 /// probe-then-build columns is LHS-then-RHS, DuckDB's output order.
 ///
+/// An INNER or LEFT join whose subquery side makes a lateral call takes that
+/// same orientation without DuckDB having flipped it, so the rows the calls
+/// return stream through the probe. DuckDB's output order is then
+/// build-then-probe, which a projection above the join restores.
+///
 /// DuckDB may express the final delim-join condition as `IS NOT DISTINCT FROM`
 /// because the distinct key set can contain NULL. For the supported shapes,
 /// the subquery reaches this final join through its own ordinary equality
@@ -1213,6 +1224,11 @@ fn build_delim_get_scan(
 /// NULL-keyed outer row is then a build row without a hash-table tuple, which
 /// the build-side outer join pads, the build-side semi join drops, and the
 /// build-side anti join emits.
+///
+/// A lateral call is the one subquery shape that repeats the keys it is fed,
+/// NULL ones included, rather than matching them against a predicate. It keeps
+/// plain equality sound by failing the query when a call returns rows for a
+/// NULL key (see [`LateralCall`]).
 fn build_delim_join(
     op: LogicalOp<'_>,
     delim: DelimJoinView<'_>,
@@ -1355,6 +1371,31 @@ fn build_delim_join(
     let outer_column_types = column_types(&outer_output, &outer_types, &outer_nullability);
     let subquery_column_types =
         column_types(&subquery_output, &subquery_types, &subquery_nullability);
+    let join_type = join.join_type()?;
+    // A lateral call returns any number of rows for a key, where the outer
+    // rows are held in full whichever side of this join they take. A subquery
+    // side that makes one therefore probes a hash table of the outer rows, as
+    // in a flipped join, instead of being collected into a hash table itself.
+    let probes_with_lateral_rows = !flipped
+        && matches!(join_type, JoinType::INNER | JoinType::LEFT)
+        && contains_lateral_call(&subquery_side);
+    // That orientation emits the subquery side's columns first, where the
+    // plan above reads the outer side's first.
+    let outer_columns_first = probes_with_lateral_rows.then(|| {
+        outer_column_types
+            .iter()
+            .enumerate()
+            .map(|(position, column)| (subquery_column_types.len() + position, column))
+            .chain(subquery_column_types.iter().enumerate())
+            .map(|(column_idx, (column_type, _))| {
+                Expression::Ref(Ref {
+                    column_idx,
+                    return_type: column_type.clone(),
+                    name: None,
+                })
+            })
+            .collect()
+    });
     // Natural orientation: the outer side probes the subquery side's (small,
     // one row per distinct key) answer table, LEFT preserving the outer side
     // through the probe-side outer mode. A flipped join swaps the sides, so
@@ -1362,9 +1403,10 @@ fn build_delim_join(
     // the build-side kinds. Either way a semi or anti join emits its
     // preserved side's columns alone, and the other side's projection map
     // must not be read (see `build_join`).
-    let (join_inputs, join_operator) = if flipped {
-        let kind = match join.join_type()? {
+    let (join_inputs, join_operator) = if flipped || probes_with_lateral_rows {
+        let kind = match join_type {
             JoinType::RIGHT => JoinKind::BuildOuter,
+            JoinType::LEFT if probes_with_lateral_rows => JoinKind::BuildOuter,
             JoinType::INNER => JoinKind::Inner,
             JoinType::RIGHT_SEMI => JoinKind::BuildSemi,
             JoinType::RIGHT_ANTI => JoinKind::BuildAnti,
@@ -1396,7 +1438,7 @@ fn build_delim_join(
             },
         )
     } else {
-        let kind = match join.join_type()? {
+        let kind = match join_type {
             JoinType::LEFT => JoinKind::ProbeOuter,
             JoinType::INNER => JoinKind::Inner,
             JoinType::SEMI => JoinKind::ProbeSemi,
@@ -1429,11 +1471,18 @@ fn build_delim_join(
             },
         )
     };
-    let join_node = PlanNode {
+    let mut join_node = PlanNode {
         name: "DELIM_SUBQUERY_JOIN".to_string(),
         inputs: join_inputs,
         operator: Operator::Join(join_operator),
     };
+    if let Some(projections) = outer_columns_first {
+        join_node = PlanNode {
+            name: "DELIM_OUTER_COLUMNS_FIRST".to_string(),
+            inputs: vec![join_node],
+            operator: Operator::Projection(Projection { projections }),
+        };
+    }
 
     let dedup = PlanNode {
         name: "DELIM_DEDUP".to_string(),
@@ -1458,6 +1507,12 @@ fn build_delim_join(
             sites: 2,
         }),
     })
+}
+
+/// Whether any operator of the plan under `node` is a lateral call.
+fn contains_lateral_call(node: &PlanNode) -> bool {
+    matches!(node.operator, Operator::LateralCall(_))
+        || node.inputs.iter().any(contains_lateral_call)
 }
 
 /// Collapse DuckDB's late-materialization SEMI join into a pivot Materialize: the

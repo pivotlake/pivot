@@ -113,13 +113,53 @@ SELECT * FROM generate_series(TIMESTAMP '2026-09-09 12:00:00',
 
 As with `range`, a call with a `NULL` argument returns no rows.
 
+## Arguments from columns
+
+The arguments of `range` and `generate_series` can be columns of an earlier
+item of the same `FROM` clause. The function then returns one series for each
+row of that item, beside the row's own columns:
+
+```sql
+SELECT spans.id, steps.step
+FROM spans, generate_series(spans.first, spans.last) AS steps(step);
+```
+
+A row whose series is empty produces no rows. `LEFT JOIN LATERAL` keeps it,
+with a `NULL` step:
+
+```sql
+SELECT spans.id, steps.step
+FROM spans
+LEFT JOIN LATERAL generate_series(spans.first, spans.last) AS steps(step) ON true;
+```
+
+This fills the gaps of a time-bucketed aggregate: generate every bucket
+between the first and the last one that has rows, and join the counts to them.
+
+```sql
+WITH counts AS (
+  SELECT time_bucket(INTERVAL '10 seconds', "timestamp") AS bucket, count(*) AS count
+  FROM events
+  GROUP BY bucket
+)
+SELECT buckets.bucket, counts.count
+FROM (SELECT min(bucket) AS first_bucket, max(bucket) AS last_bucket FROM counts) AS observed,
+     generate_series(observed.first_bucket, observed.last_bucket, INTERVAL '10 seconds')
+       AS buckets(bucket)
+LEFT JOIN counts ON counts.bucket = buckets.bucket
+ORDER BY buckets.bucket;
+```
+
 ## Limitations
 
-- The arguments of `range` and `generate_series` must be constants. A column
-  of another `FROM` item, or a subquery, fails.
 - `step` cannot be zero. The months, days, and time of an `INTERVAL` step must
   all point in the same direction: `INTERVAL '1 month -1 day'` fails.
 - Timestamp bounds cannot be `infinity` or `-infinity`.
+- A column that an argument of `range` or `generate_series` reads must be an
+  integer, decimal, date, timestamp, or text column.
+- When such a column is `NULL`, the call must return no rows. It does whenever
+  the `NULL` reaches an argument. An argument that replaces the `NULL`, such as
+  `CASE WHEN last IS NULL THEN 10 ELSE last END`, fails the query on that row.
 - `read_parquet` takes exactly one `VARCHAR` path. The path must name a file or
   a file pattern, not a directory: `s3://my-bucket/events/` fails, and
   `s3://my-bucket/events/*.parquet` works.

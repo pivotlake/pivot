@@ -2,10 +2,15 @@
 //! (inclusive). Integer arguments give integers; two timestamp bounds and an
 //! interval step give timestamps. A call with a NULL argument returns no rows.
 //!
-//! The series streams from a lazy source operator that emits one
+//! A call with constant arguments is a table of its own, bound as a
+//! [`BoundSeries`]. It streams from a lazy source operator that emits one
 //! [`SERIES_CHUNK_ROWS`] batch each time it is polled, so a huge range never
 //! materializes at once and a downstream `LIMIT`/aggregate stops it early.
+//!
+//! A call whose arguments are columns of an earlier `FROM` item is lateral,
+//! bound as a [`BoundLateralSeries`]: it returns one series per input row.
 
+use super::lateral::{BoundLateralFunction, LateralRowGenerator, LateralTableFunction};
 use super::{TableFunction, TableFunctionSignature, invalid_argument};
 use crate::catalog::{
     BoundTable, CatalogTransaction, Column, DynamicScanPredicate, Result as CatalogResult,
@@ -90,28 +95,32 @@ impl TableFunction for SeriesTableFunction {
             .collect()
     }
 
+    fn as_lateral(&self) -> Option<&dyn LateralTableFunction> {
+        Some(self)
+    }
+
     fn bind(
         &self,
         arguments: &[ScalarValue],
         _transaction: &dyn CatalogTransaction,
     ) -> CatalogResult<Box<dyn BoundTable>> {
-        // Each argument as an array of one value, where a NULL argument still
-        // has the type of its parameter.
-        let argument_values: Vec<ArrayRef> = arguments
+        // One row of argument columns, the shape a lateral call reads its
+        // arguments from.
+        let argument_columns: Vec<ArrayRef> = arguments
             .iter()
             .map(|argument| build_scalar_value(argument.clone()).map(Scalar::into_inner))
             .collect::<Result<_, _>>()
             .map_err(|error| self.reject_arguments(error.to_string()))?;
-        let argument_types = argument_values
+        let argument_types = argument_columns
             .iter()
-            .map(|value| {
-                type_from_physical(value.data_type()).ok_or_else(|| {
-                    self.reject_arguments(format!("no overload takes a {}", value.data_type()))
+            .map(|column| {
+                type_from_physical(column.data_type()).ok_or_else(|| {
+                    self.reject_arguments(format!("no overload takes a {}", column.data_type()))
                 })
             })
             .collect::<CatalogResult<Vec<Type>>>()?;
         let value_type = self.resolve_value_type(&argument_types)?;
-        let series = Series::read_from_arguments(value_type, self.inclusive, &argument_values)
+        let series = Series::read_from_row(value_type, self.inclusive, &argument_columns, 0)
             .map_err(|message| self.reject_arguments(message))?;
 
         let written_arguments: Vec<String> = arguments.iter().map(ToString::to_string).collect();
@@ -120,6 +129,16 @@ impl TableFunction for SeriesTableFunction {
             call: format!("{}({})", self.name, written_arguments.join(",")),
             value_type,
             series,
+        }))
+    }
+}
+
+impl LateralTableFunction for SeriesTableFunction {
+    fn bind(&self, argument_types: &[Type]) -> CatalogResult<Box<dyn BoundLateralFunction>> {
+        Ok(Box::new(BoundLateralSeries {
+            name: self.name,
+            inclusive: self.inclusive,
+            value_type: self.resolve_value_type(argument_types)?,
         }))
     }
 }
@@ -181,21 +200,22 @@ struct Series {
 }
 
 impl Series {
-    /// The series a call's arguments ask for: the empty one when an argument
-    /// is NULL. Each argument is an array of one value.
-    fn read_from_arguments(
+    /// The series that row `row` of a call's argument columns asks for: the
+    /// empty one when an argument is NULL.
+    fn read_from_row(
         value_type: SeriesValueType,
         inclusive: bool,
         arguments: &[ArrayRef],
+        row: usize,
     ) -> Result<Series, String> {
-        if arguments.iter().any(|argument| argument.is_null(0)) {
+        if arguments.iter().any(|argument| argument.is_null(row)) {
             return Ok(Series::empty());
         }
         let (start, stop, step_months, step_distance) = match value_type {
             SeriesValueType::Integer => {
                 let integers: Vec<i64> = arguments
                     .iter()
-                    .map(|argument| argument.as_primitive::<Int64Type>().value(0))
+                    .map(|argument| argument.as_primitive::<Int64Type>().value(row))
                     .collect();
                 match integers[..] {
                     // A single argument is the stop; the series starts at 0, step 1.
@@ -209,7 +229,7 @@ impl Series {
                 let [start, stop] = [0, 1].map(|bound| {
                     arguments[bound]
                         .as_primitive::<TimestampMicrosecondType>()
-                        .value(0)
+                        .value(row)
                 });
                 if [start, stop]
                     .iter()
@@ -219,7 +239,7 @@ impl Series {
                 }
                 let step = arguments[2]
                     .as_primitive::<IntervalMonthDayNanoType>()
-                    .value(0);
+                    .value(row);
                 // A day is a fixed 24 hours: the session zone is UTC, which has
                 // no daylight saving shift to stretch a day across.
                 let step_distance = i64::from(step.days)
@@ -305,7 +325,7 @@ fn is_infinite_timestamp(micros: i64) -> bool {
     micros == i64::MAX || micros == -i64::MAX
 }
 
-/// One call of a series function.
+/// A series call with constant arguments.
 #[derive(Clone, Debug)]
 struct BoundSeries {
     name: &'static str,
@@ -487,5 +507,76 @@ impl Nullary<RecordBatch> for SeriesSource {
 
     fn finish(&mut self, _sender: &mut dyn Sender<RecordBatch>) -> NullaryResult<bool> {
         Ok(self.done)
+    }
+}
+
+/// A lateral series call: one series per input row.
+#[derive(Clone, Debug)]
+struct BoundLateralSeries {
+    name: &'static str,
+    inclusive: bool,
+    value_type: SeriesValueType,
+}
+
+impl BoundLateralFunction for BoundLateralSeries {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn columns(&self) -> Vec<Column> {
+        vec![Column {
+            name: self.name.to_string(),
+            col_type: self.value_type.column_type(),
+        }]
+    }
+
+    fn clone_box(&self) -> Box<dyn BoundLateralFunction> {
+        Box::new(self.clone())
+    }
+
+    fn create_row_generator(&self) -> Box<dyn LateralRowGenerator> {
+        Box::new(SeriesRowGenerator {
+            function: self.clone(),
+            series: Series::empty(),
+            generated_values: Vec::new(),
+        })
+    }
+}
+
+/// Generates the series of one input row at a time.
+struct SeriesRowGenerator {
+    function: BoundLateralSeries,
+    /// What is left of the series of the call that last started.
+    series: Series,
+    generated_values: Vec<i64>,
+}
+
+impl LateralRowGenerator for SeriesRowGenerator {
+    fn start_call(
+        &mut self,
+        arguments: &[ArrayRef],
+        row: usize,
+    ) -> Result<(), crate::compile::Error> {
+        self.series = Series::read_from_row(
+            self.function.value_type,
+            self.function.inclusive,
+            arguments,
+            row,
+        )
+        .map_err(|message| invalid_argument(self.function.name, message))?;
+        Ok(())
+    }
+
+    fn generate_rows(&mut self, limit: usize) -> usize {
+        let generated_before = self.generated_values.len();
+        self.generated_values.reserve(limit);
+        self.generated_values
+            .extend(self.series.by_ref().take(limit));
+        self.generated_values.len() - generated_before
+    }
+
+    fn take_columns(&mut self) -> Vec<ArrayRef> {
+        let values = std::mem::take(&mut self.generated_values);
+        vec![self.function.value_type.build_column(values)]
     }
 }

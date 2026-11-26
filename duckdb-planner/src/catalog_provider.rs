@@ -77,6 +77,9 @@ pub struct TableFunctionDef {
     pub name: String,
     pub arg_type_ids: Vec<u8>,
     pub supports_late_materialization: bool,
+    /// Whether a call's arguments may be columns of an earlier `FROM` item,
+    /// which makes it a lateral call. All overloads of one name agree on it.
+    pub accepts_column_arguments: bool,
 }
 
 pub use crate::duckdb_bridge::ffi::ScalarFunctionDef;
@@ -121,6 +124,18 @@ pub trait DuckDBTransaction: Send + Sync {
         _arguments: Vec<crate::ScalarValue>,
     ) -> Result<Box<dyn DuckDBTable>> {
         Err("table-function binding is not supported by this transaction".into())
+    }
+
+    /// Bind a lateral call of a globally registered table function: its
+    /// arguments are columns of `argument_types`, read from each row the
+    /// function is called for. The returned object stands in for the call in
+    /// the plan and lists the columns one call returns.
+    fn bind_lateral_table_function(
+        &self,
+        _name: &str,
+        _argument_types: Vec<crate::BoundLogicalType>,
+    ) -> Result<Box<dyn DuckDBTable>> {
+        Err("lateral table-function binding is not supported by this transaction".into())
     }
 }
 
@@ -167,6 +182,7 @@ pub(crate) fn catalog_table_functions(ctx: &CatalogContext) -> Vec<ffi::TableFun
             name: function.name.clone(),
             arg_type_ids: function.arg_type_ids.clone(),
             supports_late_materialization: function.supports_late_materialization,
+            accepts_column_arguments: function.accepts_column_arguments,
         })
         .collect()
 }
@@ -236,6 +252,25 @@ pub(crate) fn catalog_bind_table_function(
     let table = transaction
         .transaction
         .bind_table_function(name, arguments)?;
+    let columns = table.duckdb_typed_columns();
+    Ok(ffi::CatalogBindTableFunctionResult {
+        columns,
+        table: Box::new(OptionalTableWrapper { table: Some(table) }),
+    })
+}
+
+pub(crate) fn catalog_bind_lateral_table_function(
+    transaction: &TransactionContext,
+    name: &str,
+    argument_types: &cxx::CxxVector<ffi::LogicalType>,
+) -> Result<ffi::CatalogBindTableFunctionResult> {
+    let argument_types = argument_types
+        .iter()
+        .map(crate::handle::bound_type_from_logical_type)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let table = transaction
+        .transaction
+        .bind_lateral_table_function(name, argument_types)?;
     let columns = table.duckdb_typed_columns();
     Ok(ffi::CatalogBindTableFunctionResult {
         columns,

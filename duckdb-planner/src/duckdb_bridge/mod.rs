@@ -9,10 +9,10 @@
 pub mod duckdb_types;
 
 use crate::catalog_provider::{
-    CatalogContext, OptionalTableWrapper, TransactionContext, catalog_bind_table_function,
-    catalog_context_default, catalog_context_names, catalog_does_schema_exist,
-    catalog_get_scalar_function, catalog_get_table, catalog_table_functions,
-    clone_table_function_table, pushdown_filter, table_estimate_row_count,
+    CatalogContext, OptionalTableWrapper, TransactionContext, catalog_bind_lateral_table_function,
+    catalog_bind_table_function, catalog_context_default, catalog_context_names,
+    catalog_does_schema_exist, catalog_get_scalar_function, catalog_get_table,
+    catalog_table_functions, clone_table_function_table, pushdown_filter, table_estimate_row_count,
     table_supports_late_materialization,
 };
 
@@ -75,6 +75,9 @@ pub mod ffi {
         /// Whether DuckDB may split this function's scan into a narrow scan
         /// followed by a late-materialization fetch.
         pub supports_late_materialization: bool,
+        /// Whether a call's arguments may be columns of an earlier `FROM`
+        /// item, which makes it a lateral call.
+        pub accepts_column_arguments: bool,
     }
 
     /// One invocation-specific table-function binding: its footer-derived
@@ -159,6 +162,11 @@ pub mod ffi {
             transaction: &TransactionContext,
             name: &str,
             arguments: &CxxVector<Value>,
+        ) -> Result<CatalogBindTableFunctionResult>;
+        fn catalog_bind_lateral_table_function(
+            transaction: &TransactionContext,
+            name: &str,
+            argument_types: &CxxVector<LogicalType>,
         ) -> Result<CatalogBindTableFunctionResult>;
         fn clone_table_function_table(table: &OptionalTableWrapper) -> Box<OptionalTableWrapper>;
         fn catalog_get_scalar_function(
@@ -361,6 +369,14 @@ pub mod ffi {
         fn lo_get_clone_bound_table_function(
             op: &LogicalOperator,
         ) -> Result<Box<OptionalTableWrapper>>;
+        /// A lateral call's parameter types, one per argument column its child
+        /// leads with.
+        fn lo_get_argument_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_get_argument_type(op: &LogicalOperator, index: usize) -> Result<&LogicalType>;
+        /// The child columns a lateral call repeats beside each row it
+        /// returns, in output order after the function's own columns.
+        fn lo_get_passthrough_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_get_passthrough_column(op: &LogicalOperator, index: usize) -> Result<usize>;
 
         // ---- CreateTable ----
         fn lo_create_table_name(op: &LogicalOperator) -> Result<String>;

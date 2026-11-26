@@ -64,7 +64,7 @@ fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
 
 /// Read a DuckDB type in full, including the fields of a `STRUCT`, which the
 /// flat FFI type struct cannot carry.
-fn bound_type_from_logical_type(raw: &ffi::LogicalType) -> Result<BoundLogicalType> {
+pub(crate) fn bound_type_from_logical_type(raw: &ffi::LogicalType) -> Result<BoundLogicalType> {
     let flat = bound_type_from(ffi::logical_type_flat(raw)?);
     if flat.id != LogicalTypeId::STRUCT {
         return Ok(flat);
@@ -232,8 +232,9 @@ impl<'plan> LogicalOp<'plan> {
 
     /// Dispatch on the operator's [`LogicalOperatorType`] into a typed [`Operator`]
     /// view that exposes only that operator's accessors. A `LOGICAL_GET` splits
-    /// into [`Operator::TableScan`] / [`Operator::TableFunctionScan`] by whether it
-    /// reads a base table; any kind the consumer doesn't handle is
+    /// into [`Operator::TableScan`], [`Operator::LateralTableFunction`] and
+    /// [`Operator::TableFunctionScan`] by whether it reads a base table or has
+    /// a child; any kind the consumer doesn't handle is
     /// [`Operator::Unsupported`].
     pub fn operator(self) -> Result<Operator<'plan>> {
         use LogicalOperatorType as L;
@@ -250,6 +251,9 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_LIMIT => Operator::Limit(Limit { raw: self.raw }),
             L::LOGICAL_GET if ffi::lo_get_has_table(self.raw)? => {
                 Operator::TableScan(TableScan { raw: self.raw })
+            }
+            L::LOGICAL_GET if self.child_count()? > 0 => {
+                Operator::LateralTableFunction(LateralTableFunction { raw: self.raw })
             }
             L::LOGICAL_GET => Operator::TableFunctionScan(TableFunctionScan { raw: self.raw }),
             L::LOGICAL_CREATE_TABLE => Operator::CreateTable(CreateTable { raw: self.raw }),
@@ -306,6 +310,9 @@ pub enum Operator<'plan> {
     TableScan(TableScan<'plan>),
     /// A scan over a table-valued function (`LOGICAL_GET` with no base table).
     TableFunctionScan(TableFunctionScan<'plan>),
+    /// A table-valued function called once per row of its child, with
+    /// arguments read from that row (`LOGICAL_GET` with a child).
+    LateralTableFunction(LateralTableFunction<'plan>),
     CreateTable(CreateTable<'plan>),
     CreateSchema(CreateSchema<'plan>),
     /// `DROP <kind> name` of any catalog entry kind; the consumer checks the
@@ -393,6 +400,9 @@ define_handles! { ffi::LogicalOperator;
     TableScan,
     /// A `LogicalGet` over a table-valued function.
     TableFunctionScan,
+    /// A `LogicalGet` over a table-valued function, with the child whose rows
+    /// the function is called for.
+    LateralTableFunction,
     /// A `LogicalCreateTable` with an explicit column list.
     CreateTable,
     /// A `LogicalCreate` for `CREATE SCHEMA`.
@@ -814,6 +824,51 @@ impl<'plan> TableFunctionScan<'plan> {
         Ok(PushedConditions {
             list: ffi::lo_get_pushed_conditions(self.raw)?,
         })
+    }
+}
+
+impl<'plan> LateralTableFunction<'plan> {
+    pub fn function_name(self) -> Result<String> {
+        Ok(ffi::lo_get_function_name(self.raw)?)
+    }
+
+    /// Whether this call was bound by a Pivot table function.
+    pub fn has_bound_function(self) -> Result<bool> {
+        Ok(ffi::lo_get_has_bound_table_function(self.raw)?)
+    }
+
+    /// Clone the object the call was bound to.
+    pub fn bound_function(self) -> Result<Box<OptionalTableWrapper>> {
+        Ok(ffi::lo_get_clone_bound_table_function(self.raw)?)
+    }
+
+    /// The function's parameter types. Argument `i` is column `i` of the
+    /// child, which the function expects cast to parameter type `i`.
+    pub fn argument_types(self) -> Result<Vec<BoundLogicalType>> {
+        (0..ffi::lo_get_argument_count(self.raw)?)
+            .map(|i| bound_type_from_logical_type(ffi::lo_get_argument_type(self.raw, i)?))
+            .collect()
+    }
+
+    /// The function's columns the call emits, each a column index of the
+    /// function paired with its type.
+    pub fn function_columns(self) -> Result<Vec<(usize, BoundLogicalType)>> {
+        (0..ffi::lo_get_output_count(self.raw)?)
+            .map(|i| {
+                Ok((
+                    ffi::lo_get_output_column(self.raw, i)?,
+                    bound_type_from(ffi::lo_get_output_type(self.raw, i)?),
+                ))
+            })
+            .collect()
+    }
+
+    /// The child columns repeated beside each row the function returns. They
+    /// follow the function's own columns in the output, in this order.
+    pub fn passthrough_columns(self) -> Result<Vec<usize>> {
+        (0..ffi::lo_get_passthrough_count(self.raw)?)
+            .map(|i| Ok(ffi::lo_get_passthrough_column(self.raw, i)?))
+            .collect()
     }
 }
 

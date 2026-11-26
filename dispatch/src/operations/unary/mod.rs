@@ -86,6 +86,7 @@ pub use default_unary_factory::DefaultUnaryFactory;
 
 mod copy_out;
 mod fake_operator;
+mod flat_map;
 mod join;
 mod limit;
 mod normalizer;
@@ -94,6 +95,7 @@ mod order_by_limit;
 mod unnest;
 
 pub use copy_out::copy_out;
+pub use flat_map::FlatMapFactory;
 pub(crate) use join::create_join_factories;
 pub(crate) use join::create_normalizing_for_workers as create_normalizing_join_factories;
 pub(crate) use join::create_range_join_factories;

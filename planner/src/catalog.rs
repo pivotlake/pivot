@@ -6,9 +6,9 @@
 //! and knows how to compile itself into a dispatch scan spec.
 //!
 //! Because DuckDB owns SQL binding, the catalog and tables also need to be
-//! visible to it: [`DuckDBTransactionAdapter`] and [`DuckDBTableAdapter`]
-//! implement DuckDB's [`DuckDBTransaction`] / [`DuckDBTable`] traits over our
-//! Pivot types. They exist as
+//! visible to it: [`DuckDBTransactionAdapter`], [`DuckDBTableAdapter`] and
+//! [`DuckDBLateralFunctionAdapter`] implement DuckDB's [`DuckDBTransaction`] /
+//! [`DuckDBTable`] traits over our Pivot types. They exist as
 //! standalone wrapper structs (rather than blanket impls) because the orphan
 //! rule prevents implementing a foreign trait for `Box<dyn BoundTable>` directly.
 
@@ -17,10 +17,11 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::expression::{CompareType, Expression};
-use crate::operator::built_in_table_function;
-use crate::types::{Type, logical_from_type};
+use crate::operator::{BoundLateralFunction, built_in_table_function};
+use crate::types::{Type, logical_from_type, type_from_logical};
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{BoundarySlot, DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use duckdb_planner::BoundLogicalType;
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::Expr;
 use duckdb_planner::ScalarValue;
@@ -617,6 +618,26 @@ impl DuckDBTable for DuckDBTableAdapter {
     }
 }
 
+/// Adapts a Pivot [`BoundLateralFunction`] to DuckDB's [`DuckDBTable`] trait,
+/// which is what a table function's binding rides a DuckDB plan as. DuckDB
+/// reads the columns one call returns from it.
+#[derive(Debug)]
+pub struct DuckDBLateralFunctionAdapter {
+    pub function: Box<dyn BoundLateralFunction>,
+}
+
+impl DuckDBTable for DuckDBLateralFunctionAdapter {
+    fn clone_box(&self) -> Box<dyn DuckDBTable> {
+        Box::new(DuckDBLateralFunctionAdapter {
+            function: self.function.clone_box(),
+        })
+    }
+
+    fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
+        duckdb_columns(&self.function.columns())
+    }
+}
+
 /// Adapts a Pivot [`CatalogTransaction`] to DuckDB's [`DuckDBTransaction`]
 /// trait: table lookups during one plan's binding resolve against this
 /// transaction's snapshot.
@@ -678,5 +699,22 @@ impl DuckDBTransaction for DuckDBTransactionAdapter {
             .ok_or_else(|| format!("no registered table function named `{name}`"))?;
         let table = function.bind(&arguments, self.transaction.as_ref())?;
         Ok(Box::new(DuckDBTableAdapter { table }))
+    }
+
+    fn bind_lateral_table_function(
+        &self,
+        name: &str,
+        argument_types: Vec<BoundLogicalType>,
+    ) -> duckdb_planner::catalog_provider::Result<Box<dyn DuckDBTable>> {
+        let lateral_function = built_in_table_function(name)
+            .ok_or_else(|| format!("no registered table function named `{name}`"))?
+            .as_lateral()
+            .ok_or_else(|| format!("table function `{name}` takes constant arguments only"))?;
+        let argument_types = argument_types
+            .into_iter()
+            .map(type_from_logical)
+            .collect::<Result<Vec<_>, _>>()?;
+        let function = lateral_function.bind(&argument_types)?;
+        Ok(Box::new(DuckDBLateralFunctionAdapter { function }))
     }
 }

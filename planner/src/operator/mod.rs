@@ -62,7 +62,10 @@ pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
 pub use projection::Projection;
 pub use set_variable::SetVariable;
-pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
+pub use table_function::{
+    BoundLateralFunction, LateralCall, LateralRowGenerator, LateralTableFunction, TableFunction,
+    TableFunctionScan, TableFunctionSignature,
+};
 pub(crate) use table_function::{built_in_table_function, built_in_table_function_defs};
 pub use top_n::TopN;
 pub use transaction::TransactionStatement;
@@ -106,6 +109,9 @@ pub enum Operator {
     Insert(Insert),
     /// A scan over a table-valued function (e.g. `generate_series`).
     TableFunctionScan(TableFunctionScan),
+    /// A table-valued function called once per input row, with arguments read
+    /// from that row (see [`LateralCall`]).
+    LateralCall(LateralCall),
     Projection(Projection),
     OrderBy(OrderBy),
     Aggregate(Aggregate),
@@ -162,6 +168,9 @@ impl Operator {
             // part of the logical schema.)
             Operator::Input(input) => expression_types(&input.columns),
             Operator::TableFunctionScan(scan) => scan.output_types(),
+            // A lateral call emits the function's columns, then the input
+            // columns it repeats beside them.
+            Operator::LateralCall(call) => Ok(call.output_types(&inputs[0])),
             // A materialize re-fetches columns like a scan: its outputs are
             // its column expressions.
             Operator::Materialize(materialize) => expression_types(&materialize.columns),
@@ -254,6 +263,7 @@ impl Operator {
             Operator::TableFunctionScan(scan) => {
                 vec![true; scan.output_types().map_or(0, |t| t.len())]
             }
+            Operator::LateralCall(call) => call.output_nullability(&inputs[0]),
             Operator::Materialize(materialize) => {
                 let table = materialize.table.nullability();
                 materialize
@@ -347,6 +357,7 @@ impl fmt::Display for Operator {
             Operator::Values(v) => write!(f, "{v}"),
             Operator::Insert(i) => write!(f, "{i}"),
             Operator::TableFunctionScan(t) => write!(f, "{t}"),
+            Operator::LateralCall(c) => write!(f, "{c}"),
             Operator::Projection(p) => write!(f, "{p}"),
             Operator::OrderBy(o) => write!(f, "{o}"),
             Operator::Aggregate(a) => write!(f, "{a}"),

@@ -471,6 +471,33 @@ fn group_by_count_row_key_with_string_field() {
     assert_eq!(collect_i64s(&results, 2), vec![3, 2, 1]);
 }
 
+#[test]
+fn flat_map_emits_every_batch_returned_for_an_input_batch() {
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(&["a", "b"], &[1, 2]);
+
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
+        .flat_map(|| {
+            // Three copies of each input batch, then nothing more for it.
+            let mut copies_returned = 0;
+            move |batch: &RecordBatch| {
+                if copies_returned == 3 {
+                    copies_returned = 0;
+                    return Ok(None);
+                }
+                copies_returned += 1;
+                Ok(Some(batch.clone()))
+            }
+        })
+        .collect()
+        .unwrap();
+
+    let mut values = collect_i64s(&results, 1);
+    values.sort();
+    assert_eq!(values, vec![1, 1, 1, 2, 2, 2]);
+}
+
 /// One element of a constant list, repeated for every row of `batch`, or NULL
 /// past the list's end.
 fn repeat_list_element(list: &ArrayRef, element_idx: usize, batch: &RecordBatch) -> ArrayRef {

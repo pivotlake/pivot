@@ -4,9 +4,15 @@
 //! Binding one invocation produces a regular [`BoundTable`] that carries its
 //! argument-dependent schema and execution state. Fixed-schema generators and
 //! dynamic external-file readers therefore follow the same planning path.
+//!
+//! A function may also offer a lateral form, for an invocation whose arguments
+//! are columns of an earlier `FROM` item (see [`lateral`]).
 
+mod lateral;
 mod read_parquet;
 mod series;
+
+pub use lateral::{BoundLateralFunction, LateralCall, LateralRowGenerator, LateralTableFunction};
 
 use crate::catalog::{BoundTable, CatalogTransaction};
 use crate::compile::{Error, RuntimeFilterSlots};
@@ -40,6 +46,12 @@ pub trait TableFunction: Send + Sync {
     /// a property of the function rather than the returned [`BoundTable`].
     fn supports_late_materialization(&self) -> bool {
         false
+    }
+
+    /// The function's lateral form, when its arguments may be columns of an
+    /// earlier `FROM` item as well as constants.
+    fn as_lateral(&self) -> Option<&dyn LateralTableFunction> {
+        None
     }
 
     fn bind(
@@ -88,6 +100,7 @@ fn table_function_defs<'a>(
                     .map(|argument_type| logical_from_type(argument_type).id as u8)
                     .collect(),
                 supports_late_materialization: function.supports_late_materialization(),
+                accepts_column_arguments: function.as_lateral().is_some(),
             }
         }));
     }

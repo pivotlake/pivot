@@ -64,10 +64,10 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CteFactory, CteScanFactory, Distinct,
-    DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind,
-    JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
-    NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory,
-    OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
+    DynamicRowKey, F64Cell, FilterFactory, FlatMapFactory, GroupFactory, GroupLimit, IntCell,
+    JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory,
+    MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
+    OrderByFactory, OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
     UnaryOperatorFactory, UnnestFactory, WideCell, copy_out, create_join_factories,
     create_normalizing_join_factories, create_normalizing_order_by_factories,
     create_range_join_factories,
@@ -735,6 +735,26 @@ impl RecordBatchOperatorSpec {
     {
         let worker_count = self.worker_count();
         self.unary((0..worker_count).map(|_| UnnestFactory::new(builder(), element_count)))
+    }
+
+    /// Turn every input batch into a sequence of output batches.
+    ///
+    /// The inner closure is called with the same input batch again and again.
+    /// Each call returns that batch's next output batch, or `None` once it has
+    /// no more, after which the closure is given the next input batch. The
+    /// closure keeps its own place in the batch between calls. One output
+    /// batch goes out per turn, so a batch that expands into a great many rows
+    /// is never resident all at once.
+    ///
+    /// Same two-level closure pattern as [`filter`](Self::filter): the outer
+    /// builder closure is called once per worker.
+    pub fn flat_map<F, FB>(self, builder: FB) -> Self
+    where
+        F: FnMut(&RecordBatch) -> crate::UnaryResult<Option<RecordBatch>> + Send + 'static,
+        FB: Fn() -> F,
+    {
+        let worker_count = self.worker_count();
+        self.unary((0..worker_count).map(|_| FlatMapFactory(builder())))
     }
 
     /// Global `COUNT(DISTINCT x)`: GROUP BY `key_cols` with no aggregate, emitting

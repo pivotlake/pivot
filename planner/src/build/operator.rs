@@ -18,23 +18,24 @@ use duckdb_planner::handle::{
     CopyFromStdin as CopyFromStdinView, CreateSchema as CreateSchemaView,
     CreateTable as CreateTableView, CreateUser as CreateUserView, Distinct as DistinctView,
     Drop as DropView, Expression as DuckExpression, Filter as FilterView, Insert as InsertView,
-    Limit as LimitView, OrderBy as OrderByView, OrderKey, Projection as ProjectionView,
-    Reset as ResetView, Set as SetView, TableFunctionScan as TableFunctionScanView,
-    TableScan as TableScanView, TopN as TopNView, Unnest as UnnestView,
-    UnnestedList as UnnestedListView, Values as ValuesView,
+    LateralTableFunction as LateralTableFunctionView, Limit as LimitView, OrderBy as OrderByView,
+    OrderKey, Projection as ProjectionView, Reset as ResetView, Set as SetView,
+    TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
+    Unnest as UnnestView, UnnestedList as UnnestedListView, Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
 use crate::catalog::{
     BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DropTableRequest,
-    DuckDBTableAdapter,
+    DuckDBLateralFunctionAdapter, DuckDBTableAdapter,
 };
 use crate::dynamic_filter::JoinFilterScanInfo;
-use crate::expression::{Error as ExpressionError, Expression, Ref};
+use crate::expression::{Cast, Error as ExpressionError, Expression, Ref};
 use crate::operator::{
-    Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Distinct,
-    DropTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode,
-    Projection, SetVariable, TableFunctionScan, TopN, Unnest, UnnestedList, Values,
+    Aggregate, BoundLateralFunction, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable,
+    CreateUser, Distinct, DropTable, Error as OperatorError, Filter, Input, Insert, LateralCall,
+    Limit, OrderBy, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Unnest,
+    UnnestedList, Values,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -387,6 +388,54 @@ impl TableFunctionScan {
     }
 }
 
+impl LateralCall {
+    /// Build the call over an input whose columns have `input_types`. The
+    /// input leads with one column per argument, which is cast here when its
+    /// type is not the parameter's.
+    pub(super) fn from_handle(
+        view: LateralTableFunctionView<'_>,
+        input_types: &[Type],
+    ) -> Result<LateralCall, OperatorError> {
+        if !view.has_bound_function()? {
+            return Err(OperatorError::Unsupported(format!(
+                "table function {} was not registered by Pivot",
+                view.function_name()?
+            )));
+        }
+        let arguments = view
+            .argument_types()?
+            .into_iter()
+            .enumerate()
+            .map(|(column_idx, parameter_type)| {
+                let parameter_type = type_from_logical(parameter_type)?;
+                let argument = Expression::Ref(Ref {
+                    column_idx,
+                    return_type: input_types[column_idx].clone(),
+                    name: None,
+                });
+                if input_types[column_idx] == parameter_type {
+                    return Ok(argument);
+                }
+                Ok(Expression::Cast(Cast {
+                    target_arrow: physical_arrow_type(&parameter_type),
+                    target: parameter_type,
+                    source: Box::new(argument),
+                }))
+            })
+            .collect::<Result<Vec<_>, OperatorError>>()?;
+        Ok(LateralCall {
+            function: bind_lateral_function(*view.bound_function()?),
+            arguments,
+            function_columns: view
+                .function_columns()?
+                .into_iter()
+                .map(|(function_column, _)| function_column)
+                .collect(),
+            passthrough_columns: view.passthrough_columns()?,
+        })
+    }
+}
+
 impl CreateSchema {
     pub(crate) fn from_handle(view: CreateSchemaView<'_>) -> Result<CreateSchema, OperatorError> {
         Ok(CreateSchema {
@@ -526,6 +575,19 @@ fn bind_table(wrapper: OptionalTableWrapper) -> Box<dyn BoundTable> {
         .downcast::<DuckDBTableAdapter>()
         .expect("scan table should be the planner's table adapter");
     adapter.table
+}
+
+/// Resolve the object a lateral call was bound to into the Pivot
+/// [`BoundLateralFunction`] it wraps.
+fn bind_lateral_function(wrapper: OptionalTableWrapper) -> Box<dyn BoundLateralFunction> {
+    let duck: Box<dyn DuckDBTable> = wrapper
+        .table
+        .expect("planner returned an unbound lateral call");
+    let any: Box<dyn Any> = duck;
+    let adapter: Box<DuckDBLateralFunctionAdapter> = any
+        .downcast::<DuckDBLateralFunctionAdapter>()
+        .expect("a lateral call should be bound to the planner's lateral function adapter");
+    adapter.function
 }
 
 /// Interpret a `LIMIT`/`OFFSET` bound's [`LimitNodeType`] into an `Option<usize>`:

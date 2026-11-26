@@ -63,13 +63,29 @@ unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &context, Table
 	if (!storage_info.current_transaction) {
 		throw InternalException("table-function bind with no pivot transaction published");
 	}
-	auto binding = catalog_bind_table_function(
-	    *storage_info.current_transaction, info.name, input.inputs);
+	// A lateral call's arguments are the columns of its input plan, so it binds
+	// with argument types and no constants. That holds when DuckDB binds the
+	// call again for a copy of the plan too, where it passes no input plan.
+	bool is_lateral = input.inputs.empty() && !input.input_table_types.empty();
+	auto binding = is_lateral
+	                   ? catalog_bind_lateral_table_function(*storage_info.current_transaction, info.name,
+	                                                         input.input_table_types)
+	                   : catalog_bind_table_function(*storage_info.current_transaction, info.name,
+	                                                 input.inputs);
 	for (const auto &col : binding.columns) {
 		names.emplace_back(std::string(col.name));
 		return_types.emplace_back(logical_type_from_column(col));
 	}
 	return make_uniq<PivotTableFunctionBindData>(std::move(binding.table));
+}
+
+// DuckDB's binder accepts arguments that are not constants only for a function
+// that has an in-out callback, and plans such a call as a scan with the
+// argument rows as its child. Pivot executes the call itself, so the callback
+// only marks the function and never runs.
+OperatorResultType pivot_lateral_table_function_stub(ExecutionContext &, TableFunctionInput &, DataChunk &,
+                                                     DataChunk &) {
+	throw InternalException("a pivot table function is executed by pivot, not by DuckDB");
 }
 
 unique_ptr<NodeStatistics> pivot_table_function_cardinality(ClientContext &,
@@ -137,12 +153,19 @@ void RegisterPivotTableFunctions(ClientContext &context, const CatalogContext &c
 		info->name = name;
 		TableFunction function(name, std::move(arguments), nullptr, pivot_table_function_bind);
 		function.function_info = std::move(info);
-		function.pushdown_complex_filter = pivot_table_function_pushdown_complex_filter;
-		// Let DuckDB lower simple comparisons into table_filters after the
-		// callback has offered them to the bound table. The plan bridge restores
-		// those filters above the Pivot scan because a bound table may use them
-		// only as a metadata optimization.
-		function.filter_pushdown = true;
+		if (definition.accepts_column_arguments) {
+			// A filter stays above such a function: DuckDB's own in-out
+			// functions take no pushed filters, so its optimizer has no path
+			// for a filter pushed into a scan that has a child.
+			function.in_out_function = pivot_lateral_table_function_stub;
+		} else {
+			function.pushdown_complex_filter = pivot_table_function_pushdown_complex_filter;
+			// Let DuckDB lower simple comparisons into table_filters after the
+			// callback has offered them to the bound table. The plan bridge
+			// restores those filters above the Pivot scan because a bound table
+			// may use them only as a metadata optimization.
+			function.filter_pushdown = true;
+		}
 		function.projection_pushdown = true;
 		function.cardinality = pivot_table_function_cardinality;
 		if (definition.supports_late_materialization) {

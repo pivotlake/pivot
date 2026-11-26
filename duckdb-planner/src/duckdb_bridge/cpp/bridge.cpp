@@ -832,6 +832,29 @@ const Value &lo_get_param(const LogicalOperator &op, size_t index) {
 	return as<duckdb::LogicalGet>(op).parameters[index];
 }
 
+// ---- Get: lateral table function ----
+//
+// A lateral call is a get with a child. The child's leading columns are the
+// call's arguments, which the get expects cast to `input_table_types`, and
+// `projected_input` lists the child columns the get repeats beside each row
+// the function returns.
+
+size_t lo_get_argument_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalGet>(op).input_table_types.size();
+}
+
+const LogicalType &lo_get_argument_type(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalGet>(op).input_table_types[index];
+}
+
+size_t lo_get_passthrough_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalGet>(op).projected_input.size();
+}
+
+size_t lo_get_passthrough_column(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalGet>(op).projected_input[index];
+}
+
 // ---- CreateTable ----
 
 static duckdb::CreateTableInfo &create_table_info(const LogicalOperator &op) {

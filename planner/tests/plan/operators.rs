@@ -722,6 +722,34 @@ fn a_small_outer_exists_becomes_a_flipped_delim_join(mut testing_planner: Testin
     ");
 }
 
+/// A table function whose arguments are columns of an earlier `FROM` item
+/// decorrelates into an INNER delim join with a lateral call on its subquery
+/// side: the call runs once per distinct argument tuple the delim scan feeds
+/// it and repeats that tuple beside its rows. Those rows probe a hash table of
+/// the outer rows, and the projection above the join puts the outer columns
+/// first again.
+#[rstest]
+fn a_table_function_over_columns_becomes_a_lateral_call(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("SELECT a, step FROM example_table, generate_series(1, a) AS steps(step)")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32, step:Int64)
+      Cte(#9223372036854775807, sites: 2)
+        Input([a:Int32])
+        Cte(#9223372036854775808, sites: 1)
+          Distinct(keys: [0])
+            CteScan(#9223372036854775807)
+          Projection(#1:Int32, #0:Int64)
+            Join(probe_keys: [1], build_keys: [0], probe_output: [0], build_output: [0])
+              LateralCall(generate_series(cast(#0:Int32 as Int64), cast(#1:Int32 as Int64)))
+                Projection(1:Int32, a:Int32, a:Int32)
+                  CteScan(#9223372036854775808)
+              CteScan(#9223372036854775807)
+    ");
+}
+
 /// A LEFT JOIN preserving the larger relation stays LEFT in DuckDB's plan and
 /// lowers to the probe-side outer join: the preserved side streams as probe
 /// and its unmatched rows pad with null build columns.
