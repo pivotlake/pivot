@@ -1,12 +1,13 @@
-use std::fmt;
-
+use crate::Error;
 use crate::duckdb_bridge::duckdb_types::LogicalTypeId;
 use crate::duckdb_bridge::ffi;
+use cxx::UniquePtr;
+use std::fmt;
 
 /// The payload that completes a parameterized DuckDB type, mirroring
 /// DuckDB's own `ExtraTypeInfo`. Most ids fully describe their type and
-/// carry [`ExtraTypeInfo::None`]; a parameterized id (`DECIMAL`, `STRUCT`)
-/// carries its parameters here.
+/// carry [`ExtraTypeInfo::None`]; a parameterized id (`DECIMAL`, `STRUCT`,
+/// `LIST`) carries its parameters here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtraTypeInfo {
     None,
@@ -19,6 +20,8 @@ pub enum ExtraTypeInfo {
     /// A field of an unnamed struct, such as a `(a, b)` tuple, has an empty
     /// name.
     Struct(Vec<(String, BoundLogicalType)>),
+    /// `LIST(element)`: the type of each element.
+    List(Box<BoundLogicalType>),
 }
 
 /// A DuckDB logical type as read off a bound plan: the type id plus the
@@ -55,15 +58,33 @@ impl BoundLogicalType {
         BoundLogicalType { id, extra }
     }
 
+    /// Encode into the flat FFI type struct, the inverse of `from_bridge`. The
+    /// flat struct has no room for a `STRUCT`'s fields or a `LIST`'s element
+    /// type, so those types are refused.
+    fn to_bridge(&self) -> Result<ffi::BridgeLogicalType, Error> {
+        let (decimal_width, decimal_scale) = match self.extra {
+            ExtraTypeInfo::None => (0, 0),
+            ExtraTypeInfo::Decimal { width, scale } => (width, scale),
+            ExtraTypeInfo::Struct(_) | ExtraTypeInfo::List(_) => {
+                return Err(Error::UnsupportedParameterType(self.id.clone()));
+            }
+        };
+        Ok(ffi::BridgeLogicalType {
+            id: self.id.clone() as u8,
+            decimal_width,
+            decimal_scale,
+        })
+    }
+
     /// Encode into the flat FFI column descriptor the DuckDB catalog glue
     /// consumes, the inverse of `from_bridge`: every parameter field is
     /// written flat, zeroed when the id has none.
     pub fn to_duckdb_column(&self, name: String) -> ffi::DuckDBColumn {
         let (decimal_width, decimal_scale) = match &self.extra {
             ExtraTypeInfo::Decimal { width, scale } => (*width, *scale),
-            // The flat descriptor has no room for a struct's fields, and no
-            // table declares a struct column.
-            ExtraTypeInfo::None | ExtraTypeInfo::Struct(_) => (0, 0),
+            // The flat descriptor has no room for a struct's fields or a
+            // list's element type, and no table declares a column of either.
+            ExtraTypeInfo::None | ExtraTypeInfo::Struct(_) | ExtraTypeInfo::List(_) => (0, 0),
         };
         ffi::DuckDBColumn {
             name,
@@ -122,12 +143,84 @@ pub enum ScalarValue {
     Variant(String),
     /// A `STRUCT`: each field's name and value, in field order.
     Struct(Vec<(String, ScalarValue)>),
+    /// A `LIST`: its elements in order. The element type is carried separately
+    /// so an empty list still has one.
+    List {
+        element_type: BoundLogicalType,
+        elements: Vec<ScalarValue>,
+    },
     /// A NULL, carrying the type the binder resolved for it (an INSERT's NULL
     /// takes the target column's type) so the consumer can build a null of the
     /// right shape. An untyped NULL keeps DuckDB's own `SQLNULL` id.
     Null(BoundLogicalType),
     /// A DuckDB type the bridge does not decode into a typed variant.
     Other(LogicalTypeId),
+}
+
+impl ScalarValue {
+    /// Build the DuckDB value this scalar describes, the inverse of decoding
+    /// one off a plan. [`Other`](ScalarValue::Other) names a type without a
+    /// value, so it has nothing to build, and a `STRUCT` cannot be built yet.
+    pub fn into_duckdb_value(self) -> Result<UniquePtr<ffi::Value>, Error> {
+        Ok(match self {
+            ScalarValue::Boolean(value) => ffi::build_boolean_value(value)?,
+            ScalarValue::Int8(value) => ffi::build_int8_value(value)?,
+            ScalarValue::Int16(value) => ffi::build_int16_value(value)?,
+            ScalarValue::Int32(value) => ffi::build_int32_value(value)?,
+            ScalarValue::Int64(value) => ffi::build_int64_value(value)?,
+            ScalarValue::UInt8(value) => ffi::build_uint8_value(value)?,
+            ScalarValue::UInt16(value) => ffi::build_uint16_value(value)?,
+            ScalarValue::UInt32(value) => ffi::build_uint32_value(value)?,
+            ScalarValue::UInt64(value) => ffi::build_uint64_value(value)?,
+            ScalarValue::Int128(value) => {
+                ffi::build_int128_value((value >> 64) as i64, value as u64)?
+            }
+            ScalarValue::Float32(value) => ffi::build_float32_value(value)?,
+            ScalarValue::Float64(value) => ffi::build_float64_value(value)?,
+            ScalarValue::Decimal {
+                value,
+                width,
+                scale,
+            } => ffi::build_decimal_value((value >> 64) as i64, value as u64, width, scale)?,
+            ScalarValue::Utf8(value) => ffi::build_varchar_value(&value)?,
+            ScalarValue::Date(days) => ffi::build_date_value(days)?,
+            ScalarValue::Timestamp(micros) => ffi::build_timestamp_value(micros)?,
+            ScalarValue::TimestampTz(micros) => ffi::build_timestamp_tz_value(micros)?,
+            ScalarValue::Interval {
+                months,
+                days,
+                micros,
+            } => ffi::build_interval_value(months, days, micros)?,
+            ScalarValue::Variant(text) => ffi::build_variant_value(&text)?,
+            ScalarValue::List {
+                element_type,
+                elements,
+            } => {
+                let mut element_values = ffi::new_value_list()?;
+                for element in elements {
+                    ffi::push_value(element_values.pin_mut(), element.into_duckdb_value()?)?;
+                }
+                ffi::build_list_value(element_type.to_bridge()?, element_values)?
+            }
+            ScalarValue::Null(BoundLogicalType {
+                extra: ExtraTypeInfo::List(element_type),
+                ..
+            }) => ffi::build_null_list_value(element_type.to_bridge()?)?,
+            // A LIST or STRUCT id alone does not say what the value holds, so
+            // there is no complete type to build a NULL of.
+            ScalarValue::Null(BoundLogicalType {
+                id: id @ (LogicalTypeId::LIST | LogicalTypeId::STRUCT),
+                extra: ExtraTypeInfo::None,
+            }) => return Err(Error::IncompleteParameterType(id)),
+            ScalarValue::Null(logical_type) => ffi::build_null_value(logical_type.to_bridge()?)?,
+            ScalarValue::Struct(_) => {
+                return Err(Error::UnsupportedParameterType(LogicalTypeId::STRUCT));
+            }
+            ScalarValue::Other(logical_type) => {
+                return Err(Error::UnsupportedParameterType(logical_type));
+            }
+        })
+    }
 }
 
 impl fmt::Display for ScalarValue {
@@ -169,6 +262,16 @@ impl fmt::Display for ScalarValue {
                     write!(f, "{name}: {value}")?;
                 }
                 f.write_str("}")
+            }
+            ScalarValue::List { elements, .. } => {
+                f.write_str("[")?;
+                for (element_idx, element) in elements.iter().enumerate() {
+                    if element_idx > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{element}")?;
+                }
+                f.write_str("]")
             }
             ScalarValue::Null(ty) => write!(f, "NULL as {:?}", ty.id),
             ScalarValue::Other(ty) => write!(f, "{ty:?}"),

@@ -109,17 +109,22 @@ pub mod ffi {
         pub rows: u64,
     }
 
+    /// What went wrong in a bridge call. `kind` is empty when nothing did, and
+    /// otherwise one of `duckdb_planning`, `unsupported_plan`, `bridge_error`.
+    struct BridgeErrorInfo {
+        pub kind: String,
+        pub message: String,
+        pub has_position: bool,
+        pub position: String,
+    }
+
     /// Outcome of `extract_plan`.
     ///
-    /// On success `error_kind` is empty and `plan` owns DuckDB's resolved plan
+    /// On success `error.kind` is empty and `plan` owns DuckDB's resolved plan
     /// tree (kept alive for the duration of the Rust walk). On failure `plan` is
-    /// null and the `error_*` fields describe what went wrong (`error_kind` is
-    /// one of `duckdb_planning`, `unsupported_plan`, `bridge_error`).
+    /// null and `error` describes what went wrong.
     struct ExtractPlanResult {
-        pub error_kind: String,
-        pub error_message: String,
-        pub has_error_position: bool,
-        pub error_position: String,
+        pub error: BridgeErrorInfo,
         pub plan: UniquePtr<PlanHandle>,
         /// The binder-resolved result column names DuckDB would hand a client,
         /// in select order (e.g. `["hour", "count_star()"]`). Empty when the
@@ -128,6 +133,13 @@ pub mod ffi {
         /// DuckDB found query-dependent state (such as its native `now()`)
         /// whose optimized value requires a fresh plan for another execution.
         pub requires_rebind: bool,
+    }
+
+    /// Outcome of `extract_param_types`. On failure `error` describes what
+    /// went wrong.
+    struct ExtractParamTypesResult {
+        pub error: BridgeErrorInfo,
+        pub parameter_types: UniquePtr<ParameterTypes>,
     }
 
     extern "Rust" {
@@ -199,11 +211,35 @@ pub mod ffi {
         /// `PivotSchemaCatalogEntry::LookupEntry`). The reference only
         /// needs to outlive this call; the C++ side clears its pointer before
         /// returning.
+        ///
+        /// `parameters` holds the values of the statement's `$1..$n`
+        /// placeholders, in placeholder order; each is bound as a constant.
         fn extract_plan(
             ctx: Pin<&mut DuckPlannerContext>,
             query: &str,
+            parameters: &ValueList,
             transaction: &TransactionContext,
         ) -> Result<ExtractPlanResult>;
+
+        /// The type DuckDB infers for each of the statement's `$1..$n`
+        /// placeholders while binding it, in placeholder order, with
+        /// `transaction` published as for `extract_plan`. The statement is
+        /// bound but not planned further. A placeholder no context gives a type
+        /// to is `UNKNOWN`.
+        fn extract_param_types(
+            ctx: Pin<&mut DuckPlannerContext>,
+            query: &str,
+            transaction: &TransactionContext,
+        ) -> Result<ExtractParamTypesResult>;
+        type ParameterTypes;
+        fn parameter_type_count(parameter_types: &ParameterTypes) -> Result<usize>;
+        fn parameter_type(parameter_types: &ParameterTypes, index: usize) -> Result<&LogicalType>;
+
+        /// An ordered run of values, filled one `push_value` at a time: a
+        /// statement's placeholder values, or the elements of a list value.
+        type ValueList;
+        fn new_value_list() -> Result<UniquePtr<ValueList>>;
+        fn push_value(values: Pin<&mut ValueList>, value: UniquePtr<Value>) -> Result<()>;
 
         fn plan_root(plan: &PlanHandle) -> Result<&LogicalOperator>;
 
@@ -614,6 +650,42 @@ pub mod ffi {
             logical_type: &LogicalType,
             index: usize,
         ) -> Result<&LogicalType>;
+        fn logical_type_list_element_type(logical_type: &LogicalType) -> Result<&LogicalType>;
+
+        // ---- Value: constructors, the inverse of the typed accessors. A
+        // 128-bit integer crosses as its two halves.
+        fn build_boolean_value(value: bool) -> Result<UniquePtr<Value>>;
+        fn build_int8_value(value: i8) -> Result<UniquePtr<Value>>;
+        fn build_int16_value(value: i16) -> Result<UniquePtr<Value>>;
+        fn build_int32_value(value: i32) -> Result<UniquePtr<Value>>;
+        fn build_int64_value(value: i64) -> Result<UniquePtr<Value>>;
+        fn build_uint8_value(value: u8) -> Result<UniquePtr<Value>>;
+        fn build_uint16_value(value: u16) -> Result<UniquePtr<Value>>;
+        fn build_uint32_value(value: u32) -> Result<UniquePtr<Value>>;
+        fn build_uint64_value(value: u64) -> Result<UniquePtr<Value>>;
+        fn build_int128_value(upper: i64, lower: u64) -> Result<UniquePtr<Value>>;
+        fn build_float32_value(value: f32) -> Result<UniquePtr<Value>>;
+        fn build_float64_value(value: f64) -> Result<UniquePtr<Value>>;
+        fn build_decimal_value(
+            upper: i64,
+            lower: u64,
+            width: u8,
+            scale: u8,
+        ) -> Result<UniquePtr<Value>>;
+        fn build_varchar_value(value: &str) -> Result<UniquePtr<Value>>;
+        fn build_variant_value(text: &str) -> Result<UniquePtr<Value>>;
+        fn build_date_value(days: i32) -> Result<UniquePtr<Value>>;
+        fn build_timestamp_value(micros: i64) -> Result<UniquePtr<Value>>;
+        fn build_timestamp_tz_value(micros: i64) -> Result<UniquePtr<Value>>;
+        fn build_interval_value(months: i32, days: i32, micros: i64) -> Result<UniquePtr<Value>>;
+        fn build_null_value(logical_type: BridgeLogicalType) -> Result<UniquePtr<Value>>;
+        /// A list of `element_type`. An element of another type is cast to
+        /// it, and one that cannot be converted is an error.
+        fn build_list_value(
+            element_type: BridgeLogicalType,
+            elements: UniquePtr<ValueList>,
+        ) -> Result<UniquePtr<Value>>;
+        fn build_null_list_value(element_type: BridgeLogicalType) -> Result<UniquePtr<Value>>;
 
         // BoundAggregateExpression
         fn expr_aggregate_name(expr: &Expression) -> Result<String>;

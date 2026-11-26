@@ -53,6 +53,8 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -106,17 +108,17 @@ std::string bridge_exception_message(const std::exception &e) {
 	return e.what();
 }
 
-static ExtractPlanResult make_error(const string &kind, const string &message,
-                                    std::optional<string> position = std::nullopt) {
-	ExtractPlanResult result;
-	result.error_kind = rust::String::lossy(kind);
-	result.error_message = rust::String::lossy(message);
-	result.has_error_position = position.has_value();
-	result.error_position = rust::String::lossy(position.value_or(""));
-	return result;
+static BridgeErrorInfo make_error(const string &kind, const string &message,
+                                  std::optional<string> position = std::nullopt) {
+	BridgeErrorInfo error;
+	error.kind = rust::String::lossy(kind);
+	error.message = rust::String::lossy(message);
+	error.has_position = position.has_value();
+	error.position = rust::String::lossy(position.value_or(""));
+	return error;
 }
 
-static ExtractPlanResult build_duckdb_error(const duckdb::Exception &e) {
+static BridgeErrorInfo build_duckdb_error(const duckdb::Exception &e) {
 	using json = nlohmann::json;
 	auto parsed = json::parse(e.what(), nullptr, false);
 	string message = e.what();
@@ -141,6 +143,24 @@ static ExtractPlanResult build_duckdb_error(const duckdb::Exception &e) {
 	}
 
 	return make_error("duckdb_planning", message, position);
+}
+
+// Run `body`, turning any exception it throws into the error a bridge result
+// carries. The error is empty (no kind) when `body` returns normally.
+template <class F>
+static BridgeErrorInfo catch_bridge_error(F &&body) {
+	try {
+		body();
+	} catch (duckdb::Exception &e) {
+		return build_duckdb_error(e);
+	} catch (const UnsupportedPlanError &e) {
+		return make_error("unsupported_plan", e.what());
+	} catch (const std::exception &e) {
+		return make_error("bridge_error", e.what());
+	} catch (...) {
+		return make_error("bridge_error", "unknown C++ exception");
+	}
+	return BridgeErrorInfo {};
 }
 
 // Create new context for an in-memory DB. The context only binds and optimizes
@@ -213,6 +233,31 @@ PlanHandle::~PlanHandle() {
 	}
 }
 
+// Parse `query` as a single statement and bind it with `parameters`, then hand
+// the planner to `use_planner` while the binding transaction is still open.
+template <class F>
+static void bind_statement(duckdb::Connection &con, const std::string &query,
+                           const ValueList &parameters, F &&use_planner) {
+	auto statements = con.ExtractStatements(query);
+	if (statements.size() != 1) {
+		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
+	}
+	con.context->RunFunctionInTransaction([&]() {
+		duckdb::Planner planner(*con.context);
+		// DuckDB binds a placeholder that already has a value as a constant, which
+		// is how bound params end up in the plan.
+		// We pass the type explicitly to prevent duckdb from coercing it into a different
+		// type than the one passed to us.
+		for (duckdb::idx_t i = 0; i < parameters.values.size(); i++) {
+			auto &value = parameters.values[i];
+			planner.parameter_data.emplace(std::to_string(i + 1),
+			                               duckdb::BoundParameterData(value, value.type()));
+		}
+		planner.CreatePlan(std::move(statements[0]));
+		use_planner(planner);
+	});
+}
+
 // Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
 // binder-resolved result column names (in select order) via `result_names`.
 // The stock `ExtractPlan` computes those names on its local `Planner` and then
@@ -221,16 +266,17 @@ PlanHandle::~PlanHandle() {
 // captured without patching the bundled DuckDB.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
 extract_plan_with_names(duckdb::Connection &con, const std::string &query,
+                        const ValueList &parameters,
                         duckdb::vector<std::string> &result_names, bool &requires_rebind) {
-	auto statements = con.ExtractStatements(query);
-	if (statements.size() != 1) {
-		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
-	}
 	auto &context = *con.context;
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
-	context.RunFunctionInTransaction([&]() {
-		duckdb::Planner planner(context);
-		planner.CreatePlan(std::move(statements[0]));
+	bind_statement(con, query, parameters, [&](duckdb::Planner &planner) {
+		// A placeholder left without a value produces no plan to optimize.
+		if (!planner.plan || planner.properties.parameter_count != parameters.values.size()) {
+			throw duckdb::InvalidInputException(
+			    "statement takes " + std::to_string(planner.properties.parameter_count) +
+			    " parameters, " + std::to_string(parameters.values.size()) + " were supplied");
+		}
 		// The binder resolves the client-facing result column names before
 		// optimization rewrites the plan; capture them while still intact.
 		result_names = planner.names;
@@ -265,42 +311,34 @@ struct CurrentTransactionScope {
 };
 
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
+                               const ValueList &parameters,
                                const TransactionContext &transaction) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
 	bool requires_rebind = false;
-	std::optional<ExtractPlanResult> error;
 	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
 
-	try {
+	ExtractPlanResult result;
+	result.error = catch_bridge_error([&]() {
 		std::string query_str(query.data(), query.size());
 		// The result column names DuckDB would hand a client, in select order
 		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
-		plan = extract_plan_with_names(ctx.con, query_str, name_list, requires_rebind);
+		plan = extract_plan_with_names(ctx.con, query_str, parameters, name_list, requires_rebind);
 		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
 		// positional BoundReference indices against each operator's actual child
 		// output. This is the standard resolution DuckDB runs before execution;
 		// the Rust walk then reads those positional indices directly.
 		duckdb::ColumnBindingResolver resolver;
 		resolver.VisitOperator(*plan);
-	} catch (duckdb::Exception &e) {
-		error = build_duckdb_error(e);
-	} catch (const UnsupportedPlanError &e) {
-		error = make_error("unsupported_plan", e.what());
-	} catch (const std::exception &e) {
-		error = make_error("bridge_error", e.what());
-	} catch (...) {
-		error = make_error("bridge_error", "unknown C++ exception");
-	}
+	});
 
-	if (error) {
+	if (!result.error.kind.empty()) {
 		// No plan was produced, so nothing took the table handles; free the
 		// per-plan catalog entries now.
 		PivotStorageInfo::Get(*ctx.db.instance).ClearTableEntries();
-		return std::move(*error);
+		return result;
 	}
 
-	ExtractPlanResult result;
 	auto handle = std::make_unique<PlanHandle>();
 	handle->root = std::move(plan);
 	handle->ctx = &ctx;
@@ -310,6 +348,47 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 		result.output_names.push_back(rust::String::lossy(name));
 	}
 	return result;
+}
+
+ExtractParamTypesResult extract_param_types(DuckPlannerContext &ctx, rust::Str query,
+                                            const TransactionContext &transaction) {
+	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
+	auto parameter_types = std::make_unique<ParameterTypes>();
+
+	ExtractParamTypesResult result;
+	result.error = catch_bridge_error([&]() {
+		std::string query_str(query.data(), query.size());
+		bind_statement(ctx.con, query_str, ValueList {}, [&](duckdb::Planner &planner) {
+			for (duckdb::idx_t i = 1; i <= planner.properties.parameter_count; i++) {
+				auto entry = planner.value_map.find(std::to_string(i));
+				// DuckDB leaves a placeholder that no context gives a type out of
+				// value_map.
+				parameter_types->types.push_back(entry == planner.value_map.end()
+				                                     ? duckdb::LogicalType(duckdb::LogicalTypeId::UNKNOWN)
+				                                     : entry->second->return_type);
+			}
+		});
+	});
+	// Binding created per-statement catalog entries, and no plan takes them.
+	PivotStorageInfo::Get(*ctx.db.instance).ClearTableEntries();
+	result.parameter_types = std::move(parameter_types);
+	return result;
+}
+
+size_t parameter_type_count(const ParameterTypes &parameter_types) {
+	return parameter_types.types.size();
+}
+
+const LogicalType &parameter_type(const ParameterTypes &parameter_types, size_t index) {
+	return parameter_types.types[index];
+}
+
+std::unique_ptr<ValueList> new_value_list() {
+	return std::make_unique<ValueList>();
+}
+
+void push_value(ValueList &values, std::unique_ptr<Value> value) {
+	values.values.push_back(std::move(*value));
 }
 
 const LogicalOperator &plan_root(const PlanHandle &plan) {
@@ -471,6 +550,15 @@ rust::String logical_type_struct_field_name(const LogicalType &type, size_t inde
 
 const LogicalType &logical_type_struct_field_type(const LogicalType &type, size_t index) {
 	return struct_fields(type)[index].second;
+}
+
+// The type is checked here because DuckDB's own accessor only asserts it in
+// debug builds.
+const LogicalType &logical_type_list_element_type(const LogicalType &type) {
+	if (type.id() != duckdb::LogicalTypeId::LIST) {
+		throw duckdb::InternalException("expected a LIST type, got %s", type.ToString());
+	}
+	return duckdb::ListType::GetChildType(type);
 }
 
 const LogicalType &lo_filter_type_id(const LogicalOperator &op, size_t index) {
@@ -1405,6 +1493,105 @@ const Value &value_struct_field(const Value &v, size_t index) {
 		throw duckdb::InternalException("expected a STRUCT value, got %s", v.type().ToString());
 	}
 	return duckdb::StructValue::GetChildren(v)[index];
+}
+
+// Constructors for a DuckDB `Value`, the inverse of the typed accessors above:
+// each builds a non-NULL value of exactly the named type.
+std::unique_ptr<Value> build_boolean_value(bool value) {
+	return std::make_unique<Value>(Value::BOOLEAN(value));
+}
+std::unique_ptr<Value> build_int8_value(int8_t value) {
+	return std::make_unique<Value>(Value::TINYINT(value));
+}
+std::unique_ptr<Value> build_int16_value(int16_t value) {
+	return std::make_unique<Value>(Value::SMALLINT(value));
+}
+std::unique_ptr<Value> build_int32_value(int32_t value) {
+	return std::make_unique<Value>(Value::INTEGER(value));
+}
+std::unique_ptr<Value> build_int64_value(int64_t value) {
+	return std::make_unique<Value>(Value::BIGINT(value));
+}
+std::unique_ptr<Value> build_uint8_value(uint8_t value) {
+	return std::make_unique<Value>(Value::UTINYINT(value));
+}
+std::unique_ptr<Value> build_uint16_value(uint16_t value) {
+	return std::make_unique<Value>(Value::USMALLINT(value));
+}
+std::unique_ptr<Value> build_uint32_value(uint32_t value) {
+	return std::make_unique<Value>(Value::UINTEGER(value));
+}
+std::unique_ptr<Value> build_uint64_value(uint64_t value) {
+	return std::make_unique<Value>(Value::UBIGINT(value));
+}
+std::unique_ptr<Value> build_int128_value(int64_t upper, uint64_t lower) {
+	return std::make_unique<Value>(Value::HUGEINT(duckdb::hugeint_t(upper, lower)));
+}
+std::unique_ptr<Value> build_float32_value(float value) {
+	return std::make_unique<Value>(Value::FLOAT(value));
+}
+std::unique_ptr<Value> build_float64_value(double value) {
+	return std::make_unique<Value>(Value::DOUBLE(value));
+}
+// A DECIMAL stores its unscaled integer in the physical width its precision
+// requires, so only a wide decimal takes the 128-bit value as is.
+std::unique_ptr<Value> build_decimal_value(int64_t upper, uint64_t lower, uint8_t width, uint8_t scale) {
+	duckdb::hugeint_t unscaled(upper, lower);
+	if (width > duckdb::Decimal::MAX_WIDTH_INT64) {
+		return std::make_unique<Value>(Value::DECIMAL(unscaled, width, scale));
+	}
+	// Throws when the value does not fit the narrower storage.
+	return std::make_unique<Value>(Value::DECIMAL(duckdb::Hugeint::Cast<int64_t>(unscaled), width, scale));
+}
+std::unique_ptr<Value> build_varchar_value(rust::Str value) {
+	return std::make_unique<Value>(Value(std::string(value.data(), value.size())));
+}
+// A variant is built from its document text the way a cast in SQL builds one.
+std::unique_ptr<Value> build_variant_value(rust::Str text) {
+	return std::make_unique<Value>(
+	    Value(std::string(text.data(), text.size())).DefaultCastAs(duckdb::LogicalType::VARIANT()));
+}
+std::unique_ptr<Value> build_date_value(int32_t days) {
+	return std::make_unique<Value>(Value::DATE(duckdb::date_t(days)));
+}
+std::unique_ptr<Value> build_timestamp_value(int64_t micros) {
+	return std::make_unique<Value>(Value::TIMESTAMP(duckdb::timestamp_t(micros)));
+}
+std::unique_ptr<Value> build_timestamp_tz_value(int64_t micros) {
+	return std::make_unique<Value>(Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(micros)));
+}
+std::unique_ptr<Value> build_interval_value(int32_t months, int32_t days, int64_t micros) {
+	return std::make_unique<Value>(Value::INTERVAL(months, days, micros));
+}
+// The DuckDB type a flat FFI type struct describes.
+// DECIMAL and VARIANT need internal type structure (even for nulls), so both are built
+// through their factories.
+static duckdb::LogicalType build_logical_type(const BridgeLogicalType &logical_type) {
+	auto id = static_cast<duckdb::LogicalTypeId>(logical_type.id);
+	if (id == duckdb::LogicalTypeId::DECIMAL) {
+		return duckdb::LogicalType::DECIMAL(logical_type.decimal_width, logical_type.decimal_scale);
+	}
+	if (id == duckdb::LogicalTypeId::VARIANT) {
+		return duckdb::LogicalType::VARIANT();
+	}
+	return duckdb::LogicalType(id);
+}
+
+// A Value built from a type alone is a NULL of that type.
+std::unique_ptr<Value> build_null_value(BridgeLogicalType logical_type) {
+	return std::make_unique<Value>(Value(build_logical_type(logical_type)));
+}
+
+// A list of `element_type` holding `elements`. DuckDB casts each element to
+// that type, and throws for one that cannot be converted.
+std::unique_ptr<Value> build_list_value(BridgeLogicalType element_type, std::unique_ptr<ValueList> elements) {
+	return std::make_unique<Value>(
+	    Value::LIST(build_logical_type(element_type), std::move(elements->values)));
+}
+
+// A NULL of type LIST(element_type).
+std::unique_ptr<Value> build_null_list_value(BridgeLogicalType element_type) {
+	return std::make_unique<Value>(Value(duckdb::LogicalType::LIST(build_logical_type(element_type))));
 }
 
 size_t expr_ref_index(const Expression &expr) {

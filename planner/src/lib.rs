@@ -158,7 +158,8 @@ use thiserror::Error;
 use crate::catalog::{CatalogTransaction, DuckDBTransactionAdapter};
 use crate::operator::built_in_table_function_defs;
 pub use duckdb_planner::{
-    DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
+    BoundLogicalType, DuckDBColumn, DuckDBTable, DuckDBTransaction, ExtraTypeInfo, LogicalTypeId,
+    ScalarValue,
 };
 
 /// Errors surfaced by planning and validating a [`Plan`].
@@ -245,8 +246,33 @@ impl Planner {
         query: &str,
         transaction: Arc<dyn CatalogTransaction>,
     ) -> Result<Plan, Error> {
+        self.plan_with_parameters(query, Vec::new(), transaction)
+    }
+
+    /// The type each of the statement's `$1..$n` placeholders takes from the
+    /// context it appears in, in placeholder order, resolving tables through
+    /// `transaction`. A placeholder no context gives a type to (e.g.
+    /// `SELECT $1`) is `UNKNOWN`.
+    pub fn infer_parameter_types(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn CatalogTransaction>,
+    ) -> Result<Vec<BoundLogicalType>, Error> {
         let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
-        let planned = self.planner_context.plan(query, adapter)?;
+        Ok(self.planner_context.infer_parameter_types(query, adapter)?)
+    }
+
+    /// Plan a SQL statement whose `$1..$n` placeholders take `parameters`, in
+    /// placeholder order. Each placeholder is planned as a constant of its
+    /// value's type, so the plan is specific to these values.
+    pub fn plan_with_parameters(
+        &mut self,
+        query: &str,
+        parameters: Vec<ScalarValue>,
+        transaction: Arc<dyn CatalogTransaction>,
+    ) -> Result<Plan, Error> {
+        let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
+        let planned = self.planner_context.plan(query, parameters, adapter)?;
         let mut root = build::build_plan(planned.root()?)?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();

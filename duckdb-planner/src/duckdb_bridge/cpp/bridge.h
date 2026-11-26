@@ -10,6 +10,8 @@ struct CatalogContext;
 struct TransactionContext;
 struct OptionalTableWrapper;
 struct ExtractPlanResult;
+struct ExtractParamTypesResult;
+struct BridgeErrorInfo;
 struct BridgeLogicalType;
 struct BridgeDecimalValue;
 struct BridgeHugeint;
@@ -67,9 +69,30 @@ struct ExpressionList {
 	std::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
 };
 
+// An ordered run of values: the values a statement's `$1..$n` placeholders
+// take, or the elements of a list value. Built on this side because cxx cannot
+// append a non-trivial C++ object to a vector from Rust.
+struct ValueList {
+	duckdb::vector<duckdb::Value> values;
+};
+
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog);
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
+                               const ValueList &parameters,
                                const TransactionContext &transaction);
+
+// The type DuckDB inferred for each of a statement's `$1..$n` placeholders.
+struct ParameterTypes {
+	duckdb::vector<duckdb::LogicalType> types;
+};
+
+ExtractParamTypesResult extract_param_types(DuckPlannerContext &ctx, rust::Str query,
+                                            const TransactionContext &transaction);
+size_t parameter_type_count(const ParameterTypes &parameter_types);
+const LogicalType &parameter_type(const ParameterTypes &parameter_types, size_t index);
+
+std::unique_ptr<ValueList> new_value_list();
+void push_value(ValueList &values, std::unique_ptr<Value> value);
 
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();
@@ -295,6 +318,7 @@ BridgeLogicalType logical_type_flat(const LogicalType &type);
 size_t logical_type_struct_field_count(const LogicalType &type);
 rust::String logical_type_struct_field_name(const LogicalType &type, size_t index);
 const LogicalType &logical_type_struct_field_type(const LogicalType &type, size_t index);
+const LogicalType &logical_type_list_element_type(const LogicalType &type);
 
 const LogicalType &value_type(const Value &v);
 bool value_is_null(const Value &v);
@@ -321,6 +345,29 @@ int64_t value_interval_micros(const Value &v);
 size_t value_list_element_count(const Value &v);
 const Value &value_list_element(const Value &v, size_t index);
 const Value &value_struct_field(const Value &v, size_t index);
+
+std::unique_ptr<Value> build_boolean_value(bool value);
+std::unique_ptr<Value> build_int8_value(int8_t value);
+std::unique_ptr<Value> build_int16_value(int16_t value);
+std::unique_ptr<Value> build_int32_value(int32_t value);
+std::unique_ptr<Value> build_int64_value(int64_t value);
+std::unique_ptr<Value> build_uint8_value(uint8_t value);
+std::unique_ptr<Value> build_uint16_value(uint16_t value);
+std::unique_ptr<Value> build_uint32_value(uint32_t value);
+std::unique_ptr<Value> build_uint64_value(uint64_t value);
+std::unique_ptr<Value> build_int128_value(int64_t upper, uint64_t lower);
+std::unique_ptr<Value> build_float32_value(float value);
+std::unique_ptr<Value> build_float64_value(double value);
+std::unique_ptr<Value> build_decimal_value(int64_t upper, uint64_t lower, uint8_t width, uint8_t scale);
+std::unique_ptr<Value> build_varchar_value(rust::Str value);
+std::unique_ptr<Value> build_variant_value(rust::Str text);
+std::unique_ptr<Value> build_date_value(int32_t days);
+std::unique_ptr<Value> build_timestamp_value(int64_t micros);
+std::unique_ptr<Value> build_timestamp_tz_value(int64_t micros);
+std::unique_ptr<Value> build_interval_value(int32_t months, int32_t days, int64_t micros);
+std::unique_ptr<Value> build_null_value(BridgeLogicalType logical_type);
+std::unique_ptr<Value> build_list_value(BridgeLogicalType element_type, std::unique_ptr<ValueList> elements);
+std::unique_ptr<Value> build_null_list_value(BridgeLogicalType element_type);
 
 size_t expr_ref_index(const Expression &expr);
 size_t expr_columnref_index(const Expression &expr);
