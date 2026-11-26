@@ -1,6 +1,7 @@
-//! Grouped `COUNT(DISTINCT x)` (alone, or mixed with non-distinct aggregates),
-//! lowered to a two-level GROUP BY by rewriting it into two stacked *regular*
-//! grouped aggregates. Every aggregate is defined once (in `aggregation_slots`,
+//! `COUNT(DISTINCT x)` over a GROUP BY (alone, or mixed with non-distinct
+//! aggregates) or beside other aggregates with no GROUP BY, lowered to two
+//! stacked *regular* aggregates: an inner GROUP BY and an outer grouped or global
+//! aggregate. Every aggregate is defined once (in `aggregation_slots`,
 //! reached through [`build_group_by_operator`]); this module only decides which synthetic
 //! expression each level gets and how the outer references the inner's partials.
 //!
@@ -15,6 +16,9 @@
 //! * **Outer** GROUP BY `group…` is another regular aggregate that re-folds each
 //!   partial (re-summing a SUM/COUNT, re-extremising a MIN/MAX) and uses
 //!   `COUNT(*)` of the inner rows for the distinct count.
+//! * With no GROUP BY the **outer** level is a global aggregate. With no input
+//!   rows it sees no inner rows, so a re-summed `COUNT` comes out NULL; SQL
+//!   counts nothing as 0, so those columns are zeroed.
 //!
 //! The outer expressions stay in the original expression order, so the output
 //! column layout matches DuckDB's aggregate output and the downstream projection
@@ -28,13 +32,19 @@
 //! outer re-reads them through that width (see `NumReader` in `dispatch`).
 
 use super::Aggregate;
+use super::global::build_global_operator;
 use super::grouped::{
     build_dedup_operator, build_group_by_operator, column_nullable, derive_outer_keys,
 };
 use crate::compile::Error;
 use crate::expression::{AggregateFunc, CountStar, Expression, NumericAggregate, Ref};
 use crate::types::Type;
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int64Type;
+use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_schema::ArrowError;
 use dispatch::RecordBatchOperatorSpec;
+use std::sync::Arc;
 
 impl Aggregate {
     /// Lower `g…, <non-distinct aggs>, COUNT(DISTINCT x) GROUP BY g…` into two
@@ -58,7 +68,8 @@ impl Aggregate {
     ///
     /// So `COUNT(DISTINCT x)` becomes "dedup the `(g, x)` pairs, then count the
     /// survivors per `g`", and every non-distinct aggregate rides along as a partial
-    /// the outer re-folds (decomposability; see the module docs).
+    /// the outer re-folds (decomposability; see the module docs). With no GROUP BY
+    /// the inner groups by `x` alone and the outer is a global aggregate.
     pub(super) fn compile_grouped_distinct(
         &self,
         input: RecordBatchOperatorSpec,
@@ -91,6 +102,10 @@ impl Aggregate {
             build_group_by_operator(input, &inner_keys, &inner_exprs, None, nullability)?
         };
 
+        if groups.is_empty() {
+            return self.build_global_outer(inner, &outer_exprs);
+        }
+
         // Step 4: build the OUTER level grouping by the inner's leading group columns
         // (`derive_outer_keys` remaps `g…` onto columns `0..n_groups`). It counts the
         // inner rows per group (the distinct count) and re-folds each partial. Only
@@ -120,6 +135,34 @@ impl Aggregate {
             self.output_limit,
             &outer_nullability,
         )
+    }
+
+    /// The OUTER level with no GROUP BY: one global aggregate over the inner rows,
+    /// with every re-summed `COUNT` zeroed where no input row made it NULL.
+    fn build_global_outer(
+        &self,
+        inner: RecordBatchOperatorSpec,
+        outer_exprs: &[Expression],
+    ) -> Result<RecordBatchOperatorSpec, Error> {
+        let aggregated = build_global_operator(inner, outer_exprs)?;
+        let count_columns: Arc<[usize]> = self
+            .expressions
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    Expression::AggregateFunc(
+                        AggregateFunc::CountStar(_) | AggregateFunc::Count(_)
+                    )
+                )
+            })
+            .map(|(column, _)| column)
+            .collect();
+        Ok(aggregated.project(move || {
+            let count_columns = count_columns.clone();
+            move |batch: RecordBatch| Ok(zero_null_counts(batch, &count_columns)?)
+        }))
     }
 
     /// Walk the SELECT aggregates once, splitting each into an inner partial and an
@@ -257,6 +300,20 @@ fn refold_expr(func: &AggregateFunc, partial: Ref) -> Expression {
         AggregateFunc::Max(_) => AggregateFunc::Max(agg),
         _ => AggregateFunc::Sum(agg),
     })
+}
+
+/// Replace every NULL in the `Int64` count `columns` of `batch` with 0.
+fn zero_null_counts(batch: RecordBatch, columns: &[usize]) -> Result<RecordBatch, ArrowError> {
+    let mut arrays = batch.columns().to_vec();
+    for &column in columns {
+        let counts = arrays[column].as_primitive::<Int64Type>();
+        if counts.null_count() > 0 {
+            let zeroed =
+                Int64Array::from_iter_values(counts.iter().map(|count| count.unwrap_or(0)));
+            arrays[column] = Arc::new(zeroed);
+        }
+    }
+    RecordBatch::try_new(batch.schema(), arrays)
 }
 
 /// A synthetic `COUNT(*)` expression (a `BIGINT` row count).

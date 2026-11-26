@@ -19,13 +19,7 @@ impl Aggregate {
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let slots = aggregation_slots(&self.expressions)?;
-        // Pick the accumulator width by column type (see `needs_wide_accumulator`).
-        Ok(if needs_wide_accumulator(&self.expressions) {
-            input.aggregate::<i128>(slots)
-        } else {
-            input.aggregate::<i64>(slots)
-        })
+        build_global_operator(input, &self.expressions)
     }
 
     /// Answer an unfiltered global `MIN`/`MAX`-only aggregate straight from
@@ -139,4 +133,19 @@ impl Aggregate {
             dispatch::values_input(dispatcher, [batch]).record_batches(),
         ))
     }
+}
+
+/// The multi-aggregate operator computing `exprs` over every input row, one
+/// single-row output column per expression. The accumulator width follows the
+/// column types (see [`needs_wide_accumulator`]).
+pub(super) fn build_global_operator(
+    input: RecordBatchOperatorSpec,
+    exprs: &[Expression],
+) -> Result<RecordBatchOperatorSpec, Error> {
+    let slots = aggregation_slots(exprs)?;
+    Ok(if needs_wide_accumulator(exprs) {
+        input.aggregate::<i128>(slots)
+    } else {
+        input.aggregate::<i64>(slots)
+    })
 }
