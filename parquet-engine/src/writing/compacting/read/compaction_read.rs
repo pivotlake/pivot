@@ -175,7 +175,6 @@ impl CompactionRead {
         self.requests.wake_gates_after_releases();
         has_progressed |= self.fetch_other_columns_ahead();
         if self.has_sent_every_row() {
-            self.requests.memory_budget.record_read_complete();
             self.requests.close();
         }
         Ok(has_progressed)

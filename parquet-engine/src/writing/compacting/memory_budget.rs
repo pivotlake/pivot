@@ -56,7 +56,7 @@
 //! may be waiting for room.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dispatch::waker::WakerSet;
 
@@ -67,9 +67,6 @@ pub(super) struct MemoryBudget {
     /// How many output row groups the read has sent on in every column
     /// and whose last column chunks are not stored yet.
     output_row_groups_in_flight: AtomicUsize,
-    /// Whether the read has sent every row on. Once it has, nothing is
-    /// held but what reservations still count.
-    is_read_complete: AtomicBool,
     /// The worker the compacter runs on, woken when bytes are given back.
     compaction_worker: usize,
     waker_set: WakerSet,
@@ -87,7 +84,6 @@ impl MemoryBudget {
             held_bytes: AtomicUsize::new(0),
             limit_bytes,
             output_row_groups_in_flight: AtomicUsize::new(0),
-            is_read_complete: AtomicBool::new(false),
             compaction_worker,
             waker_set,
         })
@@ -168,26 +164,6 @@ impl MemoryBudget {
             budget: self.clone(),
             bytes,
             ends_row_group_in_flight: ends_row_group,
-        }
-    }
-
-    /// Record that the read has sent every row on.
-    pub(super) fn record_read_complete(&self) {
-        self.is_read_complete.store(true, Ordering::Relaxed);
-    }
-}
-
-impl Drop for MemoryBudget {
-    /// The budget goes when its last reservation does. If the read sent
-    /// every row on, every byte that was counted must have been given back
-    /// by then.
-    fn drop(&mut self) {
-        if *self.is_read_complete.get_mut() && !std::thread::panicking() {
-            debug_assert_eq!(
-                *self.held_bytes.get_mut(),
-                0,
-                "bytes are still counted as held after the compaction and all it sent on are gone"
-            );
         }
     }
 }
