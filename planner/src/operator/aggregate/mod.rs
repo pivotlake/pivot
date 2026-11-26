@@ -234,11 +234,17 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
                 AggregateFunc::AnyValue(a) => (AggregationKind::AnyValue, a.column().column_idx),
                 _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
             };
-            // A temporal result leaves the operator as its backing int. The
-            // accumulator may hold it in a wide cell, and a wide cell casts to
-            // an int but not to a date.
-            let declared_type = crate::types::physical_arrow_type(func.return_type());
-            let output_type = temporal_to_int(&declared_type).unwrap_or(declared_type);
+            // A temporal MIN/MAX/ANY_VALUE leaves the operator as its backing
+            // int, which `restore_declared_output` turns back into the temporal
+            // type: the accumulator may hold it in a wide cell, and a wide cell
+            // casts to an int but not to a date. Every other result, a FIRST of
+            // a date included, keeps its declared type.
+            let output_type = match aggregate_value_temporal(e) {
+                Some(temporal) => {
+                    temporal_to_int(&temporal).expect("a temporal type has a backing int")
+                }
+                None => crate::types::physical_arrow_type(func.return_type()),
+            };
             Ok(AggregationSlot::new(kind, column, output_type))
         })
         .collect()
