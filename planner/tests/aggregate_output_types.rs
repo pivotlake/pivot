@@ -139,3 +139,41 @@ fn date_extreme_beside_wide_sum_is_date32(
     let extreme = schema.field_with_name("extreme").unwrap();
     assert_eq!(extreme.data_type(), &DataType::Date32);
 }
+
+#[rstest]
+fn date_scalar_subquery_compares_as_a_date(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "daily_sales",
+        &[
+            (
+                "customer_id",
+                planner::types::Type::Int64,
+                Arc::new(Int64Array::from(vec![1, 1, 2])),
+            ),
+            (
+                "day",
+                planner::types::Type::Date,
+                Arc::new(Date32Array::from(vec![19002, 19000, 19001])),
+            ),
+        ],
+    );
+
+    let results = testing_planner
+        .plan(
+            "SELECT customer_id FROM daily_sales \
+             WHERE day = (SELECT day FROM daily_sales ORDER BY day LIMIT 1)",
+        )
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        batches_to_json(&results),
+        [serde_json::json!({"customer_id": 1})]
+    );
+}
