@@ -2,14 +2,14 @@
 
 using namespace duckdb;
 
-PivotTransaction::PivotTransaction(TransactionManager &manager, ClientContext &context)
+PivotTransaction::PivotTransaction(TransactionManager &manager, Context &context)
     : Transaction(manager, context) {
 }
 
 PivotTransactionManager::PivotTransactionManager(AttachedDatabase &db) : TransactionManager(db) {
 }
 
-Transaction &PivotTransactionManager::StartTransaction(ClientContext &context) {
+Transaction &PivotTransactionManager::StartTransaction(Context &context, MetaTransaction &meta_transaction) {
 	lock_guard<mutex> guard(lock);
 	auto transaction = make_uniq<PivotTransaction>(*this, context);
 	auto &ref = *transaction;
@@ -26,7 +26,7 @@ ErrorData PivotTransactionManager::CommitTransaction(ClientContext &context, Tra
 	return ErrorData();
 }
 
-void PivotTransactionManager::RollbackTransaction(Transaction &transaction) {
+void PivotTransactionManager::RollbackTransaction(ClientContext &context, Transaction &transaction) {
 	lock_guard<mutex> guard(lock);
 	transactions.erase(
 	    std::remove_if(transactions.begin(), transactions.end(),

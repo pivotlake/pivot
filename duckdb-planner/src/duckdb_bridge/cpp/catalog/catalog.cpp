@@ -5,6 +5,7 @@
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/attached_database.hpp"
 
 using namespace duckdb;
 
@@ -26,7 +27,7 @@ PivotSchemaCatalogEntry &PivotCatalog::FindOrCreateSchema(const std::string &nam
 		return *existing->second;
 	}
 	CreateSchemaInfo info;
-	info.schema = name;
+	info.SetSchema(Identifier(name));
 	auto entry = make_uniq<PivotSchemaCatalogEntry>(*this, info);
 	auto &reference = *entry;
 	schemas[name] = std::move(entry);
@@ -41,7 +42,7 @@ bool PivotCatalog::DoesSchemaExist(const std::string &name) {
 	if (!storage_info.current_transaction) {
 		throw InternalException("pivot schema lookup with no pivot transaction published");
 	}
-	return catalog_does_schema_exist(*storage_info.current_transaction, GetName(), name);
+	return catalog_does_schema_exist(*storage_info.current_transaction, GetName().GetIdentifierName(), name);
 }
 
 optional_ptr<SchemaCatalogEntry> PivotCatalog::LookupSchema(CatalogTransaction transaction,

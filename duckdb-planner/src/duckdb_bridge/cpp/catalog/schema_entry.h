@@ -47,7 +47,6 @@ public:
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateTableFunction(duckdb::CatalogTransaction, duckdb::CreateTableFunctionInfo &) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateCopyFunction(duckdb::CatalogTransaction, duckdb::CreateCopyFunctionInfo &) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreatePragmaFunction(duckdb::CatalogTransaction, duckdb::CreatePragmaFunctionInfo &) override;
-	duckdb::optional_ptr<duckdb::CatalogEntry> CreateCollation(duckdb::CatalogTransaction, duckdb::CreateCollationInfo &) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateType(duckdb::CatalogTransaction, duckdb::CreateTypeInfo &) override;
 	void DropEntry(duckdb::ClientContext &, duckdb::DropInfo &) override;
 	void Alter(duckdb::CatalogTransaction, duckdb::AlterInfo &) override;

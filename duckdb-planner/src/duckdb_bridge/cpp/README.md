@@ -90,7 +90,6 @@ catalog/
 storage_info.h / .cpp             PivotStorageInfo (keeps table entries alive during planning)
 pivot_config.h / .cpp             Carries Rust CatalogContext pointer into DuckDB config
 extension.h / extension.cpp       Registers "pivotdb" storage extension
-extension_loader.cpp              Static extension loading at startup
 transaction_manager.h / .cpp      No-op transaction manager (planning only, no writes)
 common.h                          RUST_NOT_IMPLEMENTED macro
 ```

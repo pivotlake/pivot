@@ -2,6 +2,7 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/bridge.h"
 
 #include "duckdb/common/column_index.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -14,9 +15,8 @@
 
 using namespace duckdb;
 
-static BindInfo PivotScanGetBindInfo(const optional_ptr<FunctionData> bind_data) {
-	auto &data = bind_data->Cast<PivotScanBindData>();
-	return BindInfo(data.catalog_entry);
+static optional_ptr<TableCatalogEntry> PivotScanGetTableEntry(optional_ptr<const FunctionData> bind_data) {
+	return &bind_data->Cast<PivotScanBindData>().catalog_entry;
 }
 
 // Feed DuckDB's cost model the table's real size. The optimizer reaches this
@@ -30,7 +30,9 @@ static unique_ptr<NodeStatistics> PivotScanCardinality(ClientContext &context, c
 	if (!estimate.known) {
 		return nullptr;
 	}
-	return make_uniq<NodeStatistics>(estimate.rows, estimate.rows);
+	// The count is reported as an estimate and not as an upper bound. DuckDB drops a LIMIT above an
+	// input it knows to be no larger, and pivot's LIMIT is what stops a scan early.
+	return make_uniq<NodeStatistics>(estimate.rows);
 }
 
 // Walk an expression tree and rewrite every BoundReferenceExpression's index
@@ -54,21 +56,20 @@ static unique_ptr<NodeStatistics> PivotScanCardinality(ClientContext &context, c
 // the table refuses pushdown, DuckDB keeps the original filter and reapplies
 // it as a `LogicalFilter` above the scan, where projected-space indices are
 // the right ones again.
-static void RewriteRefsToStorage(Expression &expr, const vector<ColumnIndex> &column_ids) {
+static unique_ptr<Expression> RewriteRefsToStorage(unique_ptr<Expression> expr,
+                                                   const vector<ColumnIndex> &column_ids) {
 	// Filters arriving in `pushdown_complex_filter` reference columns via
-	// `BoundColumnRefExpression`, whose `binding.column_index` is a
+	// `BoundColumnRefExpression`, whose binding's column index is a
 	// `ProjectionIndex` into the LogicalGet's projected output. Remap to
 	// storage with `column_ids`.
-	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
-		auto &col_ref = expr.Cast<BoundColumnRefExpression>();
-		auto projected = col_ref.binding.column_index.GetIndex();
-		D_ASSERT(projected < column_ids.size());
-		col_ref.binding.column_index =
-		    ProjectionIndex(column_ids[projected].GetPrimaryIndex());
-		return;
-	}
-	ExpressionIterator::EnumerateChildren(
-	    expr, [&](Expression &child) { RewriteRefsToStorage(child, column_ids); });
+	return ExpressionIterator::PreorderReplace<BoundColumnRefExpression>(
+	    std::move(expr), [&](const BoundColumnRefExpression &column_ref) {
+		    auto &binding = column_ref.Binding();
+		    auto projected = binding.column_index.GetIndex();
+		    D_ASSERT(projected < column_ids.size());
+		    return column_ref.WithBinding(
+		        ColumnBinding(binding.table_index, ProjectionIndex(column_ids[projected].GetPrimaryIndex())));
+	    });
 }
 
 // This function is used to "hook" the filters a LogicalGet has before stats /
@@ -86,8 +87,7 @@ void PivotPushdownComplexFilters(LogicalGet &get, OptionalTableWrapper &table,
 	// Complex filters: offer each one to Rust. If the table pushes it down,
 	// drop it from the vector so DuckDB doesn't re-apply it on top.
 	for (auto it = filters.begin(); it != filters.end();) {
-		auto remapped = (*it)->Copy();
-		RewriteRefsToStorage(*remapped, column_ids);
+		auto remapped = RewriteRefsToStorage((*it)->Copy(), column_ids);
 		// Hand the (storage-remapped) DuckDB expression straight to Rust, which
 		// reads it through the same `expr_*` accessors the plan walk uses.
 		if (pushdown_filter(table, *remapped)) {
@@ -99,7 +99,7 @@ void PivotPushdownComplexFilters(LogicalGet &get, OptionalTableWrapper &table,
 }
 
 static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &get,
-                                           FunctionData *bind_data,
+                                           optional_ptr<const FunctionData> bind_data,
                                            vector<unique_ptr<Expression>> &filters) {
 	auto &data = bind_data->Cast<PivotScanBindData>();
 	PivotPushdownComplexFilters(get, data.table, filters);
@@ -118,14 +118,18 @@ static virtual_column_map_t PivotScanGetVirtualColumns(ClientContext &context,
 // `rowid` from TableCatalogEntry. Plan-time only; pivot never executes a
 // DuckDB scan, so no real row-id values are produced.
 static vector<column_t> PivotScanGetRowIdColumns(ClientContext &context,
-                                                 optional_ptr<FunctionData> bind_data_p) {
+                                                 optional_ptr<const FunctionData> bind_data_p) {
 	auto &data = bind_data_p->Cast<PivotScanBindData>();
 	return data.catalog_entry.GetRowIdColumns();
 }
 
 PivotTableCatalogEntry::PivotTableCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                                rust::Box<OptionalTableWrapper> table)
-    : TableCatalogEntry(catalog, schema, info), table(std::move(table)) {
+    : TableCatalogEntry(catalog, schema, info), table(std::move(table)), columns(info.columns.Copy()) {
+}
+
+const ColumnList &PivotTableCatalogEntry::GetColumns() const {
+	return columns;
 }
 
 // DuckDB's projection-pushdown pass asks, per column, whether this scanner can
@@ -141,7 +145,7 @@ static bool PivotScanSupportsPushdownExtract(const FunctionData &, const Logical
 TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	bind_data = make_uniq<PivotScanBindData>(*this, *table);
 	TableFunction func(name, {}, nullptr, nullptr);
-	func.get_bind_info = PivotScanGetBindInfo;
+	func.get_table_entry = PivotScanGetTableEntry;
 	func.pushdown_complex_filter = PivotScanPushdownComplexFilter;
 	// Enabling filter_pushdown lets DuckDB's optimizer passes install filters
 	// into get.table_filters — both `col op const` leftovers and the

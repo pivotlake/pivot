@@ -11,7 +11,7 @@ class StorageExtensionInfo;
 
 class PivotTransaction : public duckdb::Transaction {
 public:
-	PivotTransaction(duckdb::TransactionManager &manager, duckdb::ClientContext &context);
+	PivotTransaction(duckdb::TransactionManager &manager, duckdb::Context &context);
 };
 
 class PivotTransactionManager : public duckdb::TransactionManager {
@@ -20,9 +20,10 @@ class PivotTransactionManager : public duckdb::TransactionManager {
 
 public:
 	explicit PivotTransactionManager(duckdb::AttachedDatabase &db);
-	duckdb::Transaction &StartTransaction(duckdb::ClientContext &context) override;
+	duckdb::Transaction &StartTransaction(duckdb::Context &context,
+	                                      duckdb::MetaTransaction &meta_transaction) override;
 	duckdb::ErrorData CommitTransaction(duckdb::ClientContext &context, duckdb::Transaction &transaction) override;
-	void RollbackTransaction(duckdb::Transaction &transaction) override;
+	void RollbackTransaction(duckdb::ClientContext &context, duckdb::Transaction &transaction) override;
 	void Checkpoint(duckdb::ClientContext &context, bool force) override;
 };
 

@@ -38,7 +38,7 @@ fn main() {
 
     let duckdb = duckdb_config.build();
 
-    // Build the static extensions loaded by extension_loader.cpp.
+    // Build the static extensions the planner context loads when it is created.
     let build_dir = duckdb.join("build");
     let status = std::process::Command::new("cmake")
         .args([
@@ -88,6 +88,9 @@ fn main() {
     // autocxx build for auto-generated enum bindings
     let mut autocxx_b =
         autocxx_build::Builder::new("src/duckdb_bridge/duckdb_types.rs", [include_path])
+            // DuckDB's headers use C++17, which the binding generator's parser
+            // does not assume on its own.
+            .extra_clang_args(&["-std=c++17"])
             .build()
             .expect("autocxx build failed");
     autocxx_b
@@ -98,7 +101,6 @@ fn main() {
     // cxx build for manual bridge functions
     cxx_build::bridge("src/duckdb_bridge/mod.rs")
         .file("src/duckdb_bridge/cpp/bridge.cpp")
-        .file("src/duckdb_bridge/cpp/extension_loader.cpp")
         .file("src/duckdb_bridge/cpp/extension.cpp")
         .file("src/duckdb_bridge/cpp/storage_info.cpp")
         .file("src/duckdb_bridge/cpp/transaction_manager.cpp")
@@ -118,7 +120,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/bridge.h");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/bridge.cpp");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/common.h");
-    println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/extension_loader.cpp");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/extension.h");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/extension.cpp");
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/storage_info.h");

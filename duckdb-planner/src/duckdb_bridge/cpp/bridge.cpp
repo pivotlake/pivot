@@ -5,6 +5,7 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/schema_entry.h"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -26,7 +27,8 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
-#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/planner/operator/logical_drop.hpp"
+#include "duckdb/planner/operator/logical_transaction.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parsed_data/transaction_info.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
@@ -62,10 +64,10 @@
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/dynamic_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "core_functions_extension.hpp"
+#include "icu_extension.hpp"
+#include "duckdb-planner/src/duckdb_bridge/cpp/extension.h"
 
 // nlohmann/json is used only to parse DuckDB's own exception text (which DuckDB
 // emits as JSON); the C++/Rust bridge itself no longer serializes anything.
@@ -156,18 +158,55 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
       config({{"threads", duckdb::Value::BIGINT(1)}}, false),
       db(nullptr, &this->config),
       con(db) {
+	db.LoadStaticExtension<duckdb::CoreFunctionsExtension>();
+	db.LoadStaticExtension<duckdb::IcuExtension>();
+	db.LoadStaticExtension<PivotExtension>();
+
         auto timezone_result = con.Query("SET TimeZone='UTC'");
         if (timezone_result->HasError()) {
                 throw std::runtime_error(timezone_result->GetError());
+        }
+
+        // Pivot runs a correlated subquery as a delim join, so the binder must
+        // keep that shape instead of lowering it into materialized CTEs.
+        auto delim_result = con.Query("SET delim_join_as_cte=false");
+        if (delim_result->HasError()) {
+                throw std::runtime_error(delim_result->GetError());
+        }
+
+        // Pivot holds a DECIMAL in at most 128 bits, so arithmetic keeps its
+        // results within 38 digits.
+        auto decimal_result = con.Query("SET max_decimal_width=38");
+        if (decimal_result->HasError()) {
+                throw std::runtime_error(decimal_result->GetError());
+        }
+
+        // `~`, `!~` and SIMILAR TO match a pattern against the whole value.
+        auto regex_result = con.Query("SET regex_match_operator_semantics='full'");
+        if (regex_result->HasError()) {
+                throw std::runtime_error(regex_result->GetError());
         }
 
         // top_n_window_elimination rewrites `row_number() OVER (...) <= N` into
         // an aggregate that collects each partition's rows into a list and
         // unnests it. Pivot has neither lists nor unnest; its window operator
         // applies such a limit itself.
+        //
+        // duplicate_eliminated_domain replaces a delim scan with a copy of the
+        // scan it deduplicates, and DuckDB copies a plan by serializing it,
+        // which a pivot scan does not support.
+        //
+        // distinct_aggregate_rewrite computes each DISTINCT aggregate in its
+        // own grouped aggregate and joins the results on keys that treat NULLs
+        // as equal. Pivot runs mixed DISTINCT aggregates in one operator and
+        // has no such join.
+        //
+        // case_to_filter_aggregate turns an aggregate over a CASE into an
+        // aggregate with a FILTER clause, which pivot does not run.
         auto disable_result = con.Query(
             "SET disabled_optimizers='compressed_materialization,empty_result_pullup,regex_range,"
-            "top_n_window_elimination'");
+            "top_n_window_elimination,duplicate_eliminated_domain,distinct_aggregate_rewrite,"
+            "case_to_filter_aggregate'");
         if (disable_result->HasError()) {
                 throw std::runtime_error(disable_result->GetError());
         }
@@ -203,7 +242,7 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
 	std::string default_name(catalog_context_default(*this->catalog));
 	duckdb::ClientData::Get(*con.context)
 	    .catalog_search_path->Set(
-	        duckdb::CatalogSearchEntry(default_name, DEFAULT_SCHEMA),
+	        duckdb::CatalogSearchEntry(duckdb::Identifier(default_name), duckdb::Identifier::DefaultSchema()),
 	        duckdb::CatalogSetPathType::SET_DIRECTLY);
 }
 
@@ -222,18 +261,16 @@ PlanHandle::~PlanHandle() {
 	}
 }
 
-// Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
-// binder-resolved result column names (in select order) via `result_names`.
-// The stock `ExtractPlan` computes those names on its local `Planner` and then
-// discards them when it returns only the plan; we reproduce its body here (the
-// binder/optimizer/resolver steps are all public API) so the names can be
-// captured without patching the bundled DuckDB.
+// Binds and optimizes one statement into a logical plan, additionally returning
+// the binder-resolved result column names (in select order) via `result_names`.
+// The binder, optimizer and resolver steps are all public API, so the plan and
+// the names are produced here without executing anything.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
 extract_plan_with_names(duckdb::Connection &con, const std::string &query,
                         duckdb::vector<std::string> &result_names, bool &requires_rebind) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
-		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
+		throw duckdb::InvalidInputException("a plan can only be extracted from a single statement");
 	}
 	auto &context = *con.context;
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
@@ -242,17 +279,16 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 		planner.CreatePlan(std::move(statements[0]));
 		// The binder resolves the client-facing result column names before
 		// optimization rewrites the plan; capture them while still intact.
-		result_names = planner.names;
+		for (auto &name : planner.names) {
+			result_names.push_back(name.GetIdentifierName());
+		}
 		requires_rebind = planner.properties.always_require_rebind;
 		plan = std::move(planner.plan);
-		if (context.config.enable_optimizer) {
+		if (duckdb::Settings::Get<duckdb::EnableOptimizerSetting>(context)) {
 			duckdb::Optimizer optimizer(*planner.binder, context);
 			plan = optimizer.Optimize(std::move(plan));
 		}
 		plan->ResolveOperatorTypes();
-		duckdb::ColumnBindingResolver resolver;
-		resolver.Verify(*plan);
-		resolver.VisitOperator(*plan);
 	});
 	return plan;
 }
@@ -442,11 +478,18 @@ size_t lo_filter_projection_map_index(const LogicalOperator &op, size_t index) {
 	return as<duckdb::LogicalFilter>(op).projection_map[index];
 }
 
+// Whether a type is a STRUCT or a TUPLE. A TUPLE is a struct whose fields have
+// no names, such as the `(a, b)` of a row literal.
+static bool is_struct_or_tuple(const duckdb::LogicalType &type) {
+	return type.id() == duckdb::LogicalTypeId::STRUCT || type.id() == duckdb::LogicalTypeId::TUPLE;
+}
+
 // Read a DuckDB LogicalType into the FFI struct: the id discriminant plus the
-// width/scale that complete a DECIMAL (zero for every other id).
+// width/scale that complete a DECIMAL (zero for every other id). A TUPLE is
+// reported as the STRUCT it is laid out as.
 static BridgeLogicalType bridge_logical_type(const duckdb::LogicalType &type) {
 	BridgeLogicalType out;
-	out.id = static_cast<uint8_t>(type.id());
+	out.id = static_cast<uint8_t>(is_struct_or_tuple(type) ? duckdb::LogicalTypeId::STRUCT : type.id());
 	out.decimal_width = 0;
 	out.decimal_scale = 0;
 	if (type.id() == duckdb::LogicalTypeId::DECIMAL) {
@@ -463,7 +506,7 @@ BridgeLogicalType logical_type_flat(const LogicalType &type) {
 // The fields of a STRUCT type. The type is checked here because DuckDB's own
 // accessor only asserts it in debug builds.
 static const duckdb::child_list_t<LogicalType> &struct_fields(const LogicalType &type) {
-	if (type.id() != duckdb::LogicalTypeId::STRUCT) {
+	if (!is_struct_or_tuple(type)) {
 		throw duckdb::InternalException("expected a STRUCT type, got %s", type.ToString());
 	}
 	return duckdb::StructType::GetChildTypes(type);
@@ -475,7 +518,7 @@ size_t logical_type_struct_field_count(const LogicalType &type) {
 
 // Empty for a field of an unnamed struct, such as a `(a, b)` tuple.
 rust::String logical_type_struct_field_name(const LogicalType &type, size_t index) {
-	return rust::String::lossy(struct_fields(type)[index].first);
+	return rust::String::lossy(struct_fields(type)[index].first.GetIdentifierName());
 }
 
 const LogicalType &logical_type_struct_field_type(const LogicalType &type, size_t index) {
@@ -533,54 +576,55 @@ const Expression &lo_window_expr(const LogicalOperator &op, size_t index) {
 }
 
 size_t expr_window_partition_count(const Expression &expr) {
-	return as_expr<duckdb::BoundWindowExpression>(expr).partitions.size();
+	return as_expr<duckdb::BoundWindowExpression>(expr).Partitions().size();
 }
 
 const Expression &expr_window_partition(const Expression &expr, size_t index) {
-	return *as_expr<duckdb::BoundWindowExpression>(expr).partitions[index];
+	return *as_expr<duckdb::BoundWindowExpression>(expr).Partitions()[index];
 }
 
 size_t expr_window_order_count(const Expression &expr) {
-	return as_expr<duckdb::BoundWindowExpression>(expr).orders.size();
+	return as_expr<duckdb::BoundWindowExpression>(expr).OrderBy().size();
 }
 
 uint8_t expr_window_order_direction(const Expression &expr, size_t index) {
-	return static_cast<uint8_t>(as_expr<duckdb::BoundWindowExpression>(expr).orders[index].type);
+	return static_cast<uint8_t>(as_expr<duckdb::BoundWindowExpression>(expr).OrderBy()[index].type);
 }
 
 uint8_t expr_window_order_null_order(const Expression &expr, size_t index) {
-	return static_cast<uint8_t>(as_expr<duckdb::BoundWindowExpression>(expr).orders[index].null_order);
+	return static_cast<uint8_t>(as_expr<duckdb::BoundWindowExpression>(expr).OrderBy()[index].null_order);
 }
 
 const Expression &expr_window_order_expr(const Expression &expr, size_t index) {
-	return *as_expr<duckdb::BoundWindowExpression>(expr).orders[index].expression;
+	return *as_expr<duckdb::BoundWindowExpression>(expr).OrderBy()[index].expression;
 }
 
 // The function's arguments. For LAG and LEAD these are the value, then the
 // offset and the default when they were written.
 size_t expr_window_argument_count(const Expression &expr) {
-	return as_expr<duckdb::BoundWindowExpression>(expr).children.size();
+	return as_expr<duckdb::BoundWindowExpression>(expr).GetChildren().size();
 }
 
 const Expression &expr_window_argument(const Expression &expr, size_t index) {
-	return *as_expr<duckdb::BoundWindowExpression>(expr).children[index];
+	return *as_expr<duckdb::BoundWindowExpression>(expr).GetChildren()[index];
 }
 
 bool expr_window_ignores_nulls(const Expression &expr) {
-	return as_expr<duckdb::BoundWindowExpression>(expr).ignore_nulls;
+	return as_expr<duckdb::BoundWindowExpression>(expr).IgnoreNulls();
 }
 
 // The aggregate's name for an aggregate used as a window function, and an
 // empty string for the dedicated window functions.
 rust::String expr_window_aggregate_name(const Expression &expr) {
 	auto &window = as_expr<duckdb::BoundWindowExpression>(expr);
-	return rust::String::lossy(window.aggregate ? window.aggregate->name : "");
+	auto &aggregate = window.AggregateFunction();
+	return rust::String::lossy(aggregate ? aggregate->GetName().GetIdentifierName() : "");
 }
 
 // Whether the window expression has a DISTINCT or a FILTER clause.
 bool expr_window_is_distinct_or_filtered(const Expression &expr) {
 	auto &window = as_expr<duckdb::BoundWindowExpression>(expr);
-	return window.distinct || window.filter_expr != nullptr;
+	return window.Distinct() || window.Filter() != nullptr;
 }
 
 // Classifies the frame of a window expression that starts at the partition's
@@ -589,11 +633,11 @@ bool expr_window_is_distinct_or_filtered(const Expression &expr) {
 // Any other frame is 0.
 uint8_t expr_window_running_frame(const Expression &expr) {
 	auto &window = as_expr<duckdb::BoundWindowExpression>(expr);
-	if (window.start != duckdb::WindowBoundary::UNBOUNDED_PRECEDING ||
-	    window.exclude_clause != duckdb::WindowExcludeMode::NO_OTHER) {
+	if (window.WindowStart() != duckdb::WindowBoundary::UNBOUNDED_PRECEDING ||
+	    window.WindowExclude() != duckdb::WindowExcludeMode::NO_OTHER) {
 		return 0;
 	}
-	switch (window.end) {
+	switch (window.WindowEnd()) {
 	case duckdb::WindowBoundary::CURRENT_ROW_ROWS:
 		return 1;
 	case duckdb::WindowBoundary::CURRENT_ROW_RANGE:
@@ -608,7 +652,7 @@ uint8_t expr_window_running_frame(const Expression &expr) {
 // `rank(ORDER BY x) OVER (...)`, which replaces the OVER clause's ordering for
 // that function.
 size_t expr_window_argument_order_count(const Expression &expr) {
-	return as_expr<duckdb::BoundWindowExpression>(expr).arg_orders.size();
+	return as_expr<duckdb::BoundWindowExpression>(expr).ArgOrders().size();
 }
 
 // ---- Distinct ----
@@ -636,11 +680,11 @@ size_t lo_unnest_list_count(const LogicalOperator &op) {
 
 const Expression &lo_unnest_list(const LogicalOperator &op, size_t index) {
 	auto &unnest = *as<duckdb::LogicalUnnest>(op).expressions[index];
-	return *as_expr<duckdb::BoundUnnestExpression>(unnest).child;
+	return *as_expr<duckdb::BoundUnnestExpression>(unnest).Child();
 }
 
 const LogicalType &lo_unnest_element_type(const LogicalOperator &op, size_t index) {
-	return as<duckdb::LogicalUnnest>(op).expressions[index]->return_type;
+	return as<duckdb::LogicalUnnest>(op).expressions[index]->GetReturnType();
 }
 
 // ---- TopN ----
@@ -682,12 +726,12 @@ size_t lo_topn_dynamic_filter_column(const LogicalOperator &op) {
 	// BoundReferenceExpression whose `index` is the column's position in the
 	// TopN's child output.
 	auto &topn = as<duckdb::LogicalTopN>(op);
-	return topn.orders[0].expression->Cast<duckdb::BoundReferenceExpression>().index;
+	return topn.orders[0].expression->Cast<duckdb::BoundReferenceExpression>().Index();
 }
 
 uint8_t lo_topn_dynamic_filter_comparison(const LogicalOperator &op) {
 	auto &topn = as<duckdb::LogicalTopN>(op);
-	return static_cast<uint8_t>(topn.dynamic_filter->filter->comparison_type);
+	return static_cast<uint8_t>(topn.dynamic_filter->comparison_type);
 }
 
 // ---- Limit ----
@@ -722,12 +766,12 @@ rust::Box<OptionalTableWrapper> lo_get_take_table(const LogicalOperator &op) {
 
 bool lo_get_has_bound_table_function(const LogicalOperator &op) {
 	auto &get = as<duckdb::LogicalGet>(op);
-	return dynamic_cast<PivotTableFunctionBindData *>(get.bind_data.get()) != nullptr;
+	return dynamic_cast<const PivotTableFunctionBindData *>(get.bind_data.get()) != nullptr;
 }
 
 rust::Box<OptionalTableWrapper> lo_get_clone_bound_table_function(const LogicalOperator &op) {
 	auto &get = as<duckdb::LogicalGet>(op);
-	auto *bound = dynamic_cast<PivotTableFunctionBindData *>(get.bind_data.get());
+	auto *bound = dynamic_cast<const PivotTableFunctionBindData *>(get.bind_data.get());
 	if (!bound) {
 		throw std::runtime_error("table function has no pivot bound table");
 	}
@@ -784,22 +828,7 @@ rust::String lo_get_output_extract_field(const LogicalOperator &op, size_t index
 	return rust::String::lossy(cur->GetFieldName());
 }
 
-// Find a DynamicFilter inside a TableFilter, peeling off a single OPTIONAL_FILTER
-// wrapper if present. Returns nullptr when there's no DynamicFilter at the top
-// (or one level inside an OptionalFilter). More exotic shapes are intentionally
-// left unrecognised and dropped by the skip path in collect_filter.
-static duckdb::DynamicFilter *extract_dynamic_filter(duckdb::TableFilter &filter) {
-	if (filter.filter_type == duckdb::TableFilterType::DYNAMIC_FILTER) {
-		return &filter.Cast<duckdb::DynamicFilter>();
-	}
-	if (filter.filter_type == duckdb::TableFilterType::OPTIONAL_FILTER) {
-		auto &opt = filter.Cast<duckdb::OptionalFilter>();
-		if (opt.child_filter && opt.child_filter->filter_type == duckdb::TableFilterType::DYNAMIC_FILTER) {
-			return &opt.child_filter->Cast<duckdb::DynamicFilter>();
-		}
-	}
-	return nullptr;
-}
+static const duckdb::vector<duckdb::unique_ptr<Expression>> &operand_expressions(const Expression &expr);
 
 struct DynFilterInfo {
 	uint64_t data_id;
@@ -807,41 +836,71 @@ struct DynFilterInfo {
 	uint8_t comparison;
 };
 
-// Recursively split one column's TableFilter into static-predicate conditions
-// (rebuilt with `ToExpression`, appended to `conditions`) and dynamic-filter
-// consumer entries (appended to `dynamic_filters`). Either output may be null
-// when the caller only wants the other half.
+// Whether `expr` is a call to the internal table filter function named `name`.
+static bool is_table_filter_function(const duckdb::Expression &expr, const char *name) {
+	return expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+	       as_expr<duckdb::BoundFunctionExpression>(expr).Function().GetName().GetIdentifierName() == name;
+}
+
+// The shared state of a dynamic filter applied to the filtered column itself,
+// looking through one optional wrapper. Null for any other expression, and for
+// a dynamic filter over an expression of the column, which pivot's scan does
+// not evaluate.
+static duckdb::DynamicFilterData *find_dynamic_filter_data(const duckdb::Expression &expr) {
+	if (is_table_filter_function(expr, duckdb::OptionalFilterScalarFun::NAME)) {
+		auto child = duckdb::ExpressionFilter::GetOptionalFilterChild(expr);
+		return child ? find_dynamic_filter_data(*child) : nullptr;
+	}
+	if (!is_table_filter_function(expr, duckdb::DynamicFilterScalarFun::NAME)) {
+		return nullptr;
+	}
+	auto &function = as_expr<duckdb::BoundFunctionExpression>(expr);
+	if (function.GetChildren().size() != 1 ||
+	    function.GetChildren()[0]->GetExpressionType() != duckdb::ExpressionType::BOUND_REF || !function.BindInfo()) {
+		return nullptr;
+	}
+	return function.BindInfo()->Cast<duckdb::DynamicFilterFunctionData>().filter_data.get();
+}
+
+// Split the filter a scan holds on one output column into static-predicate
+// conditions (appended to `conditions`) and dynamic-filter consumer entries
+// (appended to `dynamic_filters`). Either output may be null when the caller
+// only wants the other half.
 //
-// CONJUNCTION_AND is unwrapped and its children processed independently at the
-// same column. A standalone OPTIONAL/DYNAMIC we couldn't peel is dropped (it only
-// forgoes an optimization). Anything else flows through `ToExpression`.
-static void collect_filter(duckdb::TableFilter &filter, duckdb::idx_t proj_idx, duckdb::LogicalGet &get,
+// The filter is an expression over a placeholder for the column. An AND is
+// unwrapped and its children processed independently at the same column. An
+// optional filter that is not a recognised dynamic filter is dropped, which
+// only forgoes an optimization. Anything else becomes a condition, with the
+// placeholder replaced by a reference to the scan's output column.
+static void collect_filter(const duckdb::Expression &filter, duckdb::idx_t proj_idx, duckdb::LogicalGet &get,
                            std::vector<duckdb::unique_ptr<duckdb::Expression>> *conditions,
                            std::vector<DynFilterInfo> *dynamic_filters) {
-	if (filter.filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
-		auto &conj = filter.Cast<duckdb::ConjunctionAndFilter>();
-		for (auto &child : conj.child_filters) {
+	if (filter.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : operand_expressions(filter)) {
 			collect_filter(*child, proj_idx, get, conditions, dynamic_filters);
 		}
 		return;
 	}
 
-	if (auto *df = extract_dynamic_filter(filter)) {
+	if (auto *filter_data = find_dynamic_filter_data(filter)) {
 		if (dynamic_filters) {
-			auto *filter_data = df->filter_data.get();
 			auto storage_idx = get.GetColumnIds()[proj_idx].GetPrimaryIndex();
-			dynamic_filters->push_back(DynFilterInfo{
+			dynamic_filters->push_back(DynFilterInfo {
 			    reinterpret_cast<uintptr_t>(filter_data),
 			    storage_idx,
-			    static_cast<uint8_t>(filter_data->filter->comparison_type),
+			    static_cast<uint8_t>(filter_data->comparison_type),
 			});
 		}
 		return;
 	}
 
-	if (filter.filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
-	    filter.filter_type == duckdb::TableFilterType::DYNAMIC_FILTER) {
+	if (duckdb::ExpressionFilter::IsOptionalExpression(filter)) {
 		return;
+	}
+	if (duckdb::ExpressionFilter::ContainsInternalFunction(filter, duckdb::DynamicFilterScalarFun::NAME) ||
+	    duckdb::ExpressionFilter::ContainsInternalFunction(filter, duckdb::BloomFilterScalarFun::NAME) ||
+	    duckdb::ExpressionFilter::ContainsInternalFunction(filter, duckdb::PrefixRangeScalarFun::NAME)) {
+		throw UnsupportedPlanError("a scan filter that must be applied uses a runtime filter pivot does not run");
 	}
 
 	if (conditions) {
@@ -853,24 +912,34 @@ static void collect_filter(duckdb::TableFilter &filter, duckdb::idx_t proj_idx, 
 		if (storage_idx < get.names.size()) {
 			col_ref->SetAlias(get.names[storage_idx]);
 		}
-		conditions->push_back(filter.ToExpression(*col_ref));
+		conditions->push_back(duckdb::ExpressionFilter(filter.Copy()).ToExpression(*col_ref));
+	}
+}
+
+// Run `collect_filter` over every filter the scan holds. A filter over several
+// columns has no single column to report against, so it is refused.
+static void collect_get_filters(duckdb::LogicalGet &get,
+                                std::vector<duckdb::unique_ptr<duckdb::Expression>> *conditions,
+                                std::vector<DynFilterInfo> *dynamic_filters) {
+	if (get.table_filters.HasMultiColumnFilters()) {
+		throw UnsupportedPlanError("a scan filter over several columns");
+	}
+	for (auto &entry : get.table_filters) {
+		auto &filter = duckdb::ExpressionFilter::GetExpressionFilter(entry.Filter(), "pivot plan bridge");
+		collect_filter(*filter.expr, entry.GetIndex().GetIndex(), get, conditions, dynamic_filters);
 	}
 }
 
 std::unique_ptr<ExpressionList> lo_get_pushed_conditions(const LogicalOperator &op) {
 	auto &get = as<duckdb::LogicalGet>(op);
 	auto list = std::make_unique<ExpressionList>();
-	for (auto &entry : get.table_filters) {
-		collect_filter(entry.Filter(), entry.GetIndex().GetIndex(), get, &list->exprs, nullptr);
-	}
+	collect_get_filters(get, &list->exprs, nullptr);
 	return list;
 }
 
 static std::vector<DynFilterInfo> collect_get_dynamic_filters(duckdb::LogicalGet &get) {
 	std::vector<DynFilterInfo> out;
-	for (auto &entry : get.table_filters) {
-		collect_filter(entry.Filter(), entry.GetIndex().GetIndex(), get, nullptr, &out);
-	}
+	collect_get_filters(get, nullptr, &out);
 	return out;
 }
 
@@ -913,7 +982,7 @@ size_t lo_get_storage_column(const LogicalOperator &op, size_t column_ids_index)
 // ---- Get: table function ----
 
 rust::String lo_get_function_name(const LogicalOperator &op) {
-	return rust::String::lossy(as<duckdb::LogicalGet>(op).function.name);
+	return rust::String::lossy(as<duckdb::LogicalGet>(op).function.GetName().GetIdentifierName());
 }
 
 bool lo_get_has_named_params(const LogicalOperator &op) {
@@ -935,20 +1004,20 @@ static duckdb::CreateTableInfo &create_table_info(const LogicalOperator &op) {
 }
 
 rust::String lo_create_table_name(const LogicalOperator &op) {
-	return rust::String::lossy(create_table_info(op).table);
+	return rust::String::lossy(create_table_info(op).GetQualifiedName().Name().GetIdentifierName());
 }
 
 rust::String lo_create_table_datastore(const LogicalOperator &op) {
 	// DuckDB stores the resolved datastore/database for
 	// `CREATE TABLE db.schema.t` in its native `catalog` field. It is empty when
 	// the statement is unqualified.
-	return rust::String::lossy(create_table_info(op).catalog);
+	return rust::String::lossy(create_table_info(op).GetQualifiedName().Catalog().GetIdentifierName());
 }
 
 rust::String lo_create_table_schema(const LogicalOperator &op) {
 	// DuckDB resolves the schema of `CREATE TABLE db.schema.t` into its native
 	// `schema` field. It is empty when the statement named no schema.
-	return rust::String::lossy(create_table_info(op).schema);
+	return rust::String::lossy(create_table_info(op).GetQualifiedName().Schema().GetIdentifierName());
 }
 
 // ---- CreateSchema ----
@@ -958,13 +1027,13 @@ static duckdb::CreateSchemaInfo &create_schema_info(const LogicalOperator &op) {
 }
 
 rust::String lo_create_schema_name(const LogicalOperator &op) {
-	return rust::String::lossy(create_schema_info(op).schema);
+	return rust::String::lossy(create_schema_info(op).GetQualifiedName().Schema().GetIdentifierName());
 }
 
 rust::String lo_create_schema_datastore(const LogicalOperator &op) {
 	// DuckDB stores the resolved datastore/database for `CREATE SCHEMA db.s` in
 	// its native `catalog` field. It is empty when the statement is unqualified.
-	return rust::String::lossy(create_schema_info(op).catalog);
+	return rust::String::lossy(create_schema_info(op).GetQualifiedName().Catalog().GetIdentifierName());
 }
 
 bool lo_create_schema_if_not_exists(const LogicalOperator &op) {
@@ -978,7 +1047,7 @@ bool lo_create_schema_or_replace(const LogicalOperator &op) {
 // ---- Drop ----
 
 static duckdb::DropInfo &drop_info(const LogicalOperator &op) {
-	return as<duckdb::LogicalSimple>(op).info->Cast<duckdb::DropInfo>();
+	return *as<duckdb::LogicalDrop>(op).info;
 }
 
 bool lo_drop_is_table(const LogicalOperator &op) {
@@ -990,19 +1059,19 @@ rust::String lo_drop_entry_kind(const LogicalOperator &op) {
 }
 
 rust::String lo_drop_name(const LogicalOperator &op) {
-	return rust::String::lossy(drop_info(op).name);
+	return rust::String::lossy(drop_info(op).GetQualifiedName().Name().GetIdentifierName());
 }
 
 rust::String lo_drop_schema(const LogicalOperator &op) {
 	// The binder fills `schema` with the resolved entry's parent schema; for an
 	// `IF EXISTS` drop of a missing entry it stays as written, possibly empty.
-	return rust::String::lossy(drop_info(op).schema);
+	return rust::String::lossy(drop_info(op).GetQualifiedName().Schema().GetIdentifierName());
 }
 
 rust::String lo_drop_datastore(const LogicalOperator &op) {
 	// DuckDB stores the resolved datastore/database in its native `catalog`
 	// field. It is empty when the statement is unqualified and nothing resolved.
-	return rust::String::lossy(drop_info(op).catalog);
+	return rust::String::lossy(drop_info(op).GetQualifiedName().Catalog().GetIdentifierName());
 }
 
 bool lo_drop_if_exists(const LogicalOperator &op) {
@@ -1025,7 +1094,7 @@ size_t lo_create_column_count(const LogicalOperator &op) {
 
 rust::String lo_create_column_name(const LogicalOperator &op, size_t index) {
 	auto &col = create_table_info(op).columns.GetColumn(duckdb::LogicalIndex(index));
-	return rust::String::lossy(col.GetName());
+	return rust::String::lossy(col.GetName().GetIdentifierName());
 }
 
 BridgeLogicalType lo_create_column_type(const LogicalOperator &op, size_t index) {
@@ -1035,11 +1104,11 @@ BridgeLogicalType lo_create_column_type(const LogicalOperator &op, size_t index)
 
 static string create_table_option_to_string(duckdb::ParsedExpression &expr) {
 	if (expr.GetExpressionClass() == duckdb::ExpressionClass::CONSTANT) {
-		auto &value = expr.Cast<duckdb::ConstantExpression>().value;
-		if (value.IsNull()) {
+		auto &literal = expr.Cast<duckdb::ConstantExpression>().GetLiteral();
+		if (literal.IsNull()) {
 			return "true";
 		}
-		return value.ToString();
+		return literal.ToValue().ToString();
 	}
 	return expr.ToString();
 }
@@ -1072,12 +1141,12 @@ rust::String lo_create_option_value(const LogicalOperator &op, size_t index) {
 // name.
 static string partition_key_argument_to_term(duckdb::ParsedExpression &expr) {
 	if (expr.GetExpressionClass() == duckdb::ExpressionClass::COLUMN_REF) {
-		return expr.Cast<duckdb::ColumnRefExpression>().GetColumnName();
+		return expr.Cast<duckdb::ColumnRefExpression>().GetColumnName().GetIdentifierName();
 	}
 	if (expr.GetExpressionClass() == duckdb::ExpressionClass::CONSTANT) {
-		auto &value = expr.Cast<duckdb::ConstantExpression>().value;
-		if (value.type().IsNumeric()) {
-			return value.ToString();
+		auto &literal = expr.Cast<duckdb::ConstantExpression>().GetLiteral();
+		if (literal.IsNumeric()) {
+			return literal.ToValue().ToString();
 		}
 	}
 	return expr.ToString();
@@ -1090,16 +1159,18 @@ static string partition_key_argument_to_term(duckdb::ParsedExpression &expr) {
 // writes it, for the datastore to refuse by name.
 static string partition_key_to_term(duckdb::ParsedExpression &expr) {
 	if (expr.GetExpressionClass() == duckdb::ExpressionClass::COLUMN_REF) {
-		return expr.Cast<duckdb::ColumnRefExpression>().GetColumnName();
+		return expr.Cast<duckdb::ColumnRefExpression>().GetColumnName().GetIdentifierName();
 	}
 	if (expr.GetExpressionClass() == duckdb::ExpressionClass::FUNCTION) {
 		auto &function = expr.Cast<duckdb::FunctionExpression>();
-		if (!function.is_operator && function.schema.empty()) {
+		if (!function.IsOperator() && function.GetQualifiedName().Schema().empty()) {
 			duckdb::vector<string> arguments;
-			for (auto &argument : function.children) {
-				arguments.push_back(partition_key_argument_to_term(*argument));
+			for (auto &argument : function.GetArguments()) {
+				arguments.push_back(
+				    partition_key_argument_to_term(const_cast<duckdb::ParsedExpression &>(argument.GetExpression())));
 			}
-			return function.function_name + "(" + duckdb::StringUtil::Join(arguments, ", ") + ")";
+			return function.FunctionName().GetIdentifierName() + "(" + duckdb::StringUtil::Join(arguments, ", ") +
+			       ")";
 		}
 	}
 	return expr.ToString();
@@ -1128,7 +1199,7 @@ bool lo_create_sort_key_is_column(const LogicalOperator &op, size_t index) {
 rust::String lo_create_sort_key(const LogicalOperator &op, size_t index) {
 	auto &key = *create_table_info(op).sort_keys[index];
 	if (key.GetExpressionClass() == duckdb::ExpressionClass::COLUMN_REF) {
-		return rust::String::lossy(key.Cast<duckdb::ColumnRefExpression>().GetColumnName());
+		return rust::String::lossy(key.Cast<duckdb::ColumnRefExpression>().GetColumnName().GetIdentifierName());
 	}
 	return rust::String::lossy(key.ToString());
 }
@@ -1156,7 +1227,7 @@ size_t lo_create_constraint_count(const LogicalOperator &op) {
 // ---- Set / Reset ----
 
 rust::String lo_set_name(const LogicalOperator &op) {
-	return rust::String::lossy(as<duckdb::LogicalSet>(op).name);
+	return rust::String::lossy(as<duckdb::LogicalSet>(op).name.GetIdentifierName());
 }
 
 rust::String lo_set_value(const LogicalOperator &op) {
@@ -1164,13 +1235,13 @@ rust::String lo_set_value(const LogicalOperator &op) {
 }
 
 rust::String lo_reset_name(const LogicalOperator &op) {
-	return rust::String::lossy(as<duckdb::LogicalReset>(op).name);
+	return rust::String::lossy(as<duckdb::LogicalReset>(op).name.GetIdentifierName());
 }
 
 // ---- Transaction ----
 
 uint8_t lo_transaction_type(const LogicalOperator &op) {
-	return static_cast<uint8_t>(as<duckdb::LogicalSimple>(op).info->Cast<duckdb::TransactionInfo>().type);
+	return static_cast<uint8_t>(as<duckdb::LogicalTransaction>(op).info->type);
 }
 
 // ---- Vacuum ----
@@ -1185,15 +1256,15 @@ void lo_vacuum_validate(const LogicalOperator &op) {
 // ---- Compact ----
 
 rust::String lo_compact_datastore(const LogicalOperator &op) {
-	return rust::String::lossy(as<duckdb::LogicalCompact>(op).table.catalog);
+	return rust::String::lossy(as<duckdb::LogicalCompact>(op).table.Catalog().GetIdentifierName());
 }
 
 rust::String lo_compact_schema(const LogicalOperator &op) {
-	return rust::String::lossy(as<duckdb::LogicalCompact>(op).table.schema);
+	return rust::String::lossy(as<duckdb::LogicalCompact>(op).table.Schema().GetIdentifierName());
 }
 
 rust::String lo_compact_table(const LogicalOperator &op) {
-	return rust::String::lossy(as<duckdb::LogicalCompact>(op).table.name);
+	return rust::String::lossy(as<duckdb::LogicalCompact>(op).table.Name().GetIdentifierName());
 }
 
 bool lo_compact_final(const LogicalOperator &op) {
@@ -1418,11 +1489,11 @@ const Expression &expr_list_get(const ExpressionList &list, size_t index) {
 // ---- Expression: shared ----
 
 uint8_t expr_type(const Expression &expr) {
-	return static_cast<uint8_t>(expr.type);
+	return static_cast<uint8_t>(expr.GetExpressionType());
 }
 
 const LogicalType &expr_return_type(const Expression &expr) {
-	return expr.return_type;
+	return expr.GetReturnType();
 }
 
 bool expr_has_alias(const Expression &expr) {
@@ -1430,11 +1501,11 @@ bool expr_has_alias(const Expression &expr) {
 }
 
 rust::String expr_alias(const Expression &expr) {
-	return rust::String::lossy(expr.GetAlias());
+	return rust::String::lossy(expr.GetAlias().GetIdentifierName());
 }
 
 const Value &expr_constant(const Expression &expr) {
-	return as_expr<duckdb::BoundConstantExpression>(expr).value;
+	return as_expr<duckdb::BoundConstantExpression>(expr).GetValue();
 }
 
 // Typed accessors for a DuckDB `Value`, shared by query constants and
@@ -1491,7 +1562,7 @@ rust::String value_string(const Value &v) {
 // A DECIMAL Value stores its unscaled integer in the physical width its
 // precision requires; widen the raw (unrescaled) integer to 128 bits.
 BridgeDecimalValue value_decimal(const Value &v) {
-	uint8_t width, scale;
+	uint32_t width, scale;
 	v.type().GetDecimalProperties(width, scale);
 	duckdb::hugeint_t raw;
 	switch (v.type().InternalType()) {
@@ -1566,46 +1637,46 @@ const Value &value_list_element(const Value &v, size_t index) {
 
 // One field of a non-NULL STRUCT value, in the order of its type's fields.
 const Value &value_struct_field(const Value &v, size_t index) {
-	if (v.type().id() != duckdb::LogicalTypeId::STRUCT) {
+	if (!is_struct_or_tuple(v.type())) {
 		throw duckdb::InternalException("expected a STRUCT value, got %s", v.type().ToString());
 	}
 	return duckdb::StructValue::GetChildren(v)[index];
 }
 
 size_t expr_ref_index(const Expression &expr) {
-	return as_expr<duckdb::BoundReferenceExpression>(expr).index;
+	return as_expr<duckdb::BoundReferenceExpression>(expr).Index();
 }
 
 size_t expr_columnref_index(const Expression &expr) {
-	return as_expr<duckdb::BoundColumnRefExpression>(expr).binding.column_index.GetIndex();
+	return as_expr<duckdb::BoundColumnRefExpression>(expr).Binding().column_index.GetIndex();
 }
 
 const Expression &expr_comparison_left(const Expression &expr) {
-	return *as_expr<duckdb::BoundComparisonExpression>(expr).left;
+	return duckdb::BoundComparisonExpression::Left(as_expr<duckdb::BoundFunctionExpression>(expr));
 }
 
 const Expression &expr_comparison_right(const Expression &expr) {
-	return *as_expr<duckdb::BoundComparisonExpression>(expr).right;
+	return duckdb::BoundComparisonExpression::Right(as_expr<duckdb::BoundFunctionExpression>(expr));
 }
 
 const Expression &expr_between_input(const Expression &expr) {
-	return *as_expr<duckdb::BoundBetweenExpression>(expr).input;
+	return duckdb::BoundBetweenExpression::Input(as_expr<duckdb::BoundFunctionExpression>(expr));
 }
 
 const Expression &expr_between_lower(const Expression &expr) {
-	return *as_expr<duckdb::BoundBetweenExpression>(expr).lower;
+	return duckdb::BoundBetweenExpression::LowerBound(as_expr<duckdb::BoundFunctionExpression>(expr));
 }
 
 const Expression &expr_between_upper(const Expression &expr) {
-	return *as_expr<duckdb::BoundBetweenExpression>(expr).upper;
+	return duckdb::BoundBetweenExpression::UpperBound(as_expr<duckdb::BoundFunctionExpression>(expr));
 }
 
 bool expr_between_lower_inclusive(const Expression &expr) {
-	return as_expr<duckdb::BoundBetweenExpression>(expr).lower_inclusive;
+	return duckdb::BoundBetweenExpression::LowerInclusive(as_expr<duckdb::BoundFunctionExpression>(expr));
 }
 
 bool expr_between_upper_inclusive(const Expression &expr) {
-	return as_expr<duckdb::BoundBetweenExpression>(expr).upper_inclusive;
+	return duckdb::BoundBetweenExpression::UpperInclusive(as_expr<duckdb::BoundFunctionExpression>(expr));
 }
 
 bool expr_equals(const Expression &left, const Expression &right) {
@@ -1613,7 +1684,8 @@ bool expr_equals(const Expression &left, const Expression &right) {
 }
 
 rust::String expr_aggregate_name(const Expression &expr) {
-	return rust::String::lossy(as_expr<duckdb::BoundAggregateExpression>(expr).function.name);
+	return rust::String::lossy(
+	    as_expr<duckdb::BoundAggregateExpression>(expr).Function().GetName().GetIdentifierName());
 }
 
 bool expr_aggregate_distinct(const Expression &expr) {
@@ -1621,66 +1693,83 @@ bool expr_aggregate_distinct(const Expression &expr) {
 }
 
 size_t expr_aggregate_child_count(const Expression &expr) {
-	return as_expr<duckdb::BoundAggregateExpression>(expr).children.size();
+	return as_expr<duckdb::BoundAggregateExpression>(expr).GetChildren().size();
 }
 
 const Expression &expr_aggregate_child(const Expression &expr, size_t index) {
-	return *as_expr<duckdb::BoundAggregateExpression>(expr).children[index];
+	return *as_expr<duckdb::BoundAggregateExpression>(expr).GetChildren()[index];
 }
 
 // Whether the aggregate call carries a `FILTER (WHERE …)` clause.
 bool expr_aggregate_has_filter(const Expression &expr) {
-	return as_expr<duckdb::BoundAggregateExpression>(expr).filter != nullptr;
+	return as_expr<duckdb::BoundAggregateExpression>(expr).GetFilter() != nullptr;
 }
 
 rust::String expr_function_name(const Expression &expr) {
-	return rust::String::lossy(as_expr<duckdb::BoundFunctionExpression>(expr).function.name);
+	return rust::String::lossy(
+	    as_expr<duckdb::BoundFunctionExpression>(expr).Function().GetName().GetIdentifierName());
 }
 
 size_t expr_function_child_count(const Expression &expr) {
-	return as_expr<duckdb::BoundFunctionExpression>(expr).children.size();
+	return as_expr<duckdb::BoundFunctionExpression>(expr).GetChildren().size();
 }
 
 const Expression &expr_function_child(const Expression &expr, size_t index) {
-	return *as_expr<duckdb::BoundFunctionExpression>(expr).children[index];
+	return *as_expr<duckdb::BoundFunctionExpression>(expr).GetChildren()[index];
+}
+
+// The operands of an operator or conjunction. DuckDB builds one either as its
+// own expression class or as a call to the function that implements it, and
+// both carry the operands in the same order.
+static const duckdb::vector<duckdb::unique_ptr<Expression>> &operand_expressions(const Expression &expr) {
+	switch (expr.GetExpressionClass()) {
+	case duckdb::ExpressionClass::BOUND_OPERATOR:
+		return as_expr<duckdb::BoundOperatorExpression>(expr).GetChildren();
+	case duckdb::ExpressionClass::BOUND_CONJUNCTION:
+		return as_expr<duckdb::BoundConjunctionExpression>(expr).GetChildren();
+	case duckdb::ExpressionClass::BOUND_FUNCTION:
+		return as_expr<duckdb::BoundFunctionExpression>(expr).GetChildren();
+	default:
+		throw duckdb::InternalException("expected an operator, conjunction or function, got %s", expr.ToString());
+	}
 }
 
 size_t expr_operator_child_count(const Expression &expr) {
-	return as_expr<duckdb::BoundOperatorExpression>(expr).children.size();
+	return operand_expressions(expr).size();
 }
 
 const Expression &expr_operator_child(const Expression &expr, size_t index) {
-	return *as_expr<duckdb::BoundOperatorExpression>(expr).children[index];
+	return *operand_expressions(expr)[index];
 }
 
 size_t expr_conjunction_child_count(const Expression &expr) {
-	return as_expr<duckdb::BoundConjunctionExpression>(expr).children.size();
+	return operand_expressions(expr).size();
 }
 
 const Expression &expr_conjunction_child(const Expression &expr, size_t index) {
-	return *as_expr<duckdb::BoundConjunctionExpression>(expr).children[index];
+	return *operand_expressions(expr)[index];
 }
 
 size_t expr_case_check_count(const Expression &expr) {
-	return as_expr<duckdb::BoundCaseExpression>(expr).case_checks.size();
+	return as_expr<duckdb::BoundCaseExpression>(expr).CaseChecks().size();
 }
 
 const Expression &expr_case_when(const Expression &expr, size_t index) {
-	return *as_expr<duckdb::BoundCaseExpression>(expr).case_checks[index].when_expr;
+	return *as_expr<duckdb::BoundCaseExpression>(expr).CaseChecks()[index].when_expr;
 }
 
 const Expression &expr_case_then(const Expression &expr, size_t index) {
-	return *as_expr<duckdb::BoundCaseExpression>(expr).case_checks[index].then_expr;
+	return *as_expr<duckdb::BoundCaseExpression>(expr).CaseChecks()[index].then_expr;
 }
 
 const Expression &expr_case_else(const Expression &expr) {
-	return *as_expr<duckdb::BoundCaseExpression>(expr).else_expr;
+	return as_expr<duckdb::BoundCaseExpression>(expr).Else();
 }
 
 const Expression &expr_cast_child(const Expression &expr) {
-	return *as_expr<duckdb::BoundCastExpression>(expr).child;
+	return duckdb::BoundCastExpression::Child(as_expr<duckdb::BoundFunctionExpression>(expr));
 }
 
 bool expr_cast_is_try(const Expression &expr) {
-	return as_expr<duckdb::BoundCastExpression>(expr).try_cast;
+	return duckdb::BoundCastExpression::IsTryCast(as_expr<duckdb::BoundFunctionExpression>(expr));
 }

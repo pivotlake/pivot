@@ -32,6 +32,8 @@ class PivotTableCatalogEntry : public duckdb::TableCatalogEntry {
 public:
 	/// Opaque handle to the Rust `GetDuckDBTypedColumns` object that backs this catalog entry.
 	rust::Box<OptionalTableWrapper> table;
+	/// The table's columns, in storage order.
+	duckdb::ColumnList columns;
 
 	PivotTableCatalogEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
 	                duckdb::CreateTableInfo &info, rust::Box<OptionalTableWrapper> table);
@@ -41,4 +43,5 @@ public:
 	duckdb::unique_ptr<duckdb::BaseStatistics> GetStatistics(duckdb::ClientContext &context,
 	                                                         duckdb::column_t column_id) override;
 	duckdb::TableStorageInfo GetStorageInfo(duckdb::ClientContext &context) override;
+	const duckdb::ColumnList &GetColumns() const override;
 };

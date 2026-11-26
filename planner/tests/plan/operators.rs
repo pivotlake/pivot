@@ -14,11 +14,12 @@ fn in_subquery_semijoin_is_a_join(mut testing_planner: TestingPlanner) {
 
     assert_snapshot!(plan.to_string(), @"
     Projection(a:Int32)
-      Join[probe semi](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [], publishes key bounds: [0])
-        Input([a:Int32], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)], key bitsets: [#0 in build keys])
-        Projection(b:Int32)
-          Filter(b:Int32 > 20:Int32 -> Boolean)
-            Input([b:Int32])
+      Projection(#0:Int32)
+        Join[probe semi](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [], publishes key bounds: [0])
+          Input([a:Int32], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)], key bitsets: [#0 in build keys])
+          Projection(b:Int32)
+            Filter(b:Int32 > 20:Int32 -> Boolean)
+              Input([b:Int32])
     ");
 }
 
@@ -150,11 +151,11 @@ fn order_by_limit_produces_top_n(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 2")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r#"
-    TopN(limit: 2, offset: 0, order: "default".main.example_table.a:Int32 DESC NULLS LAST)
+    assert_snapshot!(plan.to_string(), @"
+    TopN(limit: 2, offset: 0, order: a:Int32 DESC NULLS LAST)
       Projection(a:Int32)
         Input([a:Int32], dynamic: [DynamicFilter(#0 > ?)])
-    "#);
+    ");
 }
 
 #[rstest]
@@ -162,11 +163,11 @@ fn order_by_without_limit_produces_order_by(mut testing_planner: TestingPlanner)
     let plan = testing_planner
         .plan("SELECT a FROM example_table ORDER BY a DESC")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r#"
-    OrderBy("default".main.example_table.a:Int32 DESC NULLS LAST)
+    assert_snapshot!(plan.to_string(), @"
+    OrderBy(a:Int32 DESC NULLS LAST)
       Projection(a:Int32)
         Input([a:Int32])
-    "#);
+    ");
 }
 
 #[rstest]
@@ -470,9 +471,8 @@ fn insert_with_a_column_list_widens_its_values_to_the_whole_table(
     assert_snapshot!(plan.to_string(), @"
     Insert
       Projection(a:Int32, NULL:Int32, NULL:Int32, name:Utf8)
-        Projection(name:Utf8, a:Int32)
-          Values(rows: 1)
-            DummyScan
+        Values(rows: 1)
+          DummyScan
     ");
 }
 
@@ -484,8 +484,7 @@ fn insert_select_with_a_column_list_widens_the_select(mut testing_planner: Testi
     assert_snapshot!(plan.to_string(), @"
     Insert
       Projection(NULL:Int32, b:Int32, c:Int32, NULL:Utf8View)
-        Projection(c:Int32, b:Int32)
-          Input([c:Int32, b:Int32])
+        Input([c:Int32, b:Int32])
     ");
 }
 
@@ -497,8 +496,7 @@ fn insert_by_name_matches_the_select_output_names(mut testing_planner: TestingPl
     assert_snapshot!(plan.to_string(), @"
     Insert
       Projection(a:Int32, NULL:Int32, NULL:Int32, name:Utf8)
-        Projection(name:Utf8, a:Int32)
-          Input([name:Utf8, a:Int32])
+        Input([name:Utf8, a:Int32])
     ");
 }
 
@@ -521,17 +519,16 @@ fn an_unsupported_join_type_is_named_in_the_error(mut testing_planner: TestingPl
 }
 
 #[rstest]
-fn insert_default_values_is_rejected(mut testing_planner: TestingPlanner) {
-    let error = testing_planner
+fn insert_default_values_inserts_a_row_of_nulls(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
         .plan("INSERT INTO example_table DEFAULT VALUES")
-        .unwrap_err();
+        .unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("DEFAULT VALUES is not supported"),
-        "{error}"
-    );
+    assert_snapshot!(plan.to_string(), @"
+    Insert
+      Projection(NULL:Int32, NULL:Int32, NULL:Int32, NULL:Utf8View)
+        DummyScan
+    ");
 }
 
 #[rstest]
@@ -548,13 +545,13 @@ fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r#"
-    TopN(limit: 2, offset: 0, order: "default".main.example_table.a:Int32 DESC NULLS LAST)
+    assert_snapshot!(plan.to_string(), @"
+    TopN(limit: 2, offset: 0, order: a:Int32 DESC NULLS LAST)
       Projection(a:Int32)
         Projection(#0:Int32)
           Filter(a:Int32 <> b:Int32 -> Boolean)
             Input([a:Int32, b:Int32], dynamic: [DynamicFilter(#0 > ?)])
-    "#);
+    ");
 }
 
 #[rstest]
@@ -643,13 +640,12 @@ fn correlated_scalar_subquery_becomes_a_delim_join(mut testing_planner: TestingP
     ");
 }
 
-/// An IN list of five or more constants is rewritten by DuckDB into a mark
-/// join against an in-memory chunk of them (the rewrite runs after the pass
-/// that would have relaxed the marker into a semi join, so MARK is what
-/// arrives). The chunk scans as an inline VALUES source on the build side
-/// and the filter above reads the marker column.
+/// An IN list of five or more constants is rewritten by DuckDB into a join
+/// against an in-memory chunk of them, which a filter on the result relaxes
+/// into a semi join. The chunk scans as an inline VALUES source on the build
+/// side.
 #[rstest]
-fn a_long_in_list_becomes_a_mark_join_against_inline_values(mut testing_planner: TestingPlanner) {
+fn a_long_in_list_becomes_a_semi_join_against_inline_values(mut testing_planner: TestingPlanner) {
     use arrow_array::{ArrayRef, Int64Array};
     use planner::types::Type;
     use std::sync::Arc;
@@ -666,9 +662,9 @@ fn a_long_in_list_becomes_a_mark_join_against_inline_values(mut testing_planner:
     assert_snapshot!(plan.to_string(), @"
     Projection(i_order:Int64)
       Projection(#0:Int64)
-        Filter(IN (...):Boolean)
-          Join[probe mark](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])
-            Input([i_order:Int64])
+        Join[probe semi](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [], publishes key bounds: [0])
+          Input([i_order:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)], key bitsets: [#0 in build keys])
+          Projection(#0:Int64)
             Values(rows: 6)
     ");
 }
@@ -689,18 +685,19 @@ fn a_not_exists_subquery_becomes_an_anti_delim_join(mut testing_planner: Testing
 
     assert_snapshot!(plan.to_string(), @"
     Projection(o_key:Int64)
-      Cte(#9223372036854775807, sites: 2)
-        Input([o_key:Int64])
-        Cte(#9223372036854775808, sites: 1)
-          Distinct(keys: [0])
-            CteScan(#9223372036854775807)
-          Join[probe anti](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])
-            CteScan(#9223372036854775807)
-            Projection(o_key:Int64)
-              Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0], publishes key bounds: [0])
-                Filter(i_qty:Int64 > 5:Int64 -> Boolean)
-                  Input([i_order:Int64, i_qty:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)], key bitsets: [#0 in build keys])
-                CteScan(#9223372036854775808)
+      Projection(#0:Int64)
+        Cte(#9223372036854775807, sites: 2)
+          Input([o_key:Int64])
+          Cte(#9223372036854775808, sites: 1)
+            Distinct(keys: [0])
+              CteScan(#9223372036854775807)
+            Join[probe anti](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])
+              CteScan(#9223372036854775807)
+              Projection(o_key:Int64)
+                Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
+                  CteScan(#9223372036854775808)
+                  Filter(i_qty:Int64 > 5:Int64 -> Boolean)
+                    Input([i_order:Int64, i_qty:Int64])
     ");
 }
 
@@ -735,18 +732,19 @@ fn a_small_outer_exists_becomes_a_flipped_delim_join(mut testing_planner: Testin
 
     assert_snapshot!(plan.to_string(), @"
     Projection(o_key:Int64)
-      Cte(#9223372036854775807, sites: 2)
-        Input([o_key:Int64])
-        Cte(#9223372036854775808, sites: 1)
-          Distinct(keys: [0])
-            CteScan(#9223372036854775807)
-          Join[build semi](probe_keys: [0], build_keys: [0], probe_output: [], build_output: [0])
-            Projection(o_key:Int64)
-              Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0], publishes key bounds: [0])
-                Filter(i_qty:Int64 > 5:Int64 -> Boolean)
-                  Input([i_order:Int64, i_qty:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)], key bitsets: [#0 in build keys])
-                CteScan(#9223372036854775808)
-            CteScan(#9223372036854775807)
+      Projection(#0:Int64)
+        Cte(#9223372036854775807, sites: 2)
+          Input([o_key:Int64])
+          Cte(#9223372036854775808, sites: 1)
+            Distinct(keys: [0])
+              CteScan(#9223372036854775807)
+            Join[build semi](probe_keys: [0], build_keys: [0], probe_output: [], build_output: [0])
+              Projection(o_key:Int64)
+                Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0], publishes key bounds: [0])
+                  Filter(i_qty:Int64 > 5:Int64 -> Boolean)
+                    Input([i_order:Int64, i_qty:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)], key bitsets: [#0 in build keys])
+                  CteScan(#9223372036854775808)
+              CteScan(#9223372036854775807)
     ");
 }
 
@@ -805,7 +803,8 @@ fn an_anti_join_preserving_the_larger_side_is_probe_anti(mut testing_planner: Te
     Projection(i_order:Int64)
       Join[probe anti](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])
         Input([i_order:Int64])
-        Input([o_key:Int64])
+        Projection(#0:Int64)
+          Input([o_key:Int64])
     ");
 }
 
@@ -833,8 +832,9 @@ fn an_anti_join_preserving_the_smaller_side_is_build_anti(mut testing_planner: T
 
     assert_snapshot!(plan.to_string(), @"
     Projection(o_key:Int64)
-      Join[build anti](probe_keys: [0], build_keys: [0], probe_output: [], build_output: [0])
-        Input([i_order:Int64])
+      Join[build anti](probe_keys: [0], build_keys: [0], probe_output: [], build_output: [0], publishes key bounds: [0])
+        Projection(#0:Int64)
+          Input([i_order:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)], key bitsets: [#0 in build keys])
         Input([o_key:Int64])
     ");
 }

@@ -11,6 +11,7 @@
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -54,7 +55,7 @@ struct PivotTableFunctionInfo : public TableFunctionInfo {
 
 unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types,
-                                                   vector<string> &names) {
+                                                   vector<Identifier> &names) {
 	auto &info = input.info->Cast<PivotTableFunctionInfo>();
 	if (!input.named_parameters.empty()) {
 		throw BinderException("pivot table functions do not support named arguments");
@@ -79,16 +80,20 @@ unique_ptr<NodeStatistics> pivot_table_function_cardinality(ClientContext &,
 	if (!estimate.known) {
 		return nullptr;
 	}
-	return make_uniq<NodeStatistics>(estimate.rows, estimate.rows);
+	// The count is reported as an estimate and not as an upper bound. DuckDB drops a LIMIT above an
+	// input it knows to be no larger, and pivot's LIMIT is what stops a scan early.
+	return make_uniq<NodeStatistics>(estimate.rows);
 }
 
 // A Pivot table function binds to the same Rust BoundTable abstraction as a
 // catalog scan, so offer its filters through the same storage-index remapping
 // path. A table that returns false leaves the filter above the scan.
 void pivot_table_function_pushdown_complex_filter(
-    ClientContext &, LogicalGet &get, FunctionData *bind_data,
+    ClientContext &, LogicalGet &get, optional_ptr<const FunctionData> bind_data,
     vector<unique_ptr<Expression>> &filters) {
-	auto &data = bind_data->Cast<PivotTableFunctionBindData>();
+	// The table narrows what it scans as it accepts filters, which changes the bound table and not
+	// the bind data DuckDB holds.
+	auto &data = const_cast<FunctionData &>(*bind_data).Cast<PivotTableFunctionBindData>();
 	PivotPushdownComplexFilters(get, *data.table, filters);
 }
 
@@ -105,7 +110,7 @@ virtual_column_map_t pivot_table_function_get_virtual_columns(
 }
 
 vector<column_t> pivot_table_function_get_row_id_columns(
-    ClientContext &, optional_ptr<FunctionData>) {
+    ClientContext &, optional_ptr<const FunctionData>) {
 	return {COLUMN_IDENTIFIER_ROW_ID};
 }
 
@@ -126,7 +131,7 @@ void RegisterPivotTableFunctions(ClientContext &context, const CatalogContext &c
 		string name(definition.name);
 		auto entry = function_sets.find(name);
 		if (entry == function_sets.end()) {
-			entry = function_sets.emplace(name, TableFunctionSet(name)).first;
+			entry = function_sets.emplace(name, TableFunctionSet(Identifier(name))).first;
 		}
 
 		vector<LogicalType> arguments;
@@ -135,7 +140,7 @@ void RegisterPivotTableFunctions(ClientContext &context, const CatalogContext &c
 		}
 		auto info = make_shared_ptr<PivotTableFunctionInfo>();
 		info->name = name;
-		TableFunction function(name, std::move(arguments), nullptr, pivot_table_function_bind);
+		TableFunction function(Identifier(name), std::move(arguments), nullptr, pivot_table_function_bind);
 		function.function_info = std::move(info);
 		function.pushdown_complex_filter = pivot_table_function_pushdown_complex_filter;
 		// Let DuckDB lower simple comparisons into table_filters after the
@@ -204,7 +209,7 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		}
 		LogicalType return_type = logical_type_from(function.function.return_type_id);
 
-		ScalarFunction func(std::string(table_name), std::move(arguments), return_type,
+		ScalarFunction func(Identifier(table_name), std::move(arguments), return_type,
 		                    pivot_scalar_function_stub);
 		if (function.function.is_volatile) {
 			func.SetStability(FunctionStability::VOLATILE);
@@ -228,17 +233,18 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	// within this schema. The catalog only hands out an entry for a schema the
 	// datastore defines, so `name` here is always one of its own schemas.
 	auto result = catalog_get_table(
-	    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), this->name, table_name);
+	    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName().GetIdentifierName(),
+	    this->name.GetIdentifierName(), table_name);
 
 	if (!result.found) {
 		return nullptr;
 	}
 
-	CreateTableInfo table_info(*this, table_name);
+	CreateTableInfo table_info(*this, Identifier(table_name));
 	for (const auto &col : result.columns) {
 		auto col_name = std::string(col.name);
 		table_info.columns.AddColumn(
-		    ColumnDefinition(col_name, logical_type_from_column(col)));
+		    ColumnDefinition(Identifier(col_name), logical_type_from_column(col)));
 	}
 
 	auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
@@ -264,7 +270,6 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateSequence(CatalogTransa
 optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) { RUST_NOT_IMPLEMENTED; }
 optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) { RUST_NOT_IMPLEMENTED; }
 optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateCollation(CatalogTransaction, CreateCollationInfo &) { RUST_NOT_IMPLEMENTED; }
 optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateType(CatalogTransaction, CreateTypeInfo &) { RUST_NOT_IMPLEMENTED; }
 void PivotSchemaCatalogEntry::DropEntry(ClientContext &, DropInfo &) { RUST_NOT_IMPLEMENTED; }
 void PivotSchemaCatalogEntry::Alter(CatalogTransaction, AlterInfo &) { RUST_NOT_IMPLEMENTED; }

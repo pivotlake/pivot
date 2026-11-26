@@ -970,11 +970,18 @@ fn regexp_jit_replace_extracts_group(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn regexp_full_match_invalid_pattern_returns_error(mut testing_planner: TestingPlanner) {
-    let result = testing_planner.plan("SELECT regexp_full_match(name, '(') FROM example_table");
+    let transaction = testing_planner.transaction();
+    let plan = testing_planner
+        .planner
+        .plan(
+            "SELECT regexp_full_match(name, '(') FROM example_table",
+            transaction.clone(),
+        )
+        .unwrap();
 
-    // DuckDB compiles a constant pattern while binding, so an unparsable one is
-    // rejected during planning rather than reaching pivot's own compile.
-    assert!(result.is_err(), "expected a planning error");
+    let result = plan.compile(testing_planner.dispatcher(), transaction.as_ref());
+
+    assert!(result.is_err(), "expected a compile error");
 }
 
 /// A non-constant pattern can't be compiled once per plan, so it is refused

@@ -118,13 +118,18 @@ impl Round {
         } else {
             self.compile_kernel::<T>(move |values| {
                 values.unary(|value| {
-                    let rounded = (widen(value) / scale).round() * scale;
-                    // A step beyond what a float holds is further than any
-                    // value reaches halfway to, so it rounds to zero. Every
-                    // other result that is not finite is zero as well: an
-                    // infinite or NaN value, and one rounded past the
-                    // largest float.
-                    narrow(if rounded.is_finite() { rounded } else { 0.0 })
+                    let value = widen(value);
+                    if scale.is_infinite() {
+                        // A step beyond what a float holds is further than any
+                        // finite value reaches halfway to, so it rounds to
+                        // zero. An infinity or a NaN stays itself.
+                        return narrow(if value.is_finite() { 0.0 } else { value });
+                    }
+                    let rounded = (value / scale).round() * scale;
+                    // An infinity or a NaN has no digits to round, and a value
+                    // that rounds past the largest float has no nearer step:
+                    // each stays itself.
+                    narrow(if rounded.is_finite() { rounded } else { value })
                 })
             })
         }
@@ -151,11 +156,17 @@ impl Round {
         }
         // How many digits left of the decimal point become zeros.
         let zeroed_digits = kept_digits.min(0).unsigned_abs();
-        if zeroed_digits >= u32::from(whole_digits) {
-            // Every whole digit the type has is rounded away, which leaves
-            // zero. A value past half of such a step is zero too, not the
-            // step, which is how DuckDB rounds it: it folds a call over
-            // constants before the plan gets here, so a column has to agree.
+        // A decimal that loses every whole digit still rounds to the nearest
+        // step, which is one digit longer than its whole digits: 95 rounds to
+        // 100. An integer type cannot hold a step that long, so it has to lose
+        // no more than its digits to round to anything but zero. Both follow
+        // DuckDB's own `round`: it folds a call over constants before the plan
+        // gets here, so a column has to agree.
+        let zeroed_digits_holding_a_step = match self.input.result_type()? {
+            Type::Decimal { .. } => u32::from(whole_digits),
+            _ => u32::from(whole_digits) - 1,
+        };
+        if zeroed_digits > zeroed_digits_holding_a_step {
             return self.compile_kernel::<T>(|values| values.unary(|_| T::Native::ZERO));
         }
         let ten = T::Native::usize_as(10);
@@ -324,8 +335,9 @@ mod tests {
     #[rstest]
     #[case::whole_number("round(x)", f64::INFINITY, f64::INFINITY)]
     #[case::digits_after_the_point("round(x, 2)", f64::NEG_INFINITY, f64::NEG_INFINITY)]
-    #[case::digits_before_the_point("round(x, -1)", f64::INFINITY, 0.0)]
-    #[case::not_a_number_before_the_point("round(x, -1)", f64::NAN, 0.0)]
+    #[case::digits_before_the_point("round(x, -1)", f64::INFINITY, f64::INFINITY)]
+    #[case::not_a_number_before_the_point("round(x, -1)", f64::NAN, f64::NAN)]
+    #[case::a_step_beyond_every_double("round(x, -400)", f64::INFINITY, f64::INFINITY)]
     fn rounds_a_double_that_is_not_finite(
         mut testing_planner: TestingPlanner,
         #[case] call: &str,
@@ -444,8 +456,10 @@ mod tests {
 
         let batches = run_batches(&mut testing_planner, "SELECT round(x, -2) FROM numbers");
 
+        // The result has one digit more than the column, for a value that
+        // rounds up to a longer one.
         let expected = Decimal64Array::from(vec![12_400i64])
-            .with_precision_and_scale(5, 0)
+            .with_precision_and_scale(6, 0)
             .unwrap();
         assert_eq!(batches[0].column(0), &(Arc::new(expected) as ArrayRef));
     }
@@ -454,7 +468,14 @@ mod tests {
     fn fails_the_query_when_a_rounded_decimal_outgrows_its_precision(
         mut testing_planner: TestingPlanner,
     ) {
-        add_whole_decimal(&testing_planner, 99_999);
+        let column = Decimal128Array::from(vec![10i128.pow(38) - 1])
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        let column_type = Type::Decimal {
+            precision: 38,
+            scale: 0,
+        };
+        testing_planner.add_table("numbers", &[("x", column_type, Arc::new(column))]);
 
         let error = run_expecting_error(&mut testing_planner, "SELECT round(x, -1) FROM numbers");
 
