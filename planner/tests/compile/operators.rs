@@ -2230,18 +2230,6 @@ fn range_with_single_argument_starts_at_zero(mut testing_planner: TestingPlanner
 }
 
 #[rstest]
-fn timestamp_generate_series_is_not_registered(mut testing_planner: TestingPlanner) {
-    let result = testing_planner.plan(
-        "SELECT * FROM generate_series(\
-            TIMESTAMP '2024-01-01', TIMESTAMP '2024-01-03', INTERVAL '1 day')",
-    );
-
-    let error = result.unwrap_err().to_string();
-
-    assert!(error.contains("generate_series(BIGINT"), "{error}");
-}
-
-#[rstest]
 fn zero_series_step_fails_during_binding(mut testing_planner: TestingPlanner) {
     let result = testing_planner.plan("SELECT * FROM generate_series(1, 5, 0)");
 

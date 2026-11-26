@@ -1,5 +1,6 @@
-//! The generic integer-series functions `range` (exclusive upper bound) and
-//! `generate_series` (inclusive). They depend on nothing but their arguments.
+//! The series functions `range` (exclusive upper bound) and `generate_series`
+//! (inclusive). Integer arguments give integers; two timestamp bounds and an
+//! interval step give timestamps. A call with a NULL argument returns no rows.
 //!
 //! The series streams from a lazy source operator that emits one
 //! [`SERIES_CHUNK_ROWS`] batch each time it is polled, so a huge range never
@@ -10,9 +11,17 @@ use crate::catalog::{
     BoundTable, CatalogTransaction, Column, DynamicScanPredicate, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use crate::types::Type;
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use crate::expression::add_months_to_timestamp;
+use crate::types::{
+    MICROS_PER_DAY, NANOS_PER_MICRO, Type, UTC_TIMEZONE, build_scalar_value, physical_arrow_type,
+    type_from_physical,
+};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Int64Type, IntervalMonthDayNanoType, TimestampMicrosecondType};
+use arrow_array::{
+    Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, Scalar, TimestampMicrosecondArray,
+};
+use arrow_schema::{Field, Schema, SchemaRef};
 use dispatch::{Built, BuiltNullary};
 use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, Projection,
@@ -46,6 +55,24 @@ impl SeriesTableFunction {
             inclusive: true,
         }
     }
+
+    /// The type of series the overload taking `argument_types` returns.
+    fn resolve_value_type(&self, argument_types: &[Type]) -> CatalogResult<SeriesValueType> {
+        match argument_types {
+            [Type::Int64]
+            | [Type::Int64, Type::Int64]
+            | [Type::Int64, Type::Int64, Type::Int64] => Ok(SeriesValueType::Integer),
+            [Type::Timestamp, Type::Timestamp, Type::Interval] => Ok(SeriesValueType::Timestamp),
+            [Type::TimestampTz, Type::TimestampTz, Type::Interval] => {
+                Ok(SeriesValueType::TimestampTz)
+            }
+            other => Err(self.reject_arguments(format!("no overload takes {other:?}"))),
+        }
+    }
+
+    fn reject_arguments(&self, message: String) -> crate::catalog::Error {
+        crate::catalog::Error::Other(Box::new(invalid_argument(self.name, message)))
+    }
 }
 
 impl TableFunction for SeriesTableFunction {
@@ -54,10 +81,12 @@ impl TableFunction for SeriesTableFunction {
     }
 
     fn signatures(&self) -> Vec<TableFunctionSignature> {
-        (1..=3)
-            .map(|argument_count| TableFunctionSignature {
-                arguments: vec![Type::Int64; argument_count],
-            })
+        let integer_bounds = (1..=3).map(|argument_count| vec![Type::Int64; argument_count]);
+        let timestamp_bounds = [Type::Timestamp, Type::TimestampTz]
+            .map(|bound_type| vec![bound_type.clone(), bound_type, Type::Interval]);
+        integer_bounds
+            .chain(timestamp_bounds)
+            .map(|arguments| TableFunctionSignature { arguments })
             .collect()
     }
 
@@ -66,81 +95,241 @@ impl TableFunction for SeriesTableFunction {
         arguments: &[ScalarValue],
         _transaction: &dyn CatalogTransaction,
     ) -> CatalogResult<Box<dyn BoundTable>> {
-        let numbers = self
-            .parse_i64_args(arguments)
-            .map_err(|error| crate::catalog::Error::Other(Box::new(error)))?;
-        let (start, stop, step) = match numbers.as_slice() {
-            // A single argument is the stop; the series starts at 0, step 1.
-            [stop] => (0, *stop, 1),
-            [start, stop] => (*start, *stop, 1),
-            [start, stop, step] => (*start, *stop, *step),
-            _ => {
-                return Err(crate::catalog::Error::Other(Box::new(invalid_argument(
-                    self.name,
-                    format!("expected 1 to 3 arguments, got {}", numbers.len()),
-                ))));
-            }
-        };
-        if step == 0 {
-            return Err(crate::catalog::Error::Other(Box::new(invalid_argument(
-                self.name,
-                "step must not be zero".to_string(),
-            ))));
-        }
+        // Each argument as an array of one value, where a NULL argument still
+        // has the type of its parameter.
+        let argument_values: Vec<ArrayRef> = arguments
+            .iter()
+            .map(|argument| build_scalar_value(argument.clone()).map(Scalar::into_inner))
+            .collect::<Result<_, _>>()
+            .map_err(|error| self.reject_arguments(error.to_string()))?;
+        let argument_types = argument_values
+            .iter()
+            .map(|value| {
+                type_from_physical(value.data_type()).ok_or_else(|| {
+                    self.reject_arguments(format!("no overload takes a {}", value.data_type()))
+                })
+            })
+            .collect::<CatalogResult<Vec<Type>>>()?;
+        let value_type = self.resolve_value_type(&argument_types)?;
+        let series = Series::read_from_arguments(value_type, self.inclusive, &argument_values)
+            .map_err(|message| self.reject_arguments(message))?;
 
+        let written_arguments: Vec<String> = arguments.iter().map(ToString::to_string).collect();
         Ok(Box::new(BoundSeries {
             name: self.name,
-            inclusive: self.inclusive,
-            start,
-            stop,
-            step,
+            call: format!("{}({})", self.name, written_arguments.join(",")),
+            value_type,
+            series,
         }))
     }
 }
 
-impl SeriesTableFunction {
-    fn parse_i64_args(&self, arguments: &[ScalarValue]) -> Result<Vec<i64>, crate::compile::Error> {
-        arguments
-            .iter()
-            .map(|argument| match argument {
-                ScalarValue::Int64(value) => Ok(*value),
-                other => Err(invalid_argument(
-                    self.name,
-                    format!("expected an integer, got '{other}'"),
-                )),
-            })
-            .collect()
+/// What a series counts in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeriesValueType {
+    Integer,
+    /// Microseconds since the epoch.
+    Timestamp,
+    /// Microseconds since the epoch, in UTC.
+    TimestampTz,
+}
+
+impl SeriesValueType {
+    fn column_type(self) -> Type {
+        match self {
+            SeriesValueType::Integer => Type::Int64,
+            SeriesValueType::Timestamp => Type::Timestamp,
+            SeriesValueType::TimestampTz => Type::TimestampTz,
+        }
+    }
+
+    /// The series function's one column, named after the function so
+    /// `SELECT *` reports it as `range` / `generate_series`, matching DuckDB.
+    fn column_field(self, function_name: &str) -> Field {
+        Field::new(
+            function_name,
+            physical_arrow_type(&self.column_type()),
+            false,
+        )
+    }
+
+    fn build_column(self, values: Vec<i64>) -> ArrayRef {
+        match self {
+            SeriesValueType::Integer => Arc::new(Int64Array::from(values)),
+            SeriesValueType::Timestamp => Arc::new(TimestampMicrosecondArray::from(values)),
+            SeriesValueType::TimestampTz => {
+                Arc::new(TimestampMicrosecondArray::from(values).with_timezone(UTC_TIMEZONE))
+            }
+        }
     }
 }
 
+/// The values one call returns, from `next_value` towards `stop`. Iterating
+/// yields them in order.
+#[derive(Clone, Debug)]
+struct Series {
+    /// The value the series yields next. `None` once it has ended.
+    next_value: Option<i64>,
+    stop: i64,
+    /// The whole calendar months each step moves a timestamp by.
+    step_months: i64,
+    /// What each step then adds: an integer step, or an interval's days and
+    /// time in microseconds.
+    step_distance: i64,
+    /// Whether `stop` itself belongs to the series.
+    inclusive: bool,
+}
+
+impl Series {
+    /// The series a call's arguments ask for: the empty one when an argument
+    /// is NULL. Each argument is an array of one value.
+    fn read_from_arguments(
+        value_type: SeriesValueType,
+        inclusive: bool,
+        arguments: &[ArrayRef],
+    ) -> Result<Series, String> {
+        if arguments.iter().any(|argument| argument.is_null(0)) {
+            return Ok(Series::empty());
+        }
+        let (start, stop, step_months, step_distance) = match value_type {
+            SeriesValueType::Integer => {
+                let integers: Vec<i64> = arguments
+                    .iter()
+                    .map(|argument| argument.as_primitive::<Int64Type>().value(0))
+                    .collect();
+                match integers[..] {
+                    // A single argument is the stop; the series starts at 0, step 1.
+                    [stop] => (0, stop, 0, 1),
+                    [start, stop] => (start, stop, 0, 1),
+                    [start, stop, step] => (start, stop, 0, step),
+                    _ => unreachable!("an integer series takes one to three arguments"),
+                }
+            }
+            SeriesValueType::Timestamp | SeriesValueType::TimestampTz => {
+                let [start, stop] = [0, 1].map(|bound| {
+                    arguments[bound]
+                        .as_primitive::<TimestampMicrosecondType>()
+                        .value(0)
+                });
+                if [start, stop]
+                    .iter()
+                    .any(|&bound| is_infinite_timestamp(bound))
+                {
+                    return Err("the bounds cannot be infinite".to_string());
+                }
+                let step = arguments[2]
+                    .as_primitive::<IntervalMonthDayNanoType>()
+                    .value(0);
+                // A day is a fixed 24 hours: the session zone is UTC, which has
+                // no daylight saving shift to stretch a day across.
+                let step_distance = i64::from(step.days)
+                    .checked_mul(MICROS_PER_DAY)
+                    .and_then(|day_micros| {
+                        day_micros.checked_add(step.nanoseconds / NANOS_PER_MICRO)
+                    })
+                    .ok_or("the step is too long to count in microseconds")?;
+                let step_parts = [
+                    i64::from(step.months),
+                    i64::from(step.days),
+                    step.nanoseconds,
+                ];
+                if step_parts.iter().any(|&part| part > 0)
+                    && step_parts.iter().any(|&part| part < 0)
+                {
+                    return Err(
+                        "a step whose months, days and time point in different directions is \
+                         not supported"
+                            .to_string(),
+                    );
+                }
+                (start, stop, i64::from(step.months), step_distance)
+            }
+        };
+        if step_months == 0 && step_distance == 0 {
+            return Err("step must not be zero".to_string());
+        }
+        Ok(Series {
+            next_value: Some(start),
+            stop,
+            step_months,
+            step_distance,
+            inclusive,
+        })
+    }
+
+    fn empty() -> Series {
+        Series {
+            next_value: None,
+            stop: 0,
+            step_months: 0,
+            step_distance: 0,
+            inclusive: false,
+        }
+    }
+
+    /// Whether `value` lies beyond the end of the series, accounting for the
+    /// step's direction.
+    fn is_past_stop(&self, value: i64) -> bool {
+        let ascending = self.step_months > 0 || self.step_distance > 0;
+        match (ascending, self.inclusive) {
+            (true, true) => value > self.stop,
+            (true, false) => value >= self.stop,
+            (false, true) => value < self.stop,
+            (false, false) => value <= self.stop,
+        }
+    }
+
+    /// The value one step after `value`. `None` when it is past what an `i64`
+    /// holds, and so past any `stop`.
+    fn step_from(&self, value: i64) -> Option<i64> {
+        let moved_by_months = match self.step_months {
+            0 => value,
+            months => add_months_to_timestamp(value, months)?,
+        };
+        moved_by_months.checked_add(self.step_distance)
+    }
+}
+
+impl Iterator for Series {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<i64> {
+        let value = self.next_value.filter(|&value| !self.is_past_stop(value))?;
+        self.next_value = self.step_from(value);
+        Some(value)
+    }
+}
+
+/// DuckDB's `infinity` and `-infinity` timestamps.
+fn is_infinite_timestamp(micros: i64) -> bool {
+    micros == i64::MAX || micros == -i64::MAX
+}
+
+/// One call of a series function.
 #[derive(Clone, Debug)]
 struct BoundSeries {
     name: &'static str,
-    inclusive: bool,
-    start: i64,
-    stop: i64,
-    step: i64,
+    /// The call as written, which tells one series table from another.
+    call: String,
+    value_type: SeriesValueType,
+    series: Series,
 }
 
 impl BoundSeries {
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::new(vec![self.value_type.column_field(self.name)]))
+    }
+
     fn compile_full(&self, dispatcher: &DataFlowDispatcher) -> RecordBatchOperatorSpec {
-        // The column is named after the function so `SELECT *` reports it as
-        // `range` / `generate_series`, matching DuckDB.
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            self.name,
-            DataType::Int64,
-            false,
-        )]));
+        let schema = self.schema();
         // The series is a single running counter, so exactly one worker produces
         // it (claiming the shared flag) and the rest idle, mirroring `DummyScan`.
         let claimed = Arc::new(AtomicBool::new(false));
         let factories = (0..dispatcher.worker_count()).map(|_| SeriesSourceFactory {
             claimed: claimed.clone(),
             schema: schema.clone(),
-            start: self.start,
-            stop: self.stop,
-            step: self.step,
-            inclusive: self.inclusive,
+            value_type: self.value_type,
+            series: self.series.clone(),
         });
         RecordBatchOperatorSpec::from_nullary(dispatcher, factories)
     }
@@ -149,11 +338,7 @@ impl BoundSeries {
         if projection.column_indices.is_empty() {
             Arc::new(Schema::empty())
         } else {
-            Arc::new(Schema::new(vec![Field::new(
-                self.name,
-                DataType::Int64,
-                false,
-            )]))
+            self.schema()
         }
     }
 }
@@ -169,7 +354,7 @@ impl BoundTable for BoundSeries {
 
     fn table_revision(&self) -> TableRevision {
         TableRevision {
-            identity: format!("{}({},{},{})", self.name, self.start, self.stop, self.step),
+            identity: self.call.clone(),
             version: "0".to_string(),
         }
     }
@@ -216,7 +401,7 @@ impl BoundTable for BoundSeries {
     fn columns(&self) -> Vec<Column> {
         vec![Column {
             name: self.name.to_string(),
-            col_type: Type::Int64,
+            col_type: self.value_type.column_type(),
         }]
     }
 
@@ -234,10 +419,8 @@ impl BoundTable for BoundSeries {
 struct SeriesSourceFactory {
     claimed: Arc<AtomicBool>,
     schema: SchemaRef,
-    start: i64,
-    stop: i64,
-    step: i64,
-    inclusive: bool,
+    value_type: SeriesValueType,
+    series: Series,
 }
 
 impl NullaryFactory<RecordBatch> for SeriesSourceFactory {
@@ -248,17 +431,15 @@ impl NullaryFactory<RecordBatch> for SeriesSourceFactory {
             claimed: self.claimed,
             is_producer: None,
             schema: self.schema,
-            current: self.start,
-            stop: self.stop,
-            step: self.step,
-            inclusive: self.inclusive,
+            value_type: self.value_type,
+            series: self.series,
             done: false,
         })
     }
 }
 
 /// Streams `range`/`generate_series` in [`SERIES_CHUNK_ROWS`] chunks: each poll
-/// emits one chunk and advances the counter, so the full range is never resident
+/// emits one chunk and advances the series, so the full range is never resident
 /// at once.
 struct SeriesSource {
     claimed: Arc<AtomicBool>,
@@ -266,29 +447,9 @@ struct SeriesSource {
     /// the single producer, `Some(false)` for the idle ones.
     is_producer: Option<bool>,
     schema: SchemaRef,
-    current: i64,
-    stop: i64,
-    step: i64,
-    inclusive: bool,
+    value_type: SeriesValueType,
+    series: Series,
     done: bool,
-}
-
-impl SeriesSource {
-    /// Whether `current` has passed the (exclusive for `range`, inclusive for
-    /// `generate_series`) end, accounting for the step's sign.
-    fn past_end(&self) -> bool {
-        if self.step > 0 {
-            if self.inclusive {
-                self.current > self.stop
-            } else {
-                self.current >= self.stop
-            }
-        } else if self.inclusive {
-            self.current < self.stop
-        } else {
-            self.current <= self.stop
-        }
-    }
 }
 
 impl Nullary<RecordBatch> for SeriesSource {
@@ -310,29 +471,16 @@ impl Nullary<RecordBatch> for SeriesSource {
         }
 
         let mut values = Vec::with_capacity(SERIES_CHUNK_ROWS);
-        while values.len() < SERIES_CHUNK_ROWS {
-            if self.past_end() {
-                self.done = true;
-                break;
-            }
-            values.push(self.current);
-            match self.current.checked_add(self.step) {
-                Some(next) => self.current = next,
-                // Stepping past i64::MAX/MIN ends the series after this value.
-                None => {
-                    self.done = true;
-                    break;
-                }
-            }
-        }
-
+        values.extend(self.series.by_ref().take(SERIES_CHUNK_ROWS));
         if values.is_empty() {
             self.done = true;
             return Ok(WorkStatus::Pending);
         }
-        let array = Arc::new(Int64Array::from(values)) as ArrayRef;
-        let batch = RecordBatch::try_new(self.schema.clone(), vec![array])
-            .expect("single BIGINT column chunk is always well-formed");
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
+            vec![self.value_type.build_column(values)],
+        )
+        .expect("a chunk of the series column is always well-formed");
         sender.send(batch)?;
         Ok(WorkStatus::Ran)
     }

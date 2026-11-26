@@ -2,7 +2,7 @@
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use crate::types::Type;
+use crate::types::{MICROS_PER_DAY, Type};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Date32Type, Int64Type};
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
@@ -42,6 +42,28 @@ pub(super) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146_097 + doe - 719_468
+}
+
+/// Move a timestamp, counted in microseconds since the epoch, by whole
+/// calendar months, keeping its time of day. A day of the month the target
+/// month does not have becomes that month's last day, so January 31 plus one
+/// month is the last day of February. `None` when the result is past what an
+/// `i64` holds.
+pub(crate) fn add_months_to_timestamp(micros: i64, months: i64) -> Option<i64> {
+    let (year, month, day) = civil_from_days(micros.div_euclid(MICROS_PER_DAY));
+    let target_month = year * 12 + month - 1 + months;
+    let first_of_month = |epoch_month: i64| {
+        days_from_civil(
+            epoch_month.div_euclid(12),
+            epoch_month.rem_euclid(12) + 1,
+            1,
+        )
+    };
+    let month_start = first_of_month(target_month);
+    let month_length = first_of_month(target_month + 1) - month_start;
+    (month_start + day.min(month_length) - 1)
+        .checked_mul(MICROS_PER_DAY)?
+        .checked_add(micros.rem_euclid(MICROS_PER_DAY))
 }
 
 /// Number of ISO 8601 weeks (52 or 53) in the given year. A year has 53 weeks

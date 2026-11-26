@@ -59,6 +59,7 @@ pub use concat::Concat;
 pub use conjunction::{Conjunction, ConjunctionOp};
 pub use contains::Contains;
 pub use convert::TemporalConvert;
+pub(crate) use date_part::add_months_to_timestamp;
 pub use date_part::{DatePart, DatePartKind};
 pub use date_trunc::DateTrunc;
 pub use divide::Divide;
