@@ -455,7 +455,11 @@ fn count_column_expr(column: usize, column_type: Type) -> Expression {
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
+    use crate::types::Type;
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, StringViewArray};
     use rstest::rstest;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
 
     #[rstest]
     fn grouped_count_distinct_excludes_nulls(mut testing_planner: TestingPlanner) {
@@ -482,5 +486,196 @@ mod tests {
         assert_eq!(rows[0]["d"].as_i64(), Some(1));
         assert_eq!(rows[1]["d"].as_i64(), Some(0));
         assert!(rows[1]["sb"].is_null());
+    }
+
+    /// `visit_log`: `(g Int32, visitor Int64, page Utf8)`, NULLs in every column.
+    /// In group 1 a NULL-`visitor` row and a NULL-`page` row expand to the same
+    /// inner key `(1, NULL, NULL)`.
+    ///
+    /// ```text
+    /// g    | visitor | page
+    /// -----+---------+-----
+    /// 1    | 7       | a
+    /// 1    | 7       | b
+    /// 1    | 8       | a
+    /// 1    | NULL    | a
+    /// 1    | 8       | NULL
+    /// 1    | 7       | c
+    /// 2    | 9       | NULL
+    /// 2    | 9       | c
+    /// NULL | 7       | a
+    /// ```
+    fn add_visit_log(testing_planner: &TestingPlanner) {
+        testing_planner.add_table(
+            "visit_log",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(2),
+                        Some(2),
+                        None,
+                    ])) as ArrayRef,
+                ),
+                (
+                    "visitor",
+                    Type::Int64,
+                    Arc::new(Int64Array::from(vec![
+                        Some(7),
+                        Some(7),
+                        Some(8),
+                        None,
+                        Some(8),
+                        Some(7),
+                        Some(9),
+                        Some(9),
+                        Some(7),
+                    ])),
+                ),
+                (
+                    "page",
+                    Type::Utf8,
+                    Arc::new(StringViewArray::from(vec![
+                        Some("a"),
+                        Some("b"),
+                        Some("a"),
+                        Some("a"),
+                        None,
+                        Some("c"),
+                        None,
+                        Some("c"),
+                        Some("a"),
+                    ])),
+                ),
+            ],
+        );
+    }
+
+    /// `(g, column)` for every row, NULL groups first.
+    fn by_group(rows: &[Value], column: &str) -> Vec<(Option<i64>, Value)> {
+        let mut pairs: Vec<(Option<i64>, Value)> = rows
+            .iter()
+            .map(|row| (row["g"].as_i64(), row[column].clone()))
+            .collect();
+        pairs.sort_by_key(|(g, _)| *g);
+        pairs
+    }
+
+    #[rstest]
+    fn several_count_distinct_per_group(mut testing_planner: TestingPlanner) {
+        add_visit_log(&testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT g, COUNT(DISTINCT visitor) AS visitors, COUNT(DISTINCT page) AS pages \
+             FROM visit_log GROUP BY g",
+        );
+
+        assert_eq!(
+            by_group(&rows, "visitors"),
+            [(None, json!(1)), (Some(1), json!(2)), (Some(2), json!(1))]
+        );
+        assert_eq!(
+            by_group(&rows, "pages"),
+            [(None, json!(1)), (Some(1), json!(3)), (Some(2), json!(1))]
+        );
+    }
+
+    #[rstest]
+    fn several_count_distinct_beside_other_aggregates(mut testing_planner: TestingPlanner) {
+        add_visit_log(&testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT g, COUNT(*) AS n, COUNT(visitor) AS nv, COUNT(DISTINCT visitor) AS visitors, \
+             SUM(visitor) AS total, COUNT(DISTINCT page) AS pages, MIN(page) AS first_page, \
+             MAX(page) AS last_page, AVG(visitor) AS mean FROM visit_log GROUP BY g",
+        );
+
+        assert_eq!(
+            by_group(&rows, "n"),
+            [(None, json!(1)), (Some(1), json!(6)), (Some(2), json!(2))]
+        );
+        assert_eq!(
+            by_group(&rows, "nv"),
+            [(None, json!(1)), (Some(1), json!(5)), (Some(2), json!(2))]
+        );
+        assert_eq!(
+            by_group(&rows, "visitors"),
+            [(None, json!(1)), (Some(1), json!(2)), (Some(2), json!(1))]
+        );
+        assert_eq!(
+            by_group(&rows, "total"),
+            [(None, json!(7)), (Some(1), json!(37)), (Some(2), json!(18))]
+        );
+        assert_eq!(
+            by_group(&rows, "pages"),
+            [(None, json!(1)), (Some(1), json!(3)), (Some(2), json!(1))]
+        );
+        assert_eq!(
+            by_group(&rows, "first_page"),
+            [
+                (None, json!("a")),
+                (Some(1), json!("a")),
+                (Some(2), json!("c"))
+            ]
+        );
+        assert_eq!(
+            by_group(&rows, "last_page"),
+            [
+                (None, json!("a")),
+                (Some(1), json!("c")),
+                (Some(2), json!("c"))
+            ]
+        );
+        assert_eq!(
+            by_group(&rows, "mean"),
+            [
+                (None, json!(7.0)),
+                (Some(1), json!(7.4)),
+                (Some(2), json!(9.0))
+            ]
+        );
+    }
+
+    #[rstest]
+    fn several_count_distinct_of_computed_arguments(mut testing_planner: TestingPlanner) {
+        add_visit_log(&testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT g, COUNT(DISTINCT visitor) AS visitors, \
+             COUNT(DISTINCT CASE WHEN page = 'c' THEN visitor END) AS c_visitors \
+             FROM visit_log GROUP BY g",
+        );
+
+        assert_eq!(
+            by_group(&rows, "visitors"),
+            [(None, json!(1)), (Some(1), json!(2)), (Some(2), json!(1))]
+        );
+        assert_eq!(
+            by_group(&rows, "c_visitors"),
+            [(None, json!(0)), (Some(1), json!(1)), (Some(2), json!(1))]
+        );
+    }
+
+    #[rstest]
+    fn several_count_distinct_top_group(mut testing_planner: TestingPlanner) {
+        add_visit_log(&testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT g, COUNT(DISTINCT visitor) AS visitors, COUNT(DISTINCT page) AS pages \
+             FROM visit_log GROUP BY g ORDER BY pages DESC LIMIT 1",
+        );
+
+        assert_eq!(rows, [json!({"g": 1, "visitors": 2, "pages": 3})]);
     }
 }
