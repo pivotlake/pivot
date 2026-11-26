@@ -126,6 +126,7 @@ before_dir="$work_dir/before"
 after_dir="$work_dir/after"
 checkout_side "$before_sha" "$before_dir"
 checkout_side "$after_sha" "$after_dir"
+install_pinned_toolchains "$before_dir" "$after_dir"
 
 # ---------------------------------------------------------------------------
 # Phase 1: cache restore + builds, overlapping the dataset sync.

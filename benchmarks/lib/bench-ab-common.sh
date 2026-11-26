@@ -101,6 +101,34 @@ checkout_side() {
 }
 
 # ---------------------------------------------------------------------------
+# Toolchains. Each checkout names its own Rust in rust-toolchain.toml, and the
+# first rustc or cargo started inside a checkout whose toolchain or components
+# are missing makes rustup install them. The two sides build in parallel and
+# share one ~/.rustup, so two such installs at once corrupt each other's
+# downloads. Install every checkout's toolchain here, one after the other,
+# before anything builds. With no toolchain named, `rustup toolchain install`
+# installs the active one of the current directory together with the components
+# and targets its rust-toolchain.toml lists, and leaves a complete install
+# untouched. The builds target the host triple, which every toolchain carries,
+# so no further target is needed.
+# ---------------------------------------------------------------------------
+install_pinned_toolchains() {
+    local dir pinned_rustc
+    for dir in "$@"; do
+        echo ">>> installing the Rust toolchain pinned by $dir"
+        if ! (cd "$dir" && rustup toolchain install --no-self-update); then
+            echo "error: rustup could not install the toolchain pinned by $dir/rust-toolchain.toml" >&2
+            exit 1
+        fi
+        if ! pinned_rustc="$(cd "$dir" && rustc -V)"; then
+            echo "error: rustc does not run in $dir after its toolchain install" >&2
+            exit 1
+        fi
+        echo ">>> $dir builds with $pinned_rustc"
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Dataset sync from S3, one directory per scale under $data_bucket. Meant to
 # run backgrounded so the builds overlap it; each finished scale is marked
 # with a .done sentinel that wait_for_scale blocks on. s5cmd parallelises far
