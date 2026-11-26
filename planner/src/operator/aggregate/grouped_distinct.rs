@@ -367,4 +367,50 @@ mod tests {
         assert_eq!(rows[1]["d"].as_i64(), Some(0));
         assert!(rows[1]["sb"].is_null());
     }
+
+    #[rstest]
+    fn count_distinct_beside_global_aggregates(mut testing_planner: TestingPlanner) {
+        let rows = run(
+            &mut testing_planner,
+            "SELECT COUNT(*) AS n, COUNT(b) AS nb, COUNT(DISTINCT s) AS ds, SUM(b) AS sb, \
+             MIN(s) AS mn, AVG(a) AS mean FROM nullable_table",
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["n"], 6);
+        assert_eq!(rows[0]["nb"], 3);
+        assert_eq!(rows[0]["ds"], 3);
+        assert_eq!(rows[0]["sb"], 90);
+        assert_eq!(rows[0]["mn"], "x");
+        assert_eq!(rows[0]["mean"], 3.5);
+    }
+
+    #[rstest]
+    fn count_distinct_of_non_null_column_beside_global_aggregates(
+        mut testing_planner: TestingPlanner,
+    ) {
+        let rows = run(
+            &mut testing_planner,
+            "SELECT CAST(COUNT(*) AS DOUBLE) / COUNT(DISTINCT name) AS per_name, \
+             MAX(c) AS top FROM example_table",
+        );
+
+        assert_eq!(rows[0]["per_name"], 1.25);
+        assert_eq!(rows[0]["top"], 500);
+    }
+
+    #[rstest]
+    fn count_distinct_beside_global_aggregates_over_no_rows(mut testing_planner: TestingPlanner) {
+        let rows = run(
+            &mut testing_planner,
+            "SELECT COUNT(*) AS n, COUNT(b) AS nb, COUNT(DISTINCT s) AS ds, SUM(b) AS sb \
+             FROM nullable_table WHERE a > 100",
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["n"], 0);
+        assert_eq!(rows[0]["nb"], 0);
+        assert_eq!(rows[0]["ds"], 0);
+        assert!(rows[0]["sb"].is_null());
+    }
 }
