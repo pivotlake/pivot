@@ -282,7 +282,58 @@ fn count_column_expr(column: usize, column_type: Type) -> Expression {
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
+    use crate::types::Type;
+    use arrow_array::{ArrayRef, Date32Array, Int32Array, Int64Array, TimestampMicrosecondArray};
     use rstest::rstest;
+    use std::sync::Arc;
+
+    #[rstest]
+    fn grouped_count_distinct_beside_temporal_extremes(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "visits",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "visitor",
+                    Type::Int64,
+                    Arc::new(Int64Array::from(vec![7, 7, 8, 9])),
+                ),
+                (
+                    "day",
+                    Type::Date,
+                    Arc::new(Date32Array::from(vec![19000, 19002, 19001, 19005])),
+                ),
+                (
+                    "ts",
+                    Type::Timestamp,
+                    Arc::new(TimestampMicrosecondArray::from(vec![
+                        3_600_000_000,
+                        60_000_000,
+                        7_200_000_000,
+                        0,
+                    ])),
+                ),
+            ],
+        );
+
+        let mut rows = run(
+            &mut testing_planner,
+            "SELECT g, COUNT(DISTINCT visitor) AS visitors, MAX(day) AS last_day, \
+             MIN(ts) AS first_ts FROM visits GROUP BY g",
+        );
+
+        rows.sort_by_key(|r| r["g"].as_i64().unwrap());
+        assert_eq!(rows[0]["visitors"], 2);
+        assert_eq!(rows[0]["last_day"], "2022-01-10");
+        assert_eq!(rows[0]["first_ts"], "1970-01-01T00:01:00");
+        assert_eq!(rows[1]["visitors"], 1);
+        assert_eq!(rows[1]["last_day"], "2022-01-13");
+        assert_eq!(rows[1]["first_ts"], "1970-01-01T00:00:00");
+    }
 
     #[rstest]
     fn grouped_count_distinct_excludes_nulls(mut testing_planner: TestingPlanner) {
