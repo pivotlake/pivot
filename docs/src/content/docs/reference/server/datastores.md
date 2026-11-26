@@ -127,9 +127,10 @@ datastores:
 | `default` | `false` | Whether this is the [default datastore](#default-datastore). |
 
 Each catalog namespace appears as a schema. Table files are read from the
-locations the catalog reports, using the credentials the catalog vends, or the
-[storage secret](#storage-credentials) whose scope covers the file when it
-vends none. Vended credentials are renewed at every [refresh](#refresh).
+locations the catalog reports, using the credentials the catalog vends (S3
+keys, or a GCS access token), or the [storage secret](#storage-credentials)
+whose scope covers the file when it vends none. Vended credentials are renewed
+at every [refresh](#refresh).
 
 `INSERT` and `COPY` append to a catalog table: the rows are written as Parquet
 files under the table's data path, partitioned as the table's partition spec

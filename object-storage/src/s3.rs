@@ -23,15 +23,15 @@
 //!
 //! The ring's range reads and uploads are signed per request, from the keys
 //! the store holds at that moment: the keys live in a cell the store's owner
-//! renews ([`ObjectStore::renew_s3_credentials`]) when a session's keys near
+//! renews ([`ObjectStore::renew_credentials`]) when a session's keys near
 //! their expiry, and a file opened before the renewal is read on with the new
 //! keys. Nothing is signed ahead of time, so nothing a long query holds can
 //! expire.
 
 use super::{
     DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
-    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, encode_child_key,
-    object_key, parse_iso8601_millis, percent_encode,
+    ObjectVersion, Result, StoreConnection, StoreCredentials, StoreError, absolute_object_key,
+    encode_child_key, object_key, parse_iso8601_millis, percent_encode,
 };
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -348,10 +348,14 @@ impl ObjectStore for S3Store {
         }
     }
 
-    /// An anonymous store has no keys to renew and takes none, rather than
+    /// Takes S3 keys for the endpoint and region this store signs for. An
+    /// anonymous store has no keys to renew and takes none, rather than
     /// silently turning into a signing one. Credentials that name no region
     /// are for the region the store found its bucket in when it was opened.
-    fn renew_s3_credentials(&self, credentials: &S3Credentials) -> bool {
+    fn renew_credentials(&self, credentials: &StoreCredentials) -> bool {
+        let StoreCredentials::S3(credentials) = credentials else {
+            return false;
+        };
         let Some(keys) = &self.keys else {
             return false;
         };
@@ -1030,7 +1034,7 @@ mod tests {
             panic!("a signing store's source carries a signer");
         };
 
-        let renewed = store.renew_s3_credentials(&S3Credentials {
+        let renewed = store.renew_credentials(&StoreCredentials::S3(S3Credentials {
             region: None,
             keys: S3Keys {
                 access_key: "second".to_string(),
@@ -1038,7 +1042,7 @@ mod tests {
                 session_token: Some("second-token".to_string()),
             },
             endpoint: Some("http://objects.example".to_string()),
-        });
+        }));
 
         let signed = auth
             .authenticate("PUT", "/private-bucket/root/part.parquet")
@@ -1072,10 +1076,12 @@ mod tests {
         )
         .unwrap();
 
-        let renewed_for_another_endpoint =
-            store.renew_s3_credentials(&credentials("us-east-1", "http://elsewhere.example"));
-        let renewed_for_another_region =
-            store.renew_s3_credentials(&credentials("eu-west-1", "http://objects.example"));
+        let renewed_for_another_endpoint = store.renew_credentials(&StoreCredentials::S3(
+            credentials("us-east-1", "http://elsewhere.example"),
+        ));
+        let renewed_for_another_region = store.renew_credentials(&StoreCredentials::S3(
+            credentials("eu-west-1", "http://objects.example"),
+        ));
 
         assert!(!renewed_for_another_endpoint);
         assert!(!renewed_for_another_region);
@@ -1095,7 +1101,7 @@ mod tests {
         )
         .unwrap();
 
-        let renewed = store.renew_s3_credentials(&S3Credentials {
+        let renewed = store.renew_credentials(&StoreCredentials::S3(S3Credentials {
             region: Some("us-east-1".to_string()),
             keys: S3Keys {
                 access_key: "access".to_string(),
@@ -1103,7 +1109,7 @@ mod tests {
                 session_token: None,
             },
             endpoint: Some("http://objects.example".to_string()),
-        });
+        }));
 
         assert!(!renewed);
         assert!(store.is_anonymous());

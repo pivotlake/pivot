@@ -32,7 +32,7 @@ mod object_path;
 mod s3;
 #[cfg(feature = "test-support")]
 pub mod test_support;
-pub use gcs::GcsStore;
+pub use gcs::{GcsStore, GcsToken};
 pub use instance_bandwidth::{
     INSTANCE_METADATA_ENDPOINT, InstanceBandwidth, InstanceBandwidthError,
     find_instance_type_bandwidth, look_up_instance_bandwidth,
@@ -346,16 +346,24 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// and credentials without adding that client's dependencies here.
     fn connection(&self) -> StoreConnection;
 
-    /// Sign with the keys of `credentials` from now on, when this store signs
-    /// S3 requests for the endpoint and region they are for. Every request
-    /// signed after that carries them, from a file opened before as much as
-    /// one opened after, so a session's keys nearing their expiry are renewed
-    /// under the queries reading and writing through the store. Returns
-    /// whether the store took them; one that did not is left as it was. Only
-    /// an S3 store signs with such keys, so the default takes none.
-    fn renew_s3_credentials(&self, _credentials: &S3Credentials) -> bool {
+    /// Authenticate with `credentials` from now on, when they are of the kind
+    /// this store was opened with and for the place it was opened for. Every
+    /// request sent after that carries them, from a file opened before as
+    /// much as one opened after, so a session's credentials nearing their
+    /// expiry are renewed under the queries reading and writing through the
+    /// store. Returns whether the store took them; one that did not is left
+    /// as it was. The default takes none.
+    fn renew_credentials(&self, _credentials: &StoreCredentials) -> bool {
         false
     }
+}
+
+/// Credentials handed to a store from outside, such as the ones a catalog
+/// vends for a table: what a store is opened with, and what
+/// [`ObjectStore::renew_credentials`] replaces them with.
+pub enum StoreCredentials {
+    S3(S3Credentials),
+    Gcs(GcsToken),
 }
 
 /// Resolved backend settings, shared with adapters that need to address the

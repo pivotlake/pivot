@@ -110,16 +110,17 @@
 //!
 //! Every table load asks the catalog to vend storage credentials
 //! (`X-Iceberg-Access-Delegation: vended-credentials`). A catalog that does
-//! answers with S3 keys in the table's storage properties, and the table's
-//! store signs its requests with them. Those keys are usually an STS
-//! session's, short-lived, and scoped to the table, so every refresh loads
-//! the table again and renews the keys of its store in place: a query that
-//! outlives the keys it started with signs its next request with the new
-//! ones. The refresh interval must therefore stay shorter than the keys'
-//! lifetime. A catalog that vends nothing leaves the store to the factory
-//! the datastore was opened with, the process's own credential policy. Only
-//! the flat `s3.*` form is read; the per-prefix `storage-credentials` list is
-//! not.
+//! answers with credentials in the table's storage properties, S3 keys for a
+//! table on S3 or an OAuth2 token for one on GCS, and the table's store
+//! authenticates its requests with them. They are usually a session's,
+//! short-lived, and scoped to the table, so every refresh loads the table
+//! again and renews the credentials of its store in place: a query that
+//! outlives the ones it started with sends its next request with the new
+//! ones. The refresh interval must therefore stay shorter than their
+//! lifetime. A catalog that vends nothing for the table's backend leaves the
+//! store to the factory the datastore was opened with, the process's own
+//! credential policy. Only the flat `s3.*` and `gcs.oauth2.*` forms are read;
+//! the per-prefix `storage-credentials` list is not.
 //!
 //! A table's files are read through one store, the bucket its metadata file
 //! is in. The managed catalogs keep a table in one bucket; a table split
@@ -226,6 +227,8 @@ pub enum Error {
     MissingMetadataObject { table: String, path: String },
     #[error("table `{table}` was vended an S3 access key without its secret key, or the reverse")]
     IncompleteVendedCredentials { table: String },
+    #[error("table `{table}` was vended a GCS token that cannot be used: {reason}")]
+    InvalidVendedGcsToken { table: String, reason: String },
     #[error(
         "table `{table}` partition spec id changed from {bound} to {current} while the insert ran; its files were cut by the previous spec"
     )]
