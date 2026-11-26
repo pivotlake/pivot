@@ -20,6 +20,7 @@ use crate::types::filter_mask::FilterMask;
 use crate::types::metadata::QueryRowGroupMetadata;
 use bytes::Bytes;
 use dispatch::WorkerIdOutput;
+use dispatch::memory::CacheKey;
 use std::fmt::{Debug, Formatter};
 
 /// A page read from disk whose payload is still compressed.
@@ -129,6 +130,10 @@ impl Debug for DecompressedPageType {
 /// row group, column, and page index) so the downstream decoder can correlate
 /// the page with the correct column builder.
 pub struct DecompressedPage {
+    /// The key under which the decompressed cache holds the page's bytes.
+    /// `None` for a page it does not hold: one stored uncompressed, whose
+    /// bytes are the file's own, and one without bytes.
+    pub cache_key: Option<CacheKey>,
     /// Worker that owns this page.
     pub worker_id: usize,
     /// Row-group-level query metadata.

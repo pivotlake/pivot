@@ -87,6 +87,7 @@ mod tests {
     ) -> DecompressedPage {
         let header = PageHeader::for_data_page(num_values as i32, encoding);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,

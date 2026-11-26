@@ -32,8 +32,21 @@ use crate::reading::DECODE_RANGE_ROWS;
 use crate::types::leaves::projected_leaves;
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use crate::writing::compacting::read::output::InputValues;
+use crate::writing::compacting::read::pipeline::gated_reads::SORT_KEY_RANGE_ROWS;
 use crate::writing::compacting::read::row_order::key_merge::{RowGroupKeyBounds, SortKeyBounds};
 use crate::writing::error::{WriteError, WriteResult};
+
+/// The fewest rows of a read that are released at a time, unless the
+/// place in the output of fewer of them is decided. Rows are
+/// released as the output takes them, and when many files are merged
+/// together it takes few rows of each at a time: a release of a handful
+/// of rows would cost more to pass through the pipeline than to decode.
+const LEAST_ROWS_RELEASED: u32 = 1024;
+
+/// The most rows of a read that are released at a time while memory has
+/// room for work ahead, when more are asked for or the place in the
+/// output of more is decided: as many as a scan decodes in one go.
+const MOST_ROWS_RELEASED_AHEAD: u32 = DECODE_RANGE_ROWS;
 
 /// What the decoded values of a column own, as its type says.
 ///
@@ -108,11 +121,16 @@ pub(crate) struct ColumnRead {
     decoded_size: DecodedSize,
     /// How many rows the row group holds.
     row_count: u32,
+    /// Whether the files are sorted by the column. The merge compares the
+    /// keys of the same rows of every sort column, so the rows of a sort
+    /// column are released in ranges of the same rows in each:
+    /// [`SORT_KEY_RANGE_ROWS`] at a time. How many keys the merge will need
+    /// is not known before it has compared them.
+    is_sort_column: bool,
     /// Whether the column's chunk was requested from the pipeline.
     pub(crate) is_requested: bool,
     /// Every row before this one was released to be decompressed and
-    /// decoded. It is the end of a range of rows the decoder decodes in
-    /// one go, or the end of the row group.
+    /// decoded.
     released_rows_end: u32,
     /// How many released rows have not arrived decoded yet.
     awaited_row_count: u32,
@@ -131,7 +149,13 @@ impl ColumnRead {
     /// the list of row groups of `table`, with nothing requested yet. The
     /// chunk's sizes are the footer's, summed over the column's leaves.
     /// The decoded size is that of the column's type in this row group.
-    fn new(table: &ParquetTable, row_group: usize, column: usize) -> WriteResult<Self> {
+    /// `is_sort_column` says whether the files are sorted by the column.
+    fn new(
+        table: &ParquetTable,
+        row_group: usize,
+        column: usize,
+        is_sort_column: bool,
+    ) -> WriteResult<Self> {
         let row_group = QueryRowGroupMetadata::new(table, row_group, RowSelection::All);
         let fields = row_group.get_metadata().schema.fields();
         let mut compressed_bytes = 0;
@@ -149,6 +173,7 @@ impl ColumnRead {
             decompressed_bytes_per_row: decompressed_bytes.div_ceil(row_count.max(1)),
             decoded_size: DecodedSize::compute_for_field(&fields[column])?,
             row_count: row_count as u32,
+            is_sort_column,
             is_requested: false,
             released_rows_end: 0,
             awaited_row_count: 0,
@@ -159,14 +184,34 @@ impl ColumnRead {
     }
 
     /// The end of the released rows if every row before `rows_end` were
-    /// released: `rows_end` rounded up to the end of the range of rows it
-    /// falls in, since a range is decoded whole. Never before the rows
-    /// already released.
-    fn find_released_rows_end_for(&self, rows_end: u32) -> u32 {
-        rows_end
-            .next_multiple_of(DECODE_RANGE_ROWS)
-            .min(self.row_count)
-            .max(self.released_rows_end)
+    /// released: `rows_end`, or [`LEAST_ROWS_RELEASED`] rows past the rows
+    /// already released if that is further, but not past
+    /// `ordered_rows_end`. That is the end of the rows whose place in the
+    /// output is decided: no row is decoded before that, since it would
+    /// stay in memory, decoded, for nobody knows how long. For a sort
+    /// column, whose rows are decoded to decide just that,
+    /// `rows_end` rounded up to the end of the range of
+    /// [`SORT_KEY_RANGE_ROWS`] rows it falls in. Where the rows already
+    /// released end, if those include `rows_end`.
+    fn find_released_rows_end_for(&self, rows_end: u32, ordered_rows_end: u32) -> u32 {
+        if rows_end <= self.released_rows_end {
+            return self.released_rows_end;
+        }
+        if self.is_sort_column {
+            return rows_end
+                .next_multiple_of(SORT_KEY_RANGE_ROWS)
+                .min(self.row_count);
+        }
+        let least_rows_end = (self.released_rows_end + LEAST_ROWS_RELEASED).min(ordered_rows_end);
+        rows_end.max(least_rows_end)
+    }
+
+    /// Estimate how many bytes `row_count` more rows will hold once they
+    /// are released: their decompressed pages, from the chunk's average
+    /// size per row, and the most their decoded values can own.
+    fn estimate_bytes_of_released_rows(&self, row_count: u32) -> usize {
+        let row_count = row_count as usize;
+        row_count * self.decompressed_bytes_per_row + self.decoded_size.count_bytes(row_count)
     }
 
     /// Keep `values`, decoded values of the column that arrived, whose
@@ -247,31 +292,60 @@ impl FileRowGroup {
     ///
     /// Only the pages are an estimate, from the chunk's average
     /// decompressed size per row: the sizes of its pages are not known
-    /// before it is fetched.
-    fn estimate_bytes_to_decode(&self, column: usize, rows_end: u32) -> usize {
+    /// before it is fetched. `ordered_rows_end` is the end of the rows
+    /// whose place in the output is decided (see
+    /// [`ColumnRead::find_released_rows_end_for`]).
+    fn estimate_bytes_to_decode(
+        &self,
+        column: usize,
+        rows_end: u32,
+        ordered_rows_end: u32,
+    ) -> usize {
         let read = &self.columns[column];
         let unrequested_bytes = match read.is_requested {
             true => 0,
             false => read.compressed_bytes,
         };
         let new_rows =
-            (read.find_released_rows_end_for(rows_end) - read.released_rows_end) as usize;
-        unrequested_bytes
-            + new_rows * read.decompressed_bytes_per_row
-            + read.decoded_size.count_bytes(new_rows)
+            read.find_released_rows_end_for(rows_end, ordered_rows_end) - read.released_rows_end;
+        unrequested_bytes + read.estimate_bytes_of_released_rows(new_rows)
     }
 
     /// Let every row of table column `column` before `rows_end` be
     /// decompressed and decoded, requesting the column's chunk first if it
     /// was not requested.
     ///
-    /// Rows are decoded in whole ranges, so the rows up to the end of the
-    /// range that `rows_end` falls in are released. The most their decoded
-    /// values can own is counted as held from here on.
-    fn start_decoding_rows(&mut self, column: usize, rows_end: u32, requests: &mut ReadRequests) {
+    /// The rows asked for are released, and no fewer than
+    /// [`LEAST_ROWS_RELEASED`] unless that reaches past `ordered_rows_end`,
+    /// the end of the rows whose place in the output is decided. While
+    /// the memory budget has room for work ahead, the rows after them up
+    /// to there are released too, [`MOST_ROWS_RELEASED_AHEAD`] rows in
+    /// all: the output takes them next, and more rows decoded in one go
+    /// cost less per row. Without that room, rows released beyond those
+    /// asked for would only stay in memory, decoded, until the output
+    /// gets to them. The most the
+    /// decoded values of the released rows can own is counted as held
+    /// from here on.
+    fn start_decoding_rows(
+        &mut self,
+        column: usize,
+        rows_end: u32,
+        ordered_rows_end: u32,
+        requests: &mut ReadRequests,
+    ) {
         self.request_column(column, requests);
         let read = &mut self.columns[column];
-        let released_rows_end = read.find_released_rows_end_for(rows_end);
+        let asked_rows_end = read.find_released_rows_end_for(rows_end, ordered_rows_end);
+        let ahead_rows_end = (read.released_rows_end + MOST_ROWS_RELEASED_AHEAD)
+            .min(ordered_rows_end)
+            .max(asked_rows_end);
+        let ahead_bytes =
+            read.estimate_bytes_of_released_rows(ahead_rows_end - read.released_rows_end);
+        let has_room_ahead = requests.memory_budget.has_room_ahead_for(ahead_bytes);
+        let released_rows_end = match has_room_ahead {
+            true => ahead_rows_end,
+            false => asked_rows_end,
+        };
         let new_row_count = released_rows_end - read.released_rows_end;
         let decoded_bytes = read.decoded_size.count_bytes(new_row_count as usize);
         read.released_rows_end = released_rows_end;
@@ -328,8 +402,12 @@ impl InputFile {
     /// A table lists the row groups of all its files in one list, each
     /// file's row groups together and in file order. A row group whose index
     /// within its file is not higher than the previous row group's therefore
-    /// starts a new file.
-    pub(crate) fn list_files_of(table: &ParquetTable) -> WriteResult<Vec<InputFile>> {
+    /// starts a new file. `sort_columns` are the table columns the files
+    /// are sorted by.
+    pub(crate) fn list_files_of(
+        table: &ParquetTable,
+        sort_columns: &[usize],
+    ) -> WriteResult<Vec<InputFile>> {
         let column_count = table.schema().fields().len();
         let mut files: Vec<InputFile> = Vec::new();
         let mut previous_index_in_file = None;
@@ -350,7 +428,10 @@ impl InputFile {
                     table_index,
                     rows: first_row..first_row + row_group_rows,
                     columns: (0..column_count)
-                        .map(|column| ColumnRead::new(table, table_index, column))
+                        .map(|column| {
+                            let is_sort_column = sort_columns.contains(&column);
+                            ColumnRead::new(table, table_index, column, is_sort_column)
+                        })
                         .collect::<WriteResult<_>>()?,
                 });
             }
@@ -428,8 +509,16 @@ impl InputFile {
 
     /// Estimate how many more bytes will be held if every file row of
     /// table column `column` before `rows_end` is decoded (see
-    /// [`FileRowGroup::estimate_bytes_to_decode`]).
-    pub(crate) fn estimate_bytes_to_decode(&self, column: usize, rows_end: u64) -> usize {
+    /// [`FileRowGroup::estimate_bytes_to_decode`]). `ordered_rows_end` is
+    /// the file row right after the last whose place in the output is
+    /// decided, or `rows_end` for the rows of a sort column, which are
+    /// decoded to decide it.
+    pub(crate) fn estimate_bytes_to_decode(
+        &self,
+        column: usize,
+        rows_end: u64,
+        ordered_rows_end: u64,
+    ) -> usize {
         let released_rows_end = self.find_released_rows_end(column);
         if rows_end <= released_rows_end {
             return 0;
@@ -438,7 +527,8 @@ impl InputFile {
             .iter()
             .map(|row_group| {
                 let rows_end = row_group.find_rows_end_within(rows_end);
-                row_group.estimate_bytes_to_decode(column, rows_end)
+                let ordered_rows_end = row_group.find_rows_end_within(ordered_rows_end);
+                row_group.estimate_bytes_to_decode(column, rows_end, ordered_rows_end)
             })
             .sum()
     }
@@ -446,11 +536,15 @@ impl InputFile {
     /// Let every file row of table column `column` before `rows_end` be
     /// decompressed and decoded, requesting the chunks that hold them first
     /// if they were not requested. Does nothing for rows that were released
-    /// before. Returns whether any row was released.
+    /// before. Returns whether any row was released. `ordered_rows_end` is
+    /// the file row right after the last whose place in the output is
+    /// decided, or `rows_end` for the rows of a sort column, which are
+    /// decoded to decide it: no other row past it is released.
     pub(crate) fn start_decoding_rows(
         &mut self,
         column: usize,
         rows_end: u64,
+        ordered_rows_end: u64,
         requests: &mut ReadRequests,
     ) -> bool {
         let released_rows_end = self.find_released_rows_end(column);
@@ -460,7 +554,8 @@ impl InputFile {
         let row_groups = self.find_row_groups_of_rows(&(released_rows_end..rows_end));
         for row_group in &mut self.row_groups[row_groups] {
             let rows_end = row_group.find_rows_end_within(rows_end);
-            row_group.start_decoding_rows(column, rows_end, requests);
+            let ordered_rows_end = row_group.find_rows_end_within(ordered_rows_end);
+            row_group.start_decoding_rows(column, rows_end, ordered_rows_end, requests);
         }
         true
     }

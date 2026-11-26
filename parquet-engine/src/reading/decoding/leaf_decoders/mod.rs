@@ -131,6 +131,17 @@ pub trait LeafDecoder {
     /// that do not follow the ones it has emitted.
     fn restart_at_page(&mut self, page_idx: usize);
 
+    /// Lets go of the bytes of the page being read and keeps the place in
+    /// them, so that the decoder holds no page while it waits for its
+    /// next rows. It reads again once
+    /// [`take_back_page_bytes`](Self::take_back_page_bytes) has given the
+    /// bytes back.
+    fn let_go_of_page_bytes(&mut self);
+
+    /// Takes back, as `data`, the bytes of the page being read: the bytes
+    /// it let go of, in buffers that may be cut differently.
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>);
+
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
 
@@ -197,6 +208,13 @@ pub trait DecodePlain {
 
     /// Advances past `size` values without decoding them.
     fn skip(&mut self, size: usize);
+
+    /// Lets go of the page's bytes and keeps the place in them.
+    fn let_go_of_page_bytes(&mut self);
+
+    /// Takes back, as `data`, the bytes it let go of, in buffers that may
+    /// be cut differently.
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>);
 }
 
 /// Reads values stored in one of the encodings besides PLAIN and the
@@ -217,6 +235,13 @@ pub trait DecodeEncoding: Sized {
     /// Advances past `size` values. A delta decoder still decodes them,
     /// because each delta is relative to the one before it.
     fn skip(&mut self, size: usize);
+
+    /// Lets go of the page's bytes and keeps the place in them.
+    fn let_go_of_page_bytes(&mut self);
+
+    /// Takes back, as `data`, the bytes it let go of, in buffers that may
+    /// be cut differently.
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>);
 }
 
 /// The decoder a [`LeafType`] names for an encoding it does not read. It has
@@ -236,6 +261,14 @@ impl<B: ArrayBuilder> DecodeEncoding for Unsupported<B> {
     }
 
     fn skip(&mut self, _size: usize) {
+        match self.0 {}
+    }
+
+    fn let_go_of_page_bytes(&mut self) {
+        match self.0 {}
+    }
+
+    fn take_back_page_bytes(&mut self, _data: Vec<Bytes>) {
         match self.0 {}
     }
 }

@@ -93,7 +93,7 @@ impl ReadRequests {
     /// group at `row_group` be decompressed and decoded. The rows that this
     /// newly lets through are counted as held from here on, at
     /// `decoded_bytes`, the most their decoded values can own. The gates
-    /// that hold some of those rows learn of it when
+    /// and cutters that hold some of those rows learn of it when
     /// [`wake_gates_after_releases`](Self::wake_gates_after_releases) is
     /// called.
     pub(crate) fn release_rows_before(
@@ -110,7 +110,7 @@ impl ReadRequests {
     }
 
     /// If rows were released since the last call, wake the workers whose
-    /// gates hold pages or ranges, so that they look again at what is
+    /// gates and cutters hold pages, so that they look again at what is
     /// released.
     pub(crate) fn wake_gates_after_releases(&mut self) {
         if std::mem::take(&mut self.has_releases_to_wake_gates_for) {
@@ -118,7 +118,7 @@ impl ReadRequests {
             self.gated_reads
                 .waiting_decompress_gates
                 .wake_all(waker_set);
-            self.gated_reads.waiting_decode_gates.wake_all(waker_set);
+            self.gated_reads.waiting_cutters.wake_all(waker_set);
         }
     }
 

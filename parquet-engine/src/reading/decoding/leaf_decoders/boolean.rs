@@ -76,6 +76,16 @@ impl BooleanPlainDecoder {
 impl DecodePlain for BooleanPlainDecoder {
     type Builder = BooleanBuilder;
 
+    fn let_go_of_page_bytes(&mut self) {
+        self.position = self.position.flatten_over(&self.data);
+        self.data = Vec::new();
+    }
+
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>) {
+        self.position = self.position.spread_over(&data);
+        self.data = data;
+    }
+
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {
             data,
@@ -165,6 +175,14 @@ fn decode_varint(bytes: &[u8]) -> (usize, usize) {
 
 impl DecodeEncoding for BooleanRleDecoder {
     type Builder = BooleanBuilder;
+
+    fn let_go_of_page_bytes(&mut self) {
+        self.bits.let_go_of_page_bytes();
+    }
+
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>) {
+        self.bits.take_back_page_bytes(data);
+    }
 
     fn new(data: Vec<Bytes>, mut position: ReaderPosition) -> Option<Self> {
         // The stream's byte length leads it. The page's value count already
@@ -336,6 +354,7 @@ mod tests {
     ) -> DecompressedPage {
         let header = PageHeader::for_data_page(num_values as i32, encoding);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,

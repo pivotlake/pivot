@@ -25,6 +25,35 @@ pub struct ReaderPosition {
     pub offset: usize,
 }
 
+impl ReaderPosition {
+    /// The same place in `buffers` as a position in the one buffer they
+    /// would make end to end: its `offset` counts from their first byte.
+    /// A reader keeps its place this way while it does not hold the
+    /// buffers, and gets it back with [`spread_over`](Self::spread_over).
+    pub fn flatten_over(self, buffers: &[Bytes]) -> Self {
+        let buffers_before = buffers.iter().take(self.buffer_index);
+        Self {
+            buffer_index: 0,
+            offset: buffers_before.map(Bytes::len).sum::<usize>() + self.offset,
+        }
+    }
+
+    /// The place in `buffers` of a position that
+    /// [`flatten_over`](Self::flatten_over) made of the same bytes, however
+    /// they are cut into buffers now. It is in the buffer that holds the
+    /// next byte to read, or at the end of the last buffer.
+    pub fn spread_over(self, buffers: &[Bytes]) -> Self {
+        let mut position = self;
+        while position.buffer_index + 1 < buffers.len()
+            && position.offset >= buffers[position.buffer_index].len()
+        {
+            position.offset -= buffers[position.buffer_index].len();
+            position.buffer_index += 1;
+        }
+        position
+    }
+}
+
 /// A cursor for reading across scattered `Bytes` buffers as a contiguous byte stream.
 ///
 /// Holds a direct slice reference (`cur`) to the remaining bytes in the current buffer,

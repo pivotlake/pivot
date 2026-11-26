@@ -31,6 +31,10 @@ enum ColumnReference {
     /// The file has no chunk for the leaf (see [`ColumnChunkMeta::absent`]):
     /// nothing is read for it, and its column of the buffer comes back empty.
     Absent,
+    /// The read asks for a stretch of another leaf's pages (see
+    /// [`PageStretch`](crate::types::metadata::PageStretch)): nothing is
+    /// read for this leaf.
+    NotAskedFor,
 }
 
 enum ColumnChunkReference {
@@ -69,6 +73,8 @@ impl RowGroupRequest {
     /// Build a request for all projected columns in the given row group: each
     /// chunk is looked up in the decompressed cache, the pages it holds are
     /// taken, pinned, and the stretches between them become ranges to read.
+    /// A read that asks for a stretch of pages looks up and reads that
+    /// stretch of its leaf alone.
     /// The projected columns are the column the read names, or those of
     /// `scan_projection` when it names none.
     pub fn from(metadata_handle: QueryRowGroupMetadata, scan_projection: &Projection) -> Self {
@@ -81,15 +87,23 @@ impl RowGroupRequest {
         let fields = metadata_handle.get_metadata().schema.fields();
         let leaves = projected_leaves(fields, &metadata_handle, &projection);
 
+        let page_stretch = metadata_handle.page_stretch();
         let planned = leaves
             .iter()
-            .map(|&leaf| {
+            .enumerate()
+            .map(|(position, &leaf)| {
                 let meta: &ColumnChunkMeta = &columns[leaf];
                 if meta.absent {
                     return ColumnReference::Absent;
                 }
-                let offset = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize;
-                let len = meta.total_compressed_size as usize;
+                let (offset, len) = match page_stretch {
+                    Some(stretch) if stretch.leaf == position => (stretch.file_offset, stretch.len),
+                    Some(_) => return ColumnReference::NotAskedFor,
+                    None => (
+                        meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize,
+                        meta.total_compressed_size as usize,
+                    ),
+                };
                 ColumnReference::InFile {
                     codec: meta.codec,
                     parts: memory_ctx()
@@ -147,7 +161,7 @@ impl RowGroupRequest {
             .iter()
             .flat_map(|column| match column {
                 ColumnReference::InFile { parts, .. } => parts.as_slice(),
-                ColumnReference::Absent => &[],
+                ColumnReference::Absent | ColumnReference::NotAskedFor => &[],
             })
             .filter_map(|part| match part {
                 ColumnChunkReference::ToRead(range) => Some(*range),
@@ -174,6 +188,8 @@ impl RowGroupRequest {
     /// `response`, `None` for a request that [reads nothing](Self::reads_nothing).
     /// Runs on the claiming worker (the fetcher emits from the worker that
     /// admitted the request), so the buffer records it as the decode owner.
+    /// The pages of a read that asks for a stretch of pages again go to the
+    /// worker the stretch names instead, which holds the rest of the read.
     ///
     /// `read_ahead_charge` is what the claim counts against its worker's
     /// read-ahead budget, `None` for a row group that was expected to be in
@@ -184,6 +200,10 @@ impl RowGroupRequest {
         response: Option<ReadResponse>,
         read_ahead_charge: Option<ReadAheadCharge>,
     ) -> RowGroupBuffer {
+        let worker_id = match self.metadata.page_stretch() {
+            Some(page_stretch) => page_stretch.worker,
+            None => dispatch::worker::WORKER_IDX.get(),
+        };
         let mut resolved = response
             .map(|response| response.into_locations())
             .unwrap_or_default()
@@ -211,6 +231,7 @@ impl RowGroupRequest {
                         .collect(),
                 },
                 ColumnReference::Absent => ColumnBuffer::Absent,
+                ColumnReference::NotAskedFor => ColumnBuffer::NotAskedFor,
             })
             .collect();
         assert!(
@@ -220,7 +241,7 @@ impl RowGroupRequest {
         RowGroupBuffer {
             metadata: self.metadata,
             columns,
-            worker_id: dispatch::worker::WORKER_IDX.get(),
+            worker_id,
             read_ahead_charge,
         }
     }
@@ -255,4 +276,7 @@ pub enum ColumnBuffer {
     /// nothing was read, and the indexer stands in one page spanning every row
     /// so the column decodes as NULL.
     Absent,
+    /// A leaf of a read that asks for a stretch of another leaf's pages:
+    /// nothing was read, and the indexer makes no page of it.
+    NotAskedFor,
 }

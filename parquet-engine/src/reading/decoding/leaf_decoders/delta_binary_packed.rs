@@ -131,6 +131,16 @@ where
 {
     type Builder = PrimitiveBuilder<T>;
 
+    fn let_go_of_page_bytes(&mut self) {
+        self.position = self.position.flatten_over(&self.data);
+        self.data = Vec::new();
+    }
+
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>) {
+        self.position = self.position.spread_over(&data);
+        self.data = data;
+    }
+
     fn new(data: Vec<Bytes>, mut position: ReaderPosition) -> Option<Self> {
         let (block_size, miniblocks_per_block, total_values, first_value) = {
             let mut reader = MultiBufferReader::new(&data, &mut position);

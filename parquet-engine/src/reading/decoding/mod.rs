@@ -84,17 +84,21 @@ pub struct DecoderFactory {
     pub add_row_group_metadata: bool,
     /// The worker's allocator for decoded batches.
     pub allocator: Arc<WorkerAllocator>,
+    /// Whether a read's decoder lets go of the bytes of the pages it is in
+    /// between two ranges, keeping its place in them. A reader whose next
+    /// range of a read may be long in coming asks for this, and brings
+    /// the pages back with that range.
+    pub lets_go_of_pages_between_ranges: bool,
 }
 
 impl UnaryFactory<DecodeRange, RecordBatch> for DecoderFactory {
     type Unary = Decoder;
 
     fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self::Unary> {
-        Built::new(Decoder::new(
-            self.batch_size,
-            self.add_row_group_metadata,
-            self.allocator,
-        ))
+        Built::new(Decoder {
+            lets_go_of_pages_between_ranges: self.lets_go_of_pages_between_ranges,
+            ..Decoder::new(self.batch_size, self.add_row_group_metadata, self.allocator)
+        })
     }
 }
 
@@ -123,6 +127,8 @@ pub struct Decoder {
     /// Decoders that finished a range, kept for the row group's next range.
     idle: Vec<RowGroupDecoder>,
     add_row_group_metadata: bool,
+    /// Whether an idle decoder lets go of the bytes of the pages it is in.
+    lets_go_of_pages_between_ranges: bool,
     /// Accumulates the live rows of partially deleted batches until a full
     /// batch of them is ready, all of one row group: a batch carries one.
     live_row_accumulator: Option<LiveRowAccumulator>,
@@ -146,6 +152,7 @@ impl Decoder {
             active: None,
             idle: Vec::new(),
             add_row_group_metadata,
+            lets_go_of_pages_between_ranges: false,
             live_row_accumulator: None,
         }
     }
@@ -258,6 +265,9 @@ impl Decoder {
         if decoder.exhausted() {
             let mut decoder = self.active.take().unwrap();
             decoder.finish_range().decoded();
+            if self.lets_go_of_pages_between_ranges {
+                decoder.let_go_of_page_bytes();
+            }
             self.idle.push(decoder);
             // A row group whose ranges are all decoded gets no further range
             // on any worker; its decoders go, and with them the pages they
@@ -392,6 +402,7 @@ pub(crate) mod tests {
     ) -> DecompressedPage {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: metadata,
             column_idx,
@@ -414,6 +425,7 @@ pub(crate) mod tests {
     ) -> DecompressedPage {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: metadata,
             column_idx,
@@ -485,6 +497,7 @@ pub(crate) mod tests {
         }
         let header = PageHeader::for_dict_page(entries.len() as i32);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: metadata,
             column_idx,
@@ -512,6 +525,7 @@ pub(crate) mod tests {
         }
         let header = PageHeader::for_data_page(keys.len() as i32, Encoding::RLE_DICTIONARY);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: metadata,
             column_idx,

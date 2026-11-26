@@ -102,8 +102,12 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
     }
 
     /// What `row_group` counts against a read-ahead budget: its whole
-    /// projected size.
+    /// projected size, or the size of the stretch of pages it asks for
+    /// again.
     fn compute_projected_bytes(&self, row_group: &QueryRowGroupMetadata) -> usize {
+        if let Some(page_stretch) = row_group.page_stretch() {
+            return page_stretch.len;
+        }
         let projected_bytes: i64 = row_group
             .resolve_projection(&self.projection)
             .indices()

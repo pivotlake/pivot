@@ -1,13 +1,14 @@
 //! The read half of a compaction: its input files, read in merge order.
 //!
 //! The read fetches, decompresses and decodes with the operators a scan
-//! uses. It adds two gates that hold their input back, and the compacter
-//! that decides what is requested and what the gates let through.
+//! uses, but for the cutter. It adds a gate and a cutter that keep their
+//! input back, and the compacter that decides what is requested and what
+//! those two let through.
 //!
 //! The dataflow, one box per operator. A solid arrow is the channel between
 //! two operators, labelled with the type it carries. A dashed arrow is the
 //! compacter putting requests into the request queue, or releasing rows at
-//! a gate.
+//! the gate and the cutter.
 //!
 //! ```text
 //!                 ┌──────────────────────────┐
@@ -26,8 +27,8 @@
 //!   │                          │ CompressedPage
 //!                              ▼
 //!   │             ┌──────────────────────────┐
-//!     ┌ ─ ─ ─ ─ ─▶│      DecompressGate      │  any worker; holds a page
-//!   │             └──────────────────────────┘  until a row of it is released
+//!     ┌ ─ ─ ─ ─ ─▶│      DecompressGate      │  any worker; lets a page on
+//!   │             └──────────────────────────┘  once a row of it is released
 //!     │                        │ CompressedPage
 //!   │                          ▼
 //!     │           ┌──────────────────────────┐
@@ -40,18 +41,13 @@
 //!   │             └──────────────────────────┘  holds its bytes
 //!     │                        │ DecompressedPage
 //!   │                          ▼
-//!   │             ┌──────────────────────────┐  the worker that fetched;
-//!     │           │       RangeCutter        │  builds the dictionary, cuts
-//!   │             └──────────────────────────┘  ranges of 16K rows
-//!     │                        │ DecodeRange
-//!   │                          ▼
-//!     │           ┌──────────────────────────┐
-//!   │ ├ ─ ─ ─ ─ ─▶│        DecodeGate        │  any worker; holds a range
-//!     │           └──────────────────────────┘  until it is released
+//!     │           ┌──────────────────────────┐  the worker that fetched;
+//!   │ ├ ─ ─ ─ ─ ─▶│    ReleasedRowsCutter    │  builds the dictionary, cuts
+//!     │           └──────────────────────────┘  the rows that are released
 //!   │                          │ DecodeRange
 //!     │                        ▼
 //!   │             ┌──────────────────────────┐
-//!     │           │         Decoder          │  any worker
+//!     │           │         Decoder          │  the worker that fetched
 //!   │             └──────────────────────────┘
 //!     │                        │ RecordBatch, then DecodedValues
 //!   │                          ▼
@@ -66,8 +62,12 @@
 //!
 //! Every column is read on its own. A *read* is one column of one input row
 //! group. It is requested once and its chunk is fetched whole. Its pages
-//! then wait at the `DecompressGate`, and are decompressed and decoded a
-//! range of rows at a time as the compacter releases its rows. How many
+//! go on from the `DecompressGate`, to be decompressed and decoded, as the
+//! compacter releases its rows, the rows of each release in one go: a
+//! release is of the rows the output takes next. A page that waits for
+//! its rows is not held: the gate and the cutter keep where it lies, the
+//! caches keep its bytes while nothing else needs their memory, and it is
+//! read again if they did not (see [`pipeline`]). How many
 //! columns are read at once is not decided up front: the compacter starts a
 //! column's rows when the memory budget has room for them.
 //!
@@ -92,7 +92,7 @@
 //!   keeps the decoded values until they are sent on.
 //! - [`input::read_requests`]: what the files share to send their requests and
 //!   releases into the pipeline.
-//! - [`pipeline`]: the two gates,
+//! - [`pipeline`]: the gate and the cutter,
 //!   and how the compacter releases rows to them.
 //! - [`memory_budget`](super::memory_budget): the count of every byte the read holds. What can
 //!   outlive the compacter carries its count with it and gives it back
@@ -109,13 +109,12 @@ pub(crate) mod pipeline;
 pub(crate) mod row_order;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
-    channel_input, return_to_worker_mpsc, shared_work_queue, stealable, stealable_fifo,
-    to_single_worker_mpsc,
+    SharedWorkQueueChannelFactory, SharedWorkQueueSender, channel_input, return_to_worker_mpsc,
+    shared_work_queue, stealable, stealable_fifo, to_single_worker_mpsc,
 };
 
 use super::into_dataflow_error;
@@ -125,17 +124,17 @@ use crate::types::metadata::QueryRowGroupMetadata;
 use crate::writing::error::WriteError;
 use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
-    IndexerFactory, RangeCutterFactory, RowGroupBuffer, RowGroupFetcherFactory, WorkerAllocator,
+    IndexerFactory, RowGroupBuffer, RowGroupFetcherFactory, WorkerAllocator,
 };
 use compacter::MergeSortCompacter;
 use compaction_read::CompactionRead;
 use input::decoded_values::DecodedValues;
 use input::read_requests::ReadRequests;
 use output::MergedBatchColumn;
-use pipeline::decode_gate::DecodeGate;
 use pipeline::decompress_gate::DecompressGate;
 use pipeline::gated_reads::GatedReads;
 use pipeline::page_memory_counter::PageMemoryCounter;
+use pipeline::released_rows_cutter::ReleasedRowsCutterFactory;
 
 /// Builds the read half of the dataflow: it reads the files of `table`,
 /// each already sorted by `sort_column_names`, in merge order, for output
@@ -173,7 +172,7 @@ pub(super) fn read_in_merge_order_spec(
         .map_err(|error| into_dataflow_error(error.into()))?;
     let row_group_count = table.row_groups().len();
     let column_count = table.schema().fields().len();
-    let gated_reads = GatedReads::new(row_group_count, column_count, worker_count);
+    let gated_reads = GatedReads::new(row_group_count, column_count, worker_count, &sort_columns);
     // The queue has room for every read, one per column of every row group,
     // so a request is never refused.
     let (request_sender, requests) = channel_input::<QueryRowGroupMetadata>(
@@ -203,12 +202,10 @@ pub(super) fn read_in_merge_order_spec(
     )
     .map_err(into_dataflow_error)?;
 
-    // Every request names its own column, so the columns the fetchers and
-    // the range cutters read from a row group that names none are never
-    // used.
-    let no_columns = Projection::columns([]);
-    let shared_no_columns = Arc::new(no_columns.clone());
-    // One allocator per worker for the dictionaries its range cutter
+    // Every request names its own column, so the columns the fetchers
+    // read from a row group that names none are never used.
+    let shared_no_columns = Arc::new(Projection::columns([]));
+    // One allocator per worker for the dictionaries its cutter
     // builds, and one for the batches its decoder emits: a dictionary lives
     // as long as its read, a batch until its rows are sent on.
     let create_worker_allocators = || -> Vec<Arc<WorkerAllocator>> {
@@ -216,6 +213,19 @@ pub(super) fn read_in_merge_order_spec(
             .map(|_| Arc::new(WorkerAllocator::new()))
             .collect()
     };
+    // The queue of requests that need a read, which every worker's fetcher
+    // takes from. The gates and the cutters put into it the requests for
+    // the pages they ask for again.
+    let requests_to_read: Vec<SharedWorkQueueChannelFactory<QueryRowGroupMetadata>> =
+        shared_work_queue(worker_count).into_iter().collect();
+    let build_page_request_senders = || -> Vec<SharedWorkQueueSender<QueryRowGroupMetadata>> {
+        let channels = requests_to_read.iter();
+        channels
+            .map(SharedWorkQueueChannelFactory::build_sender)
+            .collect()
+    };
+    let gate_page_request_senders = build_page_request_senders();
+    let cutter_page_request_senders = build_page_request_senders();
     Ok(requests
         .chain(
             stealable_fifo::<QueryRowGroupMetadata>(topology)
@@ -226,7 +236,7 @@ pub(super) fn read_in_merge_order_spec(
             // takes from; nothing is sent to the first.
             shared_work_queue::<QueryRowGroupMetadata>(worker_count)
                 .into_iter()
-                .zip(shared_work_queue::<QueryRowGroupMetadata>(worker_count))
+                .zip(requests_to_read)
                 .map(|(io_row_groups_channel, uncached_row_groups_channel)| {
                     RowGroupFetcherFactory::new(
                         shared_no_columns.clone(),
@@ -244,7 +254,11 @@ pub(super) fn read_in_merge_order_spec(
         )
         .chain(
             stealable::<CompressedPage>(topology).into_iter().collect(),
-            DecompressGate::create_for_workers(&gated_reads, &memory_budget, worker_count),
+            DecompressGate::create_for_workers(
+                &gated_reads,
+                &memory_budget,
+                gate_page_request_senders,
+            ),
         )
         .chain(
             stealable::<CompressedPage>(topology).into_iter().collect(),
@@ -262,26 +276,20 @@ pub(super) fn read_in_merge_order_spec(
             return_to_worker_mpsc::<DecompressedPage>(worker_count)
                 .into_iter()
                 .collect(),
-            create_worker_allocators()
-                .into_iter()
-                .map(|allocator| RangeCutterFactory {
-                    projection: no_columns.clone(),
-                    eq_predicates: Arc::new(Vec::new()),
-                    // Row groups are claimed by request, not by an
-                    // injector, so this count is never consulted.
-                    outstanding_row_groups: Arc::new(AtomicUsize::new(0)),
-                    allocator,
-                })
-                .collect(),
+            ReleasedRowsCutterFactory::create_for_workers(
+                &gated_reads,
+                &memory_budget,
+                create_worker_allocators(),
+                cutter_page_request_senders,
+            ),
         )
         .chain(
-            stealable_fifo::<DecodeRange>(topology)
-                .into_iter()
-                .collect(),
-            DecodeGate::create_for_workers(&gated_reads, worker_count),
-        )
-        .chain(
-            stealable_fifo::<DecodeRange>(topology)
+            // A range goes to the decoder of the worker that cut it, which
+            // decodes each read as one stream: the ranges of a read are
+            // short when many files are merged together, and a worker that
+            // took one over would skip into its first page of every column
+            // and keep a decoder and a page of the read of its own.
+            return_to_worker_mpsc::<DecodeRange>(worker_count)
                 .into_iter()
                 .collect(),
             // The decoder appends the columns that say which rows of which
@@ -292,6 +300,10 @@ pub(super) fn read_in_merge_order_spec(
                     batch_size: RECORD_BATCH_SIZE,
                     add_row_group_metadata: true,
                     allocator,
+                    // A read's next rows are released when the output
+                    // gets to them, which is long after the last when
+                    // many files are merged together.
+                    lets_go_of_pages_between_ranges: true,
                 })
                 .collect(),
         )

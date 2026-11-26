@@ -186,6 +186,47 @@ fn two_pages_pack_into_one_slot() {
 }
 
 #[test]
+fn a_dropped_entry_is_gone_and_its_emptied_slot_is_free_again() {
+    init_test_free_pool(4);
+    insert_page(decompressed(), key(0), 100, 0xAA);
+    release_cursor(decompressed());
+
+    decompressed().drop_entry(&key(0));
+
+    assert!(decompressed().get(&key(0)).is_none());
+    assert_eq!(clock().count_owned(decompressed().id()), 0);
+}
+
+#[test]
+fn a_slot_keeps_the_entries_that_were_not_dropped() {
+    init_test_free_pool(4);
+    insert_page(decompressed(), key(0), 100, 0xAA);
+    insert_page(decompressed(), key(100), 100, 0xBB);
+    release_cursor(decompressed());
+
+    decompressed().drop_entry(&key(0));
+
+    assert!(all_bytes_are(&decompressed().get(&key(100)).unwrap(), 0xBB));
+    assert_eq!(clock().count_owned(decompressed().id()), 1);
+}
+
+#[test]
+fn a_slot_whose_dropped_entry_is_still_read_is_freed_with_a_later_drop() {
+    init_test_free_pool(4);
+    insert_page(decompressed(), key(0), 100, 0xAA);
+    release_cursor(decompressed());
+    let held = decompressed().get(&key(0)).unwrap();
+    decompressed().drop_entry(&key(0));
+    let owned_while_read = clock().count_owned(decompressed().id());
+
+    drop(held);
+    decompressed().recycle_emptied_slots();
+
+    assert_eq!(owned_while_read, 1);
+    assert_eq!(clock().count_owned(decompressed().id()), 0);
+}
+
+#[test]
 fn a_straddling_page_reads_back_its_bytes() {
     init_test_free_pool(4);
     insert_page(decompressed(), key(0), BUFFER_SIZE - 7, 0x11); // leave a 7-byte tail

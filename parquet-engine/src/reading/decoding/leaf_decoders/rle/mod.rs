@@ -404,6 +404,20 @@ impl RleDecoder {
         }
     }
 
+    /// Lets go of the page's bytes and keeps the place in them, with the
+    /// run it is in.
+    pub fn let_go_of_page_bytes(&mut self) {
+        self.position = self.position.flatten_over(&self.data);
+        self.data = Vec::new();
+    }
+
+    /// Takes back, as `data`, the bytes it let go of, in buffers that may
+    /// be cut differently.
+    pub fn take_back_page_bytes(&mut self, data: Vec<Bytes>) {
+        self.position = self.position.spread_over(&data);
+        self.data = data;
+    }
+
     /// Returns the current in-progress run, or parses the next one from the
     /// stream.
     #[inline(always)]

@@ -45,6 +45,12 @@ impl<K> SlotTenants<K> {
         std::mem::take(self.list_mut(slot))
     }
 
+    /// `slot`'s list, left in place. Under `try_write` only, as
+    /// [`take`](Self::take) is.
+    pub fn list(&self, slot: usize) -> &[K] {
+        self.list_mut(slot)
+    }
+
     /// Forget `slot`'s list. Either party, while holding the slot exclusively.
     pub fn clear(&self, slot: usize) {
         self.list_mut(slot).clear();

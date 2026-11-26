@@ -103,10 +103,16 @@ impl RangeCutter {
         }
     }
 
+    /// The pages collected of the read `read_key`, which must be open.
+    pub(crate) fn pages_of(&mut self, read_key: ReadKey) -> &mut RowGroupPages {
+        let open = self.open.get_mut(&read_key);
+        &mut open.expect("pages are asked of an open read").pages
+    }
+
     /// Forgets the read `read_key`: its pages from here on are dropped. A
     /// row group closed with no range to decode is released from the scan's
     /// outstanding count here, as no decoder will.
-    fn close(&mut self, read_key: ReadKey) {
+    pub(crate) fn close(&mut self, read_key: ReadKey) {
         let open = self
             .open
             .remove(&read_key)
@@ -138,19 +144,19 @@ impl RangeCutter {
         }
         Ok(())
     }
-}
 
-impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
-    fn consume(
+    /// Keeps `page` with the pages of its read, opening the read with its
+    /// first page, and builds the read's dictionary from a dictionary
+    /// page. Returns the read, or `None` when the read is closed, now or
+    /// before: the page is dropped, and nothing more is cut of the read.
+    pub(crate) fn collect_page(
         &mut self,
         page: DecompressedPage,
-        output: &mut dyn Sender<DecodeRange>,
-        _io: &mut dispatch::OperatorIO,
-    ) -> dispatch::UnaryResult<()> {
+    ) -> dispatch::UnaryResult<Option<ReadKey>> {
         let metadata = page.query_row_group_metadata.clone();
         let read_key = metadata.read_key();
         if self.closed.contains(&read_key) {
-            return Ok(());
+            return Ok(None);
         }
         if !self.open.contains_key(&read_key) {
             let plan = Arc::new(
@@ -193,7 +199,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
                         // pages.
                         metadata.mark_pruned();
                         self.close(read_key);
-                        return Ok(());
+                        return Ok(None);
                     }
                     BuiltDictionary::Built(dictionary) => {
                         open.pages.insert_dictionary(column, dictionary)
@@ -208,6 +214,7 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
                     page.first_row,
                     rows,
                     PageContent::Data(data),
+                    page.cache_key,
                 );
             }
             DecompressedPageType::SkippedData { header } => {
@@ -218,14 +225,35 @@ impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
                     page.first_row,
                     rows,
                     PageContent::Skipped(header),
+                    None,
                 );
             }
         }
-        self.emit_ready_ranges(read_key, output)
+        Ok(Some(read_key))
+    }
+
+    /// Whether any read is open: pages of it are collected, and not every
+    /// range of it is cut.
+    pub(crate) fn has_open_reads(&self) -> bool {
+        !self.open.is_empty()
+    }
+}
+
+impl Unary<DecompressedPage, DecodeRange> for RangeCutter {
+    fn consume(
+        &mut self,
+        page: DecompressedPage,
+        output: &mut dyn Sender<DecodeRange>,
+        _io: &mut dispatch::OperatorIO,
+    ) -> dispatch::UnaryResult<()> {
+        match self.collect_page(page)? {
+            Some(read_key) => self.emit_ready_ranges(read_key, output),
+            None => Ok(()),
+        }
     }
 
     fn finish(&mut self, _output: &mut dyn Sender<DecodeRange>) -> dispatch::UnaryResult<bool> {
-        Ok(self.open.is_empty())
+        Ok(!self.has_open_reads())
     }
 }
 
@@ -276,6 +304,7 @@ mod tests {
     fn i32_dict_page(metadata: QueryRowGroupMetadata, entries: &[i32]) -> DecompressedPage {
         let header = PageHeader::for_dict_page(entries.len() as i32);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: metadata,
             column_idx: 0,

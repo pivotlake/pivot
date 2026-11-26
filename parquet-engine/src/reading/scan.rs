@@ -86,6 +86,7 @@ where
                     batch_size,
                     add_row_group_metadata,
                     allocator,
+                    lets_go_of_pages_between_ranges: false,
                 })
                 .collect(),
         );

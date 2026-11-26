@@ -318,6 +318,27 @@ pub struct ReadKey {
     pub column: Option<usize>,
 }
 
+/// A stretch of whole data pages of one leaf's chunk. A reader that let go
+/// of pages it had read asks for them again by their stretch, instead of
+/// for the whole chunk.
+#[derive(Debug)]
+pub struct PageStretch {
+    /// Which of the read's leaves the pages are of, in the order the
+    /// leaves' chunks are fetched.
+    pub leaf: usize,
+    /// Where the stretch starts in the file.
+    pub file_offset: usize,
+    /// How many bytes the stretch is.
+    pub len: usize,
+    /// The place of the stretch's first page among the chunk's data pages.
+    pub first_page_idx: usize,
+    /// The row group row of the first value of the stretch's first page.
+    pub first_row: u32,
+    /// The worker the pages are sent to: the one that holds the rest of
+    /// the read.
+    pub worker: usize,
+}
+
 /// Row-group metadata augmented with per-query filtering state.
 ///
 /// Wraps a shared [`RowGroupMetadata`] and the [`RowSelection`] describing
@@ -339,6 +360,9 @@ pub struct QueryRowGroupMetadata {
     /// The one table column this read takes, when it names it itself.
     /// `None` for a read of the scan's projection.
     column: Option<usize>,
+    /// The pages this asks for again, of a read whose other pages are
+    /// read already. `None` for a read of whole chunks.
+    page_stretch: Option<Arc<PageStretch>>,
 }
 
 impl QueryRowGroupMetadata {
@@ -350,6 +374,7 @@ impl QueryRowGroupMetadata {
             row_group_index: index,
             pruned: Arc::new(AtomicBool::new(false)),
             column: None,
+            page_stretch: None,
         }
     }
 
@@ -360,6 +385,19 @@ impl QueryRowGroupMetadata {
             column: Some(column),
             ..Self::new(table, index, RowSelection::All)
         }
+    }
+
+    /// The same read, asking only for the pages of `page_stretch` again.
+    pub fn ask_for_page_stretch(&self, page_stretch: PageStretch) -> Self {
+        Self {
+            page_stretch: Some(Arc::new(page_stretch)),
+            ..self.clone()
+        }
+    }
+
+    /// The pages this asks for again, if it does not read whole chunks.
+    pub fn page_stretch(&self) -> Option<&PageStretch> {
+        self.page_stretch.as_deref()
     }
 
     /// Which read of its row group this is.

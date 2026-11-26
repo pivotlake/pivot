@@ -10,7 +10,7 @@ use arrow_array::types::Int64Type;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
-use dispatch::memory::SlabAllocator;
+use dispatch::memory::{BUFFER_SIZE, SlabAllocator, init_test_free_pool};
 use dispatch::{
     BuildContext, Built, BuiltUnary, DataFlowDispatcher, Dispatch, OperatorIO, Sender, Unary,
     UnaryFactory, UnaryResult, to_single_worker_mpsc, values_input,
@@ -18,6 +18,7 @@ use dispatch::{
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
+use parquet::file::metadata::ParquetMetaDataReader;
 use parquet::file::properties::WriterProperties;
 use parquet_engine::ParquetTable;
 use parquet_engine::writing::{
@@ -28,11 +29,13 @@ use parquet_variant_compute::{VariantArray, json_to_variant, unshred_variant};
 use parquet_variant_json::VariantToJson;
 use tempfile::TempDir;
 
-/// A two-worker dispatch pool shared by this file's tests.
+/// A two-worker dispatch pool shared by this file's tests, with the memory
+/// for all of them to run at once: every compaction keeps a few blocks per
+/// worker whatever it reads.
 fn test_dispatcher() -> &'static DataFlowDispatcher {
     static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
     DISPATCH
-        .get_or_init(|| Dispatch::spin_up(2, 64, None))
+        .get_or_init(|| Dispatch::spin_up(2, 128, None))
         .dispatcher()
 }
 
@@ -293,6 +296,26 @@ fn files_that_overlap_are_written_in_the_order_of_their_merge() {
 }
 
 #[test]
+fn many_files_that_overlap_are_written_in_the_order_of_their_merge() {
+    let keys_per_file: Vec<Vec<i64>> = (0..12)
+        .map(|file| (0..5000).map(|row| row * 12 + file).collect())
+        .collect();
+    let (_dir, table) = write_files(&keys_per_file, 2_500);
+
+    let merged = OutputRows::compact(table, &["key"], SETTINGS);
+
+    let expected_keys = merge_keys(&keys_per_file);
+    assert_eq!(merged.keys, expected_keys);
+    assert_eq!(
+        merged.texts,
+        expected_keys
+            .iter()
+            .map(|&key| text_of(key))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn a_file_of_several_row_groups_is_compacted_through_all_of_them() {
     let keys: Vec<i64> = (0..10_000).map(|row| row / 3).collect();
     let keys_per_file = [keys.clone(), keys];
@@ -524,4 +547,33 @@ fn documents_each_file_shredded_its_own_way_are_written_whole() {
     expected.sort();
     assert_eq!(written, expected);
     assert!(leaf_paths.contains(&"attrs.typed_value.id.typed_value".to_string()));
+}
+
+#[test]
+fn a_footer_larger_than_a_block_of_memory_is_written_whole() {
+    init_test_free_pool(8);
+    let column_count = 60_000;
+    let fields: Vec<Field> = (0..column_count)
+        .map(|column| {
+            Field::new(
+                format!("a column with a long name, number {column:06}"),
+                DataType::Int64,
+                false,
+            )
+        })
+        .collect();
+    let builder = ParquetFileBuilder::new(Arc::new(Schema::new(fields)));
+
+    let (footer, _) = builder.finish(&mut SlabAllocator::new(false)).unwrap();
+    let mut file = Vec::new();
+    file.extend(footer.runs().flatten());
+
+    assert!(file.len() > BUFFER_SIZE);
+    let metadata = ParquetMetaDataReader::new()
+        .parse_and_finish(&Bytes::from(file))
+        .unwrap();
+    assert_eq!(
+        metadata.file_metadata().schema_descr().num_columns(),
+        column_count
+    );
 }

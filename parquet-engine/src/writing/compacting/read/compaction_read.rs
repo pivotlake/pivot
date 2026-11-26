@@ -41,14 +41,25 @@
 //!
 //! Nothing but memory limits how far ahead the read works. The next rows
 //! are ordered as soon as the decoding of every ordered row was started,
-//! and the sort keys of the next two ranges of rows of each file past the
-//! merge are decoded, while the budget has room: the workers that decode and
+//! and the sort keys of the next rows of each file past the merge are
+//! decoded, while the budget has room: the workers that decode and
 //! encode would otherwise run out of rows. Rows are ordered further ahead
 //! than that while what is held is within half the budget, which leaves
 //! the other half to the columns of the rows whose order is decided. Chunks
 //! are fetched ahead within a sixteenth of the budget: the chunks of the next
 //! few output row groups, which is as far as fetching ahead was measured to
 //! help.
+//!
+//! What is decoded is what the output takes. A row of a column the files
+//! are not sorted by is released to be decoded only once its place in the
+//! output is decided, so no decoded row waits in memory for an output that
+//! may be long in getting to it: when many files are merged together, each
+//! gives the output few rows at a time. Sort keys are decoded before that,
+//! to decide it, for as many rows ahead of the merge as one output row
+//! group holds, split among the files being merged. And the pages of a read
+//! whose next rows are not released are not held: the gate and the cutter
+//! let go of them and get them back when the rows are released (see
+//! [`pipeline`](crate::writing::compacting::read::pipeline)).
 
 use std::collections::VecDeque;
 
@@ -57,7 +68,6 @@ use dispatch::{Sender, UnaryResult};
 
 use super::output::MergedBatchColumn;
 use crate::ParquetTable;
-use crate::reading::DECODE_RANGE_ROWS;
 use crate::writing::compacting::read::input::decoded_values::DecodedValues;
 use crate::writing::compacting::read::input::input_file::InputFile;
 use crate::writing::compacting::read::input::read_requests::ReadRequests;
@@ -65,14 +75,6 @@ use crate::writing::compacting::read::row_order::key_merge::{KeyMerge, NextRun, 
 use crate::writing::compacting::read::row_order::output_row_group::OutputRowGroup;
 use crate::writing::compacting::settings::MergeSortSettings;
 use crate::writing::error::WriteResult;
-
-/// How many rows of sort keys past the last merged row of a file are
-/// decoded ahead of the merge: two of the ranges that rows are decoded
-/// in. The merge takes at most half a range of a file's rows at a time,
-/// so this keeps it from waiting for keys. Keys decoded further ahead
-/// stay in memory for longer, and each of their arrays keeps the whole
-/// block it was built in.
-const KEY_ROWS_DECODED_AHEAD: u64 = 2 * DECODE_RANGE_ROWS as u64;
 
 /// A compaction's read of its input files in merge order.
 pub(crate) struct CompactionRead {
@@ -99,6 +101,10 @@ pub(crate) struct CompactionRead {
     /// row group was ordered, since its merged batches were last checked
     /// for sending.
     has_rows_to_check: Vec<bool>,
+    /// For each input file, the file row right after the last row that an
+    /// ordered output row group takes: the place in the output of every
+    /// row before it is decided.
+    ordered_rows_end_per_file: Vec<u64>,
 }
 
 impl CompactionRead {
@@ -113,7 +119,7 @@ impl CompactionRead {
         output_row_group_rows: usize,
         requests: ReadRequests,
     ) -> WriteResult<Self> {
-        let files = InputFile::list_files_of(table)?;
+        let files = InputFile::list_files_of(table, &sort_columns)?;
         let key_types: Vec<DataType> = sort_columns
             .iter()
             .map(|&column| table.schema().field(column).data_type().clone())
@@ -136,6 +142,7 @@ impl CompactionRead {
             ),
             ordered_row_groups: VecDeque::new(),
             has_rows_to_check: vec![false; column_count],
+            ordered_rows_end_per_file: vec![0; files.len()],
             files,
             requests,
             sort_columns,
@@ -376,15 +383,20 @@ impl CompactionRead {
                         let file = &mut self.files[needed_key.file];
                         let column = self.sort_columns[needed_key.sort_column];
                         let rows_end = needed_key.row + 1;
-                        let estimated_bytes = file.estimate_bytes_to_decode(column, rows_end);
+                        let estimated_bytes =
+                            file.estimate_bytes_to_decode(column, rows_end, rows_end);
                         let memory_budget = &self.requests.memory_budget;
                         let has_room = match is_every_ordered_row_decoding {
                             true => memory_budget.has_room_for(estimated_bytes),
                             false => memory_budget.has_room_ahead_for(estimated_bytes),
                         };
                         if is_required || has_room {
-                            has_started_decoding_keys |=
-                                file.start_decoding_rows(column, rows_end, &mut self.requests);
+                            has_started_decoding_keys |= file.start_decoding_rows(
+                                column,
+                                rows_end,
+                                rows_end,
+                                &mut self.requests,
+                            );
                         }
                     }
                     break;
@@ -410,6 +422,12 @@ impl CompactionRead {
         self.requests
             .memory_budget
             .add(row_group.count_held_bytes());
+        for batch in &row_group.merged_batches {
+            let rows_per_file = batch.rows_per_file.iter().enumerate();
+            for (file, rows) in rows_per_file.filter(|(_, rows)| !rows.is_empty()) {
+                self.ordered_rows_end_per_file[file] = rows.end;
+            }
+        }
         self.ordered_row_groups.push_back(row_group);
         self.has_rows_to_check.fill(true);
     }
@@ -446,7 +464,11 @@ impl CompactionRead {
                 let estimated_bytes: usize = rows_end_per_file
                     .clone()
                     .map(|(file, rows_end)| {
-                        self.files[file].estimate_bytes_to_decode(next.column, rows_end)
+                        self.files[file].estimate_bytes_to_decode(
+                            next.column,
+                            rows_end,
+                            self.ordered_rows_end_per_file[file],
+                        )
                     })
                     .sum();
                 let is_required = position == 0
@@ -458,7 +480,12 @@ impl CompactionRead {
                     return has_started;
                 }
                 for (file, rows_end) in rows_end_per_file {
-                    self.files[file].start_decoding_rows(next.column, rows_end, &mut self.requests);
+                    self.files[file].start_decoding_rows(
+                        next.column,
+                        rows_end,
+                        self.ordered_rows_end_per_file[file],
+                        &mut self.requests,
+                    );
                 }
                 self.ordered_row_groups[position].record_decoding_started();
                 has_started = true;
@@ -471,14 +498,19 @@ impl CompactionRead {
     /// the merge has asked for, so that it does not have to wait for them.
     /// Returns whether the decoding of any key was started.
     ///
-    /// The keys of the row groups to merge are decoded a range of rows at a
-    /// time, each row group in turn, while the memory budget has room, and
-    /// no further than [`KEY_ROWS_DECODED_AHEAD`] rows past the last merged
-    /// row of their file. The merge needs these keys for certain,
-    /// and every worker waits with it when it has to wait for them, so they
-    /// are not held to the room for work ahead.
+    /// The keys of the row groups to merge are released a range of rows at
+    /// a time, each row group in turn, while the memory budget has room.
+    /// They are released for as many rows ahead of the merge as one output
+    /// row group holds, split evenly among the files being merged: the
+    /// next output row group takes about that many rows of each. Keys
+    /// decoded further ahead would stay in memory for longer. The merge
+    /// needs these keys for certain, and every worker waits with it when
+    /// it has to wait for them, so they are not held to the room for work
+    /// ahead.
     fn start_decoding_sort_keys_ahead(&mut self) -> bool {
         let mut has_started = false;
+        let output_row_group_rows = self.row_group_being_ordered.row_limit;
+        let key_rows_ahead = output_row_group_rows / self.merge.count_files_to_merge().max(1);
         loop {
             let mut has_started_range = false;
             for &row_group in self.merge.row_groups_to_merge() {
@@ -486,7 +518,7 @@ impl CompactionRead {
                 let row_group_rows = file.row_groups[row_group.row_group].rows.clone();
                 let rows_end = row_group_rows
                     .end
-                    .min(self.merge.count_merged_rows(row_group.file) + KEY_ROWS_DECODED_AHEAD);
+                    .min(self.merge.count_merged_rows(row_group.file) + key_rows_ahead as u64);
                 for &column in &self.sort_columns {
                     let released_rows_end = file.find_released_rows_end(column);
                     // The file's rows are released in file order, so a row
@@ -494,13 +526,19 @@ impl CompactionRead {
                     if released_rows_end < row_group_rows.start || rows_end <= released_rows_end {
                         continue;
                     }
+                    let next_rows_end = released_rows_end + 1;
                     let estimated_bytes =
-                        file.estimate_bytes_to_decode(column, released_rows_end + 1);
+                        file.estimate_bytes_to_decode(column, next_rows_end, next_rows_end);
                     let memory_budget = &self.requests.memory_budget;
                     if !memory_budget.has_room_for(estimated_bytes) {
                         return has_started;
                     }
-                    file.start_decoding_rows(column, released_rows_end + 1, &mut self.requests);
+                    file.start_decoding_rows(
+                        column,
+                        next_rows_end,
+                        next_rows_end,
+                        &mut self.requests,
+                    );
                     has_started_range = true;
                     has_started = true;
                 }

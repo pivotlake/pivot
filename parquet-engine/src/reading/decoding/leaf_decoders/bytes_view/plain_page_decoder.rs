@@ -261,6 +261,18 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
 impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
     type Builder = ViewBuilder<V>;
 
+    fn let_go_of_page_bytes(&mut self) {
+        self.position = self.position.flatten_over(&self.data);
+        self.data = Vec::new();
+        self.buffers = Vec::new();
+    }
+
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>) {
+        self.position = self.position.spread_over(&data);
+        self.buffers = data.iter().map(|b| Buffer::from(b.clone())).collect();
+        self.data = data;
+    }
+
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {
             buffers: data.iter().map(|b| Buffer::from(b.clone())).collect(),

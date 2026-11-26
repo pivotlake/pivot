@@ -29,6 +29,12 @@
 //! table's write lock before recycling its slot, so a reader never pins a slot
 //! recycled out from under the extent it just read.
 //!
+//! A reader that works through a file and will not come back can drop
+//! what it has passed (see [`CompressedCache::drop_file_range`]). The
+//! slots those extents lay in
+//! go back to the free pool as soon as no extent is left in them and
+//! nothing reads them, instead of lying at rest until the clock takes them.
+//!
 //! ## Many instances
 //!
 //! Every family that keeps raw bytes has its own `CompressedCache`, so those
@@ -44,6 +50,7 @@ pub use lookup::{CacheLookup, MissingExtent};
 use crate::io::OpenFile;
 use crate::memory::cache::compressed::extent::{BLOCK_SIZE, BLOCKS_PER_SLOT, Extent, ExtentTable};
 use crate::memory::cache::compressed::valid_bitmap::ValidBitmap;
+use crate::memory::cache::derived_cache::SlotProbe;
 use crate::memory::cache::file_map::FileMap;
 use crate::memory::cache::fill_cursor::FillCursor;
 use crate::memory::cache::id::CacheId;
@@ -51,9 +58,10 @@ use crate::memory::cache::ring_cache::{Reclaimed, RingCache, SourceRange};
 use crate::memory::cache::slot_tenants::SlotTenants;
 use crate::memory::context::memory_ctx;
 use crate::memory::write_buffer::ProbedSlot;
+use crossbeam_queue::SegQueue;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// One `(file, first_file_block)` packed into a slot, recorded so the evictor
 /// can drop the extent when it recycles the slot.
@@ -75,6 +83,15 @@ pub struct CompressedCache {
     /// Which of each slot's blocks have been read in, by ring slot.
     valid: Box<[ValidBitmap]>,
     tenants: SlotTenants<Tenant>,
+    /// For each slot, how many extents are counted as lying in it: one more
+    /// with each extent registered, one fewer with each removed. It only
+    /// says which slots a drop on request may have emptied. Whether a slot
+    /// is empty is decided under its exclusive hold, from its tenants.
+    extents_per_slot: Box<[AtomicU32]>,
+    /// The slots a drop on request left with no extent counted in them,
+    /// which were still read when last looked at. Each is looked at again
+    /// with the next drop.
+    slots_to_recycle: SegQueue<usize>,
 }
 
 impl CompressedCache {
@@ -85,6 +102,8 @@ impl CompressedCache {
             files: FileMap::new(),
             valid: (0..slot_count).map(|_| ValidBitmap::default()).collect(),
             tenants: SlotTenants::new(slot_count),
+            extents_per_slot: (0..slot_count).map(|_| AtomicU32::new(0)).collect(),
+            slots_to_recycle: SegQueue::new(),
         }
     }
 
@@ -265,6 +284,7 @@ impl CompressedCache {
                 },
             );
             table.insert(extent.clone());
+            self.extents_per_slot[slot_idx].fetch_add(1, Ordering::Relaxed);
             // Mark it referenced so the fresh extent survives one sweep.
             memory_ctx().clock().touch(slot_idx);
             Some(extent)
@@ -279,6 +299,7 @@ impl CompressedCache {
         let slot_idx = write_buffer.slot_idx;
         self.valid_blocks(slot_idx).clear();
         self.tenants.clear(slot_idx);
+        self.extents_per_slot[slot_idx].store(0, Ordering::Relaxed);
         memory_ctx().clock().bind(slot_idx, self.id);
         cursor.rotate_to(write_buffer);
     }
@@ -294,17 +315,110 @@ impl CompressedCache {
                 // Publish failure while holding the table write lock that
                 // excludes a new lookup from discovering this extent.
                 placement.failed.store(true, Ordering::Release);
-                table.remove_placement(placement);
+                if table.remove_placement(placement) {
+                    self.count_extent_removed(placement.slot_idx as usize);
+                }
             });
         if removed.is_none() {
             placement.failed.store(true, Ordering::Release);
         }
     }
 
+    /// Count one extent fewer as lying in `slot_idx`. Returns whether none
+    /// is counted in it from here on.
+    fn count_extent_removed(&self, slot_idx: usize) -> bool {
+        let count_one_fewer = |count: u32| count.checked_sub(1);
+        let extents = &self.extents_per_slot[slot_idx];
+        extents.fetch_update(Ordering::Relaxed, Ordering::Relaxed, count_one_fewer) == Ok(1)
+    }
+
+    /// Drop every extent of `open_file` that lies wholly within bytes
+    /// `[offset, end_offset)`, for a reader that has worked through those
+    /// bytes and will not ask for them again. The slots the extents lay
+    /// in go back to the free pool if they hold no other extent.
+    ///
+    /// An extent that reaches out of the range stays whole: its first or
+    /// last block also holds bytes outside it. It goes with a later drop
+    /// of a range that takes it in.
+    ///
+    /// A slot is only looked at once no extent is counted in it: looking
+    /// takes it exclusively for a moment, which a reader of another
+    /// extent in it would see as a miss. And it can only be given back
+    /// while nothing reads it, so one that is still read is looked at
+    /// again with every later drop (see
+    /// [`recycle_emptied_slots`](Self::recycle_emptied_slots)).
+    pub fn drop_file_range(&self, open_file: &OpenFile, offset: usize, end_offset: usize) {
+        let removed = self.files.with_table_mut(open_file, |table| {
+            let first_file_block = offset.div_ceil(BLOCK_SIZE);
+            let extents = table.remove_within(first_file_block, end_offset / BLOCK_SIZE);
+            (extents, table.is_empty())
+        });
+        let Some((extents, has_emptied_file)) = removed else {
+            return;
+        };
+        if has_emptied_file {
+            self.files.prune_if_empty(open_file, ExtentTable::is_empty);
+        }
+        for extent in &extents {
+            if self.count_extent_removed(extent.slot_idx as usize) {
+                self.slots_to_recycle.push(extent.slot_idx as usize);
+            }
+        }
+        self.recycle_emptied_slots();
+    }
+
+    /// Give back to the free pool every slot that a drop on request left
+    /// with no extent counted in it, that holds none, and that nothing
+    /// reads. A slot that is still read is kept to be looked at again.
+    pub fn recycle_emptied_slots(&self) {
+        for _ in 0..self.slots_to_recycle.len() {
+            let Some(slot_idx) = self.slots_to_recycle.pop() else {
+                return;
+            };
+            if self.recycle_slot_if_emptied(slot_idx) == SlotProbe::StillRead {
+                self.slots_to_recycle.push(slot_idx);
+            }
+        }
+    }
+
+    /// Take `slot_idx` exclusively and, if it is this cache's and no extent
+    /// lies in it, release it to the free pool.
+    fn recycle_slot_if_emptied(&self, slot_idx: usize) -> SlotProbe {
+        // A slot the clock took since is working memory or another cache's
+        // by now, and would never stop being held.
+        if memory_ctx().clock().owner(slot_idx) != Some(self.id) {
+            return SlotProbe::Settled;
+        }
+        let Some(buffer) = memory_ctx().ring().try_write(slot_idx) else {
+            return SlotProbe::StillRead;
+        };
+        // Dropped without being taken, the probe leaves the slot cached.
+        let probe = ProbedSlot::new(buffer);
+        if memory_ctx().clock().owner(slot_idx) != Some(self.id) {
+            return SlotProbe::Settled;
+        }
+        let holds_extent = self.tenants.list(slot_idx).iter().any(|tenant| {
+            let lives_here = self.files.with_table(&tenant.open_file, |table| {
+                table
+                    .get(tenant.first_file_block)
+                    .is_some_and(|extent| extent.slot_idx as usize == slot_idx)
+            });
+            lives_here == Some(true)
+        });
+        if holds_extent {
+            return SlotProbe::Settled;
+        }
+        self.tenants.clear(slot_idx);
+        self.recycle_slot(slot_idx);
+        drop(probe.take_for_reuse()); // back to the free pool
+        SlotProbe::Settled
+    }
+
     /// Reset a slot's validity and release it from the clock. Sound only while
     /// the slot is held exclusively and its tenant list has been taken.
     fn recycle_slot(&self, slot_idx: usize) {
         self.valid_blocks(slot_idx).clear();
+        self.extents_per_slot[slot_idx].store(0, Ordering::Relaxed);
         memory_ctx().clock().release(slot_idx);
     }
 
@@ -396,7 +510,11 @@ impl RingCache for CompressedCache {
     /// handle to a file it holds nothing of. The orphaned tenants in their
     /// slots self-clean on eviction.
     fn invalidate(&self, file: &OpenFile) {
-        self.files.remove(file);
+        if let Some(mut table) = self.files.remove(file) {
+            for extent in table.drain() {
+                self.count_extent_removed(extent.slot_idx as usize);
+            }
+        }
     }
 
     /// Sound only while no query is in flight: it recycles bound slots, which
@@ -412,6 +530,7 @@ impl RingCache for CompressedCache {
         let mut dropped = 0;
         self.files.for_each_table_mut(|_, table| {
             for extent in table.drain() {
+                self.count_extent_removed(extent.slot_idx as usize);
                 slots.insert(extent.slot_idx as usize);
                 dropped += 1;
             }

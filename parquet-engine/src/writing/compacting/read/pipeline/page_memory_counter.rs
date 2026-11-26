@@ -23,9 +23,20 @@ use crate::types::page::{DataPage, DecompressedPageType};
 use crate::writing::compacting::memory_budget::{MemoryBudget, MemoryReservation};
 
 /// One buffer of a decompressed page, with the reservation that counts it.
-struct CountedPageBytes {
+pub(crate) struct CountedPageBytes {
     bytes: Bytes,
     _memory: MemoryReservation,
+}
+
+impl CountedPageBytes {
+    /// `bytes` as bytes that hold `memory`, the reservation that counts
+    /// them, until the last reference to them is dropped.
+    pub(crate) fn wrap(bytes: Bytes, memory: MemoryReservation) -> Bytes {
+        Bytes::from_owner(Self {
+            bytes,
+            _memory: memory,
+        })
+    }
 }
 
 impl AsRef<[u8]> for CountedPageBytes {
@@ -61,10 +72,7 @@ impl PageMemoryCounter {
     fn count_page_buffers(&self, buffers: &mut [Bytes]) {
         for buffer in buffers {
             let memory = self.memory_budget.reserve_counted_bytes(buffer.len());
-            *buffer = Bytes::from_owner(CountedPageBytes {
-                bytes: std::mem::take(buffer),
-                _memory: memory,
-            });
+            *buffer = CountedPageBytes::wrap(std::mem::take(buffer), memory);
         }
     }
 }

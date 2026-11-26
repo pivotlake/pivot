@@ -180,6 +180,9 @@ impl ColumnPageBuilder {
 /// every row of the row group, carrying no bytes: it moves through the
 /// pipeline like any page, so the row group's ranges become ready and the
 /// column's decoder emits a NULL per row.
+///
+/// The pages of a read that asks for a stretch of pages again are numbered,
+/// and their rows counted, from where the stretch starts in its chunk.
 fn build_column_pages(
     col_idx: usize,
     query_row_group_metadata: QueryRowGroupMetadata,
@@ -188,6 +191,7 @@ fn build_column_pages(
 ) -> Result<Vec<CompressedPage>, ParquetError> {
     let (codec, parts) = match column {
         ColumnBuffer::Resolved { codec, parts } => (codec, parts),
+        ColumnBuffer::NotAskedFor => return Ok(Vec::new()),
         ColumnBuffer::Absent => {
             let mut builder = ColumnPageBuilder {
                 col_idx,
@@ -221,12 +225,19 @@ fn build_column_pages(
             )]);
         }
     };
+    let cursor = match query_row_group_metadata.page_stretch() {
+        Some(page_stretch) => PageCursor {
+            data_page_idx: page_stretch.first_page_idx,
+            row_offset: page_stretch.first_row,
+        },
+        None => PageCursor::default(),
+    };
     let mut builder = ColumnPageBuilder {
         col_idx,
         codec,
         query_row_group_metadata,
         worker_id,
-        cursor: PageCursor::default(),
+        cursor,
     };
     let mut pages = Vec::with_capacity(128);
     for part in parts {

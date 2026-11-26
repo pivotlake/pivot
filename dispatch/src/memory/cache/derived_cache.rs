@@ -17,6 +17,11 @@
 //! entry straddling into another slot dies whole; its bytes there become dead
 //! space until that slot is itself reclaimed. Each view pins exactly the slots
 //! it reads, so a view stays valid however long it is held.
+//!
+//! A reader that knows it will not ask for an entry again can drop it (see
+//! [`Cache::drop_entry`]). The entry's slots then go back to the free pool
+//! as soon as no entry is left in them and nothing reads them, instead of
+//! lying at rest until the clock takes them.
 
 use crate::env::get_env_var_with_default;
 use crate::io::OpenFile;
@@ -29,8 +34,9 @@ use crate::memory::cache::slot_tenants::SlotTenants;
 use crate::memory::context::memory_ctx;
 use crate::memory::slab::{FrozenSlab, Slab, SlabBacking};
 use crate::memory::write_buffer::ProbedSlot;
+use crossbeam_queue::SegQueue;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Identity of a cache entry: the file bytes it was derived from. The map key
 /// is `(file, offset)`; `span` is checked on lookup so an entry derived from a
@@ -92,6 +98,16 @@ impl<V: Cached> Entry<V> {
     }
 }
 
+/// What a look at a slot that held a dropped entry found.
+#[derive(PartialEq, Eq)]
+pub(crate) enum SlotProbe {
+    /// Something reads the slot: it is to be looked at again.
+    StillRead,
+    /// The slot was given back, still holds an entry, or is no longer
+    /// the cache's: there is nothing more to do about it.
+    Settled,
+}
+
 /// One file's entries, by source offset.
 type EntryMap<V> = BTreeMap<usize, Entry<V>>;
 
@@ -101,6 +117,15 @@ pub struct Cache<V: Cached> {
     tenants: SlotTenants<CacheKey>,
     /// Entries across every file; the cold fast path of `get_range`.
     entries: AtomicUsize,
+    /// For each slot, how many entries are counted as lying in it: one more
+    /// with each entry published, one fewer with each removed. It only
+    /// says which slots a drop on request may have emptied. Whether a slot
+    /// is empty is decided under its exclusive hold, from its tenants.
+    entries_per_slot: Box<[AtomicU32]>,
+    /// The slots a drop on request left with no entry counted in them,
+    /// which were still read when last looked at. Each is looked at again
+    /// with the next drop.
+    slots_to_recycle: SegQueue<usize>,
     /// When off, `insert` builds into working memory and `get` always misses.
     enabled: bool,
 }
@@ -118,6 +143,8 @@ impl<V: Cached> Cache<V> {
             files: FileMap::new(),
             tenants: SlotTenants::new(slot_count),
             entries: AtomicUsize::new(0),
+            entries_per_slot: (0..slot_count).map(|_| AtomicU32::new(0)).collect(),
+            slots_to_recycle: SegQueue::new(),
             enabled,
         }
     }
@@ -164,6 +191,9 @@ impl<V: Cached> Cache<V> {
         let inserted = self.files.with_table_or_create(&key.file, |table| {
             if table.contains_key(&key.offset) {
                 return false;
+            }
+            for extent in &extents {
+                self.entries_per_slot[extent.slot as usize].fetch_add(1, Ordering::Relaxed);
             }
             table.insert(
                 key.offset,
@@ -225,6 +255,105 @@ impl<V: Cached> Cache<V> {
         self.entries.load(Ordering::Relaxed) == 0
     }
 
+    /// Count one entry fewer as lying in `slot`. Returns whether none is
+    /// counted in it from here on.
+    fn count_entry_removed_from(&self, slot: usize) -> bool {
+        let count_one_fewer = |count: u32| count.checked_sub(1);
+        let entries = &self.entries_per_slot[slot];
+        entries.fetch_update(Ordering::Relaxed, Ordering::Relaxed, count_one_fewer) == Ok(1)
+    }
+
+    /// Count `entry` as lying in none of its slots any more.
+    fn count_entry_removed(&self, entry: &Entry<V>) {
+        for extent in &entry.extents {
+            self.count_entry_removed_from(extent.slot as usize);
+        }
+    }
+
+    /// Drop the entry for `key`, which its reader will not ask for again,
+    /// and give the slots it lay in back to the free pool if they hold no
+    /// other entry. Does nothing if the cache holds no such entry.
+    ///
+    /// A slot is only looked at once no entry is counted in it: looking
+    /// takes it exclusively for a moment, which a reader of another entry
+    /// in it would see as a miss. And it can only be given back while
+    /// nothing reads it, where the reader that drops an entry often still
+    /// holds its bytes. Such a slot is looked at again with every later
+    /// drop (see [`recycle_emptied_slots`](Self::recycle_emptied_slots)).
+    pub fn drop_entry(&self, key: &CacheKey) {
+        if !self.enabled {
+            return;
+        }
+        let removed = self.files.with_table_mut(&key.file, |table| {
+            let is_cached = table
+                .get(&key.offset)
+                .is_some_and(|entry| entry.span == key.span);
+            let entry = is_cached.then(|| table.remove(&key.offset)).flatten()?;
+            Some((entry, table.is_empty()))
+        });
+        let Some(Some((entry, has_emptied_file))) = removed else {
+            return;
+        };
+        self.entries.fetch_sub(1, Ordering::Relaxed);
+        if has_emptied_file {
+            self.files.prune_if_empty(&key.file, BTreeMap::is_empty);
+        }
+        for extent in &entry.extents {
+            if self.count_entry_removed_from(extent.slot as usize) {
+                self.slots_to_recycle.push(extent.slot as usize);
+            }
+        }
+        self.recycle_emptied_slots();
+    }
+
+    /// Give back to the free pool every slot that a drop on request left
+    /// with no entry counted in it, that holds none, and that nothing
+    /// reads. A slot that is still read is kept to be looked at again.
+    pub fn recycle_emptied_slots(&self) {
+        for _ in 0..self.slots_to_recycle.len() {
+            let Some(slot) = self.slots_to_recycle.pop() else {
+                return;
+            };
+            if self.recycle_slot_if_emptied(slot) == SlotProbe::StillRead {
+                self.slots_to_recycle.push(slot);
+            }
+        }
+    }
+
+    /// Take `slot` exclusively and, if it is this cache's and no entry
+    /// lies in it, release it to the free pool.
+    fn recycle_slot_if_emptied(&self, slot: usize) -> SlotProbe {
+        // A slot the clock took since is working memory or another cache's
+        // by now, and would never stop being held.
+        if memory_ctx().clock().owner(slot) != Some(self.id) {
+            return SlotProbe::Settled;
+        }
+        let Some(buffer) = memory_ctx().ring().try_write(slot) else {
+            return SlotProbe::StillRead;
+        };
+        // Dropped without being taken, the probe leaves the slot cached.
+        let probe = ProbedSlot::new(buffer);
+        if memory_ctx().clock().owner(slot) != Some(self.id) {
+            return SlotProbe::Settled;
+        }
+        let holds_entry = self.tenants.list(slot).iter().any(|key| {
+            let lives_here = self.files.with_table(&key.file, |table| {
+                table
+                    .get(&key.offset)
+                    .is_some_and(|entry| entry.lives_in(slot))
+            });
+            lives_here == Some(true)
+        });
+        if holds_entry {
+            return SlotProbe::Settled;
+        }
+        self.tenants.clear(slot);
+        self.entries_per_slot[slot].store(0, Ordering::Relaxed);
+        memory_ctx().clock().release(slot);
+        drop(probe.take_for_reuse()); // back to the free pool
+        SlotProbe::Settled
+    }
+
     /// Drop every entry of `slot` still placed there, returning their source
     /// ranges. Stale tenants (dropped another way, lost races, failed builds,
     /// re-inserted elsewhere) are filtered by the placement check. Sound only
@@ -241,11 +370,12 @@ impl<V: Cached> Cache<V> {
                     return None;
                 }
                 let entry = table.remove(&key.offset).expect("checked present");
-                Some((entry.span, table.is_empty()))
+                Some((entry, table.is_empty()))
             });
-            if let Some(Some((span, emptied))) = removed {
+            if let Some(Some((entry, emptied))) = removed {
                 self.entries.fetch_sub(1, Ordering::Relaxed);
-                dropped.push(SourceRange::new(key.file.clone(), key.offset, span));
+                self.count_entry_removed(&entry);
+                dropped.push(SourceRange::new(key.file.clone(), key.offset, entry.span));
                 if emptied {
                     emptied_files.push(key.file);
                 }
@@ -254,6 +384,7 @@ impl<V: Cached> Cache<V> {
         for file in emptied_files {
             self.files.prune_if_empty(&file, BTreeMap::is_empty);
         }
+        self.entries_per_slot[slot].store(0, Ordering::Relaxed);
         dropped
     }
 
@@ -307,6 +438,9 @@ impl<V: Cached> RingCache for Cache<V> {
     fn invalidate(&self, file: &OpenFile) {
         if let Some(table) = self.files.remove(file) {
             self.entries.fetch_sub(table.len(), Ordering::Relaxed);
+            for entry in table.values() {
+                self.count_entry_removed(entry);
+            }
         }
     }
 
@@ -319,6 +453,7 @@ impl<V: Cached> RingCache for Cache<V> {
         for (_, table) in self.files.drain() {
             for (_, entry) in table {
                 dropped += 1;
+                self.count_entry_removed(&entry);
                 slots.extend(entry.extents.iter().map(|extent| extent.slot as usize));
             }
         }

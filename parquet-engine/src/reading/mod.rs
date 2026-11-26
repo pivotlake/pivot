@@ -26,6 +26,7 @@ pub(crate) mod decoding;
 pub use decoding::{ColumnDecoderError, DecoderFactory, ScanEqualityPredicate, WorkerAllocator};
 
 mod range_cutter;
+pub(crate) use range_cutter::RangeCutter;
 pub use range_cutter::{DecodeRange, RangeCutterFactory};
 
 mod materializer;

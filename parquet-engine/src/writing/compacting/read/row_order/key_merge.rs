@@ -421,6 +421,12 @@ impl KeyMerge {
         self.files[file].next_unmerged_row
     }
 
+    /// How many files the merge takes its next rows from: those with a row
+    /// group among the [row groups to merge](Self::row_groups_to_merge).
+    pub(crate) fn count_files_to_merge(&self) -> usize {
+        self.to_merge.files.len()
+    }
+
     /// The row groups the merge takes its next rows from, ordered by where
     /// they start: the row group that starts first and the row groups that
     /// overlap it (see the [module](self)). For a table without sort

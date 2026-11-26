@@ -23,7 +23,7 @@ use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use arrow_schema::{DataType, FieldRef, SchemaRef};
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 
-use dispatch::memory::{FileBytes, Slab, SlabAllocator};
+use dispatch::memory::{BUFFER_SIZE, FileBytes, Slab, SlabAllocator};
 
 use super::error::{WriteError, WriteResult};
 use super::types::{
@@ -587,7 +587,8 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
 }
 
 /// Write the trailing footer: `[FileMetaData][u32 LE footer length][PAR1]`. It
-/// is one more run of the file, small enough to build in one piece.
+/// grows with the file's row groups and columns, so it is written as runs of
+/// at most one block each.
 fn write_footer(
     out: &mut FileBytes,
     file_meta: &FileMetaData,
@@ -597,12 +598,14 @@ fn write_footer(
     file_meta.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut footer))?;
     footer.extend_from_slice(&(footer.len() as u32).to_le_bytes());
     footer.extend_from_slice(PARQUET_MAGIC);
-    out.push_slab(run_of(&footer, allocator));
+    for run in footer.chunks(BUFFER_SIZE) {
+        out.push_slab(run_of(run, allocator));
+    }
     Ok(())
 }
 
-/// A run holding a copy of `bytes`, for the small pieces of a file that are not
-/// pages: the leading magic, and the footer.
+/// A run holding a copy of `bytes`, for the pieces of a file that are not
+/// pages: the leading magic, and the footer. `bytes` fit in one block.
 fn run_of(bytes: &[u8], allocator: &mut SlabAllocator) -> Slab {
     let mut run = allocator.get_slab_of_size(bytes.len(), false);
     run.as_mut_slice().copy_from_slice(bytes);

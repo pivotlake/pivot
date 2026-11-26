@@ -42,6 +42,30 @@ pub enum ValueDecoder<L: LeafType> {
     Rle(L::Rle),
 }
 
+impl<L: LeafType> ValueDecoder<L> {
+    /// Lets go of the page's bytes and keeps the place in them.
+    fn let_go_of_page_bytes(&mut self) {
+        match self {
+            ValueDecoder::Plain(p) => p.let_go_of_page_bytes(),
+            ValueDecoder::Dictionary(r) => r.let_go_of_page_bytes(),
+            ValueDecoder::DeltaBinaryPacked(d) => d.let_go_of_page_bytes(),
+            ValueDecoder::DeltaLengthByteArray(d) => d.let_go_of_page_bytes(),
+            ValueDecoder::Rle(d) => d.let_go_of_page_bytes(),
+        }
+    }
+
+    /// Takes back, as `data`, the bytes it let go of.
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>) {
+        match self {
+            ValueDecoder::Plain(p) => p.take_back_page_bytes(data),
+            ValueDecoder::Dictionary(r) => r.take_back_page_bytes(data),
+            ValueDecoder::DeltaBinaryPacked(d) => d.take_back_page_bytes(data),
+            ValueDecoder::DeltaLengthByteArray(d) => d.take_back_page_bytes(data),
+            ValueDecoder::Rle(d) => d.take_back_page_bytes(data),
+        }
+    }
+}
+
 /// Decode `n` values into `builder` (a dictionary page looks each index up in
 /// `dict`). Shared by the required and nullable read loops.
 fn decode_run<D, L>(
@@ -460,6 +484,22 @@ impl<L: LeafType> LeafDecoder for TypedLeafDecoder<L> {
         self.page_idx = page_idx;
     }
 
+    /// The page being read is the only one that holds bytes once the rows
+    /// asked for are read: every page handed over held some of them. Its
+    /// definition levels were decoded when it was opened, so only its
+    /// values' decoder reads the bytes.
+    fn let_go_of_page_bytes(&mut self) {
+        if let Some(read_page) = &mut self.read_page {
+            read_page.decoder.let_go_of_page_bytes();
+        }
+    }
+
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>) {
+        let read_page = self.read_page.as_mut();
+        let read_page = read_page.expect("bytes are taken back for the page being read");
+        read_page.decoder.take_back_page_bytes(data);
+    }
+
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
         let mut builder = L::Builder::with_capacity(allocator, size);
         match self.dict.as_deref() {
@@ -572,6 +612,7 @@ mod tests {
     fn data_page(data: Vec<u8>, num_values: usize, idx: usize) -> DecompressedPage {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
@@ -593,6 +634,7 @@ mod tests {
     ) -> DecompressedPage {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
@@ -609,6 +651,7 @@ mod tests {
     fn skipped_page(num_values: usize, idx: usize) -> DecompressedPage {
         let header = PageHeader::for_data_page(num_values as i32, Encoding::PLAIN);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
@@ -634,6 +677,27 @@ mod tests {
             BuiltDictionary::Built(dictionary) => dec.adopt_dictionary(dictionary),
             BuiltDictionary::Pruned => panic!("the dictionary excludes the constant"),
         }
+    }
+
+    // -- letting go of a page --
+
+    /// A decoder that let go of its page's bytes reads on from its place
+    /// when it takes them back, cut into buffers of another size.
+    #[test]
+    fn a_decoder_reads_on_from_its_place_after_taking_its_page_back() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let bytes = encode_i32s(&[1, 2, 3, 4]);
+        let mut dec = Dec::new(0);
+        dec.insert_page(data_page(bytes.clone(), 4, 0));
+        let first = dec.read(&mut alloc, 1).unwrap();
+
+        dec.let_go_of_page_bytes();
+        dec.take_back_page_bytes(bytes.chunks(6).map(Bytes::copy_from_slice).collect());
+        let rest = dec.read(&mut alloc, 3).unwrap();
+
+        assert_eq!(extract_i32s(&first), vec![1]);
+        assert_eq!(extract_i32s(&rest), vec![2, 3, 4]);
     }
 
     // -- available --
@@ -687,6 +751,7 @@ mod tests {
         let mut dec = Dec::new(0);
         let header = PageHeader::for_data_page(3, Encoding::RLE);
         dec.insert_page(DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
@@ -715,6 +780,7 @@ mod tests {
 
         let header = PageHeader::for_data_page(8, Encoding::RLE_DICTIONARY);
         let page = DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
@@ -896,6 +962,7 @@ mod tests {
         // bit_width=2, 1 group of 8, indices [0,1,2,0,0,1,2,0]
         let header = PageHeader::for_data_page(8, Encoding::RLE_DICTIONARY);
         let rle_page = DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
@@ -921,6 +988,7 @@ mod tests {
     fn rle_page_over_three_entries(idx: usize) -> DecompressedPage {
         let header = PageHeader::for_data_page(8, Encoding::RLE_DICTIONARY);
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,
@@ -970,6 +1038,7 @@ mod tests {
 
         let header = PageHeader::for_data_page(8, Encoding::RLE_DICTIONARY);
         let rle_page = DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: dummy_metadata(RowSelection::All),
             column_idx: 0,

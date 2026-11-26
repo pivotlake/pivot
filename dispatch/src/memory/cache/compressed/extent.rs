@@ -195,15 +195,29 @@ impl ExtentTable {
         self.0.remove(&first_file_block)
     }
 
+    /// Remove every extent that lies wholly within file blocks
+    /// `[first_file_block, end_file_block)`, and return them.
+    pub fn remove_within(&mut self, first_file_block: usize, end_file_block: usize) -> Vec<Extent> {
+        if first_file_block >= end_file_block {
+            return Vec::new();
+        }
+        let starting_within = self.0.range(first_file_block..end_file_block);
+        let keys: Vec<usize> = starting_within
+            .filter(|(_, extent)| extent.last_file_block() < end_file_block)
+            .map(|(&first, _)| first)
+            .collect();
+        let extents = keys.into_iter().map(|key| self.0.remove(&key));
+        extents.flatten().collect()
+    }
+
     /// Remove the extent `placement` is a part of, if it is still there.
-    pub fn remove_placement(&mut self, placement: &Extent) {
+    /// Returns whether it was.
+    pub fn remove_placement(&mut self, placement: &Extent) -> bool {
         let key = self
             .find_covering(placement.first_file_block)
             .filter(|extent| extent.same_placement_as(placement))
             .map(|extent| extent.first_file_block);
-        if let Some(key) = key {
-            self.0.remove(&key);
-        }
+        key.is_some_and(|key| self.0.remove(&key).is_some())
     }
 
     /// Every extent overlapping file blocks `[first, last]`.

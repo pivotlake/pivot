@@ -74,6 +74,18 @@ impl Decompressor {
             other => return Err(Error::UnsupportedPageType(other)),
         };
 
+        // The decompressed cache holds the bytes of a page it resolved or
+        // is about to be given: not those of a page stored uncompressed or
+        // without bytes.
+        let is_stored_compressed =
+            page.codec != CompressionCodec::UNCOMPRESSED && page.header.uncompressed_page_size != 0;
+        let cache_key = (page.decompressed.is_some() || is_stored_compressed).then(|| {
+            CacheKey::new(
+                page.row_group.get_metadata().open_file.clone(),
+                page.file_offset,
+                page.span,
+            )
+        });
         // A page already resolved from the decompressed cache before this row
         // group's IO was even issued (see `requests::CachedColumnChunk::Decompressed`)
         // carries its bytes here directly - no cache lookup needed, and none of the
@@ -173,6 +185,7 @@ impl Decompressor {
         };
 
         Ok(DecompressedPage {
+            cache_key,
             worker_id: page.worker_id,
             query_row_group_metadata: page.row_group,
             column_idx: page.column_idx,
@@ -283,6 +296,7 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
             && page.filter_mask.as_ref().is_some_and(|f| f.all_false());
         let decompressed_page = if skip {
             DecompressedPage {
+                cache_key: None,
                 worker_id: page.worker_id,
                 query_row_group_metadata: page.row_group,
                 column_idx: page.column_idx,

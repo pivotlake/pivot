@@ -204,6 +204,16 @@ pub struct DecimalPlainDecoder<T: DecimalCarrier, S: DecimalStorage> {
 impl<T: DecimalCarrier, S: DecimalStorage> DecodePlain for DecimalPlainDecoder<T, S> {
     type Builder = PrimitiveBuilder<T>;
 
+    fn let_go_of_page_bytes(&mut self) {
+        self.position = self.position.flatten_over(&self.data);
+        self.data = Vec::new();
+    }
+
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>) {
+        self.position = self.position.spread_over(&data);
+        self.data = data;
+    }
+
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {
             data,
@@ -408,6 +418,14 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
 
     fn restart_at_page(&mut self, page_idx: usize) {
         self.inner.restart_at_page(page_idx);
+    }
+
+    fn let_go_of_page_bytes(&mut self) {
+        self.inner.let_go_of_page_bytes();
+    }
+
+    fn take_back_page_bytes(&mut self, data: Vec<Bytes>) {
+        self.inner.take_back_page_bytes(data);
     }
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {

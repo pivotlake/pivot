@@ -49,6 +49,10 @@ impl LeafDecoder for AbsentLeafDecoder {
 
     fn restart_at_page(&mut self, _page_idx: usize) {}
 
+    fn let_go_of_page_bytes(&mut self) {}
+
+    fn take_back_page_bytes(&mut self, _data: Vec<Bytes>) {}
+
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
         Ok(null_array_on_slabs(allocator, &self.data_type, size))
     }

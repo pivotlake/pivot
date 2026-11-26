@@ -162,8 +162,11 @@ pub struct RowGroupDecoder {
     /// One bit per row of the attached range, set for the rows the table
     /// format left live, when it deleted any of them.
     live_in_range: Option<BooleanBuffer>,
-    /// The row group's ranges still to decode, on any worker.
-    ranges_left: Arc<AtomicUsize>,
+    /// The row group's rows still to decode, on any worker.
+    rows_left: Arc<AtomicUsize>,
+    /// Whether the leaf decoders let go of the bytes of the pages they
+    /// are in since the last range, and take them back with the next.
+    has_let_go_of_pages: bool,
     /// Per leaf, the index of the next page to hand the leaf decoder.
     next_page: Vec<usize>,
     /// Whether to append row-group-id / row-index metadata columns.
@@ -203,7 +206,8 @@ impl RowGroupDecoder {
             end_row: 0,
             range: None,
             live_in_range: None,
-            ranges_left: range.ranges_left().clone(),
+            rows_left: range.rows_left().clone(),
+            has_let_go_of_pages: false,
             add_row_group_metadata,
             filter_batches,
             metadata,
@@ -222,7 +226,7 @@ impl RowGroupDecoder {
     /// Whether every range of the row group is decoded, on any worker, so
     /// no further range can arrive.
     pub fn row_group_done(&self) -> bool {
-        self.ranges_left.load(Ordering::Acquire) == 0
+        self.rows_left.load(Ordering::Acquire) == 0
     }
 
     /// Takes on `range`. A range starting at the row this decoder stopped
@@ -261,6 +265,15 @@ impl RowGroupDecoder {
             }
             for page in pages {
                 if page.idx < self.next_page[leaf] {
+                    // The leaf's decoder is in the middle of its last page
+                    // and reads on from there. It gets the page's bytes
+                    // back if it let go of them.
+                    if self.has_let_go_of_pages
+                        && page.idx + 1 == self.next_page[leaf]
+                        && let PageContent::Data(data_page) = &page.content
+                    {
+                        self.leaf_decoders[leaf].take_back_page_bytes(data_page.data.clone());
+                    }
                     continue;
                 }
                 self.next_page[leaf] = page.idx + 1;
@@ -268,8 +281,20 @@ impl RowGroupDecoder {
                 self.leaf_decoders[leaf].insert_page(decompressed);
             }
         }
+        self.has_let_go_of_pages = false;
         self.range = Some(range);
         Ok(())
+    }
+
+    /// Lets go of the bytes of the pages the leaf decoders are in, between
+    /// two ranges. Each keeps its place, and the next range that continues
+    /// this one brings the pages back.
+    pub fn let_go_of_page_bytes(&mut self) {
+        assert!(self.range.is_none(), "pages are let go of between ranges");
+        for leaf_decoder in &mut self.leaf_decoders {
+            leaf_decoder.let_go_of_page_bytes();
+        }
+        self.has_let_go_of_pages = true;
     }
 
     /// Gives back the range once every row of it is emitted.
@@ -317,6 +342,7 @@ impl RowGroupDecoder {
             },
         };
         DecompressedPage {
+            cache_key: None,
             worker_id: 0,
             query_row_group_metadata: self.metadata.clone(),
             column_idx: leaf,

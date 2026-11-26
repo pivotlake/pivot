@@ -116,6 +116,48 @@ fn a_committed_fill_survives_its_owner_being_dropped() {
 }
 
 #[test]
+fn a_dropped_file_range_is_gone_and_its_emptied_slot_is_free_again() {
+    init_test_free_pool(8);
+    let file = new_file();
+    fill_pattern(&cache().get(&file, 0, 3 * BLOCK_SIZE));
+    release_fill_cursor();
+
+    cache().drop_file_range(&file, 0, 3 * BLOCK_SIZE);
+
+    assert_eq!(memory_ctx().clock().count_owned(cache().id()), 0);
+    assert!(has_misses(&cache().get(&file, 0, BLOCK_SIZE)));
+}
+
+#[test]
+fn an_extent_that_reaches_out_of_a_dropped_range_stays() {
+    init_test_free_pool(8);
+    let file = new_file();
+    fill_pattern(&cache().get(&file, 0, 3 * BLOCK_SIZE));
+    release_fill_cursor();
+
+    cache().drop_file_range(&file, BLOCK_SIZE, 3 * BLOCK_SIZE);
+
+    assert!(!has_misses(&cache().get(&file, 0, BLOCK_SIZE)));
+}
+
+#[test]
+fn a_slot_whose_dropped_extent_is_still_read_is_freed_with_a_later_drop() {
+    init_test_free_pool(8);
+    let file = new_file();
+    fill_pattern(&cache().get(&file, 0, BLOCK_SIZE));
+    release_fill_cursor();
+    let held = cache().get(&file, 0, BLOCK_SIZE);
+    cache().drop_file_range(&file, 0, BLOCK_SIZE);
+    let owned_while_read = memory_ctx().clock().count_owned(cache().id());
+
+    drop(held);
+    cache().recycle_emptied_slots();
+
+    assert_eq!(owned_while_read, 1);
+    assert_eq!(memory_ctx().clock().count_owned(cache().id()), 0);
+}
+
+#[test]
 fn miss_then_fill_then_hit() {
     init_test_free_pool(8);
     cache().invalidate(&shared_file());
