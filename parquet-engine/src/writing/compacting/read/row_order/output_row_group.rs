@@ -25,12 +25,6 @@ impl MergedBatch {
             .map(|rows| (rows.end - rows.start) as usize)
             .sum()
     }
-
-    /// How many bytes the batch's row order takes.
-    fn count_held_bytes(&self) -> usize {
-        self.runs.capacity() * size_of::<FileRun>()
-            + self.rows_per_file.capacity() * size_of::<Range<u64>>()
-    }
 }
 
 /// One merged batch of one column of an output row group.
@@ -52,7 +46,7 @@ pub(crate) struct OutputRowGroup {
     file_count: usize,
     /// The row group's place among the output row groups, which are
     /// numbered from 0 in output order.
-    pub(crate) number: usize,
+    pub(crate) output_idx: usize,
     pub(crate) merged_batches: Vec<MergedBatch>,
     /// The first merged batch of a column whose rows' decoding was not
     /// started yet. The columns are started in order, and each column's
@@ -80,7 +74,7 @@ impl OutputRowGroup {
             row_limit,
             merged_batch_rows,
             file_count,
-            number: 0,
+            output_idx: 0,
             merged_batches: Vec::new(),
             next_to_decode: ColumnBatch {
                 column: 0,
@@ -94,7 +88,7 @@ impl OutputRowGroup {
     /// The output row group after this one, with no rows yet.
     pub(crate) fn start_next(&self) -> Self {
         Self {
-            number: self.number + 1,
+            output_idx: self.output_idx + 1,
             ..Self::new(
                 self.sent_batches.len(),
                 self.file_count,
@@ -158,14 +152,6 @@ impl OutputRowGroup {
             Some(last_run) if last_run.file == file => last_run.rows += rows,
             _ => runs.push(FileRun { file, rows }),
         }
-    }
-
-    /// How many bytes the row group's row order takes.
-    pub(crate) fn count_held_bytes(&self) -> usize {
-        self.merged_batches
-            .iter()
-            .map(MergedBatch::count_held_bytes)
-            .sum()
     }
 
     /// The first merged batch of a column whose rows' decoding was not

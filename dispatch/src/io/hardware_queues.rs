@@ -63,6 +63,10 @@ pub(crate) struct HardwareQueue {
     /// the worker pool; after that registration and release are atomic
     /// bitmap operations only.
     waiters: OnceLock<WaitingWorkers>,
+    /// Which waiting worker the next release wakes first: its place among
+    /// the workers waiting then, wrapped round their number. Moves one
+    /// place on with every release.
+    first_waiter_to_wake: AtomicUsize,
 }
 
 impl HardwareQueue {
@@ -83,6 +87,7 @@ impl HardwareQueue {
             most_runs_per_request,
             in_flight: AtomicUsize::new(0),
             waiters: OnceLock::new(),
+            first_waiter_to_wake: AtomicUsize::new(0),
         })
     }
 
@@ -137,7 +142,8 @@ impl HardwareQueue {
     fn release(&self, slots: usize) {
         self.in_flight.fetch_sub(slots, Ordering::SeqCst);
         if let Some(waiters) = self.waiters.get() {
-            waiters.wake_all(crate::waker::waker_set());
+            let first_place = self.first_waiter_to_wake.fetch_add(1, Ordering::Relaxed);
+            waiters.wake_all_from(crate::waker::waker_set(), first_place);
         }
     }
 }

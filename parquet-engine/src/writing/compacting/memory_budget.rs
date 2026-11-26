@@ -1,17 +1,20 @@
 //! The memory a compaction holds, counted against one limit.
 //!
-//! Every byte the compaction holds is counted from the moment the compacter
-//! lets it come into existence until it is stored in an output file:
+//! Every byte of its columns that the compaction holds is counted from the
+//! moment the compacter lets it come into existence until it is stored in
+//! an output file:
 //!
 //! | held as | size | counted from | until |
 //! |---|---|---|---|
 //! | a fetched column chunk, compressed | the footer's | the request for it | each page leaves the [`DecompressGate`](crate::writing::compacting::read::pipeline::decompress_gate::DecompressGate) |
 //! | a decompressed page or dictionary page | the page header's | the page leaves the `DecompressGate` | nothing holds the page's bytes any more |
 //! | decoded values | the most their type lets them own, then what the array owns | their rows are released to be decoded | the array is dropped by everything that holds it |
-//! | the row order of an output row group | measured | the order is decided | the row group's last column is sent on |
 //! | the leaves of one column of a merged batch, in output order | measured | they are gathered | every leaf of the column is copied to be encoded |
 //! | one leaf of an output row group, copied into one array to be encoded | what its batches hold | before the copy | the leaf is encoded |
 //! | the encoded pages of a leaf | measured | the leaf is encoded | the pages are stored |
+//!
+//! The row order of the output row groups being read is not counted: it is
+//! a few megabytes at most.
 //!
 //! Only the read waits for room. What the write half holds is counted when
 //! it exists, whatever the limit says: its rows are already decoded, and

@@ -64,7 +64,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, new_null_array};
-use arrow_row::{RowConverter, SortField};
+use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{ChunkedRowSorter, OrderBy, RECORD_BATCH_SIZE, RowComparer};
 
@@ -166,10 +166,10 @@ pub(crate) struct NeededKey {
 struct MergedRowGroup {
     /// The file row right after the row group's last row.
     rows_end: u64,
-    /// The bounds of the first sort column, in the row format. `None` for
-    /// a bound that is not known.
-    first_key_lower: Option<Vec<u8>>,
-    first_key_upper: Option<Vec<u8>>,
+    /// The bounds of the first sort column, as rows of the row format, which
+    /// compare as the values do. `None` for a bound that is not known.
+    first_key_lower: Option<OwnedRow>,
+    first_key_upper: Option<OwnedRow>,
 }
 
 /// The decoded keys of consecutive rows of one file, as they were decoded.
@@ -254,12 +254,12 @@ impl MergeInput {
         first_key_converter: Option<&RowConverter>,
     ) -> WriteResult<Self> {
         // A one-value bound of the first sort column, in the row format.
-        let encode_first_key_bound = |bound: Option<ArrayRef>| -> WriteResult<Option<Vec<u8>>> {
+        let encode_first_key_bound = |bound: Option<ArrayRef>| -> WriteResult<Option<OwnedRow>> {
             let (Some(bound), Some(converter)) = (bound, first_key_converter) else {
                 return Ok(None);
             };
             let rows = converter.convert_columns(&[bound])?;
-            Ok(Some(rows.row(0).as_ref().to_vec()))
+            Ok(Some(rows.row(0).owned()))
         };
         let mut row_count = 0;
         let mut merged_row_groups = Vec::with_capacity(row_groups.len());
@@ -454,7 +454,7 @@ impl KeyMerge {
             })
             .collect();
         row_groups
-            .sort_by_key(|&row_group| self.look_up_row_group(row_group).first_key_lower.as_deref());
+            .sort_by_key(|&row_group| self.look_up_row_group(row_group).first_key_lower.as_ref());
         row_groups
     }
 
@@ -488,8 +488,8 @@ impl KeyMerge {
         let first_key_upper = row_groups_of_next_rows
             .iter()
             .map(|&row_group| self.look_up_row_group(row_group))
-            .min_by_key(|row_group| row_group.first_key_lower.as_deref())
-            .and_then(|starts_first| starts_first.first_key_upper.as_deref());
+            .min_by_key(|row_group| row_group.first_key_lower.as_ref())
+            .and_then(|starts_first| starts_first.first_key_upper.as_ref());
         let mut row_groups = Vec::new();
         let mut files = Vec::new();
         for RowGroupOfFile { file, row_group } in row_groups_of_next_rows {
@@ -497,7 +497,7 @@ impl KeyMerge {
             let overlapping_row_groups = (row_group..self.files[file].row_groups.len())
                 .map(|row_group| RowGroupOfFile { file, row_group })
                 .take_while(|&row_group| {
-                    let lower = self.look_up_row_group(row_group).first_key_lower.as_deref();
+                    let lower = self.look_up_row_group(row_group).first_key_lower.as_ref();
                     match (lower, first_key_upper) {
                         (Some(lower), Some(first_key_upper)) => lower <= first_key_upper,
                         _ => true,
@@ -510,7 +510,7 @@ impl KeyMerge {
             }
         }
         row_groups
-            .sort_by_key(|&row_group| self.look_up_row_group(row_group).first_key_lower.as_deref());
+            .sort_by_key(|&row_group| self.look_up_row_group(row_group).first_key_lower.as_ref());
         self.to_merge = RowGroupsToMerge { row_groups, files };
     }
 

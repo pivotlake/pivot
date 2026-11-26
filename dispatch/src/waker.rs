@@ -494,10 +494,6 @@ pub(crate) fn install_test_worker_waker() {
 /// the change will see the registration.
 pub struct WaitingWorkers {
     workers: Box<[AtomicUsize]>,
-    /// Which registered worker the next wake notifies first: its place
-    /// among the workers registered then, wrapped round their number. Moves
-    /// one place on with every wake that finds any.
-    first_to_wake: AtomicUsize,
 }
 
 impl WaitingWorkers {
@@ -509,11 +505,10 @@ impl WaitingWorkers {
             workers: (0..worker_count.div_ceil(Self::WORD_BITS))
                 .map(|_| AtomicUsize::new(0))
                 .collect(),
-            first_to_wake: AtomicUsize::new(0),
         }
     }
 
-    /// Ask for `worker` to be woken by the next [`wake_all`](Self::wake_all).
+    /// Ask for `worker` to be woken by the next wake.
     pub fn register(&self, worker: usize) {
         let word = worker / Self::WORD_BITS;
         assert!(
@@ -537,11 +532,9 @@ impl WaitingWorkers {
         word & (1usize << (worker % Self::WORD_BITS)) != 0
     }
 
-    /// Wake every registered worker through `wakers` and take their
-    /// registrations away. The workers are woken in the same cycle each
-    /// time, entered one worker further on, so that when they race for
-    /// what changed no worker is always the first to be woken.
-    pub fn wake_all(&self, wakers: &WakerSet) {
+    /// Take every registration away. Returns the workers that were
+    /// registered, in the order of their numbers.
+    fn take_registered(&self) -> Vec<usize> {
         let mut waiting_workers = Vec::new();
         for (word_idx, word) in self.workers.iter().enumerate() {
             let mut waiting = word.swap(0, Ordering::SeqCst);
@@ -551,11 +544,31 @@ impl WaitingWorkers {
                 waiting &= waiting - 1;
             }
         }
+        waiting_workers
+    }
+
+    /// Wake every registered worker through `wakers` and take their
+    /// registrations away. For workers that each look at something of
+    /// their own once woken, so that the order they are woken in does not
+    /// matter.
+    pub fn wake_all(&self, wakers: &WakerSet) {
+        for worker in self.take_registered() {
+            wakers.notify_worker(worker);
+        }
+    }
+
+    /// Wake every registered worker through `wakers` and take their
+    /// registrations away, beginning with the worker at place
+    /// `first_place` among them, wrapped round their number, and going on
+    /// in the order of their numbers from there. For workers that race
+    /// for what changed: a caller that gives a place one further on with
+    /// each wake leaves no worker always the first to be woken.
+    pub fn wake_all_from(&self, wakers: &WakerSet, first_place: usize) {
+        let mut waiting_workers = self.take_registered();
         if waiting_workers.is_empty() {
             return;
         }
-        let first = self.first_to_wake.fetch_add(1, Ordering::Relaxed) % waiting_workers.len();
-        waiting_workers.rotate_left(first);
+        waiting_workers.rotate_left(first_place % waiting_workers.len());
         for worker in waiting_workers {
             wakers.notify_worker(worker);
         }

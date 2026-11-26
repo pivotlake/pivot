@@ -96,7 +96,7 @@ pub(crate) struct CompactionRead {
     row_group_being_ordered: OutputRowGroup,
     /// The output row groups whose row order is decided and that are not
     /// sent on in every column yet, oldest first.
-    ordered_row_groups: VecDeque<OutputRowGroup>,
+    output_row_groups: VecDeque<OutputRowGroup>,
     /// For each column, whether rows of it arrived decoded, or an output
     /// row group was ordered, since its merged batches were last checked
     /// for sending.
@@ -140,7 +140,7 @@ impl CompactionRead {
                 output_row_group_rows,
                 settings.pull_rows,
             ),
-            ordered_row_groups: VecDeque::new(),
+            output_row_groups: VecDeque::new(),
             has_rows_to_check: vec![false; column_count],
             ordered_rows_end_per_file: vec![0; files.len()],
             files,
@@ -154,7 +154,7 @@ impl CompactionRead {
     /// send. The last rows the merge orders are moved to the ordered output
     /// row groups at once, so none is left in the one being ordered.
     pub(crate) fn has_sent_every_row(&self) -> bool {
-        self.merge.row_groups_to_merge().is_empty() && self.ordered_row_groups.is_empty()
+        self.merge.row_groups_to_merge().is_empty() && self.output_row_groups.is_empty()
     }
 
     /// Do as much of each step of the read as can be done without waiting
@@ -233,25 +233,25 @@ impl CompactionRead {
             if !std::mem::take(&mut self.has_rows_to_check[column]) {
                 continue;
             }
-            for position in 0..self.ordered_row_groups.len() {
+            for position in 0..self.output_row_groups.len() {
                 while self.is_next_merged_batch_decoded(position, column) {
                     self.send_next_merged_batch(position, column, sender)?;
                     has_sent = true;
                 }
-                let row_group = &self.ordered_row_groups[position];
+                let row_group = &self.output_row_groups[position];
                 if row_group.find_next_to_send(column).is_some() {
                     break;
                 }
             }
         }
-        Ok(self.drop_sent_row_groups() || has_sent)
+        Ok(self.drop_sent_output_row_groups() || has_sent)
     }
 
     /// Whether the ordered output row group at `position` has a merged
     /// batch still to send in `column`, and the rows of the next such batch
     /// have all arrived decoded.
     fn is_next_merged_batch_decoded(&self, position: usize, column: usize) -> bool {
-        let Some((_, batch)) = self.ordered_row_groups[position].find_next_to_send(column) else {
+        let Some((_, batch)) = self.output_row_groups[position].find_next_to_send(column) else {
             return false;
         };
         let mut rows_per_file = batch.rows_per_file.iter().enumerate();
@@ -268,7 +268,7 @@ impl CompactionRead {
         column: usize,
         sender: &mut dyn Sender<MergedBatchColumn>,
     ) -> UnaryResult<()> {
-        let row_group = &mut self.ordered_row_groups[position];
+        let row_group = &mut self.output_row_groups[position];
         let (batch_index, batch) = row_group
             .find_next_to_send(column)
             .expect("a merged batch is sent after it was found decoded");
@@ -282,7 +282,7 @@ impl CompactionRead {
             self.files[file].take_input_values(column, rows.clone(), &mut sources);
         }
         sender.send(MergedBatchColumn {
-            row_group: row_group.number,
+            row_group: row_group.output_idx,
             batch: batch_index,
             row_group_batch_count: row_group.merged_batches.len(),
             column,
@@ -297,15 +297,14 @@ impl CompactionRead {
     /// Drop the oldest ordered output row groups that were sent on in every
     /// column. From then on they are in flight: being encoded or stored.
     /// Returns whether any was dropped.
-    fn drop_sent_row_groups(&mut self) -> bool {
+    fn drop_sent_output_row_groups(&mut self) -> bool {
         let mut has_dropped = false;
-        while let Some(row_group) = self
-            .ordered_row_groups
+        while self
+            .output_row_groups
             .pop_front_if(|row_group| row_group.find_first_unsent().is_none())
+            .is_some()
         {
-            let memory_budget = &self.requests.memory_budget;
-            memory_budget.subtract(row_group.count_held_bytes());
-            memory_budget.record_output_row_group_sent();
+            self.requests.memory_budget.record_output_row_group_sent();
             has_dropped = true;
         }
         has_dropped
@@ -352,10 +351,10 @@ impl CompactionRead {
         let is_every_row_ordered = self.merge.row_groups_to_merge().is_empty();
         let memory_budget = &self.requests.memory_budget;
         let is_required =
-            self.ordered_row_groups.is_empty() && !memory_budget.has_output_row_group_in_flight();
-        let mut ordered_row_groups = self.ordered_row_groups.iter();
+            self.output_row_groups.is_empty() && !memory_budget.has_output_row_group_in_flight();
+        let mut output_row_groups = self.output_row_groups.iter();
         let is_every_ordered_row_decoding =
-            ordered_row_groups.all(|row_group| row_group.find_next_to_decode().is_none());
+            output_row_groups.all(|row_group| row_group.find_next_to_decode().is_none());
         let is_wanted = is_required
             || (is_every_ordered_row_decoding && memory_budget.has_room_for(0))
             || memory_budget.has_room_ahead_for(0);
@@ -419,16 +418,13 @@ impl CompactionRead {
     fn keep_ordered_row_group(&mut self) {
         let next_row_group = self.row_group_being_ordered.start_next();
         let row_group = std::mem::replace(&mut self.row_group_being_ordered, next_row_group);
-        self.requests
-            .memory_budget
-            .add(row_group.count_held_bytes());
         for batch in &row_group.merged_batches {
             let rows_per_file = batch.rows_per_file.iter().enumerate();
             for (file, rows) in rows_per_file.filter(|(_, rows)| !rows.is_empty()) {
                 self.ordered_rows_end_per_file[file] = rows.end;
             }
         }
-        self.ordered_row_groups.push_back(row_group);
+        self.output_row_groups.push_back(row_group);
         self.has_rows_to_check.fill(true);
     }
 
@@ -452,9 +448,9 @@ impl CompactionRead {
     /// here.
     fn start_decoding_other_columns(&mut self) -> bool {
         let mut has_started = false;
-        for position in 0..self.ordered_row_groups.len() {
-            while let Some(next) = self.ordered_row_groups[position].find_next_to_decode() {
-                let row_group = &self.ordered_row_groups[position];
+        for position in 0..self.output_row_groups.len() {
+            while let Some(next) = self.output_row_groups[position].find_next_to_decode() {
+                let row_group = &self.output_row_groups[position];
                 let rows_end_per_file = row_group.merged_batches[next.batch]
                     .rows_per_file
                     .iter()
@@ -487,7 +483,7 @@ impl CompactionRead {
                         &mut self.requests,
                     );
                 }
-                self.ordered_row_groups[position].record_decoding_started();
+                self.output_row_groups[position].record_decoding_started();
                 has_started = true;
             }
         }
