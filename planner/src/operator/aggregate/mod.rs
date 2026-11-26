@@ -10,7 +10,7 @@
 //! | query shape | strategy |
 //! |---|---|
 //! | `COUNT(DISTINCT x)` alone, no GROUP BY | [`global_distinct`] |
-//! | grouped, one `COUNT(DISTINCT)` (alone or with other aggregates) | [`grouped_distinct`] |
+//! | grouped, one or more `COUNT(DISTINCT)` (alone or with other aggregates) | [`grouped_distinct`] |
 //! | no GROUP BY | [`global`] |
 //! | any other GROUP BY (incl. a computed key) | [`grouped`] |
 //!
@@ -128,8 +128,8 @@ impl Aggregate {
         // casts) pay nothing.
         let input = self.int_ify_temporal_values(input);
 
-        // One `COUNT(DISTINCT)` over a GROUP BY, alone or mixed with non-distinct
-        // aggregates, lowers to a two-level GROUP BY.
+        // `COUNT(DISTINCT)`s over a GROUP BY, alone or mixed with non-distinct
+        // aggregates, lower to a two-level GROUP BY.
         let n_distinct = self
             .expressions
             .iter()
@@ -140,7 +140,7 @@ impl Aggregate {
                 )
             })
             .count();
-        let grouped = if !self.groups.is_empty() && n_distinct == 1 {
+        let grouped = if !self.groups.is_empty() && n_distinct > 0 {
             self.compile_grouped_distinct(input, nullability)?
         } else if self.groups.is_empty() {
             self.compile_global(input)?
